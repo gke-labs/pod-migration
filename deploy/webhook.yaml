@@ -1,0 +1,25 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: pod-migration-webhook
+  annotations:
+    cert-manager.io/inject-ca-from: default/pod-migration-serving-cert
+webhooks:
+  - name: validate-eviction.pod-migration.gke.io
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"] # Eviction is a CREATE operation on the pods/eviction subresource
+        resources: ["pods/eviction"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: default
+    clientConfig:
+      service:
+        namespace: default
+        name: pod-migration-service
+        path: /validate-eviction
+      # If NOT using cert-manager, you must provide the base64 encoded CA bundle here
+      # caBundle: <BASE64_ENCODED_CA_CERT>
+    admissionReviewVersions: ["v1"]
+    sideEffects: None

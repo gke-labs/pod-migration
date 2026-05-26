@@ -1,0 +1,14 @@
+apiVersion: podsnapshot.gke.io/v1
+kind: PodSnapshotPolicy
+metadata:
+  name: example-pod-snapshot-policy
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      pod-migration.gke.io/enabled: "true"
+  # This must match the PodSnapshotStorageConfig
+  storageConfigName: example-pod-snapshot-storage-config
+  triggerConfig:
+    type: manual
+    postCheckpoint: resume

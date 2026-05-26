@@ -1,0 +1,21 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pod-migration-selfsigned-issuer
+  namespace: default
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pod-migration-serving-cert
+  namespace: default
+spec:
+  dnsNames:
+  - pod-migration-service.default.svc
+  - pod-migration-service.default.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: pod-migration-selfsigned-issuer
+  secretName: webhook-certs # This matches the secret name in deployment.yaml
