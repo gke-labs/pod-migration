@@ -2,7 +2,18 @@
 
 > **Proof of Concept**: This controller is a proof of concept and is intended for experimentation only. It should **not** be used in a production environment.
 
-This controller facilitates Pod Migration by intercepting eviction requests, triggering snapshots, and managing pod deletion after snapshots are ready. This enables Pod Migration for any pod evictions including evictions triggered by Vertical Pod Autoscaler.
+This controller introduces Pod Migration - the ability to "move" a pod from one node to another, while maintaining its internal state such as its memory. It uses [GKE Pod Snapshots](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/pod-snapshots) to reliably capture the state of the pod and restore it. This feature requires the use of the [GKE Sandbox](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods), which is based on the [gVisor](https://gvisor.dev/) container runtime.
+
+This controller implements Pod Migration by intercepting eviction requests, triggering snapshots, and managing pod deletion after snapshots are ready. This reduces downtime by allowing your application to recover faster from evictions such as:
+
+- **Node upgrades:** When a node is cordoned, the controller can capture the state of the pod, either reducing restart time for stateless workloads, or preserving in-progress state for Jobs or other stateful workloads.
+- **VPA evictions:** VPA will attempt to evict pods in several cases. If [in-place pod resizing (IPPR)](https://kubernetes.io/blog/2025/05/16/kubernetes-v1-33-in-place-pod-resize-beta/) is _not_ enabled, it can evict pods that need to be resized; if IPPR _is_ enabled but cannot be performed (e.g., the node is too small or doesn't have enough free capacity), VPA will fall back to evicition. Either way, this controller will capture the state of the pod prior to evicition, so the newly-created pod can resume normal operation faster.
+- **Other causes:** This controller will also respond to manual evictions and IPPR failures caused by non-VPA controllers.
+
+While this controller can _mitigate_ the effects of pod eviction, it is not transparent and the application will notice several changes, such as:
+
+- The new pod has a different identity (e.g. pod name) and IP address
+- Existing network connections will be closed and must be reopened
 
 ## How it Works
 
@@ -18,7 +29,7 @@ The controller consists of the following components:
 
 - **[PodReconciler](pkg/controller/pod_controller.go)**: Watches for Pods with the label `pod-migration.gke.io/enabled: "true"` and annotation `pod-migration.gke.io/snapshot-requested: "true"`. When both are present, it creates a `PodSnapshotManualTrigger` resource to initiate a snapshot.
 - **[SnapshotReconciler](pkg/controller/snapshot_controller.go)**: Watches for `PodSnapshot` resources. Once a snapshot becomes ready, it deletes the origin pod and the corresponding trigger resource.
-- **[DeferredEvictionReconciler](pkg/controller/deferred_eviction_controller.go)**: Watches for Pods with the label `pod-migration.gke.io/enabled: "true"` and condition `PodResizePending` with reason `Deferred`. When a pod is deferred, it acts as follows:
+- **[DeferredEvictionReconciler](pkg/controller/deferred_eviction_controller.go)**: Watches for Pods with the label `pod-migration.gke.io/enabled: "true"` and condition `PodResizePending` with reason `Deferred`. This is typically used when IPPR is not able to resize the pod due to a lack of free space on a node. When a pod is deferred, it acts as follows:
     - It searches for *other* candidate pods on the same node with `pod-migration.gke.io/enabled: "true"` that are not already being deleted.
     - If a candidate pod is found, it issues an eviction request for that *other* pod to free up resources on the node, and adds the label `pod-migration.gke.io/deferred-eviction-processed: "true"` to the deferred pod to prevent redundant actions in subsequent loops.
     - If no candidate is found, it falls back to evicting the deferred pod itself immediately.
