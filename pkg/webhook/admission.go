@@ -38,6 +38,33 @@ func (a *EvictionGuard) Handle(ctx context.Context, req admission.Request) admis
 		return admission.Allowed("feature not enabled")
 	}
 
+	// Inspect volumes to determine if we should bypass the webhook for runtime interception (Approach 2)
+	hasRWO := false
+	for _, vol := range pod.Spec.Volumes {
+		if vol.PersistentVolumeClaim != nil {
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
+			if err != nil {
+				klog.Errorf("Failed to get PVC %s: %v", vol.PersistentVolumeClaim.ClaimName, err)
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			for _, mode := range pvc.Spec.AccessModes {
+				if mode == corev1.ReadWriteOnce || mode == corev1.PersistentVolumeAccessMode("ReadWriteOncePod") {
+					hasRWO = true
+					break
+				}
+			}
+			if hasRWO {
+				break
+			}
+		}
+	}
+
+	if !hasRWO {
+		klog.Infof("Pod %s/%s has no RWO volumes, bypassing eviction webhook for runtime interception", req.Namespace, req.Name)
+		return admission.Allowed("bypassing eviction webhook for diskless/RWX workload")
+	}
+
 	// Check annotations
 	if pod.Annotations["pod-migration.gke.io/snapshot-requested"] == "true" {
 		klog.Infof("Pod %s/%s snapshot requested, denying eviction to allow snapshot and stop", req.Namespace, req.Name)
