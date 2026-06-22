@@ -4,12 +4,15 @@ import (
 	"flag"
 	"os"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"k8s.io/gke-autoscaling/pod-migration/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	lpmv1alpha1 "k8s.io/gke-autoscaling/pod-migration/api/v1alpha1"
 	"k8s.io/gke-autoscaling/pod-migration/pkg/controller"
+	"k8s.io/gke-autoscaling/pod-migration/pkg/webhook"
 )
 
 func main() {
@@ -26,6 +29,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	utilruntime.Must(lpmv1alpha1.AddToScheme(mgr.GetScheme()))
+
 	// Setup webhooks
 	decoder := admission.NewDecoder(mgr.GetScheme())
 
@@ -37,18 +42,11 @@ func main() {
 	})
 
 	// Setup controllers
-	if err = (&controller.PodReconciler{
+	if err = (&controller.PodMigrationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		klog.Error(err, "unable to create controller", "controller", "Pod")
-		os.Exit(1)
-	}
-	if err = (&controller.SnapshotReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		klog.Error(err, "unable to create controller", "controller", "Snapshot")
+		klog.Error(err, "unable to create controller", "controller", "PodMigration")
 		os.Exit(1)
 	}
 	if err = (&controller.DeferredEvictionReconciler{
