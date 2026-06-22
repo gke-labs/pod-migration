@@ -16,7 +16,10 @@ rules:
   resources: ["pods/eviction"]
   verbs: ["create"]
 - apiGroups: ["podsnapshot.gke.io"]
-  resources: ["podsnapshotmanualtriggers", "podsnapshots"]
+  resources: ["podsnapshotmanualtriggers", "podsnapshots", "podsnapshotstorageconfigs", "podsnapshotpolicies"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["lpm.example.com"]
+  resources: ["podmigrations"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
