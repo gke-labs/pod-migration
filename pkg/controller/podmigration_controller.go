@@ -107,7 +107,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	triggerType := "manual"
 	if config.Spec.MigrationPolicy != nil {
 		if config.Spec.MigrationPolicy.TriggerType == "OnEviction" {
-			triggerType = "manual"
+			triggerType = "onDelete"
 		} else if config.Spec.MigrationPolicy.TriggerType == "Periodic" {
 			triggerType = "workload"
 		}
