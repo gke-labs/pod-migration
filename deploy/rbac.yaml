@@ -10,7 +10,7 @@ metadata:
   name: pod-migration-controller-role
 rules:
 - apiGroups: [""]
-  resources: ["pods"]
+  resources: ["pods", "persistentvolumeclaims"]
   verbs: ["get", "list", "watch", "update", "patch", "delete"]
 - apiGroups: [""]
   resources: ["pods/eviction"]
@@ -18,7 +18,7 @@ rules:
 - apiGroups: ["podsnapshot.gke.io"]
   resources: ["podsnapshotmanualtriggers", "podsnapshots", "podsnapshotstorageconfigs", "podsnapshotpolicies"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["lpm.example.com"]
+- apiGroups: ["podmigration.gke.io"]
   resources: ["podmigrations"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---

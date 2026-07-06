@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: podmigrations.lpm.example.com
+  name: podmigrations.podmigration.gke.io
 spec:
-  group: lpm.example.com
+  group: podmigration.gke.io
   names:
     kind: PodMigration
     listKind: PodMigrationList
@@ -40,37 +40,13 @@ spec:
           spec:
             description: PodMigrationSpec defines the desired config.
             properties:
-              migrationPolicy:
-                description: MigrationPolicy defines optional checkpointing and scheduling
-                  rules.
-                properties:
-                  groupingLabels:
-                    description: GroupingLabels lists pod label names used to isolate
-                      and group snapshots.
-                    items:
-                      type: string
-                    type: array
-                  periodicIntervalMinutes:
-                    description: PeriodicIntervalMinutes specifies interval for periodic
-                      backups (required if triggerType is Periodic).
-                    format: int32
-                    type: integer
-                  postCheckpoint:
-                    description: 'PostCheckpoint defines container behavior after
-                      snapshot: Stop, Resume.'
-                    type: string
-                  triggerType:
-                    description: TriggerType specifies when checkpoints are taken
-                      (OnEviction, Periodic).
-                    type: string
-                type: object
               storage:
                 description: StorageSpec defines GCS storage target configuration.
                 properties:
-                  autoProvision:
-                    description: AutoProvision enables controller-driven folder and
-                      IAM creation.
-                    type: boolean
+                  folderManagement:
+                    description: FolderManagement specifies how the target snapshot
+                      folders are managed.
+                    type: string
                   location:
                     description: Location is the GCS location URI (e.g. gs://bucket-name/prefix-path)
                     type: string

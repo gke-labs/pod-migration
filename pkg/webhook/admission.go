@@ -38,59 +38,9 @@ func (a *EvictionGuard) Handle(ctx context.Context, req admission.Request) admis
 		return admission.Allowed("feature not enabled")
 	}
 
-	// Inspect volumes to determine if we should bypass the webhook for runtime interception (Approach 2)
-	hasRWO := false
-	for _, vol := range pod.Spec.Volumes {
-		if vol.PersistentVolumeClaim != nil {
-			pvc := &corev1.PersistentVolumeClaim{}
-			err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
-			if err != nil {
-				klog.Errorf("Failed to get PVC %s: %v", vol.PersistentVolumeClaim.ClaimName, err)
-				return admission.Errored(http.StatusInternalServerError, err)
-			}
-			for _, mode := range pvc.Spec.AccessModes {
-				if mode == corev1.ReadWriteOnce || mode == corev1.PersistentVolumeAccessMode("ReadWriteOncePod") {
-					hasRWO = true
-					break
-				}
-			}
-			if hasRWO {
-				break
-			}
-		}
-	}
-
-	if !hasRWO {
-		klog.Infof("Pod %s/%s has no RWO volumes, bypassing eviction webhook for runtime interception", req.Namespace, req.Name)
-		return admission.Allowed("bypassing eviction webhook for diskless/RWX workload")
-	}
-
-	// Check annotations
-	if pod.Annotations["pod-migration.gke.io/snapshot-requested"] == "true" {
-		klog.Infof("Pod %s/%s snapshot requested, denying eviction to allow snapshot and stop", req.Namespace, req.Name)
-		return admission.Denied("snapshot in progress and pod will be stopped")
-	}
-
-	// Trigger snapshot by adding annotation
-	klog.Infof("Triggering snapshot for Pod %s/%s", req.Namespace, req.Name)
-
-	// We need to update the Pod. We can do it via the client.
-	// Note: We are in a VALIDATING webhook, so we cannot mutate the object in the request (which is the eviction anyway).
-	// We must update the Pod object in the API server.
-
-	podCopy := pod.DeepCopy()
-	if podCopy.Annotations == nil {
-		podCopy.Annotations = make(map[string]string)
-	}
-	podCopy.Annotations["pod-migration.gke.io/snapshot-requested"] = "true"
-
-	err = a.Client.Update(ctx, podCopy)
-	if err != nil {
-		klog.Errorf("Failed to update pod %s/%s annotations: %v", req.Namespace, req.Name, err)
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-
-	return admission.Denied("snapshot triggered, the pod will be terminated shortly")
+	// Bypass eviction webhook for all workloads under Approach 2 runtime-only interception
+	klog.Infof("Pod %s/%s has pod-migration enabled, bypassing eviction webhook for runtime onDelete interception", req.Namespace, req.Name)
+	return admission.Allowed("bypassing eviction webhook for runtime interception")
 }
 
 // InjectDecoder injects the decoder.

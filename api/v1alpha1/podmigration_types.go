@@ -8,31 +8,14 @@ import (
 type StorageSpec struct {
 	// Location is the GCS location URI (e.g. gs://bucket-name/prefix-path)
 	Location string `json:"location"`
-	// AutoProvision enables controller-driven folder and IAM creation.
+	// FolderManagement specifies how the target snapshot folders are managed.
 	// +optional
-	AutoProvision bool `json:"autoProvision,omitempty"`
-}
-
-// MigrationPolicy defines optional checkpointing and scheduling rules.
-type MigrationPolicy struct {
-	// TriggerType specifies when checkpoints are taken (OnEviction, Periodic).
-	// +optional
-	TriggerType string `json:"triggerType,omitempty"`
-	// PeriodicIntervalMinutes specifies interval for periodic backups (required if triggerType is Periodic).
-	// +optional
-	PeriodicIntervalMinutes int32 `json:"periodicIntervalMinutes,omitempty"`
-	// PostCheckpoint defines container behavior after snapshot: Stop, Resume.
-	// +optional
-	PostCheckpoint string `json:"postCheckpoint,omitempty"`
-	// GroupingLabels lists pod label names used to isolate and group snapshots.
-	// +optional
-	GroupingLabels []string `json:"groupingLabels,omitempty"`
+	FolderManagement string `json:"folderManagement,omitempty"`
 }
 
 // PodMigrationSpec defines the desired config.
 type PodMigrationSpec struct {
-	Storage         StorageSpec      `json:"storage"`
-	MigrationPolicy *MigrationPolicy `json:"migrationPolicy,omitempty"`
+	Storage StorageSpec `json:"storage"`
 }
 
 // PodMigrationStatus defines the observed state.

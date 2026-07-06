@@ -11,7 +11,7 @@ to/from the wire, and the typed client (`client.Client`) can do
 */
 
 // +kubebuilder:object:generate=true
-// +groupName=lpm.example.com
+// +groupName=podmigration.gke.io
 package v1alpha1
 
 import (
@@ -21,7 +21,7 @@ import (
 
 var (
 	// GroupVersion is group + version used to register these objects.
-	GroupVersion = schema.GroupVersion{Group: "lpm.example.com", Version: "v1alpha1"}
+	GroupVersion = schema.GroupVersion{Group: "podmigration.gke.io", Version: "v1alpha1"}
 
 	// SchemeBuilder collects the Go types in this package; AddToScheme is
 	// what main.go calls to register them.

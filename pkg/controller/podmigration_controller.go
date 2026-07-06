@@ -24,8 +24,8 @@ type PodMigrationReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=lpm.example.com,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=lpm.example.com,resources=podmigrations/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch;delete
 
@@ -103,20 +103,6 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	psp.SetName(pspName)
 	psp.SetNamespace(req.Namespace)
 
-	// Map trigger type and postCheckpoint behavior
-	triggerType := "manual"
-	if config.Spec.MigrationPolicy != nil {
-		if config.Spec.MigrationPolicy.TriggerType == "OnEviction" {
-			triggerType = "onDelete"
-		} else if config.Spec.MigrationPolicy.TriggerType == "Periodic" {
-			triggerType = "workload"
-		}
-	}
-	postCheckpoint := "stop"
-	if config.Spec.MigrationPolicy != nil && config.Spec.MigrationPolicy.PostCheckpoint != "" {
-		postCheckpoint = strings.ToLower(string(config.Spec.MigrationPolicy.PostCheckpoint))
-	}
-
 	specPayload := map[string]interface{}{
 		"storageConfigName": psscName,
 		"selector": map[string]interface{}{
@@ -125,18 +111,9 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			},
 		},
 		"triggerConfig": map[string]interface{}{
-			"type":           triggerType,
-			"postCheckpoint": postCheckpoint,
+			"type":           "onDelete",
+			"postCheckpoint": "stop",
 		},
-	}
-
-	// Propagate groupingLabels to GKE snapshotGroupingRules
-	if config.Spec.MigrationPolicy != nil && len(config.Spec.MigrationPolicy.GroupingLabels) > 0 {
-		specPayload["snapshotGroupingRules"] = map[string]interface{}{
-			"groupByLabelValue": map[string]interface{}{
-				"labels": config.Spec.MigrationPolicy.GroupingLabels,
-			},
-		}
 	}
 
 	psp.Object["spec"] = specPayload
