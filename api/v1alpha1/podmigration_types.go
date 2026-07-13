@@ -4,9 +4,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// StorageSpec defines GCS storage target configuration.
+// StorageSpec defines the snapshot storage target configuration.
 type StorageSpec struct {
-	// Location is the GCS location URI (e.g. gs://bucket-name/prefix-path)
+	// Location is the storage location URI (e.g. gs://bucket-name/prefix-path)
 	Location string `json:"location"`
 	// FolderManagement specifies how the target snapshot folders are managed.
 	// +optional

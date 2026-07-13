@@ -41,14 +41,14 @@ spec:
             description: PodMigrationSpec defines the desired config.
             properties:
               storage:
-                description: StorageSpec defines GCS storage target configuration.
+                description: StorageSpec defines the snapshot storage target configuration.
                 properties:
                   folderManagement:
                     description: FolderManagement specifies how the target snapshot
                       folders are managed.
                     type: string
                   location:
-                    description: Location is the GCS location URI (e.g. gs://bucket-name/prefix-path)
+                    description: Location is the storage location URI (e.g. gs://bucket-name/prefix-path)
                     type: string
                 required:
                 - location
