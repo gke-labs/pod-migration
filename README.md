@@ -147,7 +147,7 @@ Since the GKE native Pod Snapshot addon is disabled, you must deploy both a cont
    Apply the manifest and wait for rollout:
    ```bash
    kubectl apply -f patches/custom-agent.yaml
-   kubectl rollout status daemonset/gps-agent -n gps-system
+   kubectl rollout status daemonset/custom-pod-snapshot-agent -n default
    ```
 
 ### Step 3: Register Webhooks & Policies
