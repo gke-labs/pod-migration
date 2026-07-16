@@ -1,5 +1,6 @@
 #!/bin/bash
 # Wrapper to run all E2E validations sequentially
+set -o pipefail
 
 APPS=(redis dragonfly vault minio nginx haproxy traefik caddy python consul mysql mariadb zookeeper kafka memcached valkey etcd nats postgres node go)
 
