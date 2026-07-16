@@ -75,8 +75,6 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	h.Write([]byte(fmt.Sprintf("%s/%s", req.Namespace, req.Name)))
 	psscName := fmt.Sprintf("pssc-%s", hex.EncodeToString(h.Sum(nil))[:16])
 
-	pspName := fmt.Sprintf("psp-%s", req.Name)
-
 	// 1. Reconcile PodSnapshotStorageConfig (Cluster-scoped)
 	pssc := &unstructured.Unstructured{}
 	pssc.SetGroupVersionKind(schema.GroupVersionKind{
@@ -106,21 +104,31 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// 2. Reconcile PodSnapshotPolicy (Namespaced)
-	psp := &unstructured.Unstructured{}
-	psp.SetGroupVersionKind(schema.GroupVersionKind{
+	// 2. Reconcile PodSnapshotPolicy for onDelete (Namespaced)
+	pspOnDeleteName := fmt.Sprintf("psp-%s-on-delete", req.Name)
+	pspOnDelete := &unstructured.Unstructured{}
+	pspOnDelete.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "podsnapshot.gke.io",
 		Version: "v1",
 		Kind:    "PodSnapshotPolicy",
 	})
-	psp.SetName(pspName)
-	psp.SetNamespace(req.Namespace)
+	pspOnDelete.SetName(pspOnDeleteName)
+	pspOnDelete.SetNamespace(req.Namespace)
 
-	specPayload := map[string]interface{}{
+	specPayloadOnDelete := map[string]interface{}{
 		"storageConfigName": psscName,
 		"selector": map[string]interface{}{
-			"matchLabels": map[string]string{
-				"pod-migration.gke.io/enabled": "true",
+			"matchExpressions": []interface{}{
+				map[string]interface{}{
+					"key":      "pod-migration.gke.io/enabled",
+					"operator": "In",
+					"values":   []string{"true"},
+				},
+				map[string]interface{}{
+					"key":      "pod-migration.gke.io/trigger",
+					"operator": "NotIn",
+					"values":   []string{"manual"},
+				},
 			},
 		},
 		"triggerConfig": map[string]interface{}{
@@ -128,13 +136,53 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			"postCheckpoint": "stop",
 		},
 	}
+	pspOnDelete.Object["spec"] = specPayloadOnDelete
 
-	psp.Object["spec"] = specPayload
-
-	logger.Info("Syncing PodSnapshotPolicy", "name", pspName, "namespace", req.Namespace)
-	err = r.syncResource(ctx, psp)
+	logger.Info("Syncing PodSnapshotPolicy (onDelete)", "name", pspOnDeleteName, "namespace", req.Namespace)
+	err = r.syncResource(ctx, pspOnDelete)
 	if err != nil {
-		logger.Error(err, "Failed to sync PodSnapshotPolicy")
+		logger.Error(err, "Failed to sync PodSnapshotPolicy (onDelete)")
+		return ctrl.Result{}, err
+	}
+
+	// 3. Reconcile PodSnapshotPolicy for manual (Namespaced)
+	pspManualName := fmt.Sprintf("psp-%s-manual", req.Name)
+	pspManual := &unstructured.Unstructured{}
+	pspManual.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	pspManual.SetName(pspManualName)
+	pspManual.SetNamespace(req.Namespace)
+
+	specPayloadManual := map[string]interface{}{
+		"storageConfigName": psscName,
+		"selector": map[string]interface{}{
+			"matchExpressions": []interface{}{
+				map[string]interface{}{
+					"key":      "pod-migration.gke.io/enabled",
+					"operator": "In",
+					"values":   []string{"true"},
+				},
+				map[string]interface{}{
+					"key":      "pod-migration.gke.io/trigger",
+					"operator": "In",
+					"values":   []string{"manual"},
+				},
+			},
+		},
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+	}
+	pspManual.Object["spec"] = specPayloadManual
+
+	logger.Info("Syncing PodSnapshotPolicy (manual)", "name", pspManualName, "namespace", req.Namespace)
+	err = r.syncResource(ctx, pspManual)
+	if err != nil {
+		logger.Error(err, "Failed to sync PodSnapshotPolicy (manual)")
 		return ctrl.Result{}, err
 	}
 
