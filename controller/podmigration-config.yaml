@@ -5,4 +5,4 @@ metadata:
   namespace: default
 spec:
   storage:
-    location: gs://yaoluo-gke-dev-podsnapshots/snapshots
+    location: gs://<YOUR_BUCKET_NAME>/snapshots
