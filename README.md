@@ -55,10 +55,10 @@ gcloud container clusters create pod-migration-cluster \
 ```
 
 #### For Existing Clusters:
-If you are bringing an existing GKE Standard cluster, you can enable the Pod Snapshot addon using:
+If you are bringing an existing GKE Standard cluster that already has GKE Pod Snapshots enabled, you must disable the native addon to avoid host agent socket conflicts:
 ```bash
 gcloud container clusters update <YOUR_CLUSTER> \
-  --enable-pod-snapshots \
+  --disable-pod-snapshots \
   --zone=<YOUR_ZONE> \
   --project=<YOUR_PROJECT>
 ```
