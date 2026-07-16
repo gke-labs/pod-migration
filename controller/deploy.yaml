@@ -151,7 +151,7 @@ spec:
       serviceAccountName: pod-migration-controller
       containers:
       - name: manager
-        image: us-central1-docker.pkg.dev/yaoluo-gke-dev/pm-poc/pod-migration-controller:dev
+        image: <YOUR_CONTROLLER_IMAGE>
         imagePullPolicy: Always
         command:
         - /manager

@@ -105,17 +105,17 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - /node_token_broker_init
-        - --audience=https://container.googleapis.com/v1/projects/970732576486/locations/us-central1-a/clusters/pod-migration-cluster-yaoluo/generateClusterNodeAgentToken
-        - --token_url=https://container.googleapis.com/v1/projects/970732576486/locations/us-central1-a/clusters/pod-migration-cluster-yaoluo/generateClusterNodeAgentToken
+        - --audience=https://container.googleapis.com/v1/projects/<YOUR_PROJECT_NUMBER>/locations/<YOUR_CLUSTER_ZONE>/clusters/<YOUR_CLUSTER_NAME>/generateClusterNodeAgentToken
+        - --token_url=https://container.googleapis.com/v1/projects/<YOUR_PROJECT_NUMBER>/locations/<YOUR_CLUSTER_ZONE>/clusters/<YOUR_CLUSTER_NAME>/generateClusterNodeAgentToken
         - --token_file=/var/run/token_broker/ksa/token
         - --output_path=/var/run/token_broker/adc/google-application-credentials.json
-        - --project_id=yaoluo-gke-dev
+        - --project_id=<YOUR_PROJECT_ID>
         volumeMounts:
         - mountPath: /var/run/token_broker/adc
           name: token-broker-adc
       containers:
       - name: gps-agent
-        image: us-central1-docker.pkg.dev/yaoluo-gke-dev/pm-poc/custom-pod-snapshot-agent:dev-user-cl-v4
+        image: <YOUR_AGENT_IMAGE>
         imagePullPolicy: Always
         command: ["/bin/agent"]
         args:
@@ -140,9 +140,9 @@ spec:
               apiVersion: v1
               fieldPath: metadata.namespace
         - name: IDENTITY_PROVIDER
-          value: https://container.googleapis.com/v1/projects/yaoluo-gke-dev/locations/us-central1-a/clusters/pod-migration-cluster-yaoluo
+          value: https://container.googleapis.com/v1/projects/<YOUR_PROJECT_ID>/locations/<YOUR_CLUSTER_ZONE>/clusters/<YOUR_CLUSTER_NAME>
         - name: WORKLOAD_POOL
-          value: yaoluo-gke-dev.svc.id.goog
+          value: <YOUR_PROJECT_ID>.svc.id.goog
         - name: TOKEN_SOURCE_MODE
           value: MODE_TOKEN_BROKER_WITH_FALLBACK
         - name: GKE_NODE_SYSTEM_WORKLOAD_CREDENTIALS
@@ -210,7 +210,7 @@ spec:
           defaultMode: 420
           sources:
           - serviceAccountToken:
-              audience: https://container.googleapis.com/v1/projects/970732576486/locations/us-central1-a/clusters/pod-migration-cluster-yaoluo/generateClusterNodeAgentToken
+              audience: https://container.googleapis.com/v1/projects/<YOUR_PROJECT_NUMBER>/locations/<YOUR_CLUSTER_ZONE>/clusters/<YOUR_CLUSTER_NAME>/generateClusterNodeAgentToken
               expirationSeconds: 3600
               path: token
       - emptyDir: {}

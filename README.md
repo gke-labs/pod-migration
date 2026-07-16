@@ -102,7 +102,10 @@ You can optionally pass custom values for Project ID, Bucket Name, and Region:
 ./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]
 ```
 
-### Step 2: Deploy containerd-shim patch (Automated DaemonSet)
+### Step 2: Deploy containerd-shim patch & Custom Agent (Automated DaemonSets)
+
+Since the GKE native Pod Snapshot addon is disabled, you must deploy both a containerd-shim patch (to intercept OCI lifecycle calls) and our custom host agent (to coordinate the snapshot uploads).
+
 1. **Retrieve the precompiled binary and build the patcher image:**
    Retrieve the precompiled `containerd-shim-runsc-v1` binary (or compile it manually).
 
@@ -114,7 +117,7 @@ You can optionally pass custom values for Project ID, Bucket Name, and Region:
    >   --location=us-central1 \
    >   --description="Docker repository for Pod Migration"
    > ```
-   > The registry path format to use is: `us-central1-docker.pkg.dev/<YOUR_PROJECT>/pm-poc`. Do not use `gs://` paths here, as GCS buckets are for storage and not container registry endpoints.
+   > The registry path format to use is: `us-central1-docker.pkg.dev/<YOUR_PROJECT>/pm-poc`.
 
    Then, build the container image using the provided Dockerfile:
    ```bash
@@ -122,11 +125,29 @@ You can optionally pass custom values for Project ID, Bucket Name, and Region:
    docker push <YOUR_REGISTRY>/node-patcher:latest
    ```
 
-2. **Deploy the DaemonSet and verify rollout:**
-   Deploy the DaemonSet by replacing the `<PATCHER_IMAGE>` placeholder on the fly with your built image (e.g. `us-central1-docker.pkg.dev/my-project/my-repo/node-patcher:latest`):
+2. **Deploy the patcher DaemonSet and verify rollout:**
+   Deploy the DaemonSet by replacing the `<PATCHER_IMAGE>` placeholder on the fly:
    ```bash
-   sed 's|<PATCHER_IMAGE>|<YOUR_PATCHER_IMAGE>|' patches/node-patcher-daemonset.yaml | kubectl apply -f -
+   sed 's|<PATCHER_IMAGE>|<YOUR_REGISTRY>/node-patcher:latest|' patches/node-patcher-daemonset.yaml | kubectl apply -f -
    kubectl rollout status daemonset/node-patcher -n kube-system
+   ```
+
+3. **Deploy the Custom Host Agent:**
+   The custom agent needs to run with workload identity permissions to upload snapshots to GCS. 
+   
+   First, build and push your custom agent image to `<YOUR_REGISTRY>/custom-pod-snapshot-agent:latest`.
+   
+   Then, edit `patches/custom-agent.yaml` to replace the following placeholders with your actual cluster details:
+   *   `<YOUR_AGENT_IMAGE>`: The agent image you just pushed.
+   *   `<YOUR_PROJECT_ID>`: Your GCP Project ID.
+   *   `<YOUR_PROJECT_NUMBER>`: Your GCP Project Number.
+   *   `<YOUR_CLUSTER_ZONE>`: The zone of your GKE cluster.
+   *   `<YOUR_CLUSTER_NAME>`: The name of your GKE cluster.
+   
+   Apply the manifest and wait for rollout:
+   ```bash
+   kubectl apply -f patches/custom-agent.yaml
+   kubectl rollout status daemonset/gps-agent -n gps-system
    ```
 
 ### Step 3: Register Webhooks & Policies
@@ -137,14 +158,37 @@ kubectl apply -f patches/gke-pod-snapshot-admission-webhook.yaml
 
 ### Step 4: Deploy the Pod Migration Controller
 Deploy the Pod Migration Controller manager to handle the lifecycle and coordination of pod migrations:
-```bash
-# Apply the Custom Resource Definitions first
-kubectl apply -f controller/config/crd/bases/
 
-# Deploy the controller
-kubectl apply -f controller/deploy.yaml
-kubectl rollout status deployment/pod-migration-controller -n pod-migration-system
-```
+1. **Build and push the controller image:**
+   Build the controller image from the `controller/` directory and push it to your registry:
+   ```bash
+   docker build -t <YOUR_REGISTRY>/pod-migration-controller:latest -f controller/Dockerfile controller/
+   docker push <YOUR_REGISTRY>/pod-migration-controller:latest
+   ```
+
+2. **Configure the GCS Bucket:**
+   Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots:
+   ```yaml
+   spec:
+     storage:
+       location: gs://<YOUR_BUCKET_NAME>/snapshots
+   ```
+
+3. **Deploy the Controller:**
+   Apply the CRDs and deploy the controller by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:
+   ```bash
+   # Apply the Custom Resource Definitions first
+   kubectl apply -f controller/config/crd/bases/
+
+   # Deploy the controller deployment
+   sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
+   
+   # Apply the storage config
+   kubectl apply -f controller/podmigration-config.yaml
+   
+   # Verify deployment status
+   kubectl rollout status deployment/pod-migration-controller -n pod-migration-system
+   ```
 
 ### Patch Dependency & Upstream Progress
 > [!NOTE]
