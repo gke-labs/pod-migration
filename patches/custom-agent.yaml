@@ -163,7 +163,7 @@ spec:
         - mountPath: /var/lib/kubelet
           mountPropagation: HostToContainer
           name: kubelet-dir
-        - mountPath: /host/run
+        - mountPath: /run
           name: host-run-dir
         - mountPath: /host/var/lib/podsnapshots
           name: podsnapshot-dir
