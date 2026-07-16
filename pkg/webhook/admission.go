@@ -27,6 +27,7 @@ func (a *EvictionGuard) Handle(ctx context.Context, req admission.Request) admis
 
 	// Fetch the Pod
 	pod := &corev1.Pod{}
+	// We must query the API server for the Pod because the eviction admission request object only contains the Eviction subresource payload, which does not carry the parent Pod's labels.
 	err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Name}, pod)
 	if err != nil {
 		klog.Errorf("Failed to get pod %s/%s: %v", req.Namespace, req.Name, err)
@@ -38,32 +39,9 @@ func (a *EvictionGuard) Handle(ctx context.Context, req admission.Request) admis
 		return admission.Allowed("feature not enabled")
 	}
 
-	// Check annotations
-	if pod.Annotations["pod-migration.gke.io/snapshot-requested"] == "true" {
-		klog.Infof("Pod %s/%s snapshot requested, denying eviction to allow snapshot and stop", req.Namespace, req.Name)
-		return admission.Denied("snapshot in progress and pod will be stopped")
-	}
-
-	// Trigger snapshot by adding annotation
-	klog.Infof("Triggering snapshot for Pod %s/%s", req.Namespace, req.Name)
-
-	// We need to update the Pod. We can do it via the client.
-	// Note: We are in a VALIDATING webhook, so we cannot mutate the object in the request (which is the eviction anyway).
-	// We must update the Pod object in the API server.
-
-	podCopy := pod.DeepCopy()
-	if podCopy.Annotations == nil {
-		podCopy.Annotations = make(map[string]string)
-	}
-	podCopy.Annotations["pod-migration.gke.io/snapshot-requested"] = "true"
-
-	err = a.Client.Update(ctx, podCopy)
-	if err != nil {
-		klog.Errorf("Failed to update pod %s/%s annotations: %v", req.Namespace, req.Name, err)
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-
-	return admission.Denied("snapshot triggered, the pod will be terminated shortly")
+	// Bypass eviction webhook for all workloads under Approach 2 runtime-only interception
+	klog.Infof("Pod %s/%s has pod-migration enabled, bypassing eviction webhook for runtime onDelete interception", req.Namespace, req.Name)
+	return admission.Allowed("bypassing eviction webhook for runtime interception")
 }
 
 // InjectDecoder injects the decoder.

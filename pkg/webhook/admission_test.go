@@ -7,7 +7,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -60,8 +59,8 @@ func TestEvictionGuard(t *testing.T) {
 				},
 			},
 			subResource:     "eviction",
-			expectedDenied:  true,
-			expectedMessage: "snapshot in progress and pod will be stopped",
+			expectedAllowed: true,
+			expectedMessage: "bypassing eviction webhook for runtime interception",
 		},
 		{
 			name: "Trigger snapshot",
@@ -75,8 +74,8 @@ func TestEvictionGuard(t *testing.T) {
 				},
 			},
 			subResource:     "eviction",
-			expectedDenied:  true,
-			expectedMessage: "snapshot triggered, the pod will be terminated shortly",
+			expectedAllowed: true,
+			expectedMessage: "bypassing eviction webhook for runtime interception",
 		},
 	}
 
@@ -108,17 +107,7 @@ func TestEvictionGuard(t *testing.T) {
 				t.Errorf("Expected message %q, got %q", tt.expectedMessage, resp.Result.Message)
 			}
 
-			// Verify annotation was added in "Trigger snapshot" case
-			if tt.name == "Trigger snapshot" {
-				updatedPod := &corev1.Pod{}
-				err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: tt.pod.Namespace, Name: tt.pod.Name}, updatedPod)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if updatedPod.Annotations["pod-migration.gke.io/snapshot-requested"] != "true" {
-					t.Errorf("Expected annotation to be added")
-				}
-			}
+			// Note: Trigger snapshot annotation is not verified in Approach 2 since it does not modify the pod annotation.
 		})
 	}
 }

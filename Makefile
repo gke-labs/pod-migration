@@ -18,3 +18,11 @@ docker-build:
 .PHONY: docker-push
 docker-push:
 	docker push $(IMAGE)
+
+.PHONY: deploy
+deploy:
+	kubectl apply -f deploy/crds/
+	kubectl wait --for=condition=established --timeout=60s -f deploy/crds/
+	kubectl apply -f deploy/rbac.yaml -f deploy/service.yaml -f deploy/webhook.yaml -f deploy/cert-manager.yaml
+	sed 's|image: pod-migration:latest|image: $(IMAGE)|g' deploy/deployment.yaml | kubectl apply -f -
+
