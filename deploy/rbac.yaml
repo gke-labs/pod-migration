@@ -10,8 +10,8 @@ metadata:
   name: pod-migration-controller-role
 rules:
 - apiGroups: [""]
-  resources: ["pods", "persistentvolumeclaims"]
-  verbs: ["get", "list", "watch", "update", "patch", "delete"]
+  resources: ["pods"]
+  verbs: ["get"]
 - apiGroups: [""]
   resources: ["pods/eviction"]
   verbs: ["create"]

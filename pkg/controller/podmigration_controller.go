@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -47,7 +49,18 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Parse bucket and path from GCS URL (gs://bucket/path)
 	location := config.Spec.Storage.Location
 	if !strings.HasPrefix(location, "gs://") {
-		return ctrl.Result{}, fmt.Errorf("invalid GCS location: %s (must start with gs://)", location)
+		err := fmt.Errorf("invalid GCS location: %s (must start with gs://)", location)
+		meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "InvalidStorageLocation",
+			Message:            err.Error(),
+			ObservedGeneration: config.Generation,
+		})
+		if updateErr := r.Status().Update(ctx, config); updateErr != nil {
+			logger.Error(updateErr, "Failed to update status on invalid storage location")
+		}
+		return ctrl.Result{}, err
 	}
 	urlStr := strings.TrimPrefix(location, "gs://")
 	parts := strings.SplitN(urlStr, "/", 2)
@@ -125,14 +138,18 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// Mark status as active
-	if !config.Status.Active {
-		config.Status.Active = true
-		err = r.Status().Update(ctx, config)
-		if err != nil {
-			logger.Error(err, "Failed to update PodMigration status")
-			return ctrl.Result{}, err
-		}
+	// Set status condition to Ready
+	meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Reconciled",
+		Message:            "Storage config and policy synced successfully",
+		ObservedGeneration: config.Generation,
+	})
+	err = r.Status().Update(ctx, config)
+	if err != nil {
+		logger.Error(err, "Failed to update PodMigration status")
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil

@@ -8,9 +8,6 @@ import (
 type StorageSpec struct {
 	// Location is the storage location URI (e.g. gs://bucket-name/prefix-path)
 	Location string `json:"location"`
-	// FolderManagement specifies how the target snapshot folders are managed.
-	// +optional
-	FolderManagement string `json:"folderManagement,omitempty"`
 }
 
 // PodMigrationSpec defines the desired config.
@@ -20,8 +17,9 @@ type PodMigrationSpec struct {
 
 // PodMigrationStatus defines the observed state.
 type PodMigrationStatus struct {
-	// Active determines if GKE storage config and policy have been generated.
-	Active bool `json:"active,omitempty"`
+	// +patchMergeKey=type
+	// +patchStrategy=merge
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true

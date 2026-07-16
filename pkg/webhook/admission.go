@@ -27,6 +27,7 @@ func (a *EvictionGuard) Handle(ctx context.Context, req admission.Request) admis
 
 	// Fetch the Pod
 	pod := &corev1.Pod{}
+	// We must query the API server for the Pod because the eviction admission request object only contains the Eviction subresource payload, which does not carry the parent Pod's labels.
 	err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Name}, pod)
 	if err != nil {
 		klog.Errorf("Failed to get pod %s/%s: %v", req.Namespace, req.Name, err)
