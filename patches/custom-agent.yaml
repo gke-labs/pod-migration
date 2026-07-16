@@ -115,7 +115,7 @@ spec:
           name: token-broker-adc
       containers:
       - name: gps-agent
-        image: us-central1-docker.pkg.dev/yaoluo-gke-dev/pm-poc/custom-pod-snapshot-agent:dev-user-cl
+        image: us-central1-docker.pkg.dev/yaoluo-gke-dev/pm-poc/custom-pod-snapshot-agent:dev-user-cl-v4
         imagePullPolicy: Always
         command: ["/bin/agent"]
         args:
@@ -163,7 +163,7 @@ spec:
         - mountPath: /var/lib/kubelet
           mountPropagation: HostToContainer
           name: kubelet-dir
-        - mountPath: /run
+        - mountPath: /host/run
           name: host-run-dir
         - mountPath: /host/var/lib/podsnapshots
           name: podsnapshot-dir

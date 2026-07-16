@@ -150,7 +150,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		for _, c := range conditions {
 			cond, ok := c.(map[string]interface{})
 			if ok {
-				if (cond["type"] == "Ready" || cond["type"] == "Checkpoint") && cond["status"] == "True" {
+				if cond["type"] == "Ready" && cond["status"] == "True" {
+					isReady = true
+					break
+				}
+				if cond["type"] == "Checkpoint" && cond["status"] == "True" && cond["reason"] == "Succeeded" {
 					isReady = true
 					break
 				}

@@ -1,0 +1,7 @@
+*.log
+scratch/
+validation_logs/
+patches/containerd-shim-runsc-v1
+controller/bin/
+controller/cover.out
+patches/crd-*.yaml

@@ -30,7 +30,7 @@ kubectl delete validatingadmissionpolicybinding gke-pod-snapshot-vap-binding --i
 # Remove finalizers using JSON patch
 kubectl get podsnapshots -o json | jq -r '.items[].metadata.name' | xargs -I {} kubectl patch podsnapshot {} --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]' || true
 # Delete them
-kubectl delete podsnapshots,podsnapshotmanualtriggers --all --timeout=15s || true
+kubectl delete podsnapshots,podsnapshotmanualtriggers,podmigrationjobs.podmigration.gke.io --all --timeout=15s || true
 # Restore VAP binding
 kubectl apply -f "$CORPUS_DIR/manifests/restore-vap-binding.yaml" || true
 
@@ -38,6 +38,9 @@ case "$APP" in
   redis)
     MANIFEST="$CORPUS_DIR/manifests/pm-redis-statefulset.yaml"
     POD_NAME="pm-redis-0"
+    
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete statefulset/pm-redis service/pm-redis-service --ignore-not-found || true
     
     echo "[*] Deploying Redis StatefulSet..."
     kubectl apply -f "$MANIFEST"
@@ -626,6 +629,9 @@ case "$APP" in
     MANIFEST="$CORPUS_DIR/manifests/pm-memcached-statefulset.yaml"
     POD_NAME="pm-memcached-0"
     
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete statefulset/pm-memcached service/pm-memcached-service --ignore-not-found || true
+    
     echo "[*] Deploying Memcached StatefulSet..."
     kubectl apply -f "$MANIFEST"
     
@@ -668,6 +674,9 @@ case "$APP" in
     MANIFEST="$CORPUS_DIR/manifests/pm-valkey-statefulset.yaml"
     POD_NAME="pm-valkey-0"
     
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete statefulset/pm-valkey service/pm-valkey-service --ignore-not-found || true
+    
     echo "[*] Deploying Valkey StatefulSet..."
     kubectl apply -f "$MANIFEST"
     
@@ -705,6 +714,9 @@ case "$APP" in
   etcd)
     MANIFEST="$CORPUS_DIR/manifests/pm-etcd-statefulset.yaml"
     POD_NAME="pm-etcd-0"
+    
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete statefulset/pm-etcd service/pm-etcd-service --ignore-not-found || true
     
     echo "[*] Deploying etcd StatefulSet..."
     kubectl apply -f "$MANIFEST"
@@ -746,6 +758,9 @@ case "$APP" in
     MANIFEST="$CORPUS_DIR/manifests/pm-nats-statefulset.yaml"
     POD_NAME="pm-nats-0"
     CONFIG_JSON="$CORPUS_DIR/manifests/nats-stream-config.json"
+    
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete statefulset/pm-nats service/pm-nats-service pvc/dummy-vol-pm-nats-0 --ignore-not-found || true
     
     echo "[*] Deploying nats StatefulSet..."
     kubectl apply -f "$MANIFEST"
@@ -804,6 +819,9 @@ case "$APP" in
     MANIFEST="$CORPUS_DIR/manifests/pm-postgres-statefulset.yaml"
     POD_NAME="pm-postgres-0"
     
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete statefulset/pm-postgres service/pm-postgres-service --ignore-not-found || true
+    
     echo "[*] Deploying Postgres StatefulSet..."
     kubectl apply -f "$MANIFEST"
     
@@ -843,6 +861,9 @@ case "$APP" in
 
   node)
     MANIFEST="$CORPUS_DIR/manifests/pm-node-job.yaml"
+    
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete job/pm-node-job service/pm-node-service --ignore-not-found || true
     
     echo "[*] Deploying Node.js Job..."
     kubectl apply -f "$MANIFEST"
@@ -888,6 +909,9 @@ case "$APP" in
 
   go)
     MANIFEST="$CORPUS_DIR/manifests/pm-go-job.yaml"
+    
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete job/pm-go-job service/pm-go-service configmap/pm-go-source --ignore-not-found || true
     
     echo "[*] Deploying Go Counter Job..."
     kubectl apply -f "$MANIFEST"

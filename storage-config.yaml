@@ -1,0 +1,10 @@
+apiVersion: podsnapshot.gke.io/v1
+kind: PodSnapshotStorageConfig
+metadata:
+  name: lpm-test-storage
+spec:
+  snapshotStorageConfig:
+    gcs:
+      bucket: yaoluo-gke-dev-podsnapshots
+      path: snapshots
+      tokenSource: podKSA

@@ -16,10 +16,7 @@ spec:
         live-migration.gke.io/enabled: "true"
         pod-migration.gke.io/enabled: "true"
         pod-migration.gke.io/trigger: "manual"
-      annotations:
-        dev.gvisor.flag.strace: "true"
-        dev.gvisor.flag.debug-log: "/tmp/sandbox-%ID%/"
-        dev.gvisor.flag.debug: "true"
+
     spec:
       serviceAccountName: pm-test-ksa
       runtimeClassName: gvisor
