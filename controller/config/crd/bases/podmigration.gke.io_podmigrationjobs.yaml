@@ -4,21 +4,25 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: podmigrations.podmigration.gke.io
+  name: podmigrationjobs.podmigration.gke.io
 spec:
   group: podmigration.gke.io
   names:
-    kind: PodMigration
-    listKind: PodMigrationList
-    plural: podmigrations
-    singular: podmigration
+    kind: PodMigrationJob
+    listKind: PodMigrationJobList
+    plural: podmigrationjobs
+    singular: podmigrationjob
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: PodMigration is the Schema for the podmigrations configuration
-          API.
+        description: PodMigrationJob tracks the execution of a single Pod Migration
+          event.
         properties:
           apiVersion:
             description: |-
@@ -38,22 +42,23 @@ spec:
           metadata:
             type: object
           spec:
-            description: PodMigrationSpec defines the desired config.
+            description: PodMigrationJobSpec defines the execution targets.
             properties:
-              storage:
-                description: StorageSpec defines the snapshot storage target configuration.
+              podRef:
+                description: PodRef references the pod to migrate.
                 properties:
-                  location:
-                    description: Location is the storage location URI (e.g. gs://bucket-name/prefix-path)
+                  name:
+                    description: |-
+                      Name of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
                     type: string
-                required:
-                - location
                 type: object
+                x-kubernetes-map-type: atomic
             required:
-            - storage
+            - podRef
             type: object
           status:
-            description: PodMigrationStatus defines the observed state.
+            description: PodMigrationJobStatus defines the observed state.
             properties:
               conditions:
                 items:
@@ -111,6 +116,19 @@ spec:
                   - type
                   type: object
                 type: array
+              phase:
+                description: PodMigrationJobPhase defines the current state in the
+                  lifecycle.
+                type: string
+              pvsToDetach:
+                description: PVsToDetach lists the Persistent Volume names we are
+                  waiting to detach.
+                items:
+                  type: string
+                type: array
+              snapshotRef:
+                description: SnapshotRef references GKE's native PodSnapshot name.
+                type: string
             type: object
         type: object
     served: true
