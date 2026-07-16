@@ -94,9 +94,9 @@ func (r *DeferredEvictionReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 		err = r.Client.SubResource("eviction").Create(ctx, targetPod, eviction)
 		if err != nil {
-			klog.Infof("Eviction request for target pod %s/%s returned: %v", targetPod.Namespace, targetPod.Name, err)
+			klog.Errorf("Eviction request for target pod %s/%s failed: %v", targetPod.Namespace, targetPod.Name, err)
 		} else {
-			klog.Warningf("Target pod %s/%s was evicted successfully (unexpectedly not stopped by webhook)", targetPod.Namespace, targetPod.Name)
+			klog.Infof("Target pod %s/%s eviction initiated successfully", targetPod.Namespace, targetPod.Name)
 		}
 
 		// 2. Add label to the deferred pod so we don't try to evict in subsequent loops
@@ -124,11 +124,11 @@ func (r *DeferredEvictionReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	err = r.Client.SubResource("eviction").Create(ctx, pod, eviction)
 	if err != nil {
-		klog.Infof("Eviction request for pod %s returned expected error (stopped by webhook): %v", pod.Name, err)
-		return ctrl.Result{}, nil
+		klog.Errorf("Eviction request for deferred pod %s failed: %v", pod.Name, err)
+		return ctrl.Result{}, err
 	}
 
-	klog.Warningf("Pod %s was evicted successfully (unexpectedly not stopped by webhook)", pod.Name)
+	klog.Infof("Deferred pod %s eviction initiated successfully", pod.Name)
 	return ctrl.Result{}, nil
 }
 
