@@ -10,7 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	lpmv1alpha1 "k8s.io/gke-autoscaling/pod-migration/api/v1alpha1"
+	pmv1alpha1 "k8s.io/gke-autoscaling/pod-migration/api/v1alpha1"
 	"k8s.io/gke-autoscaling/pod-migration/pkg/controller"
 	"k8s.io/gke-autoscaling/pod-migration/pkg/webhook"
 )
@@ -29,7 +29,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	utilruntime.Must(lpmv1alpha1.AddToScheme(mgr.GetScheme()))
+	utilruntime.Must(pmv1alpha1.AddToScheme(mgr.GetScheme()))
 
 	// Setup webhooks
 	decoder := admission.NewDecoder(mgr.GetScheme())

@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	lpmv1alpha1 "k8s.io/gke-autoscaling/pod-migration/api/v1alpha1"
+	pmv1alpha1 "k8s.io/gke-autoscaling/pod-migration/api/v1alpha1"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -36,7 +36,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	logger := log.FromContext(ctx)
 
 	// Fetch PodMigration config
-	config := &lpmv1alpha1.PodMigration{}
+	config := &pmv1alpha1.PodMigration{}
 	err := r.Get(ctx, req.NamespacedName, config)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -173,6 +173,6 @@ func (r *PodMigrationReconciler) syncResource(ctx context.Context, obj *unstruct
 // SetupWithManager sets up the controller with the Manager.
 func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&lpmv1alpha1.PodMigration{}).
+		For(&pmv1alpha1.PodMigration{}).
 		Complete(r)
 }
