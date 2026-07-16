@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-postgres
+  namespace: default
+spec:
+  serviceName: pm-postgres-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-postgres
+  template:
+    metadata:
+      labels:
+        app: pm-postgres
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: POSTGRES_HOST_AUTH_METHOD, value: "trust" }
+            - { name: POSTGRES_PASSWORD, value: "pw" }
+            - { name: PGDATA, value: "/var/lib/postgresql/pgdata" }
+          ports: [{ containerPort: 5432 }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 5432 }
+            periodSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-postgres-service
+  namespace: default
+spec:
+  selector:
+    app: pm-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

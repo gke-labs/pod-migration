@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-traefik
+  namespace: default
+spec:
+  serviceName: pm-traefik-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-traefik
+  template:
+    metadata:
+      labels:
+        app: pm-traefik
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: traefik
+          image: traefik:v3.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--api.insecure=true"
+            - "--entrypoints.traefik.address=:8080"
+            - "--ping=true"
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-traefik-service
+  namespace: default
+spec:
+  selector:
+    app: pm-traefik
+  ports:
+    - port: 8080
+      targetPort: 8080

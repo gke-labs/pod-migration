@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-patcher
+  namespace: kube-system
+  labels:
+    k8s-app: node-patcher
+spec:
+  selector:
+    matchLabels:
+      name: node-patcher
+  template:
+    metadata:
+      labels:
+        name: node-patcher
+    spec:
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      initContainers:
+        - name: patch-shim
+          image: us-central1-docker.pkg.dev/yaoluo-gke-dev/pm-poc/node-patcher:dev
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              set -ex
+              HOST_BIN="/host/bin"
+              SHIM_NAME="containerd-shim-runsc-v1"
+              
+              if [ ! -f "${HOST_BIN}/${SHIM_NAME}" ]; then
+                echo "Error: ${SHIM_NAME} not found on host at /home/containerd/opt/containerd/bin/"
+                exit 1
+              fi
+              
+              if [ ! -f "${HOST_BIN}/${SHIM_NAME}.bak" ]; then
+                echo "Backing up original ${SHIM_NAME} to ${SHIM_NAME}.bak..."
+                cp "${HOST_BIN}/${SHIM_NAME}" "${HOST_BIN}/${SHIM_NAME}.bak"
+              else
+                echo "Backup already exists."
+              fi
+              
+              echo "Copying patched binary to host..."
+              cp "/usr/local/bin/${SHIM_NAME}" "${HOST_BIN}/${SHIM_NAME}"
+              
+              RUNSC_CONF="/host/run/runsc/config.toml"
+              if [ -f "$RUNSC_CONF" ]; then
+                if ! grep -q "allow-flag-override" "$RUNSC_CONF"; then
+                  echo "Enabling allow-flag-override in runsc config..."
+                  sed -i '/\[runsc_config\]/a \  allow-flag-override = "true"' "$RUNSC_CONF"
+                fi
+              else
+                echo "Warning: runsc config not found at $RUNSC_CONF"
+              fi
+              
+              echo "Restarting containerd on the host..."
+              nsenter -t 1 -m -u -n -i systemctl restart containerd
+              
+              echo "Patching complete."
+          volumeMounts:
+            - name: host-bin
+              mountPath: /host/bin
+            - name: host-run
+              mountPath: /host/run
+      containers:
+        - name: diagnostician
+          image: alpine:3.18
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - "apk add --no-cache util-linux && sleep infinity"
+      volumes:
+        - name: host-bin
+          hostPath:
+            path: /home/containerd/opt/containerd/bin
+        - name: host-run
+          hostPath:
+            path: /run/containerd

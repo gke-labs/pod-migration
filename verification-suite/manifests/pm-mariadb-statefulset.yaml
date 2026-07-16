@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-mariadb
+  namespace: default
+spec:
+  serviceName: pm-mariadb-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-mariadb
+  template:
+    metadata:
+      labels:
+        app: pm-mariadb
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: mariadb
+          image: mariadb:11
+          imagePullPolicy: IfNotPresent
+          command:
+            - "sh"
+            - "-c"
+            - "mkdir -p /tmp/mariadb && mariadb-install-db --datadir=/tmp/mariadb --auth-root-authentication-method=normal --skip-test-db && exec mariadbd --datadir=/tmp/mariadb --bind-address=0.0.0.0 --port=3306 --innodb-use-native-aio=OFF"
+          env:
+            - { name: GODEBUG, value: multipathtcp=0 }
+            - { name: MARIADB_ALLOW_EMPTY_ROOT_PASSWORD, value: "1" }
+          ports: [{ containerPort: 3306 }]
+          resources:
+            requests: { cpu: 50m, memory: 512Mi }
+            limits: { memory: 1024Mi }
+          readinessProbe:
+            tcpSocket: { port: 3306 }
+            periodSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-mariadb-service
+  namespace: default
+spec:
+  selector:
+    app: pm-mariadb
+  ports:
+    - port: 3306
+      targetPort: 3306

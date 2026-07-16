@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-nginx
+  namespace: default
+spec:
+  serviceName: pm-nginx-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-nginx
+  template:
+    metadata:
+      labels:
+        app: pm-nginx
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/trigger: "manual"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 80 }]
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 80 }
+            periodSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: dummy-vol
+              mountPath: /usr/share/nginx/html
+  volumeClaimTemplates:
+    - metadata:
+        name: dummy-vol
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-nginx-service
+  namespace: default
+spec:
+  selector:
+    app: pm-nginx
+  ports:
+    - port: 80
+      targetPort: 80

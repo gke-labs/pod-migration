@@ -1,0 +1,11 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  annotations:
+    components.gke.io/layer: addon
+  labels:
+    addonmanager.kubernetes.io/mode: Reconcile
+  name: gke-pod-snapshot-vap-binding
+spec:
+  policyName: gke-pod-snapshot-validating-admission-policy
+  validationActions: [Audit]

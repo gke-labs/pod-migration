@@ -1,0 +1,151 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pm-go-source
+  namespace: default
+data:
+  main.go: |
+    package main
+
+    import (
+    	"crypto/rand"
+    	"encoding/hex"
+    	"encoding/json"
+    	"fmt"
+    	"log"
+    	"net/http"
+    	"os"
+    	"sync/atomic"
+    	"time"
+    )
+
+    var (
+    	counter    atomic.Int64
+    	instanceID string
+    	startTime  time.Time
+    )
+
+    type state struct {
+    	Counter    int64  `json:"counter"`
+    	InstanceID string `json:"instanceID"`
+    	StartEpoch int64  `json:"startEpoch"`
+    	UptimeSec  int64  `json:"uptimeSec"`
+    	Hostname   string `json:"hostname"`
+    }
+
+    func snapshot() state {
+    	host, _ := os.Hostname()
+    	return state{
+    		Counter:    counter.Load(),
+    		InstanceID: instanceID,
+    		StartEpoch: startTime.Unix(),
+    		UptimeSec:  int64(time.Since(startTime).Seconds()),
+    		Hostname:   host,
+    	}
+    }
+
+    func main() {
+    	instanceID = mintID()
+    	startTime = time.Now()
+
+    	mux := http.NewServeMux()
+    	mux.HandleFunc("/incr", func(w http.ResponseWriter, r *http.Request) {
+    		writeJSON(w, map[string]int64{"counter": counter.Add(1)})
+    	})
+    	mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
+    		writeJSON(w, snapshot())
+    	})
+    	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+    		s := snapshot()
+    		if s.InstanceID == "" || s.StartEpoch == 0 {
+    			http.Error(w, "state not initialized", http.StatusServiceUnavailable)
+    			return
+    		}
+    		fmt.Fprintf(w, "ok counter=%d instance=%s\n", s.Counter, s.InstanceID)
+    	})
+
+    	addr := ":" + envOr("PORT", "8080")
+    	log.Printf("counter app up on %s instance=%s", addr, instanceID)
+    	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+    	log.Fatal(srv.ListenAndServe())
+    }
+
+    func mintID() string {
+    	b := make([]byte, 6)
+    	if _, err := rand.Read(b); err != nil {
+    		return fmt.Sprintf("id-%d", time.Now().UnixNano())
+    	}
+    	return hex.EncodeToString(b)
+    }
+
+    func writeJSON(w http.ResponseWriter, v any) {
+    	w.Header().Set("Content-Type", "application/json")
+    	_ = json.NewEncoder(w).Encode(v)
+    }
+
+    func envOr(k, def string) string {
+    	if v := os.Getenv(k); v != "" {
+    		return v
+    	}
+    	return def
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pm-go-job
+  namespace: default
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        app: pm-go-job
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      restartPolicy: Never
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: go-counter
+          image: golang:1.22-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - "-c"
+            - "mkdir -p /src && cp /config/main.go /src/main.go && cd /src && go mod init counter && go run main.go"
+          volumeMounts:
+            - name: config-vol
+              mountPath: /config
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 3
+      volumes:
+        - name: config-vol
+          configMap:
+            name: pm-go-source
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-go-service
+  namespace: default
+spec:
+  selector:
+    app: pm-go-job
+  ports:
+    - port: 8080
+      targetPort: 8080

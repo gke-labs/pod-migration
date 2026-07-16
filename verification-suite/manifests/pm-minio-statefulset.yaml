@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-minio
+  namespace: default
+spec:
+  serviceName: pm-minio-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-minio
+  template:
+    metadata:
+      labels:
+        app: pm-minio
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/trigger: "manual"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: minio
+          image: minio/minio
+          imagePullPolicy: IfNotPresent
+          args:
+            - "server"
+            - "/var/minio/pgdata"
+            - "--address"
+            - ":9000"
+          env:
+            - { name: MINIO_ROOT_USER, value: "minioadmin" }
+            - { name: MINIO_ROOT_PASSWORD, value: "minioadmin" }
+          ports: [{ containerPort: 9000 }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          readinessProbe:
+            tcpSocket: { port: 9000 }
+            periodSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: dummy-vol
+              mountPath: /var/minio/pgdata
+  volumeClaimTemplates:
+    - metadata:
+        name: dummy-vol
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-minio-service
+  namespace: default
+spec:
+  selector:
+    app: pm-minio
+  ports:
+    - port: 9000
+      targetPort: 9000
