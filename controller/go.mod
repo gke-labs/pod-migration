@@ -1,4 +1,4 @@
-module k8s.io/gke-autoscaling/pod-migration
+module github.com/ahahadelyaly/gke-pod-migration/controller
 
 go 1.25.0
 

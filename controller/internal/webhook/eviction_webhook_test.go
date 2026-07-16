@@ -11,7 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-func TestEvictionGuard(t *testing.T) {
+func TestEvictionGate(t *testing.T) {
 	tests := []struct {
 		name            string
 		pod             *corev1.Pod
@@ -60,7 +60,7 @@ func TestEvictionGuard(t *testing.T) {
 			},
 			subResource:     "eviction",
 			expectedAllowed: true,
-			expectedMessage: "bypassing eviction webhook for runtime interception",
+			expectedMessage: "bypassing eviction webhook for RWX/diskless workload",
 		},
 		{
 			name: "Trigger snapshot",
@@ -75,7 +75,7 @@ func TestEvictionGuard(t *testing.T) {
 			},
 			subResource:     "eviction",
 			expectedAllowed: true,
-			expectedMessage: "bypassing eviction webhook for runtime interception",
+			expectedMessage: "bypassing eviction webhook for RWX/diskless workload",
 		},
 	}
 
@@ -86,7 +86,7 @@ func TestEvictionGuard(t *testing.T) {
 
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.pod).Build()
 
-			handler := &EvictionGuard{Client: fakeClient}
+			handler := &EvictionGate{Client: fakeClient}
 
 			req := admission.Request{}
 			req.Namespace = tt.pod.Namespace
