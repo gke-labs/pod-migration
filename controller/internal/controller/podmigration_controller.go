@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -29,6 +30,7 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile coordinates the PSSC and PSP translation.
@@ -104,6 +106,29 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	newCondition := map[string]interface{}{
+		"type":               "Ready",
+		"status":             "True",
+		"reason":             "PSSCReady",
+		"message":            "PodSnapshotStorageConfig is ready",
+		"lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
+	}
+
+	changed, err := setUnstructuredCondition(pssc, newCondition)
+	if err != nil {
+		logger.Error(err, "Failed to set PSSC status condition")
+		return ctrl.Result{}, err
+	}
+
+	if changed {
+		logger.Info("Updating PodSnapshotStorageConfig status", "name", psscName)
+		err = r.Status().Update(ctx, pssc)
+		if err != nil {
+			logger.Error(err, "Failed to update PodSnapshotStorageConfig status")
+			return ctrl.Result{}, err
+		}
+	}
+
 	// 2. Reconcile PodSnapshotPolicy for onDelete (Namespaced)
 	pspOnDeleteName := fmt.Sprintf("psp-%s-on-delete", req.Name)
 	pspOnDelete := &unstructured.Unstructured{}
@@ -122,12 +147,12 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				map[string]interface{}{
 					"key":      "pod-migration.gke.io/enabled",
 					"operator": "In",
-					"values":   []string{"true"},
+					"values":   []interface{}{"true"},
 				},
 				map[string]interface{}{
 					"key":      "pod-migration.gke.io/trigger",
 					"operator": "NotIn",
-					"values":   []string{"manual"},
+					"values":   []interface{}{"manual"},
 				},
 			},
 		},
@@ -163,12 +188,12 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				map[string]interface{}{
 					"key":      "pod-migration.gke.io/enabled",
 					"operator": "In",
-					"values":   []string{"true"},
+					"values":   []interface{}{"true"},
 				},
 				map[string]interface{}{
 					"key":      "pod-migration.gke.io/trigger",
 					"operator": "In",
-					"values":   []string{"manual"},
+					"values":   []interface{}{"manual"},
 				},
 			},
 		},
@@ -223,4 +248,47 @@ func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigration{}).
 		Complete(r)
+}
+
+func setUnstructuredCondition(u *unstructured.Unstructured, newCond map[string]interface{}) (bool, error) {
+	conditions, found, err := unstructured.NestedSlice(u.Object, "status", "conditions")
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		conditions = []interface{}{}
+	}
+
+	condType, _ := newCond["type"].(string)
+	foundIndex := -1
+	for i, cond := range conditions {
+		c, ok := cond.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		t, ok := c["type"].(string)
+		if ok && t == condType {
+			foundIndex = i
+			break
+		}
+	}
+
+	changed := false
+	if foundIndex != -1 {
+		existingCond := conditions[foundIndex].(map[string]interface{})
+		if existingCond["status"] != newCond["status"] || existingCond["reason"] != newCond["reason"] || existingCond["message"] != newCond["message"] {
+			conditions[foundIndex] = newCond
+			changed = true
+		}
+	} else {
+		conditions = append(conditions, newCond)
+		changed = true
+	}
+
+	if !changed {
+		return false, nil
+	}
+
+	err = unstructured.SetNestedSlice(u.Object, conditions, "status", "conditions")
+	return true, err
 }

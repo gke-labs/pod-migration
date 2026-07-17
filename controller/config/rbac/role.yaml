@@ -24,12 +24,6 @@ rules:
   - update
   - watch
 - apiGroups:
-  - ""
-  resources:
-  - pods/eviction
-  verbs:
-  - create
-- apiGroups:
   - apps
   resources:
   - replicasets
@@ -87,6 +81,7 @@ rules:
   - podsnapshot.gke.io
   resources:
   - podsnapshots/status
+  - podsnapshotstorageconfigs/status
   verbs:
   - get
   - patch

@@ -68,6 +68,7 @@ rules:
   - podsnapshotmanualtriggers
   - podsnapshotpolicies
   - podsnapshotstorageconfigs
+  - podsnapshotstorageconfigs/status
   verbs:
   - create
   - delete
