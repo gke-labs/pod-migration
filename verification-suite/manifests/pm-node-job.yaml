@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pm-node-job
+  namespace: default
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        app: pm-node-job
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/trigger: "manual"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      restartPolicy: Never
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: node
+          image: node:20-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - "-e"
+            - "const http=require('http');const id=require('crypto').randomBytes(6).toString('hex');http.createServer((q,s)=>{s.writeHead(200);s.end(id)}).listen(8080);console.log('up '+id)"
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-node-service
+  namespace: default
+spec:
+  selector:
+    app: pm-node-job
+  ports:
+    - port: 8080
+      targetPort: 8080

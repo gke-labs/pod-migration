@@ -1,0 +1,59 @@
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: Sandbox
+metadata:
+  name: sandbox-python-example
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        sandbox: my-python-sandbox
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+      annotations:
+        test: "yes"
+    spec:
+      runtimeClassName: gvisor
+      automountServiceAccountToken: false
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+        runAsNonRoot: true
+      containers:
+        - name: python-sandbox
+          image: us-docker.pkg.dev/yaoluo-gke-dev/analytics/analytics-tool:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8888
+          resources:
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: my-pvc
+              mountPath: /my-data
+          env:
+            - name: MPLCONFIGDIR
+              value: /app/configs
+  volumeClaimTemplates:
+    - metadata:
+        name: my-pvc
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

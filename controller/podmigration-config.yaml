@@ -1,0 +1,8 @@
+apiVersion: podmigration.gke.io/v1alpha1
+kind: PodMigration
+metadata:
+  name: diskless-migration
+  namespace: default
+spec:
+  storage:
+    location: gs://yaoluo-gke-dev-podsnapshots/snapshots

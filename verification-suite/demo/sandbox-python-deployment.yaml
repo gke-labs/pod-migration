@@ -1,0 +1,64 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sandbox-python-workspace-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-python-fancy-deployment
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      sandbox: my-python-sandbox
+  template:
+    metadata:
+      labels:
+        sandbox: my-python-sandbox
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      runtimeClassName: gvisor
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+      containers:
+        - name: python-sandbox
+          image: us-central1-docker.pkg.dev/yaoluo-gke-dev/pm-poc/analytics-tool:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8888
+          volumeMounts:
+            - name: my-pvc
+              mountPath: /my-data
+          env:
+            - name: MPLCONFIGDIR
+              value: /app/configs
+      volumes:
+        - name: my-pvc
+          persistentVolumeClaim:
+            claimName: sandbox-python-workspace-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: python-sandbox-service
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    sandbox: my-python-sandbox
+  ports:
+    - protocol: TCP
+      port: 8888
+      targetPort: 8888

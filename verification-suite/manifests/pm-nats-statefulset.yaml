@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-nats
+  namespace: default
+spec:
+  serviceName: pm-nats-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-nats
+  template:
+    metadata:
+      labels:
+        app: pm-nats
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/trigger: "manual"
+
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-js"
+          ports: [{ containerPort: 4222 }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          readinessProbe:
+            tcpSocket: { port: 4222 }
+            periodSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: dummy-vol
+              mountPath: /dummy
+  volumeClaimTemplates:
+    - metadata:
+        name: dummy-vol
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-nats-service
+  namespace: default
+spec:
+  selector:
+    app: pm-nats
+  ports:
+    - port: 4222
+      targetPort: 4222

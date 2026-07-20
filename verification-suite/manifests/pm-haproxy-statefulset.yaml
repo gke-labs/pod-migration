@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pm-haproxy-cfg
+  namespace: default
+data:
+  "haproxy.cfg": |
+    global
+      log stdout local0
+    defaults
+      mode http
+      timeout connect 5s
+      timeout client 5s
+      timeout server 5s
+    frontend f
+      bind :8080
+      http-request return status 200 content-type text/plain string "ok"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-haproxy
+  namespace: default
+spec:
+  serviceName: pm-haproxy-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-haproxy
+  template:
+    metadata:
+      labels:
+        app: pm-haproxy
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: haproxy
+          image: haproxy:2.9-alpine
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - { name: cfg, mountPath: "/usr/local/etc/haproxy/haproxy.cfg", subPath: "haproxy.cfg" }
+      volumes:
+        - name: cfg
+          configMap: { name: pm-haproxy-cfg }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-haproxy-service
+  namespace: default
+spec:
+  selector:
+    app: pm-haproxy
+  ports:
+    - port: 8080
+      targetPort: 8080

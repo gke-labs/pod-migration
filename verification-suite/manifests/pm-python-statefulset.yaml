@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-python
+  namespace: default
+spec:
+  serviceName: pm-python-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-python
+  template:
+    metadata:
+      labels:
+        app: pm-python
+        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      containers:
+        - name: python
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - "python3"
+          args:
+            - "-m"
+            - "http.server"
+            - "8080"
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-python-service
+  namespace: default
+spec:
+  selector:
+    app: pm-python
+  ports:
+    - port: 8080
+      targetPort: 8080

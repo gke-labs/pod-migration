@@ -1,0 +1,217 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: custom-pod-snapshot-agent-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: custom-pod-snapshot-agent-cluster-role
+rules:
+- apiGroups: [""]
+  resources: ["events", "pods", "pods/status"]
+  verbs: ["create", "get", "list", "watch"]
+- apiGroups: ["podsnapshot.gke.io"]
+  resources: ["podsnapshotmanualtriggers"]
+  verbs: ["get", "list", "update", "watch"]
+- apiGroups: ["podsnapshot.gke.io"]
+  resources:
+  - podsnapshotmanualtriggers/status
+  - podsnapshots/status
+  - podsnapshotstorageconfigs/status
+  verbs: ["get", "patch", "update"]
+- apiGroups: ["podsnapshot.gke.io"]
+  resources: ["podsnapshotpolicies"]
+  verbs: ["get", "list"]
+- apiGroups: ["podsnapshot.gke.io"]
+  resources: ["podsnapshots"]
+  verbs: ["create", "get", "list"]
+- apiGroups: ["podsnapshot.gke.io"]
+  resources: ["podsnapshotstorageconfigs"]
+  verbs: ["get"]
+- apiGroups: ["podsnapshot.gke.io"]
+  resources: ["podsnapshottokenrequests"]
+  verbs: ["create", "delete", "get", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: custom-pod-snapshot-agent-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: custom-pod-snapshot-agent-cluster-role
+subjects:
+- kind: ServiceAccount
+  name: custom-pod-snapshot-agent-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: custom-pod-snapshot-agent-role
+  namespace: default
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: custom-pod-snapshot-agent-lease-binding
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: custom-pod-snapshot-agent-role
+subjects:
+- kind: ServiceAccount
+  name: custom-pod-snapshot-agent-sa
+  namespace: default
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: custom-pod-snapshot-agent
+  namespace: default
+  labels:
+    app: custom-pod-snapshot-agent
+spec:
+  selector:
+    matchLabels:
+      app: custom-pod-snapshot-agent
+  template:
+    metadata:
+      labels:
+        app: custom-pod-snapshot-agent
+    spec:
+      serviceAccountName: custom-pod-snapshot-agent-sa
+      hostNetwork: true
+      hostPID: true
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+      - key: sandbox.gke.io/runtime
+        operator: Equal
+        value: gvisor
+        effect: NoSchedule
+      - effect: NoSchedule
+        operator: Exists
+      initContainers:
+      - name: token-broker-adc-init
+        image: us-central1-artifactregistry.gcr.io/gke-release/gke-release/node_token_broker/init:gke_node_token_broker_init_20260312.00_p0@sha256:d31f982e00598633fd2e94787f76894e29e80a3d87f5e15eacfc42b40e866de8
+        imagePullPolicy: IfNotPresent
+        command:
+        - /node_token_broker_init
+        - --audience=https://container.googleapis.com/v1/projects/<YOUR_PROJECT_NUMBER>/locations/<YOUR_CLUSTER_ZONE>/clusters/<YOUR_CLUSTER_NAME>/generateClusterNodeAgentToken
+        - --token_url=https://container.googleapis.com/v1/projects/<YOUR_PROJECT_NUMBER>/locations/<YOUR_CLUSTER_ZONE>/clusters/<YOUR_CLUSTER_NAME>/generateClusterNodeAgentToken
+        - --token_file=/var/run/token_broker/ksa/token
+        - --output_path=/var/run/token_broker/adc/google-application-credentials.json
+        - --project_id=<YOUR_PROJECT_ID>
+        volumeMounts:
+        - mountPath: /var/run/token_broker/adc
+          name: token-broker-adc
+      containers:
+      - name: gps-agent
+        image: <YOUR_AGENT_IMAGE>
+        imagePullPolicy: Always
+        command: ["/bin/agent"]
+        args:
+        - --log-level=info
+        - --support-psmt=true
+        env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: IDENTITY_PROVIDER
+          value: https://container.googleapis.com/v1/projects/<YOUR_PROJECT_ID>/locations/<YOUR_CLUSTER_ZONE>/clusters/<YOUR_CLUSTER_NAME>
+        - name: WORKLOAD_POOL
+          value: <YOUR_PROJECT_ID>.svc.id.goog
+        - name: TOKEN_SOURCE_MODE
+          value: MODE_TOKEN_BROKER_WITH_FALLBACK
+        - name: GKE_NODE_SYSTEM_WORKLOAD_CREDENTIALS
+          value: /var/run/token_broker/adc/google-application-credentials.json
+        - name: GKE_HOSTNAME
+          value: container.googleapis.com
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /dev
+          name: dev
+        - mountPath: /etc/srv/kubernetes/pki
+          name: srv
+        - mountPath: /home/kubernetes/bin
+          name: kubernetes-bin
+          readOnly: true
+        - mountPath: /var/lib/kubelet
+          mountPropagation: HostToContainer
+          name: kubelet-dir
+        - mountPath: /host/run
+          name: host-run-dir
+        - mountPath: /host/var/lib/podsnapshots
+          name: podsnapshot-dir
+        - mountPath: /host/home/containerd/usr/local/sbin/runsc
+          name: runsc-bin
+          readOnly: true
+        - mountPath: /var/run/token_broker/ksa
+          name: token-broker-ksa
+          readOnly: true
+        - mountPath: /var/run/token_broker/adc
+          name: token-broker-adc
+          readOnly: true
+      volumes:
+      - hostPath:
+          path: /etc/srv/kubernetes/pki
+          type: Directory
+        name: srv
+      - hostPath:
+          path: /dev
+          type: Directory
+        name: dev
+      - hostPath:
+          path: /home/kubernetes/bin
+          type: Directory
+        name: kubernetes-bin
+      - hostPath:
+          path: /var/lib/kubelet
+          type: Directory
+        name: kubelet-dir
+      - hostPath:
+          path: /run
+          type: Directory
+        name: host-run-dir
+      - hostPath:
+          path: /var/lib/podsnapshots
+          type: DirectoryOrCreate
+        name: podsnapshot-dir
+      - hostPath:
+          path: /home/containerd/usr/local/sbin/runsc
+          type: File
+        name: runsc-bin
+      - name: token-broker-ksa
+        projected:
+          defaultMode: 420
+          sources:
+          - serviceAccountToken:
+              audience: https://container.googleapis.com/v1/projects/<YOUR_PROJECT_NUMBER>/locations/<YOUR_CLUSTER_ZONE>/clusters/<YOUR_CLUSTER_NAME>/generateClusterNodeAgentToken
+              expirationSeconds: 3600
+              path: token
+      - emptyDir: {}
+        name: token-broker-adc

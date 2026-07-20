@@ -1,0 +1,96 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - podmigration.gke.io
+  resources:
+  - podmigrationjobs
+  - podmigrations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - podmigration.gke.io
+  resources:
+  - podmigrationjobs/status
+  - podmigrations/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshotmanualtriggers
+  - podsnapshotpolicies
+  - podsnapshotstorageconfigs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshots
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshots/status
+  - podsnapshotstorageconfigs/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - volumeattachments
+  verbs:
+  - get
+  - list
+  - watch

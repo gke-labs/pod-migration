@@ -1,0 +1,30 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: gke-pod-migration-validator
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: disallowedImages
+      expression: "['rabbitmq', 'couchdb', 'prometheus', 'elasticsearch']"
+  validations:
+    - expression: "!object.spec.containers.exists(c, variables.disallowedImages.exists(img, c.image.contains(img)))"
+      message: "Workload runtime uses incompatible images (Erlang BEAM / fsnotify) that do not support live-migration."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: gke-pod-migration-validator-binding
+spec:
+  policyName: gke-pod-migration-validator
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        live-migration.gke.io/enabled: "true"

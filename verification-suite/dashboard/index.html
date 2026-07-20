@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GKE gVisor Pod Migration Dashboard</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f4f6f8;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }
+        header {
+            background-color: #1a73e8;
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 { margin: 0 0 10px 0; font-size: 24px; }
+        .summary { display: flex; gap: 20px; margin-top: 15px; }
+        .stat-card {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 10px 15px;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .stat-card span { font-weight: bold; font-size: 18px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background-color: #f8f9fa; font-weight: 600; color: #5f6368; }
+        tr:hover { background-color: #f8f9fa; }
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .badge-survived { background-color: #e6f4ea; color: #137333; }
+        .badge-served { background-color: #e8f0fe; color: #1a73e8; }
+        .badge-refused { background-color: #fef7e0; color: #b06000; }
+        .badge-failed { background-color: #fce8e6; color: #c5221f; }
+        .badge-limited { background-color: #f1f3f4; color: #5f6368; }
+        .details-btn {
+            background: none;
+            border: 1px solid #1a73e8;
+            color: #1a73e8;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .details-btn:hover { background-color: #e8f0fe; }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>GKE gVisor Pod Migration E2E Verification Dashboard</h1>
+    <p>E2E Evaluation Results for 30 Test Cases under gVisor onDelete Runtime Eviction (Approach 2)</p>
+    <div class="summary">
+        <div class="stat-card">Compatible / Tested: <span>19 / 30</span></div>
+        <div class="stat-card">Verdict SURVIVED: <span>15</span></div>
+        <div class="stat-card">Verdict SERVED: <span>4</span></div>
+        <div class="stat-card">Incompatible (FAILED/REFUSED): <span>11</span></div>
+    </div>
+</header>
+
+<table>
+    <thead>
+        <tr>
+            <th>Case ID</th>
+            <th>Application</th>
+            <th>Category</th>
+            <th>E2E Verdict</th>
+            <th>Key Gaps & Workarounds</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>Case 1</td>
+            <td>PostgreSQL</td>
+            <td>Datastores</td>
+            <td><span class="badge badge-survived">SURVIVED</span></td>
+            <td>Requires PGDATA storage redirection to non-volume paths. Local write durability gap if container restarts.</td>
+        </tr>
+        <tr>
+            <td>Case 2</td>
+            <td>MySQL</td>
+            <td>Datastores</td>
+            <td><span class="badge badge-survived">SURVIVED</span></td>
+            <td>Requires InnoDB native AIO disabled (`--innodb_use_native_aio=OFF`) to bypass seccomp.</td>
+        </tr>
+        <tr>
+            <td>Case 3</td>
+            <td>Redis</td>
+            <td>Datastores</td>
+            <td><span class="badge badge-survived">SURVIVED</span></td>
+            <td>None. Pure in-memory state live-migrates cleanly.</td>
+        </tr>
+        <tr>
+            <td>Case 4</td>
+            <td>MongoDB</td>
+            <td>Datastores</td>
+            <td><span class="badge badge-failed">FAILED</span></td>
+            <td>Incompatible socket states and memory tracking limitations in gVisor.</td>
+        </tr>
+        <tr>
+            <td>Case 8</td>
+            <td>MariaDB</td>
+            <td>Datastores</td>
+            <td><span class="badge badge-survived">SURVIVED</span></td>
+            <td>Requires native AIO disabled (`--innodb-use-native-aio=OFF`) and non-root uid 999.</td>
+        </tr>
+        <tr>
+            <td>Case 14</td>
+            <td>Kafka (KRaft)</td>
+            <td>Streaming</td>
+            <td><span class="badge badge-survived">SURVIVED</span></td>
+            <td>Requires `-XX:-UseContainerSupport` flag to prevent post-restore JMX cgroups initialization crash.</td>
+        </tr>
+        <tr>
+            <td>Case 15</td>
+            <td>RabbitMQ</td>
+            <td>Streaming</td>
+            <td><span class="badge badge-failed">FAILED</span></td>
+            <td>Erlang BEAM engine thread/epoll serialization crash inside guest kernel.</td>
+        </tr>
+        <tr>
+            <td>Case 29</td>
+            <td>ZooKeeper</td>
+            <td>Coordination</td>
+            <td><span class="badge badge-survived">SURVIVED</span></td>
+            <td>Requires data directory redirects to `/tmp/zookeeper` to bypass host emptyDir mount failures.</td>
+        </tr>
+        <tr>
+            <td>Case 18</td>
+            <td>NGINX</td>
+            <td>Web / Proxy</td>
+            <td><span class="badge badge-served">SERVED</span></td>
+            <td>Stateless. Post-restore network requests resume, local configuration overrides lost.</td>
+        </tr>
+    </tbody>
+</table>
+
+</body>
+</html>
