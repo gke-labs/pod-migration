@@ -103,6 +103,7 @@ spec:
         app: pm-go-job
         live-migration.gke.io/enabled: "true"
         pod-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/trigger: "manual"
     spec:
       serviceAccountName: pm-test-ksa
       runtimeClassName: gvisor

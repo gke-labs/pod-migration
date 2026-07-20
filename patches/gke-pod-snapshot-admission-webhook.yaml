@@ -1,28 +1,4 @@
 apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: gke-pod-migration-mutator
-webhooks:
-  - name: mutate-memory-headroom.live-migration.gke.io
-    rules:
-      - apiGroups: [""]
-        apiVersions: ["v1"]
-        operations: ["CREATE"]
-        resources: ["pods"]
-        scope: "Namespaced"
-    clientConfig:
-      service:
-        name: gke-pod-migration-webhook
-        namespace: gps-system
-        path: "/mutate-pod-resources"
-    admissionReviewVersions: ["v1"]
-    sideEffects: None
-    timeoutSeconds: 5
-    namespaceSelector:
-      matchLabels:
-        live-migration.gke.io/enabled: "true"
----
-apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
   name: gke-pod-migration-validator

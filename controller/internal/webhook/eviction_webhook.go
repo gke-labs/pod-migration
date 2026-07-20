@@ -53,59 +53,6 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed("feature not enabled")
 	}
 
-	// Inspect volumes to determine if we should orchestrate migration (Approach 1 for RWO) or let runtime intercept (Approach 2 for RWX/diskless)
-	hasRWO := false
-	for _, vol := range pod.Spec.Volumes {
-		if vol.PersistentVolumeClaim != nil {
-			pvc := &corev1.PersistentVolumeClaim{}
-			err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					logger.Info("PVC not found, assuming RWO to be safe", "pvc", vol.PersistentVolumeClaim.ClaimName)
-					hasRWO = true
-					break
-				}
-				logger.Error(err, "Failed to get PVC", "pvc", vol.PersistentVolumeClaim.ClaimName)
-				return admission.Errored(http.StatusInternalServerError, err)
-			}
-			for _, mode := range pvc.Spec.AccessModes {
-				if mode == corev1.ReadWriteOnce || mode == corev1.PersistentVolumeAccessMode("ReadWriteOncePod") {
-					hasRWO = true
-					break
-				}
-			}
-			if hasRWO {
-				break
-			}
-		}
-	}
-
-	if !hasRWO {
-		logger.Info("Workload is diskless or uses only RWX volumes; bypassing eviction webhook for runtime interception")
-		return admission.Allowed("bypassing eviction webhook for RWX/diskless workload")
-	}
-
-	// Define migration job name
-	jobName := fmt.Sprintf("pmj-%s", req.Name)
-
-	// Check if PodMigrationJob already exists
-	job := &pmv1alpha1.PodMigrationJob{}
-	err = a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: jobName}, job)
-	if err == nil {
-		// Job exists, check its status
-		logger.Info("Migration job already exists", "job", jobName, "phase", job.Status.Phase)
-		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
-			logger.Info("Migration job already succeeded, allowing eviction (no-op)")
-			return admission.Allowed("migration succeeded")
-		}
-		return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
-	}
-
-	if !apierrors.IsNotFound(err) {
-		logger.Error(err, "Failed to get PodMigrationJob")
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-
 	// Resolve parent owner details
 	parentName := ""
 	parentKind := ""
@@ -134,6 +81,59 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			parentKind = "StatefulSet"
 			break
 		}
+	}
+
+	// Inspect volumes to determine if we should orchestrate migration (Approach 1 for RWO) or let runtime intercept (Approach 2 for RWX/diskless)
+	hasRWO := false
+	for _, vol := range pod.Spec.Volumes {
+		if vol.PersistentVolumeClaim != nil {
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					logger.Info("PVC not found, assuming RWO to be safe", "pvc", vol.PersistentVolumeClaim.ClaimName)
+					hasRWO = true
+					break
+				}
+				logger.Error(err, "Failed to get PVC", "pvc", vol.PersistentVolumeClaim.ClaimName)
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			for _, mode := range pvc.Spec.AccessModes {
+				if mode == corev1.ReadWriteOnce || mode == corev1.PersistentVolumeAccessMode("ReadWriteOncePod") {
+					hasRWO = true
+					break
+				}
+			}
+			if hasRWO {
+				break
+			}
+		}
+	}
+
+	if !hasRWO && parentKind == "StatefulSet" {
+		logger.Info("Workload is diskless StatefulSet; bypassing eviction webhook for runtime interception")
+		return admission.Allowed("bypassing eviction webhook for diskless StatefulSet")
+	}
+
+	// Define migration job name
+	jobName := fmt.Sprintf("pmj-%s", req.Name)
+
+	// Check if PodMigrationJob already exists
+	job := &pmv1alpha1.PodMigrationJob{}
+	err = a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: jobName}, job)
+	if err == nil {
+		// Job exists, check its status
+		logger.Info("Migration job already exists", "job", jobName, "phase", job.Status.Phase)
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+			logger.Info("Migration job already succeeded, allowing eviction (no-op)")
+			return admission.Allowed("migration succeeded")
+		}
+		return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
+	}
+
+	if !apierrors.IsNotFound(err) {
+		logger.Error(err, "Failed to get PodMigrationJob")
+		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
 	labels := map[string]string{}

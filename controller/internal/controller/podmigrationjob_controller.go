@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -135,14 +134,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		if targetSnapshot == nil {
 			logger.Info("Waiting for GKE PodSnapshot object to be generated...")
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
 		// Check if snapshot is ready
 		snapStatus, ok := targetSnapshot.Object["status"].(map[string]interface{})
 		if !ok {
 			logger.Info("Snapshot status subresource not found, waiting...")
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
 		conditions, _ := snapStatus["conditions"].([]interface{})
@@ -163,7 +162,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		if !isReady {
 			logger.Info("Snapshot is not ready yet, waiting...")
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
 		logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", targetSnapshot.GetName())
@@ -279,64 +278,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("All volumes detached successfully")
 		}
 
-		// 4.4. Once all PVs are detached, find the replacement pod and release its scheduling gate.
-		parentName := job.Labels["pod-migration.gke.io/parent-name"]
-		parentKind := job.Labels["pod-migration.gke.io/parent-kind"]
 
-		if parentName != "" {
-			podList := &corev1.PodList{}
-			err = r.List(ctx, podList, client.InNamespace(req.Namespace))
-			if err != nil {
-				logger.Error(err, "Failed to list pods to locate replacement")
-				return ctrl.Result{}, err
-			}
-
-			for _, p := range podList.Items {
-				// Determine if this pod belongs to the same parent workload
-				matchesParent := false
-				for _, ref := range p.OwnerReferences {
-					if ref.Kind == "ReplicaSet" {
-						rs := &appsv1.ReplicaSet{}
-						err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: ref.Name}, rs)
-						if err == nil {
-							for _, rsRef := range rs.OwnerReferences {
-								if rsRef.Kind == "Deployment" && rsRef.Name == parentName && parentKind == "Deployment" {
-									matchesParent = true
-									break
-								}
-							}
-						}
-					} else if ref.Kind == "Job" && ref.Name == parentName && parentKind == "Job" {
-						matchesParent = true
-					} else if ref.Kind == "StatefulSet" && ref.Name == parentName && parentKind == "StatefulSet" {
-						matchesParent = true
-					}
-					if matchesParent {
-						break
-					}
-				}
-
-				if matchesParent {
-					// Check if scheduling gate is present and remove it
-					gateIndex := -1
-					for i, gate := range p.Spec.SchedulingGates {
-						if gate.Name == "gke.io/pod-migration-gate" {
-							gateIndex = i
-							break
-						}
-					}
-					if gateIndex != -1 {
-						logger.Info("Releasing scheduling gate for replacement pod", "pod", p.Name)
-						p.Spec.SchedulingGates = append(p.Spec.SchedulingGates[:gateIndex], p.Spec.SchedulingGates[gateIndex+1:]...)
-						err = r.Update(ctx, &p)
-						if err != nil {
-							logger.Error(err, "Failed to remove scheduling gate from replacement pod")
-							return ctrl.Result{}, err
-						}
-					}
-				}
-			}
-		}
 
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
 		err = r.Status().Update(ctx, job)

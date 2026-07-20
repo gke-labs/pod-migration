@@ -82,6 +82,7 @@ rules:
   resources:
   - podsnapshots
   - podsnapshots/status
+  - podsnapshotpolicies/status
   verbs:
   - get
   - list

@@ -31,6 +31,7 @@ kubectl delete validatingadmissionpolicybinding gke-pod-snapshot-vap-binding --i
 kubectl get podsnapshots -o json | jq -r '.items[].metadata.name' | xargs -I {} kubectl patch podsnapshot {} --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]' || true
 # Delete them
 kubectl delete podsnapshots,podsnapshotmanualtriggers,podmigrationjobs.podmigration.gke.io --all --timeout=15s || true
+kubectl delete lease -l podsnapshot.gke.io/lease-type=CheckpointWorkerHeartbeat --timeout=15s || true
 # Restore VAP binding
 kubectl apply -f "$CORPUS_DIR/manifests/restore-vap-binding.yaml" || true
 
@@ -41,6 +42,7 @@ case "$APP" in
     
     echo "[*] Cleaning up potential residue..."
     kubectl delete statefulset/pm-redis service/pm-redis-service --ignore-not-found || true
+    kubectl wait --for=delete pod/pm-redis-0 --timeout=60s || true
     
     echo "[*] Deploying Redis StatefulSet..."
     kubectl apply -f "$MANIFEST"
@@ -175,6 +177,8 @@ case "$APP" in
     
     echo "[*] Cleaning up potential residue..."
     kubectl delete statefulset/pm-minio service/pm-minio-service pod/minio-client --ignore-not-found || true
+    kubectl wait --for=delete pod/pm-minio-0 --timeout=60s || true
+    kubectl wait --for=delete pod/minio-client --timeout=60s || true
     
     echo "[*] Deploying MinIO StatefulSet..."
     kubectl apply -f "$MANIFEST"
@@ -227,6 +231,7 @@ case "$APP" in
     
     echo "[*] Cleaning up potential residue..."
     kubectl delete statefulset/pm-nginx service/pm-nginx-service --ignore-not-found || true
+    kubectl wait --for=delete pod/pm-nginx-0 --timeout=60s || true
     
     echo "[*] Deploying Nginx StatefulSet..."
     kubectl apply -f "$MANIFEST"
@@ -676,6 +681,7 @@ case "$APP" in
     
     echo "[*] Cleaning up potential residue..."
     kubectl delete statefulset/pm-valkey service/pm-valkey-service --ignore-not-found || true
+    kubectl wait --for=delete pod/pm-valkey-0 --timeout=60s || true
     
     echo "[*] Deploying Valkey StatefulSet..."
     kubectl apply -f "$MANIFEST"
