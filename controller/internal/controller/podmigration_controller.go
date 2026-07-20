@@ -170,6 +170,27 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	newPSPConditionOnDelete := map[string]interface{}{
+		"type":               "Ready",
+		"status":             "True",
+		"reason":             "PSPReady",
+		"message":            "PodSnapshotPolicy is ready",
+		"lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
+	}
+	changed, err = setUnstructuredCondition(pspOnDelete, newPSPConditionOnDelete)
+	if err != nil {
+		logger.Error(err, "Failed to set PSP onDelete status condition")
+		return ctrl.Result{}, err
+	}
+	if changed {
+		logger.Info("Updating PodSnapshotPolicy (onDelete) status", "name", pspOnDeleteName)
+		err = r.Status().Update(ctx, pspOnDelete)
+		if err != nil {
+			logger.Error(err, "Failed to update PodSnapshotPolicy (onDelete) status")
+			return ctrl.Result{}, err
+		}
+	}
+
 	// 3. Reconcile PodSnapshotPolicy for manual (Namespaced)
 	pspManualName := fmt.Sprintf("psp-%s-manual", req.Name)
 	pspManual := &unstructured.Unstructured{}
@@ -209,6 +230,27 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		logger.Error(err, "Failed to sync PodSnapshotPolicy (manual)")
 		return ctrl.Result{}, err
+	}
+
+	newPSPConditionManual := map[string]interface{}{
+		"type":               "Ready",
+		"status":             "True",
+		"reason":             "PSPReady",
+		"message":            "PodSnapshotPolicy is ready",
+		"lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
+	}
+	changed, err = setUnstructuredCondition(pspManual, newPSPConditionManual)
+	if err != nil {
+		logger.Error(err, "Failed to set PSP manual status condition")
+		return ctrl.Result{}, err
+	}
+	if changed {
+		logger.Info("Updating PodSnapshotPolicy (manual) status", "name", pspManualName)
+		err = r.Status().Update(ctx, pspManual)
+		if err != nil {
+			logger.Error(err, "Failed to update PodSnapshotPolicy (manual) status")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Set status condition to Ready
