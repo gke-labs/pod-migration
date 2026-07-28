@@ -67,41 +67,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
-		// Fetch the target pod to get its node name
-		pod := &corev1.Pod{}
-		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, pod)
-		if err != nil {
-			logger.Error(err, "Failed to get target pod for node analysis")
-			return ctrl.Result{}, err
-		}
-		nodeName := pod.Spec.NodeName
-		if nodeName == "" {
-			return ctrl.Result{}, fmt.Errorf("target pod %s is not scheduled on any node", podName)
-		}
-
-		// 2. Trigger GKE Snapshot (Create PodSnapshotManualTrigger)
-		trigger := &unstructured.Unstructured{}
-		trigger.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshotManualTrigger",
-		})
-		trigger.SetName(triggerName)
-		trigger.SetNamespace(req.Namespace)
-		trigger.SetLabels(map[string]string{
-			"podsnapshot.gke.io/targetNode": nodeName,
-		})
-		trigger.Object["spec"] = map[string]interface{}{
-			"targetPod": podName,
-		}
-
-		logger.Info("Creating PodSnapshotManualTrigger", "name", triggerName, "targetNode", nodeName)
-		err = r.Create(ctx, trigger)
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create manual trigger")
-			return ctrl.Result{}, err
-		}
-
+		// In Path A, we skip triggering a manual snapshot and let the agent's onDelete
+		// trigger handle it inside Kubelet's StopContainer hook.
+		// We transition directly to Snapshotting to wait for the onDelete snapshot.
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
 		err = r.Status().Update(ctx, job)
 		if err != nil {

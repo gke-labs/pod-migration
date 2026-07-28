@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 
@@ -10,6 +11,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -80,10 +84,10 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		}
 	}
 
-	if !hasRWO {
-		logger.Info("Workload is diskless or uses only RWX volumes; bypassing eviction webhook for runtime interception")
-		return admission.Allowed("bypassing eviction webhook for RWX/diskless workload")
-	}
+	// if !hasRWO {
+	// 	logger.Info("Workload is diskless or uses only RWX volumes; bypassing eviction webhook for runtime interception")
+	// 	return admission.Allowed("bypassing eviction webhook for RWX/diskless workload")
+	// }
 
 	// Define migration job name
 	jobName := fmt.Sprintf("pmj-%s", req.Name)
@@ -136,10 +140,89 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		}
 	}
 
-	labels := map[string]string{}
+	jobLabels := map[string]string{}
 	if parentName != "" {
-		labels["pod-migration.gke.io/parent-name"] = parentName
-		labels["pod-migration.gke.io/parent-kind"] = parentKind
+		jobLabels["pod-migration.gke.io/parent-name"] = parentName
+		jobLabels["pod-migration.gke.io/parent-kind"] = parentKind
+	}
+
+	// 1. Find matching PodSnapshotPolicy (onDelete)
+	pspList := &unstructured.UnstructuredList{}
+	pspList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicyList",
+	})
+	if err := a.Client.List(ctx, pspList, client.InNamespace(req.Namespace)); err != nil {
+		logger.Error(err, "Failed to list PodSnapshotPolicies")
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to list PSPs: %w", err))
+	}
+
+	var matchingPSPName string
+	for _, psp := range pspList.Items {
+		selectorMap, found, err := unstructured.NestedMap(psp.Object, "spec", "selector")
+		if err != nil || !found {
+			continue
+		}
+		jsonBytes, err := json.Marshal(selectorMap)
+		if err != nil {
+			continue
+		}
+		var labelSelector metav1.LabelSelector
+		if err := json.Unmarshal(jsonBytes, &labelSelector); err != nil {
+			continue
+		}
+		selector, err := metav1.LabelSelectorAsSelector(&labelSelector)
+		if err != nil {
+			continue
+		}
+		if selector.Matches(labels.Set(pod.Labels)) {
+			triggerType, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "type")
+			if err == nil && found && triggerType == "onDelete" {
+				matchingPSPName = psp.GetName()
+				break
+			}
+		}
+	}
+
+	if matchingPSPName == "" {
+		logger.Error(nil, "No matching onDelete PodSnapshotPolicy found for pod", "pod", req.Name)
+		return denied429("no matching onDelete PodSnapshotPolicy found")
+	}
+
+	// 2. Synchronously create PodSnapshot CR
+	psName := fmt.Sprintf("%s-snapshot-%s", pod.Name, string(pod.UID)[:8])
+	logger.Info("Creating PodSnapshot CR", "name", psName, "policy", matchingPSPName)
+
+	podSnapshot := &unstructured.Unstructured{}
+	podSnapshot.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshot",
+	})
+	podSnapshot.SetName(psName)
+	podSnapshot.SetNamespace(req.Namespace)
+	podSnapshot.SetLabels(map[string]string{
+		"pod-migration.gke.io/target-pod-uid":  string(pod.UID),
+		"pod-migration.gke.io/target-pod-name": pod.Name,
+	})
+	podSnapshot.SetAnnotations(map[string]string{
+		"podsnapshot.gke.io/origin-pod":        pod.Name,
+		"podsnapshot.gke.io/origin-node":       pod.Spec.NodeName,
+		"podsnapshot.gke.io/pod-snapshot-hash": psName,
+	})
+	podSnapshot.Object["spec"] = map[string]interface{}{
+		"policyName": matchingPSPName,
+	}
+
+	err = a.Client.Create(ctx, podSnapshot)
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			logger.Info("PodSnapshot already exists, reusing it", "name", psName)
+		} else {
+			logger.Error(err, "Failed to create PodSnapshot")
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to create PodSnapshot: %w", err))
+		}
 	}
 
 	// Create new PodMigrationJob
@@ -148,7 +231,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
 			Namespace: req.Namespace,
-			Labels:    labels,
+			Labels:    jobLabels,
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef: corev1.LocalObjectReference{
@@ -163,7 +246,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
-	return denied429("migration job spawned, the pod will be terminated shortly")
+	return admission.Allowed("migration job spawned")
 }
 
 func denied429(msg string) admission.Response {

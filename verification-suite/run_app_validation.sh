@@ -23,6 +23,23 @@ exec_with_retry() {
   done
 }
 
+wait_for_pod_ready() {
+  local pod_name="$1"
+  local timeout="${2:-120}"
+  echo "[*] Waiting for pod $pod_name to exist in API server..."
+  local elapsed=0
+  until kubectl get pod "$pod_name" >/dev/null 2>&1; do
+    if [ "$elapsed" -ge 30 ]; then
+      echo "[ERROR] Timed out waiting for pod $pod_name to exist." >&2
+      exit 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "[*] Pod $pod_name exists. Waiting for readiness (timeout ${timeout}s)..."
+  kubectl wait --for=condition=Ready "pod/$pod_name" --timeout="${timeout}s"
+}
+
 # Cleanup old podsnapshots before starting (Rule 2)
 echo "[*] Cleaning up old podsnapshots..."
 # Temporarily delete VAP to allow finalizer removal
@@ -41,12 +58,16 @@ case "$APP" in
     
     echo "[*] Cleaning up potential residue..."
     kubectl delete statefulset/pm-redis service/pm-redis-service --ignore-not-found || true
+    if kubectl get pod/pm-redis-0 >/dev/null 2>&1; then
+      echo "[*] Waiting for old Redis pod to be deleted..."
+      kubectl wait --for=delete pod/pm-redis-0 --timeout=60s || true
+    fi
     
     echo "[*] Deploying Redis StatefulSet..."
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Redis pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="redis-nonce-$(date +%s)"
     echo "[*] Seeding state in Redis: migkey -> $NONCE"
@@ -62,7 +83,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Redis pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(kubectl exec "$POD_NAME" -- redis-cli get migkey)
@@ -87,11 +108,11 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Dragonfly pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Launching redis-client helper pod..."
     kubectl run redis-client --image=redis:7-alpine --restart=Never -- sleep 3600
-    kubectl wait --for=condition=Ready "pod/redis-client" --timeout=60s
+    wait_for_pod_ready "redis-client" 60
     
     NONCE="df-nonce-$(date +%s)"
     echo "[*] Seeding state in Dragonfly: migkey -> $NONCE"
@@ -107,7 +128,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Dragonfly pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(exec_with_retry kubectl exec redis-client -- redis-cli -h pm-dragonfly-service get migkey)
@@ -136,7 +157,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Vault pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="vault-nonce-$(date +%s)"
     echo "[*] Seeding state in Vault: secret/migkey -> $NONCE"
@@ -154,7 +175,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Vault pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- vault kv get -field=val secret/migkey)
@@ -180,11 +201,11 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for MinIO pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Launching minio-client helper pod..."
     kubectl run minio-client --image=minio/mc --restart=Never --overrides='{"spec":{"containers":[{"name":"minio-client","image":"minio/mc","command":["sh","-c","sleep 3600"]}]}}'
-    kubectl wait --for=condition=Ready "pod/minio-client" --timeout=60s
+    wait_for_pod_ready "minio-client" 60
     
     NONCE="minio-nonce-$(date +%s)"
     echo "[*] Seeding state in MinIO: bucket/object -> $NONCE"
@@ -203,7 +224,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored MinIO pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(exec_with_retry kubectl exec minio-client -- mc cat myminio/migbucket/migobject)
@@ -232,7 +253,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Nginx pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="nginx-nonce-$(date +%s)"
     echo "[*] Seeding state in Nginx: Overwriting index.html -> $NONCE"
@@ -249,7 +270,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Nginx pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     # Query Nginx service port 80 directly
@@ -276,7 +297,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for HAProxy pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NODE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.nodeName}')
     echo "[*] Pod is running on node: $NODE"
@@ -288,7 +309,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored HAProxy pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying HAProxy port response..."
     # Query port 8080. It should return "ok"
@@ -315,7 +336,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Traefik pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NODE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.nodeName}')
     echo "[*] Pod is running on node: $NODE"
@@ -327,7 +348,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Traefik pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying Traefik ping response..."
     # Traefik's default ping returns "OK"
@@ -354,7 +375,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Caddy pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NODE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.nodeName}')
     echo "[*] Pod is running on node: $NODE"
@@ -366,7 +387,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Caddy pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying Caddy response..."
     # Default Caddy welcome page contains "Caddy" in its HTML title
@@ -390,7 +411,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Python pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NODE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.nodeName}')
     echo "[*] Pod is running on node: $NODE"
@@ -402,7 +423,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Python pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying Python HTTP Server response..."
     # Python http.server returns a Directory listing containing "Directory listing" in its HTML
@@ -426,7 +447,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Consul pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="consul-nonce-$(date +%s)"
     echo "[*] Seeding state in Consul: Key 'migkey' -> $NONCE"
@@ -442,7 +463,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Consul pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- consul kv get migkey)
@@ -468,7 +489,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for MySQL pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="mysql-nonce-$(date +%s)"
     echo "[*] Seeding state in MySQL: Table durability_test -> $NONCE"
@@ -484,7 +505,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored MySQL pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- mysql -u root -e "SELECT val FROM migdb.dur_test;" -N -s)
@@ -510,7 +531,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for MariaDB pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="mariadb-nonce-$(date +%s)"
     echo "[*] Seeding state in MariaDB: Table durability_test -> $NONCE"
@@ -526,7 +547,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored MariaDB pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- mariadb -u root -e "SELECT val FROM migdb.dur_test;" -N -s)
@@ -552,7 +573,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for ZooKeeper pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="zookeeper-nonce-$(date +%s)"
     echo "[*] Seeding state in ZooKeeper: Node /migkey -> $NONCE"
@@ -568,7 +589,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored ZooKeeper pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     RAW_VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- zkCli.sh -server localhost:2181 get /migkey 2>/dev/null)
@@ -594,7 +615,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Kafka pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=180s
+    wait_for_pod_ready "$POD_NAME" 180
     
     NONCE="kafka-nonce-$(date +%s)"
     echo "[*] Seeding state in Kafka: Topic migtopic -> $NONCE"
@@ -610,7 +631,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Kafka pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=180s
+    wait_for_pod_ready "$POD_NAME" 180
     
     echo "[*] Verifying state..."
     RAW_VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- sh -c "export KAFKA_OPTS=\"-XX:-UseContainerSupport\" && /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic migtopic --from-beginning --max-messages 1 --timeout-ms 10000 2>/dev/null")
@@ -636,7 +657,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Memcached pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="memcached-nonce-$(date +%s)"
     LEN=${#NONCE}
@@ -654,7 +675,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Memcached pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(kubectl exec "$POD_NAME" -c memcached -- sh -c "printf 'get migkey\r\n' | nc localhost 11211 | sed -n 2p")
@@ -681,7 +702,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Valkey pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="valkey-nonce-$(date +%s)"
     echo "[*] Seeding state in Valkey: migkey -> $NONCE"
@@ -697,7 +718,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Valkey pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(kubectl exec "$POD_NAME" -- valkey-cli get migkey)
@@ -722,7 +743,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for etcd pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="etcd-nonce-$(date +%s)"
     echo "[*] Seeding state in etcd: migkey -> $NONCE"
@@ -738,7 +759,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored etcd pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(kubectl exec "$POD_NAME" -- etcdctl get migkey --print-value-only)
@@ -766,11 +787,11 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for nats pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Launching nats-client helper pod..."
     kubectl run nats-client --image=synadia/nats-box:latest --restart=Never --command -- sleep 3600
-    kubectl wait --for=condition=Ready pod/nats-client --timeout=60s
+    wait_for_pod_ready "nats-client" 60
     
     echo "[*] Waiting for NATS server startup settlement (10s)..."
     sleep 10
@@ -795,7 +816,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored nats pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL_JSON=$(exec_with_retry kubectl exec nats-client -- nats stream get my-stream 1 --server nats://pm-nats-service:4222 -j)
@@ -826,7 +847,7 @@ case "$APP" in
     kubectl apply -f "$MANIFEST"
     
     echo "[*] Waiting for Postgres pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     NONCE="pg-nonce-$(date +%s)"
     echo "[*] Seeding state in Postgres: Table 'migtest' -> val = $NONCE"
@@ -844,7 +865,7 @@ case "$APP" in
     kubectl uncordon "$NODE"
     
     echo "[*] Waiting for restored Postgres pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
     VAL=$(kubectl exec "$POD_NAME" -- psql -U postgres -d postgres -t -A -c "SELECT val FROM migtest;")
@@ -873,7 +894,7 @@ case "$APP" in
     POD_NAME=$(kubectl get pods -l app=pm-node-job -o jsonpath='{.items[0].metadata.name}')
     
     echo "[*] Waiting for Node.js pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
+    wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Getting initial instance ID..."
     INITIAL_ID=$(kubectl exec "$POD_NAME" -c node -- wget -qO- http://localhost:8080)
@@ -893,7 +914,7 @@ case "$APP" in
     NEW_POD_NAME=$(kubectl get pods -l app=pm-node-job -o jsonpath='{.items[0].metadata.name}')
     
     echo "[*] Waiting for new Node.js pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$NEW_POD_NAME" --timeout=120s
+    wait_for_pod_ready "$NEW_POD_NAME" 120
     
     echo "[*] Verifying state..."
     RESTORED_ID=$(kubectl exec "$NEW_POD_NAME" -c node -- wget -qO- http://localhost:8080)
@@ -921,7 +942,7 @@ case "$APP" in
     POD_NAME=$(kubectl get pods -l app=pm-go-job -o jsonpath='{.items[0].metadata.name}')
     
     echo "[*] Waiting for Go pod to compile and be Ready..."
-    kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=240s
+    wait_for_pod_ready "$POD_NAME" 240
     
     echo "[*] Seeding state (incrementing counter)..."
     kubectl exec "$POD_NAME" -c go-counter -- wget -qO- --post-data="" http://localhost:8080/incr
@@ -946,7 +967,7 @@ case "$APP" in
     NEW_POD_NAME=$(kubectl get pods -l app=pm-go-job -o jsonpath='{.items[0].metadata.name}')
     
     echo "[*] Waiting for new Go pod to be Ready..."
-    kubectl wait --for=condition=Ready "pod/$NEW_POD_NAME" --timeout=240s
+    wait_for_pod_ready "$NEW_POD_NAME" 240
     
     echo "[*] Verifying state..."
     HEALTH_VAL_RESTORED=$(kubectl exec "$NEW_POD_NAME" -c go-counter -- wget -qO- http://localhost:8080/healthz)

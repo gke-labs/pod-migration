@@ -65,9 +65,12 @@ rules:
 - apiGroups:
   - podsnapshot.gke.io
   resources:
+  - podsnapshots
   - podsnapshotmanualtriggers
   - podsnapshotpolicies
+  - podsnapshotpolicies/status
   - podsnapshotstorageconfigs
+  - podsnapshotstorageconfigs/status
   verbs:
   - create
   - delete

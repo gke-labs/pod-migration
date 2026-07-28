@@ -130,98 +130,102 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	if !hasActiveMigration {
-		// Check if there is an active PodSnapshot for this pod.
-		activeSnapshot, readyTime, latestSnap, err := r.hasActiveSnapshot(ctx, req.Namespace, req.Name, parentName, parentKind)
-		if err != nil {
-			logger.Error(err, "Failed to check active snapshots")
-			return ctrl.Result{}, err
-		}
-		if activeSnapshot {
-			logger.Info("Active snapshot found for pod; keeping scheduling gate", "pod", req.Name)
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-		if latestSnap != nil {
-			// Check if we need to promote it
-			hasReady := false
-			if status, ok := latestSnap.Object["status"].(map[string]interface{}); ok {
-				if conditions, ok := status["conditions"].([]interface{}); ok {
-					for _, cond := range conditions {
-						if condMap, ok := cond.(map[string]interface{}); ok {
-							if condMap["type"] == "Ready" && condMap["status"] == "True" {
-								hasReady = true
-								break
-							}
+	if hasActiveMigration {
+		logger.Info("Active migration job found; waiting for job completion", "pod", req.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// Check if there is an active PodSnapshot for this pod.
+	activeSnapshot, readyTime, latestSnap, err := r.hasActiveSnapshot(ctx, req.Namespace, req.Name, parentName, parentKind)
+	if err != nil {
+		logger.Error(err, "Failed to check active snapshots")
+		return ctrl.Result{}, err
+	}
+	if activeSnapshot {
+		logger.Info("Active snapshot found for pod; keeping scheduling gate", "pod", req.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	if latestSnap != nil {
+		// Check if we need to promote it
+		hasReady := false
+		if status, ok := latestSnap.Object["status"].(map[string]interface{}); ok {
+			if conditions, ok := status["conditions"].([]interface{}); ok {
+				for _, cond := range conditions {
+					if condMap, ok := cond.(map[string]interface{}); ok {
+						if condMap["type"] == "Ready" && condMap["status"] == "True" {
+							hasReady = true
+							break
 						}
 					}
 				}
 			}
-			if !hasReady {
-				err := r.promoteSnapshotToReady(ctx, latestSnap)
-				if err != nil {
-					logger.Error(err, "Failed to promote snapshot to Ready", "snapshot", latestSnap.GetName())
-					return ctrl.Result{}, err
-				}
-				// Requeue to let cache sync the status update
-				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-			}
 		}
-		if latestSnap != nil {
-			// Check if we need to promote it
-			hasReady := false
-			if status, ok := latestSnap.Object["status"].(map[string]interface{}); ok {
-				if conditions, ok := status["conditions"].([]interface{}); ok {
-					for _, cond := range conditions {
-						if condMap, ok := cond.(map[string]interface{}); ok {
-							if condMap["type"] == "Ready" && condMap["status"] == "True" {
-								hasReady = true
-								break
-							}
-						}
-					}
-				}
+		if !hasReady {
+			err := r.promoteSnapshotToReady(ctx, latestSnap)
+			if err != nil {
+				logger.Error(err, "Failed to promote snapshot to Ready", "snapshot", latestSnap.GetName())
+				return ctrl.Result{}, err
 			}
-			if !hasReady {
-				err := r.promoteSnapshotToReady(ctx, latestSnap)
-				if err != nil {
-					logger.Error(err, "Failed to promote snapshot to Ready", "snapshot", latestSnap.GetName())
-					return ctrl.Result{}, err
-				}
-				// Requeue immediately to let cache sync the status update
-				return ctrl.Result{Requeue: true}, nil
-			}
-		}
-		if !readyTime.IsZero() {
-			// Snapshot is ready. Check if we should wait for cache sync.
-			elapsed := time.Since(readyTime)
-			if elapsed < 5*time.Second {
-				waitNeeded := 5*time.Second - elapsed
-				logger.Info("Snapshot ready recently; waiting for cache sync", "pod", req.Name, "wait", waitNeeded)
-				return ctrl.Result{RequeueAfter: waitNeeded}, nil
-			}
-
-			// Add the restore annotations
-			if pod.Annotations == nil {
-				pod.Annotations = make(map[string]string)
-			}
-			pod.Annotations["gke-pod-snapshot-role"] = "restore"
-			if latestSnap != nil {
-				pod.Annotations["podsnapshot.gke.io/ps-name"] = latestSnap.GetName()
-			}
-			logger.Info("Adding restore annotations to pod", "pod", req.Name, "snapshot", latestSnap.GetName())
-		}
-
-		// Remove the scheduling gate
-		logger.Info("No active migration job or snapshot found for parent; removing scheduling gate to allow startup", "pod", req.Name)
-		pod.Spec.SchedulingGates = append(pod.Spec.SchedulingGates[:gateIndex], pod.Spec.SchedulingGates[gateIndex+1:]...)
-		err = r.Update(ctx, pod)
-		if err != nil {
-			logger.Error(err, "Failed to remove scheduling gate from Pod")
+			// Requeue to let cache sync the status update
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 	}
+	if latestSnap != nil {
+		// Check if we need to promote it
+		hasReady := false
+		if status, ok := latestSnap.Object["status"].(map[string]interface{}); ok {
+			if conditions, ok := status["conditions"].([]interface{}); ok {
+				for _, cond := range conditions {
+					if condMap, ok := cond.(map[string]interface{}); ok {
+						if condMap["type"] == "Ready" && condMap["status"] == "True" {
+							hasReady = true
+							break
+						}
+					}
+				}
+			}
+		}
+		if !hasReady {
+			err := r.promoteSnapshotToReady(ctx, latestSnap)
+			if err != nil {
+				logger.Error(err, "Failed to promote snapshot to Ready", "snapshot", latestSnap.GetName())
+				return ctrl.Result{}, err
+			}
+			// Requeue immediately to let cache sync the status update
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+	if !readyTime.IsZero() {
+		// Snapshot is ready. Check if we should wait for cache sync.
+		elapsed := time.Since(readyTime)
+		if elapsed < 5*time.Second {
+			waitNeeded := 5*time.Second - elapsed
+			logger.Info("Snapshot ready recently; waiting for cache sync", "pod", req.Name, "wait", waitNeeded)
+			return ctrl.Result{RequeueAfter: waitNeeded}, nil
+		}
+
+		// Add the restore annotations
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string)
+		}
+		pod.Annotations["gke-pod-snapshot-role"] = "restore"
+		if latestSnap != nil {
+			pod.Annotations["podsnapshot.gke.io/ps-name"] = latestSnap.GetName()
+		}
+		logger.Info("Adding restore annotations to pod", "pod", req.Name, "snapshot", latestSnap.GetName())
+	}
+
+	// Remove the scheduling gate
+	logger.Info("No active migration job or snapshot found for parent; removing scheduling gate to allow startup", "pod", req.Name)
+	pod.Spec.SchedulingGates = append(pod.Spec.SchedulingGates[:gateIndex], pod.Spec.SchedulingGates[gateIndex+1:]...)
+	err = r.Update(ctx, pod)
+	if err != nil {
+		logger.Error(err, "Failed to remove scheduling gate from Pod")
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
 
 	return ctrl.Result{}, nil
+
 }
 
 // SetupWithManager sets up the controller with the Manager.

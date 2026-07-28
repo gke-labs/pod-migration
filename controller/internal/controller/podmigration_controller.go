@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -209,13 +210,41 @@ func (r *PodMigrationReconciler) syncResource(ctx context.Context, obj *unstruct
 	err := r.Get(ctx, client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return r.Create(ctx, obj)
+			err = r.Create(ctx, obj)
+			if err != nil {
+				return err
+			}
+			return r.mockStatusIfRequired(ctx, obj)
 		}
 		return err
 	}
 
 	obj.SetResourceVersion(existing.GetResourceVersion())
-	return r.Update(ctx, obj)
+	err = r.Update(ctx, obj)
+	if err != nil {
+		return err
+	}
+	return r.mockStatusIfRequired(ctx, obj)
+}
+
+func (r *PodMigrationReconciler) mockStatusIfRequired(ctx context.Context, obj *unstructured.Unstructured) error {
+	if obj.GetKind() != "PodSnapshotPolicy" && obj.GetKind() != "PodSnapshotStorageConfig" {
+		return nil
+	}
+
+	statusPayload := map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":               "Ready",
+				"status":             "True",
+				"reason":             "Succeeded",
+				"message":            "Mocked Ready status by migration controller",
+				"lastTransitionTime": time.Now().Format(time.RFC3339),
+			},
+		},
+	}
+	obj.Object["status"] = statusPayload
+	return r.Status().Update(ctx, obj)
 }
 
 // SetupWithManager sets up the controller with the Manager.
