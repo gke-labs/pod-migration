@@ -91,13 +91,7 @@ func main() {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)
 	}
-	if err := (&controller.DeferredEvictionReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create DeferredEvictionReconciler")
-		os.Exit(1)
-	}
+
 	if err := (&controller.PodGateReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
