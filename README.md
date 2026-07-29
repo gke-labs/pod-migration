@@ -2,7 +2,7 @@
 
 This repository contains the blueprints, patches, configuration templates, and E2E verification test suites for GKE Pod Migration. 
 
-Specifically, this implements **Option A: Runtime-layer onDelete Eviction Interception** (using custom container shims to intercept Pod evictions, checkpoint RAM state to GCS, and restore statefully on target nodes).
+Specifically, this implements **Option A: Runtime-layer onDelete Eviction Interception** (using GKE native Pod Snapshots to intercept Pod evictions, checkpoint RAM state to GCS, and restore statefully on target nodes).
 
 ---
 
@@ -10,25 +10,33 @@ Specifically, this implements **Option A: Runtime-layer onDelete Eviction Interc
 
 Every workload in this matrix has been verified through real E2E eviction migrations on a GKE Standard node pool.
 
+> [!NOTE]
+> - **Job Rescheduling**: Workloads of type `Job` (e.g., `go`, `node`) are now supported for resilient rescheduling using a Status Mutating Webhook.
+> - **NATS Caveat**: `nats` is marked as flaky due to a transient runtime-level deadlock during checkpointing; see notes below for mitigation.
+
 | Application | Category | Verdict | Required Workarounds & Bypass Configurations |
 | :--- | :--- | :--- | :--- |
-| **node (Node.js)** | app | ✅ **SURVIVED** | Out-of-the-box support. Memory state and connection tokens survive. |
-| **go** | app | ✅ **SURVIVED** | Out-of-the-box support. Active state/counters survived in page cache. |
-| **redis / valkey** | datastore | ✅ **SURVIVED** | Pure in-memory key-value stores. Extremely fast migration. |
-| **mysql / mariadb** | datastore | ✅ **SURVIVED** | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`. |
+| **node** | app / Job | ✅ **SURVIVED** | Verified both as StatefulSet (connection tokens survive) and Job (rescheduled via webhook). Out-of-the-box support. |
+| **go** | app / Job | ✅ **SURVIVED** | Verified both as StatefulSet (counters survive) and Job (rescheduled via webhook). Out-of-the-box support. |
+| **redis** | datastore | ✅ **SURVIVED** | Pure in-memory key-value store. Extremely fast migration. |
+| **valkey** | datastore | ✅ **SURVIVED** | Pure in-memory key-value store. Extremely fast migration. |
+| **mysql** | datastore | ✅ **SURVIVED** | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`. |
+| **mariadb** | datastore | ✅ **SURVIVED** | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`. |
 | **memcached** | datastore | ✅ **SURVIVED** | Pure in-memory cache blocks restored. |
-| **dragonfly** | datastore | ✅ **SURVIVED** | **epoll Bypass**: Requires epoll forcing flag (`--force_epoll`). |
-| **vault** | secrets | ✅ **SURVIVED** | Both succeed. Memory secrets state restored. |
+| **dragonfly** | datastore | ✅ **SURVIVED** | **epoll Bypass**: Requires epoll forcing flag (`--force_epoll`). Verified with redis-client. |
+| **vault** | secrets | ✅ **SURVIVED** | Dev-mode secrets state restored. |
 | **consul** | coordination | ✅ **SURVIVED** | Dev-mode memory key-value databases survive. |
 | **etcd** | coordination | ✅ **SURVIVED** | BoltDB storage writes successfully restored. |
-| **nats** | streaming | ✅ **SURVIVED** | Memory jetstream offsets restored. |
+| **nats** | streaming | ⚠️ **SURVIVED (FLAKY)** | **Deadlock Flake / Retry Caveat**: Memory jetstream offsets restored. Encountered runtime-level deadlock on 1st run (stuck in Terminating). Succeeded on retry. Recommend controller timeout recovery. |
 | **zookeeper** | coordination | ✅ **SURVIVED** | **emptyDir Path Redirect**: Redirect `ZOO_DATA_DIR` away from Kubelet `emptyDir` mounts (e.g. to `/tmp/zookeeper`) to prevent walk errors. |
 | **kafka** (KRaft) | streaming | ✅ **SURVIVED** | **JVM Metrics Bypass**: Inject environment variable `KAFKA_OPTS="-XX:-UseContainerSupport"` to avoid cgroups mismatch crashes on target nodes. |
 | **postgres** | datastore | ✅ **SURVIVED** | Works out-of-the-box (uses guest POSIX shared memory). Requires setting `PGDATA` to container local directories. |
 | **minio** | datastore | ✅ **SURVIVED** | Redirect storage paths to container writable layers to avoid emptyDir mount walk failures. |
 | **influxdb** | datastore | ✅ **SURVIVED** | Go TSDB (v1) in-memory state restored. |
-| **nginx / haproxy** | proxy | ✅ **SERVED** | Stateless proxies restore and handle reconnected traffic. |
-| **traefik / caddy** | proxy | ✅ **SERVED** | Stateless routers restore and handle reconnected traffic. |
+| **nginx** | proxy | ✅ **SERVED** | Stateless proxies restore and handle reconnected traffic. |
+| **haproxy** | proxy | ✅ **SERVED** | Stateless proxies restore and handle reconnected traffic. |
+| **traefik** | proxy | ✅ **SERVED** | Stateless routers restore and handle reconnected traffic. |
+| **caddy** | proxy | ✅ **SERVED** | Stateless routers restore and handle reconnected traffic. |
 | **python** (HTTP) | app | ✅ **SERVED** | Stateless python workers survive. |
 | **mongodb** | datastore | ❌ **FAILED** | WiredTiger storage engine locks and blocks on sandboxed `io_uring` seccomp. |
 | **cassandra** | datastore | ❌ **FAILED** | Large JVM heaps mismatch host cgroups descriptors post-restore. |
@@ -42,39 +50,31 @@ Every workload in this matrix has been verified through real E2E eviction migrat
 
 ## 2. Installation Guide
 
-To deploy this live migration runtime to your GKE test cluster:
+To deploy this live migration runtime to your GKE test cluster using the native GKE Pod Snapshots:
 
-### Step 0: Create GKE Cluster (Standard Cluster)
-To test this featureset, you need a GKE Standard cluster on the Rapid release channel with Workload Identity enabled:
+### Step 1: Create GKE Cluster & Enable Native Addon
+Create a GKE Standard cluster on the Rapid release channel with the GKE Pod Snapshots addon enabled:
 ```bash
 gcloud container clusters create pod-migration-cluster \
   --release-channel=rapid \
   --workload-pool=<YOUR_PROJECT>.svc.id.goog \
+  --enable-pod-snapshots \
   --zone=<YOUR_ZONE> \
   --project=<YOUR_PROJECT>
 ```
 
-#### For Existing Clusters:
-If you are bringing an existing GKE Standard cluster that already has GKE Pod Snapshots enabled, you must disable the native addon to avoid host agent socket conflicts:
-```bash
-gcloud container clusters update <YOUR_CLUSTER> \
-  --disable-pod-snapshots \
-  --zone=<YOUR_ZONE> \
-  --project=<YOUR_PROJECT>
-```
-
-### Step 0.5: Install cert-manager
+### Step 2: Install cert-manager
 Install cert-manager to generate and manage TLS certificates for the admission webhooks:
 ```bash
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.0/cert-manager.yaml
 kubectl wait --for=condition=Available --timeout=5m -n cert-manager deployment/cert-manager-webhook
 ```
 
-### Step 1: Provision gVisor Node Pool
+### Step 3: Provision gVisor Node Pool
 Create a GKE node pool with gVisor sandboxing enabled:
 ```bash
 gcloud container node-pools create gvisor-pool \
-  --cluster=<YOUR_CLUSTER> \
+  --cluster=pod-migration-cluster \
   --sandbox=type=gvisor \
   --machine-type=n2-standard-4 \
   --num-nodes=2 \
@@ -82,118 +82,110 @@ gcloud container node-pools create gvisor-pool \
   --project=<YOUR_PROJECT>
 ```
 
-### Step 1.2: Install Pod Snapshot CRDs
-Install the Pod Snapshot CRDs into the cluster:
-```bash
-kubectl apply -f patches/crds/
-```
-
-### Step 1.5: Configure Snapshot Storage & Workload Identity
-
-Run the provided setup script to automatically create the GCS bucket, configure IAM permissions for Workload Identity, and apply the `PodSnapshotStorageConfig` (PSSC) manifest named `lpm-test-storage`:
+### Step 4: Configure Snapshot Storage & Workload Identity
+Run the provided setup script to automatically create the GCS bucket, configure IAM permissions for Workload Identity, and create the test Kubernetes Service Account (KSA):
 
 ```bash
 chmod +x patches/setup-storage.sh
-./patches/setup-storage.sh
-```
-
-You can optionally pass custom values for Project ID, Bucket Name, and Region:
-```bash
 ./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]
 ```
 
-### Step 2: Deploy containerd-shim patch & Custom Agent (Automated DaemonSets)
+*This script performs the following:*
+- Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access and soft-delete disabled.
+- Binds IAM roles `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and the GKE container engine robot service account.
+- Creates KSA `pm-test-ksa` in the `default` namespace.
 
-Since the GKE native Pod Snapshot addon is disabled, you must deploy both a containerd-shim patch (to intercept OCI lifecycle calls) and our custom host agent (to coordinate the snapshot uploads).
+*(Note: The script may attempt to apply a static PSSC named `lpm-test-storage`. The Pod Migration Controller will dynamically generate its own PSSC (`pssc-<hash>`) when you deploy the `PodMigration` resource, so the static PSSC is redundant).*
 
-1. **Retrieve the precompiled binary and build the patcher image:**
-   Retrieve the precompiled `containerd-shim-runsc-v1` binary (or compile it manually).
+### Step 5: Install CRDs
+Install the custom resource definitions for the pod migration controller (PodMigrations and PodMigrationJobs):
+```bash
+kubectl apply -f controller/config/crd/bases/
+```
+*(Note: The GKE Pod Snapshot CRDs are installed automatically by the native addon).*
 
-   > [!NOTE]
-   > `<YOUR_REGISTRY>` refers to your container image registry. If you are using Google Cloud and do not have an Artifact Registry repository created, you can create one (e.g., named `pm-poc` in `us-central1`) using the following command:
-   > ```bash
-   > gcloud artifacts repositories create pm-poc \
-   >   --repository-format=docker \
-   >   --location=us-central1 \
-   >   --description="Docker repository for Pod Migration"
-   > ```
-   > The registry path format to use is: `us-central1-docker.pkg.dev/<YOUR_PROJECT>/pm-poc`.
+### Step 6: Deploy the Pod Migration Controller & Webhooks
+The controller manager orchestrates the migration lifecycle and hosts the admission webhooks, including the scheduling gate and the status mutating webhook for Job rescheduling.
 
-   Then, build the container image using the provided Dockerfile:
-   ```bash
-   docker build -t <YOUR_REGISTRY>/node-patcher:latest -f patches/Dockerfile.patcher patches/
-   docker push <YOUR_REGISTRY>/node-patcher:latest
-   ```
+1.  **Build and push the controller image:**
 
-2. **Deploy the patcher DaemonSet and verify rollout:**
-   Deploy the DaemonSet by replacing the `<PATCHER_IMAGE>` placeholder on the fly:
-   ```bash
-   sed 's|<PATCHER_IMAGE>|<YOUR_REGISTRY>/node-patcher:latest|' patches/node-patcher-daemonset.yaml | kubectl apply -f -
-   kubectl rollout status daemonset/node-patcher -n kube-system
-   ```
+    ```bash
+    docker build -t <YOUR_REGISTRY>/pod-migration-controller:latest -f controller/Dockerfile controller/
+    docker push <YOUR_REGISTRY>/pod-migration-controller:latest
+    ```
 
-3. **Deploy the Custom Host Agent:**
-   The custom agent needs to run with workload identity permissions to upload snapshots to GCS. 
-   
-   First, build and push your custom agent image to `<YOUR_REGISTRY>/custom-pod-snapshot-agent:latest`.
-   
-   Then, edit `patches/custom-agent.yaml` to replace the following placeholders with your actual cluster details:
-   *   `<YOUR_AGENT_IMAGE>`: The agent image you just pushed.
-   *   `<YOUR_PROJECT_ID>`: Your GCP Project ID.
-   *   `<YOUR_PROJECT_NUMBER>`: Your GCP Project Number.
-   *   `<YOUR_CLUSTER_ZONE>`: The zone of your GKE cluster.
-   *   `<YOUR_CLUSTER_NAME>`: The name of your GKE cluster.
-   
-   Apply the manifest and wait for rollout:
-   ```bash
-   kubectl apply -f patches/custom-agent.yaml
-   kubectl rollout status daemonset/custom-pod-snapshot-agent -n default
-   ```
+2.  **Configure the GCS Bucket:**
 
-### Step 3: Register Webhooks & Policies
-Deploy the Mutating Webhook (for memory headroom injection and JVM flags) and Validating Policies (to reject incompatible BEAM/fsnotify workloads):
+    Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots:
+
+    ```yaml
+    spec:
+      storage:
+        location: gs://<YOUR_BUCKET_NAME>/snapshots
+    ```
+
+3.  **Deploy the Controller:**
+
+    Apply the manifests by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:
+
+    ```bash
+    sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
+    
+    # Apply the storage config
+    kubectl apply -f controller/podmigration-config.yaml
+    
+    # Verify deployment status
+    kubectl rollout status deployment/pod-migration-controller -n pod-migration-system
+    ```
+
+### Step 7: Deploy Validating Policies (Optional)
+To reject incompatible workloads (e.g. BEAM/fsnotify) at admission time:
 ```bash
 kubectl apply -f patches/gke-pod-snapshot-admission-webhook.yaml
 ```
 
-### Step 4: Deploy the Pod Migration Controller
-Deploy the Pod Migration Controller manager to handle the lifecycle and coordination of pod migrations:
+---
 
-1. **Build and push the controller image:**
-   Build the controller image from the `controller/` directory and push it to your registry:
-   ```bash
-   docker build -t <YOUR_REGISTRY>/pod-migration-controller:latest -f controller/Dockerfile controller/
-   docker push <YOUR_REGISTRY>/pod-migration-controller:latest
-   ```
+## 2.5 Job Rescheduling Configuration
 
-2. **Configure the GCS Bucket:**
-   Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots:
-   ```yaml
-   spec:
-     storage:
-       location: gs://<YOUR_BUCKET_NAME>/snapshots
-   ```
+To support resilient rescheduling of Jobs during migration, the system uses a **Status Mutating Webhook** combined with Kubernetes **Job Pod Failure Policy**.
 
-3. **Deploy the Controller:**
-   Apply the CRDs and deploy the controller by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:
-   ```bash
-   # Apply the Custom Resource Definitions first
-   kubectl apply -f controller/config/crd/bases/
+### How it works:
+1. When a migrating Job Pod is terminated, the `pod-migration-controller`'s status mutating webhook (`/mutate-v1-pod-status`) intercepts the status update.
+2. It mutates the Pod phase to `Failed` and sets the container exit code to `137`.
+3. The Job controller interprets this exit code according to the Job's `podFailurePolicy`.
+4. If configured correctly, the Job controller ignores this failure and recreates the Pod (which then restores from the snapshot) without counting it against the Job's `backoffLimit` retry budget.
 
-   # Deploy the controller deployment
-   sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
-   
-   # Apply the storage config
-   kubectl apply -f controller/podmigration-config.yaml
-   
-   # Verify deployment status
-   kubectl rollout status deployment/pod-migration-controller -n pod-migration-system
-   ```
+### Job Configuration Example:
+To enable this, your Job manifest must:
+1. Enable migration via labels.
+2. Configure `podFailurePolicy` to `Ignore` exit code `137`.
 
-### Patch Dependency & Upstream Progress
-> [!NOTE]
-> The node-level lifecycle patches required for this live-migration setup are currently pending upstream GKE platform enhancements.
-> This precompiled binary DaemonSet setup is a temporary developer preview testing utility that bridges the gap until these enhancements are natively integrated into GKE node images.
+Here is an example snippet (from `verification-suite/manifests/pm-go-job.yaml`):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pm-go-job
+spec:
+  backoffLimit: 4
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onExitCodes:
+          operator: In
+          values: [137]
+  template:
+    metadata:
+      labels:
+        pod-migration.gke.io/enabled: "true"
+        live-migration.gke.io/enabled: "true"
+    spec:
+      runtimeClassName: gvisor
+      restartPolicy: Never
+      # ... rest of the spec
+```
 
 ---
 
@@ -331,6 +323,7 @@ Exec into the restored pod to fetch the seeded key and confirm state durability:
 ```bash
 kubectl exec pm-valkey-0 -- valkey-cli get testkey
 # Expected output: "mkey-data-123"
+```
 
 ---
 
@@ -356,4 +349,3 @@ To override this check and perform cleanup:
    kubectl patch validatingadmissionpolicybinding gke-pod-snapshot-vap-binding \
      --type=json -p='[{"op": "replace", "path": "/spec/validationActions", "value": ["Deny", "Audit"]}]'
    ```
-```
