@@ -100,10 +100,10 @@ func TestDeferredEvictionReconciler(t *testing.T) {
 				createPod("pod-deferred", true, true, false, "node-1", false),
 				createPod("pod-candidate", true, false, false, "node-1", false),
 			},
-			targetPodKey:              client.ObjectKey{Namespace: "default", Name: "pod-deferred"},
-			expectedEvictedPods:       []string{"pod-candidate"},
+			targetPodKey:        client.ObjectKey{Namespace: "default", Name: "pod-deferred"},
+			expectedEvictedPods: []string{"pod-candidate"},
 			expectedDeferredPodLabels: map[string]string{
-				"pod-migration.gke.io/enabled":                    "true",
+				"pod-migration.gke.io/enabled":                     "true",
 				"pod-migration.gke.io/deferred-eviction-processed": "true",
 			},
 			expectedRequeue: false,
@@ -128,7 +128,7 @@ func TestDeferredEvictionReconciler(t *testing.T) {
 			targetPodKey:        client.ObjectKey{Namespace: "default", Name: "pod-deferred"},
 			expectedEvictedPods: nil,
 			expectedDeferredPodLabels: map[string]string{
-				"pod-migration.gke.io/enabled":                    "true",
+				"pod-migration.gke.io/enabled":                     "true",
 				"pod-migration.gke.io/deferred-eviction-processed": "true",
 			},
 			expectedRequeue: false,

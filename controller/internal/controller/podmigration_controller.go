@@ -105,47 +105,6 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// 2. Reconcile PodSnapshotPolicy for onDelete (Namespaced)
-	pspOnDeleteName := fmt.Sprintf("psp-%s-on-delete", req.Name)
-	pspOnDelete := &unstructured.Unstructured{}
-	pspOnDelete.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotPolicy",
-	})
-	pspOnDelete.SetName(pspOnDeleteName)
-	pspOnDelete.SetNamespace(req.Namespace)
-
-	specPayloadOnDelete := map[string]interface{}{
-		"storageConfigName": psscName,
-		"selector": map[string]interface{}{
-			"matchExpressions": []interface{}{
-				map[string]interface{}{
-					"key":      "pod-migration.gke.io/enabled",
-					"operator": "In",
-					"values":   []string{"true"},
-				},
-				map[string]interface{}{
-					"key":      "pod-migration.gke.io/trigger",
-					"operator": "NotIn",
-					"values":   []string{"manual"},
-				},
-			},
-		},
-		"triggerConfig": map[string]interface{}{
-			"type":           "onDelete",
-			"postCheckpoint": "stop",
-		},
-	}
-	pspOnDelete.Object["spec"] = specPayloadOnDelete
-
-	logger.Info("Syncing PodSnapshotPolicy (onDelete)", "name", pspOnDeleteName, "namespace", req.Namespace)
-	err = r.syncResource(ctx, pspOnDelete)
-	if err != nil {
-		logger.Error(err, "Failed to sync PodSnapshotPolicy (onDelete)")
-		return ctrl.Result{}, err
-	}
-
 	// 3. Reconcile PodSnapshotPolicy for manual (Namespaced)
 	pspManualName := fmt.Sprintf("psp-%s-manual", req.Name)
 	pspManual := &unstructured.Unstructured{}

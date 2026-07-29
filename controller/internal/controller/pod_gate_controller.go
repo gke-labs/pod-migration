@@ -170,6 +170,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 	}
+
 	if latestSnap != nil {
 		// Check if we need to promote it
 		hasReady := false
@@ -195,6 +196,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{Requeue: true}, nil
 		}
 	}
+
 	if !readyTime.IsZero() {
 		// Snapshot is ready. Check if we should wait for cache sync.
 		elapsed := time.Since(readyTime)

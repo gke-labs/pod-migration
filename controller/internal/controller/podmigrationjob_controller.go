@@ -67,9 +67,25 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
-		// In Path A, we skip triggering a manual snapshot and let the agent's onDelete
-		// trigger handle it inside Kubelet's StopContainer hook.
-		// We transition directly to Snapshotting to wait for the onDelete snapshot.
+		logger.Info("Creating PodSnapshotManualTrigger", "trigger", triggerName)
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		trigger.SetName(triggerName)
+		trigger.SetNamespace(req.Namespace)
+		trigger.Object["spec"] = map[string]interface{}{
+			"targetPod": podName,
+		}
+
+		err = r.Create(ctx, trigger)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			logger.Error(err, "Failed to create PodSnapshotManualTrigger")
+			return ctrl.Result{}, err
+		}
+
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
 		err = r.Status().Update(ctx, job)
 		if err != nil {

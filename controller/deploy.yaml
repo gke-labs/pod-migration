@@ -256,3 +256,28 @@ webhooks:
         operations: ["CREATE"]
         resources: ["pods"]
         scope: Namespaced
+
+  - name: mpodstatus.podmigration.gke.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        namespace: pod-migration-system
+        name: webhook-service
+        path: /mutate-v1-pod-status
+        port: 443
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - pod-migration-system
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods/status"]
+        scope: Namespaced
+

@@ -115,6 +115,10 @@ func main() {
 		setupLog.Error(err, "unable to register replacement mutating webhook")
 		os.Exit(1)
 	}
+	if err := pmwebhook.SetupStatusWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to register pod status mutating webhook")
+		os.Exit(1)
+	}
 
 	// --- Health/readiness probes --------------------------------------------
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

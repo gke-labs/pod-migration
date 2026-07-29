@@ -5,8 +5,15 @@ metadata:
   namespace: default
 spec:
   backoffLimit: 4
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onExitCodes:
+          operator: In
+          values: [137]
   template:
     metadata:
+
       labels:
         app: pm-node-job
         live-migration.gke.io/enabled: "true"

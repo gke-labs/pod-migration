@@ -1,0 +1,416 @@
+{
+  "addonsConfig": {
+    "dnsCacheConfig": {
+      "enabled": true
+    },
+    "gcePersistentDiskCsiDriverConfig": {
+      "enabled": true
+    },
+    "kubernetesDashboard": {
+      "disabled": true
+    },
+    "networkPolicyConfig": {
+      "disabled": true
+    },
+    "nodeReadinessConfig": {}
+  },
+  "anonymousAuthenticationConfig": {
+    "mode": "LIMITED"
+  },
+  "autopilot": {},
+  "autoscaling": {
+    "autoprovisioningNodePoolDefaults": {
+      "imageType": "COS_CONTAINERD",
+      "management": {
+        "autoRepair": true,
+        "autoUpgrade": true
+      },
+      "oauthScopes": [
+        "https://www.googleapis.com/auth/devstorage.read_only",
+        "https://www.googleapis.com/auth/logging.write",
+        "https://www.googleapis.com/auth/monitoring",
+        "https://www.googleapis.com/auth/service.management.readonly",
+        "https://www.googleapis.com/auth/servicecontrol",
+        "https://www.googleapis.com/auth/trace.append"
+      ],
+      "serviceAccount": "default"
+    },
+    "autoscalingProfile": "BALANCED"
+  },
+  "clusterIpv4Cidr": "10.84.0.0/14",
+  "controlPlaneEgress": {
+    "mode": "VIA_CONTROL_PLANE"
+  },
+  "controlPlaneEndpointsConfig": {
+    "dnsEndpointConfig": {
+      "allowExternalTraffic": false,
+      "enableK8sCertsViaDns": false,
+      "enableK8sTokensViaDns": false,
+      "endpoint": "gke-2d9d989ab3b5404a888544793cba8b92f7cd-970732576486.us-central1-a.gke.goog"
+    },
+    "ipEndpointsConfig": {
+      "authorizedNetworksConfig": {},
+      "enablePublicEndpoint": true,
+      "enabled": true,
+      "privateEndpoint": "10.128.0.67",
+      "publicEndpoint": "34.46.230.75"
+    }
+  },
+  "createTime": "2026-07-27T15:20:16+00:00",
+  "currentMasterVersion": "1.36.2-gke.1498000",
+  "currentNodeCount": 3,
+  "currentNodeVersion": "1.36.2-gke.1498000",
+  "databaseEncryption": {
+    "currentState": "CURRENT_STATE_DECRYPTED",
+    "state": "DECRYPTED"
+  },
+  "defaultMaxPodsConstraint": {
+    "maxPodsPerNode": "110"
+  },
+  "endpoint": "34.46.230.75",
+  "enterpriseConfig": {
+    "clusterTier": "STANDARD"
+  },
+  "etag": "982ee0e3-b27c-41c7-bf4b-113df4decd7f",
+  "id": "2d9d989ab3b5404a888544793cba8b92f7cd74c8a4b84620a7f8e865b0bc6304",
+  "initialClusterVersion": "1.36.2-gke.1498000",
+  "instanceGroupUrls": [
+    "https://www.googleapis.com/compute/v1/projects/yaoluo-gke-dev/zones/us-central1-a/instanceGroupManagers/gke-pod-migration-cluste-default-pool-a3f41939-grp",
+    "https://www.googleapis.com/compute/v1/projects/yaoluo-gke-dev/zones/us-central1-a/instanceGroupManagers/gke-pod-migration-cluster-gvisor-pool-b01075a3-grp"
+  ],
+  "ipAllocationPolicy": {
+    "clusterIpv4Cidr": "10.84.0.0/14",
+    "clusterIpv4CidrBlock": "10.84.0.0/14",
+    "clusterSecondaryRangeName": "gke-pod-migration-cluster-yaoluo-pods-2d9d989a",
+    "defaultPodIpv4RangeUtilization": 0.003,
+    "networkTierConfig": {
+      "networkTier": "NETWORK_TIER_DEFAULT"
+    },
+    "podCidrOverprovisionConfig": {},
+    "servicesIpv4Cidr": "34.118.224.0/20",
+    "servicesIpv4CidrBlock": "34.118.224.0/20",
+    "stackType": "IPV4",
+    "useIpAliases": true
+  },
+  "labelFingerprint": "a9dc16a7",
+  "legacyAbac": {},
+  "location": "us-central1-a",
+  "locations": [
+    "us-central1-a"
+  ],
+  "loggingConfig": {
+    "componentConfig": {
+      "enableComponents": [
+        "SYSTEM_COMPONENTS",
+        "WORKLOADS"
+      ]
+    }
+  },
+  "loggingService": "logging.googleapis.com/kubernetes",
+  "maintenancePolicy": {
+    "resourceVersion": "e3b0c442"
+  },
+  "masterAuth": {
+    "clientCertificateConfig": {},
+    "clusterCaCertificate": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVMRENDQXBTZ0F3SUJBZ0lRVFVpcTc2UkpzVUtjcU56cW11ZjJsVEFOQmdrcWhraUc5dzBCQVFzRkFEQXYKTVMwd0t3WURWUVFERXlRd1pUUmlOV1U1TmkwME16STFMVFExWkRBdFlXWmtPUzFoTm1JeU9HRXlZalkyTm1FdwpJQmNOTWpZd056STNNVFF5TURFM1doZ1BNakExTmpBM01Ua3hOVEl3TVRkYU1DOHhMVEFyQmdOVkJBTVRKREJsCk5HSTFaVGsyTFRRek1qVXRORFZrTUMxaFptUTVMV0UyWWpJNFlUSmlOalkyWVRDQ0FhSXdEUVlKS29aSWh2Y04KQVFFQkJRQURnZ0dQQURDQ0FZb0NnZ0dCQU1XbFRIVGVwTTRza3MrYzVHMFhyUDVobkVDNWxyMGZTVy9qK3FxNwpnVmlmc09MbGxFb0hHdmJNL3VST25sSnBCS2NiUVFKdU9EaXIzR2YvdUM1U3NVTG9zSVBjcjVxV3dKdnR2T3d0CmJUbENBMCt0dFh2RnNpaDFsekppaFpaMEE5azlESlR0QWVqZlh2QWZ4MmFqYkRheHQ5RWN5Y3JXa29qT3VmNjUKSjFBQnhZVUlIdDhSUlZRcHBOWWJ2R0hNdkpzYUZITlkyMFdGeHhzTmlHdDEvUjdlY2g3OWVmcnpYQkttVUtyWQpLdE1XK0wyTXZzS3FCVW5SanpQaHhlVnVlcmdHYzBTMXBycCtYUFpxc2Vjd0xxU1o0OWE4M2cwMldnRUMyWnc5CkRWV3VTRU55NFRjbVVRdHNnTjZZR1BWdkNPa1JUb0FsVmxjd3pOMEpSaHFldFFoakVCdmI1S1VaY1haN0xzUTQKU1gvV043UXFBY2h1Q0lRN3V0RElVbDFGOTVGb1B6TDRCWndCVkljU0ZwYmRBNnVKSkQ3WEtqSmF2Mk9aclMwdApXR3NtcEE0M1h0RGNCRFdwZk04UmlBUnZiRW5uT1lWNmJXdkhNMjdYVkxOVmEwWnVmT3RRWGRTdmhRbDBjWENnClVjYzZZVFVYeXA1c2h6emlJR3Z2UGxMT25RSURBUUFCbzBJd1FEQU9CZ05WSFE4QkFmOEVCQU1DQWdRd0R3WUQKVlIwVEFRSC9CQVV3QXdFQi96QWRCZ05WSFE0RUZnUVUxM09INWFTN1E3Z3Y2K2x6YjFXdk9UNVhic0l3RFFZSgpLb1pJaHZjTkFRRUxCUUFEZ2dHQkFFZGdXTDlnTXQvSzdENmNwSUpwV2VjeHZNV3NNOHkvcHJlWDh4K1M2S1RxCmhtM2p4WDBLNnJWL2hObTFHVVB2MDhYUXR0S3puV1pBUVlndm9YQzNuSTBVbUFYWmFmaVQ1NjBWZi80Vk9IUS8Kck5lK3I2NzNyRStlZHhsWFhYS1JQTTBWQktIRGZTc3dtMUg0anE1Q0JxakJ3dkRoZC9RUVNUNGF2M21wdnRZNQpyK3N2cE1heFlWSFVpTS9uZGlVbFp3ZC8zRWljMmRBNUkxL1QxbVZySTlXS1VGZCsrZjZZeGNya1FKYnBncFlUCnlzK1h4dGlmc1cyL1ZkMHEwcEcvZEV3Tmd4WXAzNW1lUlI5U2owaWY5dFFJNkFmK2FOeGo2cWFDTFdrVld3NU0KL1NjS1VWbUhOa2cxWXhLNjVya0k5b3ZZZFVFMGc1Y3hsMDgvbUowS1c5TTU2ODVlRDkvN055ZHk3TWpFY2RoTgovZzErek9JcTYwbjh2b3NTMkJJWXkwNnVGeHpiVDNxdFZTaUdEb0lDVHZLQ3N5SUsvUzJpaVMxUXhjNjhuVW03CnBkRmJHN2ZCOFBsVjZ2eVV2Uy9mV2pQOWRGdkNlcElmVWc1MWwyTzh4bTN1eWt4RW9rOVVPQ0lBN3R0N2NkTEoKT2tqaEJWSlBzemhuZm1xSFlycVBDUT09Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K"
+  },
+  "masterAuthorizedNetworksConfig": {},
+  "monitoringConfig": {
+    "advancedDatapathObservabilityConfig": {},
+    "componentConfig": {
+      "enableComponents": [
+        "SYSTEM_COMPONENTS",
+        "STORAGE",
+        "HPA",
+        "POD",
+        "DAEMONSET",
+        "DEPLOYMENT",
+        "STATEFULSET",
+        "CADVISOR",
+        "KUBELET",
+        "DCGM",
+        "JOBSET"
+      ]
+    },
+    "managedPrometheusConfig": {
+      "enabled": true
+    }
+  },
+  "monitoringService": "monitoring.googleapis.com/kubernetes",
+  "name": "pod-migration-cluster-yaoluo",
+  "network": "default",
+  "networkConfig": {
+    "network": "projects/yaoluo-gke-dev/global/networks/default",
+    "serviceExternalIpsConfig": {},
+    "subnetwork": "projects/yaoluo-gke-dev/regions/us-central1/subnetworks/default"
+  },
+  "nodeConfig": {
+    "bootDisk": {
+      "diskType": "pd-balanced",
+      "sizeGb": "100"
+    },
+    "diskSizeGb": 100,
+    "diskType": "pd-balanced",
+    "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
+    "imageType": "COS_CONTAINERD",
+    "kubeletConfig": {
+      "insecureKubeletReadonlyPortEnabled": false,
+      "maxParallelImagePulls": 2
+    },
+    "machineType": "e2-medium",
+    "metadata": {
+      "disable-legacy-endpoints": "true"
+    },
+    "nodeImageConfig": {
+      "image": "gke-1362-gke1498000-cos-129-19506-224-80-c-pre",
+      "imageProject": "gke-node-images"
+    },
+    "oauthScopes": [
+      "https://www.googleapis.com/auth/devstorage.read_only",
+      "https://www.googleapis.com/auth/logging.write",
+      "https://www.googleapis.com/auth/monitoring",
+      "https://www.googleapis.com/auth/service.management.readonly",
+      "https://www.googleapis.com/auth/servicecontrol",
+      "https://www.googleapis.com/auth/trace.append"
+    ],
+    "resourceLabels": {
+      "goog-gke-node-pool-provisioning-model": "on-demand"
+    },
+    "serviceAccount": "default",
+    "shieldedInstanceConfig": {
+      "enableIntegrityMonitoring": true
+    },
+    "windowsNodeConfig": {},
+    "workloadMetadataConfig": {
+      "mode": "GKE_METADATA"
+    }
+  },
+  "nodeCreationConfig": {
+    "nodeCreationMode": "VIA_KUBELET"
+  },
+  "nodePoolAutoConfig": {
+    "nodeKubeletConfig": {
+      "insecureKubeletReadonlyPortEnabled": false
+    }
+  },
+  "nodePoolDefaults": {
+    "nodeConfigDefaults": {
+      "loggingConfig": {
+        "variantConfig": {
+          "variant": "DEFAULT"
+        }
+      },
+      "nodeKubeletConfig": {
+        "insecureKubeletReadonlyPortEnabled": false
+      }
+    }
+  },
+  "nodePools": [
+    {
+      "config": {
+        "bootDisk": {
+          "diskType": "pd-balanced",
+          "sizeGb": "100"
+        },
+        "diskSizeGb": 100,
+        "diskType": "pd-balanced",
+        "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
+        "imageType": "COS_CONTAINERD",
+        "kubeletConfig": {
+          "insecureKubeletReadonlyPortEnabled": false,
+          "maxParallelImagePulls": 2
+        },
+        "machineType": "e2-medium",
+        "metadata": {
+          "disable-legacy-endpoints": "true"
+        },
+        "nodeImageConfig": {
+          "image": "gke-1362-gke1498000-cos-129-19506-224-80-c-pre",
+          "imageProject": "gke-node-images"
+        },
+        "oauthScopes": [
+          "https://www.googleapis.com/auth/devstorage.read_only",
+          "https://www.googleapis.com/auth/logging.write",
+          "https://www.googleapis.com/auth/monitoring",
+          "https://www.googleapis.com/auth/service.management.readonly",
+          "https://www.googleapis.com/auth/servicecontrol",
+          "https://www.googleapis.com/auth/trace.append"
+        ],
+        "resourceLabels": {
+          "goog-gke-node-pool-provisioning-model": "on-demand"
+        },
+        "serviceAccount": "default",
+        "shieldedInstanceConfig": {
+          "enableIntegrityMonitoring": true
+        },
+        "windowsNodeConfig": {},
+        "workloadMetadataConfig": {
+          "mode": "GKE_METADATA"
+        }
+      },
+      "etag": "104d682c-898a-47fd-ae64-6c6e957af477",
+      "initialNodeCount": 1,
+      "instanceGroupUrls": [
+        "https://www.googleapis.com/compute/v1/projects/yaoluo-gke-dev/zones/us-central1-a/instanceGroupManagers/gke-pod-migration-cluste-default-pool-a3f41939-grp"
+      ],
+      "kubeletCertInfo": {
+        "tpmBootstrapCertExpireTime": "2031-07-26T15:21:31Z"
+      },
+      "locations": [
+        "us-central1-a"
+      ],
+      "management": {
+        "autoRepair": true,
+        "autoUpgrade": true
+      },
+      "maxPodsConstraint": {
+        "maxPodsPerNode": "110"
+      },
+      "name": "default-pool",
+      "networkConfig": {
+        "networkTierConfig": {
+          "networkTier": "NETWORK_TIER_DEFAULT"
+        },
+        "podIpv4CidrBlock": "10.84.0.0/14",
+        "podIpv4RangeUtilization": 0.003,
+        "podRange": "gke-pod-migration-cluster-yaoluo-pods-2d9d989a",
+        "subnetwork": "projects/yaoluo-gke-dev/regions/us-central1/subnetworks/default"
+      },
+      "podIpv4CidrSize": 24,
+      "selfLink": "https://container.googleapis.com/v1/projects/yaoluo-gke-dev/zones/us-central1-a/clusters/pod-migration-cluster-yaoluo/nodePools/default-pool",
+      "status": "RUNNING",
+      "upgradeSettings": {
+        "maxSurge": 1,
+        "strategy": "SURGE"
+      },
+      "version": "1.36.2-gke.1498000"
+    },
+    {
+      "config": {
+        "bootDisk": {
+          "diskType": "pd-balanced",
+          "sizeGb": "100"
+        },
+        "diskSizeGb": 100,
+        "diskType": "pd-balanced",
+        "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
+        "imageType": "COS_CONTAINERD",
+        "kubeletConfig": {
+          "insecureKubeletReadonlyPortEnabled": false,
+          "maxParallelImagePulls": 2
+        },
+        "labels": {
+          "sandbox.gke.io/runtime": "gvisor"
+        },
+        "machineType": "n2-standard-4",
+        "metadata": {
+          "disable-legacy-endpoints": "true"
+        },
+        "nodeImageConfig": {
+          "image": "gke-1362-gke1498000-cos-129-19506-224-80-c-pre",
+          "imageProject": "gke-node-images"
+        },
+        "oauthScopes": [
+          "https://www.googleapis.com/auth/devstorage.read_only",
+          "https://www.googleapis.com/auth/logging.write",
+          "https://www.googleapis.com/auth/monitoring",
+          "https://www.googleapis.com/auth/service.management.readonly",
+          "https://www.googleapis.com/auth/servicecontrol",
+          "https://www.googleapis.com/auth/trace.append"
+        ],
+        "resourceLabels": {
+          "goog-gke-node-pool-provisioning-model": "on-demand"
+        },
+        "sandboxConfig": {
+          "type": "GVISOR"
+        },
+        "serviceAccount": "default",
+        "shieldedInstanceConfig": {
+          "enableIntegrityMonitoring": true
+        },
+        "taints": [
+          {
+            "effect": "NO_SCHEDULE",
+            "key": "sandbox.gke.io/runtime",
+            "value": "gvisor"
+          }
+        ],
+        "windowsNodeConfig": {},
+        "workloadMetadataConfig": {
+          "mode": "GKE_METADATA"
+        }
+      },
+      "etag": "1b1b9c98-fd11-4a64-a5a8-ee2e6c49456e",
+      "initialNodeCount": 2,
+      "instanceGroupUrls": [
+        "https://www.googleapis.com/compute/v1/projects/yaoluo-gke-dev/zones/us-central1-a/instanceGroupManagers/gke-pod-migration-cluster-gvisor-pool-b01075a3-grp"
+      ],
+      "kubeletCertInfo": {
+        "tpmBootstrapCertExpireTime": "2031-07-26T19:33:03Z"
+      },
+      "locations": [
+        "us-central1-a"
+      ],
+      "management": {
+        "autoRepair": true,
+        "autoUpgrade": true
+      },
+      "maxPodsConstraint": {
+        "maxPodsPerNode": "110"
+      },
+      "name": "gvisor-pool",
+      "networkConfig": {
+        "networkTierConfig": {
+          "networkTier": "NETWORK_TIER_DEFAULT"
+        },
+        "podIpv4CidrBlock": "10.84.0.0/14",
+        "podIpv4RangeUtilization": 0.003,
+        "podRange": "gke-pod-migration-cluster-yaoluo-pods-2d9d989a",
+        "subnetwork": "projects/yaoluo-gke-dev/regions/us-central1/subnetworks/default"
+      },
+      "podIpv4CidrSize": 24,
+      "selfLink": "https://container.googleapis.com/v1/projects/yaoluo-gke-dev/zones/us-central1-a/clusters/pod-migration-cluster-yaoluo/nodePools/gvisor-pool",
+      "status": "RUNNING",
+      "upgradeSettings": {
+        "maxSurge": 1,
+        "strategy": "SURGE"
+      },
+      "version": "1.36.2-gke.1498000"
+    }
+  ],
+  "notificationConfig": {
+    "pubsub": {}
+  },
+  "podAutoscaling": {
+    "hpaProfile": "PERFORMANCE"
+  },
+  "privateClusterConfig": {
+    "privateEndpoint": "10.128.0.67",
+    "publicEndpoint": "34.46.230.75"
+  },
+  "rbacBindingConfig": {
+    "enableInsecureBindingSystemAuthenticated": true,
+    "enableInsecureBindingSystemUnauthenticated": true
+  },
+  "releaseChannel": {
+    "channel": "RAPID"
+  },
+  "satisfiesPzi": false,
+  "satisfiesPzs": false,
+  "securityPostureConfig": {
+    "mode": "BASIC",
+    "vulnerabilityMode": "VULNERABILITY_MODE_UNSPECIFIED"
+  },
+  "selfLink": "https://container.googleapis.com/v1/projects/yaoluo-gke-dev/zones/us-central1-a/clusters/pod-migration-cluster-yaoluo",
+  "servicesIpv4Cidr": "34.118.224.0/20",
+  "shieldedNodes": {
+    "enabled": true
+  },
+  "status": "RECONCILING",
+  "subnetwork": "default",
+  "userManagedKeysConfig": {},
+  "workloadIdentityConfig": {
+    "workloadPool": "yaoluo-gke-dev.svc.id.goog"
+  },
+  "zone": "us-central1-a"
+}

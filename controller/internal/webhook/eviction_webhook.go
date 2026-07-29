@@ -24,6 +24,8 @@ import (
 )
 
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
 // EvictionGate handles eviction requests and creates PodMigrationJobs.
 type EvictionGate struct {
 	Client  client.Client
@@ -55,6 +57,12 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
 		logger.Info("Feature not enabled for pod, allowing eviction")
 		return admission.Allowed("feature not enabled")
+	}
+
+	// Check if pod uses gvisor runtime
+	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
+		logger.Info("Pod does not use gvisor runtime, allowing eviction immediately", "runtimeClassName", pod.Spec.RuntimeClassName)
+		return admission.Allowed("Pod does not use gvisor runtime, skipping migration")
 	}
 
 	// Inspect volumes to determine if we should orchestrate migration (Approach 1 for RWO) or let runtime intercept (Approach 2 for RWX/diskless)
@@ -146,7 +154,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		jobLabels["pod-migration.gke.io/parent-kind"] = parentKind
 	}
 
-	// 1. Find matching PodSnapshotPolicy (onDelete)
+	// 1. Find matching PodSnapshotPolicy (manual + stop)
 	pspList := &unstructured.UnstructuredList{}
 	pspList.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "podsnapshot.gke.io",
@@ -178,51 +186,64 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		}
 		if selector.Matches(labels.Set(pod.Labels)) {
 			triggerType, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "type")
-			if err == nil && found && triggerType == "onDelete" {
-				matchingPSPName = psp.GetName()
-				break
+			if err == nil && found && triggerType == "manual" {
+				postCheckpoint, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "postCheckpoint")
+				if err == nil && found && postCheckpoint == "stop" {
+					matchingPSPName = psp.GetName()
+					break
+				}
 			}
 		}
 	}
 
 	if matchingPSPName == "" {
-		logger.Error(nil, "No matching onDelete PodSnapshotPolicy found for pod", "pod", req.Name)
-		return denied429("no matching onDelete PodSnapshotPolicy found")
-	}
-
-	// 2. Synchronously create PodSnapshot CR
-	psName := fmt.Sprintf("%s-snapshot-%s", pod.Name, string(pod.UID)[:8])
-	logger.Info("Creating PodSnapshot CR", "name", psName, "policy", matchingPSPName)
-
-	podSnapshot := &unstructured.Unstructured{}
-	podSnapshot.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshot",
-	})
-	podSnapshot.SetName(psName)
-	podSnapshot.SetNamespace(req.Namespace)
-	podSnapshot.SetLabels(map[string]string{
-		"pod-migration.gke.io/target-pod-uid":  string(pod.UID),
-		"pod-migration.gke.io/target-pod-name": pod.Name,
-	})
-	podSnapshot.SetAnnotations(map[string]string{
-		"podsnapshot.gke.io/origin-pod":        pod.Name,
-		"podsnapshot.gke.io/origin-node":       pod.Spec.NodeName,
-		"podsnapshot.gke.io/pod-snapshot-hash": psName,
-	})
-	podSnapshot.Object["spec"] = map[string]interface{}{
-		"policyName": matchingPSPName,
-	}
-
-	err = a.Client.Create(ctx, podSnapshot)
-	if err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			logger.Info("PodSnapshot already exists, reusing it", "name", psName)
-		} else {
-			logger.Error(err, "Failed to create PodSnapshot")
-			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to create PodSnapshot: %w", err))
+		logger.Info("No matching manual+stop PodSnapshotPolicy found, attempting to create default")
+		// List PodSnapshotStorageConfigs to find one to use
+		psscList := &unstructured.UnstructuredList{}
+		psscList.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotStorageConfigList",
+		})
+		if err := a.Client.List(ctx, psscList); err != nil {
+			logger.Error(err, "Failed to list PodSnapshotStorageConfigs")
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to list PSSCs: %w", err))
 		}
+		if len(psscList.Items) == 0 {
+			logger.Error(nil, "No PodSnapshotStorageConfig found in cluster")
+			return denied429("no matching manual PodSnapshotPolicy found")
+		}
+		psscName := psscList.Items[0].GetName()
+
+		// Create default manual policy
+		defaultPSPName := "psp-default-manual"
+		defaultPSP := &unstructured.Unstructured{}
+		defaultPSP.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		defaultPSP.SetName(defaultPSPName)
+		defaultPSP.SetNamespace(req.Namespace)
+		defaultPSP.Object["spec"] = map[string]interface{}{
+			"storageConfigName": psscName,
+			"selector": map[string]interface{}{
+				"matchLabels": map[string]string{
+					"pod-migration.gke.io/enabled": "true",
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           "manual",
+				"postCheckpoint": "stop",
+			},
+		}
+		err := a.Client.Create(ctx, defaultPSP)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			logger.Error(err, "Failed to create default PodSnapshotPolicy")
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to create default PSP: %w", err))
+		}
+		matchingPSPName = defaultPSPName
+		logger.Info("Created default manual+stop PodSnapshotPolicy", "name", defaultPSPName)
 	}
 
 	// Create new PodMigrationJob
@@ -246,7 +267,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
-	return admission.Allowed("migration job spawned")
+	return denied429("migration job spawned")
 }
 
 func denied429(msg string) admission.Response {
