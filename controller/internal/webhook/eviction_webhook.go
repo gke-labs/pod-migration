@@ -65,38 +65,6 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed("Pod does not use gvisor runtime, skipping migration")
 	}
 
-	// Inspect volumes to determine if we should orchestrate migration (Approach 1 for RWO) or let runtime intercept (Approach 2 for RWX/diskless)
-	hasRWO := false
-	for _, vol := range pod.Spec.Volumes {
-		if vol.PersistentVolumeClaim != nil {
-			pvc := &corev1.PersistentVolumeClaim{}
-			err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					logger.Info("PVC not found, assuming RWO to be safe", "pvc", vol.PersistentVolumeClaim.ClaimName)
-					hasRWO = true
-					break
-				}
-				logger.Error(err, "Failed to get PVC", "pvc", vol.PersistentVolumeClaim.ClaimName)
-				return admission.Errored(http.StatusInternalServerError, err)
-			}
-			for _, mode := range pvc.Spec.AccessModes {
-				if mode == corev1.ReadWriteOnce || mode == corev1.PersistentVolumeAccessMode("ReadWriteOncePod") {
-					hasRWO = true
-					break
-				}
-			}
-			if hasRWO {
-				break
-			}
-		}
-	}
-
-	// if !hasRWO {
-	// 	logger.Info("Workload is diskless or uses only RWX volumes; bypassing eviction webhook for runtime interception")
-	// 	return admission.Allowed("bypassing eviction webhook for RWX/diskless workload")
-	// }
-
 	// Define migration job name
 	jobName := fmt.Sprintf("pmj-%s", req.Name)
 

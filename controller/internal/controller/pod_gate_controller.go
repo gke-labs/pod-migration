@@ -171,32 +171,6 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	if latestSnap != nil {
-		// Check if we need to promote it
-		hasReady := false
-		if status, ok := latestSnap.Object["status"].(map[string]interface{}); ok {
-			if conditions, ok := status["conditions"].([]interface{}); ok {
-				for _, cond := range conditions {
-					if condMap, ok := cond.(map[string]interface{}); ok {
-						if condMap["type"] == "Ready" && condMap["status"] == "True" {
-							hasReady = true
-							break
-						}
-					}
-				}
-			}
-		}
-		if !hasReady {
-			err := r.promoteSnapshotToReady(ctx, latestSnap)
-			if err != nil {
-				logger.Error(err, "Failed to promote snapshot to Ready", "snapshot", latestSnap.GetName())
-				return ctrl.Result{}, err
-			}
-			// Requeue immediately to let cache sync the status update
-			return ctrl.Result{Requeue: true}, nil
-		}
-	}
-
 	if !readyTime.IsZero() {
 		// Snapshot is ready. Check if we should wait for cache sync.
 		elapsed := time.Since(readyTime)
