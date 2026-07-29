@@ -1,12 +1,12 @@
-# GKE Pod Migration (gVisor onDelete Eviction)
+# GKE Pod Migration (Webhook-based Eviction Interception)
 
 This repository contains the blueprints, patches, configuration templates, and E2E verification test suites for GKE Pod Migration. 
 
-Specifically, this implements **Option A: Runtime-layer onDelete Eviction Interception** (using GKE native Pod Snapshots to intercept Pod evictions, checkpoint RAM state to GCS, and restore statefully on target nodes).
+Specifically, this implements the **Manual + Stop Webhook Flow** (using GKE Pod Snapshots with a manual trigger policy configured with `postCheckpoint: stop` to intercept Pod evictions, checkpoint RAM state to GCS, and restore statefully on target nodes).
 
 ---
 
-## 1. Live Migration Compatibility Matrix (E2E Verified)
+## 1. Migration Compatibility Matrix (E2E Verified)
 
 Every workload in this matrix has been verified through real E2E eviction migrations on a GKE Standard node pool.
 
@@ -32,7 +32,6 @@ Every workload in this matrix has been verified through real E2E eviction migrat
 | **kafka** (KRaft) | streaming | ✅ **SURVIVED** | **JVM Metrics Bypass**: Inject environment variable `KAFKA_OPTS="-XX:-UseContainerSupport"` to avoid cgroups mismatch crashes on target nodes. |
 | **postgres** | datastore | ✅ **SURVIVED** | Works out-of-the-box (uses guest POSIX shared memory). Requires setting `PGDATA` to container local directories. |
 | **minio** | datastore | ✅ **SURVIVED** | Redirect storage paths to container writable layers to avoid emptyDir mount walk failures. |
-| **influxdb** | datastore | ✅ **SURVIVED** | Go TSDB (v1) in-memory state restored. |
 | **nginx** | proxy | ✅ **SERVED** | Stateless proxies restore and handle reconnected traffic. |
 | **haproxy** | proxy | ✅ **SERVED** | Stateless proxies restore and handle reconnected traffic. |
 | **traefik** | proxy | ✅ **SERVED** | Stateless routers restore and handle reconnected traffic. |
@@ -52,7 +51,7 @@ Every workload in this matrix has been verified through real E2E eviction migrat
 
 To deploy this live migration runtime to your GKE test cluster using the native GKE Pod Snapshots:
 
-### Step 1: Create GKE Cluster & Enable Native Addon
+### Step 1: Create GKE Cluster & Enable Pod Snapshot
 Create a GKE Standard cluster on the Rapid release channel with the GKE Pod Snapshots addon enabled:
 ```bash
 gcloud container clusters create pod-migration-cluster \
@@ -102,7 +101,6 @@ Install the custom resource definitions for the pod migration controller (PodMig
 ```bash
 kubectl apply -f controller/config/crd/bases/
 ```
-*(Note: The GKE Pod Snapshot CRDs are installed automatically by the native addon).*
 
 ### Step 6: Deploy the Pod Migration Controller & Webhooks
 The controller manager orchestrates the migration lifecycle and hosts the admission webhooks, including the scheduling gate and the status mutating webhook for Job rescheduling.
@@ -146,7 +144,7 @@ kubectl apply -f patches/gke-pod-snapshot-admission-webhook.yaml
 
 ---
 
-## 2.5 Job Rescheduling Configuration
+## 3. Job Rescheduling Configuration
 
 To support resilient rescheduling of Jobs during migration, the system uses a **Status Mutating Webhook** combined with Kubernetes **Job Pod Failure Policy**.
 
@@ -189,7 +187,7 @@ spec:
 
 ---
 
-## 3. Workload Verification & Manifest Templates
+## 4. Workload Verification & Manifest Templates
 
 This repository contains production-ready YAML templates for trying out pod migration on your workloads under the `verification-suite/manifests/` directory:
 
@@ -211,16 +209,6 @@ You can run E2E live-migration verification for an application using the driver 
 # Run validation on MySQL
 ./verification-suite/run_app_validation.sh mysql
 ```
-
----
-
-## 4. Live Migration Controller in Action
-
-Below is an execution trace showing the containerd-shim intercepting a node eviction, snapshotting the active Valkey memory state to GCS, and gracefully restoring it on a target node:
-
-![Live Migration Controller Demo](docs/images/controller-demo.png)
-
-*(Note: Replace `docs/images/controller-demo.png` with a captured screenshot or asciicast of your terminal run).*
 
 ---
 
