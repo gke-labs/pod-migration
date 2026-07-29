@@ -42,6 +42,8 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 
 	// Fetch the Pod
 	pod := &corev1.Pod{}
+	// We must query the API server for the Pod because the eviction admission request object
+	// only contains the Eviction subresource payload, which does not carry the parent Pod's labels.
 	err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Name}, pod)
 	if err != nil {
 		if apierrors.IsNotFound(err) {

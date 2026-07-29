@@ -123,12 +123,12 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				map[string]interface{}{
 					"key":      "pod-migration.gke.io/enabled",
 					"operator": "In",
-					"values":   []string{"true"},
+					"values":   []interface{}{"true"},
 				},
 				map[string]interface{}{
 					"key":      "pod-migration.gke.io/trigger",
 					"operator": "In",
-					"values":   []string{"manual"},
+					"values":   []interface{}{"manual"},
 				},
 			},
 		},
