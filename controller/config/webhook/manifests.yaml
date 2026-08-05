@@ -19,7 +19,7 @@ webhooks:
       service:
         namespace: system
         name: webhook-service
-        path: /validate--v1-pod-eviction
+        path: /validate-v1-pod-eviction
         port: 443
       # caBundle: <injected by cert-manager>
     rules:

@@ -211,7 +211,7 @@ webhooks:
       service:
         namespace: pod-migration-system
         name: webhook-service
-        path: /validate--v1-pod-eviction
+        path: /validate-v1-pod-eviction
         port: 443
     namespaceSelector:
       matchExpressions:

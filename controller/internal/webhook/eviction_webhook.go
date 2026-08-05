@@ -261,7 +261,7 @@ func (a *EvictionGate) InjectDecoder(d admission.Decoder) error {
 func SetupEvictionWebhookWithManager(mgr ctrl.Manager) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
-		"/validate--v1-pod-eviction",
+		"/validate-v1-pod-eviction",
 		&admission.Webhook{
 			Handler: &EvictionGate{
 				Client:  mgr.GetClient(),
