@@ -7,7 +7,6 @@ spec:
     metadata:
       labels:
         sandbox: my-python-sandbox
-        live-migration.gke.io/enabled: "true"
         pod-migration.gke.io/enabled: "true"
       annotations:
         test: "yes"

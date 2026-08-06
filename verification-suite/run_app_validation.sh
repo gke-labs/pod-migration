@@ -86,7 +86,7 @@ case "$APP" in
     wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
-    VAL=$(kubectl exec "$POD_NAME" -- redis-cli get migkey)
+    VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- redis-cli get migkey)
     echo "[+] Retrieved value: $VAL"
     
     if [ "$VAL" == "$NONCE" ]; then
@@ -678,7 +678,7 @@ case "$APP" in
     wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
-    VAL=$(kubectl exec "$POD_NAME" -c memcached -- sh -c "printf 'get migkey\r\n' | nc localhost 11211 | sed -n 2p")
+    VAL=$(exec_with_retry kubectl exec "$POD_NAME" -c memcached -- sh -c "printf 'get migkey\r\n' | nc localhost 11211 | sed -n 2p")
     # Clean output (strip trailing carriage returns if any)
     VAL=$(echo "$VAL" | tr -d '\r')
     echo "[+] Retrieved value: $VAL"
@@ -721,7 +721,7 @@ case "$APP" in
     wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
-    VAL=$(kubectl exec "$POD_NAME" -- valkey-cli get migkey)
+    VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- valkey-cli get migkey)
     echo "[+] Retrieved value: $VAL"
     
     if [ "$VAL" == "$NONCE" ]; then
@@ -762,7 +762,7 @@ case "$APP" in
     wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
-    VAL=$(kubectl exec "$POD_NAME" -- etcdctl get migkey --print-value-only)
+    VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- etcdctl get migkey --print-value-only)
     # Clean output
     VAL=$(echo "$VAL" | tr -d '\r\n')
     echo "[+] Retrieved value: $VAL"
@@ -868,7 +868,7 @@ case "$APP" in
     wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Verifying state..."
-    VAL=$(kubectl exec "$POD_NAME" -- psql -U postgres -d postgres -t -A -c "SELECT val FROM migtest;")
+    VAL=$(exec_with_retry kubectl exec "$POD_NAME" -- psql -U postgres -d postgres -t -A -c "SELECT val FROM migtest;")
     VAL=$(echo "$VAL" | tr -d '\r\n')
     echo "[+] Retrieved value: $VAL"
     
@@ -917,7 +917,7 @@ case "$APP" in
     wait_for_pod_ready "$NEW_POD_NAME" 120
     
     echo "[*] Verifying state..."
-    RESTORED_ID=$(kubectl exec "$NEW_POD_NAME" -c node -- wget -qO- http://localhost:8080)
+    RESTORED_ID=$(exec_with_retry kubectl exec "$NEW_POD_NAME" -c node -- wget -qO- http://localhost:8080)
     echo "[+] Restored Instance ID: $RESTORED_ID"
     
     if [ "$RESTORED_ID" == "$INITIAL_ID" ]; then
@@ -970,7 +970,7 @@ case "$APP" in
     wait_for_pod_ready "$NEW_POD_NAME" 240
     
     echo "[*] Verifying state..."
-    HEALTH_VAL_RESTORED=$(kubectl exec "$NEW_POD_NAME" -c go-counter -- wget -qO- http://localhost:8080/healthz)
+    HEALTH_VAL_RESTORED=$(exec_with_retry kubectl exec "$NEW_POD_NAME" -c go-counter -- wget -qO- http://localhost:8080/healthz)
     RESTORED_COUNT=$(echo "$HEALTH_VAL_RESTORED" | grep -o 'counter=[0-9]*' | cut -d= -f2)
     RESTORED_INST_ID=$(echo "$HEALTH_VAL_RESTORED" | grep -o 'instance=[a-z0-9]*' | cut -d= -f2)
     echo "[+] Restored count: $RESTORED_COUNT, Instance ID: $RESTORED_INST_ID"

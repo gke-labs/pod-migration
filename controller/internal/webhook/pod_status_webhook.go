@@ -44,6 +44,18 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 		return admission.Allowed("pod not opted in")
 	}
 
+	// Only intercept Pods owned by a Job (StatefulSets/Deployments handle rescheduling natively)
+	isJob := false
+	for _, owner := range pod.OwnerReferences {
+		if owner.Kind == "Job" {
+			isJob = true
+			break
+		}
+	}
+	if !isJob {
+		return admission.Allowed("pod is not owned by a Job")
+	}
+
 	// We only care if the pod is transitioning to Succeeded phase
 	if pod.Status.Phase != corev1.PodSucceeded {
 		return admission.Allowed("pod phase is not Succeeded")

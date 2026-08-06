@@ -285,7 +285,6 @@ spec:
       labels:
         app: jupyterlab
         sandbox: jupyterlab
-        live-migration.gke.io/enabled: "true"
         pod-migration.gke.io/enabled: "true"
       annotations:
         podsnapshot.gke.io/ps-name: "20fc888c-afd2-4d4e-8c53-c67da604f8c1"

@@ -13,7 +13,6 @@ spec:
     metadata:
       labels:
         app: pm-consul
-        live-migration.gke.io/enabled: "true"
         pod-migration.gke.io/enabled: "true"
     spec:
       serviceAccountName: pm-test-ksa

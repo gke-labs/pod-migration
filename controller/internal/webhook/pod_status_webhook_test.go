@@ -94,6 +94,14 @@ func TestPodStatusMutator(t *testing.T) {
 					Labels: map[string]string{
 						"pod-migration.gke.io/enabled": "true",
 					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "test-job",
+							UID:        "job-uid",
+						},
+					},
 				},
 				Status: corev1.PodStatus{
 					Phase: corev1.PodSucceeded,
@@ -123,9 +131,6 @@ func TestPodStatusMutator(t *testing.T) {
 				if len(resp.Patches) == 0 {
 					t.Fatalf("Expected patches, got none")
 				}
-				// Verify mutation results by checking the response patches
-				// A simpler way is to check the JSON patch or just assert the handler modified the object.
-				// Since we are using fake client, we can also check if the handler returns patches.
 				foundPhasePatch := false
 				foundExitCodePatch := false
 				for _, patch := range resp.Patches {
@@ -143,6 +148,44 @@ func TestPodStatusMutator(t *testing.T) {
 				}
 				if !foundExitCodePatch {
 					t.Errorf("Expected patch to change exitCode to 137, but not found. Patches: %v", resp.Patches)
+				}
+			},
+		},
+		{
+			name: "Pod Succeeded with active PMJ but not owned by a Job (Bypasses mutation)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "StatefulSet",
+							Name:       "test-ss",
+							UID:        "ss-uid",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test-pod",
+					},
+				},
+			},
+			subResource:     "status",
+			expectedAllowed: true,
+			verifyMutation: func(t *testing.T, resp admission.Response) {
+				if len(resp.Patches) > 0 {
+					t.Fatalf("Expected no patches, got %d patches", len(resp.Patches))
 				}
 			},
 		},

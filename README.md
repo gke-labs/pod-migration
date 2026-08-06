@@ -1,8 +1,35 @@
-# GKE Pod Migration (Webhook-based Eviction Interception)
+# Pod Migration Controller
 
-This repository contains the blueprints, patches, configuration templates, and E2E verification test suites for GKE Pod Migration. 
+This controller provides **Pod Migration**—the ability to "move" a running Pod from one node to another while preserving its internal runtime state (including memory, CPU registers, and system sockets). It uses [GKE Pod Snapshots](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/pod-snapshots) to reliably capture the state of the pod and restore it. This feature requires the use of the [GKE Sandbox](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods), which is based on the [gVisor](https://gvisor.dev/) container runtime.
 
-Specifically, this implements the **Manual + Stop Webhook Flow** (using GKE Pod Snapshots with a manual trigger policy configured with `postCheckpoint: stop` to intercept Pod evictions, checkpoint RAM state to GCS, and restore statefully on target nodes).
+This controller implements Pod Migration by intercepting eviction requests (e.g. during node drains), triggering manual snapshots with container termination (`postCheckpoint: stop`), and managing the scheduling of replacement pods. This reduces downtime and prevents progress loss from evictions caused by:
+
+- **Node upgrades:** When a node is cordoned and drained, the controller captures the state of the pod, preserving in-progress state for Jobs or reducing warm-restore time for stateful database engines.
+- **VPA evictions:** When Vertical Pod Autoscaler evicts pods for resizing, the controller preserves the pod's state prior to eviction so the newly resized pod can resume normal operation faster.
+- **Other causes:** Responds to manual evictions and third-party controllers triggering Pod evictions.
+
+While this controller mitigates the effects of eviction, the migration is not completely transparent and the application will experience:
+- A change in Pod identity (different Pod name suffix and IP address).
+- Closed network connections that must be re-established by client-side retry logic.
+
+---
+
+## How it Works
+
+The controller is implemented as a custom Operator consisting of the following core components:
+
+### 1. Webhooks
+- **Eviction Interception Webhook (`/validate-eviction`)**: Handled by `EvictionGuard`. Intercepts Pod eviction API calls. If the Pod is opted-in (`pod-migration.gke.io/enabled: "true"`), it denies the eviction request with `429 (Too Many Requests)` to block immediate destruction, and spawns a `PodMigrationJob` (PMJ) CR to orchestrate the migration flow.
+- **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
+
+### 2. Reconcilers
+- **`PodMigration` (Config) Reconciler**: Watches `PodMigration` resources. It automatically provisions the required GKE `PodSnapshotStorageConfig` (PSSC) and manual `PodSnapshotPolicy` (PSP) resources with `postCheckpoint: stop` in the target namespace.
+- **`PodMigrationJob` (Execution) Reconciler**: Coordinates the active migration loop:
+  1. Creates a `PodSnapshotManualTrigger` (PSMT) targeting the source Pod to initiate snapshotting and container termination.
+  2. Monitors the resulting `PodSnapshot` until it becomes `Ready` (uploaded to GCS).
+  3. Waits for the source Pod's volumes to fully detach.
+  4. Deletes the original source Pod.
+- **Pod Gate Reconciler**: Monitors replacement Pods injected with the `gke.io/pod-migration-gate` scheduling gate. It holds them in a pending state and releases the gate only after the snapshot is ready and source volumes have safely detached, preventing replica collisions.
 
 ---
 
@@ -11,15 +38,15 @@ Specifically, this implements the **Manual + Stop Webhook Flow** (using GKE Pod 
 Every workload in this matrix has been verified through real E2E eviction migrations on a GKE Standard node pool.
 
 > [!NOTE]
-> - **Job Rescheduling**: Workloads of type `Job` (e.g., `go`, `node`) are now supported for resilient rescheduling using a Status Mutating Webhook.
-> - **NATS Caveat**: `nats` is marked as flaky due to a transient runtime-level deadlock during checkpointing; see notes below for mitigation.
+> - **Job Rescheduling**: Workloads of type `Job` (e.g., `go`, `node`) are supported for resilient rescheduling using the Status Mutating Webhook.
+> - **NATS Caveat**: `nats` is marked as flaky due to a transient runtime-level deadlock during checkpointing; see troubleshooting notes below.
 
 | Application | Category | Verdict | Required Workarounds & Bypass Configurations |
 | :--- | :--- | :--- | :--- |
-| **node** | app / Job | ✅ **SURVIVED** | Verified both as StatefulSet (connection tokens survive) and Job (rescheduled via webhook). Out-of-the-box support. |
-| **go** | app / Job | ✅ **SURVIVED** | Verified both as StatefulSet (counters survive) and Job (rescheduled via webhook). Out-of-the-box support. |
-| **redis** | datastore | ✅ **SURVIVED** | Pure in-memory key-value store. Extremely fast migration. |
-| **valkey** | datastore | ✅ **SURVIVED** | Pure in-memory key-value store. Extremely fast migration. |
+| **node** | app / Job | ✅ **SURVIVED** | Verified both as StatefulSet and Job (rescheduled via webhook). Out-of-the-box support. |
+| **go** | app / Job | ✅ **SURVIVED** | Verified both as StatefulSet and Job (rescheduled via webhook). Out-of-the-box support. |
+| **redis** | datastore | ✅ **SURVIVED** | Pure in-memory key-value store. Very fast migration. |
+| **valkey** | datastore | ✅ **SURVIVED** | Pure in-memory key-value store. Very fast migration. |
 | **mysql** | datastore | ✅ **SURVIVED** | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`. |
 | **mariadb** | datastore | ✅ **SURVIVED** | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`. |
 | **memcached** | datastore | ✅ **SURVIVED** | Pure in-memory cache blocks restored. |
@@ -27,7 +54,7 @@ Every workload in this matrix has been verified through real E2E eviction migrat
 | **vault** | secrets | ✅ **SURVIVED** | Dev-mode secrets state restored. |
 | **consul** | coordination | ✅ **SURVIVED** | Dev-mode memory key-value databases survive. |
 | **etcd** | coordination | ✅ **SURVIVED** | BoltDB storage writes successfully restored. |
-| **nats** | streaming | ⚠️ **SURVIVED (FLAKY)** | **Deadlock Flake / Retry Caveat**: Memory jetstream offsets restored. Encountered runtime-level deadlock on 1st run (stuck in Terminating). Succeeded on retry. Recommend controller timeout recovery. |
+| **nats** | streaming | ⚠️ **SURVIVED (FLAKY)** | **Deadlock Flake / Retry Caveat**: Memory jetstream offsets restored. Encountered runtime-level deadlock on 1st run. Succeeded on retry. |
 | **zookeeper** | coordination | ✅ **SURVIVED** | **emptyDir Path Redirect**: Redirect `ZOO_DATA_DIR` away from Kubelet `emptyDir` mounts (e.g. to `/tmp/zookeeper`) to prevent walk errors. |
 | **kafka** (KRaft) | streaming | ✅ **SURVIVED** | **JVM Metrics Bypass**: Inject environment variable `KAFKA_OPTS="-XX:-UseContainerSupport"` to avoid cgroups mismatch crashes on target nodes. |
 | **postgres** | datastore | ✅ **SURVIVED** | Works out-of-the-box (uses guest POSIX shared memory). Requires setting `PGDATA` to container local directories. |
@@ -49,7 +76,7 @@ Every workload in this matrix has been verified through real E2E eviction migrat
 
 ## 2. Installation Guide
 
-To deploy this live migration runtime to your GKE test cluster using the native GKE Pod Snapshots:
+To deploy this pod migration runtime to your GKE test cluster using native GKE Pod Snapshots:
 
 ### Step 1: Create GKE Cluster & Enable Pod Snapshot
 Create a GKE Standard cluster on the Rapid release channel with the GKE Pod Snapshots addon enabled:
@@ -81,7 +108,7 @@ gcloud container node-pools create gvisor-pool \
   --project=<YOUR_PROJECT>
 ```
 
-### Step 4: Configure Snapshot Storage & Workload Identity
+### Step 4: One-Time Snapshot Storage & Workload Identity Configuration
 Run the provided setup script to automatically create the GCS bucket, configure IAM permissions for Workload Identity, and create the test Kubernetes Service Account (KSA):
 
 ```bash
@@ -94,28 +121,23 @@ chmod +x patches/setup-storage.sh
 - Binds IAM roles `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and the GKE container engine robot service account.
 - Creates KSA `pm-test-ksa` in the `default` namespace.
 
-*(Note: The script may attempt to apply a static PSSC named `lpm-test-storage`. The Pod Migration Controller will dynamically generate its own PSSC (`pssc-<hash>`) when you deploy the `PodMigration` resource, so the static PSSC is redundant).*
-
 ### Step 5: Install CRDs
-Install the custom resource definitions for the pod migration controller (PodMigrations and PodMigrationJobs):
+Install the custom resource definitions for the pod migration controller:
 ```bash
 kubectl apply -f controller/config/crd/bases/
 ```
 
-### Step 6: Deploy the Pod Migration Controller & Webhooks
-The controller manager orchestrates the migration lifecycle and hosts the admission webhooks, including the scheduling gate and the status mutating webhook for Job rescheduling.
+### Step 6: Deploy the Pod Migration Controller
+The controller manager orchestrates the migration lifecycle and hosts the admission webhooks.
 
 1.  **Build and push the controller image:**
-
     ```bash
     docker build -t <YOUR_REGISTRY>/pod-migration-controller:latest -f controller/Dockerfile controller/
     docker push <YOUR_REGISTRY>/pod-migration-controller:latest
     ```
 
 2.  **Configure the GCS Bucket:**
-
     Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots:
-
     ```yaml
     spec:
       storage:
@@ -123,9 +145,7 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
     ```
 
 3.  **Deploy the Controller:**
-
     Apply the manifests by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:
-
     ```bash
     sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
     
@@ -178,7 +198,6 @@ spec:
     metadata:
       labels:
         pod-migration.gke.io/enabled: "true"
-        live-migration.gke.io/enabled: "true"
     spec:
       runtimeClassName: gvisor
       restartPolicy: Never
@@ -239,78 +258,6 @@ pod/pm-valkey-0 condition met
 [*] Verifying state...
 [+] Retrieved value: valkey-nonce-1718900000
 [SUCCESS] Valkey E2E Live Migration Succeeded. State survived!
-```
-
-#### MySQL Verification
-When running `./verification-suite/run_app_validation.sh mysql`, you should expect logs similar to:
-```
-[*] Deploying MySQL StatefulSet (Native AIO Disabled)...
-statefulset.apps/pm-mysql created
-service/pm-mysql-service created
-[*] Waiting for MySQL pod to be Ready...
-pod/pm-mysql-0 condition met
-[*] Seeding state in MySQL: Table durability_test -> mysql-nonce-1718900000
-[*] Pod is running on node: gke-pod-migration-cluster-gvisor-pool-abcdef-1234
-[*] Draining node gke-pod-migration-cluster-gvisor-pool-abcdef-1234...
-node/gke-pod-migration-cluster-gvisor-pool-abcdef-1234 cordoned
-evicting pod default/pm-mysql-0
-node/gke-pod-migration-cluster-gvisor-pool-abcdef-1234 drained
-[*] Restoring node gke-pod-migration-cluster-gvisor-pool-abcdef-1234 (uncordon)...
-node/gke-pod-migration-cluster-gvisor-pool-abcdef-1234 uncordoned
-[*] Waiting for restored MySQL pod to be Ready...
-pod/pm-mysql-0 condition met
-[*] Verifying state...
-[+] Retrieved value: mysql-nonce-1718900000
-[SUCCESS] MySQL E2E Live Migration Succeeded. State survived!
-```
-
-### Manual Verification Guide
-
-If you prefer to verify pod migration manually or to understand the mechanics, you can use `kubectl` commands.
-
-#### Step 1: Deploy a workload (e.g., Valkey)
-```bash
-kubectl apply -f verification-suite/manifests/pm-valkey-statefulset.yaml
-kubectl wait --for=condition=Ready pod/pm-valkey-0 --timeout=120s
-```
-
-#### Step 2: Seed State Before Eviction
-Exec into the pod to set a value:
-```bash
-kubectl exec pm-valkey-0 -- valkey-cli set testkey "mkey-data-123"
-```
-Verify the value is written:
-```bash
-kubectl exec pm-valkey-0 -- valkey-cli get testkey
-# Expected output: "mkey-data-123"
-```
-
-#### Step 3: Trigger Node Eviction
-Find the node the pod is running on:
-```bash
-NODE=$(kubectl get pod pm-valkey-0 -o jsonpath='{.spec.nodeName}')
-echo "Evicting from node: $NODE"
-```
-Drain the node to trigger pod eviction (and state snapshotting to GCS):
-```bash
-kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
-```
-
-#### Step 4: Uncordon the node
-Make the node schedulable again:
-```bash
-kubectl uncordon "$NODE"
-```
-
-#### Step 5: Verify State After Restoration
-Wait for the pod to become Ready again:
-```bash
-kubectl wait --for=condition=Ready pod/pm-valkey-0 --timeout=120s
-```
-Exec into the restored pod to fetch the seeded key and confirm state durability:
-```bash
-kubectl exec pm-valkey-0 -- valkey-cli get testkey
-# Expected output: "mkey-data-123"
 ```
 
 ---

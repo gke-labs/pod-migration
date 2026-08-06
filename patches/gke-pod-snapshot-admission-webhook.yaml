@@ -27,4 +27,4 @@ spec:
   matchResources:
     namespaceSelector:
       matchLabels:
-        live-migration.gke.io/enabled: "true"
+        pod-migration.gke.io/enabled: "true"

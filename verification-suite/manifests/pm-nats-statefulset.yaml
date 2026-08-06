@@ -13,7 +13,6 @@ spec:
     metadata:
       labels:
         app: pm-nats
-        live-migration.gke.io/enabled: "true"
         pod-migration.gke.io/enabled: "true"
 
     spec:
