@@ -125,23 +125,14 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		jobLabels["pod-migration.gke.io/parent-kind"] = parentKind
 	}
 
-	// 1. Find matching PodSnapshotPolicy (manual)
-	matchingPSP, err := findLatestReadyPSP(ctx, a.Client, req.Namespace, pod.Labels)
+	// 1. Find matching PodSnapshotPolicy (manual + stop)
+	matchingPSP, err := findLatestReadyManualStopPSP(ctx, a.Client, req.Namespace, pod.Labels)
 	if err != nil {
 		logger.Error(err, "Failed to resolve matching PodSnapshotPolicy")
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
-	// 2. Validate policy for Manual + Stop behavior
-	isValid := false
-	if matchingPSP != nil {
-		postCheckpoint, found, err := unstructured.NestedString(matchingPSP.Object, "spec", "triggerConfig", "postCheckpoint")
-		if err == nil && found && postCheckpoint == "stop" {
-			isValid = true
-		}
-	}
-
-	if !isValid {
+	if matchingPSP == nil {
 		logger.Info("No matching ready manual+stop policy found, skipping migration and allowing eviction", "pod", req.Name)
 		return admission.Allowed("skipping migration: no valid manual+stop policy found")
 	}
@@ -218,8 +209,9 @@ func latestUpdate(obj *unstructured.Unstructured) time.Time {
 	return latest
 }
 
-// findLatestReadyPSP finds the latest ready manual PodSnapshotPolicy in the namespace matching the labels.
-func findLatestReadyPSP(ctx context.Context, c client.Client, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {
+// findLatestReadyManualStopPSP finds the latest ready manual PodSnapshotPolicy in the namespace matching the labels,
+// and verifies that its postCheckpoint behavior is set to "stop".
+func findLatestReadyManualStopPSP(ctx context.Context, c client.Client, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {
 	pspList := &unstructured.UnstructuredList{}
 	pspList.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "podsnapshot.gke.io",
@@ -295,5 +287,13 @@ func findLatestReadyPSP(ctx context.Context, c client.Client, namespace string, 
 		return latestUpdate(b).Compare(latestUpdate(a))
 	})
 
-	return matchingPSPs[0], nil
+	latestPSP := matchingPSPs[0]
+
+	// 4. Validate latest policy for "stop" behavior
+	postCheckpoint, found, err := unstructured.NestedString(latestPSP.Object, "spec", "triggerConfig", "postCheckpoint")
+	if err == nil && found && postCheckpoint == "stop" {
+		return latestPSP, nil
+	}
+
+	return nil, nil // Return nil if the latest policy is not a "stop" policy
 }
