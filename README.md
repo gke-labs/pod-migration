@@ -243,20 +243,14 @@ The controller automatically intercepts standard Kubernetes evictions and orches
    ```bash
    kubectl get pod -l app=my-app -o wide
    ```
-2. **Drain the node:**
+2. **Drain the node to trigger eviction:**
    ```bash
    kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
    ```
-3. **Uncordon the node** once the migration starts to make it available again:
+3. **Uncordon the node** once the migration starts to make it available again for rescheduling:
    ```bash
    kubectl uncordon <node-name>
    ```
-
-### Step 3: Verify Restoration
-Wait for the replacement Pod to be created and become `Ready`. The new Pod will automatically restore its internal runtime state from the GCS bucket snapshot:
-```bash
-kubectl wait --for=condition=Ready pod -l app=my-app --timeout=120s
-```
 
 ---
 
