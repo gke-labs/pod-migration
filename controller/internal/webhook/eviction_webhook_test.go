@@ -116,7 +116,7 @@ func TestEvictionGate(t *testing.T) {
 			verifyPMJCreated:   true,
 		},
 		{
-			name: "Trigger migration fails (No Policy)",
+			name: "Bypass migration when no policy found (No Policy)",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "default",
@@ -130,10 +130,31 @@ func TestEvictionGate(t *testing.T) {
 					RuntimeClassName: &gvisorRuntime,
 				},
 			},
-			subResource:        "eviction",
-			expectedAllowed:    false,
-			expectedStatusCode: 429,
-			expectedMessage:    "no matching ready manual PodSnapshotPolicy found. Please ensure PodMigration is reconciled and Ready.",
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "skipping migration: no valid manual+stop policy found",
+		},
+		{
+			name: "Bypass migration when policy has resume instead of stop",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual-resume", "manual", "resume"),
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "skipping migration: no valid manual+stop policy found",
 		},
 		{
 			name: "Pod lacks runtimeClassName",

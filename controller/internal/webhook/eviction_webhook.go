@@ -125,15 +125,25 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		jobLabels["pod-migration.gke.io/parent-kind"] = parentKind
 	}
 
-	// 1. Find matching PodSnapshotPolicy (manual + stop)
+	// 1. Find matching PodSnapshotPolicy (manual)
 	matchingPSP, err := findLatestReadyPSP(ctx, a.Client, req.Namespace, pod.Labels)
 	if err != nil {
 		logger.Error(err, "Failed to resolve matching PodSnapshotPolicy")
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	if matchingPSP == nil {
-		logger.Error(nil, "No matching ready manual+stop PodSnapshotPolicy found for pod")
-		return denied429("no matching ready manual PodSnapshotPolicy found. Please ensure PodMigration is reconciled and Ready.")
+
+	// 2. Validate policy for Manual + Stop behavior
+	isValid := false
+	if matchingPSP != nil {
+		postCheckpoint, found, err := unstructured.NestedString(matchingPSP.Object, "spec", "triggerConfig", "postCheckpoint")
+		if err == nil && found && postCheckpoint == "stop" {
+			isValid = true
+		}
+	}
+
+	if !isValid {
+		logger.Info("No matching ready manual+stop policy found, skipping migration and allowing eviction", "pod", req.Name)
+		return admission.Allowed("skipping migration: no valid manual+stop policy found")
 	}
 
 	// Create new PodMigrationJob
@@ -208,7 +218,7 @@ func latestUpdate(obj *unstructured.Unstructured) time.Time {
 	return latest
 }
 
-// findLatestReadyPSP finds the latest ready manual+stop PodSnapshotPolicy in the namespace matching the labels.
+// findLatestReadyPSP finds the latest ready manual PodSnapshotPolicy in the namespace matching the labels.
 func findLatestReadyPSP(ctx context.Context, c client.Client, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {
 	pspList := &unstructured.UnstructuredList{}
 	pspList.SetGroupVersionKind(schema.GroupVersionKind{
@@ -232,13 +242,7 @@ func findLatestReadyPSP(ctx context.Context, c client.Client, namespace string, 
 			continue
 		}
 
-		// 2. Verify postCheckpoint is stop
-		postCheckpoint, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "postCheckpoint")
-		if err != nil || !found || postCheckpoint != "stop" {
-			continue
-		}
-
-		// 3. Verify labels selector matches
+		// 2. Verify labels selector matches
 		selectorMap, found, err := unstructured.NestedMap(psp.Object, "spec", "selector")
 		if err != nil || !found {
 			continue
@@ -259,7 +263,7 @@ func findLatestReadyPSP(ctx context.Context, c client.Client, namespace string, 
 			continue
 		}
 
-		// 4. Verify status is Ready (condition Ready=True)
+		// 3. Verify status is Ready (condition Ready=True)
 		conditions, found, err := unstructured.NestedSlice(psp.Object, "status", "conditions")
 		if err != nil || !found {
 			continue
