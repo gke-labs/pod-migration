@@ -206,21 +206,66 @@ spec:
 
 ---
 
-## 4. Workload Verification & Manifest Templates
+## 4. How to Use Pod Migration
 
-This repository contains production-ready YAML templates for trying out pod migration on your workloads under the `verification-suite/manifests/` directory:
+To migrate your workload using this controller:
 
+### Step 1: Opt-in your Workload
+Add the label `pod-migration.gke.io/enabled: "true"` to your workload Pod template and ensure the Pod uses the `gvisor` runtime.
+
+Example (Deployment):
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+        pod-migration.gke.io/enabled: "true" # Enables migration orchestration
+    spec:
+      runtimeClassName: gvisor # Required for GKE Pod Snapshots
+      containers:
+        - name: app
+          image: my-app-image:latest
 ```
-verification-suite/manifests/
-├── pm-valkey-statefulset.yaml       # Valkey StatefulSet
-├── pm-mysql-statefulset.yaml        # MySQL (with innodb AIO override)
-├── pm-zookeeper-statefulset.yaml    # Zookeeper (with path redirection)
-├── pm-kafka-statefulset.yaml        # Kafka (with JVM container bypass)
-└── ...
+
+### Step 2: Trigger Migration via Eviction
+The controller automatically intercepts standard Kubernetes evictions and orchestrates the stateful migration. You can trigger this manually (e.g. for testing node upgrades) by draining the node the Pod is running on:
+
+1. **Find the node the Pod is running on:**
+   ```bash
+   kubectl get pod -l app=my-app -o wide
+   ```
+2. **Drain the node:**
+   ```bash
+   kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+   ```
+3. **Uncordon the node** once the migration starts to make it available again:
+   ```bash
+   kubectl uncordon <node-name>
+   ```
+
+### Step 3: Verify Restoration
+Wait for the replacement Pod to be created and become `Ready`. The new Pod will automatically restore its internal runtime state from the GCS bucket snapshot:
+```bash
+kubectl wait --for=condition=Ready pod -l app=my-app --timeout=120s
 ```
+
+---
+
+## 5. Automated Verification (E2E Suite)
+
+This repository contains production-ready YAML templates for trying out pod migration on your workloads under the `verification-suite/manifests/` directory.
 
 ### Running E2E Verification
-You can run E2E live-migration verification for an application using the driver script `verification-suite/run_app_validation.sh`:
+You can run automated E2E pod migration verification for any of the 21 pre-configured applications using the driver script `verification-suite/run_app_validation.sh`:
 ```bash
 # Run validation on Valkey
 ./verification-suite/run_app_validation.sh valkey
@@ -231,7 +276,7 @@ You can run E2E live-migration verification for an application using the driver 
 
 ---
 
-## 5. What to Expect during Verification
+## 6. Expected Verification Output
 
 ### Expected Log Output from `run_app_validation.sh`
 
@@ -262,7 +307,7 @@ pod/pm-valkey-0 condition met
 
 ---
 
-## 6. Troubleshooting & Cleanup
+## 7. Troubleshooting & Cleanup
 
 ### Bypassing GKE Validating Admission Policy for Snapshot Cleanup
 
