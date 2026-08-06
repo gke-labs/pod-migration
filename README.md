@@ -38,7 +38,11 @@ The controller is implemented as a custom Operator consisting of the following c
 Before deploying the Pod Migration Controller, ensure your cluster meets the following requirements:
 
 ### 1. GKE Standard Cluster with Pod Snapshots Enabled
-The cluster must be running on the `Rapid` release channel with the GKE Pod Snapshots addon enabled:
+A GKE Standard cluster with the GKE Pod Snapshots addon enabled.
+- **Minimum GKE Version**: `1.36.0-gke.2253000` or later (required to support GKE Pod Snapshots with VPA and manual triggers).
+- **Release Channel**: Depending on availability in your region, you may need to use the `Rapid` release channel to obtain a compatible version.
+
+Example cluster creation command (using Rapid channel):
 ```bash
 gcloud container clusters create pod-migration-cluster \
   --release-channel=rapid \
