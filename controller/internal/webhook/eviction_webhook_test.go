@@ -42,6 +42,15 @@ func TestEvictionGate(t *testing.T) {
 				"postCheckpoint": postCheckpoint,
 			},
 		}
+		// Inject Ready=True condition in status
+		psp.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
 		return psp
 	}
 
@@ -124,7 +133,7 @@ func TestEvictionGate(t *testing.T) {
 			subResource:        "eviction",
 			expectedAllowed:    false,
 			expectedStatusCode: 429,
-			expectedMessage:    "no matching manual PodSnapshotPolicy found",
+			expectedMessage:    "no matching ready manual PodSnapshotPolicy found. Please ensure PodMigration is reconciled and Ready.",
 		},
 		{
 			name: "Pod lacks runtimeClassName",

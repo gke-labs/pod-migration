@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
+	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -124,95 +126,14 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	}
 
 	// 1. Find matching PodSnapshotPolicy (manual + stop)
-	pspList := &unstructured.UnstructuredList{}
-	pspList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotPolicyList",
-	})
-	if err := a.Client.List(ctx, pspList, client.InNamespace(req.Namespace)); err != nil {
-		logger.Error(err, "Failed to list PodSnapshotPolicies")
-		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to list PSPs: %w", err))
+	matchingPSP, err := findLatestReadyPSP(ctx, a.Client, req.Namespace, pod.Labels)
+	if err != nil {
+		logger.Error(err, "Failed to resolve matching PodSnapshotPolicy")
+		return admission.Errored(http.StatusInternalServerError, err)
 	}
-
-	var matchingPSPName string
-	for _, psp := range pspList.Items {
-		selectorMap, found, err := unstructured.NestedMap(psp.Object, "spec", "selector")
-		if err != nil || !found {
-			continue
-		}
-		jsonBytes, err := json.Marshal(selectorMap)
-		if err != nil {
-			continue
-		}
-		var labelSelector metav1.LabelSelector
-		if err := json.Unmarshal(jsonBytes, &labelSelector); err != nil {
-			continue
-		}
-		selector, err := metav1.LabelSelectorAsSelector(&labelSelector)
-		if err != nil {
-			continue
-		}
-		if selector.Matches(labels.Set(pod.Labels)) {
-			triggerType, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "type")
-			if err == nil && found && triggerType == "manual" {
-				postCheckpoint, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "postCheckpoint")
-				if err == nil && found && postCheckpoint == "stop" {
-					matchingPSPName = psp.GetName()
-					break
-				}
-			}
-		}
-	}
-
-	if matchingPSPName == "" {
-		logger.Info("No matching manual+stop PodSnapshotPolicy found, attempting to create default")
-		// List PodSnapshotStorageConfigs to find one to use
-		psscList := &unstructured.UnstructuredList{}
-		psscList.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshotStorageConfigList",
-		})
-		if err := a.Client.List(ctx, psscList); err != nil {
-			logger.Error(err, "Failed to list PodSnapshotStorageConfigs")
-			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to list PSSCs: %w", err))
-		}
-		if len(psscList.Items) == 0 {
-			logger.Error(nil, "No PodSnapshotStorageConfig found in cluster")
-			return denied429("no matching manual PodSnapshotPolicy found")
-		}
-		psscName := psscList.Items[0].GetName()
-
-		// Create default manual policy
-		defaultPSPName := "psp-default-manual"
-		defaultPSP := &unstructured.Unstructured{}
-		defaultPSP.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshotPolicy",
-		})
-		defaultPSP.SetName(defaultPSPName)
-		defaultPSP.SetNamespace(req.Namespace)
-		defaultPSP.Object["spec"] = map[string]interface{}{
-			"storageConfigName": psscName,
-			"selector": map[string]interface{}{
-				"matchLabels": map[string]string{
-					"pod-migration.gke.io/enabled": "true",
-				},
-			},
-			"triggerConfig": map[string]interface{}{
-				"type":           "manual",
-				"postCheckpoint": "stop",
-			},
-		}
-		err := a.Client.Create(ctx, defaultPSP)
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create default PodSnapshotPolicy")
-			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to create default PSP: %w", err))
-		}
-		matchingPSPName = defaultPSPName
-		logger.Info("Created default manual+stop PodSnapshotPolicy", "name", defaultPSPName)
+	if matchingPSP == nil {
+		logger.Error(nil, "No matching ready manual+stop PodSnapshotPolicy found for pod")
+		return denied429("no matching ready manual PodSnapshotPolicy found. Please ensure PodMigration is reconciled and Ready.")
 	}
 
 	// Create new PodMigrationJob
@@ -270,4 +191,105 @@ func SetupEvictionWebhookWithManager(mgr ctrl.Manager) error {
 		},
 	)
 	return nil
+}
+
+// latestUpdate extracts the most recent "Update" timestamp from managed fields of unstructured object.
+// Falls back to creation time if no update operation is found.
+func latestUpdate(obj *unstructured.Unstructured) time.Time {
+	var latest = obj.GetCreationTimestamp().Time
+	for _, field := range obj.GetManagedFields() {
+		if field.Operation != metav1.ManagedFieldsOperationUpdate {
+			continue
+		}
+		if field.Time != nil && field.Time.After(latest) {
+			latest = field.Time.Time
+		}
+	}
+	return latest
+}
+
+// findLatestReadyPSP finds the latest ready manual+stop PodSnapshotPolicy in the namespace matching the labels.
+func findLatestReadyPSP(ctx context.Context, c client.Client, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {
+	pspList := &unstructured.UnstructuredList{}
+	pspList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicyList",
+	})
+	if err := c.List(ctx, pspList, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list PSPs: %w", err)
+	}
+
+	var matchingPSPs []*unstructured.Unstructured
+	podLabelSet := labels.Set(podLabels)
+
+	for i := range pspList.Items {
+		psp := &pspList.Items[i]
+
+		// 1. Verify trigger type is manual
+		triggerType, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "type")
+		if err != nil || !found || triggerType != "manual" {
+			continue
+		}
+
+		// 2. Verify postCheckpoint is stop
+		postCheckpoint, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "postCheckpoint")
+		if err != nil || !found || postCheckpoint != "stop" {
+			continue
+		}
+
+		// 3. Verify labels selector matches
+		selectorMap, found, err := unstructured.NestedMap(psp.Object, "spec", "selector")
+		if err != nil || !found {
+			continue
+		}
+		jsonBytes, err := json.Marshal(selectorMap)
+		if err != nil {
+			continue
+		}
+		var labelSelector metav1.LabelSelector
+		if err := json.Unmarshal(jsonBytes, &labelSelector); err != nil {
+			continue
+		}
+		selector, err := metav1.LabelSelectorAsSelector(&labelSelector)
+		if err != nil {
+			continue
+		}
+		if !selector.Matches(podLabelSet) {
+			continue
+		}
+
+		// 4. Verify status is Ready (condition Ready=True)
+		conditions, found, err := unstructured.NestedSlice(psp.Object, "status", "conditions")
+		if err != nil || !found {
+			continue
+		}
+		isReady := false
+		for _, condVal := range conditions {
+			cond, ok := condVal.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if cond["type"] == "Ready" && cond["status"] == "True" {
+				isReady = true
+				break
+			}
+		}
+		if !isReady {
+			continue
+		}
+
+		matchingPSPs = append(matchingPSPs, psp)
+	}
+
+	if len(matchingPSPs) == 0 {
+		return nil, nil // No matching ready policy found
+	}
+
+	// Sort by latest updated time (descending)
+	slices.SortStableFunc(matchingPSPs, func(a, b *unstructured.Unstructured) int {
+		return latestUpdate(b).Compare(latestUpdate(a))
+	})
+
+	return matchingPSPs[0], nil
 }
