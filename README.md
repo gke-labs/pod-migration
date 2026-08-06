@@ -33,6 +33,102 @@ The controller is implemented as a custom Operator consisting of the following c
 
 ---
 
+## Prerequisites
+
+Before deploying the Pod Migration Controller, ensure your cluster meets the following requirements:
+
+### 1. GKE Standard Cluster with Pod Snapshots Enabled
+The cluster must be running on the `Rapid` release channel with the GKE Pod Snapshots addon enabled:
+```bash
+gcloud container clusters create pod-migration-cluster \
+  --release-channel=rapid \
+  --workload-pool=<YOUR_PROJECT>.svc.id.goog \
+  --enable-pod-snapshots \
+  --zone=<YOUR_ZONE> \
+  --project=<YOUR_PROJECT>
+```
+
+### 2. gVisor Node Pool
+At least one node pool must have gVisor sandboxing enabled (`--sandbox=type=gvisor`) to run the sandboxed workloads:
+```bash
+gcloud container node-pools create gvisor-pool \
+  --cluster=pod-migration-cluster \
+  --sandbox=type=gvisor \
+  --machine-type=n2-standard-4 \
+  --num-nodes=2 \
+  --zone=<YOUR_ZONE> \
+  --project=<YOUR_PROJECT>
+```
+
+### 3. cert-manager
+`cert-manager` must be installed to manage TLS certificates for the admission webhooks:
+```bash
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.0/cert-manager.yaml
+kubectl wait --for=condition=Available --timeout=5m -n cert-manager deployment/cert-manager-webhook
+```
+
+---
+
+## Installation Guide
+
+Follow these steps to deploy the Pod Migration Controller once the prerequisites are met:
+
+### Step 1: One-Time Snapshot Storage & Workload Identity Configuration
+Run the provided setup script to automatically create the GCS bucket, configure IAM permissions for Workload Identity, and create the test Kubernetes Service Account (KSA):
+
+```bash
+chmod +x patches/setup-storage.sh
+./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]
+```
+
+*This script performs the following:*
+- Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access and soft-delete disabled.
+- Binds IAM roles `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and the GKE container engine robot service account.
+- Creates KSA `pm-test-ksa` in the `default` namespace.
+
+### Step 2: Install CRDs
+Install the custom resource definitions for the pod migration controller:
+```bash
+kubectl apply -f controller/config/crd/bases/
+```
+
+### Step 3: Deploy the Pod Migration Controller
+The controller manager orchestrates the migration lifecycle and hosts the admission webhooks.
+
+1.  **Build and push the controller image:**
+    ```bash
+    docker build -t <YOUR_REGISTRY>/pod-migration-controller:latest -f controller/Dockerfile controller/
+    docker push <YOUR_REGISTRY>/pod-migration-controller:latest
+    ```
+
+2.  **Configure the GCS Bucket:**
+    Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots:
+    ```yaml
+    spec:
+      storage:
+        location: gs://<YOUR_BUCKET_NAME>/snapshots
+    ```
+
+3.  **Deploy the Controller:**
+    Apply the manifests by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:
+    ```bash
+    sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
+    
+    # Apply the storage config
+    kubectl apply -f controller/podmigration-config.yaml
+    
+    # Verify deployment status
+    kubectl rollout status deployment/pod-migration-controller -n pod-migration-system
+    ```
+
+### Step 4: Deploy Validating Policies (Optional)
+To reject incompatible workloads (e.g. BEAM/fsnotify) at admission time:
+```bash
+kubectl apply -f patches/gke-pod-snapshot-admission-webhook.yaml
+```
+
+---
+
 ## 1. Migration Compatibility Matrix (E2E Verified)
 
 Every workload in this matrix has been verified through real E2E eviction migrations on a GKE Standard node pool.
@@ -71,96 +167,6 @@ Every workload in this matrix has been verified through real E2E eviction migrat
 | **rabbitmq / couchdb** | streaming | ❌ **FAILED** | Erlang BEAM runtime epoll and green thread scheduler structures cannot be serialized. |
 | **prometheus** | monitoring | ❌ **REFUSED** | Active WAL memory mappings exceed serialization limits under both runtimes. |
 | **elasticsearch** | search | ❌ **REFUSED** | Heavy `fsnotify` directory watches cannot be serialized. |
-
----
-
-## 2. Installation Guide
-
-To deploy this pod migration runtime to your GKE test cluster using native GKE Pod Snapshots:
-
-### Step 1: Create GKE Cluster & Enable Pod Snapshot
-Create a GKE Standard cluster on the Rapid release channel with the GKE Pod Snapshots addon enabled:
-```bash
-gcloud container clusters create pod-migration-cluster \
-  --release-channel=rapid \
-  --workload-pool=<YOUR_PROJECT>.svc.id.goog \
-  --enable-pod-snapshots \
-  --zone=<YOUR_ZONE> \
-  --project=<YOUR_PROJECT>
-```
-
-### Step 2: Install cert-manager
-Install cert-manager to generate and manage TLS certificates for the admission webhooks:
-```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.0/cert-manager.yaml
-kubectl wait --for=condition=Available --timeout=5m -n cert-manager deployment/cert-manager-webhook
-```
-
-### Step 3: Provision gVisor Node Pool
-Create a GKE node pool with gVisor sandboxing enabled:
-```bash
-gcloud container node-pools create gvisor-pool \
-  --cluster=pod-migration-cluster \
-  --sandbox=type=gvisor \
-  --machine-type=n2-standard-4 \
-  --num-nodes=2 \
-  --zone=<YOUR_ZONE> \
-  --project=<YOUR_PROJECT>
-```
-
-### Step 4: One-Time Snapshot Storage & Workload Identity Configuration
-Run the provided setup script to automatically create the GCS bucket, configure IAM permissions for Workload Identity, and create the test Kubernetes Service Account (KSA):
-
-```bash
-chmod +x patches/setup-storage.sh
-./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]
-```
-
-*This script performs the following:*
-- Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access and soft-delete disabled.
-- Binds IAM roles `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and the GKE container engine robot service account.
-- Creates KSA `pm-test-ksa` in the `default` namespace.
-
-### Step 5: Install CRDs
-Install the custom resource definitions for the pod migration controller:
-```bash
-kubectl apply -f controller/config/crd/bases/
-```
-
-### Step 6: Deploy the Pod Migration Controller
-The controller manager orchestrates the migration lifecycle and hosts the admission webhooks.
-
-1.  **Build and push the controller image:**
-    ```bash
-    docker build -t <YOUR_REGISTRY>/pod-migration-controller:latest -f controller/Dockerfile controller/
-    docker push <YOUR_REGISTRY>/pod-migration-controller:latest
-    ```
-
-2.  **Configure the GCS Bucket:**
-    Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots:
-    ```yaml
-    spec:
-      storage:
-        location: gs://<YOUR_BUCKET_NAME>/snapshots
-    ```
-
-3.  **Deploy the Controller:**
-    Apply the manifests by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:
-    ```bash
-    sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
-    
-    # Apply the storage config
-    kubectl apply -f controller/podmigration-config.yaml
-    
-    # Verify deployment status
-    kubectl rollout status deployment/pod-migration-controller -n pod-migration-system
-    ```
-
-### Step 7: Deploy Validating Policies (Optional)
-To reject incompatible workloads (e.g. BEAM/fsnotify) at admission time:
-```bash
-kubectl apply -f patches/gke-pod-snapshot-admission-webhook.yaml
-```
 
 ---
 
