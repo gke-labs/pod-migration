@@ -1,0 +1,24 @@
+# Build output
+bin/
+
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Local kube/credential files
+kubeconfig
+*.kubeconfig
