@@ -34,6 +34,9 @@ START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "[*] Deleting pod $POD_NAME normally (user deletion)..."
 kubectl delete pod "$POD_NAME" --timeout=60s
 
+# Wait a bit for agent logs and potential CR creation to propagate
+sleep 5
+
 echo "[*] Verifying no PodSnapshot CR was created..."
 snapshots=$(kubectl get podsnapshots -o jsonpath='{.items[*].metadata.name}')
 if [ -n "$snapshots" ]; then
@@ -43,9 +46,6 @@ fi
 echo "[+] No PodSnapshot CR created. Passed."
 
 echo "[*] Verifying agent logs for user deletion skip message..."
-# Wait a bit for logs to propagate
-sleep 5
-
 if kubectl logs "$AGENT_POD" --since-time="$START_TIME" 2>&1 | grep -q "skipping checkpoint (user deletion)"; then
   echo "[+] Found skip message in agent logs. Passed."
 else

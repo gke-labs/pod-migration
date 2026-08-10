@@ -58,12 +58,22 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              targetPodUID:
+                description: TargetPodUID is the unique UID of the pod instance being
+                  migrated.
+                type: string
             required:
             - podRef
+            - targetPodUID
             type: object
           status:
             description: PodMigrationJobStatus defines the observed state.
             properties:
+              completionTime:
+                description: CompletionTime is the timestamp when this job transitioned
+                  to a terminal phase (Succeeded/Failed).
+                format: date-time
+                type: string
               phase:
                 description: PodMigrationJobPhase defines the current state in the
                   lifecycle.

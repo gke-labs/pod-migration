@@ -9,6 +9,8 @@ import (
 type PodMigrationJobSpec struct {
 	// PodRef references the pod to migrate.
 	PodRef corev1.LocalObjectReference `json:"podRef"`
+	// TargetPodUID is the unique UID of the pod instance being migrated.
+	TargetPodUID string `json:"targetPodUID"`
 }
 
 // PodMigrationJobPhase defines the current state in the lifecycle.
@@ -30,6 +32,9 @@ type PodMigrationJobStatus struct {
 	// PVsToDetach lists the Persistent Volume names we are waiting to detach.
 	// +optional
 	PVsToDetach []string `json:"pvsToDetach,omitempty"`
+	// CompletionTime is the timestamp when this job transitioned to a terminal phase (Succeeded/Failed).
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true

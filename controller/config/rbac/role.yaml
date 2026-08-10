@@ -74,8 +74,6 @@ rules:
   verbs:
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - podsnapshot.gke.io
@@ -83,8 +81,6 @@ rules:
   - podsnapshots/status
   verbs:
   - get
-  - patch
-  - update
 - apiGroups:
   - storage.k8s.io
   resources:

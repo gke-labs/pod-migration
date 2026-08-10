@@ -8,4 +8,4 @@ metadata:
   name: gke-pod-snapshot-vap-binding
 spec:
   policyName: gke-pod-snapshot-validating-admission-policy
-  validationActions: [Audit]
+  validationActions: [Deny, Audit]

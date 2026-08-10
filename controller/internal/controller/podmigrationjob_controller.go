@@ -190,22 +190,57 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
-		// 4.2. Terminate Origin Pod & Cleanup Trigger
-		logger.Info("Deleting origin Pod", "pod", podName)
+		// 4.2. Wait for Webhook to delete Pod, or delete it ourselves if it takes too long
 		pod := &corev1.Pod{}
 		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, pod)
-		if err == nil {
-			err = r.Delete(ctx, pod)
-			if err != nil {
-				logger.Error(err, "Failed to delete origin pod")
+		podExists := true
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				podExists = false
+			} else {
+				logger.Error(err, "Failed to get origin pod")
 				return ctrl.Result{}, err
 			}
-			logger.Info("Successfully deleted pod")
-		} else if !apierrors.IsNotFound(err) {
-			logger.Error(err, "Failed to get origin pod")
-			return ctrl.Result{}, err
 		}
 
+		if podExists && string(pod.UID) == job.Spec.TargetPodUID {
+			// Pod still exists and is the target pod.
+			// We wait for the eviction webhook to return Allowed and the API server to delete it.
+			// Fallback: if it takes longer than 30s (e.g. manual trigger), we delete it manually.
+			const timeout = 30 * time.Second
+			evictingSinceStr := job.Annotations["pod-migration.gke.io/evicting-since"]
+			if evictingSinceStr == "" {
+				if job.Annotations == nil {
+					job.Annotations = make(map[string]string)
+				}
+				job.Annotations["pod-migration.gke.io/evicting-since"] = time.Now().Format(time.RFC3339)
+				logger.Info("Recording evicting start time, waiting for eviction webhook to trigger delete", "pod", podName)
+				if err := r.Update(ctx, job); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+
+			evictingSince, err := time.Parse(time.RFC3339, evictingSinceStr)
+			if err != nil {
+				logger.Error(err, "Failed to parse evicting-since annotation", "val", evictingSinceStr)
+				evictingSince = time.Time{} // fallback to immediate delete
+			}
+
+			if time.Since(evictingSince) > timeout {
+				logger.Info("Eviction webhook wait timed out (30s), deleting origin pod manually (fallback)", "pod", podName)
+				err = r.Delete(ctx, pod)
+				if err != nil && !apierrors.IsNotFound(err) {
+					logger.Error(err, "Failed to delete origin pod (fallback)")
+					return ctrl.Result{}, err
+				}
+			} else {
+				logger.Info("Waiting for eviction webhook to allow deletion", "pod", podName, "elapsed", time.Since(evictingSince))
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+		}
+
+		// Once the Pod is gone (or we fallback-deleted it), we can delete the manual trigger.
 		logger.Info("Deleting manual trigger", "trigger", triggerName)
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(schema.GroupVersionKind{

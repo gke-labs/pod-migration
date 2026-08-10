@@ -77,9 +77,10 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if err == nil {
 		// Job exists, check its status
 		logger.Info("Migration job already exists", "job", jobName, "phase", job.Status.Phase)
-		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
-			logger.Info("Migration job already succeeded, allowing eviction (no-op)")
-			return admission.Allowed("migration succeeded")
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
+			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+			logger.Info("Migration checkpoint complete, allowing eviction", "job", jobName, "phase", job.Status.Phase)
+			return admission.Allowed("migration checkpoint complete")
 		}
 		return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
 	}

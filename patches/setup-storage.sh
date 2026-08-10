@@ -38,7 +38,8 @@ else
   gcloud storage buckets create "gs://${BUCKET_NAME}" \
     --project="${PROJECT_ID}" \
     --location="${REGION}" \
-    --uniform-bucket-level-access
+    --uniform-bucket-level-access \
+    --enable-hierarchical-namespace
   
   echo "Disabling soft-delete policy on gs://${BUCKET_NAME}..."
   gcloud storage buckets update "gs://${BUCKET_NAME}" \

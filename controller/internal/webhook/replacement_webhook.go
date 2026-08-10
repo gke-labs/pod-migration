@@ -10,6 +10,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/ahahadelyaly/gke-pod-migration/controller/internal/util"
 )
 
 // PodGateInjector injects the scheduling gate into replacement pods.
@@ -36,6 +38,32 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		return admission.Allowed("pod not opted in")
 	}
 
+	// Resolve parent owner details
+	parentName, parentKind, err := util.ResolveParentWorkload(ctx, a.Client, pod)
+	if err != nil {
+		logger.Error(err, "Failed to resolve parent workload")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// Find active unassigned PMJ
+	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, parentName, parentKind)
+	if err != nil {
+		logger.Error(err, "Failed to check unassigned active PMJs")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// If there is no active unassigned migration job, this is a scale-up or unrelated pod.
+	// We do NOT inject the scheduling gate and bypass native GKE restore.
+	if assignedPMJ == "" && parentName != "" {
+		logger.Info("Bypassing scheduling gate injection (scale-up pod)")
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string)
+		}
+		pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
+		marshaledPod, _ := json.Marshal(pod)
+		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
+	}
+
 	// Check if the gate is already present
 	hasGate := false
 	for _, gate := range pod.Spec.SchedulingGates {
@@ -55,6 +83,13 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	pod.Spec.SchedulingGates = append(pod.Spec.SchedulingGates, corev1.PodSchedulingGate{
 		Name: "gke.io/pod-migration-gate",
 	})
+
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	if assignedPMJ != "" {
+		pod.Annotations["pod-migration.gke.io/assigned-pmj"] = assignedPMJ
+	}
 
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
