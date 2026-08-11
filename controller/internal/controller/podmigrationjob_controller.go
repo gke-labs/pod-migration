@@ -116,6 +116,27 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
+		// Capture PV Names before starting checkpoint (pod is guaranteed to exist)
+		if len(job.Status.PVsToDetach) == 0 {
+			originPod := &corev1.Pod{}
+			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
+			if err != nil {
+				logger.Error(err, "Failed to get origin pod for PV analysis in Pending state")
+				return ctrl.Result{}, err
+			}
+			var pvs []string
+			for _, vol := range originPod.Spec.Volumes {
+				if vol.PersistentVolumeClaim != nil {
+					pvc := &corev1.PersistentVolumeClaim{}
+					err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
+					if err == nil && pvc.Spec.VolumeName != "" {
+						pvs = append(pvs, pvc.Spec.VolumeName)
+					}
+				}
+			}
+			job.Status.PVsToDetach = pvs
+		}
+
 		logger.Info("Creating PodSnapshotManualTrigger", "trigger", triggerName)
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(schema.GroupVersionKind{
@@ -210,35 +231,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
-		// 4.1. Capture PV Names before deleting the origin pod (to trace their detachment later)
-		if len(job.Status.PVsToDetach) == 0 {
-			originPod := &corev1.Pod{}
-			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
-			if err == nil {
-				var pvs []string
-				for _, vol := range originPod.Spec.Volumes {
-					if vol.PersistentVolumeClaim != nil {
-						pvc := &corev1.PersistentVolumeClaim{}
-						err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
-						if err == nil && pvc.Spec.VolumeName != "" {
-							pvs = append(pvs, pvc.Spec.VolumeName)
-						}
-					}
-				}
-				if len(pvs) > 0 {
-					job.Status.PVsToDetach = pvs
-					err = r.Status().Update(ctx, job)
-					if err != nil {
-						logger.Error(err, "Failed to update job PVsToDetach status")
-						return ctrl.Result{}, err
-					}
-					return ctrl.Result{Requeue: true}, nil
-				}
-			} else if !apierrors.IsNotFound(err) {
-				logger.Error(err, "Failed to get origin pod for PV analysis")
-				return ctrl.Result{}, err
-			}
-		}
 
 		// 4.2. Wait for Webhook to delete Pod, or delete it ourselves if it takes too long
 		pod := &corev1.Pod{}

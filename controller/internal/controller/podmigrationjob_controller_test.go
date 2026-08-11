@@ -105,3 +105,123 @@ func TestPodMigrationJobReconciler_Pending(t *testing.T) {
 		}
 	}
 }
+
+func TestPodMigrationJobReconciler_Pending_WithPVs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	pvcName := "test-pvc"
+	pvName := "test-pv"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: "vol-1",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "PersistentVolumeClaim",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pvcName,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: pvName,
+		},
+	}
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pvc, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// Reconcile: should analyze PVs, populate PVsToDetach, create manual trigger and transition to Snapshotting
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("Expected reconcile to request requeue")
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected phase to transition to %s, got %s", pmv1alpha1.PodMigrationJobPhaseSnapshotting, updatedPMJ.Status.Phase)
+	}
+
+	if len(updatedPMJ.Status.PVsToDetach) != 1 || updatedPMJ.Status.PVsToDetach[0] != pvName {
+		t.Errorf("Expected PVsToDetach to contain %q, got %v", pvName, updatedPMJ.Status.PVsToDetach)
+	}
+
+	// Verify trigger IS created
+	triggerName := fmt.Sprintf("trigger-%s", podName)
+	trigger := &unstructured.Unstructured{}
+	trigger.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotManualTrigger",
+	})
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, trigger)
+	if err != nil {
+		t.Errorf("Expected PodSnapshotManualTrigger to be created, got error: %v", err)
+	}
+}
