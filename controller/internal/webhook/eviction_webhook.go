@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -22,7 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	pmv1alpha1 "github.com/ahahadelyaly/gke-pod-migration/controller/api/v1alpha1"
+	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch
@@ -42,6 +43,12 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed("not an eviction request")
 	}
 
+	// Check for dry-run requests
+	if req.DryRun != nil && *req.DryRun {
+		logger.Info("Dry-run eviction request, bypassing migration side-effects")
+		return admission.Allowed("dry-run allowed")
+	}
+
 	// Fetch the Pod
 	pod := &corev1.Pod{}
 	// We must query the API server for the Pod because the eviction admission request object
@@ -52,8 +59,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			logger.Info("Pod already deleted, allowing eviction")
 			return admission.Allowed("pod already deleted")
 		}
-		logger.Error(err, "Failed to get pod")
-		return admission.Errored(http.StatusInternalServerError, err)
+		// Fail-open on transient errors fetching the pod to avoid blocking non-migrating workloads
+		logger.Error(err, "Transient error fetching pod, failing open to protect cluster")
+		return admission.Allowed("failing open due to transient error")
 	}
 
 	// Check if feature is enabled for this pod
@@ -75,19 +83,34 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	job := &pmv1alpha1.PodMigrationJob{}
 	err = a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: jobName}, job)
 	if err == nil {
-		// Job exists, check its status
-		logger.Info("Migration job already exists", "job", jobName, "phase", job.Status.Phase)
-		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
-			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
-			logger.Info("Migration checkpoint complete, allowing eviction", "job", jobName, "phase", job.Status.Phase)
-			return admission.Allowed("migration checkpoint complete")
+		// Verify if the job belongs to the current pod instance
+		if job.Spec.TargetPodUID != string(pod.UID) {
+			logger.Info("Found stale migration job from a previous pod instance, deleting it to start fresh", "job", jobName, "oldUID", job.Spec.TargetPodUID, "newUID", pod.UID)
+			err = a.Client.Delete(ctx, job)
+			if err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete stale migration job")
+				return denied429("failed to clear legacy migration metadata, retrying")
+			}
+			// Fall through to create a new PMJ for the new pod instance
+		} else {
+			// Job belongs to current pod instance, check status
+			logger.Info("Migration job already exists for current pod instance", "job", jobName, "phase", job.Status.Phase)
+			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
+				job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+				logger.Info("Migration checkpoint complete, allowing eviction", "job", jobName, "phase", job.Status.Phase)
+				return admission.Allowed("migration checkpoint complete")
+			}
+			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
+				logger.Info("Migration job failed for current pod instance, allowing cold eviction (fail-open)", "job", jobName)
+				return admission.Allowed("migration failed, falling back to cold eviction")
+			}
+			return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
 		}
-		return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
 	}
 
 	if !apierrors.IsNotFound(err) {
 		logger.Error(err, "Failed to get PodMigrationJob")
-		return admission.Errored(http.StatusInternalServerError, err)
+		return denied429("transient error reading migration job status, retrying")
 	}
 
 	// Resolve parent owner details
@@ -105,6 +128,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 						break
 					}
 				}
+			} else if !apierrors.IsNotFound(err) {
+				logger.Error(err, "Failed to get ReplicaSet parent")
+				return denied429("transient error resolving parent workload, retrying")
 			}
 			if parentName != "" {
 				break
@@ -130,7 +156,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	matchingPSP, err := findLatestReadyManualStopPSP(ctx, a.Client, req.Namespace, pod.Labels)
 	if err != nil {
 		logger.Error(err, "Failed to resolve matching PodSnapshotPolicy")
-		return admission.Errored(http.StatusInternalServerError, err)
+		return denied429("transient error resolving snapshot policy, retrying")
 	}
 
 	if matchingPSP == nil {
@@ -150,13 +176,19 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			PodRef: corev1.LocalObjectReference{
 				Name: req.Name,
 			},
+			// Set TargetPodUID
+			TargetPodUID: string(pod.UID),
 		},
 	}
 
 	err = a.Client.Create(ctx, newJob)
 	if err != nil {
-		logger.Error(err, "Failed to create PodMigrationJob")
-		return admission.Errored(http.StatusInternalServerError, err)
+		if apierrors.IsAlreadyExists(err) {
+			logger.Info("Migration job already exists (create race), retrying")
+			return denied429("migration job already exists, retrying")
+		}
+		logger.Error(err, "Failed to create PodMigrationJob due to transient error")
+		return denied429("failed to create migration job, retrying")
 	}
 
 	return denied429("migration job spawned")
@@ -220,6 +252,10 @@ func findLatestReadyManualStopPSP(ctx context.Context, c client.Client, namespac
 		Kind:    "PodSnapshotPolicyList",
 	})
 	if err := c.List(ctx, pspList, client.InNamespace(namespace)); err != nil {
+		if meta.IsNoMatchError(err) {
+			// Tolerate missing CRDs (fail-open)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("failed to list PSPs: %w", err)
 	}
 

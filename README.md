@@ -19,17 +19,19 @@ While this controller mitigates the effects of eviction, the migration is not co
 The controller is implemented as a custom Operator consisting of the following core components:
 
 ### 1. Webhooks
-- **Eviction Interception Webhook (`/validate-eviction`)**: Handled by `EvictionGuard`. Intercepts Pod eviction API calls. If the Pod is opted-in (`pod-migration.gke.io/enabled: "true"`), it denies the eviction request with `429 (Too Many Requests)` to block immediate destruction, and spawns a `PodMigrationJob` (PMJ) CR to orchestrate the migration flow.
-- **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
+- **Eviction Interception Webhook (`/validate-v1-pod-eviction`)**: Handled by `EvictionGate`. Intercepts Pod eviction API calls. If the Pod is opted-in (`pod-migration.gke.io/enabled: "true"`), it denies the eviction request with `429 (Too Many Requests)` to block immediate destruction, and spawns a `PodMigrationJob` (PMJ) CR to orchestrate the migration flow.
+- **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods, it injects the `gke.io/pod-migration-gate` scheduling gate to hold the pod in a pending state until volume detachment is complete, preventing replica collisions.
+- **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Handled by `PodStatusMutator`. Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
 
 ### 2. Reconcilers
 - **`PodMigration` (Config) Reconciler**: Watches `PodMigration` resources. It automatically provisions the required GKE `PodSnapshotStorageConfig` (PSSC) and manual `PodSnapshotPolicy` (PSP) resources with `postCheckpoint: stop` in the target namespace.
 - **`PodMigrationJob` (Execution) Reconciler**: Coordinates the active migration loop:
   1. Creates a `PodSnapshotManualTrigger` (PSMT) targeting the source Pod to initiate snapshotting and container termination.
   2. Monitors the resulting `PodSnapshot` until it becomes `Ready` (uploaded to GCS).
-  3. Waits for the source Pod's volumes to fully detach.
-  4. Deletes the original source Pod.
-- **Pod Gate Reconciler**: Monitors replacement Pods injected with the `gke.io/pod-migration-gate` scheduling gate. It holds them in a pending state and releases the gate only after the snapshot is ready and source volumes have safely detached, preventing replica collisions.
+  3. Transitions the job to `Evicting` phase, which signals the Eviction Webhook that it is safe to allow the source Pod deletion.
+  4. Waits for the source Pod to be deleted and its volumes to fully detach from the GCE node.
+  5. Transitions the job to `Succeeded`, signaling the Pod Gate Reconciler that it is safe to release the replacement Pod.
+- **Pod Gate Reconciler**: Monitors replacement Pods injected with the `gke.io/pod-migration-gate` scheduling gate. It holds them in a pending state and releases the gate only after the matched `PodMigrationJob` reaches `Succeeded` (confirming snapshot readiness and volume detachment), then injects the GKE snapshot name annotation to force restore, and removes the scheduling gate to allow startup. It bypasses gate injection for normal scale-up pods.
 
 ---
 

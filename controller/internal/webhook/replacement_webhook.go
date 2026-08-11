@@ -11,7 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	"github.com/ahahadelyaly/gke-pod-migration/controller/internal/util"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 // PodGateInjector injects the scheduling gate into replacement pods.
@@ -46,7 +46,7 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 
 	// Find active unassigned PMJ
-	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, parentName, parentKind)
+	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind)
 	if err != nil {
 		logger.Error(err, "Failed to check unassigned active PMJs")
 		return admission.Errored(http.StatusInternalServerError, err)

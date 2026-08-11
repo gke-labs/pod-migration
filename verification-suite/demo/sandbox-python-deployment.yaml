@@ -34,7 +34,7 @@ spec:
         fsGroup: 2000
       containers:
         - name: python-sandbox
-          image: us-central1-docker.pkg.dev/yaoluo-gke-dev/pm-poc/analytics-tool:dev
+          image: us-central1-docker.pkg.dev/<YOUR_PROJECT_ID>/pm-poc/analytics-tool:dev
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8888

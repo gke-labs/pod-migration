@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -16,7 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	pmv1alpha1 "github.com/ahahadelyaly/gke-pod-migration/controller/api/v1alpha1"
+	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
 // PodMigrationJobReconciler reconciles a PodMigrationJob object.
@@ -62,6 +63,55 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Enforce 10-minute timeout for active migrations (both Snapshotting and Evicting)
+	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
+		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+		const migrationTimeout = 10 * time.Minute
+		if time.Since(job.CreationTimestamp.Time) > migrationTimeout {
+			logger.Info("Migration job timed out (exceeded 10 minutes limit), transitioning to Failed", "job", job.Name)
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+			now := metav1.Now()
+			job.Status.CompletionTime = &now
+
+			// Clean up GKE manual trigger if it exists (best effort)
+			trigger := &unstructured.Unstructured{}
+			trigger.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "podsnapshot.gke.io",
+				Version: "v1",
+				Kind:    "PodSnapshotManualTrigger",
+			})
+			trigger.SetName(triggerName)
+			trigger.SetNamespace(req.Namespace)
+			_ = r.Delete(ctx, trigger)
+
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to update job status to Failed on timeout")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+	}
+
+	// Garbage collect completed PMJs after 5 minutes
+	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
+		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
+
+		if job.Status.CompletionTime != nil {
+			const gcDelay = 5 * time.Minute
+			if time.Since(job.Status.CompletionTime.Time) > gcDelay {
+				logger.Info("Garbage collecting completed PodMigrationJob", "job", job.Name)
+				err := r.Delete(ctx, job)
+				if err != nil && !apierrors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+			requeueIn := gcDelay - time.Since(job.Status.CompletionTime.Time)
+			return ctrl.Result{RequeueAfter: requeueIn}, nil
+		}
+		return ctrl.Result{}, nil
 	}
 
 	switch job.Status.Phase {
@@ -118,14 +168,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		if targetSnapshot == nil {
 			logger.Info("Waiting for GKE PodSnapshot object to be generated...")
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
 		// Check if snapshot is ready
 		snapStatus, ok := targetSnapshot.Object["status"].(map[string]interface{})
 		if !ok {
 			logger.Info("Snapshot status subresource not found, waiting...")
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
 		conditions, _ := snapStatus["conditions"].([]interface{})
@@ -146,7 +196,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		if !isReady {
 			logger.Info("Snapshot is not ready yet, waiting...")
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
 		logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", targetSnapshot.GetName())
@@ -299,6 +349,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// 4.4. Once all PVs are detached, transition the PMJ phase to Succeeded.
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+		now := metav1.Now()
+		job.Status.CompletionTime = &now
 		err = r.Status().Update(ctx, job)
 		if err != nil {
 			logger.Error(err, "Failed to update job status to Succeeded")

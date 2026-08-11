@@ -8,7 +8,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
 func TestPodGateInjector(t *testing.T) {
@@ -68,9 +71,13 @@ func TestPodGateInjector(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = corev1.AddToScheme(scheme)
+			_ = pmv1alpha1.AddToScheme(scheme)
 			dec := admission.NewDecoder(scheme)
 
+			cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+
 			handler := &PodGateInjector{
+				Client:  cl,
 				decoder: dec,
 			}
 

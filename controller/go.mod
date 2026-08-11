@@ -1,4 +1,4 @@
-module github.com/ahahadelyaly/gke-pod-migration/controller
+module github.com/gke-labs/pod-migration/controller
 
 go 1.25.0
 

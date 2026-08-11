@@ -33,12 +33,7 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - ""
-  resources:
-  - pods/eviction
-  verbs:
-  - create
+
 - apiGroups:
   - apps
   resources:
@@ -68,9 +63,7 @@ rules:
   - podsnapshots
   - podsnapshotmanualtriggers
   - podsnapshotpolicies
-  - podsnapshotpolicies/status
   - podsnapshotstorageconfigs
-  - podsnapshotstorageconfigs/status
   verbs:
   - create
   - delete

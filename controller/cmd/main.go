@@ -29,9 +29,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	pmv1alpha1 "github.com/ahahadelyaly/gke-pod-migration/controller/api/v1alpha1"
-	"github.com/ahahadelyaly/gke-pod-migration/controller/internal/controller"
-	pmwebhook "github.com/ahahadelyaly/gke-pod-migration/controller/internal/webhook"
+	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/controller"
+	pmwebhook "github.com/gke-labs/pod-migration/controller/internal/webhook"
 )
 
 var (

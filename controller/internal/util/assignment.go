@@ -2,6 +2,7 @@ package util
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -9,7 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	pmv1alpha1 "github.com/ahahadelyaly/gke-pod-migration/controller/api/v1alpha1"
+	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).
@@ -35,8 +36,21 @@ func ResolveParentWorkload(ctx context.Context, c client.Client, pod *corev1.Pod
 }
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, parentName, parentKind string) (string, error) {
+func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind string) (string, error) {
 	if parentName == "" {
+		// Bare Pod fallback: Look for a PMJ matching the exact pod name
+		jobName := fmt.Sprintf("pmj-%s", podName)
+		job := &pmv1alpha1.PodMigrationJob{}
+		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, job)
+		if err == nil {
+			phase := job.Status.Phase
+			if phase == pmv1alpha1.PodMigrationJobPhasePending ||
+				phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
+				phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
+				phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+				return job.Name, nil
+			}
+		}
 		return "", nil
 	}
 
@@ -66,6 +80,12 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, pa
 	for _, job := range jobList.Items {
 		if job.Labels["pod-migration.gke.io/parent-name"] == parentName &&
 			job.Labels["pod-migration.gke.io/parent-kind"] == parentKind {
+
+			// For StatefulSets, strictly match by exact name
+			if parentKind == "StatefulSet" && job.Spec.PodRef.Name != podName {
+				continue
+			}
+
 			phase := job.Status.Phase
 			if phase == pmv1alpha1.PodMigrationJobPhasePending ||
 				phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
@@ -125,7 +145,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	}
 
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, parentName, parentKind)
+	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind)
 	if err != nil {
 		return "", false, err
 	}

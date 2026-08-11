@@ -3,9 +3,7 @@
 
 IMG ?= controller:latest
 CONTROLLER_GEN ?= $(shell go env GOPATH)/bin/controller-gen
-KUSTOMIZE ?= $(shell go env GOPATH)/bin/kustomize
-
-.PHONY: help generate manifests fmt vet build run test install uninstall deploy undeploy docker-build
+.PHONY: help generate manifests fmt vet build run test install uninstall deploy undeploy docker-build docker-push
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -31,18 +29,22 @@ test: generate fmt vet manifests ## Run unit + envtest suite.
 	KUBEBUILDER_ASSETS="$(shell setup-envtest use -p path)" \
 		go test ./... -coverprofile cover.out
 
-install: manifests ## kubectl apply the generated CRDs into the current cluster.
-	$(KUSTOMIZE) build config/crd | kubectl apply -f -
+install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.
+	kubectl apply -f config/crd/bases/
+	kubectl wait --for=condition=established --timeout=60s crd/podmigrations.podmigration.gke.io crd/podmigrationjobs.podmigration.gke.io
 
-uninstall: manifests
-	$(KUSTOMIZE) build config/crd | kubectl delete --ignore-not-found=true -f -
+uninstall: manifests ## Uninstall CRDs from the K8s cluster.
+	kubectl delete --ignore-not-found=true -f config/crd/bases/
 
-deploy: manifests ## Deploy controller (Deployment + RBAC + webhooks) to the cluster.
-	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
-	$(KUSTOMIZE) build config/default | kubectl apply -f -
+deploy: install ## Deploy controller (Deployment + RBAC + webhooks) to the cluster.
+	sed 's|<YOUR_CONTROLLER_IMAGE>|$(IMG)|g' deploy.yaml | kubectl apply -f -
 
-undeploy:
-	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=true -f -
+undeploy: ## Undeploy controller from the cluster.
+	kubectl delete --ignore-not-found=true -f deploy.yaml
+	$(MAKE) uninstall
 
-docker-build:
+docker-build: ## Build docker image for the controller.
 	docker build -t $(IMG) .
+
+docker-push: ## Push docker image for the controller.
+	docker push $(IMG)
