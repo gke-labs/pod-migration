@@ -192,3 +192,89 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 		})
 	}
 }
+
+func TestPodGateReconciler_mapPMJToPods(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-original-pod"
+	originalPodName := "original-pod"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: originalPodName,
+			},
+		},
+	}
+
+	replacementPod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "replacement-pod-1",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+	}
+
+	replacementPod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "replacement-pod-2",
+		},
+	}
+
+	siblingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "sibling-pod",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj, replacementPod1, replacementPod2, siblingPod).
+		Build()
+
+	r := &PodGateReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	requests := r.mapPMJToPods(context.Background(), pmj)
+
+	// We expect 3 requests: original-pod, replacement-pod-1, sibling-pod
+	expectedNames := map[string]bool{
+		originalPodName:     true,
+		"replacement-pod-1": true,
+		"sibling-pod":       true,
+	}
+
+	if len(requests) != 3 {
+		t.Fatalf("Expected 3 requests, got %d: %v", len(requests), requests)
+	}
+
+	for _, req := range requests {
+		if req.Namespace != namespace {
+			t.Errorf("Expected namespace %q, got %q", namespace, req.Namespace)
+		}
+		if !expectedNames[req.Name] {
+			t.Errorf("Unexpected reconcile request for pod %q", req.Name)
+		}
+		delete(expectedNames, req.Name)
+	}
+
+	if len(expectedNames) > 0 {
+		t.Errorf("Failed to receive reconcile requests for expected pods: %v", expectedNames)
+	}
+}

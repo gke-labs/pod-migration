@@ -139,21 +139,44 @@ func (r *PodGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&corev1.Pod{}).
 		Watches(
 			&pmv1alpha1.PodMigrationJob{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				job, ok := obj.(*pmv1alpha1.PodMigrationJob)
-				if !ok {
-					return nil
-				}
-				// Trigger reconcile for the replacement pod when its PMJ status changes
-				return []reconcile.Request{
-					{
-						NamespacedName: types.NamespacedName{
-							Namespace: job.Namespace,
-							Name:      job.Spec.PodRef.Name,
-						},
-					},
-				}
-			}),
+			handler.EnqueueRequestsFromMapFunc(r.mapPMJToPods),
 		).
 		Complete(r)
+}
+
+func (r *PodGateReconciler) mapPMJToPods(ctx context.Context, obj client.Object) []reconcile.Request {
+	job, ok := obj.(*pmv1alpha1.PodMigrationJob)
+	if !ok {
+		return nil
+	}
+
+	var requests []reconcile.Request
+
+	// 1. Enqueue the original pod name (handles StatefulSets and Bare Pods)
+	requests = append(requests, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: job.Namespace,
+			Name:      job.Spec.PodRef.Name,
+		},
+	})
+
+	// 2. Query for replacement pods annotated with this PMJ (handles Jobs and Deployments)
+	podList := &corev1.PodList{}
+	err := r.List(ctx, podList, client.InNamespace(job.Namespace))
+	if err != nil {
+		return requests
+	}
+
+	for _, pod := range podList.Items {
+		if pod.Annotations != nil && pod.Annotations["pod-migration.gke.io/assigned-pmj"] == job.Name {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: pod.Namespace,
+					Name:      pod.Name,
+				},
+			})
+		}
+	}
+
+	return requests
 }
