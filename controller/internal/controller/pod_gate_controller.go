@@ -69,7 +69,12 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Resolve parent details to look up alternative PMJs in case of collision
 	parentName, parentKind, err := util.ResolveParentWorkload(ctx, r.Client, pod)
 	if err != nil {
-		return ctrl.Result{}, err
+		if apierrors.IsNotFound(err) {
+			logger.Info("Parent ReplicaSet not found (likely deleted), treating as bare pod")
+			err = nil // Clear error to proceed
+		} else {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Resolve any webhook assignment races

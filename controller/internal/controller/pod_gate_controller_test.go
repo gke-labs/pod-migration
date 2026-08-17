@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,6 +18,7 @@ import (
 func TestPodGateReconciler_Reconcile(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
 
 	tests := []struct {
@@ -134,6 +136,45 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 				},
 				Status: pmv1alpha1.PodMigrationJobStatus{
 					Phase: pmv1alpha1.PodMigrationJobPhaseFailed,
+				},
+			},
+			expectHasGate: false,
+		},
+		{
+			name: "Gated pod with missing parent ReplicaSet (NotFound) still releases gate if PMJ succeeds",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod-rs-missing",
+					Namespace: "default",
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": "pmj-test-pod",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "ReplicaSet",
+							Name:       "missing-rs",
+							UID:        "missing-rs-uid",
+						},
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
+			},
+			pmj: &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pmj-test-pod",
+					Namespace: "default",
+				},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef: corev1.LocalObjectReference{Name: "test-pod-rs-missing"},
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:       pmv1alpha1.PodMigrationJobPhaseSucceeded,
+					SnapshotRef: "some-snapshot-name",
 				},
 			},
 			expectHasGate: false,
