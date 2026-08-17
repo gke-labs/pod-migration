@@ -33,7 +33,6 @@ rules:
   - patch
   - update
   - watch
-
 - apiGroups:
   - apps
   resources:
@@ -47,8 +46,6 @@ rules:
   resources:
   - podmigrationjobs
   - podmigrations
-  - podmigrationjobs/status
-  - podmigrations/status
   verbs:
   - create
   - delete
@@ -58,9 +55,17 @@ rules:
   - update
   - watch
 - apiGroups:
+  - podmigration.gke.io
+  resources:
+  - podmigrationjobs/status
+  - podmigrations/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
   - podsnapshot.gke.io
   resources:
-  - podsnapshots
   - podsnapshotmanualtriggers
   - podsnapshotpolicies
   - podsnapshotstorageconfigs
@@ -76,13 +81,16 @@ rules:
   - podsnapshot.gke.io
   resources:
   - podsnapshots
-  - podsnapshots/status
   verbs:
   - get
   - list
   - watch
-  - update
-  - patch
+- apiGroups:
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshots/status
+  verbs:
+  - get
 - apiGroups:
   - storage.k8s.io
   resources:

@@ -12,8 +12,9 @@ generate: ## Run controller-gen to (re)generate deepcopy methods (zz_generated.d
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 manifests: ## Generate CRDs, RBAC, and webhook YAML from +kubebuilder:* markers.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook \
+	$(CONTROLLER_GEN) rbac:roleName=pod-migration-controller-role crd webhook \
 		paths="./..." output:crd:artifacts:config=config/crd/bases
+	python3 scripts/assemble_deploy.py
 
 fmt: ; go fmt ./...
 vet: ; go vet ./...
