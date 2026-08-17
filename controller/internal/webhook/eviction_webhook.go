@@ -108,7 +108,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		}
 	}
 
-	if !apierrors.IsNotFound(err) {
+	if err != nil && !apierrors.IsNotFound(err) {
 		logger.Error(err, "Failed to get PodMigrationJob")
 		return denied429("transient error reading migration job status, retrying")
 	}
