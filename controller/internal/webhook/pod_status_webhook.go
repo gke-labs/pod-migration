@@ -74,6 +74,18 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
+	// Verify if pmj.Spec.TargetPodUID matches string(pod.UID). If not, log it and return admission.Allowed("PMJ UID mismatch").
+	if pmj.Spec.TargetPodUID != string(pod.UID) {
+		logger.Info("Pod UID mismatch with PodMigrationJob target UID, allowing normal completion", "pmjUID", pmj.Spec.TargetPodUID, "podUID", pod.UID)
+		return admission.Allowed("PMJ UID mismatch")
+	}
+
+	// Verify if pod.DeletionTimestamp is nil. If it is nil, log it and return admission.Allowed("pod completed naturally").
+	if pod.DeletionTimestamp == nil {
+		logger.Info("Pod DeletionTimestamp is nil, allowing normal completion", "pod", pod.Name)
+		return admission.Allowed("pod completed naturally")
+	}
+
 	// If PMJ exists, it means this pod is undergoing migration.
 	// Since Kubelet is trying to mark it Succeeded (exit 0), we override it to Failed (exit 137)
 	// to trigger rescheduling by the Job controller.

@@ -17,6 +17,7 @@ import (
 )
 
 func TestPodStatusMutator(t *testing.T) {
+	now := metav1.Now()
 	tests := []struct {
 		name               string
 		pod                *corev1.Pod
@@ -89,8 +90,11 @@ func TestPodStatusMutator(t *testing.T) {
 			name: "Pod Succeeded with active PMJ (Mutates status)",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "default",
-					Name:      "test-pod",
+					Namespace:         "default",
+					Name:              "test-pod",
+					UID:               "test-pod-uid",
+					DeletionTimestamp: &now,
+					Finalizers:        []string{"pod-migration.gke.io/test-finalizer"},
 					Labels: map[string]string{
 						"pod-migration.gke.io/enabled": "true",
 					},
@@ -122,6 +126,9 @@ func TestPodStatusMutator(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
 						Name:      "pmj-test-pod",
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						TargetPodUID: "test-pod-uid",
 					},
 				},
 			},
@@ -178,6 +185,93 @@ func TestPodStatusMutator(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
 						Name:      "pmj-test-pod",
+					},
+				},
+			},
+			subResource:     "status",
+			expectedAllowed: true,
+			verifyMutation: func(t *testing.T, resp admission.Response) {
+				if len(resp.Patches) > 0 {
+					t.Fatalf("Expected no patches, got %d patches", len(resp.Patches))
+				}
+			},
+		},
+		{
+			name: "Pod Succeeded with active PMJ but UID mismatch (Bypasses mutation)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:         "default",
+					Name:              "test-pod",
+					UID:               "test-pod-uid",
+					DeletionTimestamp: &now,
+					Finalizers:        []string{"pod-migration.gke.io/test-finalizer"},
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "test-job",
+							UID:        "job-uid",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test-pod",
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						TargetPodUID: "mismatched-uid",
+					},
+				},
+			},
+			subResource:     "status",
+			expectedAllowed: true,
+			verifyMutation: func(t *testing.T, resp admission.Response) {
+				if len(resp.Patches) > 0 {
+					t.Fatalf("Expected no patches, got %d patches", len(resp.Patches))
+				}
+			},
+		},
+		{
+			name: "Pod Succeeded with active PMJ but DeletionTimestamp is nil (Bypasses mutation)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:         "default",
+					Name:              "test-pod",
+					UID:               "test-pod-uid",
+					DeletionTimestamp: nil,
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "test-job",
+							UID:        "job-uid",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test-pod",
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						TargetPodUID: "test-pod-uid",
 					},
 				},
 			},
