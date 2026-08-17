@@ -7,7 +7,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -294,6 +296,16 @@ func TestPodMigrationJobReconciler_Pending_PodNotFound(t *testing.T) {
 	if updatedPMJ.Status.CompletionTime == nil {
 		t.Errorf("Expected CompletionTime to be set")
 	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatalf("Expected Ready condition to be set, but it was nil")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("Expected Ready condition status to be False, got %s", cond.Status)
+	}
+	if cond.Reason != "PodNotFound" {
+		t.Errorf("Expected Ready condition reason to be 'PodNotFound', got %q", cond.Reason)
+	}
 }
 
 func TestPodMigrationJobReconciler_Timeout(t *testing.T) {
@@ -383,6 +395,16 @@ func TestPodMigrationJobReconciler_Timeout(t *testing.T) {
 			}
 			if updatedPMJ.Status.CompletionTime == nil {
 				t.Errorf("Expected CompletionTime to be set")
+			}
+			cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+			if cond == nil {
+				t.Fatalf("Expected Ready condition to be set, but it was nil")
+			}
+			if cond.Status != metav1.ConditionFalse {
+				t.Errorf("Expected Ready condition status to be False, got %s", cond.Status)
+			}
+			if cond.Reason != "Timeout" {
+				t.Errorf("Expected Ready condition reason to be 'Timeout', got %q", cond.Reason)
 			}
 		})
 	}
@@ -806,5 +828,89 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 		}
 	})
 }
+
+func TestPodMigrationJobReconciler_Evicting_Success(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	pvName := "test-pv"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			PVsToDetach: []string{pvName},
+		},
+	}
+
+	// Fake client setup: Pod is deleted (not added), Trigger is deleted (not added)
+	// and no VolumeAttachments are active
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected no requeue, got: %+v", res)
+	}
+
+	// Verify PMJ transitioned to Succeeded
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceeded, updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Status.CompletionTime == nil {
+		t.Errorf("Expected CompletionTime to be set")
+	}
+
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatalf("Expected Ready condition to be set, but it was nil")
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("Expected Ready condition status to be True, got %s", cond.Status)
+	}
+	if cond.Reason != "MigrationSucceeded" {
+		t.Errorf("Expected Ready condition reason to be 'MigrationSucceeded', got %q", cond.Reason)
+	}
+}
+
 
 

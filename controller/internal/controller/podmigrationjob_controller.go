@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -77,6 +78,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			now := metav1.Now()
 			job.Status.CompletionTime = &now
 
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "Timeout",
+				Message:            "Migration job timed out (exceeded 10 minutes limit)",
+				ObservedGeneration: job.Generation,
+			})
+
 			// Clean up GKE manual trigger if it exists (best effort)
 			trigger := &unstructured.Unstructured{}
 			trigger.SetGroupVersionKind(schema.GroupVersionKind{
@@ -128,6 +137,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 					now := metav1.Now()
 					job.Status.CompletionTime = &now
+
+					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+						Type:               "Ready",
+						Status:             metav1.ConditionFalse,
+						Reason:             "PodNotFound",
+						Message:            "Origin pod no longer exists in Pending state",
+						ObservedGeneration: job.Generation,
+					})
+
 					if err := r.Status().Update(ctx, job); err != nil {
 						logger.Error(err, "Failed to update job status to Failed on missing origin pod")
 						return ctrl.Result{}, err
@@ -178,6 +196,16 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				logger.Info("Waiting for PodSnapshotManualTrigger to be created...", "trigger", triggerName)
+				cond := metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "Snapshotting",
+					Message:            "Waiting for GKE PodSnapshotManualTrigger to be created",
+					ObservedGeneration: job.Generation,
+				}
+				if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+					_ = r.Status().Update(ctx, job)
+				}
 				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 			}
 			logger.Error(err, "Failed to get PodSnapshotManualTrigger")
@@ -191,6 +219,16 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		if !found || snapshotName == "" {
 			logger.Info("Waiting for snapshot name to be populated in trigger status...", "trigger", triggerName)
+			cond := metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "Snapshotting",
+				Message:            "Waiting for GKE to populate snapshot name in trigger status",
+				ObservedGeneration: job.Generation,
+			}
+			if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+				_ = r.Status().Update(ctx, job)
+			}
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 
@@ -204,6 +242,16 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				logger.Info("Waiting for PodSnapshot to be created...", "snapshot", snapshotName)
+				cond := metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "Snapshotting",
+					Message:            fmt.Sprintf("Waiting for GKE PodSnapshot object %q to be created", snapshotName),
+					ObservedGeneration: job.Generation,
+				}
+				if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+					_ = r.Status().Update(ctx, job)
+				}
 				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 			}
 			logger.Error(err, "Failed to get PodSnapshot")
@@ -214,6 +262,16 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		snapStatus, ok := targetSnapshot.Object["status"].(map[string]interface{})
 		if !ok {
 			logger.Info("Snapshot status subresource not found, waiting...")
+			cond := metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "Snapshotting",
+				Message:            fmt.Sprintf("Waiting for GKE PodSnapshot %q status to be populated", snapshotName),
+				ObservedGeneration: job.Generation,
+			}
+			if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+				_ = r.Status().Update(ctx, job)
+			}
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 
@@ -235,6 +293,16 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		if !isReady {
 			logger.Info("Snapshot is not ready yet, waiting...")
+			cond := metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "Snapshotting",
+				Message:            fmt.Sprintf("Waiting for GKE PodSnapshot %q checkpoint to complete", snapshotName),
+				ObservedGeneration: job.Generation,
+			}
+			if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+				_ = r.Status().Update(ctx, job)
+			}
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 
@@ -351,6 +419,19 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			if activeAttachment {
+				cond := metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "WaitingForVolumeDetach",
+					Message:            fmt.Sprintf("Waiting for PVs to detach: %v", job.Status.PVsToDetach),
+					ObservedGeneration: job.Generation,
+				}
+				if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+					if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+						logger.Error(updateErr, "Failed to update status on volume detach wait")
+						return ctrl.Result{}, updateErr
+					}
+				}
 				// Requeue in 3 seconds to check again
 				return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 			}
@@ -361,6 +442,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
 		now := metav1.Now()
 		job.Status.CompletionTime = &now
+		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			Reason:             "MigrationSucceeded",
+			Message:            "Pod migration completed successfully",
+			ObservedGeneration: job.Generation,
+		})
 		err = r.Status().Update(ctx, job)
 		if err != nil {
 			logger.Error(err, "Failed to update job status to Succeeded")

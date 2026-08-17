@@ -35,6 +35,12 @@ type PodMigrationJobStatus struct {
 	// CompletionTime is the timestamp when this job transitioned to a terminal phase (Succeeded/Failed).
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// Conditions represent the latest available observations of the job's current state.
+	// +optional
+	// +patchMergeKey=type
+	// +patchStrategy=merge
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
