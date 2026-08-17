@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -386,3 +387,213 @@ func TestPodMigrationJobReconciler_Timeout(t *testing.T) {
 		})
 	}
 }
+
+func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+		},
+	}
+
+	t.Run("Scenario 1: Stale Trigger Deletion", func(t *testing.T) {
+		pmj := &pmv1alpha1.PodMigrationJob{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         namespace,
+				Name:              jobName,
+				UID:               "current-job-uid",
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef: corev1.LocalObjectReference{
+					Name: podName,
+				},
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhasePending,
+			},
+		}
+
+		// Create stale trigger with different owner UID
+		triggerName := fmt.Sprintf("trigger-%s", podName)
+		staleTrigger := &unstructured.Unstructured{}
+		staleTrigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		staleTrigger.SetName(triggerName)
+		staleTrigger.SetNamespace(namespace)
+		staleTrigger.Object["spec"] = map[string]interface{}{
+			"targetPod": podName,
+		}
+		staleTrigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       "old-job",
+				UID:        "old-job-uid",
+			},
+		})
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(pod, pmj, staleTrigger).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			Build()
+
+		r := &PodMigrationJobReconciler{
+			Client: fakeClient,
+			Scheme: scheme,
+		}
+
+		res, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      jobName,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+
+		if !res.Requeue {
+			t.Errorf("Expected Requeue to be true, got %v", res.Requeue)
+		}
+
+		// Verify PMJ is still in Pending
+		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+		if err != nil {
+			t.Fatalf("Failed to get PMJ: %v", err)
+		}
+		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
+			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhasePending, updatedPMJ.Status.Phase)
+		}
+
+		// Verify stale trigger is deleted
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, trigger)
+		if err == nil {
+			t.Errorf("Expected stale trigger to be deleted, but it still exists")
+		} else if !apierrors.IsNotFound(err) {
+			t.Errorf("Expected NotFound error, got %v", err)
+		}
+	})
+
+	t.Run("Scenario 2: Owned Trigger Kept", func(t *testing.T) {
+		pmj := &pmv1alpha1.PodMigrationJob{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         namespace,
+				Name:              jobName,
+				UID:               "current-job-uid",
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef: corev1.LocalObjectReference{
+					Name: podName,
+				},
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhasePending,
+			},
+		}
+
+		// Create owned trigger with matching owner UID
+		triggerName := fmt.Sprintf("trigger-%s", podName)
+		ownedTrigger := &unstructured.Unstructured{}
+		ownedTrigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		ownedTrigger.SetName(triggerName)
+		ownedTrigger.SetNamespace(namespace)
+		ownedTrigger.Object["spec"] = map[string]interface{}{
+			"targetPod": podName,
+		}
+		isController := true
+		ownedTrigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        "current-job-uid",
+				Controller: &isController,
+			},
+		})
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(pod, pmj, ownedTrigger).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			Build()
+
+		r := &PodMigrationJobReconciler{
+			Client: fakeClient,
+			Scheme: scheme,
+		}
+
+		res, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      jobName,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+
+		if !res.Requeue {
+			t.Errorf("Expected Requeue to be true, got %v", res.Requeue)
+		}
+
+		// Verify PMJ transitioned to Snapshotting
+		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+		if err != nil {
+			t.Fatalf("Failed to get PMJ: %v", err)
+		}
+		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSnapshotting, updatedPMJ.Status.Phase)
+		}
+
+		// Verify trigger still exists
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, trigger)
+		if err != nil {
+			t.Errorf("Expected trigger to exist, got error: %v", err)
+		}
+	})
+}
+

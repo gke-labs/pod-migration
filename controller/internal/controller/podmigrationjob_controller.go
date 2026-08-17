@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -149,23 +150,12 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			job.Status.PVsToDetach = pvs
 		}
 
-		logger.Info("Creating PodSnapshotManualTrigger", "trigger", triggerName)
-		trigger := &unstructured.Unstructured{}
-		trigger.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshotManualTrigger",
-		})
-		trigger.SetName(triggerName)
-		trigger.SetNamespace(req.Namespace)
-		trigger.Object["spec"] = map[string]interface{}{
-			"targetPod": podName,
-		}
-
-		err = r.Create(ctx, trigger)
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create PodSnapshotManualTrigger")
+		_, res, err := r.ensureTrigger(ctx, job, podName)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		if res.Requeue || res.RequeueAfter != 0 {
+			return res, nil
 		}
 
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
@@ -373,3 +363,64 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&pmv1alpha1.PodMigrationJob{}).
 		Complete(r)
 }
+
+func (r *PodMigrationJobReconciler) ensureTrigger(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (string, ctrl.Result, error) {
+	triggerName := fmt.Sprintf("trigger-%s", podName)
+	logger := log.FromContext(ctx).WithValues("trigger", triggerName)
+
+	trigger := &unstructured.Unstructured{}
+	trigger.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotManualTrigger",
+	})
+	trigger.SetName(triggerName)
+	trigger.SetNamespace(job.Namespace)
+	trigger.Object["spec"] = map[string]interface{}{
+		"targetPod": podName,
+	}
+
+	// Set owner reference to allow cascade deletion and ownership verification
+	if err := controllerutil.SetControllerReference(job, trigger, r.Scheme); err != nil {
+		logger.Error(err, "Failed to set owner reference on trigger")
+		return "", ctrl.Result{}, err
+	}
+
+	logger.Info("Creating PodSnapshotManualTrigger")
+	err := r.Create(ctx, trigger)
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// Fetch existing trigger to verify ownership
+			existingTrigger := &unstructured.Unstructured{}
+			existingTrigger.SetGroupVersionKind(trigger.GroupVersionKind())
+			getErr := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, existingTrigger)
+			if getErr == nil {
+				isOwned := false
+				for _, ref := range existingTrigger.GetOwnerReferences() {
+					if ref.UID == job.UID {
+						isOwned = true
+						break
+					}
+				}
+				if isOwned {
+					logger.Info("Trigger already exists and is owned by this job, proceeding")
+					return triggerName, ctrl.Result{}, nil
+				} else {
+					logger.Info("Stale trigger found (owned by another job), deleting it first")
+					_ = r.Delete(ctx, existingTrigger)
+					return "", ctrl.Result{Requeue: true}, nil
+				}
+			} else {
+				logger.Error(getErr, "Failed to fetch existing trigger on AlreadyExists")
+				return "", ctrl.Result{}, getErr
+			}
+		} else {
+			logger.Error(err, "Failed to create PodSnapshotManualTrigger")
+			return "", ctrl.Result{}, err
+		}
+	}
+
+	logger.Info("Successfully created PodSnapshotManualTrigger")
+	return triggerName, ctrl.Result{}, nil
+}
+
