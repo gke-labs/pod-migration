@@ -168,37 +168,53 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
 		// 3. Monitor GKE Snapshot readiness
-		snapshotList := &unstructured.UnstructuredList{}
-		snapshotList.SetGroupVersionKind(schema.GroupVersionKind{
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "podsnapshot.gke.io",
 			Version: "v1",
-			Kind:    "PodSnapshotList",
+			Kind:    "PodSnapshotManualTrigger",
 		})
-		err = r.List(ctx, snapshotList, client.InNamespace(req.Namespace))
+		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: triggerName}, trigger)
 		if err != nil {
-			logger.Error(err, "Failed to list PodSnapshots")
+			if apierrors.IsNotFound(err) {
+				logger.Info("Waiting for PodSnapshotManualTrigger to be created...", "trigger", triggerName)
+				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+			}
+			logger.Error(err, "Failed to get PodSnapshotManualTrigger")
 			return ctrl.Result{}, err
 		}
 
-		var targetSnapshot *unstructured.Unstructured
-		for _, s := range snapshotList.Items {
-			annotations := s.GetAnnotations()
-			if annotations["podsnapshot.gke.io/origin-pod"] == podName {
-				targetSnapshot = &s
-				break
-			}
+		snapshotName, found, err := unstructured.NestedString(trigger.Object, "status", "snapshotCreated", "name")
+		if err != nil {
+			logger.Error(err, "Failed to read snapshotCreated.name from trigger status")
+			return ctrl.Result{}, err
+		}
+		if !found || snapshotName == "" {
+			logger.Info("Waiting for snapshot name to be populated in trigger status...", "trigger", triggerName)
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 
-		if targetSnapshot == nil {
-			logger.Info("Waiting for GKE PodSnapshot object to be generated...")
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		targetSnapshot := &unstructured.Unstructured{}
+		targetSnapshot.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshot",
+		})
+		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: snapshotName}, targetSnapshot)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("Waiting for PodSnapshot to be created...", "snapshot", snapshotName)
+				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+			}
+			logger.Error(err, "Failed to get PodSnapshot")
+			return ctrl.Result{}, err
 		}
 
 		// Check if snapshot is ready
 		snapStatus, ok := targetSnapshot.Object["status"].(map[string]interface{})
 		if !ok {
 			logger.Info("Snapshot status subresource not found, waiting...")
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 
 		conditions, _ := snapStatus["conditions"].([]interface{})
@@ -219,12 +235,12 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		if !isReady {
 			logger.Info("Snapshot is not ready yet, waiting...")
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 
-		logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", targetSnapshot.GetName())
-		job.Status.SnapshotRef = targetSnapshot.GetName()
+		logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapshotName)
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
+		job.Status.SnapshotRef = snapshotName
 		err = r.Status().Update(ctx, job)
 		if err != nil {
 			logger.Error(err, "Failed to update job status to Evicting")
