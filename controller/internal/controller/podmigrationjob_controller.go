@@ -65,8 +65,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Enforce 10-minute timeout for active migrations (both Snapshotting and Evicting)
-	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
+	// Enforce 10-minute timeout for active migrations (Pending, Snapshotting, and Evicting)
+	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhasePending ||
+		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 		const migrationTimeout = 10 * time.Minute
 		if time.Since(job.CreationTimestamp.Time) > migrationTimeout {
@@ -121,6 +122,17 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			originPod := &corev1.Pod{}
 			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
 			if err != nil {
+				if apierrors.IsNotFound(err) {
+					logger.Info("Origin pod no longer exists in Pending state, failing migration job")
+					job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+					now := metav1.Now()
+					job.Status.CompletionTime = &now
+					if err := r.Status().Update(ctx, job); err != nil {
+						logger.Error(err, "Failed to update job status to Failed on missing origin pod")
+						return ctrl.Result{}, err
+					}
+					return ctrl.Result{}, nil
+				}
 				logger.Error(err, "Failed to get origin pod for PV analysis in Pending state")
 				return ctrl.Result{}, err
 			}
