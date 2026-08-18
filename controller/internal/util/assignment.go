@@ -37,6 +37,22 @@ func ResolveParentWorkload(ctx context.Context, c client.Client, pod *corev1.Pod
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
 func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind string) (string, error) {
+	// Scan pods to find which PMJs are already assigned
+	assignedPMJs := make(map[string]bool)
+	podList := &corev1.PodList{}
+	err := c.List(ctx, podList, client.InNamespace(namespace))
+	if err != nil {
+		return "", err
+	}
+
+	for _, p := range podList.Items {
+		if p.Annotations != nil {
+			if pmjName, ok := p.Annotations["pod-migration.gke.io/assigned-pmj"]; ok {
+				assignedPMJs[pmjName] = true
+			}
+		}
+	}
+
 	if parentName == "" {
 		// Bare Pod fallback: Look for a PMJ matching the exact pod name
 		jobName := fmt.Sprintf("pmj-%s", podName)
@@ -48,32 +64,18 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 				phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 				phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
 				phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
-				return job.Name, nil
+				if !assignedPMJs[job.Name] {
+					return job.Name, nil
+				}
 			}
 		}
 		return "", nil
 	}
 
 	jobList := &pmv1alpha1.PodMigrationJobList{}
-	err := c.List(ctx, jobList, client.InNamespace(namespace))
+	err = c.List(ctx, jobList, client.InNamespace(namespace))
 	if err != nil {
 		return "", err
-	}
-
-	// Scan pods to find which PMJs are already assigned
-	assignedPMJs := make(map[string]bool)
-	podList := &corev1.PodList{}
-	err = c.List(ctx, podList, client.InNamespace(namespace))
-	if err != nil {
-		return "", err
-	}
-
-	for _, p := range podList.Items {
-		if p.Annotations != nil {
-			if pmjName, ok := p.Annotations["pod-migration.gke.io/assigned-pmj"]; ok {
-				assignedPMJs[pmjName] = true
-			}
-		}
 	}
 
 	// Pick the first active PMJ that is not yet assigned
