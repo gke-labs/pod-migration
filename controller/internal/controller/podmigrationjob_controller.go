@@ -160,7 +160,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				if vol.PersistentVolumeClaim != nil {
 					pvc := &corev1.PersistentVolumeClaim{}
 					err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
-					if err == nil && pvc.Spec.VolumeName != "" {
+					if err != nil {
+						if apierrors.IsNotFound(err) {
+							logger.Info("PVC not found, skipping volume", "pvc", vol.PersistentVolumeClaim.ClaimName)
+							continue
+						}
+						logger.Error(err, "Failed to get PVC for volume analysis", "pvc", vol.PersistentVolumeClaim.ClaimName)
+						return ctrl.Result{}, err // Return error to trigger manager retry
+					}
+					if pvc.Spec.VolumeName != "" {
 						pvs = append(pvs, pvc.Spec.VolumeName)
 					}
 				}
