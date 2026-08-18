@@ -54,7 +54,7 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 
 	// If there is no active unassigned migration job, this is a scale-up or unrelated pod.
 	// We do NOT inject the scheduling gate and bypass native GKE restore.
-	if assignedPMJ == "" && parentName != "" {
+	if assignedPMJ == "" {
 		logger.Info("Bypassing scheduling gate injection (scale-up pod)")
 		if pod.Annotations == nil {
 			pod.Annotations = make(map[string]string)

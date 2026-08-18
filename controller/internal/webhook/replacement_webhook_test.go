@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,8 +19,10 @@ func TestPodGateInjector(t *testing.T) {
 	tests := []struct {
 		name            string
 		pod             *corev1.Pod
+		initObjs        []runtime.Object
 		expectedAllowed bool
-		expectedPatched bool
+		expectGate      bool
+		expectBypass    bool
 	}{
 		{
 			name: "Pod not opted in",
@@ -30,10 +33,11 @@ func TestPodGateInjector(t *testing.T) {
 				},
 			},
 			expectedAllowed: true,
-			expectedPatched: false,
+			expectGate:      false,
+			expectBypass:    false,
 		},
 		{
-			name: "Pod opted in, gate injected",
+			name: "Pod opted in, gate bypassed (no active PMJ)",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "default",
@@ -44,10 +48,11 @@ func TestPodGateInjector(t *testing.T) {
 				},
 			},
 			expectedAllowed: true,
-			expectedPatched: true,
+			expectGate:      false,
+			expectBypass:    true,
 		},
 		{
-			name: "Pod already has gate",
+			name: "Pod already has gate, bypassed (no active PMJ)",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "default",
@@ -63,7 +68,127 @@ func TestPodGateInjector(t *testing.T) {
 				},
 			},
 			expectedAllowed: true,
-			expectedPatched: false,
+			expectGate:      false,
+			expectBypass:    true,
+		},
+		{
+			name: "Pod opted in, active PMJ exists, gate injected",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+				},
+			},
+			initObjs: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test-pod",
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      true,
+			expectBypass:    false,
+		},
+		{
+			name: "Pod opted in, parent workload exists, no active PMJ (scale-up), bypass gate",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod-12345",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "ReplicaSet",
+							Name:       "test-rs",
+							UID:        "rs-uid",
+						},
+					},
+				},
+			},
+			initObjs: []runtime.Object{
+				&appsv1.ReplicaSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-rs",
+						UID:        "rs-uid",
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "Deployment",
+								Name:       "test-deployment",
+								UID:        "deploy-uid",
+							},
+						},
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      false,
+			expectBypass:    true,
+		},
+		{
+			name: "Pod opted in, parent workload exists, active PMJ exists, gate injected",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod-12345",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "ReplicaSet",
+							Name:       "test-rs",
+							UID:        "rs-uid",
+						},
+					},
+				},
+			},
+			initObjs: []runtime.Object{
+				&appsv1.ReplicaSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-rs",
+						UID:        "rs-uid",
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "Deployment",
+								Name:       "test-deployment",
+								UID:        "deploy-uid",
+							},
+						},
+					},
+				},
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test",
+						Labels: map[string]string{
+							"pod-migration.gke.io/parent-name": "test-deployment",
+							"pod-migration.gke.io/parent-kind": "Deployment",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      true,
+			expectBypass:    false,
 		},
 	}
 
@@ -71,10 +196,11 @@ func TestPodGateInjector(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = corev1.AddToScheme(scheme)
+			_ = appsv1.AddToScheme(scheme)
 			_ = pmv1alpha1.AddToScheme(scheme)
 			dec := admission.NewDecoder(scheme)
 
-			cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tt.initObjs...).Build()
 
 			handler := &PodGateInjector{
 				Client:  cl,
@@ -97,28 +223,33 @@ func TestPodGateInjector(t *testing.T) {
 				t.Errorf("Expected allowed %t, got %t", tt.expectedAllowed, resp.Allowed)
 			}
 
-			hasPatches := len(resp.Patches) > 0
-			if tt.expectedPatched != hasPatches {
-				t.Errorf("Expected patched %t, got %t (patches: %+v)", tt.expectedPatched, hasPatches, resp.Patches)
+			gateAdded := false
+			bypassAnnotated := false
+
+			for _, patch := range resp.Patches {
+				if patch.Operation == "add" && (patch.Path == "/spec/schedulingGates" || patch.Path == "/spec/schedulingGates/-") {
+					gateAdded = true
+				}
+				if patch.Path == "/metadata/annotations" {
+					if valMap, ok := patch.Value.(map[string]interface{}); ok {
+						if psName, ok := valMap["podsnapshot.gke.io/ps-name"]; ok && psName == "" {
+							bypassAnnotated = true
+						}
+					}
+				}
+				if patch.Path == "/metadata/annotations/podsnapshot.gke.io~1ps-name" {
+					if valStr, ok := patch.Value.(string); ok && valStr == "" {
+						bypassAnnotated = true
+					}
+				}
 			}
 
-			// If patched, verify the gate was actually added
-			if tt.expectedPatched {
-				gateAdded := false
-				for _, patch := range resp.Patches {
-					if patch.Operation == "add" && patch.Path == "/spec/schedulingGates" {
-						gateAdded = true
-						break
-					}
-					// Also handle appending case if schedulingGates already exists (though empty in test)
-					if patch.Operation == "add" && patch.Path == "/spec/schedulingGates/-" {
-						gateAdded = true
-						break
-					}
-				}
-				if !gateAdded {
-					t.Errorf("Expected patch to add scheduling gate, but patches were: %+v", resp.Patches)
-				}
+			if tt.expectGate != gateAdded {
+				t.Errorf("Expected gateAdded %t, got %t (patches: %+v)", tt.expectGate, gateAdded, resp.Patches)
+			}
+
+			if tt.expectBypass != bypassAnnotated {
+				t.Errorf("Expected bypassAnnotated %t, got %t (patches: %+v)", tt.expectBypass, bypassAnnotated, resp.Patches)
 			}
 		})
 	}
