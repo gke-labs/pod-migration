@@ -319,3 +319,127 @@ func TestPodGateReconciler_mapPMJToPods(t *testing.T) {
 		t.Errorf("Failed to receive reconcile requests for expected pods: %v", expectedNames)
 	}
 }
+
+func TestPodGateReconciler_Reconcile_Collision(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-test"
+
+	winnerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "a-winner",
+			UID:       "uid-winner",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	loserPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "b-loser",
+			UID:       "uid-loser",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(winnerPod, loserPod, pmj).
+		Build()
+
+	r := &PodGateReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      "b-loser",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling loser: %v", err)
+	}
+
+	updatedLoser := &corev1.Pod{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "b-loser"}, updatedLoser)
+	if err != nil {
+		t.Fatalf("failed to fetch updated loser pod: %v", err)
+	}
+
+	hasGate := false
+	for _, gate := range updatedLoser.Spec.SchedulingGates {
+		if gate.Name == "gke.io/pod-migration-gate" {
+			hasGate = true
+			break
+		}
+	}
+	if hasGate {
+		t.Error("expected loser pod to have scheduling gate removed")
+	}
+
+	if _, assigned := updatedLoser.Annotations["pod-migration.gke.io/assigned-pmj"]; assigned {
+		t.Error("expected loser pod to have PMJ assignment cleared")
+	}
+
+	bypass, hasBypass := updatedLoser.Annotations["podsnapshot.gke.io/ps-name"]
+	if !hasBypass || bypass != "" {
+		t.Errorf("expected restore-bypass annotation, got %q (present: %t)", bypass, hasBypass)
+	}
+
+	updatedWinner := &corev1.Pod{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "a-winner"}, updatedWinner)
+	if err != nil {
+		t.Fatalf("failed to fetch winner pod: %v", err)
+	}
+
+	hasGate = false
+	for _, gate := range updatedWinner.Spec.SchedulingGates {
+		if gate.Name == "gke.io/pod-migration-gate" {
+			hasGate = true
+			break
+		}
+	}
+	if !hasGate {
+		t.Error("expected winner pod to keep scheduling gate")
+	}
+
+	if assigned := updatedWinner.Annotations["pod-migration.gke.io/assigned-pmj"]; assigned != pmjName {
+		t.Errorf("expected winner pod to keep PMJ assignment, got %q", assigned)
+	}
+
+	if _, hasBypass := updatedWinner.Annotations["podsnapshot.gke.io/ps-name"]; hasBypass {
+		t.Error("expected winner pod to NOT have restore-bypass annotation")
+	}
+}
+

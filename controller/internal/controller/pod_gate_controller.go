@@ -90,6 +90,10 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		} else {
 			logger.Info("Releasing scheduling gate for scale-up pod (race loser)")
 			delete(pod.Annotations, "pod-migration.gke.io/assigned-pmj")
+			if pod.Annotations == nil {
+				pod.Annotations = make(map[string]string)
+			}
+			pod.Annotations["podsnapshot.gke.io/ps-name"] = "" // Inject GKE restore-bypass
 			r.removeGate(pod)
 		}
 		return ctrl.Result{}, r.Update(ctx, pod)
