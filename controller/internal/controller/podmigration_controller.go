@@ -118,8 +118,12 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	specPayloadManual := map[string]interface{}{
 		"storageConfigName": psscName,
 		"selector": map[string]interface{}{
-			"matchLabels": map[string]interface{}{
-				"pod-migration.gke.io/enabled": "true",
+			"matchExpressions": []interface{}{
+				map[string]interface{}{
+					"key":      "pod-migration.gke.io/enabled",
+					"operator": "In",
+					"values":   []interface{}{"true"},
+				},
 			},
 		},
 		"triggerConfig": map[string]interface{}{

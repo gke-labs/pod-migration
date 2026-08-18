@@ -148,6 +148,40 @@ func TestPodMigrationReconciler_Reconcile_Success(t *testing.T) {
 	if psp.GetName() != "psp-test-migration-manual" {
 		t.Errorf("Expected name psp-test-migration-manual, got %s", psp.GetName())
 	}
+
+	// Verify PSP spec selector
+	pspSpec, ok := psp.Object["spec"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("PSP spec is not a map")
+	}
+	selector, ok := pspSpec["selector"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("PSP selector is not a map")
+	}
+	matchExpressions, ok := selector["matchExpressions"].([]interface{})
+	if !ok {
+		t.Fatalf("PSP selector matchExpressions is not a slice, got %T", selector["matchExpressions"])
+	}
+	if len(matchExpressions) != 1 {
+		t.Fatalf("Expected 1 matchExpression, got %d", len(matchExpressions))
+	}
+	expr, ok := matchExpressions[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("matchExpression is not a map")
+	}
+	if expr["key"] != "pod-migration.gke.io/enabled" {
+		t.Errorf("Expected key pod-migration.gke.io/enabled, got %v", expr["key"])
+	}
+	if expr["operator"] != "In" {
+		t.Errorf("Expected operator In, got %v", expr["operator"])
+	}
+	values, ok := expr["values"].([]interface{})
+	if !ok {
+		t.Fatalf("values is not []interface{}, got %T", expr["values"])
+	}
+	if len(values) != 1 || values[0] != "true" {
+		t.Errorf("Expected values [true], got %v", values)
+	}
 }
 
 func TestPodMigrationReconciler_Reconcile_BucketOnly(t *testing.T) {
