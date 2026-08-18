@@ -1,5 +1,17 @@
 /*
-Copyright 2026 The PM Learning Demo Authors.
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
 main.go — wires every Reconciler + Webhook into a single Manager.
 
@@ -8,9 +20,8 @@ one Manager, and many controllers/webhooks living inside it. The Manager
 owns the shared cache, the typed client, leader election, the metrics server,
 and the webhook HTTPS server.
 
-In Scott's PoC the structure is identical to this file: 3 reconcilers + 1
-webhook + 1 Manager. Read this top-to-bottom and the entire control plane
-shape will click.
+The structure is: 3 reconcilers + 3 webhooks + 1 Manager. Read this top-to-bottom
+and the entire control plane shape will click.
 */
 package main
 
@@ -68,8 +79,7 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "pod-migration-leader.example.com",
-		// Webhook server is on :9443 by default. The Service in
-		// config/webhook/service.yaml points at this port.
+		// Webhook server is on :9443 by default.
 		WebhookServer: webhook.NewServer(webhook.Options{Port: 9443}),
 	})
 	if err != nil {
