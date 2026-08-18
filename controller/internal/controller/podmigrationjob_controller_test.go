@@ -911,6 +911,3 @@ func TestPodMigrationJobReconciler_Evicting_Success(t *testing.T) {
 		t.Errorf("Expected Ready condition reason to be 'MigrationSucceeded', got %q", cond.Reason)
 	}
 }
-
-
-

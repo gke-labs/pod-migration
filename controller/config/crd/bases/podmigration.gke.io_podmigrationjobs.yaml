@@ -143,7 +143,7 @@ spec:
                   type: string
                 type: array
               snapshotRef:
-                description: SnapshotRef references GKE's native PodSnapshot name.
+                description: SnapshotRef references the name of the created pod snapshot.
                 type: string
             type: object
         type: object

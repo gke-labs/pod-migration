@@ -27,7 +27,7 @@ const (
 // PodMigrationJobStatus defines the observed state.
 type PodMigrationJobStatus struct {
 	Phase PodMigrationJobPhase `json:"phase,omitempty"`
-	// SnapshotRef references GKE's native PodSnapshot name.
+	// SnapshotRef references the name of the created pod snapshot.
 	SnapshotRef string `json:"snapshotRef,omitempty"`
 	// PVsToDetach lists the Persistent Volume names we are waiting to detach.
 	// +optional

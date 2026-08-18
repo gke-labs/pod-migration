@@ -535,4 +535,3 @@ func (r *PodMigrationJobReconciler) ensureTrigger(ctx context.Context, job *pmv1
 	logger.Info("Successfully created PodSnapshotManualTrigger")
 	return triggerName, ctrl.Result{}, nil
 }
-

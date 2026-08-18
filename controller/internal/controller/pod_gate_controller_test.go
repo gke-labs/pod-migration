@@ -442,4 +442,3 @@ func TestPodGateReconciler_Reconcile_Collision(t *testing.T) {
 		t.Error("expected winner pod to NOT have restore-bypass annotation")
 	}
 }
-

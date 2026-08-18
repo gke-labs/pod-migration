@@ -121,7 +121,7 @@ func TestPodGateInjector(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
 						Name:      "test-rs",
-						UID:        "rs-uid",
+						UID:       "rs-uid",
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								APIVersion: "apps/v1",
@@ -161,7 +161,7 @@ func TestPodGateInjector(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
 						Name:      "test-rs",
-						UID:        "rs-uid",
+						UID:       "rs-uid",
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								APIVersion: "apps/v1",
