@@ -155,6 +155,29 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				logger.Error(err, "Failed to get origin pod for PV analysis in Pending state")
 				return ctrl.Result{}, err
 			}
+
+			// If the pod was replaced with a new instance (UID changed), fail the migration job.
+			if string(originPod.UID) != job.Spec.TargetPodUID {
+				logger.Info("Origin pod UID mismatch in Pending state, failing migration job", "expectedUID", job.Spec.TargetPodUID, "actualUID", originPod.UID)
+				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+				now := metav1.Now()
+				job.Status.CompletionTime = &now
+
+				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "PodNotFound",
+					Message:            "Origin pod UID mismatch in Pending state",
+					ObservedGeneration: job.Generation,
+				})
+
+				if err := r.Status().Update(ctx, job); err != nil {
+					logger.Error(err, "Failed to update job status to Failed on origin pod UID mismatch")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+
 			var pvs []string
 			for _, vol := range originPod.Spec.Volumes {
 				if vol.PersistentVolumeClaim != nil {

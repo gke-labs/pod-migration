@@ -308,6 +308,99 @@ func TestPodMigrationJobReconciler_Pending_PodNotFound(t *testing.T) {
 	}
 }
 
+func TestPodMigrationJobReconciler_Pending_PodUIDMismatch(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "new-pod-uid",
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: "expected-pod-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected no requeue, got: %+v", res)
+	}
+
+	// Verify PMJ transitioned to Failed due to UID mismatch
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseFailed, updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Status.CompletionTime == nil {
+		t.Errorf("Expected CompletionTime to be set")
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatalf("Expected Ready condition to be set, but it was nil")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("Expected Ready condition status to be False, got %s", cond.Status)
+	}
+	if cond.Reason != "PodNotFound" {
+		t.Errorf("Expected Ready condition reason to be 'PodNotFound', got %q", cond.Reason)
+	}
+	if cond.Message != "Origin pod UID mismatch in Pending state" {
+		t.Errorf("Expected Ready condition message to be 'Origin pod UID mismatch in Pending state', got %q", cond.Message)
+	}
+}
+
 func TestPodMigrationJobReconciler_Timeout(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
