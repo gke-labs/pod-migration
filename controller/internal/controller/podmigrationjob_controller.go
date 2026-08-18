@@ -370,6 +370,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					logger.Error(err, "Failed to delete origin pod (fallback)")
 					return ctrl.Result{}, err
 				}
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			} else {
 				logger.Info("Waiting for eviction webhook to allow deletion", "pod", podName, "elapsed", time.Since(evictingSince))
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
