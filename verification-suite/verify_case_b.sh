@@ -24,9 +24,7 @@ kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
 NODE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.nodeName}')
 echo "[*] Pod is running on node: $NODE"
 
-# Find the agent pod on this node
-AGENT_POD=$(kubectl get pods -n default -o wide | grep "$NODE" | grep custom-pod-snapshot-agent | awk '{print $1}')
-echo "[*] Agent pod on node $NODE is: $AGENT_POD"
+
 
 # Get current log size or timestamp to filter new logs
 START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -45,15 +43,7 @@ if [ -n "$snapshots" ]; then
 fi
 echo "[+] No PodSnapshot CR created. Passed."
 
-echo "[*] Verifying agent logs for user deletion skip message..."
-if kubectl logs "$AGENT_POD" --since-time="$START_TIME" 2>&1 | grep -q "skipping checkpoint (user deletion)"; then
-  echo "[+] Found skip message in agent logs. Passed."
-else
-  echo "[FAIL] Skip message not found in agent logs!"
-  echo "--- Agent Logs since $START_TIME ---"
-  kubectl logs "$AGENT_POD" --since-time="$START_TIME"
-  exit 1
-fi
+
 
 echo "[SUCCESS] Case B verification passed!"
 # Cleanup

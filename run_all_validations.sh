@@ -11,7 +11,7 @@ cleanup() {
   local app=$1
   echo "[*] Cleaning up after $app..." | tee -a "$log_file"
   kubectl delete statefulset,pvc,job --all --ignore-not-found --timeout=30s || true
-  kubectl delete pod -l 'app!=custom-pod-snapshot-agent' --ignore-not-found --timeout=30s || true
+  kubectl delete pod --all --ignore-not-found --timeout=30s || true
   kubectl delete podmigrationjob,podsnapshotmanualtrigger --all --timeout=15s || true
   kubectl get nodes -l sandbox.gke.io/runtime=gvisor -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | xargs -I {} kubectl uncordon {} || true
 }
