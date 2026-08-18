@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -129,7 +130,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, r.Update(ctx, pod)
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }
 
 func (r *PodGateReconciler) removeGate(pod *corev1.Pod) {
