@@ -80,10 +80,19 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 		return admission.Allowed("PMJ UID mismatch")
 	}
 
-	// Verify if pod.DeletionTimestamp is nil. If it is nil, log it and return admission.Allowed("pod completed naturally").
+	// Verify if pod.DeletionTimestamp is nil.
 	if pod.DeletionTimestamp == nil {
-		logger.Info("Pod DeletionTimestamp is nil, allowing normal completion", "pod", pod.Name)
-		return admission.Allowed("pod completed naturally")
+		// If the migration job is in an active phase, the container was stopped
+		// by the checkpoint agent, so we must still force a failure to trigger rescheduling.
+		phase := pmj.Status.Phase
+		if phase == pmv1alpha1.PodMigrationJobPhasePending ||
+			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
+			phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+			logger.Info("Pod is terminating due to active migration checkpoint, forcing failure state", "phase", phase)
+		} else {
+			logger.Info("Pod DeletionTimestamp is nil and migration is not active, allowing normal completion", "phase", phase)
+			return admission.Allowed("pod completed naturally")
+		}
 	}
 
 	// If PMJ exists, it means this pod is undergoing migration.
