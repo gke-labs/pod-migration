@@ -36,6 +36,24 @@ func ResolveParentWorkload(ctx context.Context, c client.Client, pod *corev1.Pod
 	return "", "", nil
 }
 
+// ShortUID returns the first 8 characters of a UID, or the full UID if shorter.
+func ShortUID(uid string) string {
+	if len(uid) <= 8 {
+		return uid
+	}
+	return uid[:8]
+}
+
+// FormatPMJName returns the standardized PodMigrationJob name.
+func FormatPMJName(podName, uid string) string {
+	return fmt.Sprintf("pmj-%s-%s", podName, ShortUID(uid))
+}
+
+// FormatPSMTName returns the standardized PodSnapshotManualTrigger name.
+func FormatPSMTName(podName, uid string) string {
+	return fmt.Sprintf("psmt-%s-%s", podName, ShortUID(uid))
+}
+
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
 func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind string) (string, error) {
 	// Scan pods to find which PMJs are already assigned
@@ -54,25 +72,6 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 		}
 	}
 
-	if parentName == "" {
-		// Bare Pod fallback: Look for a PMJ matching the exact pod name
-		jobName := fmt.Sprintf("pmj-%s", podName)
-		job := &pmv1alpha1.PodMigrationJob{}
-		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, job)
-		if err == nil {
-			phase := job.Status.Phase
-			if phase == pmv1alpha1.PodMigrationJobPhasePending ||
-				phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
-				phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
-				phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
-				if !assignedPMJs[job.Name] {
-					return job.Name, nil
-				}
-			}
-		}
-		return "", nil
-	}
-
 	jobList := &pmv1alpha1.PodMigrationJobList{}
 	err = c.List(ctx, jobList, client.InNamespace(namespace))
 	if err != nil {
@@ -81,22 +80,30 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 
 	// Pick the first active PMJ that is not yet assigned
 	for _, job := range jobList.Items {
-		if job.Labels["pod-migration.gke.io/parent-name"] == parentName &&
-			job.Labels["pod-migration.gke.io/parent-kind"] == parentKind {
+		if parentName == "" {
+			// Bare Pod: match by origin pod name and absence of parent label
+			if job.Spec.PodRef.Name != podName || job.Labels["pod-migration.gke.io/parent-name"] != "" {
+				continue
+			}
+		} else {
+			if job.Labels["pod-migration.gke.io/parent-name"] != parentName ||
+				job.Labels["pod-migration.gke.io/parent-kind"] != parentKind {
+				continue
+			}
 
 			// For StatefulSets, strictly match by exact name
 			if parentKind == "StatefulSet" && job.Spec.PodRef.Name != podName {
 				continue
 			}
+		}
 
-			phase := job.Status.Phase
-			if phase == pmv1alpha1.PodMigrationJobPhasePending ||
-				phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
-				phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
-				phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
-				if !assignedPMJs[job.Name] {
-					return job.Name, nil
-				}
+		phase := job.Status.Phase
+		if phase == pmv1alpha1.PodMigrationJobPhasePending ||
+			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
+			phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
+			phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+			if !assignedPMJs[job.Name] {
+				return job.Name, nil
 			}
 		}
 	}

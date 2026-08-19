@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
@@ -76,36 +77,24 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed("Pod does not use gvisor runtime, skipping migration")
 	}
 
-	// Define migration job name
-	jobName := fmt.Sprintf("pmj-%s", req.Name)
+	// Define migration job name with origin Pod UID to ensure unique, collision-free identity
+	jobName := util.FormatPMJName(pod.Name, string(pod.UID))
 
 	// Check if PodMigrationJob already exists
 	job := &pmv1alpha1.PodMigrationJob{}
 	err = a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: jobName}, job)
 	if err == nil {
-		// Verify if the job belongs to the current pod instance
-		if job.Spec.TargetPodUID != string(pod.UID) {
-			logger.Info("Found stale migration job from a previous pod instance, deleting it to start fresh", "job", jobName, "oldUID", job.Spec.TargetPodUID, "newUID", pod.UID)
-			err = a.Client.Delete(ctx, job)
-			if err != nil && !apierrors.IsNotFound(err) {
-				logger.Error(err, "Failed to delete stale migration job")
-				return denied429("failed to clear legacy migration metadata, retrying")
-			}
-			// Fall through to create a new PMJ for the new pod instance
-		} else {
-			// Job belongs to current pod instance, check status
-			logger.Info("Migration job already exists for current pod instance", "job", jobName, "phase", job.Status.Phase)
-			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
-				job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
-				logger.Info("Migration checkpoint complete, allowing eviction", "job", jobName, "phase", job.Status.Phase)
-				return admission.Allowed("migration checkpoint complete")
-			}
-			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
-				logger.Info("Migration job failed for current pod instance, allowing cold eviction (fail-open)", "job", jobName)
-				return admission.Allowed("migration failed, falling back to cold eviction")
-			}
-			return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
+		logger.Info("Migration job already exists for current pod instance", "job", jobName, "phase", job.Status.Phase)
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
+			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+			logger.Info("Migration checkpoint complete, allowing eviction", "job", jobName, "phase", job.Status.Phase)
+			return admission.Allowed("migration checkpoint complete")
 		}
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
+			logger.Info("Migration job failed for current pod instance, allowing cold eviction (fail-open)", "job", jobName)
+			return admission.Allowed("migration failed, falling back to cold eviction")
+		}
+		return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
 	}
 
 	if err != nil && !apierrors.IsNotFound(err) {
