@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -105,6 +106,15 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 // ResolveCollision deterministically resolves PMJ assignment races.
 // Returns: (correctedPMJ, changed, error)
 func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, assignedPMJ, parentName, parentKind string) (string, bool, error) {
+	// Fetch the assigned PMJ to check targetPodUID
+	job := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assignedPMJ}, job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", true, nil // PMJ was deleted out-of-band, clear assignment
+		}
+		return "", false, err
+	}
+
 	podList := &corev1.PodList{}
 	err := c.List(ctx, podList, client.InNamespace(pod.Namespace))
 	if err != nil {
@@ -114,18 +124,12 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	var contenders []*corev1.Pod
 	for i := range podList.Items {
 		p := &podList.Items[i]
+		// Exclude the origin pod being migrated
+		if string(p.UID) == job.Spec.TargetPodUID {
+			continue
+		}
 		if p.Annotations != nil && p.Annotations["pod-migration.gke.io/assigned-pmj"] == assignedPMJ {
-			// Only consider contenders that are still scheduling (have the gate)
-			gated := false
-			for _, g := range p.Spec.SchedulingGates {
-				if g.Name == "gke.io/pod-migration-gate" {
-					gated = true
-					break
-				}
-			}
-			if gated {
-				contenders = append(contenders, p)
-			}
+			contenders = append(contenders, p)
 		}
 	}
 
