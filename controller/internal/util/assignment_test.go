@@ -30,15 +30,20 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 			existing: []runtime.Object{
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "pmj-my-bare-pod",
+						Name:      FormatPMJName("my-bare-pod", "12345678"),
 						Namespace: "default",
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{
+							Name: "my-bare-pod",
+						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
 						Phase: pmv1alpha1.PodMigrationJobPhasePending,
 					},
 				},
 			},
-			expected: "pmj-my-bare-pod",
+			expected: FormatPMJName("my-bare-pod", "12345678"),
 		},
 		{
 			name:    "Bare pod, active PMJ, already assigned to another pod",
@@ -46,8 +51,13 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 			existing: []runtime.Object{
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "pmj-my-bare-pod",
+						Name:      FormatPMJName("my-bare-pod", "12345678"),
 						Namespace: "default",
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{
+							Name: "my-bare-pod",
+						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
 						Phase: pmv1alpha1.PodMigrationJobPhasePending,
@@ -58,7 +68,7 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 						Name:      "my-bare-pod-terminating",
 						Namespace: "default",
 						Annotations: map[string]string{
-							"pod-migration.gke.io/assigned-pmj": "pmj-my-bare-pod",
+							"pod-migration.gke.io/assigned-pmj": FormatPMJName("my-bare-pod", "12345678"),
 						},
 					},
 				},

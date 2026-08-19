@@ -2,13 +2,11 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -19,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestPodMigrationJobReconciler_Pending(t *testing.T) {
@@ -28,7 +27,8 @@ func TestPodMigrationJobReconciler_Pending(t *testing.T) {
 
 	namespace := "default"
 	podName := "test-pod"
-	jobName := "pmj-" + podName
+	podUID := "12345678-abcd"
+	jobName := util.FormatPMJName(podName, podUID)
 
 	pod := &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
@@ -38,6 +38,7 @@ func TestPodMigrationJobReconciler_Pending(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      podName,
+			UID:       types.UID(podUID),
 		},
 	}
 
@@ -55,6 +56,7 @@ func TestPodMigrationJobReconciler_Pending(t *testing.T) {
 			PodRef: corev1.LocalObjectReference{
 				Name: podName,
 			},
+			TargetPodUID: podUID,
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase: pmv1alpha1.PodMigrationJobPhasePending,
@@ -93,7 +95,7 @@ func TestPodMigrationJobReconciler_Pending(t *testing.T) {
 	}
 
 	// Verify PodSnapshotManualTrigger was created
-	triggerName := fmt.Sprintf("trigger-%s", podName)
+	triggerName := util.FormatPSMTName(podName, podUID)
 	trigger := &unstructured.Unstructured{}
 	trigger.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "podsnapshot.gke.io",
@@ -118,9 +120,10 @@ func TestPodMigrationJobReconciler_Pending_WithPVs(t *testing.T) {
 
 	namespace := "default"
 	podName := "test-pod"
+	podUID := "12345678-abcd"
 	pvcName := "test-pvc"
 	pvName := "test-pv"
-	jobName := "pmj-" + podName
+	jobName := util.FormatPMJName(podName, podUID)
 
 	pod := &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
@@ -130,6 +133,7 @@ func TestPodMigrationJobReconciler_Pending_WithPVs(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      podName,
+			UID:       types.UID(podUID),
 		},
 		Spec: corev1.PodSpec{
 			Volumes: []corev1.Volume{
@@ -172,6 +176,7 @@ func TestPodMigrationJobReconciler_Pending_WithPVs(t *testing.T) {
 			PodRef: corev1.LocalObjectReference{
 				Name: podName,
 			},
+			TargetPodUID: podUID,
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase: pmv1alpha1.PodMigrationJobPhasePending,
@@ -218,7 +223,7 @@ func TestPodMigrationJobReconciler_Pending_WithPVs(t *testing.T) {
 	}
 
 	// Verify trigger IS created
-	triggerName := fmt.Sprintf("trigger-%s", podName)
+	triggerName := util.FormatPSMTName(podName, podUID)
 	trigger := &unstructured.Unstructured{}
 	trigger.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "podsnapshot.gke.io",
@@ -510,7 +515,8 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 
 	namespace := "default"
 	podName := "test-pod"
-	jobName := "pmj-" + podName
+	podUID := "12345678-abcd"
+	jobName := util.FormatPMJName(podName, podUID)
 
 	pod := &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
@@ -520,10 +526,11 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      podName,
+			UID:       types.UID(podUID),
 		},
 	}
 
-	t.Run("Scenario 1: Stale Trigger Deletion", func(t *testing.T) {
+	t.Run("Scenario 1: Existing Trigger Idempotent Reconcile", func(t *testing.T) {
 		pmj := &pmv1alpha1.PodMigrationJob{
 			TypeMeta: metav1.TypeMeta{
 				APIVersion: "podmigration.gke.io/v1alpha1",
@@ -539,37 +546,30 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 				PodRef: corev1.LocalObjectReference{
 					Name: podName,
 				},
+				TargetPodUID: podUID,
 			},
 			Status: pmv1alpha1.PodMigrationJobStatus{
 				Phase: pmv1alpha1.PodMigrationJobPhasePending,
 			},
 		}
 
-		// Create stale trigger with different owner UID
-		triggerName := fmt.Sprintf("trigger-%s", podName)
-		staleTrigger := &unstructured.Unstructured{}
-		staleTrigger.SetGroupVersionKind(schema.GroupVersionKind{
+		// Create existing trigger with identical name
+		triggerName := util.FormatPSMTName(podName, podUID)
+		existingTrigger := &unstructured.Unstructured{}
+		existingTrigger.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "podsnapshot.gke.io",
 			Version: "v1",
 			Kind:    "PodSnapshotManualTrigger",
 		})
-		staleTrigger.SetName(triggerName)
-		staleTrigger.SetNamespace(namespace)
-		staleTrigger.Object["spec"] = map[string]interface{}{
+		existingTrigger.SetName(triggerName)
+		existingTrigger.SetNamespace(namespace)
+		existingTrigger.Object["spec"] = map[string]interface{}{
 			"targetPod": podName,
 		}
-		staleTrigger.SetOwnerReferences([]metav1.OwnerReference{
-			{
-				APIVersion: "podmigration.gke.io/v1alpha1",
-				Kind:       "PodMigrationJob",
-				Name:       "old-job",
-				UID:        "old-job-uid",
-			},
-		})
 
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(pod, pmj, staleTrigger).
+			WithObjects(pod, pmj, existingTrigger).
 			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 			Build()
 
@@ -578,7 +578,7 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 			Scheme: scheme,
 		}
 
-		res, err := r.Reconcile(context.Background(), ctrl.Request{
+		_, err := r.Reconcile(context.Background(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: namespace,
 				Name:      jobName,
@@ -588,21 +588,17 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 			t.Fatalf("Reconcile failed: %v", err)
 		}
 
-		if !res.Requeue {
-			t.Errorf("Expected Requeue to be true, got %v", res.Requeue)
-		}
-
-		// Verify PMJ is still in Pending
+		// Verify PMJ transitioned to Snapshotting (idempotent success)
 		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
 		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
 		if err != nil {
 			t.Fatalf("Failed to get PMJ: %v", err)
 		}
-		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
-			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhasePending, updatedPMJ.Status.Phase)
+		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSnapshotting, updatedPMJ.Status.Phase)
 		}
 
-		// Verify stale trigger is deleted
+		// Verify trigger still exists
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "podsnapshot.gke.io",
@@ -610,10 +606,8 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 			Kind:    "PodSnapshotManualTrigger",
 		})
 		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, trigger)
-		if err == nil {
-			t.Errorf("Expected stale trigger to be deleted, but it still exists")
-		} else if !apierrors.IsNotFound(err) {
-			t.Errorf("Expected NotFound error, got %v", err)
+		if err != nil {
+			t.Errorf("Expected trigger to exist, got error: %v", err)
 		}
 	})
 
@@ -633,6 +627,7 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 				PodRef: corev1.LocalObjectReference{
 					Name: podName,
 				},
+				TargetPodUID: podUID,
 			},
 			Status: pmv1alpha1.PodMigrationJobStatus{
 				Phase: pmv1alpha1.PodMigrationJobPhasePending,
@@ -640,7 +635,7 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 		}
 
 		// Create owned trigger with matching owner UID
-		triggerName := fmt.Sprintf("trigger-%s", podName)
+		triggerName := util.FormatPSMTName(podName, podUID)
 		ownedTrigger := &unstructured.Unstructured{}
 		ownedTrigger.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "podsnapshot.gke.io",
@@ -719,8 +714,9 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 
 	namespace := "default"
 	podName := "test-pod"
-	jobName := "pmj-" + podName
-	triggerName := "trigger-" + podName
+	podUID := "12345678-abcd"
+	jobName := util.FormatPMJName(podName, podUID)
+	triggerName := util.FormatPSMTName(podName, podUID)
 
 	t.Run("Test Case 1 (Success)", func(t *testing.T) {
 		pmj := &pmv1alpha1.PodMigrationJob{
@@ -737,6 +733,7 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 				PodRef: corev1.LocalObjectReference{
 					Name: podName,
 				},
+				TargetPodUID: podUID,
 			},
 			Status: pmv1alpha1.PodMigrationJobStatus{
 				Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
@@ -828,6 +825,7 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 				PodRef: corev1.LocalObjectReference{
 					Name: podName,
 				},
+				TargetPodUID: podUID,
 			},
 			Status: pmv1alpha1.PodMigrationJobStatus{
 				Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,

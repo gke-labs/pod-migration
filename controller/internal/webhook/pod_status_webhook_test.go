@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestPodStatusMutator(t *testing.T) {
@@ -125,7 +126,7 @@ func TestPodStatusMutator(t *testing.T) {
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
-						Name:      "pmj-test-pod",
+						Name:      util.FormatPMJName("test-pod", "test-pod-uid"),
 					},
 					Spec: pmv1alpha1.PodMigrationJobSpec{
 						TargetPodUID: "test-pod-uid",
@@ -164,6 +165,7 @@ func TestPodStatusMutator(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "default",
 					Name:      "test-pod",
+					UID:       "test-pod-uid",
 					Labels: map[string]string{
 						"pod-migration.gke.io/enabled": "true",
 					},
@@ -184,7 +186,7 @@ func TestPodStatusMutator(t *testing.T) {
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
-						Name:      "pmj-test-pod",
+						Name:      util.FormatPMJName("test-pod", "test-pod-uid"),
 					},
 				},
 			},
@@ -225,7 +227,7 @@ func TestPodStatusMutator(t *testing.T) {
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
-						Name:      "pmj-test-pod",
+						Name:      util.FormatPMJName("test-pod", "test-pod-uid"),
 					},
 					Spec: pmv1alpha1.PodMigrationJobSpec{
 						TargetPodUID: "mismatched-uid",
@@ -268,7 +270,7 @@ func TestPodStatusMutator(t *testing.T) {
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
-						Name:      "pmj-test-pod",
+						Name:      util.FormatPMJName("test-pod", "test-pod-uid"),
 					},
 					Spec: pmv1alpha1.PodMigrationJobSpec{
 						TargetPodUID: "test-pod-uid",

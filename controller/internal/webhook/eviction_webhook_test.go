@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestEvictionGate(t *testing.T) {
@@ -239,7 +240,7 @@ func TestEvictionGate(t *testing.T) {
 
 			if tt.verifyPMJCreated {
 				pmj := &pmv1alpha1.PodMigrationJob{}
-				err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: tt.pod.Namespace, Name: "pmj-" + tt.pod.Name}, pmj)
+				err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: tt.pod.Namespace, Name: util.FormatPMJName(tt.pod.Name, string(tt.pod.UID))}, pmj)
 				if err != nil {
 					t.Errorf("Failed to find expected PodMigrationJob: %v", err)
 				}
