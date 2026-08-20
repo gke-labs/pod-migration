@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -530,7 +531,7 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 		},
 	}
 
-	t.Run("Scenario 1: Existing Trigger Idempotent Reconcile", func(t *testing.T) {
+	t.Run("Scenario 1: Stale Trigger Deletion", func(t *testing.T) {
 		pmj := &pmv1alpha1.PodMigrationJob{
 			TypeMeta: metav1.TypeMeta{
 				APIVersion: "podmigration.gke.io/v1alpha1",
@@ -553,23 +554,33 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 			},
 		}
 
-		// Create existing trigger with identical name
+		// Create stale trigger owned by an older/different PMJ UID
 		triggerName := util.FormatPSMTName(podName, podUID)
-		existingTrigger := &unstructured.Unstructured{}
-		existingTrigger.SetGroupVersionKind(schema.GroupVersionKind{
+		staleTrigger := &unstructured.Unstructured{}
+		staleTrigger.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "podsnapshot.gke.io",
 			Version: "v1",
 			Kind:    "PodSnapshotManualTrigger",
 		})
-		existingTrigger.SetName(triggerName)
-		existingTrigger.SetNamespace(namespace)
-		existingTrigger.Object["spec"] = map[string]interface{}{
+		staleTrigger.SetName(triggerName)
+		staleTrigger.SetNamespace(namespace)
+		staleTrigger.Object["spec"] = map[string]interface{}{
 			"targetPod": podName,
 		}
+		isController := true
+		staleTrigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        "stale-old-job-uid",
+				Controller: &isController,
+			},
+		})
 
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(pod, pmj, existingTrigger).
+			WithObjects(pod, pmj, staleTrigger).
 			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 			Build()
 
@@ -578,7 +589,7 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 			Scheme: scheme,
 		}
 
-		_, err := r.Reconcile(context.Background(), ctrl.Request{
+		res, err := r.Reconcile(context.Background(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: namespace,
 				Name:      jobName,
@@ -587,18 +598,21 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Reconcile failed: %v", err)
 		}
+		if !res.Requeue {
+			t.Errorf("Expected reconcile to requeue after deleting stale trigger, got res: %+v", res)
+		}
 
-		// Verify PMJ transitioned to Snapshotting (idempotent success)
+		// Verify PMJ remains in Pending until stale trigger is recreated
 		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
 		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
 		if err != nil {
 			t.Fatalf("Failed to get PMJ: %v", err)
 		}
-		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
-			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSnapshotting, updatedPMJ.Status.Phase)
+		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
+			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhasePending, updatedPMJ.Status.Phase)
 		}
 
-		// Verify trigger still exists
+		// Verify stale trigger was deleted
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "podsnapshot.gke.io",
@@ -606,8 +620,8 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 			Kind:    "PodSnapshotManualTrigger",
 		})
 		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, trigger)
-		if err != nil {
-			t.Errorf("Expected trigger to exist, got error: %v", err)
+		if err == nil || !apierrors.IsNotFound(err) {
+			t.Errorf("Expected stale trigger to be deleted (NotFound), got error: %v", err)
 		}
 	})
 
