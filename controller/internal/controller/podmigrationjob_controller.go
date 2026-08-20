@@ -527,11 +527,34 @@ func (r *PodMigrationJobReconciler) ensureTrigger(ctx context.Context, job *pmv1
 	err := r.Create(ctx, trigger)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			logger.Info("Trigger already exists for this migration job, proceeding", "trigger", triggerName)
-			return triggerName, ctrl.Result{}, nil
+			// Fetch existing trigger to verify ownership
+			existingTrigger := &unstructured.Unstructured{}
+			existingTrigger.SetGroupVersionKind(trigger.GroupVersionKind())
+			getErr := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, existingTrigger)
+			if getErr == nil {
+				isOwned := false
+				for _, ref := range existingTrigger.GetOwnerReferences() {
+					if ref.UID == job.UID {
+						isOwned = true
+						break
+					}
+				}
+				if isOwned {
+					logger.Info("Trigger already exists and is owned by this job, proceeding")
+					return triggerName, ctrl.Result{}, nil
+				} else {
+					logger.Info("Stale trigger found (owned by another job), deleting it first")
+					_ = r.Delete(ctx, existingTrigger)
+					return "", ctrl.Result{Requeue: true}, nil
+				}
+			} else {
+				logger.Error(getErr, "Failed to fetch existing trigger on AlreadyExists")
+				return "", ctrl.Result{}, getErr
+			}
+		} else {
+			logger.Error(err, "Failed to create PodSnapshotManualTrigger")
+			return "", ctrl.Result{}, err
 		}
-		logger.Error(err, "Failed to create PodSnapshotManualTrigger")
-		return "", ctrl.Result{}, err
 	}
 
 	logger.Info("Successfully created PodSnapshotManualTrigger")
