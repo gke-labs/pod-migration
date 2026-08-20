@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestPodGateInjector(t *testing.T) {
@@ -86,7 +87,12 @@ func TestPodGateInjector(t *testing.T) {
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
-						Name:      "pmj-test-pod",
+						Name:      util.FormatPMJName("test-pod", "12345678"),
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{
+							Name: "test-pod",
+						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
 						Phase: pmv1alpha1.PodMigrationJobPhasePending,

@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 // PodMigrationJobReconciler reconciles a PodMigrationJob object.
@@ -54,7 +55,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	podName := job.Spec.PodRef.Name
-	triggerName := fmt.Sprintf("trigger-%s", podName)
+	triggerName := util.FormatPSMTName(podName, job.Spec.TargetPodUID)
 
 	// Set initial phase if empty
 	if job.Status.Phase == "" {
@@ -501,7 +502,7 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *PodMigrationJobReconciler) ensureTrigger(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (string, ctrl.Result, error) {
-	triggerName := fmt.Sprintf("trigger-%s", podName)
+	triggerName := util.FormatPSMTName(podName, job.Spec.TargetPodUID)
 	logger := log.FromContext(ctx).WithValues("trigger", triggerName)
 
 	trigger := &unstructured.Unstructured{}

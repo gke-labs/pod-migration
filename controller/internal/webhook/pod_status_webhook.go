@@ -3,7 +3,6 @@ package webhook
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
@@ -15,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 // PodStatusMutator intercepts pod status updates and mutates Succeeded to Failed for migrating pods.
@@ -62,7 +62,7 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 	}
 
 	// Check if there is an active PodMigrationJob for this pod
-	pmjName := fmt.Sprintf("pmj-%s", pod.Name)
+	pmjName := util.FormatPMJName(pod.Name, string(pod.UID))
 	pmj := &pmv1alpha1.PodMigrationJob{}
 	err = a.Client.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
 	if err != nil {
