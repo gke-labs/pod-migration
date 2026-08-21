@@ -544,3 +544,153 @@ func TestPodGateReconciler_Reconcile_Collision_WinnerAlreadyUngated(t *testing.T
 		t.Errorf("expected restore-bypass annotation \"\", got %q (present: %t)", bypass, hasBypass)
 	}
 }
+
+func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-deploy-1"
+	altPmjName := "pmj-deploy-2"
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "test-rs",
+			UID:       "rs-uid",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "Deployment",
+					Name:       "test-deployment",
+					UID:        "deploy-uid",
+				},
+			},
+		},
+	}
+
+	winnerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "a-winner",
+			UID:               "uid-winner",
+			CreationTimestamp: metav1.Now(),
+			Labels: map[string]string{
+				appsv1.DefaultDeploymentUniqueLabelKey: "hash-v1",
+			},
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "test-rs",
+					UID:        "rs-uid",
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	loserPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "b-loser",
+			UID:               "uid-loser",
+			CreationTimestamp: metav1.Now(),
+			Labels: map[string]string{
+				appsv1.DefaultDeploymentUniqueLabelKey: "hash-v1",
+			},
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "test-rs",
+					UID:        "rs-uid",
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	pmj1 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+			Labels: map[string]string{
+				"pod-migration.gke.io/parent-name":       "test-deployment",
+				"pod-migration.gke.io/parent-kind":       "Deployment",
+				"pod-migration.gke.io/pod-template-hash": "hash-v1",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			TargetPodUID: "origin-uid-1",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	pmj2 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      altPmjName,
+			Labels: map[string]string{
+				"pod-migration.gke.io/parent-name":       "test-deployment",
+				"pod-migration.gke.io/parent-kind":       "Deployment",
+				"pod-migration.gke.io/pod-template-hash": "hash-v1",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			TargetPodUID: "origin-uid-2",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(rs, winnerPod, loserPod, pmj1, pmj2).
+		Build()
+
+	r := &PodGateReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      "b-loser",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling loser: %v", err)
+	}
+
+	updatedLoser := &corev1.Pod{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "b-loser"}, updatedLoser)
+	if err != nil {
+		t.Fatalf("failed to fetch updated loser pod: %v", err)
+	}
+
+	if assigned := updatedLoser.Annotations["pod-migration.gke.io/assigned-pmj"]; assigned != altPmjName {
+		t.Errorf("expected loser pod to be reassigned to %q, got %q", altPmjName, assigned)
+	}
+}

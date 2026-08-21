@@ -14,6 +14,14 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
+const (
+	LabelParentName       = "pod-migration.gke.io/parent-name"
+	LabelParentKind       = "pod-migration.gke.io/parent-kind"
+	LabelPodTemplateHash  = "pod-migration.gke.io/pod-template-hash"
+	LabelOriginPodName    = "pod-migration.gke.io/origin-pod-name"
+	AnnotationAssignedPMJ = "pod-migration.gke.io/assigned-pmj"
+)
+
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).
 func ResolveParentWorkload(ctx context.Context, c client.Client, pod *corev1.Pod) (string, string, error) {
 	for _, ref := range pod.OwnerReferences {
@@ -55,7 +63,7 @@ func FormatPSMTName(podName, uid string) string {
 }
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind string) (string, error) {
+func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind, podTemplateHash string) (string, error) {
 	// Scan pods to find which PMJs are already assigned
 	assignedPMJs := make(map[string]bool)
 	podList := &corev1.PodList{}
@@ -66,7 +74,7 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 
 	for _, p := range podList.Items {
 		if p.Annotations != nil {
-			if pmjName, ok := p.Annotations["pod-migration.gke.io/assigned-pmj"]; ok {
+			if pmjName, ok := p.Annotations[AnnotationAssignedPMJ]; ok {
 				assignedPMJs[pmjName] = true
 			}
 		}
@@ -82,12 +90,17 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 	for _, job := range jobList.Items {
 		if parentName == "" {
 			// Bare Pod: match by origin pod name and absence of parent label
-			if job.Spec.PodRef.Name != podName || job.Labels["pod-migration.gke.io/parent-name"] != "" {
+			if job.Spec.PodRef.Name != podName || job.Labels[LabelParentName] != "" {
 				continue
 			}
 		} else {
-			if job.Labels["pod-migration.gke.io/parent-name"] != parentName ||
-				job.Labels["pod-migration.gke.io/parent-kind"] != parentKind {
+			if job.Labels[LabelParentName] != parentName ||
+				job.Labels[LabelParentKind] != parentKind {
+				continue
+			}
+
+			// For Deployments, enforce pod-template-hash revision match
+			if parentKind == "Deployment" && job.Labels[LabelPodTemplateHash] != podTemplateHash {
 				continue
 			}
 
@@ -135,7 +148,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		if string(p.UID) == job.Spec.TargetPodUID {
 			continue
 		}
-		if p.Annotations != nil && p.Annotations["pod-migration.gke.io/assigned-pmj"] == assignedPMJ {
+		if p.Annotations != nil && p.Annotations[AnnotationAssignedPMJ] == assignedPMJ {
 			contenders = append(contenders, p)
 		}
 	}
@@ -157,8 +170,13 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		return assignedPMJ, false, nil // We are the winner, no change
 	}
 
+	var podTemplateHash string
+	if pod.Labels != nil {
+		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+	}
+
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind)
+	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, podTemplateHash)
 	if err != nil {
 		return "", false, err
 	}
