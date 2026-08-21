@@ -10,23 +10,28 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
-	"github.com/gke-labs/pod-migration/controller/internal/util"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 )
 
 // PodMigrationJobReconciler reconciles a PodMigrationJob object.
 type PodMigrationJobReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme           *runtime.Scheme
+	SnapshotProvider snapshot.Provider
+}
+
+func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
+	if r.SnapshotProvider != nil {
+		return r.SnapshotProvider
+	}
+	return snapshot.NewGKEProvider(r.Client, r.Scheme)
 }
 
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch;create;update;patch;delete
@@ -55,7 +60,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	podName := job.Spec.PodRef.Name
-	triggerName := util.FormatPSMTName(podName, job.Spec.TargetPodUID)
 
 	// Set initial phase if empty
 	if job.Status.Phase == "" {
@@ -87,16 +91,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				ObservedGeneration: job.Generation,
 			})
 
-			// Clean up GKE manual trigger if it exists (best effort)
-			trigger := &unstructured.Unstructured{}
-			trigger.SetGroupVersionKind(schema.GroupVersionKind{
-				Group:   "podsnapshot.gke.io",
-				Version: "v1",
-				Kind:    "PodSnapshotManualTrigger",
-			})
-			trigger.SetName(triggerName)
-			trigger.SetNamespace(req.Namespace)
-			_ = r.Delete(ctx, trigger)
+			// Clean up snapshot trigger if it exists (best effort)
+			_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 
 			if err := r.Status().Update(ctx, job); err != nil {
 				logger.Error(err, "Failed to update job status to Failed on timeout")
@@ -200,7 +196,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			job.Status.PVsToDetach = pvs
 		}
 
-		_, res, err := r.ensureTrigger(ctx, job, podName)
+		res, err := r.getSnapshotProvider().EnsureTrigger(ctx, job, podName)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -217,45 +213,31 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
-		// 3. Monitor GKE Snapshot readiness
-		trigger := &unstructured.Unstructured{}
-		trigger.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshotManualTrigger",
-		})
-		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: triggerName}, trigger)
+		// Monitor snapshot readiness via the pluggable SnapshotProvider
+		snapStatus, err := r.getSnapshotProvider().CheckStatus(ctx, job, podName)
 		if err != nil {
-			if apierrors.IsNotFound(err) {
-				logger.Info("Waiting for PodSnapshotManualTrigger to be created...", "trigger", triggerName)
-				cond := metav1.Condition{
-					Type:               "Ready",
-					Status:             metav1.ConditionFalse,
-					Reason:             "Snapshotting",
-					Message:            "Waiting for GKE PodSnapshotManualTrigger to be created",
-					ObservedGeneration: job.Generation,
-				}
-				if meta.SetStatusCondition(&job.Status.Conditions, cond) {
-					_ = r.Status().Update(ctx, job)
-				}
-				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-			}
-			logger.Error(err, "Failed to get PodSnapshotManualTrigger")
+			logger.Error(err, "Failed to check snapshot status")
 			return ctrl.Result{}, err
 		}
 
-		snapshotName, found, err := unstructured.NestedString(trigger.Object, "status", "snapshotCreated", "name")
-		if err != nil {
-			logger.Error(err, "Failed to read snapshotCreated.name from trigger status")
-			return ctrl.Result{}, err
-		}
-		if !found || snapshotName == "" {
-			logger.Info("Waiting for snapshot name to be populated in trigger status...", "trigger", triggerName)
+		switch snapStatus.Phase {
+		case snapshot.PhaseReady:
+			logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapStatus.SnapshotRef)
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
+			job.Status.SnapshotRef = snapStatus.SnapshotRef
+			err = r.Status().Update(ctx, job)
+			if err != nil {
+				logger.Error(err, "Failed to update job status to Evicting")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+
+		case snapshot.PhaseInProgress:
 			cond := metav1.Condition{
 				Type:               "Ready",
 				Status:             metav1.ConditionFalse,
-				Reason:             "Snapshotting",
-				Message:            "Waiting for GKE to populate snapshot name in trigger status",
+				Reason:             snapStatus.Reason,
+				Message:            snapStatus.Message,
 				ObservedGeneration: job.Generation,
 			}
 			if meta.SetStatusCondition(&job.Status.Conditions, cond) {
@@ -263,90 +245,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
-
-		targetSnapshot := &unstructured.Unstructured{}
-		targetSnapshot.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshot",
-		})
-		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: snapshotName}, targetSnapshot)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				logger.Info("Waiting for PodSnapshot to be created...", "snapshot", snapshotName)
-				cond := metav1.Condition{
-					Type:               "Ready",
-					Status:             metav1.ConditionFalse,
-					Reason:             "Snapshotting",
-					Message:            fmt.Sprintf("Waiting for GKE PodSnapshot object %q to be created", snapshotName),
-					ObservedGeneration: job.Generation,
-				}
-				if meta.SetStatusCondition(&job.Status.Conditions, cond) {
-					_ = r.Status().Update(ctx, job)
-				}
-				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-			}
-			logger.Error(err, "Failed to get PodSnapshot")
-			return ctrl.Result{}, err
-		}
-
-		// Check if snapshot is ready
-		snapStatus, ok := targetSnapshot.Object["status"].(map[string]interface{})
-		if !ok {
-			logger.Info("Snapshot status subresource not found, waiting...")
-			cond := metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				Reason:             "Snapshotting",
-				Message:            fmt.Sprintf("Waiting for GKE PodSnapshot %q status to be populated", snapshotName),
-				ObservedGeneration: job.Generation,
-			}
-			if meta.SetStatusCondition(&job.Status.Conditions, cond) {
-				_ = r.Status().Update(ctx, job)
-			}
-			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-		}
-
-		conditions, _ := snapStatus["conditions"].([]interface{})
-		isReady := false
-		for _, c := range conditions {
-			cond, ok := c.(map[string]interface{})
-			if ok {
-				if cond["type"] == "Ready" && cond["status"] == "True" {
-					isReady = true
-					break
-				}
-				if cond["type"] == "Checkpoint" && cond["status"] == "True" && cond["reason"] == "Succeeded" {
-					isReady = true
-					break
-				}
-			}
-		}
-
-		if !isReady {
-			logger.Info("Snapshot is not ready yet, waiting...")
-			cond := metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				Reason:             "Snapshotting",
-				Message:            fmt.Sprintf("Waiting for GKE PodSnapshot %q checkpoint to complete", snapshotName),
-				ObservedGeneration: job.Generation,
-			}
-			if meta.SetStatusCondition(&job.Status.Conditions, cond) {
-				_ = r.Status().Update(ctx, job)
-			}
-			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-		}
-
-		logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapshotName)
-		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
-		job.Status.SnapshotRef = snapshotName
-		err = r.Status().Update(ctx, job)
-		if err != nil {
-			logger.Error(err, "Failed to update job status to Evicting")
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
 
@@ -401,24 +299,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
-		// Once the Pod is gone (or we fallback-deleted it), we can delete the manual trigger.
-		logger.Info("Deleting manual trigger", "trigger", triggerName)
-		trigger := &unstructured.Unstructured{}
-		trigger.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshotManualTrigger",
-		})
-		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: triggerName}, trigger)
-		if err == nil {
-			err = r.Delete(ctx, trigger)
-			if err != nil {
-				logger.Error(err, "Failed to delete trigger")
-				return ctrl.Result{}, err
-			}
-			logger.Info("Successfully deleted trigger")
-		} else if !apierrors.IsNotFound(err) {
-			logger.Error(err, "Failed to get trigger")
+		// Once the Pod is gone (or we fallback-deleted it), clean up trigger
+		if err := r.getSnapshotProvider().Cleanup(ctx, job, podName); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -499,64 +381,4 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigrationJob{}).
 		Complete(r)
-}
-
-func (r *PodMigrationJobReconciler) ensureTrigger(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (string, ctrl.Result, error) {
-	triggerName := util.FormatPSMTName(podName, job.Spec.TargetPodUID)
-	logger := log.FromContext(ctx).WithValues("trigger", triggerName)
-
-	trigger := &unstructured.Unstructured{}
-	trigger.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotManualTrigger",
-	})
-	trigger.SetName(triggerName)
-	trigger.SetNamespace(job.Namespace)
-	trigger.Object["spec"] = map[string]interface{}{
-		"targetPod": podName,
-	}
-
-	// Set owner reference to allow cascade deletion and ownership verification
-	if err := controllerutil.SetControllerReference(job, trigger, r.Scheme); err != nil {
-		logger.Error(err, "Failed to set owner reference on trigger")
-		return "", ctrl.Result{}, err
-	}
-
-	logger.Info("Creating PodSnapshotManualTrigger")
-	err := r.Create(ctx, trigger)
-	if err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			// Fetch existing trigger to verify ownership
-			existingTrigger := &unstructured.Unstructured{}
-			existingTrigger.SetGroupVersionKind(trigger.GroupVersionKind())
-			getErr := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, existingTrigger)
-			if getErr == nil {
-				isOwned := false
-				for _, ref := range existingTrigger.GetOwnerReferences() {
-					if ref.UID == job.UID {
-						isOwned = true
-						break
-					}
-				}
-				if isOwned {
-					logger.Info("Trigger already exists and is owned by this job, proceeding")
-					return triggerName, ctrl.Result{}, nil
-				} else {
-					logger.Info("Stale trigger found (owned by another job), deleting it first")
-					_ = r.Delete(ctx, existingTrigger)
-					return "", ctrl.Result{Requeue: true}, nil
-				}
-			} else {
-				logger.Error(getErr, "Failed to fetch existing trigger on AlreadyExists")
-				return "", ctrl.Result{}, getErr
-			}
-		} else {
-			logger.Error(err, "Failed to create PodSnapshotManualTrigger")
-			return "", ctrl.Result{}, err
-		}
-	}
-
-	logger.Info("Successfully created PodSnapshotManualTrigger")
-	return triggerName, ctrl.Result{}, nil
 }
