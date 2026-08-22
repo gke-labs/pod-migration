@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,8 +46,13 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
+	var podTemplateHash string
+	if pod.Labels != nil {
+		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+	}
+
 	// Find active unassigned PMJ
-	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind)
+	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, podTemplateHash)
 	if err != nil {
 		logger.Error(err, "Failed to check unassigned active PMJs")
 		return admission.Errored(http.StatusInternalServerError, err)
@@ -88,7 +94,7 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		pod.Annotations = make(map[string]string)
 	}
 	if assignedPMJ != "" {
-		pod.Annotations["pod-migration.gke.io/assigned-pmj"] = assignedPMJ
+		pod.Annotations[util.AnnotationAssignedPMJ] = assignedPMJ
 	}
 
 	marshaledPod, err := json.Marshal(pod)

@@ -137,8 +137,11 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 
 	jobLabels := map[string]string{}
 	if parentName != "" {
-		jobLabels["pod-migration.gke.io/parent-name"] = parentName
-		jobLabels["pod-migration.gke.io/parent-kind"] = parentKind
+		jobLabels[util.LabelParentName] = parentName
+		jobLabels[util.LabelParentKind] = parentKind
+	}
+	if hash, ok := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]; ok && hash != "" {
+		jobLabels[util.LabelPodTemplateHash] = hash
 	}
 
 	// 1. Find matching PodSnapshotPolicy (manual + stop)

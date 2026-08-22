@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -67,6 +68,7 @@ func TestEvictionGate(t *testing.T) {
 		expectedStatusCode int32
 		expectedMessage    string
 		verifyPMJCreated   bool
+		expectedLabels     map[string]string
 	}{
 		{
 			name: "Not an eviction request",
@@ -115,6 +117,59 @@ func TestEvictionGate(t *testing.T) {
 			expectedStatusCode: 429,
 			expectedMessage:    "migration job spawned",
 			verifyPMJCreated:   true,
+		},
+		{
+			name: "Trigger migration on Deployment pod sets parent labels and pod-template-hash",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "deploy-pod-xyz",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":         "true",
+						appsv1.DefaultDeploymentUniqueLabelKey: "hash-deploy-v1",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "ReplicaSet",
+							Name:       "deploy-rs-v1",
+							UID:        "rs-uid-111",
+						},
+					},
+					UID: "deploy-pod-uid-999",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+				&appsv1.ReplicaSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "deploy-rs-v1",
+						UID:       "rs-uid-111",
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "Deployment",
+								Name:       "my-deployment",
+								UID:        "deploy-uid-111",
+							},
+						},
+					},
+				},
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectedLabels: map[string]string{
+				util.LabelParentName:      "my-deployment",
+				util.LabelParentKind:      "Deployment",
+				util.LabelPodTemplateHash: "hash-deploy-v1",
+			},
 		},
 		{
 			name: "Bypass migration when no policy found (No Policy)",
@@ -198,6 +253,7 @@ func TestEvictionGate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = corev1.AddToScheme(scheme)
+			_ = appsv1.AddToScheme(scheme)
 			_ = pmv1alpha1.AddToScheme(scheme)
 
 			initObjs := append(tt.initObjects, tt.pod)
@@ -243,6 +299,11 @@ func TestEvictionGate(t *testing.T) {
 				err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: tt.pod.Namespace, Name: util.FormatPMJName(tt.pod.Name, string(tt.pod.UID))}, pmj)
 				if err != nil {
 					t.Errorf("Failed to find expected PodMigrationJob: %v", err)
+				}
+				for k, v := range tt.expectedLabels {
+					if pmj.Labels[k] != v {
+						t.Errorf("Expected label %s=%s, got %s", k, v, pmj.Labels[k])
+					}
 				}
 				// Verify that PodSnapshot was NOT created in the webhook
 				psList := &unstructured.UnstructuredList{}

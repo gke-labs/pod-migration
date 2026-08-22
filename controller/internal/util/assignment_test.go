@@ -82,7 +82,184 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, "", "")
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, "", "", "")
+			if (err != nil) != tc.expectErr {
+				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+			}
+			if result != tc.expected {
+				t.Errorf("expected: %q, got: %q", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	tests := []struct {
+		name            string
+		podName         string
+		parentName      string
+		parentKind      string
+		podTemplateHash string
+		existing        []runtime.Object
+		expected        string
+		expectErr       bool
+	}{
+		{
+			name:            "Deployment pod matches PMJ with identical pod-template-hash",
+			podName:         "deploy-pod-v1-abc",
+			parentName:      "my-deploy",
+			parentKind:      "Deployment",
+			podTemplateHash: "hash-v1",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-deploy-pod-v1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:      "my-deploy",
+							LabelParentKind:      "Deployment",
+							LabelPodTemplateHash: "hash-v1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{
+							Name: "deploy-pod-v1-orig",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expected: "pmj-deploy-pod-v1",
+		},
+		{
+			name:            "Deployment pod with different pod-template-hash (rolling update new revision) does not match old revision PMJ",
+			podName:         "deploy-pod-v2-xyz",
+			parentName:      "my-deploy",
+			parentKind:      "Deployment",
+			podTemplateHash: "hash-v2",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-deploy-pod-v1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:      "my-deploy",
+							LabelParentKind:      "Deployment",
+							LabelPodTemplateHash: "hash-v1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{
+							Name: "deploy-pod-v1-orig",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expected: "", // Revision isolation prevents hijacking
+		},
+		{
+			name:            "Deployment pod with multiple PMJs selects correct PMJ matching its pod-template-hash",
+			podName:         "deploy-pod-v2-xyz",
+			parentName:      "my-deploy",
+			parentKind:      "Deployment",
+			podTemplateHash: "hash-v2",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-deploy-pod-v1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:      "my-deploy",
+							LabelParentKind:      "Deployment",
+							LabelPodTemplateHash: "hash-v1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{
+							Name: "deploy-pod-v1-orig",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-deploy-pod-v2",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:      "my-deploy",
+							LabelParentKind:      "Deployment",
+							LabelPodTemplateHash: "hash-v2",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{
+							Name: "deploy-pod-v2-orig",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expected: "pmj-deploy-pod-v2",
+		},
+		{
+			name:            "Deployment pod with matching hash PMJ already assigned returns empty",
+			podName:         "deploy-pod-v1-new",
+			parentName:      "my-deploy",
+			parentKind:      "Deployment",
+			podTemplateHash: "hash-v1",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-deploy-pod-v1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:      "my-deploy",
+							LabelParentKind:      "Deployment",
+							LabelPodTemplateHash: "hash-v1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{
+							Name: "deploy-pod-v1-orig",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "deploy-pod-v1-assigned",
+						Namespace: "default",
+						Annotations: map[string]string{
+							AnnotationAssignedPMJ: "pmj-deploy-pod-v1",
+						},
+					},
+				},
+			},
+			expected: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			ctx := context.Background()
+
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, tc.podTemplateHash)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
 			}

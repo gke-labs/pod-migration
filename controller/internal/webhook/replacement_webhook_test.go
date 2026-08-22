@@ -196,6 +196,185 @@ func TestPodGateInjector(t *testing.T) {
 			expectGate:      true,
 			expectBypass:    false,
 		},
+		{
+			name: "Deployment rolling update: pod for new revision (v2) does not inject gate or attach to v1 PMJ (bypass gate)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-deploy-v2-99999",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":         "true",
+						appsv1.DefaultDeploymentUniqueLabelKey: "hash-v2",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "ReplicaSet",
+							Name:       "test-rs-v2",
+							UID:        "rs-v2-uid",
+						},
+					},
+				},
+			},
+			initObjs: []runtime.Object{
+				&appsv1.ReplicaSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-rs-v2",
+						UID:       "rs-v2-uid",
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "Deployment",
+								Name:       "test-deployment",
+								UID:        "deploy-uid",
+							},
+						},
+					},
+				},
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test-v1",
+						Labels: map[string]string{
+							"pod-migration.gke.io/parent-name":       "test-deployment",
+							"pod-migration.gke.io/parent-kind":       "Deployment",
+							"pod-migration.gke.io/pod-template-hash": "hash-v1",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      false,
+			expectBypass:    true,
+		},
+		{
+			name: "Deployment rolling update: pod for old revision (v1) matches v1 PMJ and injects gate",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-deploy-v1-88888",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":         "true",
+						appsv1.DefaultDeploymentUniqueLabelKey: "hash-v1",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "ReplicaSet",
+							Name:       "test-rs-v1",
+							UID:        "rs-v1-uid",
+						},
+					},
+				},
+			},
+			initObjs: []runtime.Object{
+				&appsv1.ReplicaSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-rs-v1",
+						UID:       "rs-v1-uid",
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "Deployment",
+								Name:       "test-deployment",
+								UID:        "deploy-uid",
+							},
+						},
+					},
+				},
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test-v1",
+						Labels: map[string]string{
+							"pod-migration.gke.io/parent-name":       "test-deployment",
+							"pod-migration.gke.io/parent-kind":       "Deployment",
+							"pod-migration.gke.io/pod-template-hash": "hash-v1",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      true,
+			expectBypass:    false,
+		},
+		{
+			name: "Deployment rolling update: pod for new revision (v2) matches v2 PMJ when both v1 and v2 have PMJs",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-deploy-v2-77777",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":         "true",
+						appsv1.DefaultDeploymentUniqueLabelKey: "hash-v2",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "ReplicaSet",
+							Name:       "test-rs-v2",
+							UID:        "rs-v2-uid",
+						},
+					},
+				},
+			},
+			initObjs: []runtime.Object{
+				&appsv1.ReplicaSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-rs-v2",
+						UID:       "rs-v2-uid",
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "Deployment",
+								Name:       "test-deployment",
+								UID:        "deploy-uid",
+							},
+						},
+					},
+				},
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test-v1",
+						Labels: map[string]string{
+							"pod-migration.gke.io/parent-name":       "test-deployment",
+							"pod-migration.gke.io/parent-kind":       "Deployment",
+							"pod-migration.gke.io/pod-template-hash": "hash-v1",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-test-v2",
+						Labels: map[string]string{
+							"pod-migration.gke.io/parent-name":       "test-deployment",
+							"pod-migration.gke.io/parent-kind":       "Deployment",
+							"pod-migration.gke.io/pod-template-hash": "hash-v2",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      true,
+			expectBypass:    false,
+		},
 	}
 
 	for _, tt := range tests {
