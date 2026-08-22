@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -629,8 +630,9 @@ func (r *PodMigrationJobReconciler) hasColdStartFallbackEvent(ctx context.Contex
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigrationJob{}).
+		WithOptions(options).
 		Complete(r)
 }

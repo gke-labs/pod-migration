@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -176,13 +177,14 @@ func (r *PodGateReconciler) removeGate(pod *corev1.Pod) {
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *PodGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *PodGateReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
 		Watches(
 			&pmv1alpha1.PodMigrationJob{},
 			handler.EnqueueRequestsFromMapFunc(r.mapPMJToPods),
 		).
+		WithOptions(options).
 		Complete(r)
 }
 
