@@ -82,7 +82,7 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, "", "", "")
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, "", "", "", "")
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
 			}
@@ -259,7 +259,181 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, tc.podTemplateHash)
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, tc.podTemplateHash, "")
+			if (err != nil) != tc.expectErr {
+				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+			}
+			if result != tc.expected {
+				t.Errorf("expected: %q, got: %q", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestFindUnassignedActivePMJ_BatchIndexedJobs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	tests := []struct {
+		name               string
+		podName            string
+		parentName         string
+		parentKind         string
+		jobCompletionIndex string
+		existing           []runtime.Object
+		expected           string
+		expectErr          bool
+	}{
+		{
+			name:               "Indexed Job pod index 0 matches PMJ for index 0",
+			podName:            "indexed-job-0-abc",
+			parentName:         "my-indexed-job",
+			parentKind:         "Job",
+			jobCompletionIndex: "0",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-job-idx0",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:         "my-indexed-job",
+							LabelParentKind:         "Job",
+							LabelJobCompletionIndex: "0",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "indexed-job-0-orig"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+					},
+				},
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-job-idx1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:         "my-indexed-job",
+							LabelParentKind:         "Job",
+							LabelJobCompletionIndex: "1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "indexed-job-1-orig"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+					},
+				},
+			},
+			expected: "pmj-job-idx0",
+		},
+		{
+			name:               "Indexed Job pod index 1 matches PMJ for index 1",
+			podName:            "indexed-job-1-xyz",
+			parentName:         "my-indexed-job",
+			parentKind:         "Job",
+			jobCompletionIndex: "1",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-job-idx0",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:         "my-indexed-job",
+							LabelParentKind:         "Job",
+							LabelJobCompletionIndex: "0",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "indexed-job-0-orig"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+					},
+				},
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-job-idx1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:         "my-indexed-job",
+							LabelParentKind:         "Job",
+							LabelJobCompletionIndex: "1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "indexed-job-1-orig"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+					},
+				},
+			},
+			expected: "pmj-job-idx1",
+		},
+		{
+			name:               "Indexed Job pod index 2 does NOT match existing PMJs for index 0 or 1",
+			podName:            "indexed-job-2-new",
+			parentName:         "my-indexed-job",
+			parentKind:         "Job",
+			jobCompletionIndex: "2",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-job-idx0",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:         "my-indexed-job",
+							LabelParentKind:         "Job",
+							LabelJobCompletionIndex: "0",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "indexed-job-0-orig"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+					},
+				},
+			},
+			expected: "",
+		},
+		{
+			name:               "Non-indexed parallel Job matches active PMJ without index constraint",
+			podName:            "parallel-job-pod-2",
+			parentName:         "my-parallel-job",
+			parentKind:         "Job",
+			jobCompletionIndex: "",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-parallel-job-1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName: "my-parallel-job",
+							LabelParentKind: "Job",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "parallel-job-pod-1"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+					},
+				},
+			},
+			expected: "pmj-parallel-job-1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			ctx := context.Background()
+
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.jobCompletionIndex)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
 			}

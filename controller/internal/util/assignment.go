@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -15,11 +16,12 @@ import (
 )
 
 const (
-	LabelParentName       = "pod-migration.gke.io/parent-name"
-	LabelParentKind       = "pod-migration.gke.io/parent-kind"
-	LabelPodTemplateHash  = "pod-migration.gke.io/pod-template-hash"
-	LabelOriginPodName    = "pod-migration.gke.io/origin-pod-name"
-	AnnotationAssignedPMJ = "pod-migration.gke.io/assigned-pmj"
+	LabelParentName         = "pod-migration.gke.io/parent-name"
+	LabelParentKind         = "pod-migration.gke.io/parent-kind"
+	LabelPodTemplateHash    = "pod-migration.gke.io/pod-template-hash"
+	LabelJobCompletionIndex = batchv1.JobCompletionIndexAnnotation
+	LabelOriginPodName      = "pod-migration.gke.io/origin-pod-name"
+	AnnotationAssignedPMJ   = "pod-migration.gke.io/assigned-pmj"
 )
 
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).
@@ -63,7 +65,7 @@ func FormatPSMTName(podName, uid string) string {
 }
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind, podTemplateHash string) (string, error) {
+func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind, podTemplateHash, jobCompletionIndex string) (string, error) {
 	// Scan pods to find which PMJs are already assigned
 	assignedPMJs := make(map[string]bool)
 	podList := &corev1.PodList{}
@@ -101,6 +103,11 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 
 			// For Deployments, enforce pod-template-hash revision match
 			if parentKind == "Deployment" && job.Labels[LabelPodTemplateHash] != podTemplateHash {
+				continue
+			}
+
+			// For Indexed Jobs, enforce job-completion-index ordinal match
+			if parentKind == "Job" && jobCompletionIndex != "" && job.Labels[LabelJobCompletionIndex] != jobCompletionIndex {
 				continue
 			}
 
@@ -171,12 +178,14 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	}
 
 	var podTemplateHash string
+	var jobCompletionIndex string
 	if pod.Labels != nil {
 		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+		jobCompletionIndex = pod.Labels[LabelJobCompletionIndex]
 	}
 
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, podTemplateHash)
+	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, podTemplateHash, jobCompletionIndex)
 	if err != nil {
 		return "", false, err
 	}

@@ -47,12 +47,14 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 
 	var podTemplateHash string
+	var jobCompletionIndex string
 	if pod.Labels != nil {
 		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+		jobCompletionIndex = pod.Labels[util.LabelJobCompletionIndex]
 	}
 
 	// Find active unassigned PMJ
-	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, podTemplateHash)
+	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, podTemplateHash, jobCompletionIndex)
 	if err != nil {
 		logger.Error(err, "Failed to check unassigned active PMJs")
 		return admission.Errored(http.StatusInternalServerError, err)

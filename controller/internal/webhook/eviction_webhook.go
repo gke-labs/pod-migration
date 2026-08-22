@@ -143,6 +143,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if hash, ok := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]; ok && hash != "" {
 		jobLabels[util.LabelPodTemplateHash] = hash
 	}
+	if idx, ok := pod.Labels[util.LabelJobCompletionIndex]; ok && idx != "" {
+		jobLabels[util.LabelJobCompletionIndex] = idx
+	}
 
 	// 1. Find matching PodSnapshotPolicy (manual + stop)
 	matchingPSP, err := findLatestReadyManualStopPSP(ctx, a.Client, req.Namespace, pod.Labels)
