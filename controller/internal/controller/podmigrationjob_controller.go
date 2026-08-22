@@ -221,6 +221,25 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		switch snapStatus.Phase {
+		case snapshot.PhaseFailed:
+			logger.Info("Snapshot provider reported terminal failure, transitioning to Failed", "reason", snapStatus.Reason, "message", snapStatus.Message)
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+			now := metav1.Now()
+			job.Status.CompletionTime = &now
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             snapStatus.Reason,
+				Message:            snapStatus.Message,
+				ObservedGeneration: job.Generation,
+			})
+			err = r.Status().Update(ctx, job)
+			if err != nil {
+				logger.Error(err, "Failed to update job status to Failed on snapshot failure")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+
 		case snapshot.PhaseReady:
 			logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapStatus.SnapshotRef)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting

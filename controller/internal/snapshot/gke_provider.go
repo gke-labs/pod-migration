@@ -111,6 +111,24 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		return nil, err
 	}
 
+	// 1. Fast-fail if GKE Snapshot Trigger (PSMT) reported a terminal failure
+	psmtStatus, _ := trigger.Object["status"].(map[string]interface{})
+	if psmtConditions, ok := psmtStatus["conditions"].([]interface{}); ok {
+		for _, c := range psmtConditions {
+			if cond, ok := c.(map[string]interface{}); ok {
+				if cond["type"] == "Triggered" && cond["status"] == "False" && cond["reason"] == "Failed" {
+					errMsg, _ := cond["message"].(string)
+					logger.Info("PSMT reported terminal failure", "trigger", triggerName, "reason", errMsg)
+					return &Status{
+						Phase:   PhaseFailed,
+						Reason:  "SnapshotTriggerFailed",
+						Message: fmt.Sprintf("GKE PodSnapshotManualTrigger failed: %s", errMsg),
+					}, nil
+				}
+			}
+		}
+	}
+
 	snapshotName, found, err := unstructured.NestedString(trigger.Object, "status", "snapshotCreated", "name")
 	if err != nil {
 		logger.Error(err, "Failed to read snapshotCreated.name from trigger status")
@@ -169,6 +187,19 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 				return &Status{
 					Phase:       PhaseReady,
 					SnapshotRef: snapshotName,
+				}, nil
+			}
+			// 2. Fast-fail if PodSnapshot reported terminal failure in Checkpoint, StorageReplicated, or Ready
+			cType, _ := cond["type"].(string)
+			cStatus, _ := cond["status"].(string)
+			cReason, _ := cond["reason"].(string)
+			cMsg, _ := cond["message"].(string)
+			if cStatus == "False" && cReason == "Failed" && (cType == "Checkpoint" || cType == "StorageReplicated" || cType == "Ready") {
+				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", cType, "reason", cMsg)
+				return &Status{
+					Phase:   PhaseFailed,
+					Reason:  "SnapshotFailed",
+					Message: fmt.Sprintf("GKE PodSnapshot %s failed: %s", cType, cMsg),
 				}, nil
 			}
 		}
