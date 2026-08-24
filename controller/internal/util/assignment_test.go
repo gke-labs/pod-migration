@@ -82,7 +82,7 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, "", "", "", "")
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, "", "", "", "", "")
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
 			}
@@ -259,7 +259,7 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, tc.podTemplateHash, "")
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.podTemplateHash, "")
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
 			}
@@ -433,7 +433,211 @@ func TestFindUnassignedActivePMJ_BatchIndexedJobs(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.jobCompletionIndex)
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, "", "", tc.jobCompletionIndex)
+			if (err != nil) != tc.expectErr {
+				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+			}
+			if result != tc.expected {
+				t.Errorf("expected: %q, got: %q", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestFindUnassignedActivePMJ_GenerationalWorkloadIsolation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	tests := []struct {
+		name       string
+		podName    string
+		parentName string
+		parentKind string
+		parentUID  string
+		existing   []runtime.Object
+		expected   string
+		expectErr  bool
+	}{
+		{
+			name:       "StatefulSet pod matches PMJ with identical parent UID (same generation)",
+			podName:    "redis-0",
+			parentName: "redis",
+			parentKind: "StatefulSet",
+			parentUID:  "uid-generation-1",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-redis-0-gen1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName: "redis",
+							LabelParentKind: "StatefulSet",
+							LabelParentUID:  "uid-generation-1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "redis-0"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
+					},
+				},
+			},
+			expected: "pmj-redis-0-gen1",
+		},
+		{
+			name:       "Redeployed StatefulSet pod with new parent UID does NOT match PMJ from old deleted generation",
+			podName:    "redis-0",
+			parentName: "redis",
+			parentKind: "StatefulSet",
+			parentUID:  "uid-generation-2", // New generation
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-redis-0-gen1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName: "redis",
+							LabelParentKind: "StatefulSet",
+							LabelParentUID:  "uid-generation-1", // Old generation
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "redis-0"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
+					},
+				},
+			},
+			expected: "", // Stale state resurrection prevented!
+		},
+		{
+			name:       "Deployment pod with new parent UID does NOT match PMJ from old deleted generation",
+			podName:    "web-xyz",
+			parentName: "web-deploy",
+			parentKind: "Deployment",
+			parentUID:  "uid-deploy-gen2",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-web-gen1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName: "web-deploy",
+							LabelParentKind: "Deployment",
+							LabelParentUID:  "uid-deploy-gen1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "web-abc"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
+					},
+				},
+			},
+			expected: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			ctx := context.Background()
+
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, tc.parentUID, "", "")
+			if (err != nil) != tc.expectErr {
+				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+			}
+			if result != tc.expected {
+				t.Errorf("expected: %q, got: %q", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestFindUnassignedActivePMJ_SingleUseConsumedGuard(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	tests := []struct {
+		name       string
+		podName    string
+		parentName string
+		parentKind string
+		parentUID  string
+		existing   []runtime.Object
+		expected   string
+		expectErr  bool
+	}{
+		{
+			name:       "Unconsumed Succeeded PMJ is eligible for adoption",
+			podName:    "redis-0",
+			parentName: "redis",
+			parentKind: "StatefulSet",
+			parentUID:  "uid-123",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-redis-0",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName: "redis",
+							LabelParentKind: "StatefulSet",
+							LabelParentUID:  "uid-123",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "redis-0"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase:    pmv1alpha1.PodMigrationJobPhaseSucceeded,
+						Consumed: false,
+					},
+				},
+			},
+			expected: "pmj-redis-0",
+		},
+		{
+			name:       "Already consumed PMJ is NOT eligible for adoption (crash/re-spawn guard)",
+			podName:    "redis-0",
+			parentName: "redis",
+			parentKind: "StatefulSet",
+			parentUID:  "uid-123",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-redis-0",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName: "redis",
+							LabelParentKind: "StatefulSet",
+							LabelParentUID:  "uid-123",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef: corev1.LocalObjectReference{Name: "redis-0"},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase:          pmv1alpha1.PodMigrationJobPhaseSucceeded,
+						Consumed:       true, // Already consumed by prior replacement pod
+						RestoredPodUID: "prior-pod-uid",
+					},
+				},
+			},
+			expected: "", // Single-use consumption guard prevents double restore!
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			ctx := context.Background()
+
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, tc.parentUID, "", "")
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
 			}

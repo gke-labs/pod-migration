@@ -68,7 +68,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Resolve parent details to look up alternative PMJs in case of collision
-	parentName, parentKind, err := util.ResolveParentWorkload(ctx, r.Client, pod)
+	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.Client, pod)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("Parent ReplicaSet not found (likely deleted), treating as bare pod")
@@ -79,7 +79,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Resolve any webhook assignment races
-	correctedPMJ, changed, err := util.ResolveCollision(ctx, r.Client, pod, assignedPMJ, parentName, parentKind)
+	correctedPMJ, changed, err := util.ResolveCollision(ctx, r.Client, pod, assignedPMJ, parentName, parentKind, parentUID)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -124,6 +124,16 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			pod.Annotations["podsnapshot.gke.io/ps-name"] = job.Status.SnapshotRef
 			logger.Info("Injected target snapshot ref to pod annotations", "snapshot", job.Status.SnapshotRef)
+		}
+
+		// Mark PMJ as consumed by this replacement pod to prevent stale resurrection
+		if !job.Status.Consumed {
+			job.Status.Consumed = true
+			job.Status.RestoredPodUID = string(pod.UID)
+			if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+				logger.Error(updateErr, "Failed to mark PMJ as consumed")
+				return ctrl.Result{}, updateErr
+			}
 		}
 
 		r.removeGate(pod)

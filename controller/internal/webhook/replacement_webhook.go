@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -40,10 +41,14 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 
 	// Resolve parent owner details
-	parentName, parentKind, err := util.ResolveParentWorkload(ctx, a.Client, pod)
+	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)
 	if err != nil {
-		logger.Error(err, "Failed to resolve parent workload")
-		return admission.Errored(http.StatusInternalServerError, err)
+		if apierrors.IsNotFound(err) {
+			logger.Info("Parent ReplicaSet not found (likely deleted), treating as bare pod")
+		} else {
+			logger.Error(err, "Failed to resolve parent workload")
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
 	}
 
 	var podTemplateHash string
@@ -54,7 +59,7 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 
 	// Find active unassigned PMJ
-	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, podTemplateHash, jobCompletionIndex)
+	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex)
 	if err != nil {
 		logger.Error(err, "Failed to check unassigned active PMJs")
 		return admission.Errored(http.StatusInternalServerError, err)

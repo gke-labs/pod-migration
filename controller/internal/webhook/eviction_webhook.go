@@ -103,42 +103,19 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	}
 
 	// Resolve parent owner details
-	parentName := ""
-	parentKind := ""
-	for _, ref := range pod.OwnerReferences {
-		if ref.Kind == "ReplicaSet" {
-			rs := &appsv1.ReplicaSet{}
-			err := a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: ref.Name}, rs)
-			if err == nil {
-				for _, rsRef := range rs.OwnerReferences {
-					if rsRef.Kind == "Deployment" {
-						parentName = rsRef.Name
-						parentKind = "Deployment"
-						break
-					}
-				}
-			} else if !apierrors.IsNotFound(err) {
-				logger.Error(err, "Failed to get ReplicaSet parent")
-				return denied429("transient error resolving parent workload, retrying")
-			}
-			if parentName != "" {
-				break
-			}
-		} else if ref.Kind == "Job" {
-			parentName = ref.Name
-			parentKind = "Job"
-			break
-		} else if ref.Kind == "StatefulSet" {
-			parentName = ref.Name
-			parentKind = "StatefulSet"
-			break
-		}
+	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)
+	if err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "Failed to resolve parent workload")
+		return denied429("transient error resolving parent workload, retrying")
 	}
 
 	jobLabels := map[string]string{}
 	if parentName != "" {
 		jobLabels[util.LabelParentName] = parentName
 		jobLabels[util.LabelParentKind] = parentKind
+		if parentUID != "" {
+			jobLabels[util.LabelParentUID] = parentUID
+		}
 	}
 	if hash, ok := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]; ok && hash != "" {
 		jobLabels[util.LabelPodTemplateHash] = hash

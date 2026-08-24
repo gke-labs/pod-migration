@@ -190,7 +190,11 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 				initObjs = append(initObjs, tt.pmj)
 			}
 
-			cl := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(initObjs...).Build()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+				WithRuntimeObjects(initObjs...).
+				Build()
 			r := &PodGateReconciler{
 				Client: cl,
 				Scheme: scheme,

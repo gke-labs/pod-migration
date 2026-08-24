@@ -18,6 +18,7 @@ import (
 const (
 	LabelParentName         = "pod-migration.gke.io/parent-name"
 	LabelParentKind         = "pod-migration.gke.io/parent-kind"
+	LabelParentUID          = "pod-migration.gke.io/parent-uid"
 	LabelPodTemplateHash    = "pod-migration.gke.io/pod-template-hash"
 	LabelJobCompletionIndex = batchv1.JobCompletionIndexAnnotation
 	LabelOriginPodName      = "pod-migration.gke.io/origin-pod-name"
@@ -25,7 +26,7 @@ const (
 )
 
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).
-func ResolveParentWorkload(ctx context.Context, c client.Client, pod *corev1.Pod) (string, string, error) {
+func ResolveParentWorkload(ctx context.Context, c client.Client, pod *corev1.Pod) (string, string, string, error) {
 	for _, ref := range pod.OwnerReferences {
 		if ref.Kind == "ReplicaSet" {
 			rs := &appsv1.ReplicaSet{}
@@ -33,17 +34,17 @@ func ResolveParentWorkload(ctx context.Context, c client.Client, pod *corev1.Pod
 			if err == nil {
 				for _, rsRef := range rs.OwnerReferences {
 					if rsRef.Kind == "Deployment" {
-						return rsRef.Name, "Deployment", nil
+						return rsRef.Name, "Deployment", string(rsRef.UID), nil
 					}
 				}
 			} else {
-				return "", "", err
+				return "", "", "", err
 			}
 		} else if ref.Kind == "Job" || ref.Kind == "StatefulSet" {
-			return ref.Name, ref.Kind, nil
+			return ref.Name, ref.Kind, string(ref.UID), nil
 		}
 	}
-	return "", "", nil
+	return "", "", "", nil
 }
 
 // ShortUID returns the first 8 characters of a UID, or the full UID if shorter.
@@ -65,7 +66,7 @@ func FormatPSMTName(podName, uid string) string {
 }
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind, podTemplateHash, jobCompletionIndex string) (string, error) {
+func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string) (string, error) {
 	// Scan pods to find which PMJs are already assigned
 	assignedPMJs := make(map[string]bool)
 	podList := &corev1.PodList{}
@@ -90,6 +91,11 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 
 	// Pick the first active PMJ that is not yet assigned
 	for _, job := range jobList.Items {
+		// Skip already consumed PMJs
+		if job.Status.Consumed {
+			continue
+		}
+
 		if parentName == "" {
 			// Bare Pod: match by origin pod name and absence of parent label
 			if job.Spec.PodRef.Name != podName || job.Labels[LabelParentName] != "" {
@@ -98,6 +104,11 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 		} else {
 			if job.Labels[LabelParentName] != parentName ||
 				job.Labels[LabelParentKind] != parentKind {
+				continue
+			}
+
+			// Enforce parent workload UID equality to prevent cross-generation resurrection
+			if parentUID != "" && job.Labels[LabelParentUID] != "" && job.Labels[LabelParentUID] != parentUID {
 				continue
 			}
 
@@ -132,7 +143,7 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 
 // ResolveCollision deterministically resolves PMJ assignment races.
 // Returns: (correctedPMJ, changed, error)
-func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, assignedPMJ, parentName, parentKind string) (string, bool, error) {
+func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, assignedPMJ, parentName, parentKind, parentUID string) (string, bool, error) {
 	// Fetch the assigned PMJ to check targetPodUID
 	job := &pmv1alpha1.PodMigrationJob{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assignedPMJ}, job); err != nil {
@@ -185,7 +196,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	}
 
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, podTemplateHash, jobCompletionIndex)
+	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex)
 	if err != nil {
 		return "", false, err
 	}
