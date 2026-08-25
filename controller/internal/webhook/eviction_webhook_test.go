@@ -179,7 +179,7 @@ func TestEvictionGate(t *testing.T) {
 					Name:      "indexed-job-pod-0",
 					UID:       "pod-uid-job-0",
 					Labels: map[string]string{
-						"pod-migration.gke.io/enabled":           "true",
+						"pod-migration.gke.io/enabled":             "true",
 						"batch.kubernetes.io/job-completion-index": "0",
 					},
 					OwnerReferences: []metav1.OwnerReference{

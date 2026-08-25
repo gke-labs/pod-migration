@@ -777,4 +777,3 @@ func TestPodGateReconciler_Reconcile_AlreadyConsumedPMJ_ReleasesGateWithColdStar
 		t.Errorf("expected podsnapshot.gke.io/ps-name annotation to be %q, got %q (present: %t)", "", val, ok)
 	}
 }
-

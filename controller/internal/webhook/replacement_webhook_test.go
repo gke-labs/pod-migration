@@ -382,7 +382,7 @@ func TestPodGateInjector(t *testing.T) {
 					Namespace: "default",
 					Name:      "test-job-0-abc",
 					Labels: map[string]string{
-						"pod-migration.gke.io/enabled":           "true",
+						"pod-migration.gke.io/enabled":             "true",
 						"batch.kubernetes.io/job-completion-index": "0",
 					},
 					OwnerReferences: []metav1.OwnerReference{
@@ -422,7 +422,7 @@ func TestPodGateInjector(t *testing.T) {
 					Namespace: "default",
 					Name:      "test-job-2-xyz",
 					Labels: map[string]string{
-						"pod-migration.gke.io/enabled":           "true",
+						"pod-migration.gke.io/enabled":             "true",
 						"batch.kubernetes.io/job-completion-index": "2",
 					},
 					OwnerReferences: []metav1.OwnerReference{

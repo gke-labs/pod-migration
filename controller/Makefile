@@ -3,6 +3,7 @@
 
 IMG ?= controller:latest
 CONTROLLER_GEN ?= $(shell go env GOPATH)/bin/controller-gen
+SETUP_ENVTEST ?= $(shell go env GOPATH)/bin/setup-envtest
 .PHONY: help generate manifests fmt vet build run test install uninstall deploy undeploy docker-build docker-push
 
 help:
@@ -27,7 +28,7 @@ run: generate fmt vet manifests ## Run reconcilers against the current kubeconfi
 	go run ./cmd/main.go
 
 test: generate fmt vet manifests ## Run unit + envtest suite.
-	KUBEBUILDER_ASSETS="$(shell setup-envtest use -p path)" \
+	KUBEBUILDER_ASSETS="$(shell $(SETUP_ENVTEST) use -p path 2>/dev/null)" \
 		go test ./... -coverprofile cover.out
 
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.
