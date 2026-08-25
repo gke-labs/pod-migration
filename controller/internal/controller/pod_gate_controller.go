@@ -117,6 +117,17 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if phase == pmv1alpha1.PodMigrationJobPhaseSucceeded || phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 		logger.Info("Assigned PMJ has completed, releasing scheduling gate", "pmj", correctedPMJ, "phase", phase)
 
+		if job.Status.Consumed && job.Status.RestoredPodUID != "" && job.Status.RestoredPodUID != string(pod.UID) {
+			logger.Info("Assigned PMJ was already consumed by a different pod, releasing gate with cold-start bypass",
+				"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
+			if pod.Annotations == nil {
+				pod.Annotations = make(map[string]string)
+			}
+			pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
+			r.removeGate(pod)
+			return ctrl.Result{}, r.Update(ctx, pod)
+		}
+
 		// If succeeded, inject GKE's native snapshot name annotation to force correct restore mapping
 		if phase == pmv1alpha1.PodMigrationJobPhaseSucceeded && job.Status.SnapshotRef != "" {
 			if pod.Annotations == nil {
