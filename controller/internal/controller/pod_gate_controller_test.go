@@ -776,4 +776,8 @@ func TestPodGateReconciler_Reconcile_AlreadyConsumedPMJ_ReleasesGateWithColdStar
 	if val, ok := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]; !ok || val != "" {
 		t.Errorf("expected podsnapshot.gke.io/ps-name annotation to be %q, got %q (present: %t)", "", val, ok)
 	}
+
+	if val, ok := updatedPod.Annotations["pod-migration.gke.io/assigned-pmj"]; ok {
+		t.Errorf("expected pod-migration.gke.io/assigned-pmj annotation to be deleted, got %q", val)
+	}
 }

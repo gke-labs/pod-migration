@@ -123,6 +123,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if pod.Annotations == nil {
 				pod.Annotations = make(map[string]string)
 			}
+			delete(pod.Annotations, "pod-migration.gke.io/assigned-pmj")
 			pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
 			r.removeGate(pod)
 			return ctrl.Result{}, r.Update(ctx, pod)
