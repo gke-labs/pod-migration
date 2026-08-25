@@ -172,6 +172,44 @@ func TestEvictionGate(t *testing.T) {
 			},
 		},
 		{
+			name: "Trigger migration on Indexed Job pod sets parent labels and job completion index",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "indexed-job-pod-0",
+					UID:       "pod-uid-job-0",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":             "true",
+						"batch.kubernetes.io/job-completion-index": "0",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "my-indexed-job",
+							UID:        "job-uid-999",
+						},
+					},
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectedLabels: map[string]string{
+				util.LabelParentName:         "my-indexed-job",
+				util.LabelParentKind:         "Job",
+				util.LabelJobCompletionIndex: "0",
+			},
+		},
+		{
 			name: "Bypass migration when no policy found (No Policy)",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{

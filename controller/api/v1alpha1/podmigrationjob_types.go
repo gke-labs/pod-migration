@@ -36,6 +36,15 @@ type PodMigrationJobStatus struct {
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 
+	// Consumed indicates whether this migration snapshot has already been adopted by a replacement pod.
+	// Once true, subsequent pods will ignore this PMJ, preventing cross-generational stale state resurrection.
+	// +optional
+	Consumed bool `json:"consumed,omitempty"`
+
+	// RestoredPodUID records the UID of the replacement pod that adopted this migration snapshot.
+	// +optional
+	RestoredPodUID string `json:"restoredPodUID,omitempty"`
+
 	// Conditions represent the latest available observations of the job's current state.
 	// +optional
 	// +patchMergeKey=type

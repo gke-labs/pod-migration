@@ -375,6 +375,86 @@ func TestPodGateInjector(t *testing.T) {
 			expectGate:      true,
 			expectBypass:    false,
 		},
+		{
+			name: "Indexed Job pod index 0 matches PMJ for index 0 (gate injected)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-job-0-abc",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":             "true",
+						"batch.kubernetes.io/job-completion-index": "0",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "test-indexed-job",
+							UID:        "job-uid-1",
+						},
+					},
+				},
+			},
+			initObjs: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-job-0",
+						Labels: map[string]string{
+							"pod-migration.gke.io/parent-name":         "test-indexed-job",
+							"pod-migration.gke.io/parent-kind":         "Job",
+							"batch.kubernetes.io/job-completion-index": "0",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      true,
+			expectBypass:    false,
+		},
+		{
+			name: "Indexed Job pod index 2 with only index 0 PMJ bypasses gate (scale-up pod)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-job-2-xyz",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":             "true",
+						"batch.kubernetes.io/job-completion-index": "2",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "test-indexed-job",
+							UID:        "job-uid-1",
+						},
+					},
+				},
+			},
+			initObjs: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "pmj-job-0",
+						Labels: map[string]string{
+							"pod-migration.gke.io/parent-name":         "test-indexed-job",
+							"pod-migration.gke.io/parent-kind":         "Job",
+							"batch.kubernetes.io/job-completion-index": "0",
+						},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      false,
+			expectBypass:    true,
+		},
 	}
 
 	for _, tt := range tests {

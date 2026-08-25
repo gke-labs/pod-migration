@@ -132,6 +132,11 @@ spec:
                   - type
                   type: object
                 type: array
+              consumed:
+                description: |-
+                  Consumed indicates whether this migration snapshot has already been adopted by a replacement pod.
+                  Once true, subsequent pods will ignore this PMJ, preventing cross-generational stale state resurrection.
+                type: boolean
               phase:
                 description: PodMigrationJobPhase defines the current state in the
                   lifecycle.
@@ -142,6 +147,10 @@ spec:
                 items:
                   type: string
                 type: array
+              restoredPodUID:
+                description: RestoredPodUID records the UID of the replacement pod
+                  that adopted this migration snapshot.
+                type: string
               snapshotRef:
                 description: SnapshotRef references the name of the created pod snapshot.
                 type: string

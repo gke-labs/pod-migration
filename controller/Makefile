@@ -3,7 +3,9 @@
 
 IMG ?= controller:latest
 CONTROLLER_GEN ?= $(shell go env GOPATH)/bin/controller-gen
-.PHONY: help generate manifests fmt vet build run test install uninstall deploy undeploy docker-build docker-push
+ENVTEST_K8S_VERSION ?= 1.36.2
+SETUP_ENVTEST ?= $(shell which setup-envtest 2>/dev/null || echo $(shell go env GOPATH)/bin/setup-envtest)
+.PHONY: help generate manifests fmt vet build run envtest test install uninstall deploy undeploy docker-build docker-push
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -26,8 +28,14 @@ run: generate fmt vet manifests ## Run reconcilers against the current kubeconfi
 	# NB: webhooks need to run in-cluster with a serving cert; `make run` is for reconciler iteration.
 	go run ./cmd/main.go
 
-test: generate fmt vet manifests ## Run unit + envtest suite.
-	KUBEBUILDER_ASSETS="$(shell setup-envtest use -p path)" \
+envtest: ## Download setup-envtest locally if necessary.
+	@if [ ! -x "$$(command -v $(SETUP_ENVTEST))" ] && [ ! -x "$(SETUP_ENVTEST)" ]; then \
+		echo "Installing setup-envtest..."; \
+		go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest; \
+	fi
+
+test: generate fmt vet manifests envtest ## Run unit + envtest suite.
+	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path 2>/dev/null || $(SETUP_ENVTEST) use -p path 2>/dev/null)" \
 		go test ./... -coverprofile cover.out
 
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.

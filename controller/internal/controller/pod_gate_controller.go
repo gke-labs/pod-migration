@@ -68,7 +68,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Resolve parent details to look up alternative PMJs in case of collision
-	parentName, parentKind, err := util.ResolveParentWorkload(ctx, r.Client, pod)
+	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.Client, pod)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("Parent ReplicaSet not found (likely deleted), treating as bare pod")
@@ -79,7 +79,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Resolve any webhook assignment races
-	correctedPMJ, changed, err := util.ResolveCollision(ctx, r.Client, pod, assignedPMJ, parentName, parentKind)
+	correctedPMJ, changed, err := util.ResolveCollision(ctx, r.Client, pod, assignedPMJ, parentName, parentKind, parentUID)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -117,6 +117,18 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if phase == pmv1alpha1.PodMigrationJobPhaseSucceeded || phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 		logger.Info("Assigned PMJ has completed, releasing scheduling gate", "pmj", correctedPMJ, "phase", phase)
 
+		if job.Status.Consumed && job.Status.RestoredPodUID != "" && job.Status.RestoredPodUID != string(pod.UID) {
+			logger.Info("Assigned PMJ was already consumed by a different pod, releasing gate with cold-start bypass",
+				"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
+			if pod.Annotations == nil {
+				pod.Annotations = make(map[string]string)
+			}
+			delete(pod.Annotations, "pod-migration.gke.io/assigned-pmj")
+			pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
+			r.removeGate(pod)
+			return ctrl.Result{}, r.Update(ctx, pod)
+		}
+
 		// If succeeded, inject GKE's native snapshot name annotation to force correct restore mapping
 		if phase == pmv1alpha1.PodMigrationJobPhaseSucceeded && job.Status.SnapshotRef != "" {
 			if pod.Annotations == nil {
@@ -124,6 +136,16 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			pod.Annotations["podsnapshot.gke.io/ps-name"] = job.Status.SnapshotRef
 			logger.Info("Injected target snapshot ref to pod annotations", "snapshot", job.Status.SnapshotRef)
+		}
+
+		// Mark PMJ as consumed by this replacement pod to prevent stale resurrection
+		if !job.Status.Consumed {
+			job.Status.Consumed = true
+			job.Status.RestoredPodUID = string(pod.UID)
+			if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+				logger.Error(updateErr, "Failed to mark PMJ as consumed")
+				return ctrl.Result{}, updateErr
+			}
 		}
 
 		r.removeGate(pod)
