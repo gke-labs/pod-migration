@@ -223,6 +223,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		switch snapStatus.Phase {
 		case snapshot.PhaseFailed:
 			logger.Info("Snapshot provider reported terminal failure, transitioning to Failed", "reason", snapStatus.Reason, "message", snapStatus.Message)
+			_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 			now := metav1.Now()
 			job.Status.CompletionTime = &now

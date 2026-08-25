@@ -174,32 +174,42 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	}
 
 	conditions, _ := snapStatus["conditions"].([]interface{})
+	// Pass 1: Scan all conditions for terminal failures
 	for _, c := range conditions {
 		cond, ok := c.(map[string]interface{})
 		if ok {
-			if cond["type"] == "Ready" && cond["status"] == "True" {
-				return &Status{
-					Phase:       PhaseReady,
-					SnapshotRef: snapshotName,
-				}, nil
-			}
-			if cond["type"] == "Checkpoint" && cond["status"] == "True" && cond["reason"] == "Succeeded" {
-				return &Status{
-					Phase:       PhaseReady,
-					SnapshotRef: snapshotName,
-				}, nil
-			}
-			// 2. Fast-fail if PodSnapshot reported terminal failure in Checkpoint, StorageReplicated, or Ready
 			cType, _ := cond["type"].(string)
 			cStatus, _ := cond["status"].(string)
 			cReason, _ := cond["reason"].(string)
 			cMsg, _ := cond["message"].(string)
-			if cStatus == "False" && cReason == "Failed" && (cType == "Checkpoint" || cType == "StorageReplicated" || cType == "Ready") {
+			if cStatus == "False" && (cReason == "Failed" || cReason == "Error") && (cType == "Checkpoint" || cType == "StorageReplicated" || cType == "Ready") {
 				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", cType, "reason", cMsg)
 				return &Status{
 					Phase:   PhaseFailed,
 					Reason:  "SnapshotFailed",
 					Message: fmt.Sprintf("GKE PodSnapshot %s failed: %s", cType, cMsg),
+				}, nil
+			}
+		}
+	}
+
+	// Pass 2: Check for readiness
+	for _, c := range conditions {
+		cond, ok := c.(map[string]interface{})
+		if ok {
+			cType, _ := cond["type"].(string)
+			cStatus, _ := cond["status"].(string)
+			cReason, _ := cond["reason"].(string)
+			if cType == "Ready" && cStatus == "True" {
+				return &Status{
+					Phase:       PhaseReady,
+					SnapshotRef: snapshotName,
+				}, nil
+			}
+			if cType == "Checkpoint" && cStatus == "True" && cReason == "Succeeded" {
+				return &Status{
+					Phase:       PhaseReady,
+					SnapshotRef: snapshotName,
 				}, nil
 			}
 		}
