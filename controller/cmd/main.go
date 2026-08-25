@@ -101,6 +101,9 @@ func main() {
 	reconcilerOpts := ctrlruntime.Options{
 		MaxConcurrentReconciles: maxConcurrent,
 	}
+	podGateOpts := ctrlruntime.Options{
+		MaxConcurrentReconciles: 1,
+	}
 
 	if err := (&controller.PodMigrationReconciler{
 		Client: mgr.GetClient(),
@@ -121,7 +124,7 @@ func main() {
 	if err := (&controller.PodGateReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
+	}).SetupWithManager(mgr, podGateOpts); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
 		os.Exit(1)
 	}
