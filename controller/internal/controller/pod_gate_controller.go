@@ -106,6 +106,10 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: correctedPMJ}, job)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			if time.Since(pod.CreationTimestamp.Time) < 10*time.Second {
+				logger.Info("Assigned PMJ not found in cache for newly created pod, requeueing to allow cache sync", "pmj", correctedPMJ)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
 			logger.Info("Assigned PMJ completed and deleted, releasing scheduling gate", "pmj", correctedPMJ)
 			r.removeGate(pod)
 			return ctrl.Result{}, r.Update(ctx, pod)
@@ -177,6 +181,8 @@ func (r *PodGateReconciler) removeGate(pod *corev1.Pod) {
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// Contract: PodGateReconciler must be configured with MaxConcurrentReconciles: 1 to ensure
+// strictly serialized assignment and gate reconciliations across pods sharing PMJ resources.
 func (r *PodGateReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).

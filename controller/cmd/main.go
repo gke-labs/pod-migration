@@ -74,7 +74,7 @@ func main() {
 		"Enable leader election so only one replica is active at a time.")
 	flag.Float64Var(&clientGoQPS, "client-go-qps", 500.0, "QPS for client-go REST config")
 	flag.IntVar(&clientGoBurst, "client-go-burst", 1000, "Burst for client-go REST config")
-	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Max concurrent reconciles for reconcilers")
+	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -101,6 +101,8 @@ func main() {
 	reconcilerOpts := ctrlruntime.Options{
 		MaxConcurrentReconciles: maxConcurrent,
 	}
+	// PodGateReconciler must run with MaxConcurrentReconciles: 1 to ensure strict serialization
+	// of informer cache assignment checks and prevent duplicate/racing gate releases.
 	podGateOpts := ctrlruntime.Options{
 		MaxConcurrentReconciles: 1,
 	}
