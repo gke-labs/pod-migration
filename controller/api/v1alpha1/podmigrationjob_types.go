@@ -17,11 +17,13 @@ type PodMigrationJobSpec struct {
 type PodMigrationJobPhase string
 
 const (
-	PodMigrationJobPhasePending      PodMigrationJobPhase = "Pending"
-	PodMigrationJobPhaseSnapshotting PodMigrationJobPhase = "Snapshotting"
-	PodMigrationJobPhaseEvicting     PodMigrationJobPhase = "Evicting"
-	PodMigrationJobPhaseSucceeded    PodMigrationJobPhase = "Succeeded"
-	PodMigrationJobPhaseFailed       PodMigrationJobPhase = "Failed"
+	PodMigrationJobPhasePending                 PodMigrationJobPhase = "Pending"
+	PodMigrationJobPhaseSnapshotting            PodMigrationJobPhase = "Snapshotting"
+	PodMigrationJobPhaseEvicting                PodMigrationJobPhase = "Evicting"
+	PodMigrationJobPhaseRestoring               PodMigrationJobPhase = "Restoring"
+	PodMigrationJobPhaseSucceeded               PodMigrationJobPhase = "Succeeded"
+	PodMigrationJobPhaseSucceededWithoutRestore PodMigrationJobPhase = "SucceededWithoutRestore"
+	PodMigrationJobPhaseFailed                  PodMigrationJobPhase = "Failed"
 )
 
 // PodMigrationJobStatus defines the observed state.

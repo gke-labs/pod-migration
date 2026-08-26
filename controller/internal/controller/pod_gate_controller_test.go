@@ -179,6 +179,69 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 			},
 			expectHasGate: false,
 		},
+		{
+			name: "Gated pod with Restoring PMJ gets gate released & snapshot ref injected",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": "pmj-test-pod",
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
+			},
+			pmj: &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pmj-test-pod",
+					Namespace: "default",
+				},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef: corev1.LocalObjectReference{Name: "test-pod"},
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:       pmv1alpha1.PodMigrationJobPhaseRestoring,
+					SnapshotRef: "some-snapshot-name",
+				},
+			},
+			expectHasGate: false,
+		},
+		{
+			name: "Gated pod with Evicting PMJ does not release gate until Restoring",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": "pmj-test-pod",
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
+			},
+			pmj: &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pmj-test-pod",
+					Namespace: "default",
+				},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef: corev1.LocalObjectReference{Name: "test-pod"},
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+					SnapshotRef: "some-snapshot-name",
+					PVsToDetach: []string{},
+				},
+			},
+			expectHasGate: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -228,7 +291,7 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 				t.Errorf("expected scheduling gate presence: %t, got: %t", tt.expectHasGate, hasGate)
 			}
 
-			if !tt.expectHasGate && tt.pmj != nil && tt.pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+			if !tt.expectHasGate && tt.pmj != nil && (tt.pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded || tt.pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring) {
 				snapName := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]
 				if snapName != tt.pmj.Status.SnapshotRef {
 					t.Errorf("expected snapshot annotation %q, got %q", tt.pmj.Status.SnapshotRef, snapName)

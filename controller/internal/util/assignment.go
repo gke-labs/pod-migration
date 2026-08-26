@@ -23,6 +23,7 @@ const (
 	LabelJobCompletionIndex = batchv1.JobCompletionIndexAnnotation
 	LabelOriginPodName      = "pod-migration.gke.io/origin-pod-name"
 	AnnotationAssignedPMJ   = "pod-migration.gke.io/assigned-pmj"
+	AnnotationMismatchSince = "pod-migration.gke.io/mismatch-since"
 )
 
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).
@@ -132,7 +133,7 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 		if phase == pmv1alpha1.PodMigrationJobPhasePending ||
 			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 			phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
-			phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+			phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
 			if !assignedPMJs[job.Name] {
 				return job.Name, nil
 			}

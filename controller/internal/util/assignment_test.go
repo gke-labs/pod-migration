@@ -480,7 +480,7 @@ func TestFindUnassignedActivePMJ_GenerationalWorkloadIsolation(t *testing.T) {
 						PodRef: corev1.LocalObjectReference{Name: "redis-0"},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
+						Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
 					},
 				},
 			},
@@ -507,7 +507,7 @@ func TestFindUnassignedActivePMJ_GenerationalWorkloadIsolation(t *testing.T) {
 						PodRef: corev1.LocalObjectReference{Name: "redis-0"},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
+						Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
 					},
 				},
 			},
@@ -534,7 +534,7 @@ func TestFindUnassignedActivePMJ_GenerationalWorkloadIsolation(t *testing.T) {
 						PodRef: corev1.LocalObjectReference{Name: "web-abc"},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
+						Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
 					},
 				},
 			},
@@ -574,7 +574,7 @@ func TestFindUnassignedActivePMJ_SingleUseConsumedGuard(t *testing.T) {
 		expectErr  bool
 	}{
 		{
-			name:       "Unconsumed Succeeded PMJ is eligible for adoption",
+			name:       "Unconsumed Restoring PMJ is eligible for adoption",
 			podName:    "redis-0",
 			parentName: "redis",
 			parentKind: "StatefulSet",
@@ -594,7 +594,7 @@ func TestFindUnassignedActivePMJ_SingleUseConsumedGuard(t *testing.T) {
 						PodRef: corev1.LocalObjectReference{Name: "redis-0"},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase:    pmv1alpha1.PodMigrationJobPhaseSucceeded,
+						Phase:    pmv1alpha1.PodMigrationJobPhaseRestoring,
 						Consumed: false,
 					},
 				},
@@ -622,7 +622,7 @@ func TestFindUnassignedActivePMJ_SingleUseConsumedGuard(t *testing.T) {
 						PodRef: corev1.LocalObjectReference{Name: "redis-0"},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase:          pmv1alpha1.PodMigrationJobPhaseSucceeded,
+						Phase:          pmv1alpha1.PodMigrationJobPhaseRestoring,
 						Consumed:       true, // Already consumed by prior replacement pod
 						RestoredPodUID: "prior-pod-uid",
 					},
