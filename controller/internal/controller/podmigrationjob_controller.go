@@ -43,7 +43,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;get;list;patch;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
 // Reconcile drives the state machine of the PodMigrationJob.
