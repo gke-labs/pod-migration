@@ -114,6 +114,39 @@ subjects:
   name: pod-migration-controller
   namespace: pod-migration-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-migration-leader-election-role
+  namespace: pod-migration-system
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-migration-leader-election-rolebinding
+  namespace: pod-migration-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-migration-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: pod-migration-controller
+  namespace: pod-migration-system
+---
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -142,9 +175,12 @@ metadata:
   name: pod-migration-controller
   namespace: pod-migration-system
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: pod-migration-controller
@@ -153,16 +189,26 @@ spec:
       labels:
         app: pod-migration-controller
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: pod-migration-controller
+              topologyKey: kubernetes.io/hostname
       serviceAccountName: pod-migration-controller
       containers:
       - name: manager
-        image: <YOUR_CONTROLLER_IMAGE>
+        image: gcr.io/yaoluo-gke-dev/pod-migration-controller:issue16-ha-final
         imagePullPolicy: Always
         command:
         - /manager
         args:
         - --metrics-bind-address=:8080
         - --health-probe-bind-address=:8081
+        - --leader-elect=true
         ports:
         - containerPort: 9443
           name: webhook-server
@@ -221,6 +267,7 @@ webhooks:
           operator: NotIn
           values:
             - pod-migration-system
+            - kube-system
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -255,6 +302,7 @@ webhooks:
           operator: NotIn
           values:
             - pod-migration-system
+            - kube-system
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -282,10 +330,23 @@ webhooks:
           operator: NotIn
           values:
             - pod-migration-system
+            - kube-system
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["UPDATE"]
         resources: ["pods/status"]
         scope: Namespaced
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pod-migration-controller-pdb
+  namespace: pod-migration-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pod-migration-controller
+
 
