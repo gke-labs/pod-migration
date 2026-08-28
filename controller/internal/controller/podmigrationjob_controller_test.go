@@ -15,11 +15,23 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
+
+func newFakeClientBuilderWithEventIndex(scheme *runtime.Scheme) *fake.ClientBuilder {
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Event{}, "involvedObject.uid", func(rawObj client.Object) []string {
+			if event, ok := rawObj.(*corev1.Event); ok {
+				return []string{string(event.InvolvedObject.UID)}
+			}
+			return nil
+		})
+}
 
 func TestPodMigrationJobReconciler_Pending(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -1324,8 +1336,7 @@ func TestPodMigrationJobReconciler_Restoring_Success(t *testing.T) {
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
 		WithObjects(replacementPod, pmj).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		Build()
@@ -1415,8 +1426,7 @@ func TestPodMigrationJobReconciler_Restoring_Success_DifferentReplacementPodName
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
 		WithObjects(replacementPod, pmj).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		Build()
@@ -1494,6 +1504,7 @@ func TestPodMigrationJobReconciler_Restoring_ColdStartFallback(t *testing.T) {
 			Name:      podName,
 			UID:       types.UID(podUID),
 		},
+		Type:    corev1.EventTypeWarning,
 		Reason:  "FallbackToColdStart",
 		Message: "GKE runtime skipped snapshot restore and fell back to cold start",
 	}
@@ -1519,8 +1530,7 @@ func TestPodMigrationJobReconciler_Restoring_ColdStartFallback(t *testing.T) {
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
 		WithObjects(replacementPod, event, pmj).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		Build()
@@ -1558,6 +1568,211 @@ func TestPodMigrationJobReconciler_Restoring_ColdStartFallback(t *testing.T) {
 	}
 	if restoredCond.Status != metav1.ConditionFalse || restoredCond.Reason != "FallbackToColdStart" {
 		t.Errorf("Expected Restored condition False/FallbackToColdStart, got %+v", restoredCond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Restoring_IgnoresNormalEventsWithFallbackKeyword(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "cni-event",
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      "Pod",
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Type:    corev1.EventTypeNormal,
+		Reason:  "CNIFallback",
+		Message: "fallback route configured",
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Consumed:        true,
+			RestoredPodUID:  podUID,
+			RestoredPodName: podName,
+		},
+	}
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(replacementPod, event, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected no requeue, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceeded, updatedPMJ.Status.Phase)
+	}
+
+	restoredCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Restored")
+	if restoredCond == nil {
+		t.Fatalf("Expected Restored condition to be set")
+	}
+	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != "RestoreVerified" {
+		t.Errorf("Expected Restored condition True/RestoreVerified, got %+v", restoredCond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Restoring_IgnoresStaleWarningEventsBeforeRestoringStartTime(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "stale-fallback-event",
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      "Pod",
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Type:          corev1.EventTypeWarning,
+		Reason:        "FallbackToColdStart",
+		Message:       "falling back to a cold start",
+		LastTimestamp: metav1.Time{Time: time.Now().Add(-10 * time.Minute)},
+	}
+
+	restoringStartTime := metav1.Time{Time: time.Now().Add(-2 * time.Minute)}
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Consumed:           true,
+			RestoredPodUID:     podUID,
+			RestoredPodName:    podName,
+			RestoringStartTime: &restoringStartTime,
+		},
+	}
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(replacementPod, event, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected no requeue, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceeded, updatedPMJ.Status.Phase)
+	}
+
+	restoredCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Restored")
+	if restoredCond == nil {
+		t.Fatalf("Expected Restored condition to be set")
+	}
+	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != "RestoreVerified" {
+		t.Errorf("Expected Restored condition True/RestoreVerified, got %+v", restoredCond)
 	}
 }
 

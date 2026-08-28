@@ -95,8 +95,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.PodMigrationJobReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)

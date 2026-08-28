@@ -25,6 +25,7 @@ import (
 // PodMigrationJobReconciler reconciles a PodMigrationJob object.
 type PodMigrationJobReconciler struct {
 	client.Client
+	APIReader        client.Reader
 	Scheme           *runtime.Scheme
 	SnapshotProvider snapshot.Provider
 }
@@ -501,7 +502,12 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		// 5. Check for GKE PodSnapshots cold-start fallback Warning Event
-		if r.hasColdStartFallbackEvent(ctx, replacementPod) {
+		hasFallback, err := r.hasColdStartFallbackEvent(ctx, job, replacementPod)
+		if err != nil {
+			logger.Error(err, "Failed to query events for replacement pod")
+			return ctrl.Result{}, err
+		}
+		if hasFallback {
 			logger.Info("GKE runtime skipped snapshot restore and fell back to cold start", "pod", replacementPod.Name)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 			now := metav1.Now()
@@ -572,30 +578,54 @@ func isPodReady(pod *corev1.Pod) bool {
 	return false
 }
 
-func (r *PodMigrationJobReconciler) hasColdStartFallbackEvent(ctx context.Context, pod *corev1.Pod) bool {
+func (r *PodMigrationJobReconciler) hasColdStartFallbackEvent(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (bool, error) {
 	if pod == nil {
-		return false
+		return false, nil
 	}
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
 	eventList := &corev1.EventList{}
-	if err := r.List(ctx, eventList, client.InNamespace(pod.Namespace)); err != nil {
-		return false
+	listOpts := []client.ListOption{
+		client.InNamespace(pod.Namespace),
+		client.MatchingFields{"involvedObject.uid": string(pod.UID)},
 	}
+	if err := reader.List(ctx, eventList, listOpts...); err != nil {
+		return false, fmt.Errorf("failed to list events for replacement pod %s: %w", pod.Name, err)
+	}
+
 	for _, event := range eventList.Items {
-		if event.InvolvedObject.UID == pod.UID {
-			if event.Reason == "FallbackToColdStart" ||
-				event.Reason == "FailedRestore" ||
-				event.Reason == "RestoreFailed" ||
-				event.Reason == "SkipRestore" ||
-				(event.Type == corev1.EventTypeWarning && strings.Contains(strings.ToLower(event.Message), "falling back to a cold start")) ||
-				(event.Type == corev1.EventTypeWarning && strings.Contains(strings.ToLower(event.Message), "failed to restore")) ||
-				(event.Type == corev1.EventTypeWarning && strings.Contains(strings.ToLower(event.Message), "skipped restore")) ||
-				strings.Contains(strings.ToLower(event.Message), "cold start") ||
-				strings.Contains(strings.ToLower(event.Message), "fallback") {
-				return true
+		if event.InvolvedObject.UID != pod.UID {
+			continue
+		}
+
+		// Ignore events timestamped before this migration's Restoring phase started
+		if job != nil && job.Status.RestoringStartTime != nil && !event.LastTimestamp.IsZero() {
+			if event.LastTimestamp.Before(job.Status.RestoringStartTime) {
+				continue
+			}
+		}
+
+		// Only Warning events indicate an abnormal restore fallback
+		if event.Type == corev1.EventTypeWarning {
+			msg := strings.ToLower(event.Message)
+			reason := event.Reason
+			if reason == "FallbackToColdStart" ||
+				reason == "FailedRestore" ||
+				reason == "RestoreFailed" ||
+				reason == "SkipRestore" ||
+				reason == "GKEPodSnapshotting" ||
+				strings.Contains(msg, "falling back to a cold start") ||
+				strings.Contains(msg, "failed to restore") ||
+				strings.Contains(msg, "skipped restore") {
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
