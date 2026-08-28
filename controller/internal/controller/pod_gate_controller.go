@@ -114,8 +114,17 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	phase := job.Status.Phase
-	if phase == pmv1alpha1.PodMigrationJobPhaseSucceeded || phase == pmv1alpha1.PodMigrationJobPhaseFailed {
-		logger.Info("Assigned PMJ has completed, releasing scheduling gate", "pmj", correctedPMJ, "phase", phase)
+	if phase == pmv1alpha1.PodMigrationJobPhaseRestoring ||
+		phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
+		phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
+		phase == pmv1alpha1.PodMigrationJobPhaseFailed {
+		if phase == pmv1alpha1.PodMigrationJobPhaseFailed ||
+			phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+			logger.Info("Assigned PMJ completed without restore; releasing scheduling gate for cold-start fallback",
+				"pod", pod.Name, "pmj", correctedPMJ, "phase", phase)
+		} else {
+			logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
+		}
 
 		if job.Status.Consumed && job.Status.RestoredPodUID != "" && job.Status.RestoredPodUID != string(pod.UID) {
 			logger.Info("Assigned PMJ was already consumed by a different pod, releasing gate with cold-start bypass",
@@ -129,8 +138,8 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, r.Update(ctx, pod)
 		}
 
-		// If succeeded, inject GKE's native snapshot name annotation to force correct restore mapping
-		if phase == pmv1alpha1.PodMigrationJobPhaseSucceeded && job.Status.SnapshotRef != "" {
+		// Inject GKE's native snapshot name annotation when snapshotRef is present and not Failed
+		if (phase == pmv1alpha1.PodMigrationJobPhaseRestoring || phase == pmv1alpha1.PodMigrationJobPhaseSucceeded) && job.Status.SnapshotRef != "" {
 			if pod.Annotations == nil {
 				pod.Annotations = make(map[string]string)
 			}
@@ -142,6 +151,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if !job.Status.Consumed {
 			job.Status.Consumed = true
 			job.Status.RestoredPodUID = string(pod.UID)
+			job.Status.RestoredPodName = pod.Name
 			if updateErr := r.Status().Update(ctx, job); updateErr != nil {
 				logger.Error(updateErr, "Failed to mark PMJ as consumed")
 				return ctrl.Result{}, updateErr

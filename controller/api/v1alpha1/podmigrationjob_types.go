@@ -17,11 +17,13 @@ type PodMigrationJobSpec struct {
 type PodMigrationJobPhase string
 
 const (
-	PodMigrationJobPhasePending      PodMigrationJobPhase = "Pending"
-	PodMigrationJobPhaseSnapshotting PodMigrationJobPhase = "Snapshotting"
-	PodMigrationJobPhaseEvicting     PodMigrationJobPhase = "Evicting"
-	PodMigrationJobPhaseSucceeded    PodMigrationJobPhase = "Succeeded"
-	PodMigrationJobPhaseFailed       PodMigrationJobPhase = "Failed"
+	PodMigrationJobPhasePending                 PodMigrationJobPhase = "Pending"
+	PodMigrationJobPhaseSnapshotting            PodMigrationJobPhase = "Snapshotting"
+	PodMigrationJobPhaseEvicting                PodMigrationJobPhase = "Evicting"
+	PodMigrationJobPhaseRestoring               PodMigrationJobPhase = "Restoring"
+	PodMigrationJobPhaseSucceeded               PodMigrationJobPhase = "Succeeded"
+	PodMigrationJobPhaseSucceededWithoutRestore PodMigrationJobPhase = "SucceededWithoutRestore"
+	PodMigrationJobPhaseFailed                  PodMigrationJobPhase = "Failed"
 )
 
 // PodMigrationJobStatus defines the observed state.
@@ -36,6 +38,10 @@ type PodMigrationJobStatus struct {
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 
+	// RestoringStartTime is the timestamp when this job transitioned to the Restoring phase.
+	// +optional
+	RestoringStartTime *metav1.Time `json:"restoringStartTime,omitempty"`
+
 	// Consumed indicates whether this migration snapshot has already been adopted by a replacement pod.
 	// Once true, subsequent pods will ignore this PMJ, preventing cross-generational stale state resurrection.
 	// +optional
@@ -44,6 +50,10 @@ type PodMigrationJobStatus struct {
 	// RestoredPodUID records the UID of the replacement pod that adopted this migration snapshot.
 	// +optional
 	RestoredPodUID string `json:"restoredPodUID,omitempty"`
+
+	// RestoredPodName stores the metadata.name of the replacement pod that adopted this PMJ.
+	// +optional
+	RestoredPodName string `json:"restoredPodName,omitempty"`
 
 	// Conditions represent the latest available observations of the job's current state.
 	// +optional

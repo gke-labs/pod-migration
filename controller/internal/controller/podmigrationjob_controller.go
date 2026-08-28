@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -18,11 +19,13 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 // PodMigrationJobReconciler reconciles a PodMigrationJob object.
 type PodMigrationJobReconciler struct {
 	client.Client
+	APIReader        client.Reader
 	Scheme           *runtime.Scheme
 	SnapshotProvider snapshot.Provider
 }
@@ -41,6 +44,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
 // Reconcile drives the state machine of the PodMigrationJob.
@@ -104,6 +108,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// Garbage collect completed PMJs after 5 minutes
 	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
+		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 
 		if job.Status.CompletionTime != nil {
@@ -373,27 +378,254 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("All volumes detached successfully")
 		}
 
-		// 4.4. Once all PVs are detached, transition the PMJ phase to Succeeded.
-		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
-		now := metav1.Now()
-		job.Status.CompletionTime = &now
+		// 4.4. Once all PVs are detached, transition the PMJ phase to Restoring.
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+		restoringNow := metav1.Now()
+		job.Status.RestoringStartTime = &restoringNow
 		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "MigrationSucceeded",
-			Message:            "Pod migration completed successfully",
+			Status:             metav1.ConditionFalse,
+			Reason:             "RestoringState",
+			Message:            "Snapshot durable and PVs detached; waiting for replacement pod restore",
 			ObservedGeneration: job.Generation,
 		})
 		err = r.Status().Update(ctx, job)
 		if err != nil {
-			logger.Error(err, "Failed to update job status to Succeeded")
+			logger.Error(err, "Failed to update job status to Restoring")
 			return ctrl.Result{}, err
 		}
-		logger.Info("PodMigrationJob completed successfully!")
+		logger.Info("PodMigrationJob transitioned to Restoring phase", "pod", podName)
 		return ctrl.Result{}, nil
+
+	case pmv1alpha1.PodMigrationJobPhaseRestoring:
+		// 1. Ensure RestoringStartTime is initialized
+		if job.Status.RestoringStartTime == nil {
+			now := metav1.Now()
+			job.Status.RestoringStartTime = &now
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to initialize RestoringStartTime")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// 2. 5-minute safety ceiling measured from RestoringStartTime
+		const restoreTimeout = 5 * time.Minute
+		if time.Since(job.Status.RestoringStartTime.Time) > restoreTimeout {
+			logger.Info("Restore timeout reached (5m), marking SucceededWithoutRestore", "job", job.Name, "pod", podName)
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+			now := metav1.Now()
+			job.Status.CompletionTime = &now
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Restored",
+				Status:             metav1.ConditionFalse,
+				Reason:             "RestoreTimeout",
+				Message:            "Restore timed out after 5 minutes",
+				ObservedGeneration: job.Generation,
+			})
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "RestoreTimeout",
+				Message:            "Restore timed out after 5 minutes",
+				ObservedGeneration: job.Generation,
+			})
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to update job status on restore timeout")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+
+		// 2. Wait until replacement pod has claimed the PMJ at the gate
+		if !job.Status.Consumed || job.Status.RestoredPodUID == "" || job.Status.RestoredPodName == "" {
+			logger.Info("PMJ is Restoring but not yet consumed by a replacement pod; waiting...", "job", job.Name)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// 3. Fetch replacement pod by Name
+		replacementPod := &corev1.Pod{}
+		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: job.Status.RestoredPodName}, replacementPod)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("Replacement pod not found yet; waiting...", "pod", job.Status.RestoredPodName)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			logger.Error(err, "Failed to get replacement pod in Restoring phase")
+			return ctrl.Result{}, err
+		}
+
+		// 4. Strict UID Assertion: Ensure we are evaluating the exact pod instance that adopted the snapshot
+		if string(replacementPod.UID) != job.Status.RestoredPodUID {
+			logger.Info("Pod with name exists but UID mismatch (replacement pod was recreated)",
+				"expectedUID", job.Status.RestoredPodUID, "actualUID", replacementPod.UID)
+
+			const mismatchGracePeriod = 30 * time.Second
+			mismatchSinceStr := job.Annotations[util.AnnotationMismatchSince]
+			if mismatchSinceStr == "" {
+				if job.Annotations == nil {
+					job.Annotations = make(map[string]string)
+				}
+				job.Annotations[util.AnnotationMismatchSince] = time.Now().Format(time.RFC3339)
+				if err := r.Update(ctx, job); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+
+			mismatchSince, err := time.Parse(time.RFC3339, mismatchSinceStr)
+			if err != nil || time.Since(mismatchSince) > mismatchGracePeriod {
+				logger.Info("Replacement pod UID mismatch persisted > 30s; fast-failing to SucceededWithoutRestore", "job", job.Name)
+				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+				now := metav1.Now()
+				job.Status.CompletionTime = &now
+				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+					Type:               "Restored",
+					Status:             metav1.ConditionFalse,
+					Reason:             "ReplacementPodMismatch",
+					Message:            "Replacement pod was deleted and recreated (UID mismatch persisted > 30s)",
+					ObservedGeneration: job.Generation,
+				})
+				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					Reason:             "ReplacementPodMismatch",
+					Message:            "Workload recreated with new instance; migration tracking concluded",
+					ObservedGeneration: job.Generation,
+				})
+				if err := r.Status().Update(ctx, job); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// 5. Check for GKE PodSnapshots cold-start fallback Warning Event
+		hasFallback, err := r.hasColdStartFallbackEvent(ctx, job, replacementPod)
+		if err != nil {
+			logger.Error(err, "Failed to query events for replacement pod")
+			return ctrl.Result{}, err
+		}
+		if hasFallback {
+			logger.Info("GKE runtime skipped snapshot restore and fell back to cold start", "pod", replacementPod.Name)
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+			now := metav1.Now()
+			job.Status.CompletionTime = &now
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Restored",
+				Status:             metav1.ConditionFalse,
+				Reason:             "FallbackToColdStart",
+				Message:            "GKE runtime skipped snapshot restore and fell back to cold start",
+				ObservedGeneration: job.Generation,
+			})
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "FallbackToColdStart",
+				Message:            "GKE runtime skipped snapshot restore and fell back to cold start",
+				ObservedGeneration: job.Generation,
+			})
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to update job status to SucceededWithoutRestore")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+
+		// 6. Check if replacement pod has achieved PodReady condition (Verified Restore)
+		if isPodReady(replacementPod) {
+			logger.Info("Pod state restored from snapshot and replacement pod is Ready", "pod", replacementPod.Name)
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+			now := metav1.Now()
+			job.Status.CompletionTime = &now
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Restored",
+				Status:             metav1.ConditionTrue,
+				Reason:             "RestoreVerified",
+				Message:            "Pod state restored from snapshot and replacement pod is Ready",
+				ObservedGeneration: job.Generation,
+			})
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "RestoreVerified",
+				Message:            "Pod state restored from snapshot and replacement pod is Ready",
+				ObservedGeneration: job.Generation,
+			})
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to update job status to Succeeded")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *PodMigrationJobReconciler) hasColdStartFallbackEvent(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (bool, error) {
+	if pod == nil {
+		return false, nil
+	}
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	eventList := &corev1.EventList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(pod.Namespace),
+		client.MatchingFields{"involvedObject.uid": string(pod.UID)},
+	}
+	if err := reader.List(ctx, eventList, listOpts...); err != nil {
+		return false, fmt.Errorf("failed to list events for replacement pod %s: %w", pod.Name, err)
+	}
+
+	for _, event := range eventList.Items {
+		if event.InvolvedObject.UID != pod.UID {
+			continue
+		}
+
+		// Ignore events timestamped before this migration's Restoring phase started
+		if job != nil && job.Status.RestoringStartTime != nil && !event.LastTimestamp.IsZero() {
+			if event.LastTimestamp.Before(job.Status.RestoringStartTime) {
+				continue
+			}
+		}
+
+		// Only Warning events indicate an abnormal restore fallback
+		if event.Type == corev1.EventTypeWarning {
+			msg := strings.ToLower(event.Message)
+			reason := event.Reason
+			if reason == "FallbackToColdStart" ||
+				reason == "FailedRestore" ||
+				reason == "RestoreFailed" ||
+				reason == "SkipRestore" ||
+				reason == "GKEPodSnapshotting" ||
+				strings.Contains(msg, "falling back to a cold start") ||
+				strings.Contains(msg, "failed to restore") ||
+				strings.Contains(msg, "skipped restore") {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
