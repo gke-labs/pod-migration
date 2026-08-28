@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -44,6 +45,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
@@ -311,13 +313,25 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			if time.Since(evictingSince) > timeout {
-				logger.Info("Eviction webhook wait timed out (30s), deleting origin pod manually (fallback)", "pod", podName)
-				err = r.Delete(ctx, pod)
-				if err != nil && !apierrors.IsNotFound(err) {
-					logger.Error(err, "Failed to delete origin pod (fallback)")
+				logger.Info("Eviction webhook wait timed out (30s), initiating PDB-safe pod eviction (fallback)", "pod", podName)
+				eviction := &policyv1.Eviction{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      pod.Name,
+						Namespace: pod.Namespace,
+					},
+				}
+				err = r.SubResource("eviction").Create(ctx, pod, eviction)
+				switch {
+				case err == nil || apierrors.IsNotFound(err):
+					logger.Info("Successfully initiated PDB-safe pod eviction", "pod", podName)
+					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				case apierrors.IsTooManyRequests(err):
+					logger.Info("Pod eviction blocked by PodDisruptionBudget (429 Too Many Requests); waiting for budget", "pod", podName)
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				default:
+					logger.Error(err, "Failed to evict origin pod via eviction subresource (fallback)")
 					return ctrl.Result{}, err
 				}
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			} else {
 				logger.Info("Waiting for eviction webhook to allow deletion", "pod", podName, "elapsed", time.Since(evictingSince))
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil

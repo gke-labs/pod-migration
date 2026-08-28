@@ -6,6 +6,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -17,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
@@ -2175,5 +2177,188 @@ func TestPodMigrationJobReconciler_Restoring_UIDMismatch_MalformedAnnotation(t *
 	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
 	if readyCond == nil || readyCond.Reason != "ReplacementPodMismatch" || readyCond.Status != metav1.ConditionTrue {
 		t.Errorf("Expected Ready condition True/ReplacementPodMismatch, got %+v", readyCond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_PDBSafeEvictionFallback(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "12345678-abcd"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": time.Now().Add(-35 * time.Second).Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	evictionCalled := false
+	var evictedPodName string
+	var evictedNamespace string
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+				if subResourceName == "eviction" {
+					evictionCalled = true
+					if eviction, ok := subResource.(*policyv1.Eviction); ok {
+						evictedPodName = eviction.Name
+						evictedNamespace = eviction.Namespace
+					}
+					return nil
+				}
+				return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+			},
+		}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if !evictionCalled {
+		t.Fatalf("Expected eviction subresource to be called on timeout fallback, but was not")
+	}
+	if evictedPodName != podName || evictedNamespace != namespace {
+		t.Errorf("Expected eviction for %s/%s, got %s/%s", namespace, podName, evictedNamespace, evictedPodName)
+	}
+	if res.RequeueAfter != 2*time.Second {
+		t.Errorf("Expected RequeueAfter 2s, got %v", res.RequeueAfter)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_PDBBlocked_429_Requeues(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "12345678-abcd"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": time.Now().Add(-35 * time.Second).Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	evictionAttempted := false
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+				if subResourceName == "eviction" {
+					evictionAttempted = true
+					return apierrors.NewTooManyRequests("Cannot evict pod due to PDB", 5)
+				}
+				return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+			},
+		}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed unexpectedly on 429: %v", err)
+	}
+	if !evictionAttempted {
+		t.Fatalf("Expected eviction subresource to be called, but was not")
+	}
+	if res.RequeueAfter != 5*time.Second {
+		t.Errorf("Expected RequeueAfter 5s when blocked by PDB (429), got %v", res.RequeueAfter)
 	}
 }

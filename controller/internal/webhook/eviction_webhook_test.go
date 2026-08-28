@@ -285,6 +285,126 @@ func TestEvictionGate(t *testing.T) {
 			expectedAllowed: true,
 			expectedMessage: "Pod does not use gvisor runtime, skipping migration",
 		},
+		{
+			name: "Allow eviction when PMJ is in Evicting phase",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      util.FormatPMJName("test-pod", "test-uid-12345"),
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+					},
+				},
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "migration checkpoint complete",
+		},
+		{
+			name: "Allow eviction when PMJ is in Restoring phase",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      util.FormatPMJName("test-pod", "test-uid-12345"),
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+					},
+				},
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "migration checkpoint complete",
+		},
+		{
+			name: "Allow eviction when PMJ is in SucceededWithoutRestore phase",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      util.FormatPMJName("test-pod", "test-uid-12345"),
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+					},
+				},
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "migration checkpoint complete",
+		},
+		{
+			name: "Allow eviction when PMJ is in Succeeded phase",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      util.FormatPMJName("test-pod", "test-uid-12345"),
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
+					},
+				},
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "migration checkpoint complete",
+		},
 	}
 
 	for _, tt := range tests {
