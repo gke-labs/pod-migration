@@ -844,3 +844,83 @@ func TestPodGateReconciler_Reconcile_AlreadyConsumedPMJ_ReleasesGateWithColdStar
 		t.Errorf("expected pod-migration.gke.io/assigned-pmj annotation to be deleted, got %q", val)
 	}
 }
+
+func TestPodGateReconciler_Reconcile_RecordsRestoredPodNameAndUID(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-test"
+	podName := "test-replacement-pod"
+	podUID := types.UID("uid-replacement-123")
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       podUID,
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "orig-pod"},
+			TargetPodUID: "orig-pod-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef: "snapshot-123",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	r := &PodGateReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      podName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("failed to fetch updated PMJ: %v", err)
+	}
+
+	if !updatedPMJ.Status.Consumed {
+		t.Errorf("expected PMJ Consumed to be true, got false")
+	}
+	if updatedPMJ.Status.RestoredPodUID != string(podUID) {
+		t.Errorf("expected PMJ RestoredPodUID == %q, got %q", string(podUID), updatedPMJ.Status.RestoredPodUID)
+	}
+	if updatedPMJ.Status.RestoredPodName != podName {
+		t.Errorf("expected PMJ RestoredPodName == %q, got %q", podName, updatedPMJ.Status.RestoredPodName)
+	}
+}

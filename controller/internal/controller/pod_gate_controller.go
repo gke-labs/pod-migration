@@ -148,6 +148,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if !job.Status.Consumed {
 			job.Status.Consumed = true
 			job.Status.RestoredPodUID = string(pod.UID)
+			job.Status.RestoredPodName = pod.Name
 			if updateErr := r.Status().Update(ctx, job); updateErr != nil {
 				logger.Error(updateErr, "Failed to mark PMJ as consumed")
 				return ctrl.Result{}, updateErr

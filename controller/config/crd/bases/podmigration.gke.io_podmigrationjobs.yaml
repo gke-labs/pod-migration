@@ -147,6 +147,10 @@ spec:
                 items:
                   type: string
                 type: array
+              restoredPodName:
+                description: RestoredPodName stores the metadata.name of the replacement
+                  pod that adopted this PMJ.
+                type: string
               restoredPodUID:
                 description: RestoredPodUID records the UID of the replacement pod
                   that adopted this migration snapshot.

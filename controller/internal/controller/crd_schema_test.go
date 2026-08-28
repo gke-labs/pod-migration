@@ -70,6 +70,7 @@ func TestCRDSchema_PodMigrationJob_StatusFields(t *testing.T) {
 	// Update status fields
 	job.Status.Consumed = true
 	job.Status.RestoredPodUID = "uid-123"
+	job.Status.RestoredPodName = "pod-xyz"
 	if err := k8sClient.Status().Update(ctx, job); err != nil {
 		t.Fatalf("Failed to update PodMigrationJob status: %v", err)
 	}
@@ -85,5 +86,8 @@ func TestCRDSchema_PodMigrationJob_StatusFields(t *testing.T) {
 	}
 	if fetched.Status.RestoredPodUID != "uid-123" {
 		t.Errorf("Expected fetched.Status.RestoredPodUID == %q, got %q", "uid-123", fetched.Status.RestoredPodUID)
+	}
+	if fetched.Status.RestoredPodName != "pod-xyz" {
+		t.Errorf("Expected fetched.Status.RestoredPodName == %q, got %q", "pod-xyz", fetched.Status.RestoredPodName)
 	}
 }

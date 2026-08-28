@@ -47,6 +47,10 @@ type PodMigrationJobStatus struct {
 	// +optional
 	RestoredPodUID string `json:"restoredPodUID,omitempty"`
 
+	// RestoredPodName stores the metadata.name of the replacement pod that adopted this PMJ.
+	// +optional
+	RestoredPodName string `json:"restoredPodName,omitempty"`
+
 	// Conditions represent the latest available observations of the job's current state.
 	// +optional
 	// +patchMergeKey=type

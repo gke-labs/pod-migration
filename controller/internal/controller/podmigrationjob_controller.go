@@ -424,17 +424,17 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		// 2. Wait until replacement pod has claimed the PMJ at the gate
-		if !job.Status.Consumed || job.Status.RestoredPodUID == "" {
+		if !job.Status.Consumed || job.Status.RestoredPodUID == "" || job.Status.RestoredPodName == "" {
 			logger.Info("PMJ is Restoring but not yet consumed by a replacement pod; waiting...", "job", job.Name)
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
 		// 3. Fetch replacement pod by Name
 		replacementPod := &corev1.Pod{}
-		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, replacementPod)
+		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: job.Status.RestoredPodName}, replacementPod)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				logger.Info("Replacement pod not found yet; waiting...", "pod", podName)
+				logger.Info("Replacement pod not found yet; waiting...", "pod", job.Status.RestoredPodName)
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 			logger.Error(err, "Failed to get replacement pod in Restoring phase")
