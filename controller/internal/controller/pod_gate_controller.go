@@ -116,9 +116,12 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	phase := job.Status.Phase
 	if phase == pmv1alpha1.PodMigrationJobPhaseRestoring ||
 		phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
+		phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 		phase == pmv1alpha1.PodMigrationJobPhaseFailed {
-		if phase == pmv1alpha1.PodMigrationJobPhaseFailed {
-			logger.Info("Assigned PMJ failed; releasing scheduling gate for cold-start fallback", "pod", pod.Name, "pmj", correctedPMJ)
+		if phase == pmv1alpha1.PodMigrationJobPhaseFailed ||
+			phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+			logger.Info("Assigned PMJ completed without restore; releasing scheduling gate for cold-start fallback",
+				"pod", pod.Name, "pmj", correctedPMJ, "phase", phase)
 		} else {
 			logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 		}

@@ -141,6 +141,37 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 			expectHasGate: false,
 		},
 		{
+			name: "Gated pod with SucceededWithoutRestore PMJ gets gate released without snapshot injection",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": "pmj-test-pod",
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
+			},
+			pmj: &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pmj-test-pod",
+					Namespace: "default",
+				},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef: corev1.LocalObjectReference{Name: "test-pod"},
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:       pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+					SnapshotRef: "some-snapshot-name",
+				},
+			},
+			expectHasGate: false,
+		},
+		{
 			name: "Gated pod with missing parent ReplicaSet (NotFound) still releases gate if PMJ succeeds",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -295,6 +326,12 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 				snapName := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]
 				if snapName != tt.pmj.Status.SnapshotRef {
 					t.Errorf("expected snapshot annotation %q, got %q", tt.pmj.Status.SnapshotRef, snapName)
+				}
+			}
+
+			if !tt.expectHasGate && tt.pmj != nil && (tt.pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed || tt.pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore) {
+				if snapName := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]; snapName != "" {
+					t.Errorf("expected no snapshot annotation, got %q", snapName)
 				}
 			}
 		})
