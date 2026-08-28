@@ -1179,6 +1179,9 @@ func TestPodMigrationJobReconciler_Evicting_Success(t *testing.T) {
 	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
 		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseRestoring, updatedPMJ.Status.Phase)
 	}
+	if updatedPMJ.Status.RestoringStartTime == nil {
+		t.Errorf("Expected RestoringStartTime to be set, but got nil")
+	}
 
 	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
 	if cond == nil {
@@ -1567,21 +1570,22 @@ func TestPodMigrationJobReconciler_Restoring_Timeout(t *testing.T) {
 	podName := "test-pod"
 	jobName := "pmj-" + podName
 
+	restoringStartTime := metav1.NewTime(time.Now().Add(-6 * time.Minute))
 	pmj := &pmv1alpha1.PodMigrationJob{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "podmigration.gke.io/v1alpha1",
 			Kind:       "PodMigrationJob",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:         namespace,
-			Name:              jobName,
-			CreationTimestamp: metav1.NewTime(time.Now().Add(-6 * time.Minute)),
+			Namespace: namespace,
+			Name:      jobName,
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef: corev1.LocalObjectReference{Name: podName},
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+			RestoringStartTime: &restoringStartTime,
 		},
 	}
 
@@ -1621,6 +1625,69 @@ func TestPodMigrationJobReconciler_Restoring_Timeout(t *testing.T) {
 	restoredCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Restored")
 	if restoredCond == nil || restoredCond.Reason != "RestoreTimeout" {
 		t.Errorf("Expected Restored condition with Reason=RestoreTimeout, got %+v", restoredCond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Restoring_Timeout_MeasuredFromRestoringStartTimeNotCreationTimestamp(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+
+	restoringStartTime := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-8 * time.Minute)),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+			RestoringStartTime: &restoringStartTime,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 2*time.Second {
+		t.Errorf("Expected RequeueAfter 2s, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseRestoring, updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Status.CompletionTime != nil {
+		t.Errorf("Expected CompletionTime to be nil")
 	}
 }
 

@@ -38,6 +38,10 @@ type PodMigrationJobStatus struct {
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 
+	// RestoringStartTime is the timestamp when this job transitioned to the Restoring phase.
+	// +optional
+	RestoringStartTime *metav1.Time `json:"restoringStartTime,omitempty"`
+
 	// Consumed indicates whether this migration snapshot has already been adopted by a replacement pod.
 	// Once true, subsequent pods will ignore this PMJ, preventing cross-generational stale state resurrection.
 	// +optional

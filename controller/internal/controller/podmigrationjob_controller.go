@@ -379,6 +379,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// 4.4. Once all PVs are detached, transition the PMJ phase to Restoring.
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+		restoringNow := metav1.Now()
+		job.Status.RestoringStartTime = &restoringNow
 		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -395,9 +397,19 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseRestoring:
-		// 1. 5-minute safety ceiling
+		// 1. Ensure RestoringStartTime is initialized
+		if job.Status.RestoringStartTime == nil {
+			now := metav1.Now()
+			job.Status.RestoringStartTime = &now
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to initialize RestoringStartTime")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// 2. 5-minute safety ceiling measured from RestoringStartTime
 		const restoreTimeout = 5 * time.Minute
-		if time.Since(job.CreationTimestamp.Time) > restoreTimeout {
+		if time.Since(job.Status.RestoringStartTime.Time) > restoreTimeout {
 			logger.Info("Restore timeout reached (5m), marking SucceededWithoutRestore", "job", job.Name, "pod", podName)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 			now := metav1.Now()
