@@ -131,7 +131,7 @@ func main() {
 		setupLog.Error(err, "unable to set up healthz")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", mgr.GetWebhookServer().StartedChecker()); err != nil {
 		setupLog.Error(err, "unable to set up readyz")
 		os.Exit(1)
 	}

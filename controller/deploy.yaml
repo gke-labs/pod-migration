@@ -201,7 +201,7 @@ spec:
       serviceAccountName: pod-migration-controller
       containers:
       - name: manager
-        image: gcr.io/yaoluo-gke-dev/pod-migration-controller:issue16-ha-final
+        image: <YOUR_CONTROLLER_IMAGE>
         imagePullPolicy: Always
         command:
         - /manager
@@ -213,6 +213,18 @@ spec:
         - containerPort: 9443
           name: webhook-server
           protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
         volumeMounts:
         - mountPath: /tmp/k8s-webhook-server/serving-certs
           name: cert
