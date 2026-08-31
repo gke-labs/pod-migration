@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -272,6 +273,46 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 				},
 			},
 			expectHasGate: true,
+		},
+		{
+			name: "Gated pod with assigned PMJ not found (recently created < 10s) requeues and keeps gate",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-pod-recent",
+					Namespace:         "default",
+					CreationTimestamp: metav1.Now(),
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": "nonexistent-pmj",
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
+			},
+			pmj:           nil,
+			expectHasGate: true,
+		},
+		{
+			name: "Gated pod with assigned PMJ not found (older pod >= 10s) releases gate",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-pod-old",
+					Namespace:         "default",
+					CreationTimestamp: metav1.NewTime(time.Now().Add(-20 * time.Second)),
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": "nonexistent-pmj",
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
+			},
+			pmj:           nil,
+			expectHasGate: false,
 		},
 	}
 

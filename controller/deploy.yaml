@@ -173,11 +173,11 @@ spec:
           readOnly: true
         resources:
           requests:
-            cpu: 100m
-            memory: 128Mi
+            cpu: 200m
+            memory: 1Gi
           limits:
-            cpu: 500m
-            memory: 256Mi
+            cpu: 1000m
+            memory: 2Gi
       volumes:
       - name: cert
         secret:
