@@ -121,6 +121,13 @@ metadata:
   namespace: pod-migration-system
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases
@@ -180,7 +187,7 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      maxUnavailable: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: pod-migration-controller
