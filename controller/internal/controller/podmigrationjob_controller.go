@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -106,14 +107,16 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Garbage collect completed PMJs after 5 minutes
+	// Garbage collect completed PMJs after 30 minutes to allow ample time for large queue drainage.
+	// Note: Once Issue #19 (field indexers & transactional status.claimedBy) lands, gate lookups
+	// will be O(1) and this TTL can be safely reduced to a shorter interval (e.g. 5-10 minutes).
 	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 
 		if job.Status.CompletionTime != nil {
-			const gcDelay = 5 * time.Minute
-			if time.Since(job.Status.CompletionTime.Time) > gcDelay {
+			ttl := time.Minute * 30 // Extended 30m window prevents premature deletion during large drains
+			if time.Since(job.Status.CompletionTime.Time) > ttl {
 				logger.Info("Garbage collecting completed PodMigrationJob", "job", job.Name)
 				err := r.Delete(ctx, job)
 				if err != nil && !apierrors.IsNotFound(err) {
@@ -121,7 +124,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 				return ctrl.Result{}, nil
 			}
-			requeueIn := gcDelay - time.Since(job.Status.CompletionTime.Time)
+			requeueIn := ttl - time.Since(job.Status.CompletionTime.Time)
 			return ctrl.Result{RequeueAfter: requeueIn}, nil
 		}
 		return ctrl.Result{}, nil
@@ -629,8 +632,9 @@ func (r *PodMigrationJobReconciler) hasColdStartFallbackEvent(ctx context.Contex
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigrationJob{}).
+		WithOptions(options).
 		Complete(r)
 }
