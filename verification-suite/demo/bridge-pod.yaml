@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pm-bridge
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-bridge
+  template:
+    metadata:
+      labels:
+        app: pm-bridge
+    spec:
+      containers:
+      - name: socat
+        image: alpine/socat
+        command:
+        - socat
+        - -d
+        - -d
+        - tcp-listen:8888,fork,reuseaddr
+        - tcp:pm-jupyter-fancy-service:80
+        ports:
+        - containerPort: 8888
+          name: http

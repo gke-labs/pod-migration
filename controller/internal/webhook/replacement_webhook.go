@@ -1,0 +1,135 @@
+package webhook
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/gke-labs/pod-migration/controller/internal/util"
+)
+
+// PodGateInjector injects the scheduling gate into replacement pods.
+type PodGateInjector struct {
+	Client  client.Client
+	decoder admission.Decoder
+}
+
+// Handle inspects pod creations and injects the pod-migration-gate scheduling gate.
+func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) admission.Response {
+	logger := log.FromContext(ctx).WithValues("pod", req.Name, "namespace", req.Namespace)
+	logger.Info("Intercepted pod creation for scheduling gate check")
+
+	pod := &corev1.Pod{}
+	err := a.decoder.Decode(req, pod)
+	if err != nil {
+		logger.Error(err, "Failed to decode pod")
+		return admission.Errored(http.StatusBadRequest, err)
+	}
+
+	// Check if pod opted in
+	if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
+		logger.Info("Pod not opted in, bypassing scheduling gate injection")
+		return admission.Allowed("pod not opted in")
+	}
+
+	// Resolve parent owner details
+	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("Parent ReplicaSet not found (likely deleted), treating as bare pod")
+		} else {
+			logger.Error(err, "Failed to resolve parent workload")
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+	}
+
+	var podTemplateHash string
+	var jobCompletionIndex string
+	if pod.Labels != nil {
+		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+		jobCompletionIndex = pod.Labels[util.LabelJobCompletionIndex]
+	}
+
+	// Find active unassigned PMJ
+	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex)
+	if err != nil {
+		logger.Error(err, "Failed to check unassigned active PMJs")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// If there is no active unassigned migration job, this is a scale-up or unrelated pod.
+	// We do NOT inject the scheduling gate and bypass native GKE restore.
+	if assignedPMJ == "" {
+		logger.Info("Bypassing scheduling gate injection (scale-up pod)")
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string)
+		}
+		pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
+		marshaledPod, _ := json.Marshal(pod)
+		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
+	}
+
+	// Check if the gate is already present
+	hasGate := false
+	for _, gate := range pod.Spec.SchedulingGates {
+		if gate.Name == "gke.io/pod-migration-gate" {
+			hasGate = true
+			break
+		}
+	}
+
+	if hasGate {
+		logger.Info("Pod already has the scheduling gate, bypassing")
+		return admission.Allowed("scheduling gate already present")
+	}
+
+	// Inject scheduling gate
+	logger.Info("Injecting scheduling gate gke.io/pod-migration-gate")
+	pod.Spec.SchedulingGates = append(pod.Spec.SchedulingGates, corev1.PodSchedulingGate{
+		Name: "gke.io/pod-migration-gate",
+	})
+
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	if assignedPMJ != "" {
+		pod.Annotations[util.AnnotationAssignedPMJ] = assignedPMJ
+	}
+
+	marshaledPod, err := json.Marshal(pod)
+	if err != nil {
+		logger.Error(err, "Failed to marshal modified pod")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
+}
+
+// InjectDecoder injects the decoder.
+func (a *PodGateInjector) InjectDecoder(d admission.Decoder) error {
+	a.decoder = d
+	return nil
+}
+
+// SetupReplacementWebhookWithManager registers the mutating webhook on the manager.
+func SetupReplacementWebhookWithManager(mgr ctrl.Manager) error {
+	dec := admission.NewDecoder(mgr.GetScheme())
+	mgr.GetWebhookServer().Register(
+		"/mutate-v1-pod-scheduling-gate",
+		&admission.Webhook{
+			Handler: &PodGateInjector{
+				Client:  mgr.GetClient(),
+				decoder: dec,
+			},
+		},
+	)
+	return nil
+}
