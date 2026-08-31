@@ -149,7 +149,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	job := &pmv1alpha1.PodMigrationJob{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assignedPMJ}, job); err != nil {
 		if apierrors.IsNotFound(err) {
-			return assignedPMJ, false, nil // Let PodGateReconciler handle NotFound/cache-sync logic
+			return "", true, nil // PMJ was deleted out-of-band, clear assignment
 		}
 		return "", false, err
 	}
