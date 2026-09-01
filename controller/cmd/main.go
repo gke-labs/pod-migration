@@ -29,6 +29,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 
 	// Import every API group whose types we need to read/write/serialize.
@@ -116,7 +117,7 @@ func main() {
 		Metrics:                       metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress:        probeAddr,
 		LeaderElection:                enableLeaderElection,
-		LeaderElectionID:              "pod-migration-leader.gke.io",
+		LeaderElectionID:              "pod-migration-controller-leader",
 		LeaderElectionReleaseOnCancel: true,
 		Cache: cache.Options{
 			DefaultTransform: cache.TransformStripManagedFields(),
@@ -176,7 +177,7 @@ func main() {
 		setupLog.Error(err, "unable to register replacement mutating webhook")
 		os.Exit(1)
 	}
-	if err := pmwebhook.SetupStatusWebhookWithManager(mgr); err != nil {
+	if err := pmwebhook.SetupStatusWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
 		setupLog.Error(err, "unable to register pod status mutating webhook")
 		os.Exit(1)
 	}
@@ -186,7 +187,15 @@ func main() {
 		setupLog.Error(err, "unable to set up healthz")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", mgr.GetWebhookServer().StartedChecker()); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", func(req *http.Request) error {
+		if err := mgr.GetWebhookServer().StartedChecker()(req); err != nil {
+			return err
+		}
+		if !mgr.GetCache().WaitForCacheSync(req.Context()) {
+			return fmt.Errorf("informer caches not synced yet")
+		}
+		return nil
+	}); err != nil {
 		setupLog.Error(err, "unable to set up readyz")
 		os.Exit(1)
 	}

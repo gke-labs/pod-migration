@@ -44,17 +44,27 @@ def main():
         role_content = role_content[3:].strip()
 
     found = False
+    webhook_sub_count = 0
     for i, doc in enumerate(documents):
-        if re.search(r'^[ \t]*kind:[ \t]*ClusterRole[ \t]*$', doc, re.MULTILINE) and not re.search(r'^[ \t]*kind:[ \t]*ClusterRoleBinding[ \t]*$', doc, re.MULTILINE):
+        if not found and re.search(r'^kind: ClusterRole\s*$', doc, re.MULTILINE) and not re.search(r'^kind: ClusterRoleBinding\s*$', doc, re.MULTILINE):
             documents[i] = role_content + '\n'
             found = True
         elif 'kind: ValidatingWebhookConfiguration' in doc or 'kind: MutatingWebhookConfiguration' in doc:
             pattern = r'(    namespaceSelector:\n      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
             formatted = format_namespace_selector(indent=4) + '\n'
-            documents[i] = re.sub(pattern, formatted, doc)
+            new_doc, count = re.subn(pattern, formatted, doc)
+            if count == 0:
+                print(f"Error: namespaceSelector replacement failed in document {i}", file=sys.stderr)
+                sys.exit(1)
+            webhook_sub_count += count
+            documents[i] = new_doc
 
     if not found:
         print("Error: ClusterRole section not found in deploy.yaml", file=sys.stderr)
+        sys.exit(1)
+
+    if webhook_sub_count != 3:
+        print(f"Error: Expected 3 webhook namespaceSelector replacements, got {webhook_sub_count}", file=sys.stderr)
         sys.exit(1)
 
     new_deploy_content = '---\n'.join(documents)

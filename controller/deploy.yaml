@@ -132,12 +132,9 @@ rules:
   resources:
   - leases
   verbs:
-  - get
-  - list
-  - watch
   - create
+  - get
   - update
-  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -202,15 +199,6 @@ spec:
         labelSelector:
           matchLabels:
             app: pod-migration-controller
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchLabels:
-                  app: pod-migration-controller
-              topologyKey: kubernetes.io/hostname
       serviceAccountName: pod-migration-controller
       containers:
       - name: manager
@@ -222,6 +210,9 @@ spec:
         - --metrics-bind-address=:8080
         - --health-probe-bind-address=:8081
         - --leader-elect=true
+        - --client-go-qps=500
+        - --client-go-burst=1000
+        - --max-concurrent-reconciles=50
         ports:
         - containerPort: 9443
           name: webhook-server

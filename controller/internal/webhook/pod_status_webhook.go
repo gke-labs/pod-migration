@@ -19,8 +19,9 @@ import (
 
 // PodStatusMutator intercepts pod status updates and mutates Succeeded to Failed for migrating pods.
 type PodStatusMutator struct {
-	Client  client.Client
-	decoder admission.Decoder
+	Client    client.Client
+	APIReader client.Reader
+	decoder   admission.Decoder
 }
 
 // Handle inspects pod status updates and mutates the phase and exit codes if the pod is migrating.
@@ -66,12 +67,17 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 	pmj := &pmv1alpha1.PodMigrationJob{}
 	err = a.Client.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			logger.Info("Pod succeeded but no active PodMigrationJob found, allowing normal completion")
-			return admission.Allowed("no active migration job")
+		if apierrors.IsNotFound(err) && a.APIReader != nil {
+			err = a.APIReader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
 		}
-		logger.Error(err, "Failed to check for active PodMigrationJob")
-		return admission.Errored(http.StatusInternalServerError, err)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("Pod succeeded but no active PodMigrationJob found, allowing normal completion")
+				return admission.Allowed("no active migration job")
+			}
+			logger.Error(err, "Failed to check for active PodMigrationJob")
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
 	}
 
 	// Verify if pmj.Spec.TargetPodUID matches string(pod.UID). If not, log it and return admission.Allowed("PMJ UID mismatch").
@@ -131,14 +137,15 @@ func (a *PodStatusMutator) InjectDecoder(d admission.Decoder) error {
 }
 
 // SetupStatusWebhookWithManager registers the mutating status webhook on the manager.
-func SetupStatusWebhookWithManager(mgr ctrl.Manager) error {
+func SetupStatusWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/mutate-v1-pod-status",
 		&admission.Webhook{
 			Handler: &PodStatusMutator{
-				Client:  mgr.GetClient(),
-				decoder: dec,
+				Client:    mgr.GetClient(),
+				APIReader: apiReader,
+				decoder:   dec,
 			},
 		},
 	)
