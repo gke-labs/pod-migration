@@ -2,6 +2,16 @@
 # The real Makefile is ~200 lines; this captures the targets you'll touch.
 
 IMG ?= controller:latest
+VERSION ?= $(shell git describe --tags --match 'v*' --dirty 2>/dev/null || (git diff --quiet 2>/dev/null && echo "v0.1.0-dev" || echo "v0.1.0-dev-dirty"))
+GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE ?= $(shell git log -1 --format=%cI 2>/dev/null || echo "unknown")
+
+VERSION_PKG := github.com/gke-labs/pod-migration/controller/internal/version
+LDFLAGS := -X '$(VERSION_PKG).Version=$(VERSION)' \
+	-X '$(VERSION_PKG).GitCommit=$(GIT_COMMIT)' \
+	-X '$(VERSION_PKG).BuildDate=$(BUILD_DATE)'
+DOCKER_LDFLAGS := -w $(LDFLAGS)
+
 CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0
 ENVTEST_K8S_VERSION ?= 1.36.2
 SETUP_ENVTEST ?= $(shell which setup-envtest 2>/dev/null || echo $(shell go env GOPATH)/bin/setup-envtest)
@@ -29,11 +39,11 @@ fmt: ; go fmt ./...
 vet: ; go vet ./...
 
 build: generate fmt vet ## Compile the manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -ldflags "$(LDFLAGS)" -o bin/manager cmd/main.go
 
 run: generate fmt vet manifests ## Run reconcilers against the current kubeconfig.
 	# NB: webhooks need to run in-cluster with a serving cert; `make run` is for reconciler iteration.
-	go run ./cmd/main.go
+	go run -ldflags "$(LDFLAGS)" ./cmd/main.go
 
 envtest: ## Download setup-envtest locally if necessary.
 	@if [ ! -x "$$(command -v $(SETUP_ENVTEST))" ] && [ ! -x "$(SETUP_ENVTEST)" ]; then \
@@ -59,7 +69,7 @@ undeploy: ## Undeploy controller from the cluster.
 	$(MAKE) uninstall
 
 docker-build: ## Build docker image for the controller.
-	docker build -t $(IMG) .
+	docker build --build-arg LDFLAGS="$(DOCKER_LDFLAGS)" -t $(IMG) .
 
 docker-push: ## Push docker image for the controller.
 	docker push $(IMG)
