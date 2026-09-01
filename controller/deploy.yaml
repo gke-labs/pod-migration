@@ -132,12 +132,9 @@ rules:
   resources:
   - leases
   verbs:
-  - get
-  - list
-  - watch
   - create
+  - get
   - update
-  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -202,15 +199,6 @@ spec:
         labelSelector:
           matchLabels:
             app: pod-migration-controller
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchLabels:
-                  app: pod-migration-controller
-              topologyKey: kubernetes.io/hostname
       serviceAccountName: pod-migration-controller
       containers:
       - name: manager
@@ -245,10 +233,10 @@ spec:
         resources:
           requests:
             cpu: 100m
-            memory: 128Mi
-          limits:
-            cpu: 500m
             memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
       volumes:
       - name: cert
         secret:
