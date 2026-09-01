@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"testing"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,7 +25,12 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 		name          string
 		pod           *corev1.Pod
 		pmj           *pmv1alpha1.PodMigrationJob
+		apiReaderPMJ  *pmv1alpha1.PodMigrationJob // PMJ visible only via APIReader (simulates informer cache lag)
 		expectHasGate bool
+		expectRequeue bool
+		// expectColdStartBypass asserts the release scrubbed the assignment:
+		// ps-name key present and empty, assigned-pmj annotation removed.
+		expectColdStartBypass bool
 	}{
 		{
 			name: "Pod without scheduling gate is ignored",
@@ -139,7 +143,8 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 					Phase: pmv1alpha1.PodMigrationJobPhaseFailed,
 				},
 			},
-			expectHasGate: false,
+			expectHasGate:         false,
+			expectColdStartBypass: true,
 		},
 		{
 			name: "Gated pod with SucceededWithoutRestore PMJ gets gate released without snapshot injection",
@@ -170,7 +175,8 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 					SnapshotRef: "some-snapshot-name",
 				},
 			},
-			expectHasGate: false,
+			expectHasGate:         false,
+			expectColdStartBypass: true,
 		},
 		{
 			name: "Gated pod with missing parent ReplicaSet (NotFound) still releases gate if PMJ succeeds",
@@ -275,12 +281,11 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 			expectHasGate: true,
 		},
 		{
-			name: "Gated pod with assigned PMJ not found (recently created < 10s) requeues and keeps gate",
+			name: "Gated pod whose PMJ is deleted (confirmed via APIReader) releases gate with cold-start bypass",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:              "test-pod-recent",
-					Namespace:         "default",
-					CreationTimestamp: metav1.Now(),
+					Name:      "test-pod-deleted-pmj",
+					Namespace: "default",
 					Annotations: map[string]string{
 						"pod-migration.gke.io/assigned-pmj": "nonexistent-pmj",
 					},
@@ -291,18 +296,19 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 					},
 				},
 			},
-			pmj:           nil,
-			expectHasGate: true,
+			pmj:                   nil,
+			apiReaderPMJ:          nil,
+			expectHasGate:         false,
+			expectColdStartBypass: true,
 		},
 		{
-			name: "Gated pod with assigned PMJ not found (older pod >= 10s) releases gate",
+			name: "Gated pod whose PMJ is missing from cache but live per APIReader keeps gate and requeues",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:              "test-pod-old",
-					Namespace:         "default",
-					CreationTimestamp: metav1.NewTime(time.Now().Add(-20 * time.Second)),
+					Name:      "test-pod-cache-lag",
+					Namespace: "default",
 					Annotations: map[string]string{
-						"pod-migration.gke.io/assigned-pmj": "nonexistent-pmj",
+						"pod-migration.gke.io/assigned-pmj": "pmj-lagging",
 					},
 				},
 				Spec: corev1.PodSpec{
@@ -311,8 +317,18 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 					},
 				},
 			},
-			pmj:           nil,
-			expectHasGate: false,
+			pmj: nil,
+			apiReaderPMJ: &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pmj-lagging",
+					Namespace: "default",
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+				},
+			},
+			expectHasGate: true,
+			expectRequeue: true,
 		},
 	}
 
@@ -330,12 +346,26 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 				WithRuntimeObjects(initObjs...).
 				Build()
+
+			// The APIReader sees everything the cache sees, plus any PMJ the
+			// test declares as not-yet-synced into the informer cache.
+			apiObjs := append([]runtime.Object{}, initObjs...)
+			if tt.apiReaderPMJ != nil {
+				apiObjs = append(apiObjs, tt.apiReaderPMJ)
+			}
+			apiReader := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+				WithRuntimeObjects(apiObjs...).
+				Build()
+
 			r := &PodGateReconciler{
-				Client: cl,
-				Scheme: scheme,
+				Client:    cl,
+				APIReader: apiReader,
+				Scheme:    scheme,
 			}
 
-			_, err := r.Reconcile(ctx, reconcile.Request{
+			res, err := r.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Namespace: tt.pod.Namespace,
 					Name:      tt.pod.Name,
@@ -343,6 +373,10 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 			})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if tt.expectRequeue && res.RequeueAfter == 0 {
+				t.Errorf("expected a RequeueAfter, got: %+v", res)
 			}
 
 			updatedPod := &corev1.Pod{}
@@ -370,9 +404,15 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 				}
 			}
 
-			if !tt.expectHasGate && tt.pmj != nil && (tt.pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed || tt.pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore) {
-				if snapName := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]; snapName != "" {
-					t.Errorf("expected no snapshot annotation, got %q", snapName)
+			if tt.expectColdStartBypass {
+				psName, ok := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]
+				if !ok {
+					t.Errorf("expected explicit empty ps-name cold-start bypass annotation, key is absent")
+				} else if psName != "" {
+					t.Errorf("expected empty ps-name bypass, got %q", psName)
+				}
+				if leftover, ok := updatedPod.Annotations["pod-migration.gke.io/assigned-pmj"]; ok {
+					t.Errorf("expected assigned-pmj annotation removed on release, still present: %q", leftover)
 				}
 			}
 		})
@@ -429,6 +469,7 @@ func TestPodGateReconciler_mapPMJToPods(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithObjects(pmj, replacementPod1, replacementPod2, siblingPod).
 		Build()
 

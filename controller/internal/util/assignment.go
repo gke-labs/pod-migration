@@ -149,7 +149,12 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	job := &pmv1alpha1.PodMigrationJob{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assignedPMJ}, job); err != nil {
 		if apierrors.IsNotFound(err) {
-			return assignedPMJ, false, nil // Let PodGateReconciler handle NotFound/cache-sync logic
+			// NotFound is ambiguous from the cache (deleted vs not yet synced),
+			// so no collision verdict is possible: report "no change".  The
+			// caller MUST then resolve the ambiguity itself with a direct API
+			// server read, and on confirmed deletion release the pod with the
+			// cold-start bypass (assigned-pmj removed, ps-name set to "").
+			return assignedPMJ, false, nil
 		}
 		return "", false, err
 	}

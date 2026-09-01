@@ -26,6 +26,7 @@ and the entire control plane shape will click.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 
@@ -43,6 +44,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/controller"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 	pmwebhook "github.com/gke-labs/pod-migration/controller/internal/webhook"
 )
 
@@ -80,6 +82,13 @@ func main() {
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	// Reject values client-go would silently reinterpret (QPS==0 falls back to
+	// the 5-QPS default; negative disables rate limiting).
+	if err := util.ValidateClientGoRateLimits(clientGoQPS, clientGoBurst); err != nil {
+		setupLog.Error(err, "invalid client-go rate limit flags")
+		os.Exit(1)
+	}
+
 	restConfig := ctrl.GetConfigOrDie()
 	restConfig.QPS = float32(clientGoQPS)
 	restConfig.Burst = clientGoBurst
@@ -98,13 +107,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Cache indexes must be registered before any controller starts; the gate
+	// mapper and the restore-timeout deferral both List pods by assigned-pmj.
+	if err := controller.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
+		setupLog.Error(err, "unable to register field indexes")
+		os.Exit(1)
+	}
+
 	reconcilerOpts := ctrlruntime.Options{
 		MaxConcurrentReconciles: maxConcurrent,
-	}
-	// PodGateReconciler must run with MaxConcurrentReconciles: 1 to ensure strict serialization
-	// of informer cache assignment checks and prevent duplicate/racing gate releases.
-	podGateOpts := ctrlruntime.Options{
-		MaxConcurrentReconciles: 1,
 	}
 
 	if err := (&controller.PodMigrationReconciler{
@@ -123,10 +134,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// PodGateReconciler hardcodes MaxConcurrentReconciles: 1 in its own
+	// SetupWithManager — see the comment there for the serialization contract.
 	if err := (&controller.PodGateReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr, podGateOpts); err != nil {
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
 		os.Exit(1)
 	}

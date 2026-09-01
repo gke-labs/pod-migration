@@ -19,10 +19,26 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
+// MigrationGateName is the scheduling gate the replacement webhook places on
+// pods whose migration is still in flight.
+const MigrationGateName = "gke.io/pod-migration-gate"
+
+func podHasMigrationGate(pod *corev1.Pod) bool {
+	for _, gate := range pod.Spec.SchedulingGates {
+		if gate.Name == MigrationGateName {
+			return true
+		}
+	}
+	return false
+}
+
 // PodGateReconciler reconciles Pods to clean up scheduling gates on clean startups.
 type PodGateReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader reads directly from the API server, bypassing the informer
+	// cache.  Used to distinguish "PMJ deleted" from "PMJ not yet synced".
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
@@ -47,7 +63,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Check if pod has the scheduling gate
 	gateIndex := -1
 	for i, gate := range pod.Spec.SchedulingGates {
-		if gate.Name == "gke.io/pod-migration-gate" {
+		if gate.Name == MigrationGateName {
 			gateIndex = i
 			break
 		}
@@ -91,12 +107,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			logger.Info("Re-assigned pod to alternative PMJ", "alternativePMJ", correctedPMJ)
 		} else {
 			logger.Info("Releasing scheduling gate for scale-up pod (race loser)")
-			delete(pod.Annotations, "pod-migration.gke.io/assigned-pmj")
-			if pod.Annotations == nil {
-				pod.Annotations = make(map[string]string)
-			}
-			pod.Annotations["podsnapshot.gke.io/ps-name"] = "" // Inject GKE restore-bypass
-			r.removeGate(pod)
+			r.releaseWithColdStartBypass(pod)
 		}
 		return ctrl.Result{}, r.Update(ctx, pod)
 	}
@@ -106,12 +117,20 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: correctedPMJ}, job)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			if time.Since(pod.CreationTimestamp.Time) < 10*time.Second {
-				logger.Info("Assigned PMJ not found in cache for newly created pod, requeueing to allow cache sync", "pmj", correctedPMJ)
+			// The informer cache can lag PMJ creation by an unbounded amount under
+			// load, so wall-clock heuristics cannot distinguish "deleted" from
+			// "not yet synced".  Only a direct API server read can.
+			apiErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: correctedPMJ}, job)
+			if apiErr == nil {
+				logger.Info("Assigned PMJ not yet in informer cache but live on API server, requeueing", "pmj", correctedPMJ)
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
-			logger.Info("Assigned PMJ completed and deleted, releasing scheduling gate", "pmj", correctedPMJ)
-			r.removeGate(pod)
+			if !apierrors.IsNotFound(apiErr) {
+				logger.Error(apiErr, "Failed to confirm PMJ deletion via API server", "pmj", correctedPMJ)
+				return ctrl.Result{}, apiErr
+			}
+			logger.Info("Assigned PMJ deleted, releasing scheduling gate with cold-start bypass", "pmj", correctedPMJ)
+			r.releaseWithColdStartBypass(pod)
 			return ctrl.Result{}, r.Update(ctx, pod)
 		}
 		logger.Error(err, "Failed to get assigned PMJ")
@@ -127,19 +146,28 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
 			logger.Info("Assigned PMJ completed without restore; releasing scheduling gate for cold-start fallback",
 				"pod", pod.Name, "pmj", correctedPMJ, "phase", phase)
-		} else {
-			logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
+			// Record which pod fell back so verification and triage can find it,
+			// then release with the explicit bypass: without it GKE may attempt a
+			// native restore from a stale or mismatched snapshot.
+			if !job.Status.Consumed {
+				job.Status.Consumed = true
+				job.Status.RestoredPodUID = string(pod.UID)
+				job.Status.RestoredPodName = pod.Name
+				if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+					logger.Error(updateErr, "Failed to mark PMJ as consumed")
+					return ctrl.Result{}, updateErr
+				}
+			}
+			r.releaseWithColdStartBypass(pod)
+			return ctrl.Result{}, r.Update(ctx, pod)
 		}
+
+		logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 
 		if job.Status.Consumed && job.Status.RestoredPodUID != "" && job.Status.RestoredPodUID != string(pod.UID) {
 			logger.Info("Assigned PMJ was already consumed by a different pod, releasing gate with cold-start bypass",
 				"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
-			if pod.Annotations == nil {
-				pod.Annotations = make(map[string]string)
-			}
-			delete(pod.Annotations, "pod-migration.gke.io/assigned-pmj")
-			pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
-			r.removeGate(pod)
+			r.releaseWithColdStartBypass(pod)
 			return ctrl.Result{}, r.Update(ctx, pod)
 		}
 
@@ -170,10 +198,32 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }
 
+// releaseWithColdStartBypass removes the gate and scrubs the migration
+// assignment: the assigned-pmj annotation is deleted and the ps-name
+// annotation is set to the explicit empty-string bypass, which tells the GKE
+// runtime NOT to attempt a native snapshot restore.  Every release that is
+// not backed by a durable snapshot must go through here — a bare gate removal
+// leaves the pod exposed to native restore of a stale snapshot.
+func (r *PodGateReconciler) releaseWithColdStartBypass(pod *corev1.Pod) {
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	delete(pod.Annotations, "pod-migration.gke.io/assigned-pmj")
+	pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
+	r.removeGate(pod)
+}
+
+func (r *PodGateReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 func (r *PodGateReconciler) removeGate(pod *corev1.Pod) {
 	var newGates []corev1.PodSchedulingGate
 	for _, gate := range pod.Spec.SchedulingGates {
-		if gate.Name != "gke.io/pod-migration-gate" {
+		if gate.Name != MigrationGateName {
 			newGates = append(newGates, gate)
 		}
 	}
@@ -181,16 +231,21 @@ func (r *PodGateReconciler) removeGate(pod *corev1.Pod) {
 }
 
 // SetupWithManager sets up the controller with the Manager.
-// Contract: PodGateReconciler must be configured with MaxConcurrentReconciles: 1 to ensure
-// strictly serialized assignment and gate reconciliations across pods sharing PMJ resources.
-func (r *PodGateReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
+//
+// MaxConcurrentReconciles is hardcoded to 1 rather than accepted as an option:
+// serialized reconciles narrow the window in which two pods can adopt the same
+// PMJ via FindUnassignedActivePMJ, and no other value is ever legitimate here.
+// Note this serialization is a mitigation, not a guarantee — two back-to-back
+// reconciles can still read the same stale informer cache, so collision
+// resolution (util.ResolveCollision) remains the correctness backstop.
+func (r *PodGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
 		Watches(
 			&pmv1alpha1.PodMigrationJob{},
 			handler.EnqueueRequestsFromMapFunc(r.mapPMJToPods),
 		).
-		WithOptions(options).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }
 
@@ -210,22 +265,24 @@ func (r *PodGateReconciler) mapPMJToPods(ctx context.Context, obj client.Object)
 		},
 	})
 
-	// 2. Query for replacement pods annotated with this PMJ (handles Jobs and Deployments)
+	// 2. Query for replacement pods annotated with this PMJ (handles Jobs and
+	// Deployments).  Uses the assigned-pmj cache index: a full-namespace scan
+	// here runs on every PMJ event and does not scale.
 	podList := &corev1.PodList{}
-	err := r.List(ctx, podList, client.InNamespace(job.Namespace))
+	err := r.List(ctx, podList,
+		client.InNamespace(job.Namespace),
+		client.MatchingFields{PodAssignedPMJIndex: job.Name})
 	if err != nil {
 		return requests
 	}
 
 	for _, pod := range podList.Items {
-		if pod.Annotations != nil && pod.Annotations["pod-migration.gke.io/assigned-pmj"] == job.Name {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: pod.Namespace,
-					Name:      pod.Name,
-				},
-			})
-		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
+			},
+		})
 	}
 
 	return requests
