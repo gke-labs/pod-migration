@@ -86,8 +86,6 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if err == nil {
 		logger.Info("Migration job already exists for current pod instance", "job", jobName, "phase", job.Status.Phase)
 		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
-			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring ||
-			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
 			logger.Info("Migration checkpoint complete, allowing eviction", "job", jobName, "phase", job.Status.Phase)
 			return admission.Allowed("migration checkpoint complete")

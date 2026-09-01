@@ -84,6 +84,33 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 		const migrationTimeout = 10 * time.Minute
 		if time.Since(job.CreationTimestamp.Time) > migrationTimeout {
+			// If the job holds a durable snapshot in Evicting phase, do not destroy the snapshot
+			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting && job.Status.SnapshotRef != "" {
+				logger.Info("Evicting PMJ timed out while holding durable snapshot; concluding as SucceededWithoutRestore without deleting snapshot", "job", job.Name)
+				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+				now := metav1.Now()
+				job.Status.CompletionTime = &now
+				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+					Type:               "Restored",
+					Status:             metav1.ConditionFalse,
+					Reason:             "PDBEvictionTimeout",
+					Message:            "Origin pod eviction timed out while waiting for PDB budget; snapshot preserved",
+					ObservedGeneration: job.Generation,
+				})
+				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					Reason:             "PDBEvictionTimeout",
+					Message:            "Origin pod eviction timed out while waiting for PDB budget; snapshot preserved",
+					ObservedGeneration: job.Generation,
+				})
+				if err := r.Status().Update(ctx, job); err != nil {
+					logger.Error(err, "Failed to update job status on PDB eviction timeout")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+
 			logger.Info("Migration job timed out (exceeded 10 minutes limit), transitioning to Failed", "job", job.Name)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 			now := metav1.Now()
@@ -275,7 +302,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
 
-		// 4.2. Wait for Webhook to delete Pod, or delete it ourselves if it takes too long
+		// 4.2. Wait for external drain to evict origin Pod, or invoke PDB-safe eviction fallback
 		pod := &corev1.Pod{}
 		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, pod)
 		podExists := true
@@ -289,9 +316,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		if podExists && string(pod.UID) == job.Spec.TargetPodUID {
+			// If the origin pod is already terminating through its grace period, wait for deletion
+			if pod.DeletionTimestamp != nil {
+				logger.Info("Origin pod is already terminating; waiting for deletion", "pod", podName)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+
 			// Pod still exists and is the target pod.
 			// We wait for the eviction webhook to return Allowed and the API server to delete it.
-			// Fallback: if it takes longer than 30s (e.g. manual trigger), we delete it manually.
+			// Fallback: if it takes longer than 30s (e.g. manual trigger), we invoke the PDB-safe eviction subresource.
 			const timeout = 30 * time.Second
 			evictingSinceStr := job.Annotations["pod-migration.gke.io/evicting-since"]
 			if evictingSinceStr == "" {
@@ -309,11 +342,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			evictingSince, err := time.Parse(time.RFC3339, evictingSinceStr)
 			if err != nil {
 				logger.Error(err, "Failed to parse evicting-since annotation", "val", evictingSinceStr)
-				evictingSince = time.Time{} // fallback to immediate delete
+				evictingSince = time.Time{} // fallback to immediate eviction
 			}
 
 			if time.Since(evictingSince) > timeout {
-				logger.Info("Eviction webhook wait timed out (30s), initiating PDB-safe pod eviction (fallback)", "pod", podName)
+				logger.Info("Eviction webhook wait timed out (30s), requesting PDB-safe pod eviction (fallback)", "pod", podName)
 				eviction := &policyv1.Eviction{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      pod.Name,
@@ -325,8 +358,19 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				case err == nil || apierrors.IsNotFound(err):
 					logger.Info("Successfully initiated PDB-safe pod eviction", "pod", podName)
 					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-				case apierrors.IsTooManyRequests(err):
-					logger.Info("Pod eviction blocked by PodDisruptionBudget (429 Too Many Requests); waiting for budget", "pod", podName)
+				case apierrors.IsTooManyRequests(err) || apierrors.IsConflict(err):
+					logger.Info("Pod eviction delayed by PodDisruptionBudget (429/409); waiting for budget", "pod", podName)
+					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+						Type:               "BlockedByPDB",
+						Status:             metav1.ConditionTrue,
+						Reason:             "PDBBudgetExhausted",
+						Message:            "Origin pod eviction delayed by PodDisruptionBudget; waiting for budget",
+						ObservedGeneration: job.Generation,
+					})
+					_ = r.Status().Update(ctx, job)
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				case apierrors.IsInternalError(err):
+					logger.Error(err, "Pod eviction failed with 500 InternalServerError (check if pod is covered by multiple conflicting PDBs)", "pod", podName)
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 				default:
 					logger.Error(err, "Failed to evict origin pod via eviction subresource (fallback)")
