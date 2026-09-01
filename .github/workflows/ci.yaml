@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Verify & Test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'controller/go.mod'
+        check-latest: true
+
+    - name: Verify Generated Code Freshness
+      run: make -C controller verify-generate
+
+    - name: Run Unit Tests
+      run: make -C controller test

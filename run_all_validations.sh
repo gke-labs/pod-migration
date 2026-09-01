@@ -7,6 +7,13 @@ APPS=(redis dragonfly vault minio nginx haproxy traefik caddy python consul mysq
 log_file="./validation_summary.log"
 echo "E2E Validation Start: $(date)" > "$log_file"
 
+# Preflight: Verify generated code freshness
+echo "[*] Verifying generated deepcopy code freshness..." | tee -a "$log_file"
+make -C controller verify-generate || {
+  echo "Error: Generated deepcopy code is stale! Run 'make generate' in controller/ and commit the changes." | tee -a "$log_file"
+  exit 1
+}
+
 cleanup() {
   local app=$1
   echo "[*] Cleaning up after $app..." | tee -a "$log_file"
