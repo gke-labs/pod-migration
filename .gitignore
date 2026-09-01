@@ -1,3 +1,27 @@
+# Build output
+bin/
+
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Local kube/credential files
+kubeconfig
+*.kubeconfig
 *.log
 scratch/
 validation_logs/
@@ -5,4 +29,3 @@ patches/containerd-shim-runsc-v1
 controller/bin/
 controller/cover.out
 patches/crd-*.yaml
-bin/
