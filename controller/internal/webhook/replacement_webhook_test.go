@@ -3,13 +3,18 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"testing"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -518,4 +523,162 @@ func TestPodGateInjector(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPodGateInjector_APIReaderFallback(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pmj-test-pod-uid1234",
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid1234",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	rawPod, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatalf("Failed to marshal pod: %v", err)
+	}
+
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Name:      podName,
+			Namespace: namespace,
+			Object: runtime.RawExtension{
+				Raw: rawPod,
+			},
+		},
+	}
+
+	t.Run("Cache miss with live hit injects scheduling gate and assigned PMJ", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeAPIReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pmj).Build()
+
+		handler := &PodGateInjector{
+			Client:    fakeClient,
+			APIReader: fakeAPIReader,
+		}
+		_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+		resp := handler.Handle(context.Background(), req)
+		if !resp.Allowed {
+			t.Fatalf("Expected allowed with patches, got denied: %v", resp.Result)
+		}
+
+		gateAdded := false
+		pmjAssigned := false
+		for _, patch := range resp.Patches {
+			if patch.Operation == "add" && (patch.Path == "/spec/schedulingGates" || patch.Path == "/spec/schedulingGates/-") {
+				gateAdded = true
+			}
+			if patch.Path == "/metadata/annotations" {
+				if valMap, ok := patch.Value.(map[string]interface{}); ok {
+					if assigned, ok := valMap[util.AnnotationAssignedPMJ]; ok && assigned == pmj.Name {
+						pmjAssigned = true
+					}
+				}
+			}
+			if patch.Path == "/metadata/annotations/pod-migration.gke.io~1assigned-pmj" {
+				if valStr, ok := patch.Value.(string); ok && valStr == pmj.Name {
+					pmjAssigned = true
+				}
+			}
+		}
+
+		if !gateAdded {
+			t.Errorf("Expected scheduling gate to be injected via live APIReader hit, got patches: %+v", resp.Patches)
+		}
+		if !pmjAssigned {
+			t.Errorf("Expected assigned-pmj annotation to be stamped via live APIReader hit, got patches: %+v", resp.Patches)
+		}
+	})
+
+	t.Run("Cache miss with live miss bypasses gate with cold-start bypass", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeAPIReader := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		handler := &PodGateInjector{
+			Client:    fakeClient,
+			APIReader: fakeAPIReader,
+		}
+		_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+		resp := handler.Handle(context.Background(), req)
+		if !resp.Allowed {
+			t.Fatalf("Expected allowed with bypass patches, got denied: %v", resp.Result)
+		}
+
+		bypassAnnotated := false
+		gateAdded := false
+		for _, patch := range resp.Patches {
+			if patch.Operation == "add" && (patch.Path == "/spec/schedulingGates" || patch.Path == "/spec/schedulingGates/-") {
+				gateAdded = true
+			}
+			if patch.Path == "/metadata/annotations" {
+				if valMap, ok := patch.Value.(map[string]interface{}); ok {
+					if psName, ok := valMap["podsnapshot.gke.io/ps-name"]; ok && psName == "" {
+						bypassAnnotated = true
+					}
+				}
+			}
+			if patch.Path == "/metadata/annotations/podsnapshot.gke.io~1ps-name" {
+				if valStr, ok := patch.Value.(string); ok && valStr == "" {
+					bypassAnnotated = true
+				}
+			}
+		}
+
+		if gateAdded {
+			t.Errorf("Expected gate NOT to be added on scale-up pod, got patches: %+v", resp.Patches)
+		}
+		if !bypassAnnotated {
+			t.Errorf("Expected ps-name: \"\" bypass annotation on scale-up pod, got patches: %+v", resp.Patches)
+		}
+	})
+
+	t.Run("Live read error returns 500 error", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		errClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, client client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				return fmt.Errorf("simulated live apiserver list error")
+			},
+		}).Build()
+
+		handler := &PodGateInjector{
+			Client:    fakeClient,
+			APIReader: errClient,
+		}
+		_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+		resp := handler.Handle(context.Background(), req)
+		if resp.Allowed {
+			t.Fatalf("Expected admission error on live read failure, got allowed")
+		}
+		if resp.Result == nil || resp.Result.Code != http.StatusInternalServerError {
+			t.Fatalf("Expected status code 500, got: %+v", resp.Result)
+		}
+	})
 }

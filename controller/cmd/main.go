@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync/atomic"
 
 	// Import every API group whose types we need to read/write/serialize.
 	corev1 "k8s.io/api/core/v1"
@@ -173,7 +174,7 @@ func main() {
 		setupLog.Error(err, "unable to register eviction webhook")
 		os.Exit(1)
 	}
-	if err := pmwebhook.SetupReplacementWebhookWithManager(mgr); err != nil {
+	if err := pmwebhook.SetupReplacementWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
 		setupLog.Error(err, "unable to register replacement mutating webhook")
 		os.Exit(1)
 	}
@@ -183,6 +184,15 @@ func main() {
 	}
 
 	// --- Health/readiness probes --------------------------------------------
+	var startupCacheSynced atomic.Bool
+	if err := mgr.Add(&startupCacheSyncRunnable{
+		cache:  mgr.GetCache(),
+		synced: &startupCacheSynced,
+	}); err != nil {
+		setupLog.Error(err, "unable to add startup cache sync runnable")
+		os.Exit(1)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up healthz")
 		os.Exit(1)
@@ -191,8 +201,8 @@ func main() {
 		if err := mgr.GetWebhookServer().StartedChecker()(req); err != nil {
 			return err
 		}
-		if !mgr.GetCache().WaitForCacheSync(req.Context()) {
-			return fmt.Errorf("informer caches not synced yet")
+		if !startupCacheSynced.Load() {
+			return fmt.Errorf("initial startup informer caches not synced yet")
 		}
 		return nil
 	}); err != nil {
@@ -205,4 +215,23 @@ func main() {
 		setupLog.Error(err, "manager exited")
 		os.Exit(1)
 	}
+}
+
+// startupCacheSyncRunnable waits for the manager's initial informer caches to sync
+// on manager startup. It implements manager.LeaderElectionRunnable with NeedLeaderElection() = false
+// so that standby replicas also synchronize caches immediately and pass the /readyz probe.
+type startupCacheSyncRunnable struct {
+	cache  cache.Cache
+	synced *atomic.Bool
+}
+
+func (s *startupCacheSyncRunnable) Start(ctx context.Context) error {
+	if s.cache.WaitForCacheSync(ctx) {
+		s.synced.Store(true)
+	}
+	return nil
+}
+
+func (s *startupCacheSyncRunnable) NeedLeaderElection() bool {
+	return false
 }
