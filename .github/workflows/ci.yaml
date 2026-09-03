@@ -22,6 +22,7 @@ jobs:
       with:
         go-version-file: 'controller/go.mod'
         check-latest: true
+        cache-dependency-path: 'controller/go.sum'
 
     - name: Verify Generated Code Freshness
       run: make -C controller verify-generate

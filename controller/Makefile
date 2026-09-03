@@ -2,7 +2,7 @@
 # The real Makefile is ~200 lines; this captures the targets you'll touch.
 
 IMG ?= controller:latest
-VERSION ?= $(shell git describe --tags --match 'v*' --dirty 2>/dev/null || (git diff --quiet 2>/dev/null && echo "v0.1.0-dev" || echo "v0.1.0-dev-dirty"))
+VERSION ?= $(shell git describe --tags --match 'v*' --dirty 2>/dev/null || echo "v0.1.0-dev")
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell git log -1 --format=%cI 2>/dev/null || echo "unknown")
 
@@ -14,6 +14,7 @@ DOCKER_LDFLAGS := -w $(LDFLAGS)
 
 CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0
 ENVTEST_K8S_VERSION ?= 1.36.2
+SETUP_ENVTEST_VERSION ?= v0.25.0
 SETUP_ENVTEST ?= $(shell which setup-envtest 2>/dev/null || echo $(shell go env GOPATH)/bin/setup-envtest)
 .PHONY: help generate verify-generate manifests fmt vet build run envtest test install uninstall deploy undeploy docker-build docker-push
 
@@ -23,10 +24,10 @@ help:
 generate: ## Run controller-gen to (re)generate deepcopy methods (zz_generated.deepcopy.go).
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
-verify-generate: generate ## Verify generated deepcopy code is up-to-date.
-	@if [ -n "$$(git status --porcelain api/v1alpha1/zz_generated.deepcopy.go)" ]; then \
-		echo "Error: zz_generated.deepcopy.go is out of date. Run 'make generate' and commit the changes."; \
-		git diff api/v1alpha1/zz_generated.deepcopy.go; \
+verify-generate: generate manifests
+	@if [ -n "$$(git status --porcelain api/v1alpha1/zz_generated.deepcopy.go config/crd/bases deploy.yaml)" ]; then \
+		echo "Error: Generated files (deepcopy, CRDs, or deploy.yaml) are out of date. Run 'make generate manifests' and commit the changes."; \
+		git diff api/v1alpha1/zz_generated.deepcopy.go config/crd/bases deploy.yaml; \
 		exit 1; \
 	fi
 
@@ -48,10 +49,10 @@ run: generate fmt vet manifests ## Run reconcilers against the current kubeconfi
 envtest: ## Download setup-envtest locally if necessary.
 	@if [ ! -x "$$(command -v $(SETUP_ENVTEST))" ] && [ ! -x "$(SETUP_ENVTEST)" ]; then \
 		echo "Installing setup-envtest..."; \
-		go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest; \
+		go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION); \
 	fi
 
-test: verify-generate fmt vet manifests envtest ## Run unit + envtest suite.
+test: generate fmt vet manifests envtest ## Run unit + envtest suite.
 	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path 2>/dev/null || $(SETUP_ENVTEST) use -p path 2>/dev/null)" \
 		go test ./... -coverprofile cover.out
 
@@ -62,10 +63,11 @@ install: manifests ## Install CRDs into the K8s cluster and wait for them to be 
 uninstall: manifests ## Uninstall CRDs from the K8s cluster.
 	kubectl delete --ignore-not-found=true -f config/crd/bases/
 
-deploy: manifests ## Deploy controller to the K8s cluster.
-	kubectl apply -f deploy.yaml
+deploy: install ## Deploy controller (Deployment + RBAC + webhooks) to the cluster.
+	sed 's|<YOUR_CONTROLLER_IMAGE>|$(IMG)|g' deploy.yaml | kubectl apply -f -
 
 undeploy: ## Undeploy controller from the cluster.
+	kubectl delete --ignore-not-found=true -f deploy.yaml
 	$(MAKE) uninstall
 
 docker-build: ## Build docker image for the controller.

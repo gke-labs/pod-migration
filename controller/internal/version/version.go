@@ -50,7 +50,7 @@ func Get() Info {
 						d = setting.Value
 					}
 				case "vcs.modified":
-					if setting.Value == "true" && !strings.HasSuffix(v, "-dirty") {
+					if setting.Value == "true" && Version == "v0.1.0-dev" && !strings.HasSuffix(v, "-dirty") {
 						v += "-dirty"
 					}
 				}

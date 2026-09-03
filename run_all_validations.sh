@@ -10,7 +10,7 @@ echo "E2E Validation Start: $(date)" > "$log_file"
 # Preflight: Verify generated code freshness
 echo "[*] Verifying generated deepcopy code freshness..." | tee -a "$log_file"
 make -C controller verify-generate || {
-  echo "Error: Generated deepcopy code is stale! Run 'make generate' in controller/ and commit the changes." | tee -a "$log_file"
+  echo "Error: Generated code (deepcopy, CRDs, or deploy.yaml) is stale! Run 'make generate manifests' in controller/ and commit the changes." | tee -a "$log_file"
   exit 1
 }
 

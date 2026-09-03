@@ -71,3 +71,23 @@ func TestGet(t *testing.T) {
 		t.Errorf("Expected unmarshaled Platform %s, got %s", info.Platform, unmarshaled.Platform)
 	}
 }
+
+func TestGet_InjectedVersionNotMutated(t *testing.T) {
+	origVersion := Version
+	origCommit := GitCommit
+	origDate := BuildDate
+	defer func() {
+		Version = origVersion
+		GitCommit = origCommit
+		BuildDate = origDate
+	}()
+
+	Version = "v0.1.0-custom"
+	GitCommit = "unknown"
+	BuildDate = "unknown"
+
+	info := Get()
+	if info.Version != "v0.1.0-custom" {
+		t.Errorf("Expected Version to remain 'v0.1.0-custom', got %s", info.Version)
+	}
+}
