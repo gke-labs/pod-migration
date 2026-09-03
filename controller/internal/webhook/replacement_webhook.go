@@ -18,8 +18,9 @@ import (
 
 // PodGateInjector injects the scheduling gate into replacement pods.
 type PodGateInjector struct {
-	Client  client.Client
-	decoder admission.Decoder
+	Client    client.Client
+	APIReader client.Reader
+	decoder   admission.Decoder
 }
 
 // Handle inspects pod creations and injects the pod-migration-gate scheduling gate.
@@ -63,6 +64,21 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	if err != nil {
 		logger.Error(err, "Failed to check unassigned active PMJs")
 		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// Fallback to APIReader on cache miss to protect against cross-replica informer lag:
+	// If a peer replica just created a PMJ, it may not yet have synced to our local informer cache.
+	// A false miss here would irreversibly stamp ps-name: "" and skip the scheduling gate,
+	// permanently forcing a cold start and stranding the PMJ.
+	if assignedPMJ == "" && a.APIReader != nil {
+		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex)
+		if err != nil {
+			logger.Error(err, "Failed to check unassigned active PMJs via APIReader fallback")
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+		if assignedPMJ != "" {
+			logger.Info("Found unassigned active PMJ via live APIReader fallback", "pmj", assignedPMJ)
+		}
 	}
 
 	// If there is no active unassigned migration job, this is a scale-up or unrelated pod.
@@ -120,14 +136,15 @@ func (a *PodGateInjector) InjectDecoder(d admission.Decoder) error {
 }
 
 // SetupReplacementWebhookWithManager registers the mutating webhook on the manager.
-func SetupReplacementWebhookWithManager(mgr ctrl.Manager) error {
+func SetupReplacementWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/mutate-v1-pod-scheduling-gate",
 		&admission.Webhook{
 			Handler: &PodGateInjector{
-				Client:  mgr.GetClient(),
-				decoder: dec,
+				Client:    mgr.GetClient(),
+				APIReader: apiReader,
+				decoder:   dec,
 			},
 		},
 	)

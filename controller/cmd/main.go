@@ -26,8 +26,12 @@ and the entire control plane shape will click.
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
+	"net/http"
 	"os"
+	"sync/atomic"
 
 	// Import every API group whose types we need to read/write/serialize.
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +39,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -66,19 +71,22 @@ func main() {
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election so only one replica is active at a time.")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "pod-migration-leader.example.com",
+		Scheme:                        scheme,
+		Metrics:                       metricsserver.Options{BindAddress: metricsAddr},
+		HealthProbeBindAddress:        probeAddr,
+		LeaderElection:                enableLeaderElection,
+		LeaderElectionID:              "pod-migration-leader.gke.io",
+		LeaderElectionReleaseOnCancel: true,
+		Cache: cache.Options{
+			DefaultTransform: cache.TransformStripManagedFields(),
+		},
 		// Webhook server is on :9443 by default.
 		WebhookServer: webhook.NewServer(webhook.Options{Port: 9443}),
 	})
@@ -116,21 +124,38 @@ func main() {
 		setupLog.Error(err, "unable to register eviction webhook")
 		os.Exit(1)
 	}
-	if err := pmwebhook.SetupReplacementWebhookWithManager(mgr); err != nil {
+	if err := pmwebhook.SetupReplacementWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
 		setupLog.Error(err, "unable to register replacement mutating webhook")
 		os.Exit(1)
 	}
-	if err := pmwebhook.SetupStatusWebhookWithManager(mgr); err != nil {
+	if err := pmwebhook.SetupStatusWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
 		setupLog.Error(err, "unable to register pod status mutating webhook")
 		os.Exit(1)
 	}
 
 	// --- Health/readiness probes --------------------------------------------
+	var startupCacheSynced atomic.Bool
+	if err := mgr.Add(&startupCacheSyncRunnable{
+		cache:  mgr.GetCache(),
+		synced: &startupCacheSynced,
+	}); err != nil {
+		setupLog.Error(err, "unable to add startup cache sync runnable")
+		os.Exit(1)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up healthz")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", func(req *http.Request) error {
+		if err := mgr.GetWebhookServer().StartedChecker()(req); err != nil {
+			return err
+		}
+		if !startupCacheSynced.Load() {
+			return fmt.Errorf("initial startup informer caches not synced yet")
+		}
+		return nil
+	}); err != nil {
 		setupLog.Error(err, "unable to set up readyz")
 		os.Exit(1)
 	}
@@ -141,3 +166,23 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// startupCacheSyncRunnable waits for the manager's initial informer caches to sync
+// on manager startup. It implements manager.LeaderElectionRunnable with NeedLeaderElection() = false
+// so that standby replicas also synchronize caches immediately and pass the /readyz probe.
+type startupCacheSyncRunnable struct {
+	cache  cache.Cache
+	synced *atomic.Bool
+}
+
+func (s *startupCacheSyncRunnable) Start(ctx context.Context) error {
+	if s.cache.WaitForCacheSync(ctx) {
+		s.synced.Store(true)
+	}
+	return nil
+}
+
+func (s *startupCacheSyncRunnable) NeedLeaderElection() bool {
+	return false
+}
+

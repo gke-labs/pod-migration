@@ -67,7 +67,7 @@ func FormatPSMTName(podName, uid string) string {
 }
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string) (string, error) {
+func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string) (string, error) {
 	// Scan pods to find which PMJs are already assigned
 	assignedPMJs := make(map[string]bool)
 	podList := &corev1.PodList{}

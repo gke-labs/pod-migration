@@ -114,6 +114,42 @@ subjects:
   name: pod-migration-controller
   namespace: pod-migration-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-migration-leader-election-role
+  namespace: pod-migration-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-migration-leader-election-rolebinding
+  namespace: pod-migration-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-migration-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: pod-migration-controller
+  namespace: pod-migration-system
+---
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -142,9 +178,12 @@ metadata:
   name: pod-migration-controller
   namespace: pod-migration-system
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: pod-migration-controller
@@ -153,6 +192,15 @@ spec:
       labels:
         app: pod-migration-controller
     spec:
+      topologySpreadConstraints:
+      # Use ScheduleAnyway to allow both replicas to schedule on small or single-node development
+      # clusters while still spreading across distinct nodes whenever multi-node topology is available.
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: pod-migration-controller
       serviceAccountName: pod-migration-controller
       containers:
       - name: manager
@@ -163,10 +211,23 @@ spec:
         args:
         - --metrics-bind-address=:8080
         - --health-probe-bind-address=:8081
+        - --leader-elect=true
         ports:
         - containerPort: 9443
           name: webhook-server
           protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
         volumeMounts:
         - mountPath: /tmp/k8s-webhook-server/serving-certs
           name: cert
@@ -174,10 +235,10 @@ spec:
         resources:
           requests:
             cpu: 100m
-            memory: 128Mi
-          limits:
-            cpu: 500m
             memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
       volumes:
       - name: cert
         secret:
@@ -221,6 +282,7 @@ webhooks:
           operator: NotIn
           values:
             - pod-migration-system
+            - kube-system
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -255,6 +317,7 @@ webhooks:
           operator: NotIn
           values:
             - pod-migration-system
+            - kube-system
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -282,10 +345,23 @@ webhooks:
           operator: NotIn
           values:
             - pod-migration-system
+            - kube-system
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["UPDATE"]
         resources: ["pods/status"]
         scope: Namespaced
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pod-migration-controller-pdb
+  namespace: pod-migration-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pod-migration-controller
+
 
