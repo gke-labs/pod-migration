@@ -43,12 +43,12 @@ def main():
     if role_content.startswith('---'):
         role_content = role_content[3:].strip()
 
-    found = False
+    clusterrole_sub_count = 0
     webhook_sub_count = 0
     for i, doc in enumerate(documents):
-        if not found and re.search(r'^kind: ClusterRole\s*$', doc, re.MULTILINE) and not re.search(r'^kind: ClusterRoleBinding\s*$', doc, re.MULTILINE):
+        if re.search(r'^kind: ClusterRole\s*$', doc, re.MULTILINE) and re.search(r'^\s*name:\s*pod-migration-controller-role\s*$', doc, re.MULTILINE):
             documents[i] = role_content + '\n'
-            found = True
+            clusterrole_sub_count += 1
         elif 'kind: ValidatingWebhookConfiguration' in doc or 'kind: MutatingWebhookConfiguration' in doc:
             pattern = r'(    namespaceSelector:\n      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
             formatted = format_namespace_selector(indent=4) + '\n'
@@ -59,8 +59,8 @@ def main():
             webhook_sub_count += count
             documents[i] = new_doc
 
-    if not found:
-        print("Error: ClusterRole section not found in deploy.yaml", file=sys.stderr)
+    if clusterrole_sub_count != 1:
+        print(f"Error: Expected exactly 1 ClusterRole (name: pod-migration-controller-role) replacement, got {clusterrole_sub_count}", file=sys.stderr)
         sys.exit(1)
 
     if webhook_sub_count != 3:

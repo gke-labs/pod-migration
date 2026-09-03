@@ -193,6 +193,8 @@ spec:
         app: pod-migration-controller
     spec:
       topologySpreadConstraints:
+      # Use ScheduleAnyway to allow both replicas to schedule on small or single-node development
+      # clusters while still spreading across distinct nodes whenever multi-node topology is available.
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname
         whenUnsatisfiable: ScheduleAnyway

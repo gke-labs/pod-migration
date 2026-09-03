@@ -62,22 +62,24 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 		return admission.Allowed("pod phase is not Succeeded")
 	}
 
-	// Check if there is an active PodMigrationJob for this pod
+	// Check if there is an active PodMigrationJob for this pod.
+	// Read via APIReader unconditionally if available to protect against both stale
+	// misses (live PMJ not yet in local cache) and stale hits (PMJ already terminal
+	// in reality but still cached as active).
 	pmjName := util.FormatPMJName(pod.Name, string(pod.UID))
 	pmj := &pmv1alpha1.PodMigrationJob{}
-	err = a.Client.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
+	reader := a.APIReader
+	if reader == nil {
+		reader = a.Client
+	}
+	err = reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
 	if err != nil {
-		if apierrors.IsNotFound(err) && a.APIReader != nil {
-			err = a.APIReader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
+		if apierrors.IsNotFound(err) {
+			logger.Info("Pod succeeded but no active PodMigrationJob found, allowing normal completion")
+			return admission.Allowed("no active migration job")
 		}
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				logger.Info("Pod succeeded but no active PodMigrationJob found, allowing normal completion")
-				return admission.Allowed("no active migration job")
-			}
-			logger.Error(err, "Failed to check for active PodMigrationJob")
-			return admission.Errored(http.StatusInternalServerError, err)
-		}
+		logger.Error(err, "Failed to check for active PodMigrationJob")
+		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
 	// Verify if pmj.Spec.TargetPodUID matches string(pod.UID). If not, log it and return admission.Allowed("PMJ UID mismatch").
@@ -88,11 +90,12 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 
 	// Verify if pod.DeletionTimestamp is nil.
 	if pod.DeletionTimestamp == nil {
-		// If the migration job is in an active phase, the container was stopped
+		// If the migration job is actively checkpointing/evicting, the container was stopped
 		// by the checkpoint agent, so we must still force a failure to trigger rescheduling.
+		// Note: Pending is excluded because a Job pod completing naturally while a PMJ is
+		// merely Pending has not been checkpointed or disrupted.
 		phase := pmj.Status.Phase
-		if phase == pmv1alpha1.PodMigrationJobPhasePending ||
-			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
+		if phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 			phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 			logger.Info("Pod is terminating due to active migration checkpoint, forcing failure state", "phase", phase)
 		} else {
