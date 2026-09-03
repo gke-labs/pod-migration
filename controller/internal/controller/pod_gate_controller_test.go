@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -46,7 +47,7 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 			expectHasGate: false,
 		},
 		{
-			name: "Gated pod without PMJ assignment gets gate released immediately (bare pod)",
+			name: "Gated pod without PMJ assignment gets gate released with cold-start bypass (bare pod)",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-pod",
@@ -58,7 +59,60 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 					},
 				},
 			},
-			expectHasGate: false,
+			expectHasGate:         false,
+			expectColdStartBypass: true,
+		},
+		{
+			name: "Terminating gated pod is left alone",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-pod-terminating",
+					Namespace:         "default",
+					DeletionTimestamp: &metav1.Time{Time: metav1.Now().Time},
+					Finalizers:        []string{"test.gke.io/keep"},
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": "pmj-test-pod",
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
+			},
+			expectHasGate: true,
+		},
+		{
+			name: "Gated pod with Restoring PMJ but empty SnapshotRef releases with cold-start bypass",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod-no-snapref",
+					Namespace: "default",
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": "pmj-no-snapref",
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
+			},
+			pmj: &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pmj-no-snapref",
+					Namespace: "default",
+				},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef: corev1.LocalObjectReference{Name: "test-pod-no-snapref"},
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:       pmv1alpha1.PodMigrationJobPhaseRestoring,
+					SnapshotRef: "",
+				},
+			},
+			expectHasGate:         false,
+			expectColdStartBypass: true,
 		},
 		{
 			name: "Gated pod with in-progress PMJ does not release gate",
@@ -343,6 +397,7 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
+				WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 				WithRuntimeObjects(initObjs...).
 				Build()
@@ -355,6 +410,7 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 			}
 			apiReader := fake.NewClientBuilder().
 				WithScheme(scheme).
+				WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 				WithRuntimeObjects(apiObjs...).
 				Build()
@@ -419,6 +475,51 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 	}
 }
 
+// The 2s poll was a requeue storm at scale: 2,000 gated pods on a single
+// serialized worker.  PMJ watch events are the fast path for gate release;
+// the wait requeue is only a resync backstop and must stay coarse.
+func TestPodGateReconciler_ActivePMJWaitUsesBackstopRequeue(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "waiting-pod",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": "pmj-active",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{{Name: MigrationGateName}},
+		},
+	}
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "pmj-active", Namespace: "default"},
+		Status:     pmv1alpha1.PodMigrationJobStatus{Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithRuntimeObjects(pod, pmj).
+		Build()
+	r := &PodGateReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+
+	res, err := r.Reconcile(context.TODO(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "waiting-pod"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.RequeueAfter < 30*time.Second {
+		t.Errorf("expected coarse backstop requeue (>= 30s), got %v", res.RequeueAfter)
+	}
+}
+
 func TestPodGateReconciler_mapPMJToPods(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -470,7 +571,7 @@ func TestPodGateReconciler_mapPMJToPods(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
-		WithObjects(pmj, replacementPod1, replacementPod2, siblingPod).
+				WithObjects(pmj, replacementPod1, replacementPod2, siblingPod).
 		Build()
 
 	r := &PodGateReconciler{
@@ -561,6 +662,7 @@ func TestPodGateReconciler_Reconcile_Collision(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithObjects(winnerPod, loserPod, pmj).
 		Build()
 
@@ -689,6 +791,7 @@ func TestPodGateReconciler_Reconcile_Collision_WinnerAlreadyUngated(t *testing.T
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithObjects(winnerPod, loserPod, pmj).
 		Build()
 
@@ -851,6 +954,7 @@ func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t 
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithObjects(rs, winnerPod, loserPod, pmj1, pmj2).
 		Build()
 
@@ -923,6 +1027,7 @@ func TestPodGateReconciler_Reconcile_AlreadyConsumedPMJ_ReleasesGateWithColdStar
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(loserPod, pmj).
 		Build()
@@ -1007,6 +1112,7 @@ func TestPodGateReconciler_Reconcile_RecordsRestoredPodNameAndUID(t *testing.T) 
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(pod, pmj).
 		Build()

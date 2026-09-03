@@ -10,8 +10,9 @@ import (
 )
 
 // PodAssignedPMJIndex is the cache index key mapping pods to the PMJ named in
-// their assigned-pmj annotation.
-const PodAssignedPMJIndex = "pod.podmigration.gke.io/assigned-pmj"
+// their assigned-pmj annotation.  Defined in util so ResolveCollision can use
+// the index without an import cycle.
+const PodAssignedPMJIndex = util.PodAssignedPMJIndexKey
 
 // PodAssignedPMJIndexValue extracts the index value for a pod.
 func PodAssignedPMJIndexValue(obj client.Object) []string {

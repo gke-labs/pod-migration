@@ -1895,6 +1895,86 @@ func TestPodMigrationJobReconciler_GC_DeletesAfterTTLWhenNoClaimant(t *testing.T
 	}
 }
 
+// A crashlooping cold-start-fallback pod never reaches Ready; the throttled
+// probe must still surface the fallback promptly instead of waiting for the
+// 5-minute ceiling.
+func TestPodMigrationJobReconciler_Restoring_NotReadyPodWithFallbackEventConcludesPromptly(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	crashloopingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+			},
+		},
+	}
+
+	fallbackEvent := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "fallback-event",
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      "Pod",
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Type:    corev1.EventTypeWarning,
+		Reason:  "FallbackToColdStart",
+		Message: "GKE runtime skipped snapshot restore and fell back to cold start",
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Consumed:        true,
+			RestoredPodUID:  podUID,
+			RestoredPodName: podName,
+		},
+	}
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(crashloopingPod, fallbackEvent, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{Client: fakeClient, Scheme: scheme}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Errorf("Expected prompt SucceededWithoutRestore for not-ready pod with fallback event, got %s", updatedPMJ.Status.Phase)
+	}
+}
+
 func TestPodMigrationJobReconciler_Restoring_NoEventQueriesBeforePodReady(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -1934,8 +2014,9 @@ func TestPodMigrationJobReconciler_Restoring_NoEventQueriesBeforePodReady(t *tes
 		},
 	}
 
-	// Each Restoring poll of a not-yet-Ready pod must not hit the Events API:
-	// at 50 workers those uncached per-2s LISTs saturate the QPS budget.
+	// Restoring polls of a not-yet-Ready pod must not hit the Events API every
+	// 2s tick — at 50 workers those uncached LISTs saturate the QPS budget.
+	// The probe is throttled: first tick queries, back-to-back ticks do not.
 	eventLists := 0
 	base := newFakeClientBuilderWithEventIndex(scheme).
 		WithObjects(notReadyPod, pmj).
@@ -1955,17 +2036,20 @@ func TestPodMigrationJobReconciler_Restoring_NoEventQueriesBeforePodReady(t *tes
 		Scheme: scheme,
 	}
 
-	res, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
-	})
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName}}
+	var res ctrl.Result
+	var err error
+	for i := 0; i < 3; i++ {
+		res, err = r.Reconcile(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
 	}
 	if res.RequeueAfter == 0 {
 		t.Errorf("Expected requeue while waiting for pod readiness, got: %+v", res)
 	}
-	if eventLists != 0 {
-		t.Errorf("Expected no Event API queries for a not-yet-Ready pod, got %d", eventLists)
+	if eventLists != 1 {
+		t.Errorf("Expected exactly 1 throttled Event API query across back-to-back reconciles of a not-yet-Ready pod, got %d", eventLists)
 	}
 }
 
@@ -2039,6 +2123,13 @@ func TestPodMigrationJobReconciler_Restoring_Timeout_DefersWhileReplacementPodSt
 	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
 		t.Errorf("Expected phase to remain %s while replacement pod is gated, got %s",
 			pmv1alpha1.PodMigrationJobPhaseRestoring, updatedPMJ.Status.Phase)
+	}
+
+	// Deferral must be visible to operators: an indefinitely deferred PMJ with
+	// a wedged PodGate worker should be alertable from status alone.
+	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Reason != "WaitingOnGateRelease" {
+		t.Errorf("Expected Ready condition with Reason=WaitingOnGateRelease while deferred, got %+v", readyCond)
 	}
 }
 

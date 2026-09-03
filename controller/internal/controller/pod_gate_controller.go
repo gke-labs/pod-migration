@@ -73,14 +73,20 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	// A terminating pod is going away regardless; releasing its gate is
+	// pointless and the update just races the deletion.
+	if pod.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
+	}
+
 	assignedPMJ := ""
 	if pod.Annotations != nil {
 		assignedPMJ = pod.Annotations["pod-migration.gke.io/assigned-pmj"]
 	}
 
 	if assignedPMJ == "" {
-		logger.Info("Gated pod has no PMJ assignment, releasing gate immediately")
-		r.removeGate(pod)
+		logger.Info("Gated pod has no PMJ assignment, releasing gate with cold-start bypass")
+		r.releaseWithColdStartBypass(pod)
 		return ctrl.Result{}, r.Update(ctx, pod)
 	}
 
@@ -143,9 +149,17 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 		phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 		if phase == pmv1alpha1.PodMigrationJobPhaseFailed ||
-			phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
-			logger.Info("Assigned PMJ completed without restore; releasing scheduling gate for cold-start fallback",
-				"pod", pod.Name, "pmj", correctedPMJ, "phase", phase)
+			phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
+			job.Status.SnapshotRef == "" {
+			if job.Status.SnapshotRef == "" &&
+				phase != pmv1alpha1.PodMigrationJobPhaseFailed &&
+				phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+				logger.Info("Assigned PMJ is in a durable phase but has no snapshot ref; releasing scheduling gate with cold-start bypass",
+					"pod", pod.Name, "pmj", correctedPMJ, "phase", phase)
+			} else {
+				logger.Info("Assigned PMJ completed without restore; releasing scheduling gate for cold-start fallback",
+					"pod", pod.Name, "pmj", correctedPMJ, "phase", phase)
+			}
 			// Record which pod fell back so verification and triage can find it,
 			// then release with the explicit bypass: without it GKE may attempt a
 			// native restore from a stale or mismatched snapshot.
@@ -171,14 +185,13 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, r.Update(ctx, pod)
 		}
 
-		// Inject GKE's native snapshot name annotation when snapshotRef is present and not Failed
-		if (phase == pmv1alpha1.PodMigrationJobPhaseRestoring || phase == pmv1alpha1.PodMigrationJobPhaseSucceeded) && job.Status.SnapshotRef != "" {
-			if pod.Annotations == nil {
-				pod.Annotations = make(map[string]string)
-			}
-			pod.Annotations["podsnapshot.gke.io/ps-name"] = job.Status.SnapshotRef
-			logger.Info("Injected target snapshot ref to pod annotations", "snapshot", job.Status.SnapshotRef)
+		// Inject GKE's native snapshot name annotation (SnapshotRef is non-empty
+		// here; the empty case released with the cold-start bypass above)
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string)
 		}
+		pod.Annotations["podsnapshot.gke.io/ps-name"] = job.Status.SnapshotRef
+		logger.Info("Injected target snapshot ref to pod annotations", "snapshot", job.Status.SnapshotRef)
 
 		// Mark PMJ as consumed by this replacement pod to prevent stale resurrection
 		if !job.Status.Consumed {
@@ -195,7 +208,11 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, r.Update(ctx, pod)
 	}
 
-	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	// PMJ still in an active phase.  The PMJ watch (mapPMJToPods) enqueues this
+	// pod on every PMJ transition, so that's the fast path for release; this
+	// requeue is only a resync backstop and must stay coarse — at 2s, 2,000
+	// gated pods turn the single worker into a full-time polling loop.
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 // releaseWithColdStartBypass removes the gate and scrubs the migration
