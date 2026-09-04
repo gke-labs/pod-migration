@@ -7,14 +7,18 @@ import (
 	"strings"
 )
 
+const DefaultVersion = "v0.1.0-dev"
+
 var (
 	// Version is the current SemVer release tag (injected via -ldflags at build time).
-	Version = "v0.1.0-dev"
+	Version = DefaultVersion
 	// GitCommit is the git commit SHA (injected via -ldflags at build time).
 	GitCommit = "unknown"
 	// BuildDate is the commit timestamp (or build timestamp) in ISO 8601 (injected via -ldflags at build time).
 	BuildDate = "unknown"
 )
+
+var readBuildInfo = debug.ReadBuildInfo
 
 // Info holds structured runtime and build metadata.
 type Info struct {
@@ -34,7 +38,7 @@ func Get() Info {
 
 	// Fallback to runtime/debug.ReadBuildInfo if ldflags were omitted (e.g. plain go build ./cmd/)
 	if c == "unknown" || c == "" || d == "unknown" || d == "" {
-		if bi, ok := debug.ReadBuildInfo(); ok {
+		if bi, ok := readBuildInfo(); ok {
 			for _, setting := range bi.Settings {
 				switch setting.Key {
 				case "vcs.revision":
@@ -50,7 +54,7 @@ func Get() Info {
 						d = setting.Value
 					}
 				case "vcs.modified":
-					if setting.Value == "true" && Version == "v0.1.0-dev" && !strings.HasSuffix(v, "-dirty") {
+					if setting.Value == "true" && !strings.HasSuffix(v, "-dirty") {
 						v += "-dirty"
 					}
 				}

@@ -24,10 +24,22 @@ help:
 generate: ## Run controller-gen to (re)generate deepcopy methods (zz_generated.deepcopy.go).
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
-verify-generate: generate manifests
-	@if [ -n "$$(git status --porcelain api/v1alpha1/zz_generated.deepcopy.go config/crd/bases deploy.yaml)" ]; then \
-		echo "Error: Generated files (deepcopy, CRDs, or deploy.yaml) are out of date. Run 'make generate manifests' and commit the changes."; \
-		git diff api/v1alpha1/zz_generated.deepcopy.go config/crd/bases deploy.yaml; \
+verify-generate: ## Verify generated files are up to date.
+	@TMP_DIR=$$(mktemp -d); \
+	trap 'rm -rf "$$TMP_DIR"' EXIT; \
+	mkdir -p "$$TMP_DIR/api/v1alpha1" "$$TMP_DIR/config/crd" "$$TMP_DIR/config/rbac"; \
+	cp api/v1alpha1/zz_generated.deepcopy.go "$$TMP_DIR/api/v1alpha1/"; \
+	cp -r config/crd/bases "$$TMP_DIR/config/crd/"; \
+	cp config/rbac/role.yaml "$$TMP_DIR/config/rbac/"; \
+	cp deploy.yaml "$$TMP_DIR/"; \
+	$(MAKE) generate manifests; \
+	DIFF_FAILED=0; \
+	for path in api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml; do \
+		diff -ru "$$TMP_DIR/$$path" "$$path" || DIFF_FAILED=1; \
+	done; \
+	if [ $$DIFF_FAILED -ne 0 ]; then \
+		echo "Error: Generated files (deepcopy, CRDs, role.yaml, or deploy.yaml) are out of date. Run 'make generate manifests' and commit the changes."; \
+		git status --porcelain api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml; \
 		exit 1; \
 	fi
 
@@ -53,7 +65,7 @@ envtest: ## Download setup-envtest locally if necessary.
 	fi
 
 test: generate fmt vet manifests envtest ## Run unit + envtest suite.
-	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path 2>/dev/null || $(SETUP_ENVTEST) use -p path 2>/dev/null)" \
+	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path || $(SETUP_ENVTEST) use -p path)" \
 		go test ./... -coverprofile cover.out
 
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.

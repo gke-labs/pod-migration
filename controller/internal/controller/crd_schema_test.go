@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +21,9 @@ import (
 
 func TestCRDSchema_PodMigrationJob_StatusFields(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("KUBEBUILDER_ASSETS not set in CI environment; failing to prevent silent skip of envtest suite")
+		}
 		t.Skip("KUBEBUILDER_ASSETS not set; skipping envtest CRD schema test")
 	}
 
@@ -95,5 +100,31 @@ func TestCRDSchema_PodMigrationJob_StatusFields(t *testing.T) {
 	}
 	if fetched.Status.RestoringStartTime == nil || !fetched.Status.RestoringStartTime.Equal(&now) {
 		t.Errorf("Expected fetched.Status.RestoringStartTime == %v, got %v", now, fetched.Status.RestoringStartTime)
+	}
+}
+
+func TestCRDSchema_EnvtestFailsInCIWhenAssetsUnset(t *testing.T) {
+	if os.Getenv("TEST_CRD_SCHEMA_FAIL_CI_SUBPROCESS") == "1" {
+		TestCRDSchema_PodMigrationJob_StatusFields(t)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestCRDSchema_EnvtestFailsInCIWhenAssetsUnset$")
+	var env []string
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "KUBEBUILDER_ASSETS=") &&
+			!strings.HasPrefix(e, "CI=") &&
+			!strings.HasPrefix(e, "TEST_CRD_SCHEMA_FAIL_CI_SUBPROCESS=") {
+			env = append(env, e)
+		}
+	}
+	cmd.Env = append(env, "TEST_CRD_SCHEMA_FAIL_CI_SUBPROCESS=1", "CI=true", "KUBEBUILDER_ASSETS=")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("Expected subprocess to fail when CI=true and KUBEBUILDER_ASSETS is empty, but it succeeded. Output:\n%s", string(out))
+	}
+	expectedMsg := "KUBEBUILDER_ASSETS not set in CI environment; failing to prevent silent skip of envtest suite"
+	if !strings.Contains(string(out), expectedMsg) {
+		t.Errorf("Expected output to contain %q, got:\n%s", expectedMsg, string(out))
 	}
 }
