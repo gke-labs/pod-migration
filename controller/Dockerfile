@@ -6,7 +6,10 @@ RUN go mod download
 COPY cmd/   cmd/
 COPY api/   api/
 COPY internal/ internal/
-RUN CGO_ENABLED=0 GOOS=linux go build -a -o manager cmd/main.go
+ARG LDFLAGS=""
+RUN if [ -z "${LDFLAGS}" ]; then echo "WARNING: LDFLAGS is empty. Built image will have default/unknown version metadata." >&2; fi && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags "${LDFLAGS}" -o manager cmd/main.go
+
 
 # Runtime: distroless, nonroot.
 FROM gcr.io/distroless/static:nonroot
