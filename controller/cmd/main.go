@@ -26,6 +26,7 @@ and the entire control plane shape will click.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 
@@ -35,6 +36,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlruntime "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -42,6 +44,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/controller"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 	pmwebhook "github.com/gke-labs/pod-migration/controller/internal/webhook"
 )
 
@@ -63,17 +66,34 @@ func main() {
 		metricsAddr          string
 		probeAddr            string
 		enableLeaderElection bool
+		clientGoQPS          float64
+		clientGoBurst        int
+		maxConcurrent        int
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election so only one replica is active at a time.")
+	flag.Float64Var(&clientGoQPS, "client-go-qps", 500.0, "QPS for client-go REST config")
+	flag.IntVar(&clientGoBurst, "client-go-burst", 1000, "Burst for client-go REST config")
+	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// Reject values client-go would silently reinterpret (QPS==0 falls back to
+	// the 5-QPS default; negative disables rate limiting).
+	if err := util.ValidateClientGoRateLimits(clientGoQPS, clientGoBurst); err != nil {
+		setupLog.Error(err, "invalid client-go rate limit flags")
+		os.Exit(1)
+	}
+
+	restConfig := ctrl.GetConfigOrDie()
+	restConfig.QPS = float32(clientGoQPS)
+	restConfig.Burst = clientGoBurst
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
@@ -87,6 +107,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Cache indexes must be registered before any controller starts; the gate
+	// mapper and the restore-timeout deferral both List pods by assigned-pmj.
+	if err := controller.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
+		setupLog.Error(err, "unable to register field indexes")
+		os.Exit(1)
+	}
+
+	reconcilerOpts := ctrlruntime.Options{
+		MaxConcurrentReconciles: maxConcurrent,
+	}
+
 	if err := (&controller.PodMigrationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -98,14 +129,17 @@ func main() {
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)
 	}
 
+	// PodGateReconciler hardcodes MaxConcurrentReconciles: 1 in its own
+	// SetupWithManager — see the comment there for the serialization contract.
 	if err := (&controller.PodGateReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
 		os.Exit(1)

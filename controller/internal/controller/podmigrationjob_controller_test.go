@@ -17,6 +17,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
@@ -1776,6 +1777,362 @@ func TestPodMigrationJobReconciler_Restoring_IgnoresStaleWarningEventsBeforeRest
 	}
 }
 
+func TestPodMigrationJobReconciler_GC_DefersWhileClaimantPodStillGated(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+
+	completed := metav1.NewTime(time.Now().Add(-45 * time.Minute)) // past the 30m TTL
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			SnapshotRef:    "snapshot-1",
+			CompletionTime: &completed,
+		},
+	}
+
+	// A pod still gated and assigned to this PMJ has not yet received its
+	// snapshot ref; deleting the PMJ now forces it into a cold start.
+	gatedClaimant := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": jobName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithObjects(pmj, gatedClaimant).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Errorf("Expected requeue while deferring GC for gated claimant pod, got: %+v", res)
+	}
+
+	stillThere := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, stillThere); err != nil {
+		t.Errorf("Expected PMJ to survive GC while claimant pod is gated, got: %v", err)
+	}
+}
+
+func TestPodMigrationJobReconciler_GC_DeletesAfterTTLWhenNoClaimant(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	jobName := "pmj-test-pod"
+
+	completed := metav1.NewTime(time.Now().Add(-45 * time.Minute)) // past the 30m TTL
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "test-pod"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			CompletionTime: &completed,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	gone := &pmv1alpha1.PodMigrationJob{}
+	err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, gone)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("Expected PMJ garbage collected after TTL with no gated claimant, got err=%v", err)
+	}
+}
+
+// A crashlooping cold-start-fallback pod never reaches Ready; the throttled
+// probe must still surface the fallback promptly instead of waiting for the
+// 5-minute ceiling.
+func TestPodMigrationJobReconciler_Restoring_NotReadyPodWithFallbackEventConcludesPromptly(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	crashloopingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+			},
+		},
+	}
+
+	fallbackEvent := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "fallback-event",
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      "Pod",
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Type:    corev1.EventTypeWarning,
+		Reason:  "FallbackToColdStart",
+		Message: "GKE runtime skipped snapshot restore and fell back to cold start",
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Consumed:        true,
+			RestoredPodUID:  podUID,
+			RestoredPodName: podName,
+		},
+	}
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(crashloopingPod, fallbackEvent, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{Client: fakeClient, Scheme: scheme}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Errorf("Expected prompt SucceededWithoutRestore for not-ready pod with fallback event, got %s", updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Restoring_NoEventQueriesBeforePodReady(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	notReadyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Consumed:        true,
+			RestoredPodUID:  podUID,
+			RestoredPodName: podName,
+		},
+	}
+
+	// Restoring polls of a not-yet-Ready pod must not hit the Events API every
+	// 2s tick — at 50 workers those uncached LISTs saturate the QPS budget.
+	// The probe is throttled: first tick queries, back-to-back ticks do not.
+	eventLists := 0
+	base := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(notReadyPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+	cl := interceptor.NewClient(base, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.EventList); ok {
+				eventLists++
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+
+	r := &PodMigrationJobReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName}}
+	var res ctrl.Result
+	var err error
+	for i := 0; i < 3; i++ {
+		res, err = r.Reconcile(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+	if res.RequeueAfter == 0 {
+		t.Errorf("Expected requeue while waiting for pod readiness, got: %+v", res)
+	}
+	if eventLists != 1 {
+		t.Errorf("Expected exactly 1 throttled Event API query across back-to-back reconciles of a not-yet-Ready pod, got %d", eventLists)
+	}
+}
+
+func TestPodMigrationJobReconciler_Restoring_Timeout_DefersWhileReplacementPodStillGated(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+
+	restoringStartTime := metav1.NewTime(time.Now().Add(-6 * time.Minute))
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+			RestoringStartTime: &restoringStartTime,
+			// Not consumed: the replacement pod below is still waiting on the
+			// single PodGate worker to release its scheduling gate.
+		},
+	}
+
+	gatedReplacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": jobName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithObjects(pmj, gatedReplacement).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Errorf("Expected requeue while deferring timeout for gated replacement pod, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+		t.Errorf("Expected phase to remain %s while replacement pod is gated, got %s",
+			pmv1alpha1.PodMigrationJobPhaseRestoring, updatedPMJ.Status.Phase)
+	}
+
+	// Deferral must be visible to operators: an indefinitely deferred PMJ with
+	// a wedged PodGate worker should be alertable from status alone.
+	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Reason != "WaitingOnGateRelease" {
+		t.Errorf("Expected Ready condition with Reason=WaitingOnGateRelease while deferred, got %+v", readyCond)
+	}
+}
+
 func TestPodMigrationJobReconciler_Restoring_Timeout(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -1806,6 +2163,7 @@ func TestPodMigrationJobReconciler_Restoring_Timeout(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithObjects(pmj).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		Build()

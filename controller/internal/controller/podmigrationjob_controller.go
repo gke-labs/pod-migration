@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -15,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -22,12 +24,36 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
+// fallbackEventCheckInterval throttles the uncached Events API probe for
+// not-yet-Ready replacement pods: often enough to surface a crashlooping
+// cold-start fallback promptly, coarse enough that a large drain does not
+// spend the QPS budget on event LISTs.
+const fallbackEventCheckInterval = 30 * time.Second
+
 // PodMigrationJobReconciler reconciles a PodMigrationJob object.
 type PodMigrationJobReconciler struct {
 	client.Client
 	APIReader        client.Reader
 	Scheme           *runtime.Scheme
 	SnapshotProvider snapshot.Provider
+
+	// fallbackEventChecks records the last fallback-event probe per PMJ
+	// (namespace/name -> time.Time).  In-memory only; a restart just means
+	// one extra probe per in-flight migration.
+	fallbackEventChecks sync.Map
+}
+
+// shouldProbeFallbackEvents reports whether the throttle window for this PMJ
+// has elapsed, and if so, marks it probed now.
+func (r *PodMigrationJobReconciler) shouldProbeFallbackEvents(key string) bool {
+	now := time.Now()
+	if v, ok := r.fallbackEventChecks.Load(key); ok {
+		if last, ok := v.(time.Time); ok && now.Sub(last) < fallbackEventCheckInterval {
+			return false
+		}
+	}
+	r.fallbackEventChecks.Store(key, now)
+	return true
 }
 
 func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
@@ -57,6 +83,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	err := r.Get(ctx, req.NamespacedName, job)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.fallbackEventChecks.Delete(req.NamespacedName.String())
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get PodMigrationJob")
@@ -106,22 +133,36 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Garbage collect completed PMJs after 5 minutes
+	// Garbage collect completed PMJs after 30 minutes to allow ample time for large queue drainage.
+	// Note: Once Issue #19 (field indexers & transactional status.claimedBy) lands, gate lookups
+	// will be O(1) and this TTL can be safely reduced to a shorter interval (e.g. 5-10 minutes).
 	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 
 		if job.Status.CompletionTime != nil {
-			const gcDelay = 5 * time.Minute
-			if time.Since(job.Status.CompletionTime.Time) > gcDelay {
+			ttl := time.Minute * 30 // Extended 30m window prevents premature deletion during large drains
+			if time.Since(job.Status.CompletionTime.Time) > ttl {
+				// A pod still gated on this PMJ has not yet been through gate
+				// release: deleting the PMJ now would strand it (its eventual
+				// release becomes a cold start with no snapshot ref).  Defer
+				// until the PodGate worker has processed the claimant.
+				gated, err := r.hasGatedClaimant(ctx, job)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if gated {
+					logger.Info("GC TTL expired but a gated pod still claims this PMJ; deferring deletion", "job", job.Name)
+					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+				}
 				logger.Info("Garbage collecting completed PodMigrationJob", "job", job.Name)
-				err := r.Delete(ctx, job)
+				err = r.Delete(ctx, job)
 				if err != nil && !apierrors.IsNotFound(err) {
 					return ctrl.Result{}, err
 				}
 				return ctrl.Result{}, nil
 			}
-			requeueIn := gcDelay - time.Since(job.Status.CompletionTime.Time)
+			requeueIn := ttl - time.Since(job.Status.CompletionTime.Time)
 			return ctrl.Result{RequeueAfter: requeueIn}, nil
 		}
 		return ctrl.Result{}, nil
@@ -411,6 +452,37 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// 2. 5-minute safety ceiling measured from RestoringStartTime
 		const restoreTimeout = 5 * time.Minute
 		if time.Since(job.Status.RestoringStartTime.Time) > restoreTimeout {
+			// The ceiling exists to catch replacement pods that started but never
+			// consumed the snapshot.  A pod still held by its scheduling gate has
+			// not started at all — it is waiting on the single PodGate worker,
+			// whose queue can exceed 5 minutes during large drains.  Flipping to
+			// SucceededWithoutRestore here would silently discard a durable
+			// snapshot, so defer while a gated claimant exists.
+			if !job.Status.Consumed {
+				gated, err := r.hasGatedClaimant(ctx, job)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if gated {
+					logger.Info("Restore timeout reached but replacement pod is still gated awaiting release; deferring",
+						"job", job.Name)
+					// The deferral is unbounded by design (a gated pod cannot have
+					// started), so it must be visible: operators can alert on this
+					// condition if a wedged PodGate worker holds PMJs here.
+					if meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+						Type:               "Ready",
+						Status:             metav1.ConditionFalse,
+						Reason:             "WaitingOnGateRelease",
+						Message:            "Restore ceiling reached but replacement pod is still gated awaiting the PodGate worker",
+						ObservedGeneration: job.Generation,
+					}) {
+						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+							return ctrl.Result{}, updateErr
+						}
+					}
+					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+				}
+			}
 			logger.Info("Restore timeout reached (5m), marking SucceededWithoutRestore", "job", job.Name, "pod", podName)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 			now := metav1.Now()
@@ -501,69 +573,112 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
-		// 5. Check for GKE PodSnapshots cold-start fallback Warning Event
+		// 5. While the pod is not yet Ready, probe for a cold-start fallback
+		// event on a throttle: the query goes straight to the API server, so
+		// per-2s-tick probing saturates the QPS budget at 50 workers, but no
+		// probing at all leaves a crashlooping fallback pod undetected until
+		// the 5-minute ceiling.
+		if !isPodReady(replacementPod) {
+			if r.shouldProbeFallbackEvents(req.NamespacedName.String()) {
+				hasFallback, err := r.hasColdStartFallbackEvent(ctx, job, replacementPod)
+				if err != nil {
+					logger.Error(err, "Failed to query events for replacement pod")
+					return ctrl.Result{}, err
+				}
+				if hasFallback {
+					logger.Info("GKE runtime skipped snapshot restore and fell back to cold start (pod not yet Ready)", "pod", replacementPod.Name)
+					r.fallbackEventChecks.Delete(req.NamespacedName.String())
+					return ctrl.Result{}, r.markSucceededWithoutRestore(ctx, job,
+						"FallbackToColdStart", "GKE runtime skipped snapshot restore and fell back to cold start")
+				}
+			}
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// 6. Pod is Ready: a decisive fallback-event check picks between
+		// verified restore and cold-start fallback.
 		hasFallback, err := r.hasColdStartFallbackEvent(ctx, job, replacementPod)
 		if err != nil {
 			logger.Error(err, "Failed to query events for replacement pod")
 			return ctrl.Result{}, err
 		}
+		r.fallbackEventChecks.Delete(req.NamespacedName.String())
 		if hasFallback {
 			logger.Info("GKE runtime skipped snapshot restore and fell back to cold start", "pod", replacementPod.Name)
-			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
-			now := metav1.Now()
-			job.Status.CompletionTime = &now
-			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-				Type:               "Restored",
-				Status:             metav1.ConditionFalse,
-				Reason:             "FallbackToColdStart",
-				Message:            "GKE runtime skipped snapshot restore and fell back to cold start",
-				ObservedGeneration: job.Generation,
-			})
-			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionTrue,
-				Reason:             "FallbackToColdStart",
-				Message:            "GKE runtime skipped snapshot restore and fell back to cold start",
-				ObservedGeneration: job.Generation,
-			})
-			if err := r.Status().Update(ctx, job); err != nil {
-				logger.Error(err, "Failed to update job status to SucceededWithoutRestore")
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, r.markSucceededWithoutRestore(ctx, job,
+				"FallbackToColdStart", "GKE runtime skipped snapshot restore and fell back to cold start")
 		}
 
-		// 6. Check if replacement pod has achieved PodReady condition (Verified Restore)
-		if isPodReady(replacementPod) {
-			logger.Info("Pod state restored from snapshot and replacement pod is Ready", "pod", replacementPod.Name)
-			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
-			now := metav1.Now()
-			job.Status.CompletionTime = &now
-			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-				Type:               "Restored",
-				Status:             metav1.ConditionTrue,
-				Reason:             "RestoreVerified",
-				Message:            "Pod state restored from snapshot and replacement pod is Ready",
-				ObservedGeneration: job.Generation,
-			})
-			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionTrue,
-				Reason:             "RestoreVerified",
-				Message:            "Pod state restored from snapshot and replacement pod is Ready",
-				ObservedGeneration: job.Generation,
-			})
-			if err := r.Status().Update(ctx, job); err != nil {
-				logger.Error(err, "Failed to update job status to Succeeded")
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
+		// 7. Verified restore: the pod is Ready with no fallback event.
+		logger.Info("Pod state restored from snapshot and replacement pod is Ready", "pod", replacementPod.Name)
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+		now := metav1.Now()
+		job.Status.CompletionTime = &now
+		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               "Restored",
+			Status:             metav1.ConditionTrue,
+			Reason:             "RestoreVerified",
+			Message:            "Pod state restored from snapshot and replacement pod is Ready",
+			ObservedGeneration: job.Generation,
+		})
+		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			Reason:             "RestoreVerified",
+			Message:            "Pod state restored from snapshot and replacement pod is Ready",
+			ObservedGeneration: job.Generation,
+		})
+		if err := r.Status().Update(ctx, job); err != nil {
+			logger.Error(err, "Failed to update job status to Succeeded")
+			return ctrl.Result{}, err
 		}
-
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		return ctrl.Result{}, nil
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// markSucceededWithoutRestore concludes the PMJ with the given reason on both
+// the Restored (False) and Ready (True) conditions.
+func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, reason, message string) error {
+	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+	now := metav1.Now()
+	job.Status.CompletionTime = &now
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type:               "Restored",
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: job.Generation,
+	})
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: job.Generation,
+	})
+	return r.Status().Update(ctx, job)
+}
+
+// hasGatedClaimant reports whether any pod annotated as assigned to this PMJ
+// is still held by the migration scheduling gate.  Such a pod has not been
+// processed by the (single-worker) PodGate reconciler yet, so both the
+// restore-timeout ceiling and GC must wait for it.  Uses the assigned-pmj
+// cache index; this is a cache read, not an API call.
+func (r *PodMigrationJobReconciler) hasGatedClaimant(ctx context.Context, job *pmv1alpha1.PodMigrationJob) (bool, error) {
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods,
+		client.InNamespace(job.Namespace),
+		client.MatchingFields{PodAssignedPMJIndex: job.Name}); err != nil {
+		return false, fmt.Errorf("failed to list pods assigned to PMJ %s: %w", job.Name, err)
+	}
+	for i := range pods.Items {
+		if podHasMigrationGate(&pods.Items[i]) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func isPodReady(pod *corev1.Pod) bool {
@@ -629,8 +744,9 @@ func (r *PodMigrationJobReconciler) hasColdStartFallbackEvent(ctx context.Contex
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigrationJob{}).
+		WithOptions(options).
 		Complete(r)
 }

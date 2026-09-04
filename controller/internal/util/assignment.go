@@ -24,6 +24,11 @@ const (
 	LabelOriginPodName      = "pod-migration.gke.io/origin-pod-name"
 	AnnotationAssignedPMJ   = "pod-migration.gke.io/assigned-pmj"
 	AnnotationMismatchSince = "pod-migration.gke.io/mismatch-since"
+
+	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
+	// in their assigned-pmj annotation.  Registered at manager startup via
+	// controller.RegisterFieldIndexes.
+	PodAssignedPMJIndexKey = "pod.podmigration.gke.io/assigned-pmj"
 )
 
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).
@@ -149,13 +154,23 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	job := &pmv1alpha1.PodMigrationJob{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assignedPMJ}, job); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", true, nil // PMJ was deleted out-of-band, clear assignment
+			// NotFound is ambiguous from the cache (deleted vs not yet synced),
+			// so no collision verdict is possible: report "no change".  The
+			// caller MUST then resolve the ambiguity itself with a direct API
+			// server read, and on confirmed deletion release the pod with the
+			// cold-start bypass (assigned-pmj removed, ps-name set to "").
+			return assignedPMJ, false, nil
 		}
 		return "", false, err
 	}
 
+	// Contenders are exactly the pods indexed under this PMJ name; a
+	// full-namespace List here runs on every reconcile of every assigned pod
+	// and does not scale.  Callers must have PodAssignedPMJIndex registered.
 	podList := &corev1.PodList{}
-	err := c.List(ctx, podList, client.InNamespace(pod.Namespace))
+	err := c.List(ctx, podList,
+		client.InNamespace(pod.Namespace),
+		client.MatchingFields{PodAssignedPMJIndexKey: assignedPMJ})
 	if err != nil {
 		return "", false, err
 	}
@@ -167,9 +182,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		if string(p.UID) == job.Spec.TargetPodUID {
 			continue
 		}
-		if p.Annotations != nil && p.Annotations[AnnotationAssignedPMJ] == assignedPMJ {
-			contenders = append(contenders, p)
-		}
+		contenders = append(contenders, p)
 	}
 
 	if len(contenders) <= 1 {
