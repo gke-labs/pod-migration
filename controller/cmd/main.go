@@ -170,7 +170,7 @@ func main() {
 	}
 
 	// --- Webhooks ------------------------------------------------------------
-	if err := pmwebhook.SetupEvictionWebhookWithManager(mgr); err != nil {
+	if err := pmwebhook.SetupEvictionWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
 		setupLog.Error(err, "unable to register eviction webhook")
 		os.Exit(1)
 	}

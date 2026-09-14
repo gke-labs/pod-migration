@@ -242,14 +242,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			job.Status.PVsToDetach = pvs
 		}
 
-		res, err := r.getSnapshotProvider().EnsureTrigger(ctx, job, podName)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if res.Requeue || res.RequeueAfter != 0 {
-			return res, nil
-		}
-
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
 		err = r.Status().Update(ctx, job)
 		if err != nil {
@@ -259,6 +251,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
+		res, err := r.getSnapshotProvider().EnsureTrigger(ctx, job, podName)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if res.Requeue || res.RequeueAfter != 0 {
+			return res, nil
+		}
+
 		// Monitor snapshot readiness via the pluggable SnapshotProvider
 		snapStatus, err := r.getSnapshotProvider().CheckStatus(ctx, job, podName)
 		if err != nil {
@@ -289,6 +289,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		case snapshot.PhaseReady:
 			logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapStatus.SnapshotRef)
+			// Proactively clean up the manual trigger to free the target pod name in the snapshot agent
+			// for any subsequent migration hops without waiting for the 30-minute PMJ GC TTL.
+			_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
 			job.Status.SnapshotRef = snapStatus.SnapshotRef
 			err = r.Status().Update(ctx, job)

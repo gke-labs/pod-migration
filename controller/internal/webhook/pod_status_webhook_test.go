@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -135,6 +134,9 @@ func TestPodStatusMutator(t *testing.T) {
 					Spec: pmv1alpha1.PodMigrationJobSpec{
 						TargetPodUID: "test-pod-uid",
 					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+					},
 				},
 			},
 			subResource:     "status",
@@ -236,6 +238,9 @@ func TestPodStatusMutator(t *testing.T) {
 					Spec: pmv1alpha1.PodMigrationJobSpec{
 						TargetPodUID: "mismatched-uid",
 					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+					},
 				},
 			},
 			subResource:     "status",
@@ -289,6 +294,99 @@ func TestPodStatusMutator(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "Pod Succeeded with PMJ in Pending phase (Bypasses mutation) with DeletionTimestamp == nil",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:         "default",
+					Name:              "test-pod",
+					UID:               "test-pod-uid",
+					DeletionTimestamp: nil,
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "test-job",
+							UID:        "job-uid",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      util.FormatPMJName("test-pod", "test-pod-uid"),
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						TargetPodUID: "test-pod-uid",
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			subResource:     "status",
+			expectedAllowed: true,
+			verifyMutation: func(t *testing.T, resp admission.Response) {
+				if len(resp.Patches) > 0 {
+					t.Fatalf("Expected no patches, got %d patches", len(resp.Patches))
+				}
+			},
+		},
+		{
+			name: "Pod Succeeded with PMJ in Pending phase (Bypasses mutation) with DeletionTimestamp != nil (terminating)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:         "default",
+					Name:              "test-pod",
+					UID:               "test-pod-uid",
+					DeletionTimestamp: &now,
+					Finalizers:        []string{"pod-migration.gke.io/test-finalizer"},
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "test-job",
+							UID:        "job-uid",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      util.FormatPMJName("test-pod", "test-pod-uid"),
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						TargetPodUID: "test-pod-uid",
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+					},
+				},
+			},
+			subResource:     "status",
+			expectedAllowed: true,
+			verifyMutation: func(t *testing.T, resp admission.Response) {
+				if len(resp.Patches) > 0 {
+					t.Fatalf("Expected no patches, got %d patches", len(resp.Patches))
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -300,7 +398,7 @@ func TestPodStatusMutator(t *testing.T) {
 			initObjs := append(tt.initObjects, tt.pod)
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).Build()
 
-			handler := &PodStatusMutator{Client: fakeClient}
+			handler := &PodStatusMutator{Client: fakeClient, APIReader: fakeClient}
 			dec := admission.NewDecoder(scheme)
 			_ = handler.InjectDecoder(dec)
 
@@ -455,8 +553,9 @@ func TestPodStatusMutator_APIReaderFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("Live read error returns 500 error", func(t *testing.T) {
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	t.Run("Live read error falls back to cache", func(t *testing.T) {
+		// We put PMJ in cache
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pmj).Build()
 		errClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
 			Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				return fmt.Errorf("simulated apiserver connection error")
@@ -470,11 +569,33 @@ func TestPodStatusMutator_APIReaderFallback(t *testing.T) {
 		_ = handler.InjectDecoder(admission.NewDecoder(scheme))
 
 		resp := handler.Handle(context.Background(), req)
-		if resp.Allowed {
-			t.Fatalf("Expected admission error on live read failure, got allowed")
+		if !resp.Allowed {
+			t.Fatalf("Expected allowed (mutated), got denied: %v", resp.Result)
 		}
-		if resp.Result == nil || resp.Result.Code != http.StatusInternalServerError {
-			t.Fatalf("Expected status code 500, got: %+v", resp.Result)
+		if len(resp.Patches) == 0 {
+			t.Fatalf("Expected patches mutating status to Failed, got 0 patches")
+		}
+	})
+
+	t.Run("Live read error and cache error fails toward mutation", func(t *testing.T) {
+		errClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				return fmt.Errorf("simulated apiserver connection error")
+			},
+		}).Build()
+
+		handler := &PodStatusMutator{
+			Client:    errClient,
+			APIReader: errClient,
+		}
+		_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+		resp := handler.Handle(context.Background(), req)
+		if !resp.Allowed {
+			t.Fatalf("Expected allowed (mutated), got denied: %v", resp.Result)
+		}
+		if len(resp.Patches) == 0 {
+			t.Fatalf("Expected patches mutating status to Failed, got 0 patches")
 		}
 	})
 }

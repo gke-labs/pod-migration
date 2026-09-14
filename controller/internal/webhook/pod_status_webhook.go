@@ -63,23 +63,36 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 	}
 
 	// Check if there is an active PodMigrationJob for this pod.
-	// Read via APIReader unconditionally if available to protect against both stale
-	// misses (live PMJ not yet in local cache) and stale hits (PMJ already terminal
-	// in reality but still cached as active).
+	// Read via APIReader unconditionally if available. On live-read error,
+	// fall back to the cached Get, and if that fails too, fail toward mutation
+	// instead of Errored(500) to avoid failurePolicy: Ignore bypassing the gate.
 	pmjName := util.FormatPMJName(pod.Name, string(pod.UID))
 	pmj := &pmv1alpha1.PodMigrationJob{}
-	reader := a.APIReader
-	if reader == nil {
-		reader = a.Client
-	}
-	err = reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
+	var getErr error
+
+	if a.APIReader != nil {
+		getErr = a.APIReader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
+		if getErr != nil && apierrors.IsNotFound(getErr) {
 			logger.Info("Pod succeeded but no active PodMigrationJob found, allowing normal completion")
 			return admission.Allowed("no active migration job")
 		}
-		logger.Error(err, "Failed to check for active PodMigrationJob")
-		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	if a.APIReader == nil || (getErr != nil && !apierrors.IsNotFound(getErr)) {
+		if getErr != nil {
+			logger.Error(getErr, "Live API read failed, falling back to cache", "pmj", pmjName)
+		}
+		cacheErr := a.Client.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj)
+		if cacheErr != nil {
+			if apierrors.IsNotFound(cacheErr) {
+				logger.Info("Pod succeeded but no active PodMigrationJob found in cache, allowing normal completion")
+				return admission.Allowed("no active migration job")
+			}
+			logger.Error(cacheErr, "Cache read failed, failing toward mutation instead of erroring out")
+			// Fail toward mutation: mock the pmj to pass checks
+			pmj.Spec.TargetPodUID = string(pod.UID)
+			pmj.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
+		}
 	}
 
 	// Verify if pmj.Spec.TargetPodUID matches string(pod.UID). If not, log it and return admission.Allowed("PMJ UID mismatch").
@@ -88,23 +101,18 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 		return admission.Allowed("PMJ UID mismatch")
 	}
 
-	// Verify if pod.DeletionTimestamp is nil.
-	if pod.DeletionTimestamp == nil {
-		// If the migration job is actively checkpointing/evicting, the container was stopped
-		// by the checkpoint agent, so we must still force a failure to trigger rescheduling.
-		// Note: Pending is excluded because a Job pod completing naturally while a PMJ is
-		// merely Pending has not been checkpointed or disrupted.
-		phase := pmj.Status.Phase
-		if phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
-			phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
-			logger.Info("Pod is terminating due to active migration checkpoint, forcing failure state", "phase", phase)
-		} else {
-			logger.Info("Pod DeletionTimestamp is nil and migration is not active, allowing normal completion", "phase", phase)
-			return admission.Allowed("pod completed naturally")
-		}
+	// Since Kubelet is trying to mark it Succeeded (exit 0), we only override it to Failed (exit 137)
+	// if the PMJ has actually reached the checkpoint/evict phase. Otherwise (e.g. Pending), the pod
+	// finished naturally or was deleted out of band before migration took action, so we allow it.
+	// This exclusion applies identically whether the pod is terminating (DeletionTimestamp != nil) or not.
+	phase := pmj.Status.Phase
+	if phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting &&
+		phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		logger.Info("Pod completion not caused by active migration, allowing normal completion", "phase", phase, "terminating", pod.DeletionTimestamp != nil)
+		return admission.Allowed("migration not active")
 	}
 
-	// If PMJ exists, it means this pod is undergoing migration.
+	// If PMJ exists and is active, it means this pod is undergoing migration.
 	// Since Kubelet is trying to mark it Succeeded (exit 0), we override it to Failed (exit 137)
 	// to trigger rescheduling by the Job controller.
 	logger.Info("Intercepted Succeeded status update for migrating pod; forcing failure state to trigger rescheduling", "pmj", pmjName)

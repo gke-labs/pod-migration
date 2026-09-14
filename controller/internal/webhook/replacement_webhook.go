@@ -35,6 +35,10 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
+	if pod.Namespace == "" {
+		pod.Namespace = req.Namespace
+	}
+
 	// Check if pod opted in
 	if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
 		logger.Info("Pod not opted in, bypassing scheduling gate injection")
@@ -71,7 +75,8 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	// A false miss here would irreversibly stamp ps-name: "" and skip the scheduling gate,
 	// permanently forcing a cold start and stranding the PMJ.
 	if assignedPMJ == "" && a.APIReader != nil {
-		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex)
+		liveParentName, liveParentKind, liveParentUID, _ := util.ResolveParentWorkload(ctx, a.APIReader, pod)
+		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex)
 		if err != nil {
 			logger.Error(err, "Failed to check unassigned active PMJs via APIReader fallback")
 			return admission.Errored(http.StatusInternalServerError, err)
