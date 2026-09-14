@@ -18,6 +18,8 @@ SETUP_ENVTEST_VERSION ?= v0.25.0
 SETUP_ENVTEST ?= $(shell which setup-envtest 2>/dev/null || echo $(shell go env GOPATH)/bin/setup-envtest)
 .PHONY: help generate verify-generate manifests fmt vet build run envtest test install uninstall deploy undeploy docker-build docker-push
 
+VERIFY_ARTIFACTS := api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml
+
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
@@ -26,20 +28,29 @@ generate: ## Run controller-gen to (re)generate deepcopy methods (zz_generated.d
 
 verify-generate: ## Verify generated files are up to date.
 	@TMP_DIR=$$(mktemp -d); \
-	trap 'rm -rf "$$TMP_DIR"' EXIT; \
-	mkdir -p "$$TMP_DIR/api/v1alpha1" "$$TMP_DIR/config/crd" "$$TMP_DIR/config/rbac"; \
-	cp api/v1alpha1/zz_generated.deepcopy.go "$$TMP_DIR/api/v1alpha1/"; \
-	cp -r config/crd/bases "$$TMP_DIR/config/crd/"; \
-	cp config/rbac/role.yaml "$$TMP_DIR/config/rbac/"; \
-	cp deploy.yaml "$$TMP_DIR/"; \
-	$(MAKE) generate manifests; \
+	cleanup() { \
+		if [ -d "$$TMP_DIR" ]; then \
+			for path in $(VERIFY_ARTIFACTS); do \
+				if [ -e "$$TMP_DIR/$$path" ]; then \
+					cp -r "$$TMP_DIR/$$path" "$$(dirname "$$path")/" 2>/dev/null || true; \
+				fi; \
+			done; \
+			rm -rf "$$TMP_DIR"; \
+		fi; \
+	}; \
+	trap cleanup EXIT; \
+	for path in $(VERIFY_ARTIFACTS); do \
+		mkdir -p "$$TMP_DIR/$$(dirname "$$path")"; \
+		cp -r "$$path" "$$TMP_DIR/$$(dirname "$$path")/"; \
+	done; \
+	$(MAKE) generate manifests || exit 1; \
 	DIFF_FAILED=0; \
-	for path in api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml; do \
+	for path in $(VERIFY_ARTIFACTS); do \
 		diff -ru "$$TMP_DIR/$$path" "$$path" || DIFF_FAILED=1; \
 	done; \
 	if [ $$DIFF_FAILED -ne 0 ]; then \
-		echo "Error: Generated files (deepcopy, CRDs, role.yaml, or deploy.yaml) are out of date. Run 'make generate manifests' and commit the changes."; \
-		git status --porcelain api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml; \
+		echo "Error: Generated files ($(VERIFY_ARTIFACTS)) are out of date. Run 'make generate manifests' and commit the changes."; \
+		git status --porcelain $(VERIFY_ARTIFACTS); \
 		exit 1; \
 	fi
 
@@ -65,8 +76,12 @@ envtest: ## Download setup-envtest locally if necessary.
 	fi
 
 test: generate fmt vet manifests envtest ## Run unit + envtest suite.
-	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path || $(SETUP_ENVTEST) use -p path)" \
-		go test ./... -coverprofile cover.out
+	@KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path || $(SETUP_ENVTEST) use -p path)"; \
+	if [ -z "$$KUBEBUILDER_ASSETS" ]; then \
+		echo "Error: setup-envtest failed to locate Kubernetes assets for version $(ENVTEST_K8S_VERSION)." >&2; \
+		exit 1; \
+	fi; \
+	KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test ./... -coverprofile cover.out
 
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.
 	kubectl apply -f config/crd/bases/
