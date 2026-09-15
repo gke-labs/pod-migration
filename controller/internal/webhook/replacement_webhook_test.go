@@ -473,8 +473,9 @@ func TestPodGateInjector(t *testing.T) {
 			cl := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tt.initObjs...).Build()
 
 			handler := &PodGateInjector{
-				Client:  cl,
-				decoder: dec,
+				Client:    cl,
+				APIReader: cl,
+				decoder:   dec,
 			}
 
 			rawPod, err := json.Marshal(tt.pod)
@@ -676,6 +677,161 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 		resp := handler.Handle(context.Background(), req)
 		if resp.Allowed {
 			t.Fatalf("Expected admission error on live read failure, got allowed")
+		}
+		if resp.Result == nil || resp.Result.Code != http.StatusInternalServerError {
+			t.Fatalf("Expected status code 500, got: %+v", resp.Result)
+		}
+	})
+
+	t.Run("Cached parent missing but live parent resolved via APIReader injects scheduling gate", func(t *testing.T) {
+		rs := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "test-deploy-rs-v1",
+				UID:       "rs-v1-uid",
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       "test-deploy",
+						UID:        "deploy-uid",
+					},
+				},
+			},
+		}
+
+		deployPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "test-deploy-replacement-xyz",
+				Labels: map[string]string{
+					"pod-migration.gke.io/enabled": "true",
+					"pod-template-hash":            "hash-v1",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "ReplicaSet",
+						Name:       "test-deploy-rs-v1",
+						UID:        "rs-v1-uid",
+					},
+				},
+			},
+		}
+
+		deployPMJ := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "pmj-test-deploy-orig-1234",
+				Labels: map[string]string{
+					util.LabelParentName:      "test-deploy",
+					util.LabelParentKind:      "Deployment",
+					util.LabelParentUID:       "deploy-uid",
+					util.LabelPodTemplateHash: "hash-v1",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				TargetPodUID: "orig-uid-1234",
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			},
+		}
+
+		// Cache is empty (lagging), live APIReader has the ReplicaSet and PMJ
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeAPIReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rs, deployPMJ).Build()
+
+		handler := &PodGateInjector{
+			Client:    fakeClient,
+			APIReader: fakeAPIReader,
+		}
+		_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+		rawDeployPod, _ := json.Marshal(deployPod)
+		deployReq := admission.Request{}
+		deployReq.Namespace = deployPod.Namespace
+		deployReq.Name = deployPod.Name
+		deployReq.Object = runtime.RawExtension{Raw: rawDeployPod}
+
+		resp := handler.Handle(context.Background(), deployReq)
+		if !resp.Allowed {
+			t.Fatalf("Expected allowed, got denied: %v", resp.Result)
+		}
+
+		gateAdded := false
+		pmjAssigned := false
+		for _, patch := range resp.Patches {
+			if patch.Operation == "add" && (patch.Path == "/spec/schedulingGates" || patch.Path == "/spec/schedulingGates/-") {
+				gateAdded = true
+			}
+			if patch.Path == "/metadata/annotations" {
+				if valMap, ok := patch.Value.(map[string]interface{}); ok {
+					if val, ok := valMap["pod-migration.gke.io/assigned-pmj"]; ok && val == deployPMJ.Name {
+						pmjAssigned = true
+					}
+				}
+			}
+			if patch.Path == "/metadata/annotations/pod-migration.gke.io~1assigned-pmj" {
+				if valStr, ok := patch.Value.(string); ok && valStr == deployPMJ.Name {
+					pmjAssigned = true
+				}
+			}
+		}
+
+		if !gateAdded {
+			t.Errorf("Expected scheduling gate to be added via live parent resolution, got patches: %+v", resp.Patches)
+		}
+		if !pmjAssigned {
+			t.Errorf("Expected assigned-pmj annotation to be stamped via live parent resolution, got patches: %+v", resp.Patches)
+		}
+	})
+
+	t.Run("Live parent resolution error returns 500 error", func(t *testing.T) {
+		deployPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "test-deploy-replacement-xyz",
+				Labels: map[string]string{
+					"pod-migration.gke.io/enabled": "true",
+					"pod-template-hash":            "hash-v1",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "ReplicaSet",
+						Name:       "test-deploy-rs-v1",
+						UID:        "rs-v1-uid",
+					},
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		errAPIReader := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*appsv1.ReplicaSet); ok {
+					return fmt.Errorf("simulated live apiserver error resolving ReplicaSet")
+				}
+				return nil
+			},
+		}).Build()
+
+		handler := &PodGateInjector{
+			Client:    fakeClient,
+			APIReader: errAPIReader,
+		}
+		_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+		rawDeployPod, _ := json.Marshal(deployPod)
+		deployReq := admission.Request{}
+		deployReq.Namespace = deployPod.Namespace
+		deployReq.Name = deployPod.Name
+		deployReq.Object = runtime.RawExtension{Raw: rawDeployPod}
+
+		resp := handler.Handle(context.Background(), deployReq)
+		if resp.Allowed {
+			t.Fatalf("Expected admission error on live parent resolution failure, got allowed")
 		}
 		if resp.Result == nil || resp.Result.Code != http.StatusInternalServerError {
 			t.Fatalf("Expected status code 500, got: %+v", resp.Result)

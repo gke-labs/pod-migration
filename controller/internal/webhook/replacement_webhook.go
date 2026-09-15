@@ -75,7 +75,15 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	// A false miss here would irreversibly stamp ps-name: "" and skip the scheduling gate,
 	// permanently forcing a cold start and stranding the PMJ.
 	if assignedPMJ == "" && a.APIReader != nil {
-		liveParentName, liveParentKind, liveParentUID, _ := util.ResolveParentWorkload(ctx, a.APIReader, pod)
+		liveParentName, liveParentKind, liveParentUID, err := util.ResolveParentWorkload(ctx, a.APIReader, pod)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("Parent ReplicaSet not found via live APIReader, treating as bare pod")
+			} else {
+				logger.Error(err, "Failed to resolve parent workload via live APIReader")
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+		}
 		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex)
 		if err != nil {
 			logger.Error(err, "Failed to check unassigned active PMJs via APIReader fallback")

@@ -884,6 +884,17 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 			t.Errorf("Expected SnapshotRef to be 'my-snap', got '%s'", updatedPMJ.Status.SnapshotRef)
 		}
 
+		// Reconcile again in PhaseEvicting to execute the idempotent Cleanup
+		_, err = r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      jobName,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile in Evicting phase failed: %v", err)
+		}
+
 		cleanedTrigger := &unstructured.Unstructured{}
 		cleanedTrigger.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "podsnapshot.gke.io",

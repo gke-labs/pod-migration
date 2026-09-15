@@ -49,38 +49,39 @@ func (p *GKEProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigr
 		return ctrl.Result{}, err
 	}
 
+	// Fetch existing trigger first to verify ownership and avoid write amplification on 1s polling loops
+	existingTrigger := &unstructured.Unstructured{}
+	existingTrigger.SetGroupVersionKind(trigger.GroupVersionKind())
+	err := p.client.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, existingTrigger)
+	if err == nil {
+		isOwned := false
+		for _, ref := range existingTrigger.GetOwnerReferences() {
+			if ref.UID == job.UID {
+				isOwned = true
+				break
+			}
+		}
+		if isOwned {
+			logger.Info("Trigger already exists and is owned by this job, proceeding")
+			return ctrl.Result{}, nil
+		}
+		logger.Info("Stale trigger found (owned by another job), deleting it first")
+		_ = p.client.Delete(ctx, existingTrigger)
+		return ctrl.Result{Requeue: true}, nil
+	} else if !apierrors.IsNotFound(err) {
+		logger.Error(err, "Failed to get PodSnapshotManualTrigger")
+		return ctrl.Result{}, err
+	}
+
 	logger.Info("Creating PodSnapshotManualTrigger")
-	err := p.client.Create(ctx, trigger)
+	err = p.client.Create(ctx, trigger)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			// Fetch existing trigger to verify ownership
-			existingTrigger := &unstructured.Unstructured{}
-			existingTrigger.SetGroupVersionKind(trigger.GroupVersionKind())
-			getErr := p.client.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, existingTrigger)
-			if getErr == nil {
-				isOwned := false
-				for _, ref := range existingTrigger.GetOwnerReferences() {
-					if ref.UID == job.UID {
-						isOwned = true
-						break
-					}
-				}
-				if isOwned {
-					logger.Info("Trigger already exists and is owned by this job, proceeding")
-					return ctrl.Result{}, nil
-				} else {
-					logger.Info("Stale trigger found (owned by another job), deleting it first")
-					_ = p.client.Delete(ctx, existingTrigger)
-					return ctrl.Result{Requeue: true}, nil
-				}
-			} else {
-				logger.Error(getErr, "Failed to fetch existing trigger on AlreadyExists")
-				return ctrl.Result{}, getErr
-			}
-		} else {
-			logger.Error(err, "Failed to create PodSnapshotManualTrigger")
-			return ctrl.Result{}, err
+			logger.Info("Trigger already exists after create race, proceeding")
+			return ctrl.Result{}, nil
 		}
+		logger.Error(err, "Failed to create PodSnapshotManualTrigger")
+		return ctrl.Result{}, err
 	}
 
 	logger.Info("Successfully created PodSnapshotManualTrigger")

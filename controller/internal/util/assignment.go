@@ -9,7 +9,6 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -126,17 +125,17 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 		return "", nil // Overwhelmingly common path: no matching active PMJ
 	}
 
-	// Scan pods via metadata to find which PMJs are already assigned
+	// Scan opted-in pods to find which PMJs are already assigned.
+	// We use typed PodList with MatchingLabels so the cached client performs an in-memory
+	// filter on the already-running pod informer rather than lazily starting a 2nd metadata watch.
 	assignedPMJs := make(map[string]bool)
-	podMetaList := &metav1.PartialObjectMetadataList{}
-	podMetaList.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Pod"))
-
-	err = c.List(ctx, podMetaList, client.InNamespace(namespace))
+	podList := &corev1.PodList{}
+	err = c.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{"pod-migration.gke.io/enabled": "true"})
 	if err != nil {
 		return "", err
 	}
 
-	for _, p := range podMetaList.Items {
+	for _, p := range podList.Items {
 		if p.Annotations != nil {
 			if pmjName, ok := p.Annotations[AnnotationAssignedPMJ]; ok {
 				assignedPMJs[pmjName] = true

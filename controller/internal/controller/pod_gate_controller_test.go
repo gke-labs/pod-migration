@@ -868,6 +868,7 @@ func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t 
 			CreationTimestamp: metav1.Now(),
 			Labels: map[string]string{
 				appsv1.DefaultDeploymentUniqueLabelKey: "hash-v1",
+				"pod-migration.gke.io/enabled":         "true",
 			},
 			Annotations: map[string]string{
 				"pod-migration.gke.io/assigned-pmj": pmjName,
@@ -896,6 +897,7 @@ func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t 
 			CreationTimestamp: metav1.Now(),
 			Labels: map[string]string{
 				appsv1.DefaultDeploymentUniqueLabelKey: "hash-v1",
+				"pod-migration.gke.io/enabled":         "true",
 			},
 			Annotations: map[string]string{
 				"pod-migration.gke.io/assigned-pmj": pmjName,

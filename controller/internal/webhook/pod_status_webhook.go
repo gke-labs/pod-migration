@@ -89,7 +89,11 @@ func (a *PodStatusMutator) Handle(ctx context.Context, req admission.Request) ad
 				return admission.Allowed("no active migration job")
 			}
 			logger.Error(cacheErr, "Cache read failed, failing toward mutation instead of erroring out")
-			// Fail toward mutation: mock the pmj to pass checks
+			// Fail toward mutation: The cache Get essentially cannot error after startup. If both the live
+			// and cached reads suffer fatal connection failures, we intentionally mock an active Snapshotting PMJ
+			// so the status update is mutated to Failed (exit 137). Because this webhook uses failurePolicy: Ignore,
+			// returning Errored(500) would allow Kubelet's Succeeded (exit 0) update to slip through unmutated,
+			// permanently completing a migrating Job without rescheduling.
 			pmj.Spec.TargetPodUID = string(pod.UID)
 			pmj.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
 		}

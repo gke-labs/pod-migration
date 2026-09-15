@@ -289,9 +289,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		case snapshot.PhaseReady:
 			logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapStatus.SnapshotRef)
-			// Proactively clean up the manual trigger to free the target pod name in the snapshot agent
-			// for any subsequent migration hops without waiting for the 30-minute PMJ GC TTL.
-			_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
 			job.Status.SnapshotRef = snapStatus.SnapshotRef
 			err = r.Status().Update(ctx, job)
@@ -316,6 +313,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
+		// Proactively clean up the manual trigger once the PMJ is durably Evicting.
+		// This frees the target pod lock in the snapshot agent for sequential 2-hop migrations,
+		// and runs idempotently without risk of trigger re-creation on Status().Update retry.
+		_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 
 		// 4.2. Wait for Webhook to delete Pod, or delete it ourselves if it takes too long
 		pod := &corev1.Pod{}

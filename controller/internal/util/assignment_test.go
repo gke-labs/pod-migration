@@ -67,6 +67,9 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "my-bare-pod-terminating",
 						Namespace: "default",
+						Labels: map[string]string{
+							"pod-migration.gke.io/enabled": "true",
+						},
 						Annotations: map[string]string{
 							"pod-migration.gke.io/assigned-pmj": FormatPMJName("my-bare-pod", "12345678"),
 						},
@@ -244,6 +247,9 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "deploy-pod-v1-assigned",
 						Namespace: "default",
+						Labels: map[string]string{
+							"pod-migration.gke.io/enabled": "true",
+						},
 						Annotations: map[string]string{
 							AnnotationAssignedPMJ: "pmj-deploy-pod-v1",
 						},

@@ -252,7 +252,7 @@ func TestPodStatusMutator(t *testing.T) {
 			},
 		},
 		{
-			name: "Pod Succeeded with active PMJ but DeletionTimestamp is nil (Bypasses mutation)",
+			name: "Pod Succeeded with un-started PMJ (Phase blank) allows normal completion",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace:         "default",
