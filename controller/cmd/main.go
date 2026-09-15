@@ -28,6 +28,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import every API group whose types we need to read/write/serialize.
@@ -45,6 +46,7 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/controller"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
+	"github.com/gke-labs/pod-migration/controller/internal/version"
 	pmwebhook "github.com/gke-labs/pod-migration/controller/internal/webhook"
 )
 
@@ -69,6 +71,7 @@ func main() {
 		clientGoQPS          float64
 		clientGoBurst        int
 		maxConcurrent        int
+		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "")
@@ -77,10 +80,25 @@ func main() {
 	flag.Float64Var(&clientGoQPS, "client-go-qps", 500.0, "QPS for client-go REST config")
 	flag.IntVar(&clientGoBurst, "client-go-burst", 1000, "Burst for client-go REST config")
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
+	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version.Get().String())
+		os.Exit(0)
+	}
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	ver := version.Get()
+	setupLog.Info("Starting pod-migration-controller",
+		"version", ver.Version,
+		"commit", ver.GitCommit,
+		"buildDate", ver.BuildDate,
+		"go", ver.GoVersion,
+		"platform", ver.Platform)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).

@@ -571,7 +571,7 @@ func TestPodGateReconciler_mapPMJToPods(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
-				WithObjects(pmj, replacementPod1, replacementPod2, siblingPod).
+		WithObjects(pmj, replacementPod1, replacementPod2, siblingPod).
 		Build()
 
 	r := &PodGateReconciler{

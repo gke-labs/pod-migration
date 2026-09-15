@@ -103,7 +103,7 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
 
 1.  **Build and push the controller image:**
     ```bash
-    docker build -t <YOUR_REGISTRY>/pod-migration-controller:latest -f controller/Dockerfile controller/
+    make -C controller docker-build IMG=<YOUR_REGISTRY>/pod-migration-controller:latest
     docker push <YOUR_REGISTRY>/pod-migration-controller:latest
     ```
 
