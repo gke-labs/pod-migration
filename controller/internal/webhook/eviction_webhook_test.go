@@ -290,6 +290,88 @@ func TestEvictionGate(t *testing.T) {
 			expectedAllowed: true,
 			expectedMessage: "Pod does not use gvisor runtime, skipping migration",
 		},
+		{
+			name: "PMJ in SucceededWithoutRestore allows cold eviction with origin pod alive",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      util.FormatPMJName("test-pod", "test-uid-12345"),
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+					},
+				},
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "migration concluded without restore, falling back to cold eviction",
+		},
+		{
+			name: "PMJ in Failed phase allows cold eviction with origin pod alive",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      util.FormatPMJName("test-pod", "test-uid-12345"),
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseFailed,
+					},
+				},
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "migration concluded without restore, falling back to cold eviction",
+		},
+		{
+			name: "Pod with pdb-eviction-timeout annotation skips re-snapshot and allows eviction",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					Annotations: map[string]string{
+						util.AnnotationPDBEvictionTimeout: "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "skipping migration: prior migration timed out on PDB budget",
+		},
 	}
 
 	for _, tt := range tests {

@@ -653,3 +653,103 @@ func TestFindUnassignedActivePMJ_SingleUseConsumedGuard(t *testing.T) {
 		})
 	}
 }
+
+func TestFindUnassignedActivePMJ_EvictingScaleUpIsolation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	tests := []struct {
+		name            string
+		podName         string
+		parentName      string
+		parentKind      string
+		podTemplateHash string
+		existing        []runtime.Object
+		expected        string
+	}{
+		{
+			name:            "Evicting PMJ with origin pod still alive does NOT match concurrent scale-up pod",
+			podName:         "deploy-pod-scaleup-2",
+			parentName:      "my-deploy",
+			parentKind:      "Deployment",
+			podTemplateHash: "hash-v1",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-deploy-pod-1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:      "my-deploy",
+							LabelParentKind:      "Deployment",
+							LabelPodTemplateHash: "hash-v1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef:       corev1.LocalObjectReference{Name: "deploy-pod-1"},
+						TargetPodUID: "origin-uid-111",
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+					},
+				},
+				// Origin pod still exists (e.g. waiting for PDB budget or drain)
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "deploy-pod-1",
+						Namespace: "default",
+						UID:       "origin-uid-111",
+						Labels: map[string]string{
+							"pod-migration.gke.io/enabled": "true",
+						},
+					},
+				},
+			},
+			expected: "", // Scale-up pod must NOT adopt the PMJ while origin pod is alive!
+		},
+		{
+			name:            "Evicting PMJ with origin pod deleted matches replacement pod",
+			podName:         "deploy-pod-replacement-1",
+			parentName:      "my-deploy",
+			parentKind:      "Deployment",
+			podTemplateHash: "hash-v1",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-deploy-pod-1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:      "my-deploy",
+							LabelParentKind:      "Deployment",
+							LabelPodTemplateHash: "hash-v1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef:       corev1.LocalObjectReference{Name: "deploy-pod-1"},
+						TargetPodUID: "origin-uid-111",
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+					},
+				},
+				// Origin pod is gone (deleted)
+			},
+			expected: "pmj-deploy-pod-1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			ctx := context.Background()
+
+			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.podTemplateHash, "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result != tc.expected {
+				t.Errorf("expected: %q, got: %q", tc.expected, result)
+			}
+		})
+	}
+}
