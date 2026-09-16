@@ -32,7 +32,7 @@ const (
 )
 
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).
-func ResolveParentWorkload(ctx context.Context, c client.Client, pod *corev1.Pod) (string, string, string, error) {
+func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod) (string, string, string, error) {
 	for _, ref := range pod.OwnerReferences {
 		if ref.Kind == "ReplicaSet" {
 			rs := &appsv1.ReplicaSet{}
@@ -72,11 +72,65 @@ func FormatPSMTName(podName, uid string) string {
 }
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string) (string, error) {
-	// Scan pods to find which PMJs are already assigned
+func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string) (string, error) {
+	jobList := &pmv1alpha1.PodMigrationJobList{}
+	err := c.List(ctx, jobList, client.InNamespace(namespace))
+	if err != nil {
+		return "", err
+	}
+
+	var candidates []string
+	for _, job := range jobList.Items {
+		if job.Status.Consumed {
+			continue
+		}
+
+		if parentName == "" {
+			if job.Spec.PodRef.Name != podName || job.Labels[LabelParentName] != "" {
+				continue
+			}
+		} else {
+			if job.Labels[LabelParentName] != parentName ||
+				job.Labels[LabelParentKind] != parentKind {
+				continue
+			}
+
+			if parentUID != "" && job.Labels[LabelParentUID] != "" && job.Labels[LabelParentUID] != parentUID {
+				continue
+			}
+
+			if parentKind == "Deployment" && job.Labels[LabelPodTemplateHash] != podTemplateHash {
+				continue
+			}
+
+			if parentKind == "Job" && jobCompletionIndex != "" && job.Labels[LabelJobCompletionIndex] != jobCompletionIndex {
+				continue
+			}
+
+			if parentKind == "StatefulSet" && job.Spec.PodRef.Name != podName {
+				continue
+			}
+		}
+
+		phase := job.Status.Phase
+		if phase == pmv1alpha1.PodMigrationJobPhasePending ||
+			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
+			phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
+			phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
+			candidates = append(candidates, job.Name)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "", nil // Overwhelmingly common path: no matching active PMJ
+	}
+
+	// Scan opted-in pods to find which PMJs are already assigned.
+	// We use typed PodList with MatchingLabels so the cached client performs an in-memory
+	// filter on the already-running pod informer rather than lazily starting a 2nd metadata watch.
 	assignedPMJs := make(map[string]bool)
 	podList := &corev1.PodList{}
-	err := c.List(ctx, podList, client.InNamespace(namespace))
+	err = c.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{"pod-migration.gke.io/enabled": "true"})
 	if err != nil {
 		return "", err
 	}
@@ -89,61 +143,12 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Client, namespace, po
 		}
 	}
 
-	jobList := &pmv1alpha1.PodMigrationJobList{}
-	err = c.List(ctx, jobList, client.InNamespace(namespace))
-	if err != nil {
-		return "", err
-	}
-
-	// Pick the first active PMJ that is not yet assigned
-	for _, job := range jobList.Items {
-		// Skip already consumed PMJs
-		if job.Status.Consumed {
-			continue
-		}
-
-		if parentName == "" {
-			// Bare Pod: match by origin pod name and absence of parent label
-			if job.Spec.PodRef.Name != podName || job.Labels[LabelParentName] != "" {
-				continue
-			}
-		} else {
-			if job.Labels[LabelParentName] != parentName ||
-				job.Labels[LabelParentKind] != parentKind {
-				continue
-			}
-
-			// Enforce parent workload UID equality to prevent cross-generation resurrection
-			if parentUID != "" && job.Labels[LabelParentUID] != "" && job.Labels[LabelParentUID] != parentUID {
-				continue
-			}
-
-			// For Deployments, enforce pod-template-hash revision match
-			if parentKind == "Deployment" && job.Labels[LabelPodTemplateHash] != podTemplateHash {
-				continue
-			}
-
-			// For Indexed Jobs, enforce job-completion-index ordinal match
-			if parentKind == "Job" && jobCompletionIndex != "" && job.Labels[LabelJobCompletionIndex] != jobCompletionIndex {
-				continue
-			}
-
-			// For StatefulSets, strictly match by exact name
-			if parentKind == "StatefulSet" && job.Spec.PodRef.Name != podName {
-				continue
-			}
-		}
-
-		phase := job.Status.Phase
-		if phase == pmv1alpha1.PodMigrationJobPhasePending ||
-			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
-			phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
-			phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
-			if !assignedPMJs[job.Name] {
-				return job.Name, nil
-			}
+	for _, cand := range candidates {
+		if !assignedPMJs[cand] {
+			return cand, nil
 		}
 	}
+
 	return "", nil
 }
 

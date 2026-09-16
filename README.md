@@ -127,6 +127,15 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
     kubectl rollout status deployment/pod-migration-controller -n pod-migration-system
     ```
 
+> [!IMPORTANT]
+> **Upgrading from Single-Replica to Multi-Replica HA**:
+> The controller runs in High Availability (2 replicas) with active/standby Leader Election enabled by default. When upgrading an existing cluster from the legacy un-elected single-replica deployment, scale down and wait for the old pod to fully terminate before applying the HA manifests:
+> ```bash
+> kubectl scale deployment/pod-migration-controller -n pod-migration-system --replicas=0
+> kubectl wait --for=delete pod -l app=pod-migration-controller -n pod-migration-system --timeout=60s
+> sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
+> ```
+
 ### Step 4: Deploy Validating Policies (Optional)
 To reject incompatible workloads (e.g. BEAM/fsnotify) at admission time:
 ```bash

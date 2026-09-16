@@ -31,8 +31,9 @@ import (
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
 // EvictionGate handles eviction requests and creates PodMigrationJobs.
 type EvictionGate struct {
-	Client  client.Client
-	decoder admission.Decoder
+	Client    client.Client
+	APIReader client.Reader
+	decoder   admission.Decoder
 }
 
 // Handle intercepts eviction requests.
@@ -83,6 +84,10 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	// Check if PodMigrationJob already exists
 	job := &pmv1alpha1.PodMigrationJob{}
 	err = a.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: jobName}, job)
+	if err != nil && apierrors.IsNotFound(err) && a.APIReader != nil {
+		// Cache miss: query the live API server to prevent duplicate PMJ creation across HA replicas
+		err = a.APIReader.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: jobName}, job)
+	}
 	if err == nil {
 		logger.Info("Migration job already exists for current pod instance", "job", jobName, "phase", job.Status.Phase)
 		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
@@ -185,14 +190,15 @@ func (a *EvictionGate) InjectDecoder(d admission.Decoder) error {
 }
 
 // SetupEvictionWebhookWithManager registers the webhook on the manager.
-func SetupEvictionWebhookWithManager(mgr ctrl.Manager) error {
+func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/validate-v1-pod-eviction",
 		&admission.Webhook{
 			Handler: &EvictionGate{
-				Client:  mgr.GetClient(),
-				decoder: dec,
+				Client:    mgr.GetClient(),
+				APIReader: apiReader,
+				decoder:   dec,
 			},
 		},
 	)

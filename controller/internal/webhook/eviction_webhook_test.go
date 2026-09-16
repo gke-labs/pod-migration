@@ -2,16 +2,21 @@ package webhook
 
 import (
 	"context"
+	"net/http"
 	"testing"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -297,7 +302,7 @@ func TestEvictionGate(t *testing.T) {
 			initObjs := append(tt.initObjects, tt.pod)
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).Build()
 
-			handler := &EvictionGate{Client: fakeClient}
+			handler := &EvictionGate{Client: fakeClient, APIReader: fakeClient}
 
 			req := admission.Request{}
 			req.Namespace = tt.pod.Namespace
@@ -357,4 +362,148 @@ func TestEvictionGate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEvictionGate_APIReaderFallback(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "uid1234"
+	gvisorRuntime := "gvisor"
+	jobName := util.FormatPMJName(podName, podUID)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+	}
+
+	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
+		psp := &unstructured.Unstructured{}
+		psp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		psp.SetName(name)
+		psp.SetNamespace(namespace)
+		psp.Object["spec"] = map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      "pod-migration.gke.io/enabled",
+						"operator": "In",
+						"values":   []interface{}{"true"},
+					},
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           triggerType,
+				"postCheckpoint": postCheckpoint,
+			},
+		}
+		psp.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+		return psp
+	}
+
+	psp := createPSP("psp-test-manual", "manual", "stop")
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	}
+
+	t.Run("Cache miss with live hit", func(t *testing.T) {
+		// Omit PMJ from fakeClient (simulating cache lag), but include in fakeAPIReader
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+		fakeAPIReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp, pmj).Build()
+
+		handler := &EvictionGate{
+			Client:    fakeClient,
+			APIReader: fakeAPIReader,
+		}
+
+		resp := handler.Handle(context.Background(), req)
+		if resp.Allowed {
+			t.Fatalf("Expected eviction to be denied (429), got allowed")
+		}
+		if resp.Result == nil || resp.Result.Code != http.StatusTooManyRequests {
+			t.Fatalf("Expected status code 429, got: %+v", resp.Result)
+		}
+		expectedMsg := "migration job in progress: status " + string(pmv1alpha1.PodMigrationJobPhaseSnapshotting)
+		if resp.Result.Message != expectedMsg {
+			t.Errorf("Expected message %q, got %q", expectedMsg, resp.Result.Message)
+		}
+
+		// Verify no duplicate PMJ was created in fakeClient
+		pmjInClient := &pmv1alpha1.PodMigrationJob{}
+		err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: jobName}, pmjInClient)
+		if err == nil || !apierrors.IsNotFound(err) {
+			t.Errorf("Expected PMJ to not exist in Client cache, got err: %v", err)
+		}
+	})
+
+	t.Run("Create race condition with IsAlreadyExists", func(t *testing.T) {
+		clientWithRace := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*pmv1alpha1.PodMigrationJob); ok {
+					return apierrors.NewAlreadyExists(schema.GroupResource{Group: "podmigration.gke.io", Resource: "podmigrationjobs"}, obj.GetName())
+				}
+				return client.Create(ctx, obj, opts...)
+			},
+		}).Build()
+
+		handler := &EvictionGate{
+			Client:    clientWithRace,
+			APIReader: clientWithRace,
+		}
+
+		resp := handler.Handle(context.Background(), req)
+		if resp.Allowed {
+			t.Fatalf("Expected eviction to be denied (429), got allowed")
+		}
+		if resp.Result == nil || resp.Result.Code != http.StatusTooManyRequests {
+			t.Fatalf("Expected status code 429, got: %+v", resp.Result)
+		}
+		expectedMsg := "migration job already exists, retrying"
+		if resp.Result.Message != expectedMsg {
+			t.Errorf("Expected message %q, got %q", expectedMsg, resp.Result.Message)
+		}
+	})
 }

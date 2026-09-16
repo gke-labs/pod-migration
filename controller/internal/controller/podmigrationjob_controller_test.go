@@ -108,6 +108,17 @@ func TestPodMigrationJobReconciler_Pending(t *testing.T) {
 		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSnapshotting, updatedPMJ.Status.Phase)
 	}
 
+	// Second reconcile: in Snapshotting phase, calls EnsureTrigger to create PSMT
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Second reconcile failed: %v", err)
+	}
+
 	// Verify PodSnapshotManualTrigger was created
 	triggerName := util.FormatPSMTName(podName, podUID)
 	trigger := &unstructured.Unstructured{}
@@ -234,6 +245,17 @@ func TestPodMigrationJobReconciler_Pending_WithPVs(t *testing.T) {
 
 	if len(updatedPMJ.Status.PVsToDetach) != 1 || updatedPMJ.Status.PVsToDetach[0] != pvName {
 		t.Errorf("Expected PVsToDetach to contain %q, got %v", pvName, updatedPMJ.Status.PVsToDetach)
+	}
+
+	// Second reconcile: in Snapshotting phase, calls EnsureTrigger to create PSMT
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Second reconcile failed: %v", err)
 	}
 
 	// Verify trigger IS created
@@ -602,6 +624,7 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 			Scheme: scheme,
 		}
 
+		// First reconcile: Pending -> Snapshotting
 		res, err := r.Reconcile(context.Background(), ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: namespace,
@@ -612,17 +635,31 @@ func TestPodMigrationJobReconciler_Pending_StaleTrigger(t *testing.T) {
 			t.Fatalf("Reconcile failed: %v", err)
 		}
 		if !res.Requeue {
+			t.Errorf("Expected reconcile to requeue after transition to Snapshotting, got res: %+v", res)
+		}
+
+		// Second reconcile: in Snapshotting phase, EnsureTrigger deletes stale trigger and requeues
+		res, err = r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      jobName,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Second reconcile failed: %v", err)
+		}
+		if !res.Requeue {
 			t.Errorf("Expected reconcile to requeue after deleting stale trigger, got res: %+v", res)
 		}
 
-		// Verify PMJ remains in Pending until stale trigger is recreated
+		// Verify PMJ remains in Snapshotting until stale trigger is recreated
 		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
 		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
 		if err != nil {
 			t.Fatalf("Failed to get PMJ: %v", err)
 		}
-		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
-			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhasePending, updatedPMJ.Status.Phase)
+		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSnapshotting, updatedPMJ.Status.Phase)
 		}
 
 		// Verify stale trigger was deleted
@@ -754,6 +791,7 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:         namespace,
 				Name:              jobName,
+				UID:               "job-uid",
 				CreationTimestamp: metav1.Now(),
 			},
 			Spec: pmv1alpha1.PodMigrationJobSpec{
@@ -775,6 +813,16 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 		})
 		trigger.SetName(triggerName)
 		trigger.SetNamespace(namespace)
+		isController := true
+		trigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        pmj.UID,
+				Controller: &isController,
+			},
+		})
 		trigger.Object["status"] = map[string]interface{}{
 			"snapshotCreated": map[string]interface{}{
 				"name": "my-snap",
@@ -835,6 +883,28 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 		if updatedPMJ.Status.SnapshotRef != "my-snap" {
 			t.Errorf("Expected SnapshotRef to be 'my-snap', got '%s'", updatedPMJ.Status.SnapshotRef)
 		}
+
+		// Reconcile again in PhaseEvicting to execute the idempotent Cleanup
+		_, err = r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      jobName,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile in Evicting phase failed: %v", err)
+		}
+
+		cleanedTrigger := &unstructured.Unstructured{}
+		cleanedTrigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, cleanedTrigger)
+		if err == nil || !apierrors.IsNotFound(err) {
+			t.Errorf("Expected PSMT trigger to be cleaned up proactively upon snapshot completion, got error: %v", err)
+		}
 	})
 
 	t.Run("Test Case 2 (Isolation)", func(t *testing.T) {
@@ -846,6 +916,7 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:         namespace,
 				Name:              jobName,
+				UID:               "job-uid",
 				CreationTimestamp: metav1.Now(),
 			},
 			Spec: pmv1alpha1.PodMigrationJobSpec{
@@ -867,6 +938,16 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 		})
 		trigger.SetName(triggerName)
 		trigger.SetNamespace(namespace)
+		isController := true
+		trigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        pmj.UID,
+				Controller: &isController,
+			},
+		})
 		trigger.Object["status"] = map[string]interface{}{
 			"snapshotCreated": map[string]interface{}{
 				"name": "new-snap",
@@ -955,6 +1036,7 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:         namespace,
 				Name:              jobName,
+				UID:               "job-uid",
 				CreationTimestamp: metav1.Now(),
 			},
 			Spec: pmv1alpha1.PodMigrationJobSpec{
@@ -976,6 +1058,16 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 		})
 		trigger.SetName(triggerName)
 		trigger.SetNamespace(namespace)
+		isController := true
+		trigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        pmj.UID,
+				Controller: &isController,
+			},
+		})
 		trigger.Object["status"] = map[string]interface{}{
 			"conditions": []interface{}{
 				map[string]interface{}{
@@ -1037,6 +1129,7 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:         namespace,
 				Name:              jobName,
+				UID:               "job-uid",
 				CreationTimestamp: metav1.Now(),
 			},
 			Spec: pmv1alpha1.PodMigrationJobSpec{
@@ -1058,6 +1151,16 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 		})
 		trigger.SetName(triggerName)
 		trigger.SetNamespace(namespace)
+		isController := true
+		trigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        pmj.UID,
+				Controller: &isController,
+			},
+		})
 		trigger.Object["status"] = map[string]interface{}{
 			"snapshotCreated": map[string]interface{}{
 				"name": "failed-snap",
