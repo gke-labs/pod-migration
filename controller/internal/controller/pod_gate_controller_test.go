@@ -1009,6 +1009,14 @@ func TestPodGateReconciler_Reconcile_AlreadyConsumedPMJ_ReleasesGateWithColdStar
 		},
 	}
 
+	winnerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-winner",
+			UID:       "uid-winner",
+		},
+	}
+
 	pmj := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
@@ -1018,10 +1026,11 @@ func TestPodGateReconciler_Reconcile_AlreadyConsumedPMJ_ReleasesGateWithColdStar
 			PodRef: corev1.LocalObjectReference{Name: "pod-orig"},
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceeded,
-			SnapshotRef:    "snapshot-ref",
-			Consumed:       true,
-			RestoredPodUID: "uid-winner",
+			Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			SnapshotRef:     "snapshot-ref",
+			Consumed:        true,
+			RestoredPodUID:  "uid-winner",
+			RestoredPodName: "pod-winner",
 		},
 	}
 
@@ -1029,7 +1038,7 @@ func TestPodGateReconciler_Reconcile_AlreadyConsumedPMJ_ReleasesGateWithColdStar
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(loserPod, pmj).
+		WithObjects(loserPod, winnerPod, pmj).
 		Build()
 
 	r := &PodGateReconciler{
@@ -1147,5 +1156,387 @@ func TestPodGateReconciler_Reconcile_RecordsRestoredPodNameAndUID(t *testing.T) 
 	}
 	if updatedPMJ.Status.RestoredPodName != podName {
 		t.Errorf("expected PMJ RestoredPodName == %q, got %q", podName, updatedPMJ.Status.RestoredPodName)
+	}
+}
+
+func TestPodGateReconciler_Reconcile_StrandedPMJ_RecoversAndAdopts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-stranded"
+
+	candidatePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-candidate",
+			UID:       "uid-candidate",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	// PMJ was previously marked Consumed by a pod that has since died/disappeared
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "pod-orig"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-valid-123",
+			Consumed:        true,
+			RestoredPodUID:  "uid-dead-consumer",
+			RestoredPodName: "pod-dead-consumer",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(candidatePod, pmj). // dead consumer pod is NOT in objects
+		Build()
+
+	r := &PodGateReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      "pod-candidate",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify candidate pod was ungated and adopted the snapshot
+	updatedPod := &corev1.Pod{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "pod-candidate"}, updatedPod)
+	if err != nil {
+		t.Fatalf("failed to fetch updated candidate pod: %v", err)
+	}
+
+	for _, gate := range updatedPod.Spec.SchedulingGates {
+		if gate.Name == "gke.io/pod-migration-gate" {
+			t.Error("expected scheduling gate to be removed from candidate pod")
+		}
+	}
+
+	if val := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]; val != "snapshot-valid-123" {
+		t.Errorf("expected ps-name annotation %q, got %q", "snapshot-valid-123", val)
+	}
+
+	// Verify PMJ was recovered and adopted by candidate pod
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("failed to fetch updated PMJ: %v", err)
+	}
+
+	if !updatedPMJ.Status.Consumed {
+		t.Errorf("expected PMJ Consumed to be true, got false")
+	}
+	if updatedPMJ.Status.RestoredPodUID != "uid-candidate" {
+		t.Errorf("expected PMJ RestoredPodUID == %q, got %q", "uid-candidate", updatedPMJ.Status.RestoredPodUID)
+	}
+	if updatedPMJ.Status.RestoredPodName != "pod-candidate" {
+		t.Errorf("expected PMJ RestoredPodName == %q, got %q", "pod-candidate", updatedPMJ.Status.RestoredPodName)
+	}
+}
+
+func TestPodGateReconciler_Reconcile_StrandedPMJ_TerminatingConsumerRecovers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-stranded-terminating"
+
+	candidatePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-candidate",
+			UID:       "uid-candidate",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	// Prior consumer exists, but is terminating (DeletionTimestamp is set)
+	now := metav1.Now()
+	terminatingConsumer := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "pod-terminating",
+			UID:               "uid-terminating",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"test.gke.io/protect"},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "pod-orig"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-term-123",
+			Consumed:        true,
+			RestoredPodUID:  "uid-terminating",
+			RestoredPodName: "pod-terminating",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(candidatePod, terminatingConsumer, pmj).
+		Build()
+
+	r := &PodGateReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      "pod-candidate",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify candidate pod was ungated and adopted the snapshot
+	updatedPod := &corev1.Pod{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "pod-candidate"}, updatedPod)
+	if err != nil {
+		t.Fatalf("failed to fetch updated candidate pod: %v", err)
+	}
+
+	if val := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]; val != "snapshot-term-123" {
+		t.Errorf("expected ps-name annotation %q, got %q", "snapshot-term-123", val)
+	}
+
+	// Verify PMJ was recovered and adopted by candidate pod
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("failed to fetch updated PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.RestoredPodUID != "uid-candidate" {
+		t.Errorf("expected PMJ RestoredPodUID == %q, got %q", "uid-candidate", updatedPMJ.Status.RestoredPodUID)
+	}
+}
+
+func TestPodGateReconciler_Reconcile_StrandedPMJ_UIDMismatchRecovers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-stranded-mismatch"
+
+	candidatePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-candidate",
+			UID:       "uid-candidate",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	// Pod with same name exists, but UID is different (recreated pod instance)
+	recreatedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-prior",
+			UID:       "uid-different-instance",
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "pod-orig"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-mismatch-123",
+			Consumed:        true,
+			RestoredPodUID:  "uid-original-instance",
+			RestoredPodName: "pod-prior",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(candidatePod, recreatedPod, pmj).
+		Build()
+
+	r := &PodGateReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      "pod-candidate",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify candidate pod was ungated and adopted the snapshot
+	updatedPod := &corev1.Pod{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "pod-candidate"}, updatedPod)
+	if err != nil {
+		t.Fatalf("failed to fetch updated candidate pod: %v", err)
+	}
+
+	if val := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]; val != "snapshot-mismatch-123" {
+		t.Errorf("expected ps-name annotation %q, got %q", "snapshot-mismatch-123", val)
+	}
+
+	// Verify PMJ was recovered and adopted by candidate pod
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("failed to fetch updated PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.RestoredPodUID != "uid-candidate" {
+		t.Errorf("expected PMJ RestoredPodUID == %q, got %q", "uid-candidate", updatedPMJ.Status.RestoredPodUID)
+	}
+}
+
+func TestPodGateReconciler_Reconcile_StrandedPMJ_EmptyRestoredPodNameRecovers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-stranded-noname"
+
+	candidatePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-candidate",
+			UID:       "uid-candidate",
+			Annotations: map[string]string{
+				"pod-migration.gke.io/assigned-pmj": pmjName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+		},
+	}
+
+	// Legacy status: RestoredPodName is empty, RestoredPodUID is set to non-existent pod
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "pod-orig"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:    "snapshot-noname-123",
+			Consumed:       true,
+			RestoredPodUID: "uid-dead-no-name",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(candidatePod, pmj).
+		Build()
+
+	r := &PodGateReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      "pod-candidate",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify candidate pod was ungated and adopted the snapshot
+	updatedPod := &corev1.Pod{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "pod-candidate"}, updatedPod)
+	if err != nil {
+		t.Fatalf("failed to fetch updated candidate pod: %v", err)
+	}
+
+	if val := updatedPod.Annotations["podsnapshot.gke.io/ps-name"]; val != "snapshot-noname-123" {
+		t.Errorf("expected ps-name annotation %q, got %q", "snapshot-noname-123", val)
+	}
+
+	// Verify PMJ was recovered and adopted by candidate pod
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("failed to fetch updated PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.RestoredPodUID != "uid-candidate" {
+		t.Errorf("expected PMJ RestoredPodUID == %q, got %q", "uid-candidate", updatedPMJ.Status.RestoredPodUID)
 	}
 }
