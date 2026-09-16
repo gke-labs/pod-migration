@@ -15,10 +15,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
+
+// StorageCleanupFinalizer is the finalizer added to PodMigration resources
+// to ensure cluster-scoped PodSnapshotStorageConfig and associated policies are
+// cleaned up when the PodMigration CR is deleted.
+const StorageCleanupFinalizer = "podmigration.gke.io/storage-cleanup"
 
 // PodMigrationReconciler reconciles a PodMigration object.
 type PodMigrationReconciler struct {
@@ -28,6 +34,7 @@ type PodMigrationReconciler struct {
 
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch;delete
 
@@ -44,6 +51,33 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		logger.Error(err, "Failed to get PodMigration config")
 		return ctrl.Result{}, err
+	}
+
+	// Examine DeletionTimestamp to determine if object is under deletion
+	if !config.ObjectMeta.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
+			logger.Info("Cleaning up storage config and policy before deletion", "name", config.Name, "namespace", config.Namespace)
+			if err := r.deleteStorageResources(ctx, req.Namespace, req.Name); err != nil {
+				logger.Error(err, "Failed to clean up storage resources during finalization")
+				return ctrl.Result{}, err
+			}
+
+			controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
+			if err := r.Update(ctx, config); err != nil {
+				logger.Error(err, "Failed to remove finalizer from PodMigration")
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Ensure finalizer is present
+	if !controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
+		controllerutil.AddFinalizer(config, StorageCleanupFinalizer)
+		if err := r.Update(ctx, config); err != nil {
+			logger.Error(err, "Failed to add finalizer to PodMigration")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Parse bucket and path from GCS URL (gs://bucket/path)
@@ -71,9 +105,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Hash-based unique name for cluster-scoped PSSC to prevent namespace conflicts
-	h := sha256.New()
-	h.Write([]byte(fmt.Sprintf("%s/%s", req.Namespace, req.Name)))
-	psscName := fmt.Sprintf("pssc-%s", hex.EncodeToString(h.Sum(nil))[:16])
+	psscName := getPSSCName(req.Namespace, req.Name)
 
 	// 1. Reconcile PodSnapshotStorageConfig (Cluster-scoped)
 	pssc := &unstructured.Unstructured{}
@@ -105,7 +137,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// 3. Reconcile PodSnapshotPolicy for manual (Namespaced)
-	pspManualName := fmt.Sprintf("psp-%s-manual", req.Name)
+	pspManualName := getPSPManualName(req.Name)
 	pspManual := &unstructured.Unstructured{}
 	pspManual.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "podsnapshot.gke.io",
@@ -155,6 +187,47 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func getPSSCName(namespace, name string) string {
+	h := sha256.New()
+	h.Write([]byte(fmt.Sprintf("%s/%s", namespace, name)))
+	return fmt.Sprintf("pssc-%s", hex.EncodeToString(h.Sum(nil))[:16])
+}
+
+func getPSPManualName(name string) string {
+	return fmt.Sprintf("psp-%s-manual", name)
+}
+
+func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, namespace, name string) error {
+	// 1. Delete cluster-scoped PodSnapshotStorageConfig
+	psscName := getPSSCName(namespace, name)
+	pssc := &unstructured.Unstructured{}
+	pssc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotStorageConfig",
+	})
+	pssc.SetName(psscName)
+	if err := r.Delete(ctx, pssc); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete PodSnapshotStorageConfig %s: %w", psscName, err)
+	}
+
+	// 2. Delete namespaced PodSnapshotPolicy (manual)
+	pspManualName := getPSPManualName(name)
+	pspManual := &unstructured.Unstructured{}
+	pspManual.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	pspManual.SetName(pspManualName)
+	pspManual.SetNamespace(namespace)
+	if err := r.Delete(ctx, pspManual); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete PodSnapshotPolicy %s: %w", pspManualName, err)
+	}
+
+	return nil
 }
 
 func (r *PodMigrationReconciler) syncResource(ctx context.Context, obj *unstructured.Unstructured) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
@@ -328,5 +330,213 @@ func TestPodMigrationReconciler_Reconcile_InvalidGCSPath(t *testing.T) {
 	}
 	if cond.Reason != "InvalidStorageLocation" {
 		t.Errorf("Expected reason InvalidStorageLocation, got %s", cond.Reason)
+	}
+}
+
+func TestPodMigrationReconciler_Finalizer_AddedOnReconcile(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	configName := "test-finalizer-add"
+
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  namespace,
+			Name:       configName,
+			Generation: 1,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://my-test-bucket/snapshots",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      configName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedConfig := &pmv1alpha1.PodMigration{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, updatedConfig)
+	if err != nil {
+		t.Fatalf("Failed to get updated config: %v", err)
+	}
+
+	if !controllerutil.ContainsFinalizer(updatedConfig, StorageCleanupFinalizer) {
+		t.Errorf("Expected finalizer %s to be added to PodMigration, got %v", StorageCleanupFinalizer, updatedConfig.Finalizers)
+	}
+}
+
+func TestPodMigrationReconciler_Finalizer_CleansUpStorageResourcesOnDelete(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "prod-ns"
+	configName := "migration-to-delete"
+
+	now := metav1.Now()
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              configName,
+			Generation:        1,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{StorageCleanupFinalizer},
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://my-test-bucket/snapshots",
+			},
+		},
+	}
+
+	psscName := getPSSCName(namespace, configName)
+	pssc := &unstructured.Unstructured{}
+	pssc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotStorageConfig",
+	})
+	pssc.SetName(psscName)
+
+	pspName := getPSPManualName(configName)
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	psp.SetName(pspName)
+	psp.SetNamespace(namespace)
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config, pssc, psp).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      configName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile deletion failed: %v", err)
+	}
+
+	// 1. Verify cluster-scoped PSSC was deleted
+	checkPSSC := &unstructured.Unstructured{}
+	checkPSSC.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotStorageConfig",
+	})
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: psscName}, checkPSSC)
+	if err == nil {
+		t.Errorf("Expected PSSC %s to be deleted, but it still exists", psscName)
+	}
+
+	// 2. Verify namespaced PSP was deleted
+	checkPSP := &unstructured.Unstructured{}
+	checkPSP.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pspName}, checkPSP)
+	if err == nil {
+		t.Errorf("Expected PSP %s in namespace %s to be deleted, but it still exists", pspName, namespace)
+	}
+
+	// 3. Verify finalizer was removed and PodMigration was deleted by the API server
+	updatedConfig := &pmv1alpha1.PodMigration{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, updatedConfig)
+	if err == nil {
+		if controllerutil.ContainsFinalizer(updatedConfig, StorageCleanupFinalizer) {
+			t.Errorf("Expected finalizer %s to be removed, but still found in %v", StorageCleanupFinalizer, updatedConfig.Finalizers)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("Unexpected error getting updated config: %v", err)
+	}
+}
+
+func TestPodMigrationReconciler_Finalizer_IdempotentWhenAlreadyDeleted(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	configName := "already-deleted"
+
+	now := metav1.Now()
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              configName,
+			Generation:        1,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{StorageCleanupFinalizer},
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://my-test-bucket/snapshots",
+			},
+		},
+	}
+
+	// Fake client without PSSC or PSP (already gone)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      configName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile should succeed when storage resources are already gone: %v", err)
+	}
+
+	// Verify finalizer removal led to deletion
+	updatedConfig := &pmv1alpha1.PodMigration{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, updatedConfig)
+	if err == nil {
+		if controllerutil.ContainsFinalizer(updatedConfig, StorageCleanupFinalizer) {
+			t.Errorf("Expected finalizer to be removed even if storage resources were not found")
+		}
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("Unexpected error getting config: %v", err)
 	}
 }
