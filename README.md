@@ -324,6 +324,21 @@ pod/pm-valkey-0 condition met
 
 ## 7. Troubleshooting & Cleanup
 
+### PodMigration Storage Cleanup Finalizer & Clean Undeploy
+
+`PodMigration` resources use the `podmigration.gke.io/storage-cleanup` finalizer to ensure that cluster-scoped `PodSnapshotStorageConfig` (PSSC) and namespaced `PodSnapshotPolicy` (PSP) resources are cleanly deleted when a `PodMigration` CR is deleted. The finalizer also verifies whether any active migrations (`PodMigrationJob` resources in non-terminal phases) are running in the namespace, postponing deletion until in-flight jobs reach a terminal state (`Succeeded`, `SucceededWithoutRestore`, or `Failed`).
+
+When undeploying the controller, `PodMigration` custom resources must be deleted while the controller is still running so it can process the finalizer:
+```bash
+# make undeploy handles this automatically by deleting PodMigration CRs first:
+make -C controller undeploy
+```
+
+If the controller is deleted before the custom resources, `PodMigration` objects will wedge in `Terminating` and block CRD deletion. To manually unwedge:
+```bash
+kubectl patch podmigration <name> -n <namespace> --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]'
+```
+
 ### Bypassing GKE Validating Admission Policy for Snapshot Cleanup
 
 GKE enforces a ValidatingAdmissionPolicy (`gke-pod-snapshot-validating-admission-policy`) that prevents manual edits to `podsnapshots` by anyone other than the GKE snapshot controller and agent. This blocks users from manually removing finalizers from stuck `podsnapshots` (e.g. when GCS upload fails or during test resets).

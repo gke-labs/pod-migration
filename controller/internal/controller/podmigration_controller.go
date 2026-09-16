@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -35,18 +36,19 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations/finalizers,verbs=update
+// +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile coordinates the PSSC and PSP translation.
 func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch PodMigration config
+	// Fetch the PodMigration instance
 	config := &pmv1alpha1.PodMigration{}
 	err := r.Get(ctx, req.NamespacedName, config)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			logger.Info("PodMigration resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get PodMigration config")
@@ -56,6 +58,35 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Examine DeletionTimestamp to determine if object is under deletion
 	if !config.ObjectMeta.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
+			// Check if any in-flight migrations are running in this namespace before deleting storage config
+			var pmjList pmv1alpha1.PodMigrationJobList
+			if err := r.List(ctx, &pmjList, client.InNamespace(req.Namespace)); err != nil {
+				logger.Error(err, "Failed to list PodMigrationJobs during finalization")
+				return ctrl.Result{}, err
+			}
+
+			var inFlight []string
+			for _, pmj := range pmjList.Items {
+				switch pmj.Status.Phase {
+				case pmv1alpha1.PodMigrationJobPhaseSucceeded,
+					pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+					pmv1alpha1.PodMigrationJobPhaseFailed:
+					// Terminal state: safe to ignore
+					continue
+				default:
+					inFlight = append(inFlight, pmj.Name)
+				}
+			}
+
+			if len(inFlight) > 0 {
+				logger.Info("Postponing storage resource cleanup: active migrations in flight in namespace",
+					"name", config.Name,
+					"namespace", config.Namespace,
+					"inFlightCount", len(inFlight),
+					"jobs", inFlight)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
 			logger.Info("Cleaning up storage config and policy before deletion", "name", config.Name, "namespace", config.Namespace)
 			if err := r.deleteStorageResources(ctx, req.Namespace, req.Name); err != nil {
 				logger.Error(err, "Failed to clean up storage resources during finalization")
@@ -136,7 +167,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// 3. Reconcile PodSnapshotPolicy for manual (Namespaced)
+	// 2. Reconcile PodSnapshotPolicy for manual (Namespaced)
 	pspManualName := getPSPManualName(req.Name)
 	pspManual := &unstructured.Unstructured{}
 	pspManual.SetGroupVersionKind(schema.GroupVersionKind{
@@ -200,6 +231,9 @@ func getPSPManualName(name string) string {
 }
 
 func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, namespace, name string) error {
+	// Note: Clusters predating PR #5 might still have a legacy psp-<name>-on-delete
+	// policy that is not tracked or deleted here.
+
 	// 1. Delete cluster-scoped PodSnapshotStorageConfig
 	psscName := getPSSCName(namespace, name)
 	pssc := &unstructured.Unstructured{}
