@@ -16,14 +16,15 @@ import (
 )
 
 const (
-	LabelParentName         = "pod-migration.gke.io/parent-name"
-	LabelParentKind         = "pod-migration.gke.io/parent-kind"
-	LabelParentUID          = "pod-migration.gke.io/parent-uid"
-	LabelPodTemplateHash    = "pod-migration.gke.io/pod-template-hash"
-	LabelJobCompletionIndex = batchv1.JobCompletionIndexAnnotation
-	LabelOriginPodName      = "pod-migration.gke.io/origin-pod-name"
-	AnnotationAssignedPMJ   = "pod-migration.gke.io/assigned-pmj"
-	AnnotationMismatchSince = "pod-migration.gke.io/mismatch-since"
+	LabelParentName              = "pod-migration.gke.io/parent-name"
+	LabelParentKind              = "pod-migration.gke.io/parent-kind"
+	LabelParentUID               = "pod-migration.gke.io/parent-uid"
+	LabelPodTemplateHash         = "pod-migration.gke.io/pod-template-hash"
+	LabelJobCompletionIndex      = batchv1.JobCompletionIndexAnnotation
+	LabelOriginPodName           = "pod-migration.gke.io/origin-pod-name"
+	AnnotationAssignedPMJ        = "pod-migration.gke.io/assigned-pmj"
+	AnnotationMismatchSince      = "pod-migration.gke.io/mismatch-since"
+	AnnotationPDBEvictionTimeout = "pod-migration.gke.io/pdb-eviction-timeout"
 
 	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
 	// in their assigned-pmj annotation.  Registered at manager startup via
@@ -79,7 +80,7 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 		return "", err
 	}
 
-	var candidates []string
+	var candidates []pmv1alpha1.PodMigrationJob
 	for _, job := range jobList.Items {
 		if job.Status.Consumed {
 			continue
@@ -117,7 +118,7 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 			phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
 			phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
-			candidates = append(candidates, job.Name)
+			candidates = append(candidates, job)
 		}
 	}
 
@@ -125,10 +126,12 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 		return "", nil // Overwhelmingly common path: no matching active PMJ
 	}
 
-	// Scan opted-in pods to find which PMJs are already assigned.
+	// Scan opted-in pods to find which PMJs are already assigned and track existing pod UIDs and names.
 	// We use typed PodList with MatchingLabels so the cached client performs an in-memory
 	// filter on the already-running pod informer rather than lazily starting a 2nd metadata watch.
 	assignedPMJs := make(map[string]bool)
+	existingPodUIDs := make(map[string]bool)
+	existingPodNames := make(map[string]bool)
 	podList := &corev1.PodList{}
 	err = c.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{"pod-migration.gke.io/enabled": "true"})
 	if err != nil {
@@ -136,6 +139,8 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 	}
 
 	for _, p := range podList.Items {
+		existingPodUIDs[string(p.UID)] = true
+		existingPodNames[p.Name] = true
 		if p.Annotations != nil {
 			if pmjName, ok := p.Annotations[AnnotationAssignedPMJ]; ok {
 				assignedPMJs[pmjName] = true
@@ -143,9 +148,23 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 		}
 	}
 
-	for _, cand := range candidates {
-		if !assignedPMJs[cand] {
-			return cand, nil
+	for _, job := range candidates {
+		// Narrowing for scale-up race: don't match Evicting-phase PMJs whose origin pod still exists.
+		// If the origin pod is still alive, any newly arriving candidate pod is a concurrent scale-up.
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+			originExists := false
+			if job.Spec.TargetPodUID != "" {
+				originExists = existingPodUIDs[job.Spec.TargetPodUID]
+			} else if job.Spec.PodRef.Name != "" {
+				originExists = existingPodNames[job.Spec.PodRef.Name]
+			}
+			if originExists {
+				continue
+			}
+		}
+
+		if !assignedPMJs[job.Name] {
+			return job.Name, nil
 		}
 	}
 

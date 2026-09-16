@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -3114,13 +3115,185 @@ func TestPodMigrationJobReconciler_Evicting_DeletionTimestamp_SkipsEvictionCall(
 	}
 }
 
-func TestPodMigrationJobReconciler_Evicting_Timeout_PreservesDurableSnapshot(t *testing.T) {
+func TestPodMigrationJobReconciler_Evicting_500InternalServerError_SetsEvictionMisconfigured(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "misconfigured-pod"
+	podUID := "uid-misconfig-123"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": time.Now().Add(-35 * time.Second).Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+				if subResourceName == "eviction" {
+					return apierrors.NewInternalError(fmt.Errorf("multiple conflicting PDBs covering pod"))
+				}
+				return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+			},
+		}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 5*time.Second {
+		t.Errorf("Expected RequeueAfter 5s on 500 error, got %v", res.RequeueAfter)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "EvictionMisconfigured")
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "MultiplePDBsOrInternalError" {
+		t.Errorf("Expected EvictionMisconfigured condition True/MultiplePDBsOrInternalError, got: %+v", cond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_SuccessAfter429_ClearsBlockedByPDB(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "recovering-pod"
+	podUID := "uid-recovering-123"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": time.Now().Add(-35 * time.Second).Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "BlockedByPDB",
+					Status:             metav1.ConditionTrue,
+					Reason:             "PDBBudgetExhausted",
+					Message:            "Prior 429",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+				if subResourceName == "eviction" {
+					return nil // Success
+				}
+				return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+			},
+		}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 2*time.Second {
+		t.Errorf("Expected RequeueAfter 2s on eviction success, got %v", res.RequeueAfter)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "BlockedByPDB")
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "EvictionInitiated" {
+		t.Errorf("Expected BlockedByPDB condition False/EvictionInitiated, got: %+v", cond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_Timeout_PDBBlocked_ConcludesSucceededWithoutRestore(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
 
 	namespace := "default"
+	podName := "my-pdb-pod"
 	jobName := "pmj-timeout-pdb"
+
+	originPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-my-pod",
+		},
+	}
 
 	pmj := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3129,12 +3302,162 @@ func TestPodMigrationJobReconciler_Evicting_Timeout_PreservesDurableSnapshot(t *
 			CreationTimestamp: metav1.Time{Time: time.Now().Add(-15 * time.Minute)},
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
-			PodRef:       corev1.LocalObjectReference{Name: "my-pod"},
+			PodRef:       corev1.LocalObjectReference{Name: podName},
 			TargetPodUID: "uid-my-pod",
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
 			SnapshotRef: "durable-snap-xyz",
+			Conditions: []metav1.Condition{
+				{
+					Type:               "BlockedByPDB",
+					Status:             metav1.ConditionTrue,
+					Reason:             "PDBBudgetExhausted",
+					Message:            "Waiting for budget",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(originPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Errorf("Expected Phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, updatedPMJ.Status.Phase)
+	}
+	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Status != metav1.ConditionTrue || readyCond.Reason != "PDBEvictionTimeout" {
+		t.Errorf("Expected Ready condition True/PDBEvictionTimeout, got %+v", readyCond)
+	}
+
+	// Verify origin pod was annotated to prevent re-snapshot churn
+	updatedPod := &corev1.Pod{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: podName}, updatedPod); err != nil {
+		t.Fatalf("Failed to get updated origin pod: %v", err)
+	}
+	if updatedPod.Annotations[util.AnnotationPDBEvictionTimeout] != "true" {
+		t.Errorf("Expected origin pod to have annotation %s=true, got: %v", util.AnnotationPDBEvictionTimeout, updatedPod.Annotations)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_Timeout_EvictionMisconfigured_ConcludesSucceededWithoutRestore(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "my-misconfig-pod"
+	jobName := "pmj-timeout-misconfig"
+
+	originPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-misconfig-pod",
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Time{Time: time.Now().Add(-15 * time.Minute)},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-misconfig-pod",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			SnapshotRef: "durable-snap-xyz",
+			Conditions: []metav1.Condition{
+				{
+					Type:               "EvictionMisconfigured",
+					Status:             metav1.ConditionTrue,
+					Reason:             "MultiplePDBsOrInternalError",
+					Message:            "Multiple conflicting PDBs",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(originPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Errorf("Expected Phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, updatedPMJ.Status.Phase)
+	}
+	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Status != metav1.ConditionTrue || readyCond.Reason != "EvictionMisconfiguredTimeout" {
+		t.Errorf("Expected Ready condition True/EvictionMisconfiguredTimeout, got %+v", readyCond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_Timeout_NoBlockage_ConcludesFailed(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "my-generic-timeout-pod"
+	jobName := "pmj-timeout-generic"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Time{Time: time.Now().Add(-15 * time.Minute)},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-generic-pod",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			SnapshotRef: "durable-snap-xyz",
+			// No BlockedByPDB or EvictionMisconfigured condition
 		},
 	}
 
@@ -3161,10 +3484,11 @@ func TestPodMigrationJobReconciler_Evicting_Timeout_PreservesDurableSnapshot(t *
 		t.Fatalf("Failed to get updated PMJ: %v", err)
 	}
 
-	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
-		t.Errorf("Expected Phase %s to preserve snapshot, got %s", pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, updatedPMJ.Status.Phase)
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected Phase %s on generic eviction timeout, got %s", pmv1alpha1.PodMigrationJobPhaseFailed, updatedPMJ.Status.Phase)
 	}
-	if updatedPMJ.Status.SnapshotRef != "durable-snap-xyz" {
-		t.Errorf("Expected SnapshotRef to be preserved, got %s", updatedPMJ.Status.SnapshotRef)
+	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != "Timeout" {
+		t.Errorf("Expected Ready condition False/Timeout, got %+v", readyCond)
 	}
 }
