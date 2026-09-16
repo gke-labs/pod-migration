@@ -178,11 +178,25 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 
-		if job.Status.Consumed && job.Status.RestoredPodUID != "" && job.Status.RestoredPodUID != string(pod.UID) {
-			logger.Info("Assigned PMJ was already consumed by a different pod, releasing gate with cold-start bypass",
-				"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
-			r.releaseWithColdStartBypass(pod)
-			return ctrl.Result{}, r.Update(ctx, pod)
+		if job.Status.Consumed && job.Status.RestoredPodUID != string(pod.UID) {
+			consumerExists, checkErr := r.checkConsumerPodExists(ctx, req.Namespace, job)
+			if checkErr != nil {
+				logger.Error(checkErr, "Failed to check if recorded consumer pod exists", "consumingPodUID", job.Status.RestoredPodUID)
+				return ctrl.Result{}, checkErr
+			}
+
+			if consumerExists {
+				logger.Info("Assigned PMJ was already consumed by an active pod, releasing gate with cold-start bypass",
+					"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
+				r.releaseWithColdStartBypass(pod)
+				return ctrl.Result{}, r.Update(ctx, pod)
+			}
+
+			logger.Info("Recorded consumer pod no longer exists; recovering stranded PMJ for adoption",
+				"deadConsumerPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "pmj", correctedPMJ)
+			job.Status.Consumed = false
+			job.Status.RestoredPodUID = ""
+			job.Status.RestoredPodName = ""
 		}
 
 		// Inject GKE's native snapshot name annotation (SnapshotRef is non-empty
@@ -213,6 +227,56 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// requeue is only a resync backstop and must stay coarse — at 2s, 2,000
 	// gated pods turn the single worker into a full-time polling loop.
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// checkConsumerPodExists verifies whether the pod recorded in job.Status.RestoredPodUID
+// still exists and is not terminating. Distinguishes between active consumption and
+// a dead/stranded consumer pod.
+func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespace string, job *pmv1alpha1.PodMigrationJob) (bool, error) {
+	if job.Status.RestoredPodUID == "" {
+		return false, nil
+	}
+
+	// 1. If RestoredPodName is set, perform a targeted lookup by Name
+	if job.Status.RestoredPodName != "" {
+		consumingPod := &corev1.Pod{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, consumingPod)
+		if err == nil {
+			if string(consumingPod.UID) == job.Status.RestoredPodUID && consumingPod.DeletionTimestamp.IsZero() {
+				return true, nil
+			}
+			return false, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return false, err
+		}
+
+		// Informer cache returned NotFound. Read directly from the API server to guard against cache lag.
+		apiErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, consumingPod)
+		if apiErr == nil {
+			if string(consumingPod.UID) == job.Status.RestoredPodUID && consumingPod.DeletionTimestamp.IsZero() {
+				return true, nil
+			}
+			return false, nil
+		}
+		if apierrors.IsNotFound(apiErr) {
+			return false, nil
+		}
+		return false, apiErr
+	}
+
+	// 2. If RestoredPodName is empty, fall back to scanning pods in the namespace
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(namespace)); err != nil {
+		return false, err
+	}
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if string(p.UID) == job.Status.RestoredPodUID && p.DeletionTimestamp.IsZero() {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // releaseWithColdStartBypass removes the gate and scrubs the migration
