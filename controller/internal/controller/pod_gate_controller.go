@@ -44,6 +44,7 @@ type PodGateReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
 
 // Reconcile checks for active migration jobs and removes the scheduling gate if none exist.
 func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -179,6 +180,17 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 
 		if job.Status.Consumed && job.Status.RestoredPodUID != string(pod.UID) {
+			// Single-use isolation: a migration that already concluded (Succeeded)
+			// must never be re-restored even if the consumer pod later exits or is deleted.
+			// Only in-flight Restoring PMJs whose consumer pod disappeared before un-gating
+			// can be recovered.
+			if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+				logger.Info("Assigned PMJ was already consumed (phase is not Restoring), releasing gate with cold-start bypass",
+					"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "phase", job.Status.Phase)
+				r.releaseWithColdStartBypass(pod)
+				return ctrl.Result{}, r.Update(ctx, pod)
+			}
+
 			consumerExists, checkErr := r.checkConsumerPodExists(ctx, req.Namespace, job)
 			if checkErr != nil {
 				logger.Error(checkErr, "Failed to check if recorded consumer pod exists", "consumingPodUID", job.Status.RestoredPodUID)
@@ -192,11 +204,18 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{}, r.Update(ctx, pod)
 			}
 
-			logger.Info("Recorded consumer pod no longer exists; recovering stranded PMJ for adoption",
+			logger.Info("Recorded consumer pod no longer exists during Restoring; recovering stranded PMJ for adoption",
 				"deadConsumerPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "pmj", correctedPMJ)
 			job.Status.Consumed = false
 			job.Status.RestoredPodUID = ""
 			job.Status.RestoredPodName = ""
+			if job.Annotations != nil && job.Annotations[util.AnnotationMismatchSince] != "" {
+				delete(job.Annotations, util.AnnotationMismatchSince)
+				if err := r.Update(ctx, job); err != nil {
+					logger.Error(err, "Failed to clear mismatch-since annotation on recovered PMJ")
+					return ctrl.Result{}, err
+				}
+			}
 		}
 
 		// Inject GKE's native snapshot name annotation (SnapshotRef is non-empty
@@ -230,8 +249,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 }
 
 // checkConsumerPodExists verifies whether the pod recorded in job.Status.RestoredPodUID
-// still exists and is not terminating. Distinguishes between active consumption and
-// a dead/stranded consumer pod.
+// still exists. Distinguishes between active consumption and a dead/deleted consumer pod.
 func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespace string, job *pmv1alpha1.PodMigrationJob) (bool, error) {
 	if job.Status.RestoredPodUID == "" {
 		return false, nil
@@ -242,10 +260,23 @@ func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespac
 		consumingPod := &corev1.Pod{}
 		err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, consumingPod)
 		if err == nil {
-			if string(consumingPod.UID) == job.Status.RestoredPodUID && consumingPod.DeletionTimestamp.IsZero() {
+			if string(consumingPod.UID) == job.Status.RestoredPodUID {
 				return true, nil
 			}
-			return false, nil
+			// Cache shows a different UID for this pod name (recreated pod).
+			// Confirm against APIReader before concluding the original consumer is dead.
+			apiPod := &corev1.Pod{}
+			apiErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, apiPod)
+			if apiErr == nil {
+				if string(apiPod.UID) == job.Status.RestoredPodUID {
+					return true, nil
+				}
+				return false, nil
+			}
+			if apierrors.IsNotFound(apiErr) {
+				return false, nil
+			}
+			return false, apiErr
 		}
 		if !apierrors.IsNotFound(err) {
 			return false, err
@@ -254,7 +285,7 @@ func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespac
 		// Informer cache returned NotFound. Read directly from the API server to guard against cache lag.
 		apiErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, consumingPod)
 		if apiErr == nil {
-			if string(consumingPod.UID) == job.Status.RestoredPodUID && consumingPod.DeletionTimestamp.IsZero() {
+			if string(consumingPod.UID) == job.Status.RestoredPodUID {
 				return true, nil
 			}
 			return false, nil
@@ -272,7 +303,7 @@ func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespac
 	}
 	for i := range podList.Items {
 		p := &podList.Items[i]
-		if string(p.UID) == job.Status.RestoredPodUID && p.DeletionTimestamp.IsZero() {
+		if string(p.UID) == job.Status.RestoredPodUID {
 			return true, nil
 		}
 	}
