@@ -55,6 +55,11 @@ type PodMigrationJobStatus struct {
 	// +optional
 	RestoredPodName string `json:"restoredPodName,omitempty"`
 
+	// GateReleased indicates whether the scheduling gate on the replacement pod has been
+	// successfully removed. Written after the Pod update succeeds.
+	// +optional
+	GateReleased bool `json:"gateReleased,omitempty"`
+
 	// Conditions represent the latest available observations of the job's current state.
 	// +optional
 	// +patchMergeKey=type
