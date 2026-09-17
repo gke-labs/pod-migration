@@ -128,37 +128,23 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						message = "Origin pod eviction timed out due to eviction configuration error (500 InternalServerError / multiple PDBs)"
 					}
 					logger.Info("Evicting PMJ timed out due to eviction blockage; concluding as SucceededWithoutRestore", "job", job.Name, "reason", reason)
-					job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
-					now := metav1.Now()
-					job.Status.CompletionTime = &now
-					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-						Type:               "Restored",
-						Status:             metav1.ConditionFalse,
-						Reason:             reason,
-						Message:            message,
-						ObservedGeneration: job.Generation,
-					})
-					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-						Type:               "Ready",
-						Status:             metav1.ConditionTrue,
-						Reason:             reason,
-						Message:            message,
-						ObservedGeneration: job.Generation,
-					})
 
 					// Annotate the origin pod to detect repeat eviction attempts and prevent re-snapshot churn
 					pod := &corev1.Pod{}
 					if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: podName}, pod); err == nil {
-						if pod.Annotations == nil {
-							pod.Annotations = make(map[string]string)
-						}
-						pod.Annotations[util.AnnotationPDBEvictionTimeout] = "true"
-						if err := r.Update(ctx, pod); err != nil {
-							logger.Error(err, "Failed to annotate origin pod with pdb-eviction-timeout", "pod", podName)
+						if job.Spec.TargetPodUID == "" || string(pod.UID) == job.Spec.TargetPodUID {
+							if pod.Annotations == nil {
+								pod.Annotations = make(map[string]string)
+							}
+							pod.Annotations[util.AnnotationPDBEvictionTimeout] = "true"
+							if err := r.Update(ctx, pod); err != nil {
+								logger.Error(err, "Failed to annotate origin pod with pdb-eviction-timeout", "pod", podName)
+								return ctrl.Result{}, err
+							}
 						}
 					}
 
-					if err := r.Status().Update(ctx, job); err != nil {
+					if err := r.markSucceededWithoutRestore(ctx, job, reason, message); err != nil {
 						logger.Error(err, "Failed to update job status on eviction timeout")
 						return ctrl.Result{}, err
 					}
@@ -430,16 +416,25 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				switch {
 				case err == nil || apierrors.IsNotFound(err):
 					logger.Info("Successfully initiated PDB-safe pod eviction", "pod", podName)
-					cond := metav1.Condition{
+					condPDB := metav1.Condition{
 						Type:               "BlockedByPDB",
 						Status:             metav1.ConditionFalse,
 						Reason:             "EvictionInitiated",
 						Message:            "Origin pod eviction accepted by eviction subresource",
 						ObservedGeneration: job.Generation,
 					}
-					if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+					condMisconfig := metav1.Condition{
+						Type:               "EvictionMisconfigured",
+						Status:             metav1.ConditionFalse,
+						Reason:             "EvictionInitiated",
+						Message:            "Origin pod eviction accepted by eviction subresource",
+						ObservedGeneration: job.Generation,
+					}
+					updatedPDB := meta.SetStatusCondition(&job.Status.Conditions, condPDB)
+					updatedMisconfig := meta.SetStatusCondition(&job.Status.Conditions, condMisconfig)
+					if updatedPDB || updatedMisconfig {
 						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
-							logger.Error(updateErr, "Failed to update status on clearing BlockedByPDB condition")
+							logger.Error(updateErr, "Failed to update status on clearing eviction blockage conditions")
 							return ctrl.Result{}, updateErr
 						}
 					}

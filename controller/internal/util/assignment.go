@@ -139,8 +139,10 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 	}
 
 	for _, p := range podList.Items {
-		existingPodUIDs[string(p.UID)] = true
-		existingPodNames[p.Name] = true
+		if p.DeletionTimestamp == nil {
+			existingPodUIDs[string(p.UID)] = true
+			existingPodNames[p.Name] = true
+		}
 		if p.Annotations != nil {
 			if pmjName, ok := p.Annotations[AnnotationAssignedPMJ]; ok {
 				assignedPMJs[pmjName] = true

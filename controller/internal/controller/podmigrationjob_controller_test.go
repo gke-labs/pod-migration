@@ -3028,6 +3028,13 @@ func TestPodMigrationJobReconciler_Evicting_SuccessAfter429_ClearsBlockedByPDB(t
 					Message:            "Prior 429",
 					LastTransitionTime: metav1.Now(),
 				},
+				{
+					Type:               "EvictionMisconfigured",
+					Status:             metav1.ConditionTrue,
+					Reason:             "MultiplePDBsOrInternalError",
+					Message:            "Prior 500",
+					LastTransitionTime: metav1.Now(),
+				},
 			},
 		},
 	}
@@ -3065,9 +3072,13 @@ func TestPodMigrationJobReconciler_Evicting_SuccessAfter429_ClearsBlockedByPDB(t
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
 		t.Fatalf("Failed to get updated PMJ: %v", err)
 	}
-	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "BlockedByPDB")
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "EvictionInitiated" {
-		t.Errorf("Expected BlockedByPDB condition False/EvictionInitiated, got: %+v", cond)
+	condPDB := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "BlockedByPDB")
+	if condPDB == nil || condPDB.Status != metav1.ConditionFalse || condPDB.Reason != "EvictionInitiated" {
+		t.Errorf("Expected BlockedByPDB condition False/EvictionInitiated, got: %+v", condPDB)
+	}
+	condMisconfig := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "EvictionMisconfigured")
+	if condMisconfig == nil || condMisconfig.Status != metav1.ConditionFalse || condMisconfig.Reason != "EvictionInitiated" {
+		t.Errorf("Expected EvictionMisconfigured condition False/EvictionInitiated, got: %+v", condMisconfig)
 	}
 }
 
@@ -3283,5 +3294,145 @@ func TestPodMigrationJobReconciler_Evicting_Timeout_NoBlockage_ConcludesFailed(t
 	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
 	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != "Timeout" {
 		t.Errorf("Expected Ready condition False/Timeout, got %+v", readyCond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_Timeout_UIDMismatch_SkipsAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "my-pdb-pod"
+	jobName := "pmj-timeout-pdb"
+
+	// Recreated pod with a DIFFERENT UID than the PMJ's TargetPodUID
+	recreatedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-recreated-new-pod",
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Time{Time: time.Now().Add(-15 * time.Minute)},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-my-original-pod",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			SnapshotRef: "durable-snap-xyz",
+			Conditions: []metav1.Condition{
+				{
+					Type:               "BlockedByPDB",
+					Status:             metav1.ConditionTrue,
+					Reason:             "PDBBudgetExhausted",
+					Message:            "Waiting for budget",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(recreatedPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// Verify recreated pod was NOT annotated because UID did not match
+	updatedPod := &corev1.Pod{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: podName}, updatedPod); err != nil {
+		t.Fatalf("Failed to get updated pod: %v", err)
+	}
+	if updatedPod.Annotations != nil && updatedPod.Annotations[util.AnnotationPDBEvictionTimeout] != "" {
+		t.Errorf("Expected recreated pod NOT to be annotated due to UID mismatch, got annotations: %v", updatedPod.Annotations)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_Timeout_PodAnnotationUpdateError_ReturnsError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "my-pdb-pod"
+	jobName := "pmj-timeout-pdb"
+
+	originPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-my-pod",
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Time{Time: time.Now().Add(-15 * time.Minute)},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-my-pod",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			SnapshotRef: "durable-snap-xyz",
+			Conditions: []metav1.Condition{
+				{
+					Type:               "BlockedByPDB",
+					Status:             metav1.ConditionTrue,
+					Reason:             "PDBBudgetExhausted",
+					Message:            "Waiting for budget",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(originPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*corev1.Pod); ok {
+					return apierrors.NewConflict(corev1.Resource("pods"), podName, fmt.Errorf("conflict updating pod annotation"))
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err == nil {
+		t.Fatalf("Expected Reconcile to return error when pod annotation update fails, but got nil")
 	}
 }
