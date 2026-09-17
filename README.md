@@ -334,7 +334,7 @@ When undeploying the controller, `PodMigration` custom resources must be deleted
 make -C controller undeploy
 ```
 
-If the controller is deleted before the custom resources, `PodMigration` objects will wedge in `Terminating` and block CRD deletion. To manually unwedge:
+If the controller is deleted before the custom resources, `PodMigration` objects will wedge in `Terminating` and block CRD deletion. Similarly, if the controller is downgraded or rolled back to a pre-#35 image that does not support the finalizer, any `PodMigration` deleted during that time will wedge in `Terminating`. To manually unwedge:
 ```bash
 kubectl patch podmigration <name> -n <namespace> --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]'
 ```

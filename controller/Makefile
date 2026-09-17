@@ -95,7 +95,7 @@ deploy: install ## Deploy controller (Deployment + RBAC + webhooks) to the clust
 
 undeploy: ## Undeploy controller from the cluster.
 	@if kubectl get crd podmigrations.podmigration.gke.io >/dev/null 2>&1; then \
-		kubectl delete podmigrations.podmigration.gke.io --all --all-namespaces --ignore-not-found=true --wait=true --timeout=600s; \
+		kubectl delete podmigrations.podmigration.gke.io --all --all-namespaces --ignore-not-found=true --wait=true --timeout=600s || true; \
 	fi
 	kubectl delete --ignore-not-found=true -f deploy.yaml
 	$(MAKE) uninstall
