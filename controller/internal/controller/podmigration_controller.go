@@ -84,6 +84,16 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 					"namespace", config.Namespace,
 					"inFlightCount", len(inFlight),
 					"jobs", inFlight)
+				meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "DeletionBlockedByInFlightMigrations",
+					Message:            fmt.Sprintf("Deletion deferred: %d migration(s) in flight (%s)", len(inFlight), strings.Join(inFlight, ", ")),
+					ObservedGeneration: config.Generation,
+				})
+				if err := r.Status().Update(ctx, config); err != nil {
+					logger.Error(err, "Failed to update PodMigration status during deletion deferral")
+				}
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 

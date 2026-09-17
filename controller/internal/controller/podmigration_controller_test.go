@@ -717,6 +717,10 @@ func TestPodMigrationReconciler_Finalizer_PostponesDeleteWhenMigrationsInFlight(
 	if !controllerutil.ContainsFinalizer(updatedConfig, StorageCleanupFinalizer) {
 		t.Errorf("Expected finalizer %s to remain while job is in-flight", StorageCleanupFinalizer)
 	}
+	readyCond := meta.FindStatusCondition(updatedConfig.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != "DeletionBlockedByInFlightMigrations" {
+		t.Errorf("Expected Ready=False DeletionBlockedByInFlightMigrations condition, got: %+v", readyCond)
+	}
 
 	// 2. Transition job to terminal phase (Succeeded)
 	activeJob.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
