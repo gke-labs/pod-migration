@@ -366,4 +366,7 @@ When migrating single-replica workloads (such as a `StatefulSet` with `replicas:
 
 - **PDB-Safe Eviction Fallback:** The controller respects Kubernetes PDB constraints by issuing eviction requests through the official Kubernetes eviction subresource (`policy/v1 Eviction`) and retrying on `429 Too Many Requests` / `409 Conflict`.
 - **Timeout & Churn Protection:** If the PDB budget does not recover within the 10-minute active migration timeout, the PMJ concludes with status `SucceededWithoutRestore` (Reason: `PDBEvictionTimeout`), and the controller marks the pod with `pod-migration.gke.io/pdb-eviction-timeout: "true"` to prevent repeated snapshot loops during ongoing drain retries.
-- **Operator Intervention:** Draining nodes hosting `minAvailable=1` single-replica workloads requires operator intervention (e.g. temporarily updating or relaxing the PDB budget, scaling up the workload, or deleting the pod).
+- **Operator Intervention & Re-arming Migration:** Draining nodes hosting `minAvailable=1` single-replica workloads requires operator intervention (e.g. temporarily updating or relaxing the PDB budget, scaling up the workload, or deleting the pod). Once the PDB is relaxed, to re-arm live migration on the existing pod instance without recreating it, remove the timeout annotation:
+  ```bash
+  kubectl annotate pod <pod-name> pod-migration.gke.io/pdb-eviction-timeout-
+  ```

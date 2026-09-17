@@ -3,6 +3,7 @@ package util
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -706,6 +707,47 @@ func TestFindUnassignedActivePMJ_EvictingScaleUpIsolation(t *testing.T) {
 				},
 			},
 			expected: "", // Scale-up pod must NOT adopt the PMJ while origin pod is alive!
+		},
+		{
+			name:            "Evicting PMJ with origin pod terminating (has DeletionTimestamp) matches replacement pod",
+			podName:         "deploy-pod-replacement-1",
+			parentName:      "my-deploy",
+			parentKind:      "Deployment",
+			podTemplateHash: "hash-v1",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-deploy-pod-1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName:      "my-deploy",
+							LabelParentKind:      "Deployment",
+							LabelPodTemplateHash: "hash-v1",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef:       corev1.LocalObjectReference{Name: "deploy-pod-1"},
+						TargetPodUID: "origin-uid-111",
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+					},
+				},
+				// Origin pod is terminating in grace period (has DeletionTimestamp)
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "deploy-pod-1",
+						Namespace:         "default",
+						UID:               "origin-uid-111",
+						DeletionTimestamp: &metav1.Time{Time: time.Now()},
+						Finalizers:        []string{"kubernetes.io/test-finalizer"},
+						Labels: map[string]string{
+							"pod-migration.gke.io/enabled": "true",
+						},
+					},
+				},
+			},
+			expected: "pmj-deploy-pod-1",
 		},
 		{
 			name:            "Evicting PMJ with origin pod deleted matches replacement pod",
