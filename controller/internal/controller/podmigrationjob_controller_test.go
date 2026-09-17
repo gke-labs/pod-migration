@@ -2484,7 +2484,7 @@ func TestPodMigrationJobReconciler_Restoring_UIDMismatch_PersistedTimeout(t *tes
 			Namespace: namespace,
 			Name:      jobName,
 			Annotations: map[string]string{
-				util.AnnotationMismatchSince: time.Now().Add(-35 * time.Second).Format(time.RFC3339),
+				util.AnnotationMismatchSince: time.Now().Add(-45 * time.Second).Format(time.RFC3339),
 			},
 			CreationTimestamp: metav1.Now(),
 		},

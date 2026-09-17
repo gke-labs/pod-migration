@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -255,12 +256,24 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 
-		// Record that the scheduling gate was successfully released on the consumer pod
+		// Record that the scheduling gate was successfully released on the consumer pod.
+		// Wrapped in RetryOnConflict to guarantee persistence across concurrent writers,
+		// and any terminal error is returned so the workqueue retries.
 		if !job.Status.GateReleased {
-			job.Status.GateReleased = true
-			if err := r.Status().Update(ctx, job); err != nil {
-				logger.Error(err, "Failed to record GateReleased on PMJ", "job", job.Name)
-				// Non-fatal since pod is already un-gated
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				latest := &pmv1alpha1.PodMigrationJob{}
+				if err := r.Get(ctx, client.ObjectKeyFromObject(job), latest); err != nil {
+					return err
+				}
+				if latest.Status.GateReleased {
+					return nil // already recorded by another writer
+				}
+				latest.Status.GateReleased = true
+				return r.Status().Update(ctx, latest)
+			})
+			if err != nil {
+				logger.Error(err, "Failed to record GateReleased on PMJ after retries", "job", job.Name)
+				return ctrl.Result{}, err
 			}
 		}
 
@@ -329,27 +342,18 @@ func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespac
 		return false, apiErr
 	}
 
-	// 2. If RestoredPodName is empty, query pods annotated with this PMJ via the
-	// assigned-pmj index: a full-namespace scan does not scale.
+	// 2. If RestoredPodName is empty, query pods annotated with this PMJ via a LIVE list.
+	// APIReader does not support field indexing, so query live namespace list and filter in memory.
 	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList,
-		client.InNamespace(namespace),
-		client.MatchingFields{PodAssignedPMJIndex: job.Name}); err != nil {
+	if err := r.apiReader().List(ctx, podList, client.InNamespace(namespace)); err != nil {
 		return false, err
 	}
 	for i := range podList.Items {
 		p := &podList.Items[i]
-		if string(p.UID) == job.Status.RestoredPodUID {
-			// Cache hit: re-confirm live against APIReader to guard against stale cache
-			apiPod := &corev1.Pod{}
-			apiErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: p.Name}, apiPod)
-			if apiErr == nil {
-				return string(apiPod.UID) == job.Status.RestoredPodUID, nil
+		if p.Annotations != nil && p.Annotations[util.AnnotationAssignedPMJ] == job.Name {
+			if string(p.UID) == job.Status.RestoredPodUID {
+				return true, nil
 			}
-			if apierrors.IsNotFound(apiErr) {
-				return false, nil
-			}
-			return false, apiErr
 		}
 	}
 	return false, nil

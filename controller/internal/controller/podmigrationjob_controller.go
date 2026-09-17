@@ -535,7 +535,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("Pod with name exists but UID mismatch (replacement pod was recreated)",
 				"expectedUID", job.Status.RestoredPodUID, "actualUID", replacementPod.UID)
 
-			const mismatchGracePeriod = 30 * time.Second
+			const (
+				mismatchGracePeriod = 30 * time.Second
+				clockSkewTolerance  = 10 * time.Second
+			)
 			mismatchSinceStr := job.Annotations[util.AnnotationMismatchSince]
 			if mismatchSinceStr == "" {
 				if job.Annotations == nil {
@@ -549,8 +552,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			mismatchSince, err := time.Parse(time.RFC3339, mismatchSinceStr)
-			if err != nil || time.Since(mismatchSince) > mismatchGracePeriod {
-				logger.Info("Replacement pod UID mismatch persisted > 30s; fast-failing to SucceededWithoutRestore", "job", job.Name)
+			if err != nil || time.Since(mismatchSince) > (mismatchGracePeriod+clockSkewTolerance) {
+				logger.Info("Replacement pod UID mismatch persisted > 30s (+ skew tolerance); fast-failing to SucceededWithoutRestore", "job", job.Name)
 				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 				now := metav1.Now()
 				job.Status.CompletionTime = &now
