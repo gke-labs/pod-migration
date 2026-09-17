@@ -577,6 +577,29 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
+		// 4a. Self-healing mismatch-since cleanup: if a previous UID mismatch set
+		// AnnotationMismatchSince, clear it now that the replacement pod matches the recorded consumer UID.
+		if job.Annotations != nil && job.Annotations[util.AnnotationMismatchSince] != "" {
+			delete(job.Annotations, util.AnnotationMismatchSince)
+			if err := r.Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to clear mismatch-since annotation on PMJ")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// 4b. Self-healing GateReleased: if the consumer pod has been un-gated
+		// (scheduling gate removed) but GateReleased was not recorded on PMJ status
+		// (e.g. due to a transient Conflict during PodGate reconciliation), stamp GateReleased=true.
+		if !job.Status.GateReleased && !podHasMigrationGate(replacementPod) {
+			logger.Info("Self-healing GateReleased on PMJ status for un-gated replacement pod",
+				"job", job.Name, "pod", replacementPod.Name)
+			job.Status.GateReleased = true
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to self-heal GateReleased on PMJ status")
+				return ctrl.Result{}, err
+			}
+		}
+
 		// 5. While the pod is not yet Ready, probe for a cold-start fallback
 		// event on a throttle: the query goes straight to the API server, so
 		// per-2s-tick probing saturates the QPS budget at 50 workers, but no

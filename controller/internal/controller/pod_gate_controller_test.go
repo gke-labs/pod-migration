@@ -14,7 +14,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
-	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestPodGateReconciler_Reconcile(t *testing.T) {
@@ -1578,13 +1577,13 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_ConfirmedDeletedOnAPIServer(t *
 	}
 }
 
-func TestPodGateReconciler_Reconcile_StrandedPMJ_ClearsMismatchSinceAnnotation(t *testing.T) {
+func TestPodGateReconciler_Reconcile_StrandedPMJ_AdoptsNewCandidateUIDAndReleasesGate(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
 
 	namespace := "default"
-	pmjName := "pmj-mismatch-clear"
+	pmjName := "pmj-stranded-adopt"
 
 	candidatePod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1606,9 +1605,6 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_ClearsMismatchSinceAnnotation(t
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      pmjName,
-			Annotations: map[string]string{
-				util.AnnotationMismatchSince: time.Now().Format(time.RFC3339),
-			},
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef: corev1.LocalObjectReference{Name: "pod-orig"},
@@ -1652,10 +1648,6 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_ClearsMismatchSinceAnnotation(t
 	err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ)
 	if err != nil {
 		t.Fatalf("failed to fetch updated PMJ: %v", err)
-	}
-
-	if _, exists := updatedPMJ.Annotations[util.AnnotationMismatchSince]; exists {
-		t.Errorf("expected AnnotationMismatchSince to be cleared, but still exists")
 	}
 
 	if updatedPMJ.Status.RestoredPodUID != "uid-candidate" {

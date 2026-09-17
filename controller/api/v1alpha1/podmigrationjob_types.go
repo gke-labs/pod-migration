@@ -42,8 +42,10 @@ type PodMigrationJobStatus struct {
 	// +optional
 	RestoringStartTime *metav1.Time `json:"restoringStartTime,omitempty"`
 
-	// Consumed indicates whether this migration snapshot has already been adopted by a replacement pod.
-	// Once true, subsequent pods will ignore this PMJ, preventing cross-generational stale state resurrection.
+	// Consumed indicates whether this migration snapshot has been adopted by a replacement pod.
+	// If the recorded consumer pod is deleted before its scheduling gate is released (GateReleased == false),
+	// a subsequent replacement pod may recover and re-adopt this PMJ. Once GateReleased is true, subsequent
+	// pods will ignore this PMJ, preventing cross-generational stale state resurrection.
 	// +optional
 	Consumed bool `json:"consumed,omitempty"`
 
@@ -56,7 +58,7 @@ type PodMigrationJobStatus struct {
 	RestoredPodName string `json:"restoredPodName,omitempty"`
 
 	// GateReleased indicates whether the scheduling gate on the replacement pod has been
-	// successfully removed. Written after the Pod update succeeds.
+	// successfully removed. Written after the Pod update succeeds or self-healed by the PMJ controller.
 	// +optional
 	GateReleased bool `json:"gateReleased,omitempty"`
 

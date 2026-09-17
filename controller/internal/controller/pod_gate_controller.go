@@ -213,7 +213,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			logger.Info("Recorded consumer pod no longer exists and gate was never released; recovering stranded PMJ for adoption",
 				"deadConsumerPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "pmj", correctedPMJ)
 
-			// 1. Assign PMJ status to this new candidate pod first
+			// 1. Assign PMJ status to this new candidate pod
 			job.Status.Consumed = true
 			job.Status.RestoredPodUID = string(pod.UID)
 			job.Status.RestoredPodName = pod.Name
@@ -224,15 +224,6 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if updateErr := r.Status().Update(ctx, job); updateErr != nil {
 				logger.Error(updateErr, "Failed to update PMJ status for adopted consumer pod")
 				return ctrl.Result{}, updateErr
-			}
-
-			// 2. Clear mismatch-since annotation if present on PMJ metadata
-			if job.Annotations != nil && job.Annotations[util.AnnotationMismatchSince] != "" {
-				delete(job.Annotations, util.AnnotationMismatchSince)
-				if err := r.Update(ctx, job); err != nil {
-					logger.Error(err, "Failed to clear mismatch-since annotation on recovered PMJ")
-					return ctrl.Result{}, err
-				}
 			}
 		}
 

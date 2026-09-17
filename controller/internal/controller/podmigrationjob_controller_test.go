@@ -2415,8 +2415,7 @@ func TestPodMigrationJobReconciler_Restoring_UIDMismatch_Initial(t *testing.T) {
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
 		WithObjects(replacementPod, pmj).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		Build()
@@ -2500,8 +2499,7 @@ func TestPodMigrationJobReconciler_Restoring_UIDMismatch_PersistedTimeout(t *tes
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
 		WithObjects(replacementPod, pmj).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		Build()
@@ -2595,8 +2593,7 @@ func TestPodMigrationJobReconciler_Restoring_UIDMismatch_MalformedAnnotation(t *
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
 		WithObjects(replacementPod, pmj).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		Build()
@@ -2636,5 +2633,215 @@ func TestPodMigrationJobReconciler_Restoring_UIDMismatch_MalformedAnnotation(t *
 	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
 	if readyCond == nil || readyCond.Reason != "ReplacementPodMismatch" || readyCond.Status != metav1.ConditionTrue {
 		t.Errorf("Expected Ready condition True/ReplacementPodMismatch, got %+v", readyCond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Restoring_ClearsMismatchSinceWhenUIDMatches(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	expectedUID := "uid-recovered"
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(expectedUID),
+		},
+		Spec: corev1.PodSpec{},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+			Annotations: map[string]string{
+				util.AnnotationMismatchSince: time.Now().Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Consumed:        true,
+			GateReleased:    true,
+			RestoredPodUID:  expectedUID,
+			RestoredPodName: podName,
+		},
+	}
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(replacementPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	if _, exists := updatedPMJ.Annotations[util.AnnotationMismatchSince]; exists {
+		t.Errorf("Expected AnnotationMismatchSince to be cleared when UID matches, but it still exists")
+	}
+}
+
+func TestPodMigrationJobReconciler_Restoring_SelfHealsGateReleasedWhenPodUngated(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	expectedUID := "uid-ungated"
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(expectedUID),
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: nil, // Gate removed
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Consumed:        true,
+			GateReleased:    false, // Lost or conflicted during PodGate update
+			RestoredPodUID:  expectedUID,
+			RestoredPodName: podName,
+		},
+	}
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(replacementPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	if !updatedPMJ.Status.GateReleased {
+		t.Errorf("Expected GateReleased to be self-healed to true when replacement pod has no scheduling gate, got false")
+	}
+}
+
+func TestPodMigrationJobReconciler_Restoring_GateReleasedRemainsFalseWhileGatePresent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	expectedUID := "uid-gated"
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(expectedUID),
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: MigrationGateName},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			Consumed:        true,
+			GateReleased:    false,
+			RestoredPodUID:  expectedUID,
+			RestoredPodName: podName,
+		},
+	}
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(replacementPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.GateReleased {
+		t.Errorf("Expected GateReleased to remain false while replacement pod has scheduling gate, got true")
 	}
 }
