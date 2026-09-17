@@ -204,7 +204,7 @@ case "$APP" in
     wait_for_pod_ready "$POD_NAME" 120
     
     echo "[*] Launching minio-client helper pod..."
-    kubectl run minio-client --image=minio/mc --restart=Never --overrides='{"spec":{"containers":[{"name":"minio-client","image":"minio/mc","command":["sh","-c","sleep 3600"]}]}}'
+    kubectl run minio-client --image=quay.io/minio/mc:latest --restart=Never --overrides='{"spec":{"containers":[{"name":"minio-client","image":"quay.io/minio/mc:latest","command":["sh","-c","sleep 3600"]}]}}'
     wait_for_pod_ready "minio-client" 60
     
     NONCE="minio-nonce-$(date +%s)"
