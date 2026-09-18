@@ -96,7 +96,7 @@ func main() {
 
 	ver := version.Get()
 	setupLog.Info("Starting pod-migration-controller",
-		"version", ver.Version,
+		"version", ver.GitVersion,
 		"commit", ver.GitCommit,
 		"buildDate", ver.BuildDate,
 		"go", ver.GoVersion,
