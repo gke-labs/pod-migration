@@ -376,26 +376,22 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// 4.3. Wait for volume detachment from GCE node using VolumeAttachment API
 		if len(job.Status.PVsToDetach) > 0 {
-			vaList := &storagev1.VolumeAttachmentList{}
-			err = r.List(ctx, vaList)
-			if err != nil {
-				logger.Error(err, "Failed to list VolumeAttachments")
-				return ctrl.Result{}, err
-			}
-
 			activeAttachment := false
-			for _, va := range vaList.Items {
-				if va.Spec.Source.PersistentVolumeName != nil {
-					pvName := *va.Spec.Source.PersistentVolumeName
-					for _, targetPV := range job.Status.PVsToDetach {
-						if pvName == targetPV {
-							// Check if the volume is still reported as attached in GKE status
-							if va.Status.Attached {
-								logger.Info("Volume is still attached, waiting...", "pv", pvName, "volumeAttachment", va.Name)
-								activeAttachment = true
-								break
-							}
-						}
+			for _, targetPV := range job.Status.PVsToDetach {
+				if targetPV == "" {
+					continue
+				}
+				vaList := &storagev1.VolumeAttachmentList{}
+				if err := r.List(ctx, vaList, client.MatchingFields{VolumeAttachmentPVIndex: targetPV}); err != nil {
+					logger.Error(err, "Failed to list VolumeAttachments for PV", "pv", targetPV)
+					return ctrl.Result{}, err
+				}
+
+				for _, va := range vaList.Items {
+					if va.Status.Attached {
+						logger.Info("Volume is still attached, waiting...", "pv", targetPV, "volumeAttachment", va.Name)
+						activeAttachment = true
+						break
 					}
 				}
 				if activeAttachment {
