@@ -535,7 +535,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("Pod with name exists but UID mismatch (replacement pod was recreated)",
 				"expectedUID", job.Status.RestoredPodUID, "actualUID", replacementPod.UID)
 
-			const mismatchGracePeriod = 30 * time.Second
+			const (
+				mismatchGracePeriod = 30 * time.Second
+				clockSkewTolerance  = 10 * time.Second
+			)
 			mismatchSinceStr := job.Annotations[util.AnnotationMismatchSince]
 			if mismatchSinceStr == "" {
 				if job.Annotations == nil {
@@ -549,8 +552,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			mismatchSince, err := time.Parse(time.RFC3339, mismatchSinceStr)
-			if err != nil || time.Since(mismatchSince) > mismatchGracePeriod {
-				logger.Info("Replacement pod UID mismatch persisted > 30s; fast-failing to SucceededWithoutRestore", "job", job.Name)
+			if err != nil || time.Since(mismatchSince) > (mismatchGracePeriod+clockSkewTolerance) {
+				logger.Info("Replacement pod UID mismatch persisted > 30s (+ skew tolerance); fast-failing to SucceededWithoutRestore", "job", job.Name)
 				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 				now := metav1.Now()
 				job.Status.CompletionTime = &now
@@ -575,6 +578,29 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// 4a. Self-healing mismatch-since cleanup: if a previous UID mismatch set
+		// AnnotationMismatchSince, clear it now that the replacement pod matches the recorded consumer UID.
+		if job.Annotations != nil && job.Annotations[util.AnnotationMismatchSince] != "" {
+			delete(job.Annotations, util.AnnotationMismatchSince)
+			if err := r.Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to clear mismatch-since annotation on PMJ")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// 4b. Self-healing GateReleased: if the consumer pod has been un-gated
+		// (scheduling gate removed) but GateReleased was not recorded on PMJ status
+		// (e.g. due to a transient Conflict during PodGate reconciliation), stamp GateReleased=true.
+		if !job.Status.GateReleased && !podHasMigrationGate(replacementPod) {
+			logger.Info("Self-healing GateReleased on PMJ status for un-gated replacement pod",
+				"job", job.Name, "pod", replacementPod.Name)
+			job.Status.GateReleased = true
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to self-heal GateReleased on PMJ status")
+				return ctrl.Result{}, err
+			}
 		}
 
 		// 5. While the pod is not yet Ready, probe for a cold-start fallback

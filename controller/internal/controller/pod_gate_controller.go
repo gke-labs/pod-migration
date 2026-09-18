@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -44,6 +45,7 @@ type PodGateReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
 
 // Reconcile checks for active migration jobs and removes the scheduling gate if none exist.
 func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -178,11 +180,51 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 
-		if job.Status.Consumed && job.Status.RestoredPodUID != "" && job.Status.RestoredPodUID != string(pod.UID) {
-			logger.Info("Assigned PMJ was already consumed by a different pod, releasing gate with cold-start bypass",
-				"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
-			r.releaseWithColdStartBypass(pod)
-			return ctrl.Result{}, r.Update(ctx, pod)
+		if job.Status.Consumed && job.Status.RestoredPodUID != string(pod.UID) {
+			// Single-use isolation: a migration that already concluded (Succeeded)
+			// or whose scheduling gate was already released on the consumer pod must
+			// never be re-restored, preventing application state rollback to checkpoint time.
+			// Only in-flight Restoring PMJs whose consumer pod disappeared BEFORE
+			// its scheduling gate was released can be safely recovered (#25).
+			if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring || job.Status.GateReleased {
+				logger.Info("Assigned PMJ was already consumed (phase is not Restoring or gate was already released), releasing gate with cold-start bypass",
+					"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "phase", job.Status.Phase, "gateReleased", job.Status.GateReleased)
+				r.releaseWithColdStartBypass(pod)
+				return ctrl.Result{}, r.Update(ctx, pod)
+			}
+
+			consumerExists, checkErr := r.checkConsumerPodExists(ctx, req.Namespace, job)
+			if checkErr != nil {
+				logger.Error(checkErr, "Failed to check if recorded consumer pod exists", "consumingPodUID", job.Status.RestoredPodUID)
+				return ctrl.Result{}, checkErr
+			}
+
+			if consumerExists {
+				// The recorded consumer still exists (e.g. terminating with grace period).
+				// Do NOT un-gate this candidate pod with cold-start bypass yet: waiting
+				// costs nothing because the candidate is safely held in Pending by its
+				// scheduling gate. Once the terminating consumer finishes and disappears from
+				// the API server, this candidate will recover and adopt the PMJ snapshot.
+				logger.Info("Assigned PMJ consumer pod still exists (possibly terminating); requeuing to wait for completion",
+					"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
+			logger.Info("Recorded consumer pod no longer exists and gate was never released; recovering stranded PMJ for adoption",
+				"deadConsumerPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "pmj", correctedPMJ)
+
+			// 1. Assign PMJ status to this new candidate pod
+			job.Status.Consumed = true
+			job.Status.RestoredPodUID = string(pod.UID)
+			job.Status.RestoredPodName = pod.Name
+			job.Status.GateReleased = false
+			now := metav1.Now()
+			job.Status.RestoringStartTime = &now
+
+			if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+				logger.Error(updateErr, "Failed to update PMJ status for adopted consumer pod")
+				return ctrl.Result{}, updateErr
+			}
 		}
 
 		// Inject GKE's native snapshot name annotation (SnapshotRef is non-empty
@@ -198,14 +240,35 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			job.Status.Consumed = true
 			job.Status.RestoredPodUID = string(pod.UID)
 			job.Status.RestoredPodName = pod.Name
+			job.Status.GateReleased = false
+			now := metav1.Now()
+			job.Status.RestoringStartTime = &now
 			if updateErr := r.Status().Update(ctx, job); updateErr != nil {
 				logger.Error(updateErr, "Failed to mark PMJ as consumed")
 				return ctrl.Result{}, updateErr
 			}
 		}
 
+		// 1. Durable record first: mark GateReleased = true on PMJ status before un-gating the pod.
+		// If this fails, the pod is still gated, fails closed, and cannot restore until retried.
+		// Using Patch avoids cached-Get stale resourceVersion conflicts and avoids clobbering
+		// sibling status fields touched by concurrent reconcilers.
+		if !job.Status.GateReleased {
+			patch := client.MergeFrom(job.DeepCopy())
+			job.Status.GateReleased = true
+			if err := r.Status().Patch(ctx, job, patch); err != nil {
+				logger.Error(err, "Failed to patch GateReleased on PMJ status", "job", job.Name)
+				return ctrl.Result{}, err
+			}
+		}
+
+		// 2. Irreversible step: remove scheduling gate on the candidate pod.
 		r.removeGate(pod)
-		return ctrl.Result{}, r.Update(ctx, pod)
+		if err := r.Update(ctx, pod); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
 	}
 
 	// PMJ still in an active phase.  The PMJ watch (mapPMJToPods) enqueues this
@@ -213,6 +276,78 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// requeue is only a resync backstop and must stay coarse — at 2s, 2,000
 	// gated pods turn the single worker into a full-time polling loop.
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// checkConsumerPodExists verifies whether the pod recorded in job.Status.RestoredPodUID
+// still exists. Distinguishes between active consumption and a dead/deleted consumer pod.
+func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespace string, job *pmv1alpha1.PodMigrationJob) (bool, error) {
+	if job.Status.RestoredPodUID == "" {
+		return false, nil
+	}
+
+	// 1. If RestoredPodName is set, perform a targeted lookup by Name
+	if job.Status.RestoredPodName != "" {
+		consumingPod := &corev1.Pod{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, consumingPod)
+		if err == nil {
+			if string(consumingPod.UID) == job.Status.RestoredPodUID {
+				// Cache hit: re-confirm live against APIReader to guard against stale cache hits
+				// where the pod was deleted on the API server but hasn't been evicted from cache yet.
+				apiPod := &corev1.Pod{}
+				apiErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, apiPod)
+				if apiErr == nil {
+					return string(apiPod.UID) == job.Status.RestoredPodUID, nil
+				}
+				if apierrors.IsNotFound(apiErr) {
+					return false, nil
+				}
+				return false, apiErr
+			}
+			// Cache shows a different UID for this pod name (recreated pod).
+			// Confirm against APIReader before concluding the original consumer is dead.
+			apiPod := &corev1.Pod{}
+			apiErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, apiPod)
+			if apiErr == nil {
+				return string(apiPod.UID) == job.Status.RestoredPodUID, nil
+			}
+			if apierrors.IsNotFound(apiErr) {
+				return false, nil
+			}
+			return false, apiErr
+		}
+		if !apierrors.IsNotFound(err) {
+			return false, err
+		}
+
+		// Informer cache returned NotFound. Read directly from the API server to guard against cache lag.
+		apiErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Status.RestoredPodName}, consumingPod)
+		if apiErr == nil {
+			if string(consumingPod.UID) == job.Status.RestoredPodUID {
+				return true, nil
+			}
+			return false, nil
+		}
+		if apierrors.IsNotFound(apiErr) {
+			return false, nil
+		}
+		return false, apiErr
+	}
+
+	// 2. If RestoredPodName is empty, query pods annotated with this PMJ via a LIVE list.
+	// APIReader does not support field indexing, so query live namespace list and filter in memory.
+	podList := &corev1.PodList{}
+	if err := r.apiReader().List(ctx, podList, client.InNamespace(namespace)); err != nil {
+		return false, err
+	}
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if p.Annotations != nil && p.Annotations[util.AnnotationAssignedPMJ] == job.Name {
+			if string(p.UID) == job.Status.RestoredPodUID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // releaseWithColdStartBypass removes the gate and scrubs the migration

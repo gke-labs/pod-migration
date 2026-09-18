@@ -134,8 +134,15 @@ spec:
                 type: array
               consumed:
                 description: |-
-                  Consumed indicates whether this migration snapshot has already been adopted by a replacement pod.
-                  Once true, subsequent pods will ignore this PMJ, preventing cross-generational stale state resurrection.
+                  Consumed indicates whether this migration snapshot has been adopted by a replacement pod.
+                  If the recorded consumer pod is deleted before its scheduling gate is released (GateReleased == false),
+                  a subsequent replacement pod may recover and re-adopt this PMJ. Once GateReleased is true, subsequent
+                  pods will ignore this PMJ, preventing cross-generational stale state resurrection.
+                type: boolean
+              gateReleased:
+                description: |-
+                  GateReleased indicates whether the scheduling gate on the replacement pod has been
+                  successfully removed. Written after the Pod update succeeds or self-healed by the PMJ controller.
                 type: boolean
               phase:
                 description: PodMigrationJobPhase defines the current state in the
