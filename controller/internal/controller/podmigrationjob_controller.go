@@ -8,6 +8,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -70,6 +71,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
@@ -109,6 +111,47 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 		const migrationTimeout = 10 * time.Minute
 		if time.Since(job.CreationTimestamp.Time) > migrationTimeout {
+			// If the job was observed to be blocked by PDB or eviction misconfiguration during Evicting phase,
+			// conclude as SucceededWithoutRestore so the durable snapshot remains for operator recovery.
+			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+				pdbBlockedCond := meta.FindStatusCondition(job.Status.Conditions, "BlockedByPDB")
+				isPDBBlocked := pdbBlockedCond != nil && pdbBlockedCond.Status == metav1.ConditionTrue
+
+				misconfigCond := meta.FindStatusCondition(job.Status.Conditions, "EvictionMisconfigured")
+				isMisconfigured := misconfigCond != nil && misconfigCond.Status == metav1.ConditionTrue
+
+				if isPDBBlocked || isMisconfigured {
+					reason := "PDBEvictionTimeout"
+					message := "Origin pod eviction timed out while waiting for PDB budget"
+					if isMisconfigured {
+						reason = "EvictionMisconfiguredTimeout"
+						message = "Origin pod eviction timed out due to eviction configuration error (500 InternalServerError / multiple PDBs)"
+					}
+					logger.Info("Evicting PMJ timed out due to eviction blockage; concluding as SucceededWithoutRestore", "job", job.Name, "reason", reason)
+
+					// Annotate the origin pod to detect repeat eviction attempts and prevent re-snapshot churn
+					pod := &corev1.Pod{}
+					if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: podName}, pod); err == nil {
+						if job.Spec.TargetPodUID == "" || string(pod.UID) == job.Spec.TargetPodUID {
+							if pod.Annotations == nil {
+								pod.Annotations = make(map[string]string)
+							}
+							pod.Annotations[util.AnnotationPDBEvictionTimeout] = "true"
+							if err := r.Update(ctx, pod); err != nil {
+								logger.Error(err, "Failed to annotate origin pod with pdb-eviction-timeout", "pod", podName)
+								return ctrl.Result{}, err
+							}
+						}
+					}
+
+					if err := r.markSucceededWithoutRestore(ctx, job, reason, message); err != nil {
+						logger.Error(err, "Failed to update job status on eviction timeout")
+						return ctrl.Result{}, err
+					}
+					return ctrl.Result{}, nil
+				}
+			}
+
 			logger.Info("Migration job timed out (exceeded 10 minutes limit), transitioning to Failed", "job", job.Name)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 			now := metav1.Now()
@@ -318,7 +361,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// and runs idempotently without risk of trigger re-creation on Status().Update retry.
 		_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 
-		// 4.2. Wait for Webhook to delete Pod, or delete it ourselves if it takes too long
+		// 4.2. Wait for external drain to evict origin Pod, or invoke PDB-safe eviction fallback
 		pod := &corev1.Pod{}
 		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, pod)
 		podExists := true
@@ -332,9 +375,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		if podExists && string(pod.UID) == job.Spec.TargetPodUID {
+			// If the origin pod is already terminating through its grace period, wait for deletion
+			if pod.DeletionTimestamp != nil {
+				logger.Info("Origin pod is already terminating; waiting for deletion", "pod", podName)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+
 			// Pod still exists and is the target pod.
 			// We wait for the eviction webhook to return Allowed and the API server to delete it.
-			// Fallback: if it takes longer than 30s (e.g. manual trigger), we delete it manually.
+			// Fallback: if it takes longer than 30s (e.g. manual trigger), we invoke the PDB-safe eviction subresource.
 			const timeout = 30 * time.Second
 			evictingSinceStr := job.Annotations["pod-migration.gke.io/evicting-since"]
 			if evictingSinceStr == "" {
@@ -352,24 +401,100 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			evictingSince, err := time.Parse(time.RFC3339, evictingSinceStr)
 			if err != nil {
 				logger.Error(err, "Failed to parse evicting-since annotation", "val", evictingSinceStr)
-				evictingSince = time.Time{} // fallback to immediate delete
+				evictingSince = time.Time{} // fallback to immediate eviction
 			}
 
 			if time.Since(evictingSince) > timeout {
-				logger.Info("Eviction webhook wait timed out (30s), deleting origin pod manually (fallback)", "pod", podName)
-				err = r.Delete(ctx, pod)
-				if err != nil && !apierrors.IsNotFound(err) {
-					logger.Error(err, "Failed to delete origin pod (fallback)")
+				logger.Info("Eviction webhook wait timed out (30s), requesting PDB-safe pod eviction (fallback)", "pod", podName)
+				eviction := &policyv1.Eviction{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      pod.Name,
+						Namespace: pod.Namespace,
+					},
+				}
+				err = r.SubResource("eviction").Create(ctx, pod, eviction)
+				switch {
+				case err == nil || apierrors.IsNotFound(err):
+					logger.Info("Successfully initiated PDB-safe pod eviction", "pod", podName)
+					condPDB := metav1.Condition{
+						Type:               "BlockedByPDB",
+						Status:             metav1.ConditionFalse,
+						Reason:             "EvictionInitiated",
+						Message:            "Origin pod eviction accepted by eviction subresource",
+						ObservedGeneration: job.Generation,
+					}
+					condMisconfig := metav1.Condition{
+						Type:               "EvictionMisconfigured",
+						Status:             metav1.ConditionFalse,
+						Reason:             "EvictionInitiated",
+						Message:            "Origin pod eviction accepted by eviction subresource",
+						ObservedGeneration: job.Generation,
+					}
+					updatedPDB := meta.SetStatusCondition(&job.Status.Conditions, condPDB)
+					updatedMisconfig := meta.SetStatusCondition(&job.Status.Conditions, condMisconfig)
+					if updatedPDB || updatedMisconfig {
+						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+							logger.Error(updateErr, "Failed to update status on clearing eviction blockage conditions")
+							return ctrl.Result{}, updateErr
+						}
+					}
+					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				case apierrors.IsTooManyRequests(err) || apierrors.IsConflict(err):
+					logger.Info("Pod eviction delayed by PodDisruptionBudget (429/409); waiting for budget", "pod", podName)
+					cond := metav1.Condition{
+						Type:               "BlockedByPDB",
+						Status:             metav1.ConditionTrue,
+						Reason:             "PDBBudgetExhausted",
+						Message:            "Origin pod eviction delayed by PodDisruptionBudget; waiting for budget",
+						ObservedGeneration: job.Generation,
+					}
+					if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+							logger.Error(updateErr, "Failed to update status on BlockedByPDB condition")
+							return ctrl.Result{}, updateErr
+						}
+					}
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				case apierrors.IsInternalError(err):
+					logger.Error(err, "Pod eviction failed with 500 InternalServerError (check if pod is covered by multiple conflicting PDBs)", "pod", podName)
+					cond := metav1.Condition{
+						Type:               "EvictionMisconfigured",
+						Status:             metav1.ConditionTrue,
+						Reason:             "MultiplePDBsOrInternalError",
+						Message:            "Origin pod eviction failed with 500 InternalServerError; check if pod is covered by multiple conflicting PDBs",
+						ObservedGeneration: job.Generation,
+					}
+					if meta.SetStatusCondition(&job.Status.Conditions, cond) {
+						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
+							logger.Error(updateErr, "Failed to update status on EvictionMisconfigured condition")
+							return ctrl.Result{}, updateErr
+						}
+					}
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				default:
+					logger.Error(err, "Failed to evict origin pod via eviction subresource (fallback)")
 					return ctrl.Result{}, err
 				}
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			} else {
 				logger.Info("Waiting for eviction webhook to allow deletion", "pod", podName, "elapsed", time.Since(evictingSince))
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 		}
 
-		// Once the Pod is gone (or we fallback-deleted it), clean up trigger
+		// The origin pod is gone (or was replaced by a pod with a different UID), so any
+		// eviction blockage recorded earlier no longer holds. The pod is frequently removed
+		// by an external drain's own eviction call rather than by our fallback, in which
+		// case the clearing path above never runs and a stale BlockedByPDB /
+		// EvictionMisconfigured condition would be reported on a job that went on to
+		// succeed. Retract those conditions before advancing.
+		if r.clearEvictionBlockageConditions(job) {
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to update status on retracting eviction blockage conditions")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Once the origin Pod is gone after eviction, clean up trigger
 		if err := r.getSnapshotProvider().Cleanup(ctx, job, podName); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -689,6 +814,34 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 		ObservedGeneration: job.Generation,
 	})
 	return r.Status().Update(ctx, job)
+}
+
+// clearEvictionBlockageConditions retracts the BlockedByPDB and EvictionMisconfigured
+// conditions once the origin pod is no longer present, since a blockage that was
+// observed while the pod existed cannot still apply to a pod that is gone.
+//
+// Only conditions currently reporting True are touched, so a job that was never
+// blocked keeps a status free of vacuous False conditions and no needless status
+// write is issued.  Returns true if any condition was changed, in which case the
+// caller is responsible for persisting the status.
+func (r *PodMigrationJobReconciler) clearEvictionBlockageConditions(job *pmv1alpha1.PodMigrationJob) bool {
+	changed := false
+	for _, condType := range []string{"BlockedByPDB", "EvictionMisconfigured"} {
+		existing := meta.FindStatusCondition(job.Status.Conditions, condType)
+		if existing == nil || existing.Status != metav1.ConditionTrue {
+			continue
+		}
+		if meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               condType,
+			Status:             metav1.ConditionFalse,
+			Reason:             "OriginPodRemoved",
+			Message:            "Origin pod is no longer present; the eviction blockage no longer applies",
+			ObservedGeneration: job.Generation,
+		}) {
+			changed = true
+		}
+	}
+	return changed
 }
 
 // hasGatedClaimant reports whether any pod annotated as assigned to this PMJ

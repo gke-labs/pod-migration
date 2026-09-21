@@ -78,6 +78,12 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed("Pod does not use gvisor runtime, skipping migration")
 	}
 
+	// Check if this pod already had a migration that timed out waiting for PDB
+	if pod.Annotations != nil && pod.Annotations[util.AnnotationPDBEvictionTimeout] == "true" {
+		logger.Info("Prior migration for pod timed out on PDB budget, skipping re-snapshot and allowing eviction", "pod", req.Name)
+		return admission.Allowed("skipping migration: prior migration timed out on PDB budget")
+	}
+
 	// Define migration job name with origin Pod UID to ensure unique, collision-free identity
 	jobName := util.FormatPMJName(pod.Name, string(pod.UID))
 
@@ -95,9 +101,10 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			logger.Info("Migration checkpoint complete, allowing eviction", "job", jobName, "phase", job.Status.Phase)
 			return admission.Allowed("migration checkpoint complete")
 		}
-		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
-			logger.Info("Migration job failed for current pod instance, allowing cold eviction (fail-open)", "job", jobName)
-			return admission.Allowed("migration failed, falling back to cold eviction")
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed ||
+			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+			logger.Info("Migration job concluded without restore, allowing eviction (fail-open)", "job", jobName, "phase", job.Status.Phase)
+			return admission.Allowed("migration concluded without restore, falling back to cold eviction")
 		}
 		return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
 	}
