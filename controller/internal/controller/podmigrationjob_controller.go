@@ -481,6 +481,19 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
+		// The origin pod is gone (or was replaced by a pod with a different UID), so any
+		// eviction blockage recorded earlier no longer holds. The pod is frequently removed
+		// by an external drain's own eviction call rather than by our fallback, in which
+		// case the clearing path above never runs and a stale BlockedByPDB /
+		// EvictionMisconfigured condition would be reported on a job that went on to
+		// succeed. Retract those conditions before advancing.
+		if r.clearEvictionBlockageConditions(job) {
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to update status on retracting eviction blockage conditions")
+				return ctrl.Result{}, err
+			}
+		}
+
 		// Once the origin Pod is gone after eviction, clean up trigger
 		if err := r.getSnapshotProvider().Cleanup(ctx, job, podName); err != nil {
 			return ctrl.Result{}, err
@@ -801,6 +814,34 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 		ObservedGeneration: job.Generation,
 	})
 	return r.Status().Update(ctx, job)
+}
+
+// clearEvictionBlockageConditions retracts the BlockedByPDB and EvictionMisconfigured
+// conditions once the origin pod is no longer present, since a blockage that was
+// observed while the pod existed cannot still apply to a pod that is gone.
+//
+// Only conditions currently reporting True are touched, so a job that was never
+// blocked keeps a status free of vacuous False conditions and no needless status
+// write is issued.  Returns true if any condition was changed, in which case the
+// caller is responsible for persisting the status.
+func (r *PodMigrationJobReconciler) clearEvictionBlockageConditions(job *pmv1alpha1.PodMigrationJob) bool {
+	changed := false
+	for _, condType := range []string{"BlockedByPDB", "EvictionMisconfigured"} {
+		existing := meta.FindStatusCondition(job.Status.Conditions, condType)
+		if existing == nil || existing.Status != metav1.ConditionTrue {
+			continue
+		}
+		if meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               condType,
+			Status:             metav1.ConditionFalse,
+			Reason:             "OriginPodRemoved",
+			Message:            "Origin pod is no longer present; the eviction blockage no longer applies",
+			ObservedGeneration: job.Generation,
+		}) {
+			changed = true
+		}
+	}
+	return changed
 }
 
 // hasGatedClaimant reports whether any pod annotated as assigned to this PMJ

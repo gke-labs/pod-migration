@@ -3643,3 +3643,171 @@ func TestPodMigrationJobReconciler_Evicting_Timeout_PodAnnotationUpdateError_Ret
 		t.Fatalf("Expected Reconcile to return error when pod annotation update fails, but got nil")
 	}
 }
+
+// TestPodMigrationJobReconciler_Evicting_OriginPodRemoved_ClearsStaleBlockageConditions
+// covers the case where the origin pod is removed by an external actor (typically
+// `kubectl drain`'s own eviction call) after we had already recorded an eviction
+// blockage. The controller's own clearing path never runs in that case, so the
+// pod-gone path must retract the conditions itself; otherwise the job advances and
+// terminates while still reporting BlockedByPDB=True.
+func TestPodMigrationJobReconciler_Evicting_OriginPodRemoved_ClearsStaleBlockageConditions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "drained-pod"
+	podUID := "uid-drained-123"
+	jobName := "pmj-" + podName
+
+	// Note: no Pod object is seeded, modelling the origin pod already being gone.
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": time.Now().Add(-35 * time.Second).Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "BlockedByPDB",
+					Status:             metav1.ConditionTrue,
+					Reason:             "PDBBudgetExhausted",
+					Message:            "Origin pod eviction delayed by PodDisruptionBudget; waiting for budget",
+					LastTransitionTime: metav1.Now(),
+				},
+				{
+					Type:               "EvictionMisconfigured",
+					Status:             metav1.ConditionTrue,
+					Reason:             "MultiplePDBsOrInternalError",
+					Message:            "Origin pod eviction failed with 500 InternalServerError",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	}); err != nil {
+		t.Fatalf("Reconcile failed unexpectedly when origin pod is gone: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+
+	for _, condType := range []string{"BlockedByPDB", "EvictionMisconfigured"} {
+		cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, condType)
+		if cond == nil {
+			t.Errorf("Expected %s condition to be present and retracted, but it is absent", condType)
+			continue
+		}
+		if cond.Status != metav1.ConditionFalse || cond.Reason != "OriginPodRemoved" {
+			t.Errorf("Expected %s condition False/OriginPodRemoved once the origin pod is gone, got %s/%s", condType, cond.Status, cond.Reason)
+		}
+	}
+
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+		t.Errorf("Expected phase to advance to Restoring, got %s", updatedPMJ.Status.Phase)
+	}
+}
+
+// TestPodMigrationJobReconciler_Evicting_OriginPodRemoved_NoVacuousConditions asserts
+// that a job which was never blocked does not gain BlockedByPDB / EvictionMisconfigured
+// conditions merely because it passed through the pod-gone path.
+func TestPodMigrationJobReconciler_Evicting_OriginPodRemoved_NoVacuousConditions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "unblocked-pod"
+	podUID := "uid-unblocked-456"
+	jobName := "pmj-" + podName
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	}); err != nil {
+		t.Fatalf("Reconcile failed unexpectedly when origin pod is gone: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+
+	for _, condType := range []string{"BlockedByPDB", "EvictionMisconfigured"} {
+		if cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, condType); cond != nil {
+			t.Errorf("Expected no %s condition on a job that was never blocked, got %+v", condType, cond)
+		}
+	}
+}
