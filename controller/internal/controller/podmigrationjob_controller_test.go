@@ -3642,6 +3642,21 @@ func TestPodMigrationJobReconciler_Evicting_Timeout_PodAnnotationUpdateError_Ret
 	if err == nil {
 		t.Fatalf("Expected Reconcile to return error when pod annotation update fails, but got nil")
 	}
+
+	// The annotation write must happen before the PMJ is concluded. If it fails, the
+	// job has to stay Evicting so the next reconcile retries and the churn guard
+	// still gets stamped; concluding first would strand the origin pod unannotated
+	// and let a subsequent drain re-snapshot it. Pin that ordering.
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		t.Errorf("Expected PMJ to remain Evicting after a failed annotation write so the reconcile retries, got %s", updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Status.CompletionTime != nil {
+		t.Errorf("Expected CompletionTime to remain unset after a failed annotation write, got %v", updatedPMJ.Status.CompletionTime)
+	}
 }
 
 // TestPodMigrationJobReconciler_Evicting_OriginPodRemoved_ClearsStaleBlockageConditions
