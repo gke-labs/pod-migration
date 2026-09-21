@@ -15,12 +15,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/metrics"
+	"github.com/gke-labs/pod-migration/controller/internal/restore"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -31,17 +34,112 @@ import (
 // spend the QPS budget on event LISTs.
 const fallbackEventCheckInterval = 30 * time.Second
 
+// Condition types and reasons for the restore-crash cold-start fallback.
+const (
+	// ConditionRestoreCrashed distinguishes a PMJ that we failed *and acted on*
+	// (the replacement pod was deleted so its controller recreates it cold)
+	// from every other route to Phase=Failed.  It is deliberately not
+	// SucceededWithoutRestore: that phase means "the same pod came up without
+	// the snapshot", which we can assert for a native GKE fallback but not
+	// here — we destroy the pod and never observe its successor.
+	ConditionRestoreCrashed = "RestoreCrashed"
+	// ReasonRestoreCrashFallback marks the condition set when a recognised
+	// restore-failure signature triggered the destructive fallback.
+	ReasonRestoreCrashFallback = "RestoreCrashFallback"
+
+	// ConditionUnrecognizedRestoreCrash records a StartError/128 crash whose
+	// message matched no known signature.  It doubles as the once-only guard
+	// for the corresponding Warning event: the event is emitted only on the
+	// reconcile that actually transitions the condition.
+	ConditionUnrecognizedRestoreCrash = "UnrecognizedRestoreCrash"
+	// ReasonUnrecognizedRestoreCrash is the reason paired with
+	// ConditionUnrecognizedRestoreCrash.
+	ReasonUnrecognizedRestoreCrash = "UnrecognizedRestoreCrash"
+)
+
 // PodMigrationJobReconciler reconciles a PodMigrationJob object.
 type PodMigrationJobReconciler struct {
 	client.Client
 	APIReader        client.Reader
 	Scheme           *runtime.Scheme
 	SnapshotProvider snapshot.Provider
+	// Recorder emits Warning events for restore crashes we recognise as
+	// start failures but cannot attribute to a known signature.  Optional:
+	// nil disables event emission (used by unit tests that don't assert on
+	// events).
+	Recorder record.EventRecorder
+
+	// RestoreEngines classifies restore failures.  Optional: nil selects the
+	// default engine set.  Overridden in tests.
+	RestoreEngines []restore.Engine
 
 	// fallbackEventChecks records the last fallback-event probe per PMJ
 	// (namespace/name -> time.Time).  In-memory only; a restart just means
 	// one extra probe per in-flight migration.
 	fallbackEventChecks sync.Map
+}
+
+func (r *PodMigrationJobReconciler) restoreEngines() []restore.Engine {
+	if r.RestoreEngines != nil {
+		return r.RestoreEngines
+	}
+	return restore.DefaultEngines()
+}
+
+// eventf emits an event if a Recorder is wired, and is a no-op otherwise.
+func (r *PodMigrationJobReconciler) eventf(obj runtime.Object, eventType, reason, messageFmt string, args ...any) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(obj, eventType, reason, messageFmt, args...)
+}
+
+// ensureCrashedReplacementPodDeleted performs the destructive half of the
+// restore-crash fallback, idempotently.
+//
+// It is deliberately separate from the status write so it can be re-driven:
+// the fallback persists Phase=Failed BEFORE deleting (so the verdict survives
+// a crash), which means a Delete that fails — a throttled DELETE during a
+// large evacuation is the realistic case — cannot be retried by the Restoring
+// case, because the phase is no longer Restoring.  The Failed-phase completion
+// path in Reconcile calls this until it succeeds.
+//
+// Returns nil when there is nothing left to do: no recorded pod, the pod is
+// gone, the pod is already terminating, or the name now belongs to a successor
+// with a different UID (which must never be deleted — it is the cold-start
+// replacement the fallback exists to create).
+func (r *PodMigrationJobReconciler) ensureCrashedReplacementPodDeleted(ctx context.Context, job *pmv1alpha1.PodMigrationJob) error {
+	if job.Status.RestoredPodName == "" {
+		return nil
+	}
+
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: job.Status.RestoredPodName}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get crashed replacement pod %s: %w", job.Status.RestoredPodName, err)
+	}
+
+	if job.Status.RestoredPodUID != "" && string(pod.UID) != job.Status.RestoredPodUID {
+		// The successor already took the name; the crashed instance is gone.
+		return nil
+	}
+	if pod.DeletionTimestamp != nil {
+		return nil
+	}
+
+	// The UID precondition closes the same race at the API server: between the
+	// Get above and this call the pod could be replaced by a same-named
+	// successor, and deleting that would be a second, self-inflicted outage.
+	if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			// Both mean the instance we targeted is already gone.
+			return nil
+		}
+		return fmt.Errorf("failed to delete crashed replacement pod %s: %w", pod.Name, err)
+	}
+	return nil
 }
 
 // shouldProbeFallbackEvents reports whether the throttle window for this PMJ
@@ -73,6 +171,8 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
+// The recorder publishes restore-crash Warning events, which needs write access.
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
 // Reconcile drives the state machine of the PodMigrationJob.
@@ -173,6 +273,22 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
+		}
+	}
+
+	// A restore-crash fallback writes Phase=Failed before it deletes the
+	// crashed pod, so a Delete that failed (throttling is the realistic cause
+	// at evacuation scale) can never be retried by the Restoring case below —
+	// the phase no longer matches.  Re-drive it here, ahead of GC: leaving the
+	// pod running is precisely the permanent wedge this feature exists to
+	// break, and the GC block below would otherwise sit on a 30-minute requeue
+	// and then delete the PMJ, destroying the only record of which pod is
+	// stuck.
+	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed &&
+		meta.IsStatusConditionTrue(job.Status.Conditions, ConditionRestoreCrashed) {
+		if err := r.ensureCrashedReplacementPodDeleted(ctx, job); err != nil {
+			logger.Error(err, "Failed to complete restore-crash pod deletion; will retry", "pod", job.Status.RestoredPodName)
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -728,7 +844,103 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
-		// 5. While the pod is not yet Ready, probe for a cold-start fallback
+		// 5. Restore-crash detection.  This MUST stay below the strict UID
+		// assertion above: the matched branch DELETES this pod, so it must be
+		// impossible to reach with any pod other than the exact instance this
+		// PMJ restored.  The self-healing steps 4a/4b in between are safe to
+		// interleave — they only touch PMJ status and annotations, never pod
+		// identity — but nothing that reassigns replacementPod may be added
+		// between the assertion and this block.
+		switch verdict := restore.Classify(replacementPod, r.restoreEngines()...); verdict.Class {
+		case restore.FailureFatal:
+			// The snapshot cannot be restored on this pod and retrying is
+			// futile — the kubelet will not even restart the container.  Fail
+			// the PMJ, then delete the pod so its workload controller
+			// recreates it cold (the PMJ is already Consumed, so the successor
+			// cannot re-adopt this snapshot).  Fires on the first matched
+			// signature: a debounce would only extend the outage.
+			metrics.RestoreCrashFallbackTotal.Inc()
+			message := fmt.Sprintf("Replacement pod %s failed to restore from snapshot (engine %q, container %q, signature %q): %s",
+				replacementPod.Name, verdict.Engine, verdict.Container, verdict.Signature, verdict.Message)
+			logger.Info("Restore crash detected; failing migration and deleting replacement pod for cold start",
+				"pod", replacementPod.Name, "engine", verdict.Engine, "signature", verdict.Signature)
+
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+			now := metav1.Now()
+			job.Status.CompletionTime = &now
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               ConditionRestoreCrashed,
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonRestoreCrashFallback,
+				Message:            message,
+				ObservedGeneration: job.Generation,
+			})
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Restored",
+				Status:             metav1.ConditionFalse,
+				Reason:             ReasonRestoreCrashFallback,
+				Message:            message,
+				ObservedGeneration: job.Generation,
+			})
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             ReasonRestoreCrashFallback,
+				Message:            message,
+				ObservedGeneration: job.Generation,
+			})
+
+			// The status write MUST land before the Delete.  If we deleted
+			// first and then crashed, the PMJ would stay Restoring with its
+			// recorded pod gone and no record of why.
+			if err := r.Status().Update(ctx, job); err != nil {
+				logger.Error(err, "Failed to update job status on restore crash")
+				return ctrl.Result{}, err
+			}
+
+			r.eventf(job, corev1.EventTypeWarning, ReasonRestoreCrashFallback, "%s", message)
+
+			// Deletion goes through the shared helper so this first attempt
+			// and the Failed-phase retry below cannot drift apart.  A returned
+			// error requeues; because the phase is now Failed, that requeue
+			// lands on the completion path, not here.
+			if err := r.ensureCrashedReplacementPodDeleted(ctx, job); err != nil {
+				logger.Error(err, "Failed to delete crashed replacement pod", "pod", replacementPod.Name)
+				return ctrl.Result{}, err
+			}
+			r.fallbackEventChecks.Delete(req.NamespacedName.String())
+			return ctrl.Result{}, nil
+
+		case restore.FailureUnrecognized:
+			// A start failure we cannot attribute to a restore.  Taking a
+			// destructive action on a signal we do not understand is strictly
+			// worse than waiting, so we only report it.  This path is bounded:
+			// the 5-minute restore ceiling above concludes the PMJ, so an
+			// unrecognised crash cannot leak a PMJ stuck in Restoring forever.
+			message := fmt.Sprintf("Replacement pod %s hit a container start failure with no recognised restore-failure signature (container %q): %s",
+				replacementPod.Name, verdict.Container, verdict.Message)
+			// The condition transition is the once-only guard: without it every
+			// 2s requeue would emit another identical event.
+			if meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               ConditionUnrecognizedRestoreCrash,
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonUnrecognizedRestoreCrash,
+				Message:            message,
+				ObservedGeneration: job.Generation,
+			}) {
+				if err := r.Status().Update(ctx, job); err != nil {
+					logger.Error(err, "Failed to record unrecognised restore crash")
+					return ctrl.Result{}, err
+				}
+				logger.Info("Unrecognised StartError on restoring pod; taking no action",
+					"pod", replacementPod.Name, "message", verdict.Message)
+				r.eventf(job, corev1.EventTypeWarning, ReasonUnrecognizedRestoreCrash, "%s", message)
+				metrics.RestoreCrashUnmatchedTotal.Inc()
+			}
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// 6. While the pod is not yet Ready, probe for a cold-start fallback
 		// event on a throttle: the query goes straight to the API server, so
 		// per-2s-tick probing saturates the QPS budget at 50 workers, but no
 		// probing at all leaves a crashlooping fallback pod undetected until
@@ -750,7 +962,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
-		// 6. Pod is Ready: a decisive fallback-event check picks between
+		// 7. Pod is Ready: a decisive fallback-event check picks between
 		// verified restore and cold-start fallback.
 		hasFallback, err := r.hasColdStartFallbackEvent(ctx, job, replacementPod)
 		if err != nil {
@@ -764,7 +976,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				"FallbackToColdStart", "GKE runtime skipped snapshot restore and fell back to cold start")
 		}
 
-		// 7. Verified restore: the pod is Ready with no fallback event.
+		// 8. Verified restore: the pod is Ready with no fallback event.
 		logger.Info("Pod state restored from snapshot and replacement pod is Ready", "pod", replacementPod.Name)
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
 		now := metav1.Now()
