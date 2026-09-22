@@ -102,7 +102,9 @@ spec:
       - action: Ignore
         onExitCodes:
           operator: In
-          values: [137]
+          # 137: pod evicted by migration (synthesized by the status webhook)
+          # 128: container start failure -> restore-crash cold-start fallback
+          values: [137, 128]
   template:
     metadata:
 

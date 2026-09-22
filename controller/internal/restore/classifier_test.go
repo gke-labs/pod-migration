@@ -170,6 +170,134 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// A container that failed to start once and then came up keeps StartError/128
+// in LastTerminationState forever.  The first version of this detector read
+// that history unconditionally, so it classified recovered pods as fatal and
+// DELETED them; where the message did not match a signature it instead pinned
+// the PMJ in a 2s requeue loop forever.
+//
+// Every fixture below carries a stale history entry with a real gVisor
+// signature in it, so nothing but the container's CURRENT state distinguishes
+// them from a genuine crash.  All must classify FailureNone.
+func TestClassify_IgnoresStaleTerminationHistory(t *testing.T) {
+	staleHistory := corev1.ContainerState{
+		Terminated: &corev1.ContainerStateTerminated{
+			Reason:   "StartError",
+			ExitCode: 128,
+			Message:  restoreCrashOCIMessage,
+		},
+	}
+
+	tests := []struct {
+		name string
+		cs   corev1.ContainerStatus
+	}{
+		{
+			// The bug as reported: a Running, Ready container that recovered.
+			name: "Running container with stale StartError history",
+			cs: corev1.ContainerStatus{
+				Name:                 "app",
+				Ready:                true,
+				RestartCount:         1,
+				State:                corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				LastTerminationState: staleHistory,
+			},
+		},
+		{
+			// CrashLoopBackOff means the container DID start and the
+			// application exited. Whatever is in its history, this is an
+			// application failure and deleting the pod would not help.
+			name: "CrashLoopBackOff with stale StartError history",
+			cs: corev1.ContainerStatus{
+				Name:         "app",
+				RestartCount: 4,
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason:  "CrashLoopBackOff",
+						Message: "Back-off restarting failed container",
+					},
+				},
+				LastTerminationState: staleHistory,
+			},
+		},
+		{
+			// An init container that retried and then completed. Init
+			// containers are in scope for detection, so this is a real
+			// exposure, not a hypothetical.
+			name: "Completed init container with stale StartError history",
+			cs: corev1.ContainerStatus{
+				Name:         "init",
+				RestartCount: 1,
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Reason:   "Completed",
+						ExitCode: 0,
+					},
+				},
+				LastTerminationState: staleHistory,
+			},
+		},
+		{
+			// K3: reason and exit code must agree. A StartError that did not
+			// exit 128 is not the runtime-level failure we act on.
+			name: "StartError with a non-128 exit code",
+			cs: corev1.ContainerStatus{
+				Name: "app",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Reason:   "StartError",
+						ExitCode: 1,
+						Message:  restoreCrashOCIMessage,
+					},
+				},
+			},
+		},
+		{
+			// K3, mirrored on the Waiting branch: RunContainerError is only a
+			// licence to READ the history, not to trust whatever is in it.
+			name: "RunContainerError whose history exited 1, not 128",
+			cs: corev1.ContainerStatus{
+				Name: "app",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason:  "RunContainerError",
+						Message: restoreCrashOCIMessage,
+					},
+				},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Reason:   "Error",
+						ExitCode: 1,
+						Message:  restoreCrashOCIMessage,
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, place := range []string{"container", "initContainer"} {
+				t.Run(place, func(t *testing.T) {
+					status := corev1.PodStatus{Phase: corev1.PodRunning}
+					if place == "container" {
+						status.ContainerStatuses = []corev1.ContainerStatus{tc.cs}
+					} else {
+						status.InitContainerStatuses = []corev1.ContainerStatus{tc.cs}
+					}
+					pod := &corev1.Pod{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p"},
+						Status:     status,
+					}
+					if got := Classify(pod, DefaultEngines()...); got.Class != FailureNone {
+						t.Errorf("Expected FailureNone, got %v (verdict %+v)", got.Class, got)
+					}
+				})
+			}
+		})
+	}
+}
+
 // Classify must never key off restartCount: on a failed restore the kubelet
 // pins it at 0 forever, so a threshold would make the detector permanently
 // blind. This test exists to break anyone who "fixes" the detector by adding

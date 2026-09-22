@@ -6,8 +6,8 @@ import "strings"
 // identify a failed gVisor sentry restore as wrapped by containerd.
 //
 // Provenance is recorded per entry on purpose: a signature that fires DELETES a
-// running pod, so each one has to justify itself. See
-// pm-notes/technical_docs/restore-failure-signal-taxonomy.md.
+// running pod, so each one has to justify itself. The full observation table is
+// reproduced in the PR that introduced this package.
 //
 //   - "oci runtime restore failed" — OBSERVED on a live cluster (scenario S2).
 //     Full message: "failed to start containerd task ... OCI runtime restore

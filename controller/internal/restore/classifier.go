@@ -13,6 +13,17 @@ import (
 // engine-specific one.
 const startFailureExitCode = 128
 
+// The two kubelet reason strings the detector keys off.
+const (
+	// startErrorReason is set on a terminated container state when the runtime
+	// failed to start the container.
+	startErrorReason = "StartError"
+	// runContainerErrorReason is set on a waiting container state while the
+	// kubelet is parked between start attempts; the StartError that caused it
+	// lives in LastTerminationState.
+	runContainerErrorReason = "RunContainerError"
+)
+
 // FailureClass is the three-state verdict on a replacement pod.
 type FailureClass int
 
@@ -56,7 +67,8 @@ type startFailure struct {
 // containers that the runtime failed to start.
 //
 // Detection keys strictly off the start-failure shape observed on a live
-// cluster (see pm-notes/technical_docs/restore-failure-signal-taxonomy.md):
+// cluster (the taxonomy table is reproduced in the PR that introduced this
+// package):
 //
 //	waiting.reason=RunContainerError, terminated.reason=StartError, exitCode=128
 //
@@ -64,15 +76,25 @@ type startFailure struct {
 //
 //	waiting.reason=CrashLoopBackOff, terminated.reason=Error, exitCode=1
 //
+// The verdict is derived ONLY from the container's *current* state.
+// LastTerminationState is consulted solely to recover the message for a
+// container the kubelet has currently parked in RunContainerError.  Reading it
+// unconditionally is a correctness bug, not an optimisation: a container that
+// failed to start once and then came up keeps StartError/128 in its history
+// forever, so an unconditional read classifies a healthy, Ready pod as a fatal
+// restore failure and deletes it.  The original taxonomy was derived entirely
+// from crashed pods and had no row for a *recovered* one, which is how that
+// shape went unconsidered.
+//
+// Every branch below requires the reason AND the exit code together.  Neither
+// is sufficient alone: exit 128 also appears on ordinary signal-adjacent exits,
+// and StartError without 128 is not the runtime-level failure we act on.
+//
 // DO NOT add a restartCount threshold here.  On a restore failure the kubelet
 // never restarts the container, so restartCount is pinned at 0 forever; any
 // "restartCount > N" gate would make this detector permanently blind.  The
 // exit code plus the StartError/RunContainerError reasons are the only signals
 // that actually separate the two cases. This remains true for all engines.
-//
-// Both kubelet shapes are handled: the container may be parked in
-// Waiting(RunContainerError) with the StartError in LastTerminationState, or —
-// racing the status update — land directly in Terminated(StartError).
 func startFailures(pod *corev1.Pod) []startFailure {
 	if pod == nil {
 		return nil
@@ -89,20 +111,35 @@ func startFailures(pod *corev1.Pod) []startFailure {
 
 	var failures []startFailure
 	for _, cs := range statuses {
-		waiting := cs.State.Waiting
-		runContainerError := waiting != nil && waiting.Reason == "RunContainerError"
+		// Running: whatever a previous attempt recorded, this container
+		// started. Nothing in its history can make that untrue.
+		if cs.State.Running != nil {
+			continue
+		}
 
-		// Examine both the current and the previous termination: which one
-		// holds the StartError depends on where the kubelet is in its status
-		// update cycle.
+		waiting := cs.State.Waiting
+
 		var startFail *corev1.ContainerStateTerminated
-		for _, term := range []*corev1.ContainerStateTerminated{cs.State.Terminated, cs.LastTerminationState.Terminated} {
-			if term == nil || term.ExitCode != startFailureExitCode {
-				continue
+		switch {
+		case cs.State.Terminated != nil:
+			// Terminated directly in the start failure — the kubelet has not
+			// (or will not) move the container to Waiting. A container that
+			// ran and exited lands here too, but carries reason=Error or
+			// Completed with a different exit code, so it falls straight out.
+			if cs.State.Terminated.Reason == startErrorReason &&
+				cs.State.Terminated.ExitCode == startFailureExitCode {
+				startFail = cs.State.Terminated
 			}
-			if term.Reason == "StartError" || runContainerError {
-				startFail = term
-				break
+
+		case waiting != nil && waiting.Reason == runContainerErrorReason:
+			// Parked between start attempts, so the StartError is in history.
+			// ONLY RunContainerError qualifies to read it: CrashLoopBackOff
+			// means the container did start and the application exited, which
+			// is never ours no matter what the history says.
+			if lt := cs.LastTerminationState.Terminated; lt != nil &&
+				lt.Reason == startErrorReason &&
+				lt.ExitCode == startFailureExitCode {
+				startFail = lt
 			}
 		}
 		if startFail == nil {

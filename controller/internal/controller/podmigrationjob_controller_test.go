@@ -3835,7 +3835,7 @@ func TestPodMigrationJobReconciler_Evicting_OriginPodRemoved_NoVacuousConditions
 // --- Issue #15: cold-start fallback on a gVisor/OCI restore crash -----------
 //
 // Ground truth for the fixtures below was captured from a live cluster replay
-// (see pm-notes/technical_docs/restore-failure-signal-taxonomy.md):
+// (the observation table is reproduced in the PR that introduced this feature):
 //
 //	restore failure : waiting=RunContainerError, terminated=StartError,
 //	                  exitCode=128, restartCount=0 (NEVER increments)
@@ -4503,5 +4503,315 @@ func TestPodMigrationJobReconciler_RestoreCrash_CompletionPathSparesSuccessorPod
 
 	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &corev1.Pod{}); err != nil {
 		t.Errorf("Expected the successor pod to survive the completion path, got err=%v", err)
+	}
+}
+
+// recoveredPodStatus is a pod that failed to start once and then came up: it is
+// Running and Ready, but keeps the StartError/128 from the failed attempt in
+// LastTerminationState forever — carrying a real gVisor signature in it.
+//
+// This shape was missing from the taxonomy the detector was derived from, which
+// was built entirely from crashed pods.  The first implementation read
+// LastTerminationState unconditionally and so DELETED pods in this state.
+func recoveredPodStatus(message string) corev1.PodStatus {
+	return corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+		},
+		ContainerStatuses: []corev1.ContainerStatus{
+			{
+				Name:         "app",
+				Ready:        true,
+				RestartCount: 1,
+				State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						Reason:   "StartError",
+						ExitCode: 128,
+						Message:  message,
+					},
+				},
+			},
+		},
+	}
+}
+
+// T7 (K1/K2): a replacement pod that hit a restore crash and then RECOVERED is
+// Running and Ready, but still carries StartError/128 in LastTerminationState.
+// It must survive and the PMJ must conclude Succeeded.
+//
+// Two independent defects made this fail: the classifier read termination
+// history unconditionally, and step 5 ran before the readiness check, so a
+// Ready pod could still be intercepted.  Both are exercised here — the fixture
+// carries a signature that WOULD match if either guard were missing.
+func TestPodMigrationJobReconciler_Restoring_RecoveredReadyPodIsNotDeleted(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	pod, pmj := newRestoreCrashFixture(namespace, jobName, podName, podUID,
+		recoveredPodStatus(restoreCrashOCIMessage))
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{Client: fakeClient, Scheme: scheme}
+
+	before := counterValue(t, metrics.RestoreCrashFallbackTotal)
+
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &corev1.Pod{}); err != nil {
+		t.Fatalf("Expected the recovered pod to survive, got err=%v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceeded, updatedPMJ.Status.Phase)
+	}
+	if cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, ConditionRestoreCrashed); cond != nil {
+		t.Errorf("Expected no %s condition on a recovered pod, got %+v", ConditionRestoreCrashed, cond)
+	}
+	if got := counterValue(t, metrics.RestoreCrashFallbackTotal) - before; got != 0 {
+		t.Errorf("Expected the fallback counter not to move, got +%v", got)
+	}
+}
+
+// T8 (B1): a crash first OBSERVED after the 5-minute ceiling is still a crash.
+//
+// The ceiling sits above the pod fetch and, for a Consumed PMJ, concluded
+// SucceededWithoutRestore without ever looking at the pod — recording success
+// and leaving the pod wedged forever.  Any delay in first observation triggers
+// it: controller restart, leader handoff, or the evacuation backlog this
+// feature was filed for.
+func TestPodMigrationJobReconciler_Restoring_CrashAfterCeilingStillRunsFallback(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	pod, pmj := newRestoreCrashFixture(namespace, jobName, podName, podUID,
+		restoreCrashPodStatus(restoreCrashOCIMessage))
+
+	// Push the restore start past the 5-minute ceiling.
+	restoringStart := metav1.NewTime(time.Now().Add(-6 * time.Minute))
+	pmj.Status.RestoringStartTime = &restoringStart
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{Client: fakeClient, Scheme: scheme}
+
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Fatalf("Ceiling recorded SucceededWithoutRestore for a crashed pod; the crash was never acted on")
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseFailed, updatedPMJ.Status.Phase)
+	}
+	if !meta.IsStatusConditionTrue(updatedPMJ.Status.Conditions, ConditionRestoreCrashed) {
+		t.Errorf("Expected %s condition True, got %+v", ConditionRestoreCrashed, updatedPMJ.Status.Conditions)
+	}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Errorf("Expected the crashed pod to be deleted by the post-ceiling fallback, got err=%v", err)
+	}
+}
+
+// T9 (B2): the destructive decision is confirmed against the API server.
+//
+// The informer cache serves the per-reconcile classification, so it can show a
+// crash on a pod that has already recovered.  Here the cache holds the crashed
+// snapshot while the API server holds the recovered one: nothing may be written
+// and nothing may be deleted.
+func TestPodMigrationJobReconciler_Restoring_StaleCachedCrashIsNotActedOn(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	// The cache's view: crashed.
+	cachedPod, pmj := newRestoreCrashFixture(namespace, jobName, podName, podUID,
+		restoreCrashPodStatus(restoreCrashOCIMessage))
+
+	// The API server's view: the same pod instance, recovered.
+	livePod := cachedPod.DeepCopy()
+	livePod.Status = recoveredPodStatus(restoreCrashOCIMessage)
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(cachedPod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+	apiReader := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(livePod).
+		Build()
+
+	r := &PodMigrationJobReconciler{Client: fakeClient, APIReader: apiReader, Scheme: scheme}
+
+	before := counterValue(t, metrics.RestoreCrashFallbackTotal)
+
+	ctx := context.Background()
+	res, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Errorf("Expected the unconfirmed verdict to requeue rather than conclude, got %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+		t.Errorf("Expected the PMJ to stay %s on an unconfirmed verdict, got %s",
+			pmv1alpha1.PodMigrationJobPhaseRestoring, updatedPMJ.Status.Phase)
+	}
+	if cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, ConditionRestoreCrashed); cond != nil {
+		t.Errorf("Expected no %s condition to be persisted off a stale cache read, got %+v", ConditionRestoreCrashed, cond)
+	}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &corev1.Pod{}); err != nil {
+		t.Errorf("Expected the pod to survive an unconfirmed verdict, got err=%v", err)
+	}
+	if got := counterValue(t, metrics.RestoreCrashFallbackTotal) - before; got != 0 {
+		t.Errorf("Expected the fallback counter not to move, got +%v", got)
+	}
+}
+
+// T10 (B4): UnrecognizedRestoreCrash must be retractable.
+//
+// An unrecognised start failure is deliberately never acted on, so the
+// container can start on a later attempt.  The condition was only ever set
+// True, which permanently mislabelled a migration that went on to succeed.
+func TestPodMigrationJobReconciler_Restoring_UnrecognizedConditionClearedOnSuccess(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	// A pod that hit an unrecognised start failure and has since come up Ready.
+	pod, pmj := newRestoreCrashFixture(namespace, jobName, podName, podUID,
+		recoveredPodStatus(restoreCrashUnknownMessage))
+	pmj.Status.Conditions = []metav1.Condition{
+		{
+			Type:               ConditionUnrecognizedRestoreCrash,
+			Status:             metav1.ConditionTrue,
+			Reason:             ReasonUnrecognizedRestoreCrash,
+			Message:            "unrecognised start failure",
+			LastTransitionTime: metav1.Now(),
+		},
+	}
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{Client: fakeClient, Scheme: scheme}
+
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
+		t.Fatalf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceeded, updatedPMJ.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, ConditionUnrecognizedRestoreCrash)
+	if cond == nil {
+		t.Fatalf("Expected %s to be retracted, not removed", ConditionUnrecognizedRestoreCrash)
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("Expected %s to be False once the pod recovered, got %s", ConditionUnrecognizedRestoreCrash, cond.Status)
+	}
+}
+
+// A job that never saw an unrecognised crash must not acquire a vacuous False
+// condition, matching the hygiene clearEvictionBlockageConditions already
+// enforces.
+func TestPodMigrationJobReconciler_Restoring_NoVacuousUnrecognizedCondition(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	podUID := "restored-uid-1234"
+	jobName := "pmj-" + podName
+
+	pod, pmj := newRestoreCrashFixture(namespace, jobName, podName, podUID, corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+		},
+	})
+
+	fakeClient := newFakeClientBuilderWithEventIndex(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{Client: fakeClient, Scheme: scheme}
+
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, ConditionUnrecognizedRestoreCrash); cond != nil {
+		t.Errorf("Expected no %s condition on a job that never saw one, got %+v", ConditionUnrecognizedRestoreCrash, cond)
 	}
 }
