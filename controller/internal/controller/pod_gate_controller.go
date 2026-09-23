@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -40,9 +41,11 @@ type PodGateReconciler struct {
 	// cache.  Used to distinguish "PMJ deleted" from "PMJ not yet synced".
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
@@ -266,6 +269,10 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		r.removeGate(pod)
 		if err := r.Update(ctx, pod); err != nil {
 			return ctrl.Result{}, err
+		}
+
+		if r.Recorder != nil {
+			r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Scheduling gate removed and snapshot %s injected for restore", job.Status.SnapshotRef)
 		}
 
 		return ctrl.Result{}, nil

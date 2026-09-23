@@ -142,10 +142,12 @@ func main() {
 		MaxConcurrentReconciles: maxConcurrent,
 	}
 
+	eventRecorder := mgr.GetEventRecorderFor("pod-migration-controller")
+
 	if err := (&controller.PodMigrationReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("podmigration-controller"),
+		Recorder: eventRecorder,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")
 		os.Exit(1)
@@ -154,6 +156,7 @@ func main() {
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
+		Recorder:  eventRecorder,
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)
@@ -165,6 +168,7 @@ func main() {
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
+		Recorder:  eventRecorder,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
 		os.Exit(1)

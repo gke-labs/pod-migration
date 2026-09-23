@@ -71,7 +71,10 @@ type PodMigrationJobStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=pmj
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Snapshot",type="string",JSONPath=".status.snapshotRef"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // PodMigrationJob tracks the execution of a single Pod Migration event.
 type PodMigrationJob struct {
