@@ -5,6 +5,8 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+
+	apimachineryversion "k8s.io/apimachinery/pkg/version"
 )
 
 const DefaultVersion = "v0.1.0-dev"
@@ -20,14 +22,11 @@ var (
 
 var readBuildInfo = debug.ReadBuildInfo
 
-// Info holds structured runtime and build metadata.
+// Info holds structured runtime and build metadata reconciled with k8s.io/apimachinery/pkg/version.Info.
 type Info struct {
-	Version   string `json:"version"`
-	GitCommit string `json:"gitCommit"`
-	BuildDate string `json:"buildDate"`
-	GoVersion string `json:"goVersion"`
-	Compiler  string `json:"compiler"`
-	Platform  string `json:"platform"`
+	apimachineryversion.Info
+	// Version is maintained as an alias to GitVersion for backward compatibility.
+	Version string `json:"version,omitempty"`
 }
 
 // Get returns structured version information for the controller.
@@ -43,11 +42,7 @@ func Get() Info {
 				switch setting.Key {
 				case "vcs.revision":
 					if c == "unknown" || c == "" {
-						if len(setting.Value) > 7 {
-							c = setting.Value[:7]
-						} else {
-							c = setting.Value
-						}
+						c = setting.Value
 					}
 				case "vcs.time":
 					if d == "unknown" || d == "" {
@@ -62,18 +57,47 @@ func Get() Info {
 		}
 	}
 
-	return Info{
-		Version:   v,
-		GitCommit: c,
-		BuildDate: d,
-		GoVersion: runtime.Version(),
-		Compiler:  runtime.Compiler,
-		Platform:  fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+	gitTreeState := "clean"
+	if strings.HasSuffix(v, "-dirty") {
+		gitTreeState = "dirty"
 	}
+
+	major, minor := parseMajorMinor(v)
+
+	return Info{
+		Info: apimachineryversion.Info{
+			Major:        major,
+			Minor:        minor,
+			GitVersion:   v,
+			GitCommit:    c,
+			GitTreeState: gitTreeState,
+			BuildDate:    d,
+			GoVersion:    runtime.Version(),
+			Compiler:     runtime.Compiler,
+			Platform:     fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		},
+		Version: v,
+	}
+}
+
+func parseMajorMinor(v string) (string, string) {
+	clean := strings.TrimPrefix(v, "v")
+	parts := strings.Split(clean, ".")
+	if len(parts) >= 2 {
+		return parts[0], parts[1]
+	}
+	if len(parts) == 1 && parts[0] != "" {
+		return parts[0], ""
+	}
+	return "", ""
 }
 
 // String returns a human-readable version string.
 func (i Info) String() string {
+	ver := i.GitVersion
+	if ver == "" {
+		ver = i.Version
+	}
 	return fmt.Sprintf("pod-migration-controller %s (commit: %s, built: %s, go: %s, compiler: %s, platform: %s)",
-		i.Version, i.GitCommit, i.BuildDate, i.GoVersion, i.Compiler, i.Platform)
+		ver, i.GitCommit, i.BuildDate, i.GoVersion, i.Compiler, i.Platform)
 }

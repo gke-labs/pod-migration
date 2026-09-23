@@ -2,6 +2,7 @@ package version
 
 import (
 	"encoding/json"
+	apimachineryversion "k8s.io/apimachinery/pkg/version"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -30,6 +31,9 @@ func TestGet(t *testing.T) {
 	if info.Version == "" {
 		t.Errorf("Expected Version to not be empty")
 	}
+	if info.GitVersion == "" {
+		t.Errorf("Expected GitVersion to not be empty")
+	}
 	if info.GitCommit == "" {
 		t.Errorf("Expected GitCommit to not be empty")
 	}
@@ -45,6 +49,9 @@ func TestGet(t *testing.T) {
 	if info.Platform == "" {
 		t.Errorf("Expected Platform to not be empty")
 	}
+	if info.GitTreeState == "" {
+		t.Errorf("Expected GitTreeState to not be empty")
+	}
 
 	str := info.String()
 	if !strings.Contains(str, "pod-migration-controller") {
@@ -59,12 +66,18 @@ func TestGet(t *testing.T) {
 
 	// Verify custom struct formatting
 	customInfo := Info{
-		Version:   "v1.2.3",
-		GitCommit: "abcdef1",
-		BuildDate: "2026-09-01T12:00:00Z",
-		GoVersion: "go1.24.0",
-		Compiler:  "gc",
-		Platform:  "linux/amd64",
+		Info: apimachineryversion.Info{
+			Major:        "1",
+			Minor:        "2",
+			GitVersion:   "v1.2.3",
+			GitCommit:    "abcdef1",
+			GitTreeState: "clean",
+			BuildDate:    "2026-09-01T12:00:00Z",
+			GoVersion:    "go1.24.0",
+			Compiler:     "gc",
+			Platform:     "linux/amd64",
+		},
+		Version: "v1.2.3",
 	}
 	customStr := customInfo.String()
 	expectedSubstrings := []string{"v1.2.3", "abcdef1", "2026-09-01T12:00:00Z", "go1.24.0", "gc", "linux/amd64"}
@@ -74,20 +87,36 @@ func TestGet(t *testing.T) {
 		}
 	}
 
-	// Verify JSON marshaling & unmarshaling
+	// Verify JSON marshaling & unmarshaling with standard apimachinery fields
 	data, err := json.Marshal(info)
 	if err != nil {
 		t.Fatalf("Failed to marshal version Info to JSON: %v", err)
 	}
+	var rawMap map[string]interface{}
+	if err := json.Unmarshal(data, &rawMap); err != nil {
+		t.Fatalf("Failed to unmarshal raw JSON map: %v", err)
+	}
+	for _, expectedKey := range []string{"gitVersion", "gitCommit", "gitTreeState", "buildDate", "goVersion", "compiler", "platform", "major", "minor"} {
+		if _, ok := rawMap[expectedKey]; !ok {
+			t.Errorf("Expected JSON key %q in marshaled version Info, got keys: %v", expectedKey, rawMap)
+		}
+	}
+
 	var unmarshaled Info
 	if err := json.Unmarshal(data, &unmarshaled); err != nil {
 		t.Fatalf("Failed to unmarshal version Info JSON: %v", err)
+	}
+	if unmarshaled.GitVersion != info.GitVersion {
+		t.Errorf("Expected unmarshaled GitVersion %s, got %s", info.GitVersion, unmarshaled.GitVersion)
 	}
 	if unmarshaled.Version != info.Version {
 		t.Errorf("Expected unmarshaled Version %s, got %s", info.Version, unmarshaled.Version)
 	}
 	if unmarshaled.Platform != info.Platform {
 		t.Errorf("Expected unmarshaled Platform %s, got %s", info.Platform, unmarshaled.Platform)
+	}
+	if unmarshaled.GitTreeState != info.GitTreeState {
+		t.Errorf("Expected unmarshaled GitTreeState %s, got %s", info.GitTreeState, unmarshaled.GitTreeState)
 	}
 }
 
@@ -107,11 +136,17 @@ func TestGet_DefaultVersionDirty(t *testing.T) {
 		if info.Version != expected {
 			t.Errorf("Expected Version %q on dirty tree, got %q", expected, info.Version)
 		}
-		if info.GitCommit != "0123456" {
-			t.Errorf("Expected GitCommit %q, got %q", "0123456", info.GitCommit)
+		if info.GitVersion != expected {
+			t.Errorf("Expected GitVersion %q on dirty tree, got %q", expected, info.GitVersion)
+		}
+		if info.GitCommit != "0123456789abcdef" {
+			t.Errorf("Expected GitCommit %q, got %q", "0123456789abcdef", info.GitCommit)
 		}
 		if info.BuildDate != "2026-09-04T12:00:00Z" {
 			t.Errorf("Expected BuildDate %q, got %q", "2026-09-04T12:00:00Z", info.BuildDate)
+		}
+		if info.GitTreeState != "dirty" {
+			t.Errorf("Expected GitTreeState %q, got %q", "dirty", info.GitTreeState)
 		}
 	})
 }
@@ -130,6 +165,12 @@ func TestGet_InjectedVersionDirty(t *testing.T) {
 		if info.Version != expected {
 			t.Errorf("Expected Version %q on dirty tree, got %q", expected, info.Version)
 		}
+		if info.GitVersion != expected {
+			t.Errorf("Expected GitVersion %q on dirty tree, got %q", expected, info.GitVersion)
+		}
+		if info.GitTreeState != "dirty" {
+			t.Errorf("Expected GitTreeState %q, got %q", "dirty", info.GitTreeState)
+		}
 	})
 }
 
@@ -147,6 +188,9 @@ func TestGet_InjectedVersionAlreadyDirty(t *testing.T) {
 		if info.Version != expected {
 			t.Errorf("Expected Version %q to not become %q-dirty, got %q", expected, expected, info.Version)
 		}
+		if info.GitVersion != expected {
+			t.Errorf("Expected GitVersion %q to not become %q-dirty, got %q", expected, expected, info.GitVersion)
+		}
 	})
 }
 
@@ -154,24 +198,36 @@ func TestGet_CleanTree(t *testing.T) {
 	defer resetGlobals()()
 
 	tests := []struct {
-		name     string
-		inputVer string
-		expected string
+		name          string
+		inputVer      string
+		expected      string
+		expectedTree  string
+		expectedMajor string
+		expectedMinor string
 	}{
 		{
-			name:     "default version on clean tree",
-			inputVer: DefaultVersion,
-			expected: DefaultVersion,
+			name:          "default version on clean tree",
+			inputVer:      DefaultVersion,
+			expected:      DefaultVersion,
+			expectedTree:  "clean",
+			expectedMajor: "0",
+			expectedMinor: "1",
 		},
 		{
-			name:     "injected version on clean tree",
-			inputVer: "v0.2.0",
-			expected: "v0.2.0",
+			name:          "injected version on clean tree",
+			inputVer:      "v0.2.0",
+			expected:      "v0.2.0",
+			expectedTree:  "clean",
+			expectedMajor: "0",
+			expectedMinor: "2",
 		},
 		{
-			name:     "injected dirty version on clean tree preserved",
-			inputVer: "v0.2.0-dirty",
-			expected: "v0.2.0-dirty",
+			name:          "injected dirty version on clean tree preserved",
+			inputVer:      "v0.2.0-dirty",
+			expected:      "v0.2.0-dirty",
+			expectedTree:  "dirty",
+			expectedMajor: "0",
+			expectedMinor: "2",
 		},
 	}
 
@@ -187,6 +243,18 @@ func TestGet_CleanTree(t *testing.T) {
 				info := Get()
 				if info.Version != tc.expected {
 					t.Errorf("Expected Version %q on clean tree, got %q", tc.expected, info.Version)
+				}
+				if info.GitVersion != tc.expected {
+					t.Errorf("Expected GitVersion %q on clean tree, got %q", tc.expected, info.GitVersion)
+				}
+				if info.GitTreeState != tc.expectedTree {
+					t.Errorf("Expected GitTreeState %q, got %q", tc.expectedTree, info.GitTreeState)
+				}
+				if info.Major != tc.expectedMajor {
+					t.Errorf("Expected Major %q, got %q", tc.expectedMajor, info.Major)
+				}
+				if info.Minor != tc.expectedMinor {
+					t.Errorf("Expected Minor %q, got %q", tc.expectedMinor, info.Minor)
 				}
 			})
 		})
@@ -206,6 +274,9 @@ func TestGet_LdflagsInjected(t *testing.T) {
 		info := Get()
 		if info.Version != "v1.0.0" {
 			t.Errorf("Expected Version %q to remain unmodified when ldflags injected, got %q", "v1.0.0", info.Version)
+		}
+		if info.GitVersion != "v1.0.0" {
+			t.Errorf("Expected GitVersion %q to remain unmodified when ldflags injected, got %q", "v1.0.0", info.GitVersion)
 		}
 		if info.GitCommit != "abcdef1" {
 			t.Errorf("Expected GitCommit %q, got %q", "abcdef1", info.GitCommit)
