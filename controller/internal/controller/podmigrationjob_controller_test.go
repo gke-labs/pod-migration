@@ -1273,6 +1273,7 @@ func TestPodMigrationJobReconciler_Evicting_Success(t *testing.T) {
 	// and no VolumeAttachments are active
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
 		WithObjects(pmj).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		Build()
@@ -1317,6 +1318,366 @@ func TestPodMigrationJobReconciler_Evicting_Success(t *testing.T) {
 	}
 	if cond.Reason != "RestoringState" {
 		t.Errorf("Expected Ready condition reason to be 'RestoringState', got %q", cond.Reason)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_StillAttached_Requeues(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	pvName := "target-pv"
+	otherPV := "other-pv"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			PVsToDetach: []string{pvName},
+		},
+	}
+
+	vaTarget := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-target",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName,
+			},
+			NodeName: "node-1",
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: true,
+		},
+	}
+
+	vaOther := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-other",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &otherPV,
+			},
+			NodeName: "node-2",
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: true,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+		WithObjects(pmj, vaTarget, vaOther).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 3*time.Second {
+		t.Errorf("Expected RequeueAfter 3s, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseEvicting, updatedPMJ.Status.Phase)
+	}
+
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatalf("Expected Ready condition to be set, but it was nil")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("Expected Ready condition status to be False, got %s", cond.Status)
+	}
+	if cond.Reason != "WaitingForVolumeDetach" {
+		t.Errorf("Expected Ready condition reason to be 'WaitingForVolumeDetach', got %q", cond.Reason)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_Detached_TransitionsToRestoring(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	pvName := "target-pv"
+	otherPV := "other-pv"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			PVsToDetach: []string{pvName},
+		},
+	}
+
+	// Target PV attachment is detached (Attached: false)
+	vaTarget := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-target",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName,
+			},
+			NodeName: "node-1",
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: false,
+		},
+	}
+
+	// Unrelated PV is attached
+	vaOther := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-other",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &otherPV,
+			},
+			NodeName: "node-2",
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: true,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+		WithObjects(pmj, vaTarget, vaOther).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected no requeue on transition to Restoring, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseRestoring, updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_MultiplePVs_OneStillAttached(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	pv1 := "target-pv-1"
+	pv2 := "target-pv-2"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			PVsToDetach: []string{pv1, pv2},
+		},
+	}
+
+	va1 := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-1",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pv1,
+			},
+			NodeName: "node-1",
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: false,
+		},
+	}
+
+	va2 := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-2",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pv2,
+			},
+			NodeName: "node-2",
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: true,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+		WithObjects(pmj, va1, va2).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 3*time.Second {
+		t.Errorf("Expected RequeueAfter 3s, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseEvicting, updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_ListError_ReturnsError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	pvName := "target-pv"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			PVsToDetach: []string{pvName},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+		WithObjects(pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, client client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*storagev1.VolumeAttachmentList); ok {
+					return fmt.Errorf("simulated volume attachment list error")
+				}
+				return client.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err == nil {
+		t.Fatal("Expected error on VolumeAttachment list failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "simulated volume attachment list error") {
+		t.Errorf("Expected simulated error message, got: %v", err)
 	}
 }
 
