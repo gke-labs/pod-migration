@@ -134,8 +134,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Cache indexes must be registered before any controller starts; the gate
-	// mapper and the restore-timeout deferral both List pods by assigned-pmj.
+	// Cache indexes must be registered before any controller starts:
+	// 1. Pods by assigned PMJ (used by gate mapper and restore-timeout deferral)
+	// 2. VolumeAttachments by persistent volume name (used by PMJ detachment wait)
 	if err := controller.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		setupLog.Error(err, "unable to register field indexes")
 		os.Exit(1)
