@@ -491,8 +491,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
-		// Capture PV Names before starting checkpoint (pod is guaranteed to exist)
-		if len(job.Status.PVsToDetach) == 0 {
+		// Capture PV Names and origin node name before starting checkpoint (pod is guaranteed to exist)
+		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" {
 			originPod := &corev1.Pod{}
 			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
 			if err != nil {
@@ -540,25 +540,31 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, nil
 			}
 
-			var pvs []string
-			for _, vol := range originPod.Spec.Volumes {
-				if vol.PersistentVolumeClaim != nil {
-					pvc := &corev1.PersistentVolumeClaim{}
-					err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
-					if err != nil {
-						if apierrors.IsNotFound(err) {
-							logger.Info("PVC not found, skipping volume", "pvc", vol.PersistentVolumeClaim.ClaimName)
-							continue
+			if job.Status.OriginNodeName == "" && originPod.Spec.NodeName != "" {
+				job.Status.OriginNodeName = originPod.Spec.NodeName
+			}
+
+			if len(job.Status.PVsToDetach) == 0 {
+				var pvs []string
+				for _, vol := range originPod.Spec.Volumes {
+					if vol.PersistentVolumeClaim != nil {
+						pvc := &corev1.PersistentVolumeClaim{}
+						err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
+						if err != nil {
+							if apierrors.IsNotFound(err) {
+								logger.Info("PVC not found, skipping volume", "pvc", vol.PersistentVolumeClaim.ClaimName)
+								continue
+							}
+							logger.Error(err, "Failed to get PVC for volume analysis", "pvc", vol.PersistentVolumeClaim.ClaimName)
+							return ctrl.Result{}, err // Return error to trigger manager retry
 						}
-						logger.Error(err, "Failed to get PVC for volume analysis", "pvc", vol.PersistentVolumeClaim.ClaimName)
-						return ctrl.Result{}, err // Return error to trigger manager retry
-					}
-					if pvc.Spec.VolumeName != "" {
-						pvs = append(pvs, pvc.Spec.VolumeName)
+						if pvc.Spec.VolumeName != "" {
+							pvs = append(pvs, pvc.Spec.VolumeName)
+						}
 					}
 				}
+				job.Status.PVsToDetach = pvs
 			}
-			job.Status.PVsToDetach = pvs
 		}
 
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
@@ -656,6 +662,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		if podExists && string(pod.UID) == job.Spec.TargetPodUID {
+			if job.Status.OriginNodeName == "" && pod.Spec.NodeName != "" {
+				job.Status.OriginNodeName = pod.Spec.NodeName
+			}
+
 			// If the origin pod is already terminating through its grace period, wait for deletion
 			if pod.DeletionTimestamp != nil {
 				logger.Info("Origin pod is already terminating; waiting for deletion", "pod", podName)
@@ -790,8 +800,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 
 				for _, va := range vaList.Items {
+					// If OriginNodeName is known, only wait for detachment from the origin node.
+					// Other nodes (e.g. destination node or existing RWX attachments) must not block migration.
+					if job.Status.OriginNodeName != "" && va.Spec.NodeName != job.Status.OriginNodeName {
+						continue
+					}
 					if va.Status.Attached {
-						logger.Info("Volume is still attached, waiting...", "pv", targetPV, "volumeAttachment", va.Name)
+						logger.Info("Volume is still attached, waiting...", "pv", targetPV, "volumeAttachment", va.Name, "node", va.Spec.NodeName)
 						activeAttachment = true
 						break
 					}
