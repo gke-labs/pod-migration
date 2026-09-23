@@ -13,12 +13,15 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -213,6 +216,7 @@ func (r *PodMigrationJobReconciler) concludeRestoreCrash(
 	ctx context.Context,
 	req ctrl.Request,
 	job *pmv1alpha1.PodMigrationJob,
+	origJob *pmv1alpha1.PodMigrationJob,
 	pod *corev1.Pod,
 	verdict restore.Failure,
 ) (ctrl.Result, error) {
@@ -260,9 +264,8 @@ func (r *PodMigrationJobReconciler) concludeRestoreCrash(
 	// The status write MUST land before the Delete.  If we deleted first and
 	// then crashed, the PMJ would stay in its pre-fallback phase with its
 	// recorded pod gone and no record of why.
-	if err := r.Status().Update(ctx, job); err != nil {
-		logger.Error(err, "Failed to update job status on restore crash")
-		return ctrl.Result{}, err
+	if err := r.patchStatus(ctx, job, origJob); err != nil {
+		return r.handleStatusError(ctx, err, "Failed to update job status on restore crash")
 	}
 
 	r.eventf(job, corev1.EventTypeWarning, ReasonRestoreCrashFallback, "%s", message)
@@ -353,14 +356,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	podName := job.Spec.PodRef.Name
+	origJob := job.DeepCopy()
 
 	// Set initial phase if empty
 	if job.Status.Phase == "" {
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhasePending
-		err = r.Status().Update(ctx, job)
+		err = r.patchStatus(ctx, job, origJob)
 		if err != nil {
-			logger.Error(err, "Failed to initialize job phase")
-			return ctrl.Result{}, err
+			return r.handleStatusError(ctx, err, "Failed to initialize job phase")
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -404,9 +407,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						}
 					}
 
-					if err := r.markSucceededWithoutRestore(ctx, job, reason, message); err != nil {
-						logger.Error(err, "Failed to update job status on eviction timeout")
-						return ctrl.Result{}, err
+					if err := r.markSucceededWithoutRestore(ctx, job, origJob, reason, message); err != nil {
+						return r.handleStatusError(ctx, err, "Failed to update job status on eviction timeout")
 					}
 					return ctrl.Result{}, nil
 				}
@@ -428,9 +430,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			// Clean up snapshot trigger if it exists (best effort)
 			_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 
-			if err := r.Status().Update(ctx, job); err != nil {
-				logger.Error(err, "Failed to update job status to Failed on timeout")
-				return ctrl.Result{}, err
+			if err := r.patchStatus(ctx, job, origJob); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to update job status to Failed on timeout")
 			}
 			return ctrl.Result{}, nil
 		}
@@ -509,9 +510,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						ObservedGeneration: job.Generation,
 					})
 
-					if err := r.Status().Update(ctx, job); err != nil {
-						logger.Error(err, "Failed to update job status to Failed on missing origin pod")
-						return ctrl.Result{}, err
+					if err := r.patchStatus(ctx, job, origJob); err != nil {
+						return r.handleStatusError(ctx, err, "Failed to update job status to Failed on missing origin pod")
 					}
 					return ctrl.Result{}, nil
 				}
@@ -534,9 +534,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					ObservedGeneration: job.Generation,
 				})
 
-				if err := r.Status().Update(ctx, job); err != nil {
-					logger.Error(err, "Failed to update job status to Failed on origin pod UID mismatch")
-					return ctrl.Result{}, err
+				if err := r.patchStatus(ctx, job, origJob); err != nil {
+					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on origin pod UID mismatch")
 				}
 				return ctrl.Result{}, nil
 			}
@@ -563,10 +562,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
-		err = r.Status().Update(ctx, job)
+		err = r.patchStatus(ctx, job, origJob)
 		if err != nil {
-			logger.Error(err, "Failed to update job status to Snapshotting")
-			return ctrl.Result{}, err
+			return r.handleStatusError(ctx, err, "Failed to update job status to Snapshotting")
 		}
 		return ctrl.Result{Requeue: true}, nil
 
@@ -600,10 +598,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Message:            snapStatus.Message,
 				ObservedGeneration: job.Generation,
 			})
-			err = r.Status().Update(ctx, job)
+			err = r.patchStatus(ctx, job, origJob)
 			if err != nil {
-				logger.Error(err, "Failed to update job status to Failed on snapshot failure")
-				return ctrl.Result{}, err
+				return r.handleStatusError(ctx, err, "Failed to update job status to Failed on snapshot failure")
 			}
 			return ctrl.Result{}, nil
 
@@ -611,10 +608,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapStatus.SnapshotRef)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
 			job.Status.SnapshotRef = snapStatus.SnapshotRef
-			err = r.Status().Update(ctx, job)
+			err = r.patchStatus(ctx, job, origJob)
 			if err != nil {
-				logger.Error(err, "Failed to update job status to Evicting")
-				return ctrl.Result{}, err
+				return r.handleStatusError(ctx, err, "Failed to update job status to Evicting")
 			}
 			return ctrl.Result{Requeue: true}, nil
 
@@ -626,10 +622,18 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Message:            snapStatus.Message,
 				ObservedGeneration: job.Generation,
 			}
-			if meta.SetStatusCondition(&job.Status.Conditions, cond) {
-				_ = r.Status().Update(ctx, job)
+			condChanged := meta.SetStatusCondition(&job.Status.Conditions, cond)
+			refChanged := false
+			if snapStatus.SnapshotRef != "" && job.Status.SnapshotRef != snapStatus.SnapshotRef {
+				job.Status.SnapshotRef = snapStatus.SnapshotRef
+				refChanged = true
 			}
-			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+			if condChanged || refChanged {
+				if err := r.patchStatus(ctx, job, origJob); err != nil {
+					return r.handleStatusError(ctx, err, "Failed to update snapshot status in progress")
+				}
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
@@ -710,9 +714,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					updatedPDB := meta.SetStatusCondition(&job.Status.Conditions, condPDB)
 					updatedMisconfig := meta.SetStatusCondition(&job.Status.Conditions, condMisconfig)
 					if updatedPDB || updatedMisconfig {
-						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
-							logger.Error(updateErr, "Failed to update status on clearing eviction blockage conditions")
-							return ctrl.Result{}, updateErr
+						if updateErr := r.patchStatus(ctx, job, origJob); updateErr != nil {
+							return r.handleStatusError(ctx, updateErr, "Failed to update status on clearing eviction blockage conditions")
 						}
 					}
 					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -726,9 +729,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						ObservedGeneration: job.Generation,
 					}
 					if meta.SetStatusCondition(&job.Status.Conditions, cond) {
-						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
-							logger.Error(updateErr, "Failed to update status on BlockedByPDB condition")
-							return ctrl.Result{}, updateErr
+						if updateErr := r.patchStatus(ctx, job, origJob); updateErr != nil {
+							return r.handleStatusError(ctx, updateErr, "Failed to update status on BlockedByPDB condition")
 						}
 					}
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -742,9 +744,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						ObservedGeneration: job.Generation,
 					}
 					if meta.SetStatusCondition(&job.Status.Conditions, cond) {
-						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
-							logger.Error(updateErr, "Failed to update status on EvictionMisconfigured condition")
-							return ctrl.Result{}, updateErr
+						if updateErr := r.patchStatus(ctx, job, origJob); updateErr != nil {
+							return r.handleStatusError(ctx, updateErr, "Failed to update status on EvictionMisconfigured condition")
 						}
 					}
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -765,9 +766,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// EvictionMisconfigured condition would be reported on a job that went on to
 		// succeed. Retract those conditions before advancing.
 		if r.clearEvictionBlockageConditions(job) {
-			if err := r.Status().Update(ctx, job); err != nil {
-				logger.Error(err, "Failed to update status on retracting eviction blockage conditions")
-				return ctrl.Result{}, err
+			if err := r.patchStatus(ctx, job, origJob); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to update status on retracting eviction blockage conditions")
 			}
 		}
 
@@ -814,9 +814,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					ObservedGeneration: job.Generation,
 				}
 				if meta.SetStatusCondition(&job.Status.Conditions, cond) {
-					if updateErr := r.Status().Update(ctx, job); updateErr != nil {
-						logger.Error(updateErr, "Failed to update status on volume detach wait")
-						return ctrl.Result{}, updateErr
+					if updateErr := r.patchStatus(ctx, job, origJob); updateErr != nil {
+						return r.handleStatusError(ctx, updateErr, "Failed to update status on volume detach wait")
 					}
 				}
 				// Requeue in 3 seconds to check again
@@ -836,10 +835,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Message:            "Snapshot durable and PVs detached; waiting for replacement pod restore",
 			ObservedGeneration: job.Generation,
 		})
-		err = r.Status().Update(ctx, job)
+		err = r.patchStatus(ctx, job, origJob)
 		if err != nil {
-			logger.Error(err, "Failed to update job status to Restoring")
-			return ctrl.Result{}, err
+			return r.handleStatusError(ctx, err, "Failed to update job status to Restoring")
 		}
 		logger.Info("PodMigrationJob transitioned to Restoring phase", "pod", podName)
 		return ctrl.Result{}, nil
@@ -849,9 +847,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if job.Status.RestoringStartTime == nil {
 			now := metav1.Now()
 			job.Status.RestoringStartTime = &now
-			if err := r.Status().Update(ctx, job); err != nil {
-				logger.Error(err, "Failed to initialize RestoringStartTime")
-				return ctrl.Result{}, err
+			if err := r.patchStatus(ctx, job, origJob); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to initialize RestoringStartTime")
 			}
 		}
 
@@ -881,7 +878,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				if verdict.Class == restore.FailureFatal {
 					logger.Info("Restore crash observed after the 5m ceiling; running the cold-start fallback instead of concluding SucceededWithoutRestore",
 						"job", job.Name, "pod", crashedPod.Name)
-					return r.concludeRestoreCrash(ctx, req, job, crashedPod, verdict)
+					return r.concludeRestoreCrash(ctx, req, job, origJob, crashedPod, verdict)
 				}
 			}
 
@@ -909,8 +906,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						Message:            "Restore ceiling reached but replacement pod is still gated awaiting the PodGate worker",
 						ObservedGeneration: job.Generation,
 					}) {
-						if updateErr := r.Status().Update(ctx, job); updateErr != nil {
-							return ctrl.Result{}, updateErr
+						if updateErr := r.patchStatus(ctx, job, origJob); updateErr != nil {
+							return r.handleStatusError(ctx, updateErr, "Failed to update status on WaitingOnGateRelease condition")
 						}
 					}
 					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
@@ -934,9 +931,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Message:            "Restore timed out after 5 minutes",
 				ObservedGeneration: job.Generation,
 			})
-			if err := r.Status().Update(ctx, job); err != nil {
-				logger.Error(err, "Failed to update job status on restore timeout")
-				return ctrl.Result{}, err
+			if err := r.patchStatus(ctx, job, origJob); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore on restore timeout")
 			}
 			return ctrl.Result{}, nil
 		}
@@ -1000,8 +996,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					Message:            "Workload recreated with new instance; migration tracking concluded",
 					ObservedGeneration: job.Generation,
 				})
-				if err := r.Status().Update(ctx, job); err != nil {
-					return ctrl.Result{}, err
+				if err := r.patchStatus(ctx, job, origJob); err != nil {
+					return r.handleStatusError(ctx, err, "Failed to update status on replacement pod mismatch")
 				}
 				return ctrl.Result{}, nil
 			}
@@ -1026,9 +1022,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("Self-healing GateReleased on PMJ status for un-gated replacement pod",
 				"job", job.Name, "pod", replacementPod.Name)
 			job.Status.GateReleased = true
-			if err := r.Status().Update(ctx, job); err != nil {
-				logger.Error(err, "Failed to self-heal GateReleased on PMJ status")
-				return ctrl.Result{}, err
+			if err := r.patchStatus(ctx, job, origJob); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to self-heal GateReleased on PMJ status")
 			}
 		}
 
@@ -1064,7 +1059,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						"pod", job.Status.RestoredPodName, "cachedSignature", verdict.Signature)
 					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 				}
-				return r.concludeRestoreCrash(ctx, req, job, livePod, liveVerdict)
+				return r.concludeRestoreCrash(ctx, req, job, origJob, livePod, liveVerdict)
 
 			case restore.FailureUnrecognized:
 				// A start failure we cannot attribute to a restore.  Taking a
@@ -1083,9 +1078,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					Message:            message,
 					ObservedGeneration: job.Generation,
 				}) {
-					if err := r.Status().Update(ctx, job); err != nil {
-						logger.Error(err, "Failed to record unrecognised restore crash")
-						return ctrl.Result{}, err
+					if err := r.patchStatus(ctx, job, origJob); err != nil {
+						return r.handleStatusError(ctx, err, "Failed to record unrecognised restore crash")
 					}
 					logger.Info("Unrecognised StartError on restoring pod; taking no action",
 						"pod", replacementPod.Name, "message", verdict.Message)
@@ -1109,7 +1103,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				if hasFallback {
 					logger.Info("GKE runtime skipped snapshot restore and fell back to cold start (pod not yet Ready)", "pod", replacementPod.Name)
 					r.fallbackEventChecks.Delete(req.NamespacedName.String())
-					return ctrl.Result{}, r.markSucceededWithoutRestore(ctx, job,
+					return ctrl.Result{}, r.markSucceededWithoutRestore(ctx, job, origJob,
 						"FallbackToColdStart", "GKE runtime skipped snapshot restore and fell back to cold start")
 				}
 			}
@@ -1126,7 +1120,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		r.fallbackEventChecks.Delete(req.NamespacedName.String())
 		if hasFallback {
 			logger.Info("GKE runtime skipped snapshot restore and fell back to cold start", "pod", replacementPod.Name)
-			return ctrl.Result{}, r.markSucceededWithoutRestore(ctx, job,
+			return ctrl.Result{}, r.markSucceededWithoutRestore(ctx, job, origJob,
 				"FallbackToColdStart", "GKE runtime skipped snapshot restore and fell back to cold start")
 		}
 
@@ -1152,9 +1146,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// The pod recovered and came up Ready, so any earlier unrecognised
 		// start failure was transient after all.
 		r.clearUnrecognizedRestoreCrash(job)
-		if err := r.Status().Update(ctx, job); err != nil {
-			logger.Error(err, "Failed to update job status to Succeeded")
-			return ctrl.Result{}, err
+		if err := r.patchStatus(ctx, job, origJob); err != nil {
+			return r.handleStatusError(ctx, err, "Failed to update job status to Succeeded")
 		}
 		return ctrl.Result{}, nil
 	}
@@ -1164,7 +1157,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 // markSucceededWithoutRestore concludes the PMJ with the given reason on both
 // the Restored (False) and Ready (True) conditions.
-func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, reason, message string) error {
+func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob, reason, message string) error {
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 	now := metav1.Now()
 	job.Status.CompletionTime = &now
@@ -1185,7 +1178,7 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 	// The job is concluding, so a standing "unrecognised start failure" report
 	// no longer describes anything actionable.
 	r.clearUnrecognizedRestoreCrash(job)
-	return r.Status().Update(ctx, job)
+	return r.patchStatus(ctx, job, orig)
 }
 
 // clearEvictionBlockageConditions retracts the BlockedByPDB and EvictionMisconfigured
@@ -1297,8 +1290,86 @@ func (r *PodMigrationJobReconciler) hasColdStartFallbackEvent(ctx context.Contex
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	logger := mgr.GetLogger().WithName("podmigrationjob-setup")
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigrationJob{}).
-		WithOptions(options).
-		Complete(r)
+		WithOptions(options)
+
+	psmtGVK := schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotManualTrigger",
+	}
+	snapGVK := schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshot",
+	}
+
+	restMapper := mgr.GetRESTMapper()
+
+	// Check if PodSnapshotManualTrigger CRD is installed before watching
+	if _, err := restMapper.RESTMapping(psmtGVK.GroupKind(), psmtGVK.Version); err != nil {
+		logger.Info("PodSnapshotManualTrigger CRD not registered; skipping watch and falling back to polling", "error", err)
+	} else {
+		psmt := &unstructured.Unstructured{}
+		psmt.SetGroupVersionKind(psmtGVK)
+		bldr = bldr.Watches(psmt, handler.EnqueueRequestForOwner(mgr.GetScheme(), restMapper, &pmv1alpha1.PodMigrationJob{}))
+	}
+
+	// Check if PodSnapshot CRD is installed before watching
+	if _, err := restMapper.RESTMapping(snapGVK.GroupKind(), snapGVK.Version); err != nil {
+		logger.Info("PodSnapshot CRD not registered; skipping watch and falling back to polling", "error", err)
+	} else {
+		snap := &unstructured.Unstructured{}
+		snap.SetGroupVersionKind(snapGVK)
+		bldr = bldr.Watches(snap, handler.EnqueueRequestsFromMapFunc(r.mapSnapshotToPMJ))
+	}
+
+	return bldr.Complete(r)
+}
+
+// mapSnapshotToPMJ maps changes on PodSnapshot CRDs to their corresponding PodMigrationJobs via the snapshotRef index.
+func (r *PodMigrationJobReconciler) mapSnapshotToPMJ(ctx context.Context, obj client.Object) []ctrl.Request {
+	snapName := obj.GetName()
+	namespace := obj.GetNamespace()
+	if snapName == "" || namespace == "" {
+		return nil
+	}
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := r.List(ctx, pmjList, client.InNamespace(namespace), client.MatchingFields{PMJSnapshotRefIndex: snapName}); err != nil {
+		return nil
+	}
+	var reqs []ctrl.Request
+	for _, job := range pmjList.Items {
+		reqs = append(reqs, ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: job.Namespace,
+				Name:      job.Name,
+			},
+		})
+	}
+	return reqs
+}
+
+// patchStatus updates the PodMigrationJob status using a MergeFrom patch,
+// falling back to Update if orig is nil.
+func (r *PodMigrationJobReconciler) patchStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob) error {
+	if orig != nil {
+		patch := client.MergeFrom(orig)
+		return r.Status().Patch(ctx, job, patch)
+	}
+	return r.Status().Update(ctx, job)
+}
+
+// handleStatusError logs an error or gracefully requeues on optimistic lock conflicts.
+// Note: client.MergeFrom patches do not assert resourceVersion unless optimistic locking is configured;
+// this handler primarily guards fallback Update paths and custom interceptors.
+func (r *PodMigrationJobReconciler) handleStatusError(ctx context.Context, err error, msg string) (ctrl.Result, error) {
+	if apierrors.IsConflict(err) {
+		log.FromContext(ctx).Info("Optimistic lock conflict updating status; requeuing silently", "error", err.Error())
+		return ctrl.Result{Requeue: true}, nil
+	}
+	log.FromContext(ctx).Error(err, msg)
+	return ctrl.Result{}, err
 }

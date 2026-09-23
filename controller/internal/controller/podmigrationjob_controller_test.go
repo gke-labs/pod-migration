@@ -27,6 +27,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -38,7 +39,8 @@ func newFakeClientBuilderWithEventIndex(scheme *runtime.Scheme) *fake.ClientBuil
 				return []string{string(event.InvolvedObject.UID)}
 			}
 			return nil
-		})
+		}).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue)
 }
 
 func TestPodMigrationJobReconciler_Pending(t *testing.T) {
@@ -1019,8 +1021,8 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 			t.Fatalf("Reconcile failed: %v", err)
 		}
 
-		if res.RequeueAfter != 1*time.Second {
-			t.Errorf("Expected RequeueAfter to be 1s, got %v", res.RequeueAfter)
+		if res.RequeueAfter != 30*time.Second {
+			t.Errorf("Expected RequeueAfter to be 30s, got %v", res.RequeueAfter)
 		}
 
 		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
@@ -4813,5 +4815,201 @@ func TestPodMigrationJobReconciler_Restoring_NoVacuousUnrecognizedCondition(t *t
 	}
 	if cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, ConditionUnrecognizedRestoreCrash); cond != nil {
 		t.Errorf("Expected no %s condition on a job that never saw one, got %+v", ConditionUnrecognizedRestoreCrash, cond)
+	}
+}
+
+func TestPodMigrationJobReconciler_mapSnapshotToPMJ(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	pmjWithSnap := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-with-snap",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			SnapshotRef: "snap-123",
+		},
+	}
+	pmjSnapshottingDifferentSnap := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-other-snap",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			SnapshotRef: "snap-456",
+		},
+	}
+	pmjSnapshottingNoSnap := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-no-snap",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+	pmjOtherNamespace := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-system",
+			Name:      "pmj-other-ns",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			SnapshotRef: "snap-123",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithObjects(pmjWithSnap, pmjSnapshottingDifferentSnap, pmjSnapshottingNoSnap, pmjOtherNamespace).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	snapObj := &unstructured.Unstructured{}
+	snapObj.SetNamespace("default")
+	snapObj.SetName("snap-123")
+
+	reqs := r.mapSnapshotToPMJ(context.Background(), snapObj)
+	if len(reqs) != 1 {
+		t.Fatalf("Expected exactly 1 request mapped to owning PMJ, got %d: %+v", len(reqs), reqs)
+	}
+	if reqs[0].Name != "pmj-with-snap" || reqs[0].Namespace != "default" {
+		t.Errorf("Expected pmj-with-snap in default, got %+v", reqs[0])
+	}
+}
+
+func TestPodMigrationJobReconciler_handleStatusError(t *testing.T) {
+	r := &PodMigrationJobReconciler{}
+	ctx := context.Background()
+
+	// Conflict error -> silent requeue without error
+	conflictErr := apierrors.NewConflict(schema.GroupResource{Group: "podmigration.gke.io", Resource: "podmigrationjobs"}, "my-job", fmt.Errorf("object modified"))
+	res, err := r.handleStatusError(ctx, conflictErr, "Failed to update status")
+	if err != nil {
+		t.Errorf("Expected nil error on conflict, got %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("Expected Requeue: true on conflict, got %+v", res)
+	}
+
+	// Non-conflict error -> returns error
+	internalErr := apierrors.NewInternalError(fmt.Errorf("db connection failed"))
+	res, err = r.handleStatusError(ctx, internalErr, "Failed to update status")
+	if err == nil {
+		t.Errorf("Expected non-nil error on internal error")
+	}
+	if res.Requeue {
+		t.Errorf("Expected Requeue: false on non-conflict error, got %+v", res)
+	}
+}
+
+type fakeSnapshotProvider struct {
+	ensureTriggerResult ctrl.Result
+	ensureTriggerErr    error
+	checkStatusResult   *snapshot.Status
+	checkStatusErr      error
+	cleanupErr          error
+}
+
+func (f *fakeSnapshotProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (ctrl.Result, error) {
+	return f.ensureTriggerResult, f.ensureTriggerErr
+}
+
+func (f *fakeSnapshotProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (*snapshot.Status, error) {
+	return f.checkStatusResult, f.checkStatusErr
+}
+
+func (f *fakeSnapshotProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) error {
+	return f.cleanupErr
+}
+
+func TestPodMigrationJobReconciler_Snapshotting_RecordsSnapshotRefInProgress(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	snapName := "ps-early-discovered"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "origin-uid-123",
+		},
+	}
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "origin-uid-123",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	mockProvider := &fakeSnapshotProvider{
+		checkStatusResult: &snapshot.Status{
+			Phase:       snapshot.PhaseInProgress,
+			SnapshotRef: snapName,
+			Reason:      "Snapshotting",
+			Message:     "Waiting for checkpoint",
+		},
+	}
+
+	r := &PodMigrationJobReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		SnapshotProvider: mockProvider,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Errorf("Expected RequeueAfter 30s, got %v", res.RequeueAfter)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.SnapshotRef != snapName {
+		t.Errorf("Expected SnapshotRef %q recorded in progress, got %q", snapName, updatedPMJ.Status.SnapshotRef)
+	}
+
+	// Verify mapSnapshotToPMJ now maps to this PMJ via the index
+	snapObj := &unstructured.Unstructured{}
+	snapObj.SetNamespace(namespace)
+	snapObj.SetName(snapName)
+	reqs := r.mapSnapshotToPMJ(context.Background(), snapObj)
+	if len(reqs) != 1 || reqs[0].Name != jobName {
+		t.Errorf("Expected mapped request for %q, got %+v", jobName, reqs)
 	}
 }

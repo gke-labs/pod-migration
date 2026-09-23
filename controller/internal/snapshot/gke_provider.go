@@ -155,9 +155,10 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		if apierrors.IsNotFound(err) {
 			logger.Info("Waiting for PodSnapshot to be created...", "snapshot", snapshotName)
 			return &Status{
-				Phase:   PhaseInProgress,
-				Reason:  "Snapshotting",
-				Message: fmt.Sprintf("Waiting for GKE PodSnapshot object %q to be created", snapshotName),
+				Phase:       PhaseInProgress,
+				SnapshotRef: snapshotName,
+				Reason:      "Snapshotting",
+				Message:     fmt.Sprintf("Waiting for GKE PodSnapshot object %q to be created", snapshotName),
 			}, nil
 		}
 		logger.Error(err, "Failed to get PodSnapshot")
@@ -168,9 +169,10 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	if !ok {
 		logger.Info("Snapshot status subresource not found, waiting...")
 		return &Status{
-			Phase:   PhaseInProgress,
-			Reason:  "Snapshotting",
-			Message: fmt.Sprintf("Waiting for GKE PodSnapshot %q status to be populated", snapshotName),
+			Phase:       PhaseInProgress,
+			SnapshotRef: snapshotName,
+			Reason:      "Snapshotting",
+			Message:     fmt.Sprintf("Waiting for GKE PodSnapshot %q status to be populated", snapshotName),
 		}, nil
 	}
 
@@ -186,9 +188,10 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 			if cStatus == "False" && (cReason == "Failed" || cReason == "Error") && (cType == "Checkpoint" || cType == "StorageReplicated" || cType == "Ready") {
 				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", cType, "reason", cMsg)
 				return &Status{
-					Phase:   PhaseFailed,
-					Reason:  "SnapshotFailed",
-					Message: fmt.Sprintf("GKE PodSnapshot %s failed: %s", cType, cMsg),
+					Phase:       PhaseFailed,
+					SnapshotRef: snapshotName,
+					Reason:      "SnapshotFailed",
+					Message:     fmt.Sprintf("GKE PodSnapshot %s failed: %s", cType, cMsg),
 				}, nil
 			}
 		}
@@ -218,9 +221,10 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 
 	logger.Info("Snapshot is not ready yet, waiting...")
 	return &Status{
-		Phase:   PhaseInProgress,
-		Reason:  "Snapshotting",
-		Message: fmt.Sprintf("Waiting for GKE PodSnapshot %q checkpoint to complete", snapshotName),
+		Phase:       PhaseInProgress,
+		SnapshotRef: snapshotName,
+		Reason:      "Snapshotting",
+		Message:     fmt.Sprintf("Waiting for GKE PodSnapshot %q checkpoint to complete", snapshotName),
 	}, nil
 }
 
