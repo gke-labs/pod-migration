@@ -34,6 +34,12 @@ type PodMigrationJobStatus struct {
 	// PVsToDetach lists the Persistent Volume names we are waiting to detach.
 	// +optional
 	PVsToDetach []string `json:"pvsToDetach,omitempty"`
+
+	// OriginNodeName records the name of the node where the origin pod was running.
+	// Used during the Evicting phase to scope volume detachment checks specifically
+	// to the origin node.
+	// +optional
+	OriginNodeName string `json:"originNodeName,omitempty"`
 	// CompletionTime is the timestamp when this job transitioned to a terminal phase (Succeeded/Failed).
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`

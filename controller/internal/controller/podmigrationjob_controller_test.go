@@ -1679,6 +1679,365 @@ func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_ListError_ReturnsEr
 	}
 }
 
+func TestPodMigrationJobReconciler_Pending_CapturesOriginNodeName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-origin-node-pod"
+	podUID := "uid-node-test-1234"
+	jobName := util.FormatPMJName(podName, podUID)
+	originNode := "gke-cluster-node-alpha"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Spec: corev1.PodSpec{
+			NodeName: originNode,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("Expected reconcile to request requeue")
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.OriginNodeName != originNode {
+		t.Errorf("Expected OriginNodeName %q, got %q", originNode, updatedPMJ.Status.OriginNodeName)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSnapshotting, updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_OriginNodeScoping_IgnoresDestinationNodeAttachment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	pvName := "target-pv"
+	originNode := "node-origin"
+	destNode := "node-destination"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseEvicting,
+			PVsToDetach:    []string{pvName},
+			OriginNodeName: originNode,
+		},
+	}
+
+	// Origin node volume attachment is detached
+	vaOrigin := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-origin",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName,
+			},
+			NodeName: originNode,
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: false,
+		},
+	}
+
+	// Destination node volume attachment for the same PV is already attached
+	vaDest := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-dest",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName,
+			},
+			NodeName: destNode,
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: true,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+		WithObjects(pmj, vaOrigin, vaDest).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected transition to Restoring without requeue, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseRestoring, updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_OriginNodeScoping_WaitsWhenOriginNodeStillAttached(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	pvName := "target-pv"
+	originNode := "node-origin"
+	destNode := "node-destination"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseEvicting,
+			PVsToDetach:    []string{pvName},
+			OriginNodeName: originNode,
+		},
+	}
+
+	// Origin node volume attachment is still attached
+	vaOrigin := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-origin",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName,
+			},
+			NodeName: originNode,
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: true,
+		},
+	}
+
+	// Destination node volume attachment is not attached
+	vaDest := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-dest",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName,
+			},
+			NodeName: destNode,
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: false,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+		WithObjects(pmj, vaOrigin, vaDest).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 3*time.Second {
+		t.Errorf("Expected RequeueAfter 3s, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseEvicting, updatedPMJ.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "WaitingForVolumeDetach" {
+		t.Errorf("Expected condition WaitingForVolumeDetach, got: %+v", cond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_EmptyOriginNode_FallbackWaitsForAllAttachments(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+	pvName := "target-pv"
+	someNode := "node-other"
+
+	// OriginNodeName is empty (fallback behavior)
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseEvicting,
+			PVsToDetach:    []string{pvName},
+			OriginNodeName: "",
+		},
+	}
+
+	vaOther := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "va-other",
+		},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi-driver",
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvName,
+			},
+			NodeName: someNode,
+		},
+		Status: storagev1.VolumeAttachmentStatus{
+			Attached: true,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+		WithObjects(pmj, vaOther).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 3*time.Second {
+		t.Errorf("Expected RequeueAfter 3s, got: %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseEvicting, updatedPMJ.Status.Phase)
+	}
+}
+
 func TestPodMigrationJobReconciler_Restoring_WaitingForConsumed(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
