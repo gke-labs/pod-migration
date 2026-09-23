@@ -45,7 +45,6 @@ type PodGateReconciler struct {
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
@@ -272,7 +271,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 
 		if r.Recorder != nil {
-			r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Scheduling gate removed and snapshot %s injected for restore", job.Status.SnapshotRef)
+			r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation", MigrationGateName)
 		}
 
 		return ctrl.Result{}, nil

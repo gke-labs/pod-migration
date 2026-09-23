@@ -178,6 +178,11 @@ spec:
               snapshotRef:
                 description: SnapshotRef references the name of the created pod snapshot.
                 type: string
+              snapshottingStartTime:
+                description: SnapshottingStartTime is the timestamp when this job
+                  transitioned to the Snapshotting phase.
+                format: date-time
+                type: string
             type: object
         type: object
     served: true

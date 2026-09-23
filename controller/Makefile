@@ -3,7 +3,7 @@
 
 IMG ?= controller:latest
 VERSION ?= $(shell git describe --tags --match 'v*' --dirty 2>/dev/null || echo "v0.1.0-dev")
-GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell git log -1 --format=%cI 2>/dev/null || echo "unknown")
 
 VERSION_PKG := github.com/gke-labs/pod-migration/controller/internal/version
@@ -12,29 +12,53 @@ LDFLAGS := -X '$(VERSION_PKG).Version=$(VERSION)' \
 	-X '$(VERSION_PKG).BuildDate=$(BUILD_DATE)'
 DOCKER_LDFLAGS := -w $(LDFLAGS)
 
-CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0
+LOCALBIN ?= $(abspath ./bin)
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
+CONTROLLER_GEN_VERSION ?= v0.21.0
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_GEN_VERSION)
+
 ENVTEST_K8S_VERSION ?= 1.36.2
 SETUP_ENVTEST_VERSION ?= v0.25.0
-SETUP_ENVTEST ?= $(shell which setup-envtest 2>/dev/null || echo $(shell go env GOPATH)/bin/setup-envtest)
-.PHONY: help generate verify-generate manifests fmt vet build run envtest test install uninstall deploy undeploy docker-build docker-push
+SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest-$(SETUP_ENVTEST_VERSION)
+.PHONY: help generate verify-generate manifests fmt vet build run envtest test install uninstall deploy undeploy docker-build docker-push controller-gen
 
 VERIFY_ARTIFACTS := api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
-generate: ## Run controller-gen to (re)generate deepcopy methods (zz_generated.deepcopy.go).
+controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
+$(CONTROLLER_GEN): | $(LOCALBIN)
+	@if [ ! -x "$(CONTROLLER_GEN)" ]; then \
+		echo "Installing controller-gen $(CONTROLLER_GEN_VERSION)..."; \
+		GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION); \
+		if [ "$(LOCALBIN)/controller-gen" != "$(CONTROLLER_GEN)" ]; then \
+			mv $(LOCALBIN)/controller-gen $(CONTROLLER_GEN); \
+		fi; \
+	fi
+
+generate: controller-gen ## Run controller-gen to (re)generate deepcopy methods (zz_generated.deepcopy.go).
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 verify-generate: ## Verify generated files are up to date.
 	@TMP_DIR=$$(mktemp -d); \
+	VERIFY_FAILED=0; \
 	cleanup() { \
-		if [ -d "$$TMP_DIR" ]; then \
+		if [ $$VERIFY_FAILED -ne 0 ] && [ -d "$$TMP_DIR" ]; then \
+			RESTORE_FAILED=0; \
 			for path in $(VERIFY_ARTIFACTS); do \
 				if [ -e "$$TMP_DIR/$$path" ]; then \
-					cp -r "$$TMP_DIR/$$path" "$$(dirname "$$path")/" 2>/dev/null || true; \
+					rm -rf "$$path"; \
+					if ! cp -r "$$TMP_DIR/$$path" "$$(dirname "$$path")/"; then \
+						echo "ERROR: Failed to restore $$path from $$TMP_DIR" >&2; \
+						RESTORE_FAILED=1; \
+					fi; \
 				fi; \
 			done; \
+			if [ $$RESTORE_FAILED -eq 0 ]; then rm -rf "$$TMP_DIR"; else echo "Backup preserved in $$TMP_DIR" >&2; fi; \
+		else \
 			rm -rf "$$TMP_DIR"; \
 		fi; \
 	}; \
@@ -43,18 +67,22 @@ verify-generate: ## Verify generated files are up to date.
 		mkdir -p "$$TMP_DIR/$$(dirname "$$path")"; \
 		cp -r "$$path" "$$TMP_DIR/$$(dirname "$$path")/"; \
 	done; \
-	$(MAKE) generate manifests || exit 1; \
-	DIFF_FAILED=0; \
+	if ! $(MAKE) generate manifests; then \
+		VERIFY_FAILED=1; \
+		exit 1; \
+	fi; \
 	for path in $(VERIFY_ARTIFACTS); do \
-		diff -ru "$$TMP_DIR/$$path" "$$path" || DIFF_FAILED=1; \
+		if ! diff -ru "$$TMP_DIR/$$path" "$$path"; then \
+			VERIFY_FAILED=1; \
+		fi; \
 	done; \
-	if [ $$DIFF_FAILED -ne 0 ]; then \
+	if [ $$VERIFY_FAILED -ne 0 ]; then \
 		echo "Error: Generated files ($(VERIFY_ARTIFACTS)) are out of date. Run 'make generate manifests' and commit the changes."; \
 		git status --porcelain $(VERIFY_ARTIFACTS); \
 		exit 1; \
 	fi
 
-manifests: ## Generate CRDs, RBAC, and webhook YAML from +kubebuilder:* markers.
+manifests: controller-gen ## Generate CRDs, RBAC, and webhook YAML from +kubebuilder:* markers.
 	$(CONTROLLER_GEN) rbac:roleName=pod-migration-controller-role crd webhook \
 		paths="./..." output:crd:artifacts:config=config/crd/bases
 	python3 scripts/assemble_deploy.py
@@ -69,10 +97,14 @@ run: generate fmt vet manifests ## Run reconcilers against the current kubeconfi
 	# NB: webhooks need to run in-cluster with a serving cert; `make run` is for reconciler iteration.
 	go run -ldflags "$(LDFLAGS)" ./cmd/main.go
 
-envtest: ## Download setup-envtest locally if necessary.
-	@if [ ! -x "$$(command -v $(SETUP_ENVTEST))" ] && [ ! -x "$(SETUP_ENVTEST)" ]; then \
-		echo "Installing setup-envtest..."; \
-		go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION); \
+envtest: $(SETUP_ENVTEST) ## Download setup-envtest locally if necessary.
+$(SETUP_ENVTEST): | $(LOCALBIN)
+	@if [ ! -x "$(SETUP_ENVTEST)" ]; then \
+		echo "Installing setup-envtest $(SETUP_ENVTEST_VERSION)..."; \
+		GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION); \
+		if [ "$(LOCALBIN)/setup-envtest" != "$(SETUP_ENVTEST)" ]; then \
+			mv $(LOCALBIN)/setup-envtest $(SETUP_ENVTEST); \
+		fi; \
 	fi
 
 test: generate fmt vet manifests envtest ## Run unit + envtest suite.
@@ -101,7 +133,7 @@ undeploy: ## Undeploy controller from the cluster.
 	$(MAKE) uninstall
 
 docker-build: ## Build docker image for the controller.
-	docker build --build-arg LDFLAGS="$(DOCKER_LDFLAGS)" -t $(IMG) .
+	DOCKER_BUILDKIT=1 docker build --build-arg LDFLAGS="$(DOCKER_LDFLAGS)" -t $(IMG) .
 
 docker-push: ## Push docker image for the controller.
 	docker push $(IMG)
