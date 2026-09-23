@@ -48,6 +48,9 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/controller"
+	// Imported for its side effect: registers the pod-migration collectors on
+	// the controller-runtime metrics registry served at --metrics-bind-address.
+	_ "github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 	"github.com/gke-labs/pod-migration/controller/internal/version"
 	pmwebhook "github.com/gke-labs/pod-migration/controller/internal/webhook"
@@ -154,6 +157,7 @@ func main() {
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("podmigrationjob-controller"),
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)

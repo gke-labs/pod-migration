@@ -189,16 +189,39 @@ Every workload in this matrix has been verified through real E2E eviction migrat
 
 To support resilient rescheduling of Jobs during migration, the system uses a **Status Mutating Webhook** combined with Kubernetes **Job Pod Failure Policy**.
 
-### How it works:
+A migrating Job Pod can terminate for two distinct reasons, and **each needs its own `podFailurePolicy` match**. Cover both, or the Job will burn `backoffLimit` retries on events that are not application failures.
+
+### 3.1 Migration eviction — exit code `137`
+
 1. When a migrating Job Pod is terminated, the `pod-migration-controller`'s status mutating webhook (`/mutate-v1-pod-status`) intercepts the status update.
 2. It mutates the Pod phase to `Failed` and sets the container exit code to `137`.
 3. The Job controller interprets this exit code according to the Job's `podFailurePolicy`.
 4. If configured correctly, the Job controller ignores this failure and recreates the Pod (which then restores from the snapshot) without counting it against the Job's `backoffLimit` retry budget.
 
+### 3.2 Restore-crash cold-start fallback — exit code `128`
+
+When a replacement Pod fails to restore from its snapshot, the controller fails the migration and **deletes the Pod** so its Job recreates it cold. This is a recovery action, not an application failure, but it is **not** covered by the rule above:
+
+- The status webhook only rewrites exit codes on Pods transitioning to `Succeeded` during an active `Snapshotting`/`Evicting` migration. The crashed replacement Pod is in neither state, so it is never touched and never receives the synthetic `137`.
+- A container the runtime failed to start terminates with `reason: StartError` and **exit code `128`**.
+
+Without a match for `128`, every cold-start fallback silently consumes one of the Job's `backoffLimit` retries.
+
+> [!IMPORTANT]
+> **Precondition:** `onExitCodes` matches the exit code alone — it cannot additionally require `reason: StartError`. An `Ignore` match on `128` therefore assumes **your application never exits `128` itself**. If it can, leave `128` out and treat these as application failures; you will spend one retry per fallback instead.
+
+<details>
+<summary>Why not a <code>DisruptionTarget</code> condition rule?</summary>
+
+Kubernetes only adds the `DisruptionTarget` Pod condition for evictions via the Eviction API, kubelet node-pressure and graceful shutdown, the taint manager, PodGC, and scheduler preemption. The fallback issues a direct `DELETE`, so the condition is never set and such a rule would never fire.
+
+Routing the fallback through the Eviction API to obtain the condition would make it PDB-aware — and the crashed Pod is not Ready, so under the default `unhealthyPodEvictionPolicy: IfHealthyBudget` the eviction can be **refused**, wedging the exact Pod the fallback exists to remove. Separately, `onPodConditions` matches on type and status but not `reason`, so the rule would also swallow preemptions and node-pressure evictions. The exit code is both narrower and more reliable here.
+</details>
+
 ### Job Configuration Example:
 To enable this, your Job manifest must:
 1. Enable migration via labels.
-2. Configure `podFailurePolicy` to `Ignore` exit code `137`.
+2. Configure `podFailurePolicy` to `Ignore` exit codes `137` (migration eviction) and `128` (restore-crash fallback).
 
 Here is an example snippet (from `verification-suite/manifests/pm-go-job.yaml`):
 
@@ -214,7 +237,9 @@ spec:
       - action: Ignore
         onExitCodes:
           operator: In
-          values: [137]
+          # 137: pod evicted by migration (synthesized by the status webhook)
+          # 128: container start failure -> restore-crash cold-start fallback
+          values: [137, 128]
   template:
     metadata:
       labels:
