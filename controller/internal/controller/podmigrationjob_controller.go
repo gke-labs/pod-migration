@@ -133,11 +133,15 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 	if base <= 0 {
 		base = util.DefaultMigrationTimeout
 	}
-	readyCond := meta.FindStatusCondition(job.Status.Conditions, "Ready")
-	if readyCond != nil && readyCond.Reason == "Evicting" {
-		return time.Since(readyCond.LastTransitionTime.Time) < base
+	evictingSinceStr := job.Annotations["pod-migration.gke.io/evicting-since"]
+	if evictingSinceStr == "" {
+		return false
 	}
-	return false
+	evictingSince, err := time.Parse(time.RFC3339, evictingSinceStr)
+	if err != nil {
+		return false
+	}
+	return time.Since(evictingSince) < base
 }
 
 func (r *PodMigrationJobReconciler) restoreEngines() []restore.Engine {
@@ -727,6 +731,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
+		if annotationUpdated {
+			if err := r.Update(ctx, job); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to update timeout annotation on PMJ in Pending phase")
+			}
+			origJob = job.DeepCopy()
+		}
+
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
 		now := metav1.Now()
 		job.Status.SnapshottingStartTime = &now
@@ -737,11 +748,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Message:            "Taking pod snapshot",
 			ObservedGeneration: job.Generation,
 		})
-		if annotationUpdated {
-			if err := r.Update(ctx, job); err != nil {
-				return r.handleStatusError(ctx, err, "Failed to update timeout annotation on PMJ in Pending phase")
-			}
-		}
 		err = r.patchStatus(ctx, job, origJob)
 		if err != nil {
 			return r.handleStatusError(ctx, err, "Failed to update job status to Snapshotting")

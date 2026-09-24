@@ -6393,6 +6393,9 @@ func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeout
 			Namespace:         namespace,
 			Name:              jobName,
 			CreationTimestamp: creationTime,
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": evictingTransitionTime.Time.Format(time.RFC3339),
+			},
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef:       corev1.LocalObjectReference{Name: podName},
@@ -6473,6 +6476,9 @@ func TestPodMigrationJobReconciler_Evicting_PhaseTimeout_AfterExtendedSnapshot(t
 			Namespace:         namespace,
 			Name:              jobName,
 			CreationTimestamp: creationTime,
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": evictingTransitionTime.Time.Format(time.RFC3339),
+			},
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef:       corev1.LocalObjectReference{Name: podName},

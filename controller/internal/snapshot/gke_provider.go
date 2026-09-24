@@ -292,10 +292,7 @@ func isTerminalSnapshotFailureReason(reason string) bool {
 		return false
 	}
 	switch r {
-	case "failed", "error", "deadlineexceeded", "timeout", "timedout", "canceled", "cancelled", "terminated", "agentfailed", "preconditionfailed", "rejected":
-		return true
-	}
-	if strings.HasSuffix(r, "failed") || strings.HasSuffix(r, "failure") || strings.HasSuffix(r, "error") || strings.HasSuffix(r, "timeout") || strings.HasSuffix(r, "exceeded") || strings.HasSuffix(r, "canceled") || strings.HasSuffix(r, "cancelled") {
+	case "failed", "error", "deadlineexceeded", "agentfailed", "preconditionfailed", "rejected":
 		return true
 	}
 	return false
