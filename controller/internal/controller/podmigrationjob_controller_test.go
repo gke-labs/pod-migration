@@ -5374,3 +5374,83 @@ func TestPodMigrationJobReconciler_Snapshotting_RecordsSnapshotRefInProgress(t *
 		t.Errorf("Expected mapped request for %q, got %+v", jobName, reqs)
 	}
 }
+
+type fakeRESTMapper struct {
+	meta.RESTMapper
+	mappingFn func(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error)
+}
+
+func (f *fakeRESTMapper) RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+	if f.mappingFn != nil {
+		return f.mappingFn(gk, versions...)
+	}
+	return nil, nil
+}
+
+func TestShouldWatchCRD(t *testing.T) {
+	gvk := schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshot",
+	}
+
+	tests := []struct {
+		name      string
+		mappingFn func(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error)
+		wantWatch bool
+		wantErr   bool
+	}{
+		{
+			name: "CRD registered",
+			mappingFn: func(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+				return &meta.RESTMapping{
+					Resource: schema.GroupVersionResource{
+						Group:    gvk.Group,
+						Version:  gvk.Version,
+						Resource: "podsnapshots",
+					},
+					GroupVersionKind: gvk,
+				}, nil
+			},
+			wantWatch: true,
+			wantErr:   false,
+		},
+		{
+			name: "CRD not registered (NoKindMatchError)",
+			mappingFn: func(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+				return nil, &meta.NoKindMatchError{GroupKind: gk}
+			},
+			wantWatch: false,
+			wantErr:   false,
+		},
+		{
+			name: "CRD not registered (NoResourceMatchError)",
+			mappingFn: func(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+				return nil, &meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{Group: gk.Group, Resource: gk.Kind}}
+			},
+			wantWatch: false,
+			wantErr:   false,
+		},
+		{
+			name: "Discovery failure (e.g. apiserver unreachable)",
+			mappingFn: func(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+				return nil, fmt.Errorf("connection refused")
+			},
+			wantWatch: false,
+			wantErr:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mapper := &fakeRESTMapper{mappingFn: tc.mappingFn}
+			watch, err := shouldWatchCRD(mapper, gvk)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("shouldWatchCRD() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if watch != tc.wantWatch {
+				t.Errorf("shouldWatchCRD() = %v, want %v", watch, tc.wantWatch)
+			}
+		})
+	}
+}

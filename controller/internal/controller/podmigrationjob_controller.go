@@ -1305,8 +1305,12 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 	restMapper := mgr.GetRESTMapper()
 
 	// Check if PodSnapshotManualTrigger CRD is installed before watching
-	if _, err := restMapper.RESTMapping(psmtGVK.GroupKind(), psmtGVK.Version); err != nil {
-		logger.Info("PodSnapshotManualTrigger CRD not registered; skipping watch and falling back to polling", "error", err)
+	watchPSMT, err := shouldWatchCRD(restMapper, psmtGVK)
+	if err != nil {
+		return err
+	}
+	if !watchPSMT {
+		logger.Info("PodSnapshotManualTrigger CRD not registered; skipping watch and falling back to polling")
 	} else {
 		psmt := &unstructured.Unstructured{}
 		psmt.SetGroupVersionKind(psmtGVK)
@@ -1314,8 +1318,12 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 	}
 
 	// Check if PodSnapshot CRD is installed before watching
-	if _, err := restMapper.RESTMapping(snapGVK.GroupKind(), snapGVK.Version); err != nil {
-		logger.Info("PodSnapshot CRD not registered; skipping watch and falling back to polling", "error", err)
+	watchSnap, err := shouldWatchCRD(restMapper, snapGVK)
+	if err != nil {
+		return err
+	}
+	if !watchSnap {
+		logger.Info("PodSnapshot CRD not registered; skipping watch and falling back to polling")
 	} else {
 		snap := &unstructured.Unstructured{}
 		snap.SetGroupVersionKind(snapGVK)
@@ -1323,6 +1331,20 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 	}
 
 	return bldr.Complete(r)
+}
+
+// shouldWatchCRD checks whether a CRD kind is registered in the RESTMapper.
+// If registered, it returns (true, nil).
+// If missing (meta.IsNoMatchError), it returns (false, nil) to allow safe fallback to polling.
+// Any other error (e.g. transient apiserver discovery failure) is returned so setup fails and restarts.
+func shouldWatchCRD(restMapper meta.RESTMapper, gvk schema.GroupVersionKind) (bool, error) {
+	if _, err := restMapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
+		if meta.IsNoMatchError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // mapSnapshotToPMJ maps changes on PodSnapshot CRDs to their corresponding PodMigrationJobs via the snapshotRef index.
