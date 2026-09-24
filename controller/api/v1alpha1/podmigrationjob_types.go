@@ -38,6 +38,10 @@ type PodMigrationJobStatus struct {
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 
+	// SnapshottingStartTime is the timestamp when this job transitioned to the Snapshotting phase.
+	// +optional
+	SnapshottingStartTime *metav1.Time `json:"snapshottingStartTime,omitempty"`
+
 	// RestoringStartTime is the timestamp when this job transitioned to the Restoring phase.
 	// +optional
 	RestoringStartTime *metav1.Time `json:"restoringStartTime,omitempty"`
@@ -71,7 +75,10 @@ type PodMigrationJobStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=pmj
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Snapshot",type="string",JSONPath=".status.snapshotRef"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // PodMigrationJob tracks the execution of a single Pod Migration event.
 type PodMigrationJob struct {
