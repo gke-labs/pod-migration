@@ -1959,6 +1959,100 @@ func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_OriginNodeScoping_W
 	}
 }
 
+func TestPodMigrationJobReconciler_Evicting_BackfillsOriginNodeName_PersistsAndDoesNotDuplicate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-evicting-backfill-pod"
+	podUID := "uid-backfill-1234"
+	jobName := util.FormatPMJName(podName, podUID)
+	originNode := "gke-node-evicting-alpha"
+	now := metav1.Now()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              podName,
+			UID:               types.UID(podUID),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"test-finalizer"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: originNode,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseEvicting,
+			OriginNodeName: "", // In-flight job without OriginNodeName
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// First reconcile: backfill should persist OriginNodeName
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("First reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 2*time.Second {
+		t.Errorf("Expected RequeueAfter 2s, got %v", res.RequeueAfter)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.OriginNodeName != originNode {
+		t.Fatalf("Expected OriginNodeName %q, got %q", originNode, updatedPMJ.Status.OriginNodeName)
+	}
+	firstRV := updatedPMJ.ResourceVersion
+
+	// Second reconcile: OriginNodeName already set, should not trigger another status write
+	res2, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Second reconcile failed: %v", err)
+	}
+	if res2.RequeueAfter != 2*time.Second {
+		t.Errorf("Expected RequeueAfter 2s, got %v", res2.RequeueAfter)
+	}
+
+	afterSecondPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, afterSecondPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if afterSecondPMJ.ResourceVersion != firstRV {
+		t.Errorf("Expected ResourceVersion unchanged (%s), got %s (unexpected second write)", firstRV, afterSecondPMJ.ResourceVersion)
+	}
+}
+
 func TestPodMigrationJobReconciler_Evicting_VolumeAttachment_EmptyOriginNode_FallbackWaitsForAllAttachments(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
