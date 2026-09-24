@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 )
 
 // StorageCleanupFinalizer is the finalizer added to PodMigration resources
@@ -37,8 +38,20 @@ const (
 // PodMigrationReconciler reconciles a PodMigration object.
 type PodMigrationReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme          *runtime.Scheme
+	Recorder        record.EventRecorder
+	InvariantEngine *invariants.Engine
+}
+
+func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config *pmv1alpha1.PodMigration) {
+	if r.InvariantEngine == nil || config == nil {
+		return
+	}
+	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
+		Now:              time.Now(),
+		Reconciler:       "PodMigrationReconciler",
+		PrimaryMigration: config,
+	})
 }
 
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -62,6 +75,8 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		logger.Error(err, "Failed to get PodMigration config")
 		return ctrl.Result{}, err
 	}
+
+	defer r.evaluateInvariants(ctx, config)
 
 	// Examine DeletionTimestamp to determine if object is under deletion
 	if !config.ObjectMeta.DeletionTimestamp.IsZero() {

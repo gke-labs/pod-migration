@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
@@ -71,6 +72,11 @@ type PodMigrationJobReconciler struct {
 	// nil disables event emission (used by unit tests that don't assert on
 	// events).
 	Recorder record.EventRecorder
+
+	// InvariantEngine evaluates stateless correctness invariants (I1-I9) at the
+	// end of each reconcile step with zero extra API calls. Optional: nil skips
+	// evaluation.
+	InvariantEngine *invariants.Engine
 
 	// RestoreEngines classifies restore failures.  Optional: nil selects the
 	// default engine set.  Overridden in tests.
@@ -396,6 +402,36 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
+// evaluateInvariants evaluates the in-memory PodMigrationJob against the invariant engine
+// with zero extra API reads. In strict mode, any violation transitions the PMJ to PhaseFailed.
+func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job *pmv1alpha1.PodMigrationJob) {
+	if r.InvariantEngine == nil || job == nil {
+		return
+	}
+	violations, shouldFailStrict := r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
+		Now:        time.Now(),
+		Reconciler: "PodMigrationJobReconciler",
+		PrimaryPMJ: job,
+	})
+	if shouldFailStrict && len(violations) > 0 && job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		orig := job.DeepCopy()
+		v := violations[0]
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+		now := metav1.Now()
+		job.Status.CompletionTime = &now
+		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             invariants.EventReasonInvariantViolation,
+			Message:            fmt.Sprintf("[%s:%s] %s", v.InvariantID, v.InvariantName, v.Message),
+			ObservedGeneration: job.Generation,
+		})
+		_ = r.patchStatus(ctx, job, orig)
+		metrics.MarkPMJInactive(job.Namespace + "/" + job.Name)
+		metrics.RecordOutcome("failed")
+	}
+}
+
 // Reconcile drives the state machine of the PodMigrationJob.
 func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("job", req.NamespacedName)
@@ -412,6 +448,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		logger.Error(err, "Failed to get PodMigrationJob")
 		return ctrl.Result{}, err
 	}
+
+	defer r.evaluateInvariants(ctx, job)
 
 	podName := job.Spec.PodRef.Name
 	origJob := job.DeepCopy()

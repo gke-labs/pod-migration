@@ -48,6 +48,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/controller"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	// Imported for its side effect: registers the pod-migration collectors on
 	// the controller-runtime metrics registry served at --metrics-bind-address.
 	_ "github.com/gke-labs/pod-migration/controller/internal/metrics"
@@ -77,6 +78,7 @@ func main() {
 		clientGoQPS          float64
 		clientGoBurst        int
 		maxConcurrent        int
+		invariantModeRaw     string
 		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -85,6 +87,7 @@ func main() {
 	flag.Float64Var(&clientGoQPS, "client-go-qps", 500.0, "QPS for client-go REST config")
 	flag.IntVar(&clientGoBurst, "client-go-burst", 1000, "Burst for client-go REST config")
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
+	flag.StringVar(&invariantModeRaw, "invariant-mode", string(invariants.ModeObserve), "Correctness invariant evaluation mode: disabled, observe (default in prod), or strict (CI gate)")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -97,13 +100,20 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	invariantMode, err := invariants.ParseMode(invariantModeRaw)
+	if err != nil {
+		setupLog.Error(err, "invalid --invariant-mode flag")
+		os.Exit(1)
+	}
+
 	ver := version.Get()
 	setupLog.Info("Starting pod-migration-controller",
 		"version", ver.GitVersion,
 		"commit", ver.GitCommit,
 		"buildDate", ver.BuildDate,
 		"go", ver.GoVersion,
-		"platform", ver.Platform)
+		"platform", ver.Platform,
+		"invariantMode", invariantMode)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -147,20 +157,23 @@ func main() {
 	}
 
 	eventRecorder := mgr.GetEventRecorderFor("pod-migration-controller")
+	invariantEngine := invariants.NewEngine(invariantMode, eventRecorder)
 
 	if err := (&controller.PodMigrationReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: eventRecorder,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		Recorder:        eventRecorder,
+		InvariantEngine: invariantEngine,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")
 		os.Exit(1)
 	}
 	if err := (&controller.PodMigrationJobReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-		Scheme:    mgr.GetScheme(),
-		Recorder:  eventRecorder,
+		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
+		Scheme:          mgr.GetScheme(),
+		Recorder:        eventRecorder,
+		InvariantEngine: invariantEngine,
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)
@@ -169,10 +182,11 @@ func main() {
 	// PodGateReconciler hardcodes MaxConcurrentReconciles: 1 in its own
 	// SetupWithManager — see the comment there for the serialization contract.
 	if err := (&controller.PodGateReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-		Scheme:    mgr.GetScheme(),
-		Recorder:  eventRecorder,
+		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
+		Scheme:          mgr.GetScheme(),
+		Recorder:        eventRecorder,
+		InvariantEngine: invariantEngine,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
 		os.Exit(1)
