@@ -230,6 +230,10 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 					"operator": "In",
 					"values":   []interface{}{"true"},
 				},
+				map[string]interface{}{
+					"key":      "notebooks.kubeflow.org/workspace-name",
+					"operator": "DoesNotExist",
+				},
 			},
 		},
 		"triggerConfig": map[string]interface{}{

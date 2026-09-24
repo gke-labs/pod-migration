@@ -95,8 +95,13 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 
 	// If there is no active unassigned migration job, this is a scale-up or unrelated pod.
-	// We do NOT inject the scheduling gate and bypass native GKE restore.
+	// We do NOT inject the scheduling gate and bypass native GKE restore unless an
+	// upstream admission webhook or user explicitly set podsnapshot.gke.io/ps-name.
 	if assignedPMJ == "" {
+		if existingPS := pod.Annotations["podsnapshot.gke.io/ps-name"]; existingPS != "" {
+			logger.Info("Preserving pre-existing snapshot annotation (no active PMJ)", "snapshotName", existingPS)
+			return admission.Allowed("preserving pre-existing podsnapshot.gke.io/ps-name annotation")
+		}
 		logger.Info("Bypassing scheduling gate injection (scale-up pod)")
 		if pod.Annotations == nil {
 			pod.Annotations = make(map[string]string)

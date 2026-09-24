@@ -58,6 +58,24 @@ func TestPodGateInjector(t *testing.T) {
 			expectBypass:    true,
 		},
 		{
+			name: "Pod opted in with pre-existing podsnapshot.gke.io/ps-name (e.g. Kubeflow UI resume), no active PMJ, preserves ps-name",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-workspace-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					Annotations: map[string]string{
+						"podsnapshot.gke.io/ps-name": "ws-snapshot-123",
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      false,
+			expectBypass:    false,
+		},
+		{
 			name: "Pod already has gate, bypassed (no active PMJ)",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
