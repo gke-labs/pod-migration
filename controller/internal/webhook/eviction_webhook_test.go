@@ -9,6 +9,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -65,15 +66,16 @@ func TestEvictionGate(t *testing.T) {
 	otherRuntime := "other"
 
 	tests := []struct {
-		name               string
-		pod                *corev1.Pod
-		initObjects        []client.Object
-		subResource        string
-		expectedAllowed    bool
-		expectedStatusCode int32
-		expectedMessage    string
-		verifyPMJCreated   bool
-		expectedLabels     map[string]string
+		name                string
+		pod                 *corev1.Pod
+		initObjects         []client.Object
+		subResource         string
+		expectedAllowed     bool
+		expectedStatusCode  int32
+		expectedMessage     string
+		verifyPMJCreated    bool
+		expectedLabels      map[string]string
+		expectedAnnotations map[string]string
 	}{
 		{
 			name: "Not an eviction request",
@@ -372,6 +374,73 @@ func TestEvictionGate(t *testing.T) {
 			expectedAllowed: true,
 			expectedMessage: "skipping migration: prior migration timed out on PDB budget",
 		},
+		{
+			name: "Trigger migration propagates explicit timeout annotation from pod",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "timeout-annotated-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					Annotations: map[string]string{
+						util.AnnotationMigrationTimeout: "25m",
+					},
+					UID: "test-uid-timeout-annotated",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectedAnnotations: map[string]string{
+				util.AnnotationMigrationTimeout: "25m",
+			},
+		},
+		{
+			name: "Trigger migration scales timeout for pod with memory request",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "large-memory-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-large-memory",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+					Containers: []corev1.Container{
+						{
+							Name: "redis",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("16Gi"),
+								},
+							},
+						},
+					},
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectedAnnotations: map[string]string{
+				util.AnnotationMigrationTimeout: "15m27s",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -428,6 +497,11 @@ func TestEvictionGate(t *testing.T) {
 				for k, v := range tt.expectedLabels {
 					if pmj.Labels[k] != v {
 						t.Errorf("Expected label %s=%s, got %s", k, v, pmj.Labels[k])
+					}
+				}
+				for k, v := range tt.expectedAnnotations {
+					if pmj.Annotations[k] != v {
+						t.Errorf("Expected annotation %s=%s, got %s", k, v, pmj.Annotations[k])
 					}
 				}
 				// Verify that PodSnapshot was NOT created in the webhook

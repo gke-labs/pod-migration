@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"sync/atomic"
+	"time"
 
 	// Import every API group whose types we need to read/write/serialize.
 	corev1 "k8s.io/api/core/v1"
@@ -77,6 +78,7 @@ func main() {
 		clientGoQPS          float64
 		clientGoBurst        int
 		maxConcurrent        int
+		migrationTimeout     time.Duration
 		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -85,6 +87,7 @@ func main() {
 	flag.Float64Var(&clientGoQPS, "client-go-qps", 500.0, "QPS for client-go REST config")
 	flag.IntVar(&clientGoBurst, "client-go-burst", 1000, "Burst for client-go REST config")
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
+	flag.DurationVar(&migrationTimeout, "migration-timeout", util.DefaultMigrationTimeout, "Default timeout for active migrations (Pending, Snapshotting, Evicting)")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -109,6 +112,11 @@ func main() {
 	// the 5-QPS default; negative disables rate limiting).
 	if err := util.ValidateClientGoRateLimits(clientGoQPS, clientGoBurst); err != nil {
 		setupLog.Error(err, "invalid client-go rate limit flags")
+		os.Exit(1)
+	}
+
+	if migrationTimeout < util.MinMigrationTimeout || migrationTimeout > util.MaxMigrationTimeout {
+		setupLog.Error(fmt.Errorf("migration-timeout %v out of range [%v, %v]", migrationTimeout, util.MinMigrationTimeout, util.MaxMigrationTimeout), "invalid migration timeout flag")
 		os.Exit(1)
 	}
 
@@ -157,10 +165,11 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.PodMigrationJobReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-		Scheme:    mgr.GetScheme(),
-		Recorder:  eventRecorder,
+		Client:                  mgr.GetClient(),
+		APIReader:               mgr.GetAPIReader(),
+		Scheme:                  mgr.GetScheme(),
+		Recorder:                eventRecorder,
+		DefaultMigrationTimeout: migrationTimeout,
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)
@@ -179,7 +188,7 @@ func main() {
 	}
 
 	// --- Webhooks ------------------------------------------------------------
-	if err := pmwebhook.SetupEvictionWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
+	if err := pmwebhook.SetupEvictionWebhookWithManager(mgr, mgr.GetAPIReader(), migrationTimeout); err != nil {
 		setupLog.Error(err, "unable to register eviction webhook")
 		os.Exit(1)
 	}
