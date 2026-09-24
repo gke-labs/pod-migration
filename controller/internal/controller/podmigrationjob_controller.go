@@ -20,13 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
@@ -387,7 +384,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 	return snapshot.NewGKEProvider(r.Client, r.Scheme)
 }
 
-// +kubebuilder:rbac:groups=apps,resources=deployments;replicasets;statefulsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch;create;update;patch;delete
@@ -530,19 +527,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 
-		// Proactively clean up unassigned completed PMJs if the parent workload has scaled down.
-		if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
-			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore) &&
-			!job.Status.Consumed {
-			cleanedUp, err := r.cleanupScaleDownZombie(ctx, job)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if cleanedUp {
-				return ctrl.Result{}, nil
-			}
-		}
-
 		if job.Status.CompletionTime != nil {
 			ttl := time.Minute * 30 // Extended 30m window prevents premature deletion during large drains
 			if time.Since(job.Status.CompletionTime.Time) > ttl {
@@ -565,6 +549,23 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 				return ctrl.Result{}, nil
 			}
+		}
+
+		// Proactively clean up unassigned SucceededWithoutRestore PMJs if the parent workload has scaled down.
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore && !job.Status.Consumed {
+			cleanedUp, err := r.cleanupScaleDownZombie(ctx, job)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if cleanedUp {
+				return ctrl.Result{}, nil
+			}
+			// Requeue periodically to check if the parent workload scales down before the 30-minute GC TTL.
+			return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+		}
+
+		if job.Status.CompletionTime != nil {
+			ttl := time.Minute * 30
 			requeueIn := ttl - time.Since(job.Status.CompletionTime.Time)
 			return ctrl.Result{RequeueAfter: requeueIn}, nil
 		}
@@ -1351,23 +1352,9 @@ func (r *PodMigrationJobReconciler) clearEvictionBlockageConditions(job *pmv1alp
 // cache index; this is a cache read, not an API call.
 func (r *PodMigrationJobReconciler) hasGatedClaimant(ctx context.Context, job *pmv1alpha1.PodMigrationJob) (bool, error) {
 	pods := &corev1.PodList{}
-	err := r.List(ctx, pods,
+	if err := r.List(ctx, pods,
 		client.InNamespace(job.Namespace),
-		client.MatchingFields{PodAssignedPMJIndex: job.Name})
-	if err != nil {
-		if strings.Contains(err.Error(), "index") || strings.Contains(err.Error(), "indexer") {
-			if listErr := r.List(ctx, pods, client.InNamespace(job.Namespace)); listErr != nil {
-				return false, listErr
-			}
-			for i := range pods.Items {
-				if pods.Items[i].Annotations != nil && pods.Items[i].Annotations[util.AnnotationAssignedPMJ] == job.Name {
-					if podHasMigrationGate(&pods.Items[i]) {
-						return true, nil
-					}
-				}
-			}
-			return false, nil
-		}
+		client.MatchingFields{PodAssignedPMJIndex: job.Name}); err != nil {
 		return false, fmt.Errorf("failed to list pods assigned to PMJ %s: %w", job.Name, err)
 	}
 	for i := range pods.Items {
@@ -1381,21 +1368,9 @@ func (r *PodMigrationJobReconciler) hasGatedClaimant(ctx context.Context, job *p
 // hasAssignedClaimant reports whether any pod is annotated as assigned to this PMJ.
 func (r *PodMigrationJobReconciler) hasAssignedClaimant(ctx context.Context, job *pmv1alpha1.PodMigrationJob) (bool, error) {
 	pods := &corev1.PodList{}
-	err := r.List(ctx, pods,
+	if err := r.List(ctx, pods,
 		client.InNamespace(job.Namespace),
-		client.MatchingFields{PodAssignedPMJIndex: job.Name})
-	if err != nil {
-		if strings.Contains(err.Error(), "index") || strings.Contains(err.Error(), "indexer") {
-			if listErr := r.List(ctx, pods, client.InNamespace(job.Namespace)); listErr != nil {
-				return false, listErr
-			}
-			for i := range pods.Items {
-				if pods.Items[i].Annotations != nil && pods.Items[i].Annotations[util.AnnotationAssignedPMJ] == job.Name {
-					return true, nil
-				}
-			}
-			return false, nil
-		}
+		client.MatchingFields{PodAssignedPMJIndex: job.Name}); err != nil {
 		return false, fmt.Errorf("failed to list pods assigned to PMJ %s: %w", job.Name, err)
 	}
 	return len(pods.Items) > 0, nil
@@ -1424,9 +1399,8 @@ func (r *PodMigrationJobReconciler) countActiveWorkloadPods(pods []corev1.Pod, j
 	return active
 }
 
-// cleanupScaleDownZombie proactively deletes unassigned completed PMJs (Succeeded or
-// SucceededWithoutRestore) whose parent workload has scaled down and already has all
-// target replicas satisfied by other active pods.
+// cleanupScaleDownZombie proactively deletes unassigned completed PMJs in SucceededWithoutRestore
+// whose parent workload has scaled down and already has all target replicas satisfied by active pods.
 func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, job *pmv1alpha1.PodMigrationJob) (bool, error) {
 	if job.Status.Consumed {
 		return false, nil
@@ -1435,6 +1409,14 @@ func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, 
 	parentName := job.Labels[util.LabelParentName]
 	parentKind := job.Labels[util.LabelParentKind]
 	if parentName == "" || parentKind == "" {
+		return false, nil
+	}
+
+	gated, err := r.hasGatedClaimant(ctx, job)
+	if err != nil {
+		return false, err
+	}
+	if gated {
 		return false, nil
 	}
 
@@ -1451,22 +1433,61 @@ func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, 
 
 	switch parentKind {
 	case "Deployment":
-		deploy := &appsv1.Deployment{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, deploy); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
+		podTemplateHash := job.Labels[util.LabelPodTemplateHash]
+		if podTemplateHash != "" {
+			rs := &appsv1.ReplicaSet{}
+			rsName := fmt.Sprintf("%s-%s", parentName, podTemplateHash)
+			err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: rsName}, rs)
+			if err != nil && apierrors.IsNotFound(err) {
+				rsList := &appsv1.ReplicaSetList{}
+				if listErr := r.liveReader().List(ctx, rsList,
+					client.InNamespace(job.Namespace),
+					client.MatchingLabels{appsv1.DefaultDeploymentUniqueLabelKey: podTemplateHash}); listErr == nil {
+					for i := range rsList.Items {
+						for _, ref := range rsList.Items[i].OwnerReferences {
+							if ref.Kind == "Deployment" && ref.Name == parentName {
+								rs = &rsList.Items[i]
+								err = nil
+								break
+							}
+						}
+						if err == nil {
+							break
+						}
+					}
+				}
 			}
-			return false, err
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					targetReplicas = 0
+				} else {
+					return false, err
+				}
+			} else {
+				targetReplicas = 1
+				if rs.Spec.Replicas != nil {
+					targetReplicas = *rs.Spec.Replicas
+				}
+				selector = rs.Spec.Selector
+			}
+		} else {
+			deploy := &appsv1.Deployment{}
+			if err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, deploy); err != nil {
+				if apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			targetReplicas = 1
+			if deploy.Spec.Replicas != nil {
+				targetReplicas = *deploy.Spec.Replicas
+			}
+			selector = deploy.Spec.Selector
 		}
-		targetReplicas = 1
-		if deploy.Spec.Replicas != nil {
-			targetReplicas = *deploy.Spec.Replicas
-		}
-		selector = deploy.Spec.Selector
 
 	case "ReplicaSet":
 		rs := &appsv1.ReplicaSet{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, rs); err != nil {
+		if err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, rs); err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
 			}
@@ -1480,7 +1501,7 @@ func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, 
 
 	case "StatefulSet":
 		sts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, sts); err != nil {
+		if err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, sts); err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
 			}
@@ -1496,24 +1517,21 @@ func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, 
 		return false, nil
 	}
 
-	if selector == nil {
-		return false, nil
+	var activeCount int32
+	if selector != nil {
+		sel, err := metav1.LabelSelectorAsSelector(selector)
+		if err != nil {
+			return false, err
+		}
+
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList, client.InNamespace(job.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
+			return false, err
+		}
+		activeCount = r.countActiveWorkloadPods(podList.Items, job)
 	}
 
-	sel, err := metav1.LabelSelectorAsSelector(selector)
-	if err != nil {
-		return false, err
-	}
-
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(job.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
-		return false, err
-	}
-
-	activeCount := r.countActiveWorkloadPods(podList.Items, job)
-
-	// If the parent workload's active pod count satisfies or exceeds its target replicas,
-	// no replacement pod will be created for scaled-down replicas.
+	// If active pods satisfy or exceed target replicas, the workload has scaled down and no replacement pod will be created.
 	if activeCount >= targetReplicas {
 		logger := log.FromContext(ctx)
 		logger.Info("Proactively deleting unassigned completed PodMigrationJob after parent workload scale-down",
@@ -1523,143 +1541,18 @@ func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, 
 			"activePods", activeCount,
 			"targetReplicas", targetReplicas)
 
-		r.Recorder.Event(job, corev1.EventTypeNormal, "ScaleDownZombieCleaned",
-			fmt.Sprintf("Proactively deleted unassigned completed PMJ for scaled-down %s %s (active pods: %d, target replicas: %d)",
-				parentKind, parentName, activeCount, targetReplicas))
-
 		if err := r.Delete(ctx, job); err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
+
+		r.eventf(job, corev1.EventTypeNormal, "ScaleDownZombieCleaned",
+			"Proactively deleted unassigned completed PMJ for scaled-down %s %s (active pods: %d, target replicas: %d)",
+			parentKind, parentName, activeCount, targetReplicas)
+
 		return true, nil
 	}
 
 	return false, nil
-}
-
-func deploymentScaleDownPredicate() predicate.Predicate {
-	return predicate.Funcs{
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldDep, ok1 := e.ObjectOld.(*appsv1.Deployment)
-			newDep, ok2 := e.ObjectNew.(*appsv1.Deployment)
-			if !ok1 || !ok2 || oldDep == nil || newDep == nil {
-				return false
-			}
-			oldReplicas := int32(1)
-			if oldDep.Spec.Replicas != nil {
-				oldReplicas = *oldDep.Spec.Replicas
-			}
-			newReplicas := int32(1)
-			if newDep.Spec.Replicas != nil {
-				newReplicas = *newDep.Spec.Replicas
-			}
-			return newReplicas < oldReplicas
-		},
-		CreateFunc:  func(e event.CreateEvent) bool { return false },
-		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
-		GenericFunc: func(e event.GenericEvent) bool { return false },
-	}
-}
-
-func replicaSetScaleDownPredicate() predicate.Predicate {
-	return predicate.Funcs{
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldRS, ok1 := e.ObjectOld.(*appsv1.ReplicaSet)
-			newRS, ok2 := e.ObjectNew.(*appsv1.ReplicaSet)
-			if !ok1 || !ok2 || oldRS == nil || newRS == nil {
-				return false
-			}
-			oldReplicas := int32(1)
-			if oldRS.Spec.Replicas != nil {
-				oldReplicas = *oldRS.Spec.Replicas
-			}
-			newReplicas := int32(1)
-			if newRS.Spec.Replicas != nil {
-				newReplicas = *newRS.Spec.Replicas
-			}
-			return newReplicas < oldReplicas
-		},
-		CreateFunc:  func(e event.CreateEvent) bool { return false },
-		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
-		GenericFunc: func(e event.GenericEvent) bool { return false },
-	}
-}
-
-func statefulSetScaleDownPredicate() predicate.Predicate {
-	return predicate.Funcs{
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldSTS, ok1 := e.ObjectOld.(*appsv1.StatefulSet)
-			newSTS, ok2 := e.ObjectNew.(*appsv1.StatefulSet)
-			if !ok1 || !ok2 || oldSTS == nil || newSTS == nil {
-				return false
-			}
-			oldReplicas := int32(1)
-			if oldSTS.Spec.Replicas != nil {
-				oldReplicas = *oldSTS.Spec.Replicas
-			}
-			newReplicas := int32(1)
-			if newSTS.Spec.Replicas != nil {
-				newReplicas = *newSTS.Spec.Replicas
-			}
-			return newReplicas < oldReplicas
-		},
-		CreateFunc:  func(e event.CreateEvent) bool { return false },
-		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
-		GenericFunc: func(e event.GenericEvent) bool { return false },
-	}
-}
-
-func (r *PodMigrationJobReconciler) mapParentToPMJs(ctx context.Context, namespace, parentName, parentKind string) []ctrl.Request {
-	pmjList := &pmv1alpha1.PodMigrationJobList{}
-	if err := r.List(ctx, pmjList,
-		client.InNamespace(namespace),
-		client.MatchingLabels{
-			util.LabelParentName: parentName,
-			util.LabelParentKind: parentKind,
-		}); err != nil {
-		return nil
-	}
-	var reqs []ctrl.Request
-	for i := range pmjList.Items {
-		job := &pmjList.Items[i]
-		if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
-			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore) &&
-			!job.Status.Consumed {
-			reqs = append(reqs, ctrl.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: job.Namespace,
-					Name:      job.Name,
-				},
-			})
-		}
-	}
-	return reqs
-}
-
-func (r *PodMigrationJobReconciler) mapDeploymentToPMJs(ctx context.Context, obj client.Object) []ctrl.Request {
-	if obj == nil {
-		return nil
-	}
-	return r.mapParentToPMJs(ctx, obj.GetNamespace(), obj.GetName(), "Deployment")
-}
-
-func (r *PodMigrationJobReconciler) mapReplicaSetToPMJs(ctx context.Context, obj client.Object) []ctrl.Request {
-	rs, ok := obj.(*appsv1.ReplicaSet)
-	if !ok || rs == nil {
-		return nil
-	}
-	for _, ref := range rs.OwnerReferences {
-		if ref.Kind == "Deployment" {
-			return r.mapParentToPMJs(ctx, obj.GetNamespace(), ref.Name, "Deployment")
-		}
-	}
-	return r.mapParentToPMJs(ctx, obj.GetNamespace(), rs.Name, "ReplicaSet")
-}
-
-func (r *PodMigrationJobReconciler) mapStatefulSetToPMJs(ctx context.Context, obj client.Object) []ctrl.Request {
-	if obj == nil {
-		return nil
-	}
-	return r.mapParentToPMJs(ctx, obj.GetNamespace(), obj.GetName(), "StatefulSet")
 }
 
 func isPodReady(pod *corev1.Pod) bool {
@@ -1726,22 +1619,7 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 	logger := mgr.GetLogger().WithName("podmigrationjob-setup")
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigrationJob{}).
-		WithOptions(options).
-		Watches(
-			&appsv1.Deployment{},
-			handler.EnqueueRequestsFromMapFunc(r.mapDeploymentToPMJs),
-			builder.WithPredicates(deploymentScaleDownPredicate()),
-		).
-		Watches(
-			&appsv1.ReplicaSet{},
-			handler.EnqueueRequestsFromMapFunc(r.mapReplicaSetToPMJs),
-			builder.WithPredicates(replicaSetScaleDownPredicate()),
-		).
-		Watches(
-			&appsv1.StatefulSet{},
-			handler.EnqueueRequestsFromMapFunc(r.mapStatefulSetToPMJs),
-			builder.WithPredicates(statefulSetScaleDownPredicate()),
-		)
+		WithOptions(options)
 
 	psmtGVK := schema.GroupVersionKind{
 		Group:   "podsnapshot.gke.io",

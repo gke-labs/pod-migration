@@ -5,9 +5,11 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -793,5 +795,57 @@ func TestFindUnassignedActivePMJ_EvictingScaleUpIsolation(t *testing.T) {
 				t.Errorf("expected: %q, got: %q", tc.expected, result)
 			}
 		})
+	}
+}
+
+func TestResolveParentWorkload_StandaloneReplicaSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	namespace := "default"
+	rsUID := "rs-uid-999"
+	rsName := "standalone-rs"
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rsName,
+			Namespace: namespace,
+			UID:       types.UID(rsUID),
+			// No owner reference to a Deployment -> standalone ReplicaSet
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "standalone-rs-pod",
+			Namespace: namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       rsName,
+					UID:        types.UID(rsUID),
+				},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rs, pod).Build()
+	ctx := context.Background()
+
+	parentName, parentKind, parentUID, err := ResolveParentWorkload(ctx, c, pod)
+	if err != nil {
+		t.Fatalf("ResolveParentWorkload failed: %v", err)
+	}
+
+	if parentName != rsName {
+		t.Errorf("expected parentName %q, got %q", rsName, parentName)
+	}
+	if parentKind != "ReplicaSet" {
+		t.Errorf("expected parentKind %q, got %q", "ReplicaSet", parentKind)
+	}
+	if parentUID != rsUID {
+		t.Errorf("expected parentUID %q, got %q", rsUID, parentUID)
 	}
 }

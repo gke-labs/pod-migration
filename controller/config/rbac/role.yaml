@@ -43,8 +43,13 @@ rules:
   - apps
   resources:
   - deployments
-  - replicasets
   - statefulsets
+  verbs:
+  - get
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
   verbs:
   - get
   - list
