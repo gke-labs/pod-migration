@@ -6109,12 +6109,8 @@ func TestPodMigrationJobReconciler_Pending_ScalesMemoryRequestTimeout(t *testing
 	if err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
-	if res.Requeue {
-		if _, err := r.Reconcile(context.Background(), ctrl.Request{
-			NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
-		}); err != nil {
-			t.Fatalf("Second Reconcile failed: %v", err)
-		}
+	if !res.Requeue {
+		t.Errorf("Expected reconcile to requeue")
 	}
 
 	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
@@ -6126,6 +6122,116 @@ func TestPodMigrationJobReconciler_Pending_ScalesMemoryRequestTimeout(t *testing
 	}
 	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
 		t.Errorf("Expected phase to transition to Snapshotting, got %s", updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Pending_WithMemoryScalingAndPVC_PreservesOriginNodeAndPVsToDetach(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "redis-pod"
+	jobName := "pmj-" + podName
+	pvcName := "redis-pvc"
+	pvName := "redis-pv"
+	originNode := "worker-node-42"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-redis-123",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: originNode,
+			Containers: []corev1.Container{
+				{
+					Name: "redis",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("16Gi"),
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "redis-data",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pvcName,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: pvName,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-redis-123",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pvc, pmj).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// Exactly one reconcile: must update timeout annotation, backfill OriginNodeName & PVsToDetach,
+	// and transition to Snapshotting without clobbering unpersisted status.
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("Expected reconcile to requeue")
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected phase Snapshotting on single reconcile, got %s", updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Annotations[util.AnnotationMigrationTimeout] != "15m27s" {
+		t.Errorf("Expected annotation 15m27s, got %q", updatedPMJ.Annotations[util.AnnotationMigrationTimeout])
+	}
+	if updatedPMJ.Status.OriginNodeName != originNode {
+		t.Errorf("Expected OriginNodeName %q, got %q", originNode, updatedPMJ.Status.OriginNodeName)
+	}
+	if len(updatedPMJ.Status.PVsToDetach) != 1 || updatedPMJ.Status.PVsToDetach[0] != pvName {
+		t.Errorf("Expected PVsToDetach [%q], got %v", pvName, updatedPMJ.Status.PVsToDetach)
 	}
 }
 

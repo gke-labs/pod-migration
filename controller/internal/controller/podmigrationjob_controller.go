@@ -732,10 +732,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		if annotationUpdated {
-			if err := r.Update(ctx, job); err != nil {
+			savedStatus := job.Status.DeepCopy()
+			jobToUpdate := job.DeepCopy()
+			if err := r.Update(ctx, jobToUpdate); err != nil {
 				return r.handleStatusError(ctx, err, "Failed to update timeout annotation on PMJ in Pending phase")
 			}
-			origJob = job.DeepCopy()
+			job.ObjectMeta = *jobToUpdate.ObjectMeta.DeepCopy()
+			job.Status = *savedStatus
+			origJob.ObjectMeta = *jobToUpdate.ObjectMeta.DeepCopy()
 		}
 
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting

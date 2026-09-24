@@ -286,13 +286,17 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 
 // isTerminalSnapshotFailureReason checks if a condition reason indicates that the snapshot operation
 // has terminally failed and will not recover or complete.
+// Note on retries (#21): When a snapshot provider emits a terminal failure reason (such as Checkpoint failed or
+// DeadlineExceeded), retrying trigger creation within the same PMJ prolongs migration disruption and risks
+// double-checkpointing an actively degrading pod; failing fast allows the controller or workload controller
+// to cleanly initiate fallback or reschedule rather than burning the migration deadline on known terminal states.
 func isTerminalSnapshotFailureReason(reason string) bool {
 	r := strings.ToLower(reason)
 	if r == "" || r == "noerror" || strings.HasPrefix(r, "not") || strings.HasPrefix(r, "non") {
 		return false
 	}
 	switch r {
-	case "failed", "error", "deadlineexceeded", "agentfailed", "preconditionfailed", "rejected":
+	case "failed", "error", "deadlineexceeded":
 		return true
 	}
 	return false
