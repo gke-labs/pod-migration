@@ -152,6 +152,12 @@ spec:
                   GateReleased indicates whether the scheduling gate on the replacement pod has been
                   successfully removed. Written after the Pod update succeeds or self-healed by the PMJ controller.
                 type: boolean
+              originNodeName:
+                description: |-
+                  OriginNodeName records the name of the node where the origin pod was running.
+                  Used during the Evicting phase to scope volume detachment checks specifically
+                  to the origin node.
+                type: string
               phase:
                 description: PodMigrationJobPhase defines the current state in the
                   lifecycle.
