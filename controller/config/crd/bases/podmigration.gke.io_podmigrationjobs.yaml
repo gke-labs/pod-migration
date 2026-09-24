@@ -11,6 +11,8 @@ spec:
     kind: PodMigrationJob
     listKind: PodMigrationJobList
     plural: podmigrationjobs
+    shortNames:
+    - pmj
     singular: podmigrationjob
   scope: Namespaced
   versions:
@@ -18,6 +20,12 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.snapshotRef
+      name: Snapshot
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -169,6 +177,11 @@ spec:
                 type: string
               snapshotRef:
                 description: SnapshotRef references the name of the created pod snapshot.
+                type: string
+              snapshottingStartTime:
+                description: SnapshottingStartTime is the timestamp when this job
+                  transitioned to the Snapshotting phase.
+                format: date-time
                 type: string
             type: object
         type: object

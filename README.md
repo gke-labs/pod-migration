@@ -395,3 +395,24 @@ When migrating single-replica workloads (such as a `StatefulSet` with `replicas:
   ```bash
   kubectl annotate pod <pod-name> pod-migration.gke.io/pdb-eviction-timeout-
   ```
+
+## 8. Monitoring & Prometheus Metrics
+
+The controller registers Prometheus metrics on the standard controller-runtime metrics endpoint (`:8080/metrics` by default):
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `pod_migration_active` | Gauge | None | Number of currently active pod migrations in flight. |
+| `pod_migration_outcomes_total` | Counter | `outcome` (`succeeded`, `failed`, `timeout`, `fallback`, `succeeded_without_restore`) | Total completed migrations by outcome. |
+| `pod_migration_phase_duration_seconds` | Histogram | `phase` (`pending`, `snapshotting`, `evicting`, `restoring`) | Latency distribution of individual migration phases. |
+| `pod_migration_restore_crash_fallback_total` | Counter | None | Total cold-start fallbacks triggered by matched gVisor/OCI restore crashes. |
+| `pod_migration_restore_crash_unmatched_total` | Counter | None | Total unrecognised StartError restore-pod crashes with no known signature. |
+
+### High Availability (HA) Scraping Considerations
+
+When running in multi-replica HA mode with leader election enabled:
+- The `/metrics` endpoint is served by all controller replicas.
+- Only the **leader replica** reconciles migrations and updates `pod_migration_active` in memory; standby replicas serve `pod_migration_active == 0`.
+- Prometheus scrape jobs should scrape per-pod endpoints and use `max(pod_migration_active)` when querying or alerting on active in-flight migrations across the cluster.
+- For counter and histogram metrics, use `sum(rate(pod_migration_outcomes_total[5m])) by (outcome)` and `sum(rate(pod_migration_phase_duration_seconds_sum[5m])) by (phase) / sum(rate(pod_migration_phase_duration_seconds_count[5m])) by (phase)`.
+
