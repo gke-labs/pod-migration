@@ -664,6 +664,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if podExists && string(pod.UID) == job.Spec.TargetPodUID {
 			if job.Status.OriginNodeName == "" && pod.Spec.NodeName != "" {
 				job.Status.OriginNodeName = pod.Spec.NodeName
+				if err := r.patchStatus(ctx, job, origJob); err != nil {
+					return r.handleStatusError(ctx, err, "Failed to persist OriginNodeName in Evicting phase")
+				}
 			}
 
 			// If the origin pod is already terminating through its grace period, wait for deletion
