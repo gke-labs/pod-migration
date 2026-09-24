@@ -7,6 +7,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -40,11 +41,29 @@ func VolumeAttachmentPVIndexValue(obj client.Object) []string {
 	return []string{*va.Spec.Source.PersistentVolumeName}
 }
 
+// PMJSnapshotRefIndex is the cache index key mapping PodMigrationJobs to their Status.SnapshotRef.
+const PMJSnapshotRefIndex = ".status.snapshotRef"
+
+// PMJSnapshotRefIndexValue extracts the snapshotRef status value for a PodMigrationJob.
+func PMJSnapshotRefIndexValue(obj client.Object) []string {
+	job, ok := obj.(*pmv1alpha1.PodMigrationJob)
+	if !ok || job == nil {
+		return nil
+	}
+	if job.Status.SnapshotRef != "" {
+		return []string{job.Status.SnapshotRef}
+	}
+	return nil
+}
+
 // RegisterFieldIndexes registers all cache indexes the controllers rely on.
 // Must be called before the manager starts.
 func RegisterFieldIndexes(ctx context.Context, indexer client.FieldIndexer) error {
 	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue); err != nil {
 		return err
 	}
-	return indexer.IndexField(ctx, &storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue)
+	if err := indexer.IndexField(ctx, &storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue); err != nil {
+		return err
+	}
+	return indexer.IndexField(ctx, &pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue)
 }
