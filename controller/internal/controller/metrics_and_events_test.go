@@ -8,6 +8,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -442,15 +443,21 @@ func TestMetrics_PhaseDurations_ReconcileDriven(t *testing.T) {
 		t.Fatalf("Failed to update SnapshottingStartTime: %v", err)
 	}
 
+	snapSumBefore := getHistogramSampleSum(snapshottingHist)
+
 	// Step 2: Reconcile Snapshotting -> Evicting (mock provider returns PhaseReady)
 	_, err = r.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("Reconcile snapshotting failed: %v", err)
 	}
 
-	// Snapshotting duration recorded, ~3s
+	// Snapshotting duration recorded, ~3s (anchored by metav1.Time with second precision)
 	if getHistogramSampleCount(snapshottingHist) != snapshottingBeforeCount+1 {
 		t.Errorf("Expected snapshotting duration histogram to observe 1 sample")
+	}
+	observedSnapshotting := getHistogramSampleSum(snapshottingHist) - snapSumBefore
+	if observedSnapshotting < 2.9 || observedSnapshotting > 4.2 {
+		t.Errorf("Expected snapshotting duration ~3s (observed between 2.9s and 4.2s), got %v seconds", observedSnapshotting)
 	}
 
 	// Step 3: Reconcile Evicting (first pass records evicting-since annotation)
@@ -467,8 +474,8 @@ func TestMetrics_PhaseDurations_ReconcileDriven(t *testing.T) {
 		t.Fatalf("Expected evicting-since annotation to be set")
 	}
 
-	// Set evicting-since to 1s ago to simulate realistic evicting duration
-	currentPMJ.Annotations["pod-migration.gke.io/evicting-since"] = time.Now().Add(-1 * time.Second).Format(time.RFC3339)
+	// Set evicting-since to 1s ago to simulate realistic evicting duration (RFC3339Nano retains subsecond precision)
+	currentPMJ.Annotations["pod-migration.gke.io/evicting-since"] = time.Now().Add(-1 * time.Second).Format(time.RFC3339Nano)
 	// Delete source pod to simulate successful eviction and detachment
 	if err := fakeClient.Delete(ctx, pod); err != nil {
 		t.Fatalf("Failed to delete source pod: %v", err)
@@ -490,8 +497,9 @@ func TestMetrics_PhaseDurations_ReconcileDriven(t *testing.T) {
 	}
 
 	observedEvicting := getHistogramSampleSum(evictingHist) - evictingSumBefore
-	// The evicting duration must measure ~1s (from evicting-since), NOT 1s + 3s = 4s (leaking snapshotting duration)
-	if observedEvicting < 0.9 || observedEvicting > 2.5 {
+	// The evicting duration must measure ~1s (from evicting-since), tightened around the backdated 1s anchor
+	// to ensure leaks from snapshotting (e.g. 2.2s+) fail.
+	if observedEvicting < 0.95 || observedEvicting > 1.4 {
 		t.Errorf("Expected evicting duration ~1s without snapshotting leakage, got %v seconds", observedEvicting)
 	}
 
@@ -541,6 +549,8 @@ func TestMetrics_PhaseDurations_ReconcileDriven(t *testing.T) {
 		t.Fatalf("Failed to update PMJ status for consumed pod: %v", err)
 	}
 
+	restoringSumBefore := getHistogramSampleSum(restoringHist)
+
 	// Step 5: Reconcile Restoring -> Succeeded
 	_, err = r.Reconcile(ctx, req)
 	if err != nil {
@@ -550,12 +560,116 @@ func TestMetrics_PhaseDurations_ReconcileDriven(t *testing.T) {
 	if getHistogramSampleCount(restoringHist) != restoringBeforeCount+1 {
 		t.Errorf("Expected restoring duration histogram to observe 1 sample")
 	}
+	observedRestoring := getHistogramSampleSum(restoringHist) - restoringSumBefore
+	if observedRestoring < 1.9 || observedRestoring > 3.2 {
+		t.Errorf("Expected restoring duration ~2s (observed between 1.9s and 3.2s), got %v seconds", observedRestoring)
+	}
 
 	if err := fakeClient.Get(ctx, req.NamespacedName, &currentPMJ); err != nil {
 		t.Fatalf("Failed to fetch final PMJ: %v", err)
 	}
 	if currentPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
 		t.Errorf("Expected PMJ to be in Succeeded phase, got %s", currentPMJ.Status.Phase)
+	}
+}
+
+func TestMetrics_RestoringCeilingTimeout_DecrementsActiveGaugeAndRecordsMetrics(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	jobName := "pmj-" + podName
+
+	sixMinutesAgo := metav1.NewTime(time.Now().Add(-6 * time.Minute))
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "origin-uid-123",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+			RestoringStartTime: &sixMinutesAgo,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pmj).
+		Build()
+
+	recorder := record.NewFakeRecorder(10)
+	r := &PodMigrationJobReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: recorder,
+	}
+
+	metrics.ResetActiveJobsForTest()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName}}
+	metrics.MarkPMJActive(req.NamespacedName.String())
+
+	if val := testutil.ToFloat64(metrics.ActiveMigrations); val != 1 {
+		t.Fatalf("Expected ActiveMigrations to be 1 initially, got %v", val)
+	}
+
+	timeoutCounterBefore := testutil.ToFloat64(metrics.OutcomesTotal.WithLabelValues("timeout"))
+	restoringHist := metrics.PhaseDurationSeconds.WithLabelValues("restoring")
+	restoringBeforeCount := getHistogramSampleCount(restoringHist)
+	restoringSumBefore := getHistogramSampleSum(restoringHist)
+
+	ctx := context.Background()
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected no requeue on terminal timeout, got %+v", res)
+	}
+
+	// 1. Verify ActiveMigrations gauge decremented to 0
+	if val := testutil.ToFloat64(metrics.ActiveMigrations); val != 0 {
+		t.Errorf("Expected ActiveMigrations to decrement to 0 after restore timeout, got %v", val)
+	}
+
+	// 2. Verify OutcomesTotal counter with outcome='timeout' incremented
+	if val := testutil.ToFloat64(metrics.OutcomesTotal.WithLabelValues("timeout")); val != timeoutCounterBefore+1 {
+		t.Errorf("Expected OutcomesTotal{outcome='timeout'} to increment by 1, got %v (before: %v)", val, timeoutCounterBefore)
+	}
+
+	// 3. Verify restoring phase duration was observed
+	if count := getHistogramSampleCount(restoringHist); count != restoringBeforeCount+1 {
+		t.Errorf("Expected restoring phase duration histogram count to increment, got %d (before: %d)", count, restoringBeforeCount)
+	}
+	observedRestoring := getHistogramSampleSum(restoringHist) - restoringSumBefore
+	if observedRestoring < 350 || observedRestoring > 400 {
+		t.Errorf("Expected restoring duration around ~360s (6m), got %v seconds", observedRestoring)
+	}
+
+	// 4. Verify PMJ reached SucceededWithoutRestore with RestoreTimeout conditions
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(ctx, req.NamespacedName, updatedPMJ); err != nil {
+		t.Fatalf("Failed to fetch updated PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, updatedPMJ.Status.Phase)
+	}
+	restoredCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Restored")
+	if restoredCond == nil || restoredCond.Status != metav1.ConditionFalse || restoredCond.Reason != "RestoreTimeout" {
+		t.Errorf("Expected Restored=False (RestoreTimeout) condition, got %+v", restoredCond)
+	}
+	readyCond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Status != metav1.ConditionTrue || readyCond.Reason != "RestoreTimeout" {
+		t.Errorf("Expected Ready=True (RestoreTimeout) condition, got %+v", readyCond)
 	}
 }
 

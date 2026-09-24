@@ -143,9 +143,15 @@ func (r *PodMigrationJobReconciler) recordPreviousPhaseDuration(job *pmv1alpha1.
 			metrics.RecordPhaseDuration("snapshotting", time.Since(job.Status.SnapshottingStartTime.Time).Seconds())
 		}
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
+		// The evicting anchor is the pod-migration.gke.io/evicting-since annotation,
+		// which is only written while the origin pod still exists. If the origin pod was
+		// already gone when entering Evicting, this annotation is absent and no evicting
+		// sample is recorded.
 		if job.Annotations != nil {
 			if s := job.Annotations["pod-migration.gke.io/evicting-since"]; s != "" {
-				if t, err := time.Parse(time.RFC3339, s); err == nil {
+				if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+					metrics.RecordPhaseDuration("evicting", time.Since(t).Seconds())
+				} else if t, err := time.Parse(time.RFC3339, s); err == nil {
 					metrics.RecordPhaseDuration("evicting", time.Since(t).Seconds())
 				}
 			}
@@ -763,7 +769,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				if job.Annotations == nil {
 					job.Annotations = make(map[string]string)
 				}
-				job.Annotations["pod-migration.gke.io/evicting-since"] = time.Now().Format(time.RFC3339)
+				job.Annotations["pod-migration.gke.io/evicting-since"] = time.Now().Format(time.RFC3339Nano)
 				logger.Info("Recording evicting start time, waiting for eviction webhook to trigger delete", "pod", podName)
 				r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "EvictedForMigration", "Origin pod marked for eviction following successful checkpoint")
 				if err := r.Update(ctx, job); err != nil {
@@ -772,7 +778,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{Requeue: true}, nil
 			}
 
-			evictingSince, err := time.Parse(time.RFC3339, evictingSinceStr)
+			evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
+			if err != nil {
+				evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)
+			}
 			if err != nil {
 				logger.Error(err, "Failed to parse evicting-since annotation", "val", evictingSinceStr)
 				evictingSince = time.Time{} // fallback to immediate eviction
@@ -1005,24 +1014,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 			}
 			logger.Info("Restore timeout reached (5m), marking SucceededWithoutRestore", "job", job.Name, "pod", podName)
-			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
-			now := metav1.Now()
-			job.Status.CompletionTime = &now
-			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-				Type:               "Restored",
-				Status:             metav1.ConditionFalse,
-				Reason:             "RestoreTimeout",
-				Message:            "Restore timed out after 5 minutes",
-				ObservedGeneration: job.Generation,
-			})
-			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionTrue,
-				Reason:             "RestoreTimeout",
-				Message:            "Restore timed out after 5 minutes",
-				ObservedGeneration: job.Generation,
-			})
-			if err := r.patchStatus(ctx, job, origJob); err != nil {
+			if err := r.markSucceededWithoutRestore(ctx, job, origJob, "RestoreTimeout", "Restore timed out after 5 minutes"); err != nil {
 				return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore on restore timeout")
 			}
 			return ctrl.Result{}, nil
