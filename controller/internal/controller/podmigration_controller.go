@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 )
 
 // StorageCleanupFinalizer is the finalizer added to PodMigration resources
@@ -37,8 +38,24 @@ const (
 // PodMigrationReconciler reconciles a PodMigration object.
 type PodMigrationReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme          *runtime.Scheme
+	Recorder        record.EventRecorder
+	InvariantEngine *invariants.Engine
+}
+
+func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config *pmv1alpha1.PodMigration, reconcileErr *error) {
+	if !r.InvariantEngine.Enabled() || config == nil {
+		return
+	}
+	if reconcileErr != nil && *reconcileErr != nil && config.DeletionTimestamp.IsZero() {
+		return
+	}
+
+	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
+		Now:              time.Now(),
+		Reconciler:       "PodMigrationReconciler",
+		PrimaryMigration: config,
+	})
 }
 
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -48,7 +65,7 @@ type PodMigrationReconciler struct {
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch;delete
 
-func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx)
 
 	// Fetch the PodMigration instance
@@ -56,12 +73,17 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	err := r.Get(ctx, req.NamespacedName, config)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.InvariantEngine.ForgetObject("PodMigrationReconciler", "mig", req.Namespace, req.Name)
 			logger.Info("PodMigration resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get PodMigration config")
 		return ctrl.Result{}, err
 	}
+
+	defer func() {
+		r.evaluateInvariants(ctx, config, &reconcileErr)
+	}()
 
 	// Examine DeletionTimestamp to determine if object is under deletion
 	if !config.ObjectMeta.DeletionTimestamp.IsZero() {

@@ -135,6 +135,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if hash, ok := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]; ok && hash != "" {
 		jobLabels[util.LabelPodTemplateHash] = hash
 	}
+	if rev, ok := pod.Labels[appsv1.ControllerRevisionHashLabelKey]; ok && rev != "" {
+		jobLabels[util.LabelControllerRevisionHash] = rev
+	}
 	if idx, ok := pod.Labels[util.LabelJobCompletionIndex]; ok && idx != "" {
 		jobLabels[util.LabelJobCompletionIndex] = idx
 	}

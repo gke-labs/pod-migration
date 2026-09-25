@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -39,9 +40,35 @@ type PodGateReconciler struct {
 	client.Client
 	// APIReader reads directly from the API server, bypassing the informer
 	// cache.  Used to distinguish "PMJ deleted" from "PMJ not yet synced".
-	APIReader client.Reader
-	Scheme    *runtime.Scheme
-	Recorder  record.EventRecorder
+	APIReader       client.Reader
+	Scheme          *runtime.Scheme
+	Recorder        record.EventRecorder
+	InvariantEngine *invariants.Engine
+}
+
+func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, reconcileErr *error) {
+	if !r.InvariantEngine.Enabled() || pod == nil {
+		return
+	}
+	if reconcileErr != nil && *reconcileErr != nil {
+		return
+	}
+
+	if job == nil && pod.Annotations != nil {
+		if assigned := pod.Annotations[util.AnnotationAssignedPMJ]; assigned != "" {
+			fetched := &pmv1alpha1.PodMigrationJob{}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assigned}, fetched); err == nil {
+				job = fetched
+			}
+		}
+	}
+
+	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
+		Now:        time.Now(),
+		Reconciler: "PodGateReconciler",
+		PrimaryPod: pod,
+		PrimaryPMJ: job,
+	})
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
@@ -50,7 +77,7 @@ type PodGateReconciler struct {
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
 
 // Reconcile checks for active migration jobs and removes the scheduling gate if none exist.
-func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx).WithValues("pod", req.Name, "namespace", req.Namespace)
 
 	// Fetch Pod
@@ -58,11 +85,17 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	err := r.Get(ctx, req.NamespacedName, pod)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.InvariantEngine.ForgetObject("PodGateReconciler", "pod", req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get Pod")
 		return ctrl.Result{}, err
 	}
+
+	var observedJob *pmv1alpha1.PodMigrationJob
+	defer func() {
+		r.evaluateInvariants(ctx, pod, observedJob, &reconcileErr)
+	}()
 
 	// Check if pod has the scheduling gate
 	gateIndex := -1
@@ -147,6 +180,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	observedJob = job
 	phase := job.Status.Phase
 	if phase == pmv1alpha1.PodMigrationJobPhaseRestoring ||
 		phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||

@@ -1,0 +1,5 @@
+# Two-Lane Governance Lock for LPM Correctness Guard Rail (Epic #49 / Issue #50)
+# Feature and bugfix pull requests must not weaken or modify invariant rules
+# without explicit human owner sign-off.
+/controller/internal/invariants/ @yaoluo @bnaylor
+/.github/CODEOWNERS @yaoluo @bnaylor

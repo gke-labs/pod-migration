@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
@@ -71,6 +72,11 @@ type PodMigrationJobReconciler struct {
 	// nil disables event emission (used by unit tests that don't assert on
 	// events).
 	Recorder record.EventRecorder
+
+	// InvariantEngine evaluates stateless correctness invariants (I1-I9) at the
+	// end of each reconcile step with zero extra API calls. Optional: nil skips
+	// evaluation.
+	InvariantEngine *invariants.Engine
 
 	// RestoreEngines classifies restore failures.  Optional: nil selects the
 	// default engine set.  Overridden in tests.
@@ -460,8 +466,108 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
+// evaluateInvariants evaluates the PodMigrationJob and local informer-cached namespace state
+// against the invariant engine when enabled. It runs only when the reconcile step completed without error.
+// In strict mode, any violation patches a non-terminal PMJ to PhaseFailed, cleans up triggers, and suppresses requeue.
+func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job *pmv1alpha1.PodMigrationJob, res *ctrl.Result, reconcileErr *error) {
+	if !r.InvariantEngine.Enabled() || job == nil {
+		return
+	}
+	if reconcileErr != nil && *reconcileErr != nil {
+		return
+	}
+
+	var namespacePMJs []pmv1alpha1.PodMigrationJob
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := r.List(ctx, pmjList, client.InNamespace(job.Namespace)); err == nil {
+		namespacePMJs = pmjList.Items
+	}
+
+	var namespacePods []corev1.Pod
+	var primaryPod *corev1.Pod
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(job.Namespace)); err == nil {
+		namespacePods = podList.Items
+		targetName := job.Status.RestoredPodName
+		if targetName == "" {
+			targetName = job.Spec.PodRef.Name
+		}
+		for i := range namespacePods {
+			if namespacePods[i].Name == targetName {
+				primaryPod = &namespacePods[i]
+				break
+			}
+		}
+	}
+
+	hasOrphanedTrigger := false
+	if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
+		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed) && job.Spec.PodRef.Name != "" {
+		triggerName := util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger); err == nil && trigger.GetDeletionTimestamp() == nil {
+			hasOrphanedTrigger = true
+		}
+	}
+
+	restoreCrashMatched := false
+	if primaryPod != nil && job.Status.RestoredPodName != "" && primaryPod.Name == job.Status.RestoredPodName {
+		if job.Status.RestoredPodUID == "" || string(primaryPod.UID) == job.Status.RestoredPodUID {
+			if verdict := restore.Classify(primaryPod, r.restoreEngines()...); verdict.Class == restore.FailureFatal {
+				restoreCrashMatched = true
+			}
+		}
+	}
+
+	violations, shouldFailStrict := r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
+		Now:                          time.Now(),
+		Reconciler:                   "PodMigrationJobReconciler",
+		PrimaryPMJ:                   job,
+		PrimaryPod:                   primaryPod,
+		NamespacePMJs:                namespacePMJs,
+		NamespacePods:                namespacePods,
+		HasOrphanedTrigger:           hasOrphanedTrigger,
+		RestoreCrashSignatureMatched: restoreCrashMatched,
+	})
+	if shouldFailStrict && len(violations) > 0 && !invariants.IsTerminalPhase(job.Status.Phase) {
+		orig := job.DeepCopy()
+		prevPhase := job.Status.Phase
+		v := violations[0]
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+		now := metav1.Now()
+		job.Status.CompletionTime = &now
+		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             invariants.EventReasonInvariantViolation,
+			Message:            fmt.Sprintf("[%s:%s] %s", v.InvariantID, v.InvariantName, v.Message),
+			ObservedGeneration: job.Generation,
+		})
+		// Persist status BEFORE Cleanup so a status patch failure never leaves the PMJ
+		// in an active phase with its trigger already deleted.
+		if patchErr := r.patchStatus(ctx, job, orig); patchErr != nil {
+			if reconcileErr != nil {
+				*reconcileErr = patchErr
+			}
+			return
+		}
+		_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
+		metrics.MarkPMJInactive(job.Namespace + "/" + job.Name)
+		metrics.RecordOutcome("failed")
+		r.recordPreviousPhaseDuration(job, prevPhase)
+		if res != nil {
+			*res = ctrl.Result{}
+		}
+	}
+}
+
 // Reconcile drives the state machine of the PodMigrationJob.
-func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx).WithValues("job", req.NamespacedName)
 	logger.Info("Reconciling PodMigrationJob")
 
@@ -471,11 +577,16 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			r.fallbackEventChecks.Delete(req.NamespacedName.String())
+			r.InvariantEngine.ForgetObject("PodMigrationJobReconciler", "pmj", req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get PodMigrationJob")
 		return ctrl.Result{}, err
 	}
+
+	defer func() {
+		r.evaluateInvariants(ctx, job, &res, &reconcileErr)
+	}()
 
 	podName := job.Spec.PodRef.Name
 	origJob := job.DeepCopy()
