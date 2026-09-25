@@ -11,6 +11,9 @@ const (
 	// Valid values are parseable duration strings (e.g. "15m", "30m", "1h").
 	AnnotationMigrationTimeout = "pod-migration.gke.io/timeout"
 
+	// AnnotationEvictingSince records the timestamp when the PMJ entered PhaseEvicting.
+	AnnotationEvictingSince = "pod-migration.gke.io/evicting-since"
+
 	// DefaultMigrationTimeout is the baseline timeout for active migrations (Pending, Snapshotting, Evicting).
 	DefaultMigrationTimeout = 10 * time.Minute
 
@@ -47,6 +50,25 @@ func CalculatePodMemoryRequest(pod *corev1.Pod) int64 {
 	return totalBytes
 }
 
+// ParseClampedTimeout parses a duration string and clamps it between MinMigrationTimeout and MaxMigrationTimeout.
+// It returns (duration, true) if raw is valid and positive, or (0, false) otherwise.
+func ParseClampedTimeout(raw string) (time.Duration, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, false
+	}
+	if d < MinMigrationTimeout {
+		return MinMigrationTimeout, true
+	}
+	if d > MaxMigrationTimeout {
+		return MaxMigrationTimeout, true
+	}
+	return d, true
+}
+
 // CalculateMigrationTimeout computes the effective migration timeout based on explicit annotation,
 // pod memory request scaling, and controller baseline timeout.
 func CalculateMigrationTimeout(annotatedTimeout string, memBytes int64, baseTimeout time.Duration) time.Duration {
@@ -54,16 +76,8 @@ func CalculateMigrationTimeout(annotatedTimeout string, memBytes int64, baseTime
 		baseTimeout = DefaultMigrationTimeout
 	}
 
-	if annotatedTimeout != "" {
-		if d, err := time.ParseDuration(annotatedTimeout); err == nil && d > 0 {
-			if d < MinMigrationTimeout {
-				return MinMigrationTimeout
-			}
-			if d > MaxMigrationTimeout {
-				return MaxMigrationTimeout
-			}
-			return d
-		}
+	if d, ok := ParseClampedTimeout(annotatedTimeout); ok {
+		return d
 	}
 
 	if memBytes > 0 {

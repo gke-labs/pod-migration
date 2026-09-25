@@ -156,21 +156,20 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if baseTimeout <= 0 {
 		baseTimeout = util.DefaultMigrationTimeout
 	}
-	if pod.Annotations != nil && pod.Annotations[util.AnnotationMigrationTimeout] != "" {
+	var rawTimeout string
+	if pod.Annotations != nil {
+		rawTimeout = pod.Annotations[util.AnnotationMigrationTimeout]
+	}
+	memBytes := util.CalculatePodMemoryRequest(pod)
+	effectiveTimeout := util.CalculateMigrationTimeout(rawTimeout, memBytes, baseTimeout)
+	if effectiveTimeout != baseTimeout || rawTimeout != "" {
 		if jobAnnotations == nil {
 			jobAnnotations = make(map[string]string)
 		}
-		jobAnnotations[util.AnnotationMigrationTimeout] = pod.Annotations[util.AnnotationMigrationTimeout]
-	} else {
-		memBytes := util.CalculatePodMemoryRequest(pod)
-		if memBytes > 0 {
-			timeout := util.CalculateMigrationTimeout("", memBytes, baseTimeout)
-			if timeout != baseTimeout {
-				if jobAnnotations == nil {
-					jobAnnotations = make(map[string]string)
-				}
-				jobAnnotations[util.AnnotationMigrationTimeout] = timeout.String()
-			}
+		if _, ok := util.ParseClampedTimeout(rawTimeout); ok {
+			jobAnnotations[util.AnnotationMigrationTimeout] = rawTimeout
+		} else if effectiveTimeout != baseTimeout {
+			jobAnnotations[util.AnnotationMigrationTimeout] = effectiveTimeout.String()
 		}
 	}
 

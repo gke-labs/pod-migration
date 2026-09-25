@@ -6491,34 +6491,21 @@ func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeout
 
 	// Job was created 25 minutes ago (snapshot upload took 25 minutes with baseline 10m timeout)
 	creationTime := metav1.NewTime(time.Now().Add(-25 * time.Minute))
-	// Transitioned to Evicting 30 seconds ago
-	evictingTransitionTime := metav1.NewTime(time.Now().Add(-30 * time.Second))
 
+	// PMJ starts in PhaseSnapshotting without pre-populated evicting-since annotation
 	pmj := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         namespace,
 			Name:              jobName,
 			CreationTimestamp: creationTime,
-			Annotations: map[string]string{
-				"pod-migration.gke.io/evicting-since": evictingTransitionTime.Time.Format(time.RFC3339),
-			},
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef:       corev1.LocalObjectReference{Name: podName},
 			TargetPodUID: "uid-evicting",
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			Phase:       pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 			SnapshotRef: snapName,
-			Conditions: []metav1.Condition{
-				{
-					Type:               "Ready",
-					Status:             metav1.ConditionFalse,
-					Reason:             "Evicting",
-					Message:            "Snapshot durable; waiting for origin pod eviction and volume detachment",
-					LastTransitionTime: evictingTransitionTime,
-				},
-			},
 		},
 	}
 
@@ -6529,7 +6516,13 @@ func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeout
 		WithObjects(pod, pmj).
 		Build()
 
-	mockProvider := &fakeSnapshotProvider{}
+	mockProvider := &fakeSnapshotProvider{
+		checkStatusResult: &snapshot.Status{
+			Phase:            snapshot.PhaseReady,
+			SnapshotRef:      snapName,
+			LastProgressTime: time.Now().Add(-1 * time.Minute),
+		},
+	}
 
 	r := &PodMigrationJobReconciler{
 		Client:           fakeClient,
@@ -6537,11 +6530,23 @@ func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeout
 		SnapshotProvider: mockProvider,
 	}
 
-	_, err := r.Reconcile(context.Background(), ctrl.Request{
+	// First reconcile: handles Snapshotting -> Evicting transition
+	res1, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
 	})
 	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+		t.Fatalf("Reconcile 1 (Snapshotting -> Evicting) failed: %v", err)
+	}
+	if !res1.Requeue {
+		t.Fatalf("Expected Reconcile 1 to requeue on transition to Evicting, got %+v", res1)
+	}
+
+	// Second reconcile: handles top-of-reconcile timeout guard and entries into Evicting phase
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile 2 (Evicting handoff) failed: %v", err)
 	}
 
 	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
@@ -6551,6 +6556,9 @@ func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeout
 	// Must NOT fail immediately upon entering Evicting phase post-snapshot-extension
 	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		t.Errorf("Expected PMJ to remain in Evicting, got %s", updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Annotations == nil || updatedPMJ.Annotations[util.AnnotationEvictingSince] == "" {
+		t.Errorf("Expected evicting-since annotation to be stamped, got annotations=%v", updatedPMJ.Annotations)
 	}
 }
 

@@ -129,19 +129,25 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 	if time.Since(job.CreationTimestamp.Time) > util.MaxMigrationTimeout {
 		return false
 	}
-	base := r.DefaultMigrationTimeout
-	if base <= 0 {
-		base = util.DefaultMigrationTimeout
+	evictionBudget := r.getMigrationTimeout(job)
+	if job.Annotations != nil {
+		if evictingSinceStr := job.Annotations[util.AnnotationEvictingSince]; evictingSinceStr != "" {
+			evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
+			if err != nil {
+				evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)
+			}
+			if err == nil {
+				return time.Since(evictingSince) < evictionBudget
+			}
+		}
 	}
-	evictingSinceStr := job.Annotations["pod-migration.gke.io/evicting-since"]
-	if evictingSinceStr == "" {
-		return false
+	// Fallback when evicting-since annotation is not yet stamped (e.g. handoff from Snapshotting,
+	// or pod already deleted when entering Evicting during volume detachment):
+	// Check the LastTransitionTime of the Ready condition stamped when entering Evicting phase.
+	if cond := meta.FindStatusCondition(job.Status.Conditions, "Ready"); cond != nil && (cond.Reason == "Evicting" || cond.Reason == "WaitingForVolumeDetach") {
+		return time.Since(cond.LastTransitionTime.Time) < evictionBudget
 	}
-	evictingSince, err := time.Parse(time.RFC3339, evictingSinceStr)
-	if err != nil {
-		return false
-	}
-	return time.Since(evictingSince) < base
+	return false
 }
 
 func (r *PodMigrationJobReconciler) restoreEngines() []restore.Engine {
@@ -542,6 +548,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					}
 				}
 
+				prevPhase := origJob.Status.Phase
 				logger.Info("Migration job timed out, transitioning to Failed", "job", job.Name, "timeout", migrationTimeout)
 				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 				now := metav1.Now()
@@ -558,7 +565,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				// Clean up snapshot trigger if it exists (best effort)
 				_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 
-				prevPhase := job.Status.Phase
 				if err := r.patchStatus(ctx, job, origJob); err != nil {
 					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on timeout")
 				}
@@ -691,13 +697,12 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				job.Annotations = make(map[string]string)
 			}
 			if job.Annotations[util.AnnotationMigrationTimeout] == "" {
-				var calculated time.Duration
-				if originPod.Annotations != nil && originPod.Annotations[util.AnnotationMigrationTimeout] != "" {
-					calculated = util.CalculateMigrationTimeout(originPod.Annotations[util.AnnotationMigrationTimeout], 0, r.DefaultMigrationTimeout)
-				} else {
-					memBytes := util.CalculatePodMemoryRequest(originPod)
-					calculated = util.CalculateMigrationTimeout("", memBytes, r.DefaultMigrationTimeout)
+				var rawTimeout string
+				if originPod.Annotations != nil {
+					rawTimeout = originPod.Annotations[util.AnnotationMigrationTimeout]
 				}
+				memBytes := util.CalculatePodMemoryRequest(originPod)
+				calculated := util.CalculateMigrationTimeout(rawTimeout, memBytes, r.DefaultMigrationTimeout)
 				base := r.DefaultMigrationTimeout
 				if base <= 0 {
 					base = util.DefaultMigrationTimeout
@@ -873,6 +878,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			// If the origin pod is already terminating through its grace period, wait for deletion
 			if pod.DeletionTimestamp != nil {
 				logger.Info("Origin pod is already terminating; waiting for deletion", "pod", podName)
+				if job.Annotations == nil {
+					job.Annotations = make(map[string]string)
+				}
+				if job.Annotations[util.AnnotationEvictingSince] == "" {
+					job.Annotations[util.AnnotationEvictingSince] = time.Now().Format(time.RFC3339Nano)
+					_ = r.Update(ctx, job)
+				}
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 
@@ -880,12 +892,12 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			// We wait for the eviction webhook to return Allowed and the API server to delete it.
 			// Fallback: if it takes longer than 30s (e.g. manual trigger), we invoke the PDB-safe eviction subresource.
 			const timeout = 30 * time.Second
-			evictingSinceStr := job.Annotations["pod-migration.gke.io/evicting-since"]
+			evictingSinceStr := job.Annotations[util.AnnotationEvictingSince]
 			if evictingSinceStr == "" {
 				if job.Annotations == nil {
 					job.Annotations = make(map[string]string)
 				}
-				job.Annotations["pod-migration.gke.io/evicting-since"] = time.Now().Format(time.RFC3339Nano)
+				job.Annotations[util.AnnotationEvictingSince] = time.Now().Format(time.RFC3339Nano)
 				logger.Info("Recording evicting start time, waiting for eviction webhook to trigger delete", "pod", podName)
 				r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "EvictedForMigration", "Origin pod marked for eviction following successful checkpoint")
 				if err := r.Update(ctx, job); err != nil {
@@ -893,7 +905,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 				return ctrl.Result{Requeue: true}, nil
 			}
-
 			evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
 			if err != nil {
 				evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)

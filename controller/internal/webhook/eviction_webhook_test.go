@@ -441,6 +441,46 @@ func TestEvictionGate(t *testing.T) {
 				util.AnnotationMigrationTimeout: "15m27s",
 			},
 		},
+		{
+			name: "Trigger migration with malformed timeout annotation falls back to memory-request scaling",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "malformed-timeout-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					Annotations: map[string]string{
+						util.AnnotationMigrationTimeout: "invalid-duration",
+					},
+					UID: "test-uid-malformed-timeout",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+					Containers: []corev1.Container{
+						{
+							Name: "redis",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("16Gi"),
+								},
+							},
+						},
+					},
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectedAnnotations: map[string]string{
+				util.AnnotationMigrationTimeout: "15m27s",
+			},
+		},
 	}
 
 	for _, tt := range tests {
