@@ -965,6 +965,21 @@ func TestPodMigrationJobReconciler_ScaleDown_OriginPodStillRunning_FailOpenPrese
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 
+	// A second running pod satisfies targetReplicas (1), so activeCount (1) >= targetReplicas (1)
+	// would trigger scale-down deletion if the origin-pod fail-open guard were absent.
+	secondPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-second",
+			Namespace: namespace,
+			UID:       "uid-second-alive",
+			Labels: map[string]string{
+				"app":                                  "web",
+				appsv1.DefaultDeploymentUniqueLabelKey: hash,
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
 	pmj := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pmj-pdb-timeout",
@@ -988,7 +1003,7 @@ func TestPodMigrationJobReconciler_ScaleDown_OriginPodStillRunning_FailOpenPrese
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
-		WithObjects(rs, originPod, pmj).
+		WithObjects(rs, originPod, secondPod, pmj).
 		Build()
 
 	r := &PodMigrationJobReconciler{
