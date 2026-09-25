@@ -12,10 +12,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -326,8 +328,9 @@ func getPSSCName(namespace, name string) string {
 
 func validateExcludedPodSelectors(selectors []metav1.LabelSelectorRequirement) error {
 	for i, req := range selectors {
-		if req.Key == "" {
-			return fmt.Errorf("excludedPodSelectors[%d]: key must not be empty", i)
+		fldPath := field.NewPath("spec", "excludedPodSelectors").Index(i)
+		if errs := metav1validation.ValidateLabelSelectorRequirement(req, metav1validation.LabelSelectorValidationOptions{}, fldPath); len(errs) > 0 {
+			return errs.ToAggregate()
 		}
 		if req.Key == "pod-migration.gke.io/enabled" {
 			return fmt.Errorf("excludedPodSelectors[%d]: key %q cannot be overridden in excludedPodSelectors", i, req.Key)

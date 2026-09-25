@@ -688,7 +688,24 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 				Key:      "",
 				Operator: metav1.LabelSelectorOpDoesNotExist,
 			},
-			errSubstr: "key must not be empty",
+			errSubstr: "name part must be non-empty",
+		},
+		{
+			name: "malformed key syntax",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "invalid/key/name/with/extra/slashes",
+				Operator: metav1.LabelSelectorOpDoesNotExist,
+			},
+			errSubstr: "a valid label key must consist of alphanumeric characters",
+		},
+		{
+			name: "malformed value syntax",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpNotIn,
+				Values:   []string{"invalid value with spaces"},
+			},
+			errSubstr: "a valid label must be an empty string or consist of alphanumeric characters",
 		},
 		{
 			name: "override opt-in key",
@@ -704,7 +721,7 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 				Key:      "app",
 				Operator: "InvalidOperator",
 			},
-			errSubstr: "invalid operator",
+			errSubstr: "not a valid selector operator",
 		},
 		{
 			name: "In operator rejected",
@@ -730,7 +747,7 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 				Operator: metav1.LabelSelectorOpNotIn,
 				Values:   nil,
 			},
-			errSubstr: "requires non-empty values",
+			errSubstr: "must be specified when `operator` is 'In' or 'NotIn'",
 		},
 		{
 			name: "DoesNotExist operator with non-empty values",
@@ -739,7 +756,7 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 				Operator: metav1.LabelSelectorOpDoesNotExist,
 				Values:   []string{"val"},
 			},
-			errSubstr: "requires empty values",
+			errSubstr: "may not be specified when `operator` is 'Exists' or 'DoesNotExist'",
 		},
 	}
 
