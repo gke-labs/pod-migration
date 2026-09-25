@@ -21,8 +21,10 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 type testSnapshotProvider struct {
@@ -695,3 +697,77 @@ func TestCRDSchema_PrinterColumnsAndShortName(t *testing.T) {
 		t.Errorf("CRD does not contain 'Phase' printcolumn")
 	}
 }
+
+func TestInvariantEngine_ReconcilerStrictAndObserveIntegration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	// Construct a non-terminal PMJ in Restoring whose assigned pod had its gate removed
+	// without a snapshot or cold-start bypass -> triggers I2 in strict mode and transitions to Failed.
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pmj-invariant-i2",
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-10 * time.Second)),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "source-pod"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snap-1",
+			RestoredPodName: "ungated-pod-no-ps",
+			RestoredPodUID:  "uid-ungated-1",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ungated-pod-no-ps",
+			Namespace: "default",
+			UID:       types.UID("uid-ungated-1"),
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ: "pmj-invariant-i2",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj, pod).
+		WithStatusSubresource(pmj).
+		Build()
+
+	recorder := record.NewFakeRecorder(10)
+	reconciler := &PodMigrationJobReconciler{
+		Client:          fakeClient,
+		Scheme:          scheme,
+		Recorder:        recorder,
+		InvariantEngine: invariants.NewEngine(invariants.ModeStrict, recorder),
+	}
+
+	i2Before := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2"))
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-invariant-i2"}}
+
+	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile returned unexpected error: %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2")); got != i2Before+1 {
+		t.Errorf("Expected pod_migration_invariant_violations_total{invariant='I2'} to increment by 1, got %v (before %v)", got, i2Before)
+	}
+
+	events := drainEvents(recorder.Events)
+	if !containsEvent(events, corev1.EventTypeWarning, invariants.EventReasonInvariantViolation) {
+		t.Errorf("Expected Warning InvariantViolation event, got: %v", events)
+	}
+
+	updated := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), req.NamespacedName, updated); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+	if updated.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected strict mode to transition non-terminal PMJ to PhaseFailed, got %s", updated.Status.Phase)
+	}
+}
+

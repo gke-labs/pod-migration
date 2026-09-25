@@ -55,6 +55,12 @@ var (
 		Help: "Number of currently active pod migrations.",
 	})
 
+	// InvariantViolationsTotal counts detected correctness invariant violations by invariant ID (I1-I9).
+	InvariantViolationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_invariant_violations_total",
+		Help: "Total number of detected correctness invariant violations by invariant ID (I1-I9).",
+	}, []string{"invariant"})
+
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
 )
@@ -66,7 +72,15 @@ func init() {
 		OutcomesTotal,
 		PhaseDurationSeconds,
 		ActiveMigrations,
+		InvariantViolationsTotal,
 	)
+}
+
+// RecordInvariantViolation increments the invariant violation counter for the given invariant ID (e.g. "I1").
+func RecordInvariantViolation(invariant string) {
+	if invariant != "" {
+		InvariantViolationsTotal.WithLabelValues(invariant).Inc()
+	}
 }
 
 // MarkPMJActive adds a PMJ key to the active tracking set and updates ActiveMigrations.

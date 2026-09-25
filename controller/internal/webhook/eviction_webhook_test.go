@@ -610,6 +610,100 @@ func TestEvictionGate_APIReaderFallback(t *testing.T) {
 	})
 }
 
+func TestEvictionGate_PropagatesControllerRevisionHashLabel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "sts-web-0"
+	podUID := "uid-sts-web-0"
+
+	gvisorRuntime := "gvisor"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"app":                          "sts-web",
+				"controller-revision-hash":     "sts-web-6b7f8c9d4",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "StatefulSet",
+					Name: "sts-web",
+					UID:  types.UID("uid-sts-parent"),
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	psp.SetName("psp-sts")
+	psp.SetNamespace(namespace)
+	psp.Object["spec"] = map[string]interface{}{
+		"selector": map[string]interface{}{
+			"matchLabels": map[string]interface{}{
+				"app": "sts-web",
+			},
+		},
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+	}
+	psp.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+	if resp.Allowed {
+		t.Fatalf("Expected initial eviction to create PMJ and return 429, got allowed")
+	}
+
+	jobName := util.FormatPMJName(podName, podUID)
+	createdJob := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: jobName}, createdJob); err != nil {
+		t.Fatalf("Expected PMJ %s to be created, got error: %v", jobName, err)
+	}
+	if got := createdJob.Labels[util.LabelControllerRevisionHash]; got != "sts-web-6b7f8c9d4" {
+		t.Fatalf("Expected PMJ label %s=%q, got %q", util.LabelControllerRevisionHash, "sts-web-6b7f8c9d4", got)
+	}
+}
+
 func TestEvictionGate_ExcludedPodSelectors_Coexistence(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)

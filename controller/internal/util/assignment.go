@@ -20,6 +20,7 @@ const (
 	LabelParentKind              = "pod-migration.gke.io/parent-kind"
 	LabelParentUID               = "pod-migration.gke.io/parent-uid"
 	LabelPodTemplateHash         = "pod-migration.gke.io/pod-template-hash"
+	LabelControllerRevisionHash  = appsv1.ControllerRevisionHashLabelKey
 	LabelJobCompletionIndex      = batchv1.JobCompletionIndexAnnotation
 	LabelOriginPodName           = "pod-migration.gke.io/origin-pod-name"
 	AnnotationAssignedPMJ        = "pod-migration.gke.io/assigned-pmj"
