@@ -849,3 +849,273 @@ func TestResolveParentWorkload_StandaloneReplicaSet(t *testing.T) {
 		t.Errorf("expected parentUID %q, got %q", rsUID, parentUID)
 	}
 }
+
+func TestFormatParentKey(t *testing.T) {
+	tests := []struct {
+		name       string
+		parentName string
+		parentKind string
+		podName    string
+		expected   string
+	}{
+		{
+			name:       "Deployment parent",
+			parentName: "web-deploy",
+			parentKind: "Deployment",
+			podName:    "web-deploy-xxx",
+			expected:   "web-deploy/Deployment",
+		},
+		{
+			name:       "StatefulSet parent",
+			parentName: "db-sts",
+			parentKind: "StatefulSet",
+			podName:    "db-sts-0",
+			expected:   "db-sts/StatefulSet",
+		},
+		{
+			name:       "Job parent",
+			parentName: "batch-job",
+			parentKind: "Job",
+			podName:    "batch-job-1",
+			expected:   "batch-job/Job",
+		},
+		{
+			name:       "Bare pod (empty parent)",
+			parentName: "",
+			parentKind: "",
+			podName:    "my-bare-pod",
+			expected:   "my-bare-pod/Pod",
+		},
+		{
+			name:       "All empty",
+			parentName: "",
+			parentKind: "",
+			podName:    "",
+			expected:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FormatParentKey(tt.parentName, tt.parentKind, tt.podName)
+			if got != tt.expected {
+				t.Errorf("FormatParentKey(%q, %q, %q) = %q, expected %q", tt.parentName, tt.parentKind, tt.podName, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestPMJParentKeyIndexValue_Extraction(t *testing.T) {
+	// Workload PMJ
+	workloadPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pmj-w",
+			Labels: map[string]string{
+				LabelParentName: "deploy-1",
+				LabelParentKind: "Deployment",
+			},
+		},
+	}
+	keys := PMJParentKeyIndexValue(workloadPMJ)
+	if len(keys) != 1 || keys[0] != "deploy-1/Deployment" {
+		t.Errorf("expected [deploy-1/Deployment], got %v", keys)
+	}
+
+	// Bare pod PMJ
+	barePMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pmj-b",
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "bare-1"},
+		},
+	}
+	bareKeys := PMJParentKeyIndexValue(barePMJ)
+	if len(bareKeys) != 1 || bareKeys[0] != "bare-1/Pod" {
+		t.Errorf("expected [bare-1/Pod], got %v", bareKeys)
+	}
+
+	// Nil / empty checks
+	if keys := PMJParentKeyIndexValue(nil); keys != nil {
+		t.Errorf("expected nil for nil job, got %v", keys)
+	}
+	emptyPMJ := &pmv1alpha1.PodMigrationJob{}
+	if keys := PMJParentKeyIndexValue(emptyPMJ); keys != nil {
+		t.Errorf("expected nil for empty job, got %v", keys)
+	}
+}
+
+func TestFindUnassignedActivePMJ_IndexedMultiWorkload(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "prod"
+
+	// Setup 3 workloads in the same namespace:
+	// 1. Deployment "frontend" (hash-v1) with active PMJ "pmj-frontend-1"
+	// 2. Deployment "backend" (hash-b1) with active PMJ "pmj-backend-1" already assigned to a pod
+	// 3. StatefulSet "database" with active PMJ "pmj-database-0"
+	// 4. Bare pod "standalone" with active PMJ "pmj-standalone"
+
+	frontendPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-frontend-1",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName:      "frontend",
+				LabelParentKind:      "Deployment",
+				LabelPodTemplateHash: "hash-v1",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "frontend-origin-1"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	backendPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-backend-1",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName:      "backend",
+				LabelParentKind:      "Deployment",
+				LabelPodTemplateHash: "hash-b1",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "backend-origin-1"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	backendAssignedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "backend-replacement-1",
+			Namespace: namespace,
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			Annotations: map[string]string{
+				AnnotationAssignedPMJ: "pmj-backend-1",
+			},
+		},
+	}
+
+	databasePMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-database-0",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: "database",
+				LabelParentKind: "StatefulSet",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "database-0"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	// Database origin pod is terminating
+	databaseOriginPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "database-0",
+			Namespace:         namespace,
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			Finalizers:        []string{"test-finalizer"},
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+	}
+
+	barePMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-standalone",
+			Namespace: namespace,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "standalone"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	// Build indexed client
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(frontendPMJ, backendPMJ, backendAssignedPod, databasePMJ, databaseOriginPod, barePMJ).
+		Build()
+
+	ctx := context.Background()
+
+	// 1. Frontend query should find pmj-frontend-1
+	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "frontend-replacement-1", "frontend", "Deployment", "", "hash-v1", "")
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ for frontend failed: %v", err)
+	}
+	if got != "pmj-frontend-1" {
+		t.Errorf("expected pmj-frontend-1, got %q", got)
+	}
+
+	// 2. Backend query should return "" because pmj-backend-1 is already assigned to backend-replacement-1
+	gotBackend, err := FindUnassignedActivePMJ(ctx, cl, namespace, "backend-replacement-2", "backend", "Deployment", "", "hash-b1", "")
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ for backend failed: %v", err)
+	}
+	if gotBackend != "" {
+		t.Errorf("expected empty string for backend (already assigned), got %q", gotBackend)
+	}
+
+	// 3. Database query for database-0 should match pmj-database-0
+	gotDB, err := FindUnassignedActivePMJ(ctx, cl, namespace, "database-0", "database", "StatefulSet", "", "", "")
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ for database-0 failed: %v", err)
+	}
+	if gotDB != "pmj-database-0" {
+		t.Errorf("expected pmj-database-0, got %q", gotDB)
+	}
+
+	// 4. Database query for database-1 should NOT match pmj-database-0 (wrong pod name)
+	gotDB1, err := FindUnassignedActivePMJ(ctx, cl, namespace, "database-1", "database", "StatefulSet", "", "", "")
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ for database-1 failed: %v", err)
+	}
+	if gotDB1 != "" {
+		t.Errorf("expected empty string for database-1, got %q", gotDB1)
+	}
+
+	// 5. Bare pod query for "standalone" should match pmj-standalone
+	gotBare, err := FindUnassignedActivePMJ(ctx, cl, namespace, "standalone", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ for standalone failed: %v", err)
+	}
+	if gotBare != "pmj-standalone" {
+		t.Errorf("expected pmj-standalone, got %q", gotBare)
+	}
+
+	// 6. Test unindexed fallback produces identical results
+	unindexedClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(frontendPMJ, backendPMJ, backendAssignedPod, databasePMJ, databaseOriginPod, barePMJ).
+		Build()
+
+	gotFallback, err := FindUnassignedActivePMJ(ctx, unindexedClient, namespace, "frontend-replacement-1", "frontend", "Deployment", "", "hash-v1", "")
+	if err != nil {
+		t.Fatalf("unindexed fallback for frontend failed: %v", err)
+	}
+	if gotFallback != "pmj-frontend-1" {
+		t.Errorf("expected pmj-frontend-1 on unindexed fallback, got %q", gotFallback)
+	}
+}

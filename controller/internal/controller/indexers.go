@@ -56,6 +56,15 @@ func PMJSnapshotRefIndexValue(obj client.Object) []string {
 	return nil
 }
 
+// PMJParentKeyIndex is the cache index key mapping PodMigrationJobs to their
+// parent workload key ("<parentName>/<parentKind>" or "<podName>/Pod").
+const PMJParentKeyIndex = util.PMJParentKeyIndexKey
+
+// PMJParentKeyIndexValue extracts the parent key for a PodMigrationJob.
+func PMJParentKeyIndexValue(obj client.Object) []string {
+	return util.PMJParentKeyIndexValue(obj)
+}
+
 // RegisterFieldIndexes registers all cache indexes the controllers rely on.
 // Must be called before the manager starts.
 func RegisterFieldIndexes(ctx context.Context, indexer client.FieldIndexer) error {
@@ -63,6 +72,9 @@ func RegisterFieldIndexes(ctx context.Context, indexer client.FieldIndexer) erro
 		return err
 	}
 	if err := indexer.IndexField(ctx, &storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue); err != nil {
+		return err
+	}
+	if err := indexer.IndexField(ctx, &pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue); err != nil {
 		return err
 	}
 	return indexer.IndexField(ctx, &pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue)
