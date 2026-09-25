@@ -448,4 +448,102 @@ func TestGKEProvider_CheckStatus(t *testing.T) {
 			t.Errorf("Order 2: expected Reason=SnapshotFailed, got %s", status2.Reason)
 		}
 	})
+
+	t.Run("PodSnapshot_DeadlineExceeded_FastFail", func(t *testing.T) {
+		trigger := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshotManualTrigger",
+				"metadata": map[string]interface{}{
+					"name":      triggerName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"snapshotCreated": map[string]interface{}{
+						"name": snapshotName,
+					},
+				},
+			},
+		}
+		snapshot := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshot",
+				"metadata": map[string]interface{}{
+					"name":      snapshotName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{
+							"type":    "Checkpoint",
+							"status":  "False",
+							"reason":  "DeadlineExceeded",
+							"message": "snapshot agent timed out writing checkpoint stream",
+						},
+					},
+				},
+			},
+		}
+
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(trigger, snapshot).Build()
+		provider := NewGKEProvider(client, scheme)
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
+			Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "pod-uid-456"},
+		}
+		status, err := provider.CheckStatus(context.Background(), job, "test-pod")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status.Phase != PhaseFailed {
+			t.Fatalf("expected PhaseFailed for DeadlineExceeded, got %v", status.Phase)
+		}
+		if status.Reason != "SnapshotFailed" {
+			t.Errorf("expected Reason=SnapshotFailed, got %s", status.Reason)
+		}
+		if !strings.Contains(status.Message, "DeadlineExceeded") {
+			t.Errorf("expected message to contain DeadlineExceeded, got %s", status.Message)
+		}
+	})
+
+	t.Run("PSMT_DeadlineExceeded_FastFail", func(t *testing.T) {
+		trigger := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshotManualTrigger",
+				"metadata": map[string]interface{}{
+					"name":      triggerName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{
+							"type":    "Triggered",
+							"status":  "False",
+							"reason":  "DeadlineExceeded",
+							"message": "agent trigger handshake deadline exceeded",
+						},
+					},
+				},
+			},
+		}
+
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(trigger).Build()
+		provider := NewGKEProvider(client, scheme)
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
+			Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "pod-uid-456"},
+		}
+		status, err := provider.CheckStatus(context.Background(), job, "test-pod")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status.Phase != PhaseFailed {
+			t.Fatalf("expected PhaseFailed for PSMT DeadlineExceeded, got %v", status.Phase)
+		}
+		if status.Reason != "SnapshotTriggerFailed" {
+			t.Errorf("expected Reason=SnapshotTriggerFailed, got %s", status.Reason)
+		}
+	})
 }

@@ -472,11 +472,20 @@ func TestMetrics_PhaseDurations_ReconcileDriven(t *testing.T) {
 	if err := fakeClient.Get(ctx, req.NamespacedName, &currentPMJ); err != nil {
 		t.Fatalf("Failed to fetch PMJ: %v", err)
 	}
+	if currentPMJ.Status.EvictingStartTime == nil {
+		t.Fatalf("Expected EvictingStartTime to be set, got nil")
+	}
+
+	// Set EvictingStartTime and evicting-since to 1s ago to simulate realistic evicting duration
+	evictingStartTime := metav1.NewTime(time.Now().Add(-1 * time.Second))
+	currentPMJ.Status.EvictingStartTime = &evictingStartTime
+	if err := fakeClient.Status().Update(ctx, &currentPMJ); err != nil {
+		t.Fatalf("Failed to update EvictingStartTime: %v", err)
+	}
 	if currentPMJ.Annotations["pod-migration.gke.io/evicting-since"] == "" {
 		t.Fatalf("Expected evicting-since annotation to be set")
 	}
 
-	// Set evicting-since to 1s ago to simulate realistic evicting duration (RFC3339Nano retains subsecond precision)
 	currentPMJ.Annotations["pod-migration.gke.io/evicting-since"] = time.Now().Add(-1 * time.Second).Format(time.RFC3339Nano)
 	// Delete source pod to simulate successful eviction and detachment
 	if err := fakeClient.Delete(ctx, pod); err != nil {
@@ -499,9 +508,9 @@ func TestMetrics_PhaseDurations_ReconcileDriven(t *testing.T) {
 	}
 
 	observedEvicting := getHistogramSampleSum(evictingHist) - evictingSumBefore
-	// The evicting duration must measure ~1s (from evicting-since), tightened around the backdated 1s anchor
-	// to ensure leaks from snapshotting (e.g. 2.2s+) fail.
-	if observedEvicting < 0.95 || observedEvicting > 1.4 {
+	// The evicting duration must measure ~1s (anchored by metav1.Time EvictingStartTime with second precision),
+	// tightened around the backdated 1s anchor to ensure leaks from snapshotting (e.g. 2.9s+) fail.
+	if observedEvicting < 0.9 || observedEvicting > 2.2 {
 		t.Errorf("Expected evicting duration ~1s without snapshotting leakage, got %v seconds", observedEvicting)
 	}
 

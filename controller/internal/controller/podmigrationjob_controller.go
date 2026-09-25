@@ -82,10 +82,76 @@ type PodMigrationJobReconciler struct {
 	// default engine set.  Overridden in tests.
 	RestoreEngines []restore.Engine
 
+	// DefaultMigrationTimeout specifies the baseline timeout for active migrations.
+	// Defaults to util.DefaultMigrationTimeout (10 minutes) if unset or <= 0.
+	DefaultMigrationTimeout time.Duration
+
 	// fallbackEventChecks records the last fallback-event probe per PMJ
 	// (namespace/name -> time.Time).  In-memory only; a restart just means
 	// one extra probe per in-flight migration.
 	fallbackEventChecks sync.Map
+}
+
+func (r *PodMigrationJobReconciler) getMigrationTimeout(job *pmv1alpha1.PodMigrationJob) time.Duration {
+	base := r.DefaultMigrationTimeout
+	if base <= 0 {
+		base = util.DefaultMigrationTimeout
+	}
+	var annotated string
+	if job.Annotations != nil {
+		annotated = job.Annotations[util.AnnotationMigrationTimeout]
+	}
+	return util.CalculateMigrationTimeout(annotated, 0, base)
+}
+
+func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, job *pmv1alpha1.PodMigrationJob, timeout time.Duration) bool {
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || job.Status.SnapshotRef == "" {
+		return false
+	}
+	if time.Since(job.CreationTimestamp.Time) > util.MaxMigrationTimeout {
+		return false
+	}
+	podName := job.Spec.PodRef.Name
+	snapStatus, err := r.getSnapshotProvider().CheckStatus(ctx, job, podName)
+	if err != nil || snapStatus == nil {
+		return false
+	}
+	if snapStatus.Phase == snapshot.PhaseReady {
+		return true
+	}
+	if snapStatus.Phase == snapshot.PhaseFailed {
+		return false
+	}
+	if !snapStatus.LastProgressTime.IsZero() && time.Since(snapStatus.LastProgressTime) < timeout {
+		return true
+	}
+	return false
+}
+
+func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMigrationJob) bool {
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		return false
+	}
+	if time.Since(job.CreationTimestamp.Time) > util.MaxMigrationTimeout {
+		return false
+	}
+	evictionBudget := r.getMigrationTimeout(job)
+	if job.Status.EvictingStartTime != nil {
+		return time.Since(job.Status.EvictingStartTime.Time) < evictionBudget
+	}
+	// Fallback to evicting-since annotation for in-flight jobs during upgrade
+	if job.Annotations != nil {
+		if evictingSinceStr := job.Annotations[util.AnnotationEvictingSince]; evictingSinceStr != "" {
+			evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
+			if err != nil {
+				evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)
+			}
+			if err == nil {
+				return time.Since(evictingSince) < evictionBudget
+			}
+		}
+	}
+	return false
 }
 
 func (r *PodMigrationJobReconciler) restoreEngines() []restore.Engine {
@@ -149,12 +215,10 @@ func (r *PodMigrationJobReconciler) recordPreviousPhaseDuration(job *pmv1alpha1.
 			metrics.RecordPhaseDuration("snapshotting", time.Since(job.Status.SnapshottingStartTime.Time).Seconds())
 		}
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
-		// The evicting anchor is the pod-migration.gke.io/evicting-since annotation,
-		// which is only written while the origin pod still exists. If the origin pod was
-		// already gone when entering Evicting, this annotation is absent and no evicting
-		// sample is recorded.
-		if job.Annotations != nil {
-			if s := job.Annotations["pod-migration.gke.io/evicting-since"]; s != "" {
+		if job.Status.EvictingStartTime != nil {
+			metrics.RecordPhaseDuration("evicting", time.Since(job.Status.EvictingStartTime.Time).Seconds())
+		} else if job.Annotations != nil {
+			if s := job.Annotations[util.AnnotationEvictingSince]; s != "" {
 				if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 					metrics.RecordPhaseDuration("evicting", time.Since(t).Seconds())
 				} else if t, err := time.Parse(time.RFC3339, s); err == nil {
@@ -538,77 +602,85 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Enforce 10-minute timeout for active migrations (Pending, Snapshotting, and Evicting)
+	// Enforce configurable timeout for active migrations (Pending, Snapshotting, and Evicting)
 	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhasePending ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
-		const migrationTimeout = 10 * time.Minute
+		migrationTimeout := r.getMigrationTimeout(job)
 		if time.Since(job.CreationTimestamp.Time) > migrationTimeout {
-			// If the job was observed to be blocked by PDB or eviction misconfiguration during Evicting phase,
-			// conclude as SucceededWithoutRestore so the durable snapshot remains for operator recovery.
-			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
-				pdbBlockedCond := meta.FindStatusCondition(job.Status.Conditions, "BlockedByPDB")
-				isPDBBlocked := pdbBlockedCond != nil && pdbBlockedCond.Status == metav1.ConditionTrue
+			if r.isSnapshotProgressing(ctx, job, migrationTimeout) {
+				logger.Info("Migration exceeded baseline timeout but snapshot is actively progressing; extending deadline",
+					"job", job.Name, "snapshot", job.Status.SnapshotRef, "timeout", migrationTimeout)
+			} else if r.isEvictionWithinBudget(job) {
+				logger.Info("Migration exceeded baseline timeout from creation but Evicting phase is within budget; extending deadline",
+					"job", job.Name, "timeout", migrationTimeout)
+			} else {
+				// If the job was observed to be blocked by PDB or eviction misconfiguration during Evicting phase,
+				// conclude as SucceededWithoutRestore so the durable snapshot remains for operator recovery.
+				if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+					pdbBlockedCond := meta.FindStatusCondition(job.Status.Conditions, "BlockedByPDB")
+					isPDBBlocked := pdbBlockedCond != nil && pdbBlockedCond.Status == metav1.ConditionTrue
 
-				misconfigCond := meta.FindStatusCondition(job.Status.Conditions, "EvictionMisconfigured")
-				isMisconfigured := misconfigCond != nil && misconfigCond.Status == metav1.ConditionTrue
+					misconfigCond := meta.FindStatusCondition(job.Status.Conditions, "EvictionMisconfigured")
+					isMisconfigured := misconfigCond != nil && misconfigCond.Status == metav1.ConditionTrue
 
-				if isPDBBlocked || isMisconfigured {
-					reason := "PDBEvictionTimeout"
-					message := "Origin pod eviction timed out while waiting for PDB budget"
-					if isMisconfigured {
-						reason = "EvictionMisconfiguredTimeout"
-						message = "Origin pod eviction timed out due to eviction configuration error (500 InternalServerError / multiple PDBs)"
-					}
-					logger.Info("Evicting PMJ timed out due to eviction blockage; concluding as SucceededWithoutRestore", "job", job.Name, "reason", reason)
+					if isPDBBlocked || isMisconfigured {
+						reason := "PDBEvictionTimeout"
+						message := "Origin pod eviction timed out while waiting for PDB budget"
+						if isMisconfigured {
+							reason = "EvictionMisconfiguredTimeout"
+							message = "Origin pod eviction timed out due to eviction configuration error (500 InternalServerError / multiple PDBs)"
+						}
+						logger.Info("Evicting PMJ timed out due to eviction blockage; concluding as SucceededWithoutRestore", "job", job.Name, "reason", reason)
 
-					// Annotate the origin pod to detect repeat eviction attempts and prevent re-snapshot churn
-					pod := &corev1.Pod{}
-					if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: podName}, pod); err == nil {
-						if job.Spec.TargetPodUID == "" || string(pod.UID) == job.Spec.TargetPodUID {
-							if pod.Annotations == nil {
-								pod.Annotations = make(map[string]string)
-							}
-							pod.Annotations[util.AnnotationPDBEvictionTimeout] = "true"
-							if err := r.Update(ctx, pod); err != nil {
-								logger.Error(err, "Failed to annotate origin pod with pdb-eviction-timeout", "pod", podName)
-								return ctrl.Result{}, err
+						// Annotate the origin pod to detect repeat eviction attempts and prevent re-snapshot churn
+						pod := &corev1.Pod{}
+						if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: podName}, pod); err == nil {
+							if job.Spec.TargetPodUID == "" || string(pod.UID) == job.Spec.TargetPodUID {
+								if pod.Annotations == nil {
+									pod.Annotations = make(map[string]string)
+								}
+								pod.Annotations[util.AnnotationPDBEvictionTimeout] = "true"
+								if err := r.Update(ctx, pod); err != nil {
+									logger.Error(err, "Failed to annotate origin pod with pdb-eviction-timeout", "pod", podName)
+									return ctrl.Result{}, err
+								}
 							}
 						}
-					}
 
-					if err := r.markSucceededWithoutRestore(ctx, job, origJob, reason, message); err != nil {
-						return r.handleStatusError(ctx, err, "Failed to update job status on eviction timeout")
+						if err := r.markSucceededWithoutRestore(ctx, job, origJob, reason, message); err != nil {
+							return r.handleStatusError(ctx, err, "Failed to update job status on eviction timeout")
+						}
+						return ctrl.Result{}, nil
 					}
-					return ctrl.Result{}, nil
 				}
+
+				prevPhase := origJob.Status.Phase
+				logger.Info("Migration job timed out, transitioning to Failed", "job", job.Name, "timeout", migrationTimeout)
+				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+				now := metav1.Now()
+				job.Status.CompletionTime = &now
+
+				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "Timeout",
+					Message:            fmt.Sprintf("Migration job timed out (exceeded %v limit)", migrationTimeout),
+					ObservedGeneration: job.Generation,
+				})
+
+				// Clean up snapshot trigger if it exists (best effort)
+				_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
+
+				if err := r.patchStatus(ctx, job, origJob); err != nil {
+					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on timeout")
+				}
+				metrics.MarkPMJInactive(req.NamespacedName.String())
+				metrics.RecordOutcome("timeout")
+				r.recordPreviousPhaseDuration(job, prevPhase)
+				r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", fmt.Sprintf("Migration job timed out (exceeded %v limit)", migrationTimeout))
+				return ctrl.Result{}, nil
 			}
-
-			logger.Info("Migration job timed out (exceeded 10 minutes limit), transitioning to Failed", "job", job.Name)
-			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
-			now := metav1.Now()
-			job.Status.CompletionTime = &now
-
-			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				Reason:             "Timeout",
-				Message:            "Migration job timed out (exceeded 10 minutes limit)",
-				ObservedGeneration: job.Generation,
-			})
-
-			// Clean up snapshot trigger if it exists (best effort)
-			_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
-
-			prevPhase := job.Status.Phase
-			if err := r.patchStatus(ctx, job, origJob); err != nil {
-				return r.handleStatusError(ctx, err, "Failed to update job status to Failed on timeout")
-			}
-			metrics.MarkPMJInactive(req.NamespacedName.String())
-			metrics.RecordOutcome("timeout")
-			r.recordPreviousPhaseDuration(job, prevPhase)
-			r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Migration job timed out (exceeded 10 minutes limit)")
-			return ctrl.Result{}, nil
 		}
 	}
 
@@ -666,8 +738,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
-		// Capture PV Names and origin node name before starting checkpoint (pod is guaranteed to exist)
-		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" {
+		var annotationUpdated bool
+		// Capture PV Names, origin node name, and migration timeout before starting checkpoint (pod is guaranteed to exist)
+		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" || (job.Annotations == nil || job.Annotations[util.AnnotationMigrationTimeout] == "") {
 			originPod := &corev1.Pod{}
 			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
 			if err != nil {
@@ -727,6 +800,26 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				job.Status.OriginNodeName = originPod.Spec.NodeName
 			}
 
+			if job.Annotations == nil {
+				job.Annotations = make(map[string]string)
+			}
+			if job.Annotations[util.AnnotationMigrationTimeout] == "" {
+				var rawTimeout string
+				if originPod.Annotations != nil {
+					rawTimeout = originPod.Annotations[util.AnnotationMigrationTimeout]
+				}
+				memBytes := util.CalculatePodMemoryRequest(originPod)
+				calculated := util.CalculateMigrationTimeout(rawTimeout, memBytes, r.DefaultMigrationTimeout)
+				base := r.DefaultMigrationTimeout
+				if base <= 0 {
+					base = util.DefaultMigrationTimeout
+				}
+				if calculated != base {
+					job.Annotations[util.AnnotationMigrationTimeout] = calculated.String()
+					annotationUpdated = true
+				}
+			}
+
 			if len(job.Status.PVsToDetach) == 0 {
 				var pvs []string
 				for _, vol := range originPod.Spec.Volumes {
@@ -748,6 +841,17 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 				job.Status.PVsToDetach = pvs
 			}
+		}
+
+		if annotationUpdated {
+			savedStatus := job.Status.DeepCopy()
+			jobToUpdate := job.DeepCopy()
+			if err := r.Update(ctx, jobToUpdate); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to update timeout annotation on PMJ in Pending phase")
+			}
+			job.ObjectMeta = *jobToUpdate.ObjectMeta.DeepCopy()
+			job.Status = *savedStatus
+			origJob.ObjectMeta = *jobToUpdate.ObjectMeta.DeepCopy()
 		}
 
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
@@ -811,7 +915,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		case snapshot.PhaseReady:
 			logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapStatus.SnapshotRef)
+			now := metav1.Now()
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
+			job.Status.EvictingStartTime = &now
 			job.Status.SnapshotRef = snapStatus.SnapshotRef
 			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 				Type:               "Ready",
@@ -852,6 +958,24 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
+		// Ensure EvictingStartTime is initialized
+		if job.Status.EvictingStartTime == nil {
+			startTime := metav1.Now()
+			if job.Annotations != nil {
+				if s := job.Annotations[util.AnnotationEvictingSince]; s != "" {
+					if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+						startTime = metav1.NewTime(t)
+					} else if t, err := time.Parse(time.RFC3339, s); err == nil {
+						startTime = metav1.NewTime(t)
+					}
+				}
+			}
+			job.Status.EvictingStartTime = &startTime
+			if err := r.patchStatus(ctx, job, origJob); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to initialize EvictingStartTime")
+			}
+		}
+
 		// Proactively clean up the manual trigger once the PMJ is durably Evicting.
 		// This frees the target pod lock in the snapshot agent for sequential 2-hop migrations,
 		// and runs idempotently without risk of trigger re-creation on Status().Update retry.
@@ -881,6 +1005,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			// If the origin pod is already terminating through its grace period, wait for deletion
 			if pod.DeletionTimestamp != nil {
 				logger.Info("Origin pod is already terminating; waiting for deletion", "pod", podName)
+				if job.Annotations == nil {
+					job.Annotations = make(map[string]string)
+				}
+				if job.Annotations[util.AnnotationEvictingSince] == "" {
+					// Status must be flushed above this line before calling r.Update on the main resource.
+					job.Annotations[util.AnnotationEvictingSince] = time.Now().Format(time.RFC3339Nano)
+					_ = r.Update(ctx, job)
+				}
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 
@@ -888,12 +1020,12 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			// We wait for the eviction webhook to return Allowed and the API server to delete it.
 			// Fallback: if it takes longer than 30s (e.g. manual trigger), we invoke the PDB-safe eviction subresource.
 			const timeout = 30 * time.Second
-			evictingSinceStr := job.Annotations["pod-migration.gke.io/evicting-since"]
+			evictingSinceStr := job.Annotations[util.AnnotationEvictingSince]
 			if evictingSinceStr == "" {
 				if job.Annotations == nil {
 					job.Annotations = make(map[string]string)
 				}
-				job.Annotations["pod-migration.gke.io/evicting-since"] = time.Now().Format(time.RFC3339Nano)
+				job.Annotations[util.AnnotationEvictingSince] = time.Now().Format(time.RFC3339Nano)
 				logger.Info("Recording evicting start time, waiting for eviction webhook to trigger delete", "pod", podName)
 				r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "EvictedForMigration", "Origin pod marked for eviction following successful checkpoint")
 				if err := r.Update(ctx, job); err != nil {
@@ -901,7 +1033,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 				return ctrl.Result{Requeue: true}, nil
 			}
-
 			evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
 			if err != nil {
 				evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)

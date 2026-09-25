@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -19,10 +20,11 @@ const (
 
 // Status represents the observed result of a snapshot check.
 type Status struct {
-	Phase       Phase
-	SnapshotRef string
-	Reason      string
-	Message     string
+	Phase            Phase
+	SnapshotRef      string
+	Reason           string
+	Message          string
+	LastProgressTime time.Time
 }
 
 // Provider abstracts the snapshot / checkpoint engine (e.g. GKE Pod Snapshots, CRIU, MicroVM).

@@ -48,6 +48,10 @@ type PodMigrationJobStatus struct {
 	// +optional
 	SnapshottingStartTime *metav1.Time `json:"snapshottingStartTime,omitempty"`
 
+	// EvictingStartTime is the timestamp when this job transitioned to the Evicting phase.
+	// +optional
+	EvictingStartTime *metav1.Time `json:"evictingStartTime,omitempty"`
+
 	// RestoringStartTime is the timestamp when this job transitioned to the Restoring phase.
 	// +optional
 	RestoringStartTime *metav1.Time `json:"restoringStartTime,omitempty"`
