@@ -6573,6 +6573,83 @@ func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeout
 	}
 }
 
+func TestPodMigrationJobReconciler_Evicting_UpgradeInFlightJob_SeedsEvictingStartTimeFromAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "in-flight-pod"
+	jobName := "pmj-" + podName
+	pastEvictingTime := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			UID:       types.UID("pod-uid-42"),
+		},
+	}
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              jobName,
+			Namespace:         namespace,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
+			Annotations: map[string]string{
+				util.AnnotationEvictingSince: pastEvictingTime.Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: "pod-uid-42",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:             pmv1alpha1.PodMigrationJobPhaseEvicting,
+			EvictingStartTime: nil, // Simulating an in-flight job prior to upgrade
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "Evicting",
+					LastTransitionTime: metav1.NewTime(pastEvictingTime),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj, pod).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.EvictingStartTime == nil {
+		t.Fatalf("Expected EvictingStartTime to be populated from annotation, got nil")
+	}
+	if !updatedPMJ.Status.EvictingStartTime.Time.Equal(pastEvictingTime) {
+		t.Errorf("Expected EvictingStartTime to equal %v, got %v", pastEvictingTime, updatedPMJ.Status.EvictingStartTime.Time)
+	}
+}
+
 func TestPodMigrationJobReconciler_Evicting_PhaseTimeout_AfterExtendedSnapshot(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)

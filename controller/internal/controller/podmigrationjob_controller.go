@@ -212,7 +212,7 @@ func (r *PodMigrationJobReconciler) recordPreviousPhaseDuration(job *pmv1alpha1.
 		if job.Status.EvictingStartTime != nil {
 			metrics.RecordPhaseDuration("evicting", time.Since(job.Status.EvictingStartTime.Time).Seconds())
 		} else if job.Annotations != nil {
-			if s := job.Annotations["pod-migration.gke.io/evicting-since"]; s != "" {
+			if s := job.Annotations[util.AnnotationEvictingSince]; s != "" {
 				if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 					metrics.RecordPhaseDuration("evicting", time.Since(t).Seconds())
 				} else if t, err := time.Parse(time.RFC3339, s); err == nil {
@@ -849,8 +849,17 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
 		// Ensure EvictingStartTime is initialized
 		if job.Status.EvictingStartTime == nil {
-			now := metav1.Now()
-			job.Status.EvictingStartTime = &now
+			startTime := metav1.Now()
+			if job.Annotations != nil {
+				if s := job.Annotations[util.AnnotationEvictingSince]; s != "" {
+					if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+						startTime = metav1.NewTime(t)
+					} else if t, err := time.Parse(time.RFC3339, s); err == nil {
+						startTime = metav1.NewTime(t)
+					}
+				}
+			}
+			job.Status.EvictingStartTime = &startTime
 			if err := r.patchStatus(ctx, job, origJob); err != nil {
 				return r.handleStatusError(ctx, err, "Failed to initialize EvictingStartTime")
 			}
