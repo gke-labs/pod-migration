@@ -5,15 +5,34 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
+
+func newTestClientIndexed(scheme *runtime.Scheme, objs ...runtime.Object) client.WithWatch {
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithRuntimeObjects(objs...).
+		Build()
+}
+
+func newTestClientLive(scheme *runtime.Scheme, objs ...runtime.Object) client.WithWatch {
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(objs...).
+		Build()
+}
 
 func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -85,15 +104,24 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			cIndexed := newTestClientIndexed(scheme, tc.existing...)
+			cLive := newTestClientLive(scheme, tc.existing...)
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, "", "", "", "", "")
+			result, err := FindUnassignedActivePMJ(ctx, cIndexed, "default", tc.podName, "", "", "", "", "", true)
 			if (err != nil) != tc.expectErr {
-				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+				t.Fatalf("indexed path expected error: %v, got: %v", tc.expectErr, err)
 			}
 			if result != tc.expected {
-				t.Errorf("expected: %q, got: %q", tc.expected, result)
+				t.Errorf("indexed path expected: %q, got: %q", tc.expected, result)
+			}
+
+			resultLive, errLive := FindUnassignedActivePMJ(ctx, cLive, "default", tc.podName, "", "", "", "", "", false)
+			if (errLive != nil) != tc.expectErr {
+				t.Fatalf("live path expected error: %v, got: %v", tc.expectErr, errLive)
+			}
+			if resultLive != tc.expected {
+				t.Errorf("live path expected: %q, got: %q", tc.expected, resultLive)
 			}
 		})
 	}
@@ -265,15 +293,24 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			cIndexed := newTestClientIndexed(scheme, tc.existing...)
+			cLive := newTestClientLive(scheme, tc.existing...)
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.podTemplateHash, "")
+			result, err := FindUnassignedActivePMJ(ctx, cIndexed, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.podTemplateHash, "", true)
 			if (err != nil) != tc.expectErr {
-				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+				t.Fatalf("indexed path expected error: %v, got: %v", tc.expectErr, err)
 			}
 			if result != tc.expected {
-				t.Errorf("expected: %q, got: %q", tc.expected, result)
+				t.Errorf("indexed path expected: %q, got: %q", tc.expected, result)
+			}
+
+			resultLive, errLive := FindUnassignedActivePMJ(ctx, cLive, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.podTemplateHash, "", false)
+			if (errLive != nil) != tc.expectErr {
+				t.Fatalf("live path expected error: %v, got: %v", tc.expectErr, errLive)
+			}
+			if resultLive != tc.expected {
+				t.Errorf("live path expected: %q, got: %q", tc.expected, resultLive)
 			}
 		})
 	}
@@ -439,15 +476,24 @@ func TestFindUnassignedActivePMJ_BatchIndexedJobs(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			cIndexed := newTestClientIndexed(scheme, tc.existing...)
+			cLive := newTestClientLive(scheme, tc.existing...)
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, "", "", tc.jobCompletionIndex)
+			result, err := FindUnassignedActivePMJ(ctx, cIndexed, "default", tc.podName, tc.parentName, tc.parentKind, "", "", tc.jobCompletionIndex, true)
 			if (err != nil) != tc.expectErr {
-				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+				t.Fatalf("indexed path expected error: %v, got: %v", tc.expectErr, err)
 			}
 			if result != tc.expected {
-				t.Errorf("expected: %q, got: %q", tc.expected, result)
+				t.Errorf("indexed path expected: %q, got: %q", tc.expected, result)
+			}
+
+			resultLive, errLive := FindUnassignedActivePMJ(ctx, cLive, "default", tc.podName, tc.parentName, tc.parentKind, "", "", tc.jobCompletionIndex, false)
+			if (errLive != nil) != tc.expectErr {
+				t.Fatalf("live path expected error: %v, got: %v", tc.expectErr, errLive)
+			}
+			if resultLive != tc.expected {
+				t.Errorf("live path expected: %q, got: %q", tc.expected, resultLive)
 			}
 		})
 	}
@@ -553,15 +599,24 @@ func TestFindUnassignedActivePMJ_GenerationalWorkloadIsolation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			cIndexed := newTestClientIndexed(scheme, tc.existing...)
+			cLive := newTestClientLive(scheme, tc.existing...)
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, tc.parentUID, "", "")
+			result, err := FindUnassignedActivePMJ(ctx, cIndexed, "default", tc.podName, tc.parentName, tc.parentKind, tc.parentUID, "", "", true)
 			if (err != nil) != tc.expectErr {
-				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+				t.Fatalf("indexed path expected error: %v, got: %v", tc.expectErr, err)
 			}
 			if result != tc.expected {
-				t.Errorf("expected: %q, got: %q", tc.expected, result)
+				t.Errorf("indexed path expected: %q, got: %q", tc.expected, result)
+			}
+
+			resultLive, errLive := FindUnassignedActivePMJ(ctx, cLive, "default", tc.podName, tc.parentName, tc.parentKind, tc.parentUID, "", "", false)
+			if (errLive != nil) != tc.expectErr {
+				t.Fatalf("live path expected error: %v, got: %v", tc.expectErr, errLive)
+			}
+			if resultLive != tc.expected {
+				t.Errorf("live path expected: %q, got: %q", tc.expected, resultLive)
 			}
 		})
 	}
@@ -643,15 +698,24 @@ func TestFindUnassignedActivePMJ_SingleUseConsumedGuard(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			cIndexed := newTestClientIndexed(scheme, tc.existing...)
+			cLive := newTestClientLive(scheme, tc.existing...)
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, tc.parentUID, "", "")
+			result, err := FindUnassignedActivePMJ(ctx, cIndexed, "default", tc.podName, tc.parentName, tc.parentKind, tc.parentUID, "", "", true)
 			if (err != nil) != tc.expectErr {
-				t.Fatalf("expected error: %v, got: %v", tc.expectErr, err)
+				t.Fatalf("indexed path expected error: %v, got: %v", tc.expectErr, err)
 			}
 			if result != tc.expected {
-				t.Errorf("expected: %q, got: %q", tc.expected, result)
+				t.Errorf("indexed path expected: %q, got: %q", tc.expected, result)
+			}
+
+			resultLive, errLive := FindUnassignedActivePMJ(ctx, cLive, "default", tc.podName, tc.parentName, tc.parentKind, tc.parentUID, "", "", false)
+			if (errLive != nil) != tc.expectErr {
+				t.Fatalf("live path expected error: %v, got: %v", tc.expectErr, errLive)
+			}
+			if resultLive != tc.expected {
+				t.Errorf("live path expected: %q, got: %q", tc.expected, resultLive)
 			}
 		})
 	}
@@ -784,15 +848,24 @@ func TestFindUnassignedActivePMJ_EvictingScaleUpIsolation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tc.existing...).Build()
+			cIndexed := newTestClientIndexed(scheme, tc.existing...)
+			cLive := newTestClientLive(scheme, tc.existing...)
 			ctx := context.Background()
 
-			result, err := FindUnassignedActivePMJ(ctx, c, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.podTemplateHash, "")
+			result, err := FindUnassignedActivePMJ(ctx, cIndexed, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.podTemplateHash, "", true)
 			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+				t.Fatalf("indexed path unexpected error: %v", err)
 			}
 			if result != tc.expected {
-				t.Errorf("expected: %q, got: %q", tc.expected, result)
+				t.Errorf("indexed path expected: %q, got: %q", tc.expected, result)
+			}
+
+			resultLive, errLive := FindUnassignedActivePMJ(ctx, cLive, "default", tc.podName, tc.parentName, tc.parentKind, "", tc.podTemplateHash, "", false)
+			if errLive != nil {
+				t.Fatalf("live path unexpected error: %v", errLive)
+			}
+			if resultLive != tc.expected {
+				t.Errorf("live path expected: %q, got: %q", tc.expected, resultLive)
 			}
 		})
 	}
@@ -1061,7 +1134,7 @@ func TestFindUnassignedActivePMJ_IndexedMultiWorkload(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Frontend query should find pmj-frontend-1
-	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "frontend-replacement-1", "frontend", "Deployment", "", "hash-v1", "")
+	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "frontend-replacement-1", "frontend", "Deployment", "", "hash-v1", "", true)
 	if err != nil {
 		t.Fatalf("FindUnassignedActivePMJ for frontend failed: %v", err)
 	}
@@ -1070,7 +1143,7 @@ func TestFindUnassignedActivePMJ_IndexedMultiWorkload(t *testing.T) {
 	}
 
 	// 2. Backend query should return "" because pmj-backend-1 is already assigned to backend-replacement-1
-	gotBackend, err := FindUnassignedActivePMJ(ctx, cl, namespace, "backend-replacement-2", "backend", "Deployment", "", "hash-b1", "")
+	gotBackend, err := FindUnassignedActivePMJ(ctx, cl, namespace, "backend-replacement-2", "backend", "Deployment", "", "hash-b1", "", true)
 	if err != nil {
 		t.Fatalf("FindUnassignedActivePMJ for backend failed: %v", err)
 	}
@@ -1079,7 +1152,7 @@ func TestFindUnassignedActivePMJ_IndexedMultiWorkload(t *testing.T) {
 	}
 
 	// 3. Database query for database-0 should match pmj-database-0
-	gotDB, err := FindUnassignedActivePMJ(ctx, cl, namespace, "database-0", "database", "StatefulSet", "", "", "")
+	gotDB, err := FindUnassignedActivePMJ(ctx, cl, namespace, "database-0", "database", "StatefulSet", "", "", "", true)
 	if err != nil {
 		t.Fatalf("FindUnassignedActivePMJ for database-0 failed: %v", err)
 	}
@@ -1088,7 +1161,7 @@ func TestFindUnassignedActivePMJ_IndexedMultiWorkload(t *testing.T) {
 	}
 
 	// 4. Database query for database-1 should NOT match pmj-database-0 (wrong pod name)
-	gotDB1, err := FindUnassignedActivePMJ(ctx, cl, namespace, "database-1", "database", "StatefulSet", "", "", "")
+	gotDB1, err := FindUnassignedActivePMJ(ctx, cl, namespace, "database-1", "database", "StatefulSet", "", "", "", true)
 	if err != nil {
 		t.Fatalf("FindUnassignedActivePMJ for database-1 failed: %v", err)
 	}
@@ -1097,7 +1170,7 @@ func TestFindUnassignedActivePMJ_IndexedMultiWorkload(t *testing.T) {
 	}
 
 	// 5. Bare pod query for "standalone" should match pmj-standalone
-	gotBare, err := FindUnassignedActivePMJ(ctx, cl, namespace, "standalone", "", "", "", "", "")
+	gotBare, err := FindUnassignedActivePMJ(ctx, cl, namespace, "standalone", "", "", "", "", "", true)
 	if err != nil {
 		t.Fatalf("FindUnassignedActivePMJ for standalone failed: %v", err)
 	}
@@ -1111,11 +1184,126 @@ func TestFindUnassignedActivePMJ_IndexedMultiWorkload(t *testing.T) {
 		WithObjects(frontendPMJ, backendPMJ, backendAssignedPod, databasePMJ, databaseOriginPod, barePMJ).
 		Build()
 
-	gotFallback, err := FindUnassignedActivePMJ(ctx, unindexedClient, namespace, "frontend-replacement-1", "frontend", "Deployment", "", "hash-v1", "")
+	gotFallback, err := FindUnassignedActivePMJ(ctx, unindexedClient, namespace, "frontend-replacement-1", "frontend", "Deployment", "", "hash-v1", "", false)
 	if err != nil {
 		t.Fatalf("unindexed fallback for frontend failed: %v", err)
 	}
 	if gotFallback != "pmj-frontend-1" {
 		t.Errorf("expected pmj-frontend-1 on unindexed fallback, got %q", gotFallback)
+	}
+}
+
+func TestFindUnassignedActivePMJ_TerminatingClaimantCountsAsAssigned(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-terminating-claimant"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pmjName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: "web",
+				LabelParentKind: "Deployment",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "web-origin-pod"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	// Pod A is assigned to pmjName and is terminating (DeletionTimestamp != nil)
+	terminatingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-replacement-a",
+			Namespace:         namespace,
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			Finalizers:        []string{"test-finalizer"},
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			Annotations: map[string]string{
+				AnnotationAssignedPMJ: pmjName,
+			},
+		},
+	}
+
+	cIndexed := newTestClientIndexed(scheme, pmj, terminatingPod)
+	cLive := newTestClientLive(scheme, pmj, terminatingPod)
+	ctx := context.Background()
+
+	// New pod B arrives for the same Deployment
+	gotIndexed, err := FindUnassignedActivePMJ(ctx, cIndexed, namespace, "web-replacement-b", "web", "Deployment", "", "", "", true)
+	if err != nil {
+		t.Fatalf("indexed lookup failed: %v", err)
+	}
+	if gotIndexed != "" {
+		t.Errorf("expected empty string (PMJ already assigned to terminating claimant), got %q", gotIndexed)
+	}
+
+	gotLive, err := FindUnassignedActivePMJ(ctx, cLive, namespace, "web-replacement-b", "web", "Deployment", "", "", "", false)
+	if err != nil {
+		t.Fatalf("live lookup failed: %v", err)
+	}
+	if gotLive != "" {
+		t.Errorf("expected empty string on live fallback (PMJ already assigned to terminating claimant), got %q", gotLive)
+	}
+}
+
+func TestFindUnassignedActivePMJ_OriginPodTransientReadError_SkipsCandidate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	pmjName := "pmj-evicting-error"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pmjName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: "web",
+				LabelParentKind: "Deployment",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "web-origin-pod"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	// Intercept Get on Pod to simulate transient apiserver error
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Pod); ok && key.Name == "web-origin-pod" {
+					return fmt.Errorf("simulated 500 transient apiserver read error")
+				}
+				return client.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	ctx := context.Background()
+	// Should skip the candidate on transient read error rather than failing admission!
+	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "web-replacement-1", "web", "Deployment", "", "", "", true)
+	if err != nil {
+		t.Fatalf("expected transient error to be skipped, got error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("expected candidate to be skipped, got %q", got)
 	}
 }

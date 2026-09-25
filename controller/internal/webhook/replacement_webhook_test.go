@@ -488,7 +488,12 @@ func TestPodGateInjector(t *testing.T) {
 			_ = pmv1alpha1.AddToScheme(scheme)
 			dec := admission.NewDecoder(scheme)
 
-			cl := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tt.initObjs...).Build()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+				WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+				WithRuntimeObjects(tt.initObjs...).
+				Build()
 
 			handler := &PodGateInjector{
 				Client:    cl,
@@ -593,7 +598,11 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 	}
 
 	t.Run("Cache miss with live hit injects scheduling gate and assigned PMJ", func(t *testing.T) {
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+			WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+			Build()
 		fakeAPIReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pmj).Build()
 
 		handler := &PodGateInjector{
@@ -636,7 +645,11 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 	})
 
 	t.Run("Cache miss with live miss bypasses gate with cold-start bypass", func(t *testing.T) {
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+			WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+			Build()
 		fakeAPIReader := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 		handler := &PodGateInjector{
@@ -679,7 +692,11 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 	})
 
 	t.Run("Live read error returns 500 error", func(t *testing.T) {
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+			WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+			Build()
 		errClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
 			List: func(ctx context.Context, client client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 				return fmt.Errorf("simulated live apiserver list error")
@@ -757,7 +774,11 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 		}
 
 		// Cache is empty (lagging), live APIReader has the ReplicaSet and PMJ
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+			WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+			Build()
 		fakeAPIReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rs, deployPMJ).Build()
 
 		handler := &PodGateInjector{
@@ -825,7 +846,11 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 			},
 		}
 
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+			WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+			Build()
 		errAPIReader := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
 			Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if _, ok := obj.(*appsv1.ReplicaSet); ok {

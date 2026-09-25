@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -122,67 +121,18 @@ func PodAssignedPMJIndexValue(obj client.Object) []string {
 	return nil
 }
 
-func isIndexerUnsupported(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "no index with name") ||
-		strings.Contains(msg, "has been registered") ||
-		strings.Contains(msg, "indexer not found") ||
-		strings.Contains(msg, "field label not supported") ||
-		strings.Contains(msg, "not supported") ||
-		apierrors.IsBadRequest(err)
-}
-
 func isPMJAssignedToPod(ctx context.Context, c client.Reader, namespace, pmjName string) (bool, error) {
 	podList := &corev1.PodList{}
 	err := c.List(ctx, podList, client.InNamespace(namespace), client.MatchingFields{PodAssignedPMJIndexKey: pmjName})
-	if err == nil {
-		for i := range podList.Items {
-			if podList.Items[i].DeletionTimestamp == nil {
-				return true, nil
-			}
-		}
-		return false, nil
+	if err != nil {
+		return false, err
 	}
-	if isIndexerUnsupported(err) {
-		// Fallback for unindexed readers (e.g. direct APIReader without field indexing):
-		// list opted-in pods in namespace and filter in memory.
-		if listErr := c.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{"pod-migration.gke.io/enabled": "true"}); listErr != nil {
-			return false, listErr
-		}
-		for i := range podList.Items {
-			p := &podList.Items[i]
-			if p.DeletionTimestamp == nil && p.Annotations != nil && p.Annotations[AnnotationAssignedPMJ] == pmjName {
-				return true, nil
-			}
-		}
-		return false, nil
-	}
-	return false, err
+	return len(podList.Items) > 0, nil
 }
 
-// FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
-// Uses cache field indexes (PMJParentKeyIndexKey and PodAssignedPMJIndexKey) to perform O(result) lookups
-// on the pod creation admission path instead of O(namespace) LISTs.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string) (string, error) {
-	parentKey := FormatParentKey(parentName, parentKind, podName)
-	jobList := &pmv1alpha1.PodMigrationJobList{}
-	var listErr error
-	if parentKey != "" {
-		listErr = c.List(ctx, jobList, client.InNamespace(namespace), client.MatchingFields{PMJParentKeyIndexKey: parentKey})
-	}
-	if parentKey == "" || (listErr != nil && isIndexerUnsupported(listErr)) {
-		if err := c.List(ctx, jobList, client.InNamespace(namespace)); err != nil {
-			return "", err
-		}
-	} else if listErr != nil {
-		return "", listErr
-	}
-
+func filterCandidates(jobs []pmv1alpha1.PodMigrationJob, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex string) []pmv1alpha1.PodMigrationJob {
 	var candidates []pmv1alpha1.PodMigrationJob
-	for _, job := range jobList.Items {
+	for _, job := range jobs {
 		if job.Status.Consumed {
 			continue
 		}
@@ -222,34 +172,106 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 			candidates = append(candidates, job)
 		}
 	}
+	return candidates
+}
 
-	if len(candidates) == 0 {
-		return "", nil // Overwhelmingly common path: no matching active PMJ
-	}
+// FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
+// When indexed is true, it uses cache field indexes (PMJParentKeyIndexKey and PodAssignedPMJIndexKey) to perform
+// O(result) lookups against an index-backed client (e.g. manager cache client).
+// When indexed is false (live APIReader fallback), it performs unindexed namespace lists and in-memory filtering
+// without sending unsupported field selectors to the real apiserver.
+func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string, indexed bool) (string, error) {
+	if indexed {
+		parentKey := FormatParentKey(parentName, parentKind, podName)
+		if parentKey == "" {
+			return "", nil
+		}
+		jobList := &pmv1alpha1.PodMigrationJobList{}
+		if err := c.List(ctx, jobList, client.InNamespace(namespace), client.MatchingFields{PMJParentKeyIndexKey: parentKey}); err != nil {
+			return "", err
+		}
 
-	for _, job := range candidates {
-		// Narrowing for scale-up race: don't match Evicting-phase PMJs whose origin pod still exists.
-		// If the origin pod is still alive, any newly arriving candidate pod is a concurrent scale-up.
-		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
-			targetName := job.Spec.PodRef.Name
-			if targetName != "" {
-				originPod := &corev1.Pod{}
-				err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: targetName}, originPod)
-				if err == nil && originPod.DeletionTimestamp == nil {
-					if job.Spec.TargetPodUID == "" || string(originPod.UID) == job.Spec.TargetPodUID {
+		candidates := filterCandidates(jobList.Items, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex)
+		if len(candidates) == 0 {
+			return "", nil
+		}
+
+		for _, job := range candidates {
+			// Narrowing for scale-up race: don't match Evicting-phase PMJs whose origin pod still exists.
+			// If the origin pod is still alive, any newly arriving candidate pod is a concurrent scale-up.
+			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+				targetName := job.Spec.PodRef.Name
+				if targetName != "" {
+					originPod := &corev1.Pod{}
+					err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: targetName}, originPod)
+					if err == nil && originPod.DeletionTimestamp == nil {
+						if job.Spec.TargetPodUID == "" || string(originPod.UID) == job.Spec.TargetPodUID {
+							continue
+						}
+					} else if err != nil && !apierrors.IsNotFound(err) {
+						// Skip candidate on transient read error rather than rejecting admission.
 						continue
 					}
-				} else if err != nil && !apierrors.IsNotFound(err) {
-					return "", err
 				}
+			}
+
+			assigned, err := isPMJAssignedToPod(ctx, c, namespace, job.Name)
+			if err != nil {
+				return "", err
+			}
+			if !assigned {
+				return job.Name, nil
 			}
 		}
 
-		assigned, err := isPMJAssignedToPod(ctx, c, namespace, job.Name)
-		if err != nil {
-			return "", err
+		return "", nil
+	}
+
+	// Unindexed live reader path (fallback): full namespace list without field selectors.
+	jobList := &pmv1alpha1.PodMigrationJobList{}
+	if err := c.List(ctx, jobList, client.InNamespace(namespace)); err != nil {
+		return "", err
+	}
+
+	candidates := filterCandidates(jobList.Items, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex)
+	if len(candidates) == 0 {
+		return "", nil
+	}
+
+	assignedPMJs := make(map[string]bool)
+	existingPodUIDs := make(map[string]bool)
+	existingPodNames := make(map[string]bool)
+	podList := &corev1.PodList{}
+	if err := c.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{"pod-migration.gke.io/enabled": "true"}); err != nil {
+		return "", err
+	}
+
+	for _, p := range podList.Items {
+		if p.DeletionTimestamp == nil {
+			existingPodUIDs[string(p.UID)] = true
+			existingPodNames[p.Name] = true
 		}
-		if !assigned {
+		if p.Annotations != nil {
+			if pmjName, ok := p.Annotations[AnnotationAssignedPMJ]; ok {
+				assignedPMJs[pmjName] = true
+			}
+		}
+	}
+
+	for _, job := range candidates {
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+			originExists := false
+			if job.Spec.TargetPodUID != "" {
+				originExists = existingPodUIDs[job.Spec.TargetPodUID]
+			} else if job.Spec.PodRef.Name != "" {
+				originExists = existingPodNames[job.Spec.PodRef.Name]
+			}
+			if originExists {
+				continue
+			}
+		}
+
+		if !assignedPMJs[job.Name] {
 			return job.Name, nil
 		}
 	}
@@ -320,7 +342,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	}
 
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex)
+	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true)
 	if err != nil {
 		return "", false, err
 	}
