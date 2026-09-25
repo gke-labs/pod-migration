@@ -1,0 +1,219 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pm-multicontainer
+  namespace: default
+spec:
+  serviceName: pm-multicontainer-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pm-multicontainer
+  template:
+    metadata:
+      labels:
+        app: pm-multicontainer
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: sandbox.gke.io/runtime
+          operator: Equal
+          value: gvisor
+          effect: NoSchedule
+      volumes:
+        - name: shared-data
+          emptyDir: {}
+      initContainers:
+        - name: init-seed
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -c
+            - |
+              import uuid, time
+              seed = "init-" + uuid.uuid4().hex[:8]
+              with open("/shared/init-token.txt", "w") as f:
+                  f.write(seed)
+              with open("/shared/init-timestamp.txt", "w") as f:
+                  f.write(str(time.time()))
+              print(f"init-seed completed: {seed}")
+          volumeMounts:
+            - name: shared-data
+              mountPath: /shared
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+      containers:
+        - name: app
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -c
+            - |
+              import http.server, socketserver, json, os, uuid
+
+              app_id = "app-" + uuid.uuid4().hex[:8]
+              counter = 0
+
+              with open("/shared/init-token.txt", "r") as f:
+                  init_token = f.read().strip()
+
+              class Handler(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      if self.path == "/healthz":
+                          self.send_response(200)
+                          self.end_headers()
+                          self.wfile.write(b"OK")
+                      elif self.path == "/status":
+                          self.send_response(200)
+                          self.send_header("Content-Type", "application/json")
+                          self.end_headers()
+                          vol_data = ""
+                          if os.path.exists("/shared/app-data.txt"):
+                              with open("/shared/app-data.txt", "r") as f:
+                                  vol_data = f.read().strip()
+                          payload = {
+                              "container": "app",
+                              "instance_id": app_id,
+                              "init_token": init_token,
+                              "counter": counter,
+                              "volume_data": vol_data,
+                          }
+                          self.wfile.write(json.dumps(payload).encode())
+                      else:
+                          self.send_response(404)
+                          self.end_headers()
+
+                  def do_POST(self):
+                      global counter
+                      if self.path == "/incr":
+                          counter += 1
+                          with open("/shared/app-data.txt", "a") as f:
+                              f.write(f"app-step-{counter}\n")
+                          self.send_response(200)
+                          self.send_header("Content-Type", "application/json")
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"counter": counter}).encode())
+                      else:
+                          self.send_response(404)
+                          self.end_headers()
+
+                  def log_message(self, format, *args):
+                      pass
+
+              server = socketserver.TCPServer(("0.0.0.0", 8080), Handler)
+              print(f"app container started: id={app_id}, init_token={init_token}")
+              server.serve_forever()
+          ports:
+            - name: http-app
+              containerPort: 8080
+          volumeMounts:
+            - name: shared-data
+              mountPath: /shared
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 3
+        - name: sidecar
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -c
+            - |
+              import http.server, socketserver, json, os, uuid
+
+              sidecar_id = "sidecar-" + uuid.uuid4().hex[:8]
+              counter = 0
+
+              with open("/shared/init-token.txt", "r") as f:
+                  init_token = f.read().strip()
+
+              class Handler(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      if self.path == "/healthz":
+                          self.send_response(200)
+                          self.end_headers()
+                          self.wfile.write(b"OK")
+                      elif self.path == "/status":
+                          self.send_response(200)
+                          self.send_header("Content-Type", "application/json")
+                          self.end_headers()
+                          vol_data = ""
+                          if os.path.exists("/shared/sidecar-data.txt"):
+                              with open("/shared/sidecar-data.txt", "r") as f:
+                                  vol_data = f.read().strip()
+                          payload = {
+                              "container": "sidecar",
+                              "instance_id": sidecar_id,
+                              "init_token": init_token,
+                              "counter": counter,
+                              "volume_data": vol_data,
+                          }
+                          self.wfile.write(json.dumps(payload).encode())
+                      else:
+                          self.send_response(404)
+                          self.end_headers()
+
+                  def do_POST(self):
+                      global counter
+                      if self.path == "/incr":
+                          counter += 1
+                          with open("/shared/sidecar-data.txt", "a") as f:
+                              f.write(f"sidecar-step-{counter}\n")
+                          self.send_response(200)
+                          self.send_header("Content-Type", "application/json")
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"counter": counter}).encode())
+                      else:
+                          self.send_response(404)
+                          self.end_headers()
+
+                  def log_message(self, format, *args):
+                      pass
+
+              server = socketserver.TCPServer(("0.0.0.0", 9090), Handler)
+              print(f"sidecar container started: id={sidecar_id}, init_token={init_token}")
+              server.serve_forever()
+          ports:
+            - name: http-sidecar
+              containerPort: 9090
+          volumeMounts:
+            - name: shared-data
+              mountPath: /shared
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            periodSeconds: 2
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pm-multicontainer-service
+  namespace: default
+spec:
+  selector:
+    app: pm-multicontainer
+  ports:
+    - name: http-app
+      port: 8080
+      targetPort: 8080
+    - name: http-sidecar
+      port: 9090
+      targetPort: 9090

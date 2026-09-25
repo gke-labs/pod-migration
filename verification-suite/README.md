@@ -56,6 +56,7 @@ To run the automated E2E migration check for any application:
 *   `mysql`, `mariadb`, `postgres`, `zookeeper`, `kafka`
 *   `nginx`, `haproxy`, `traefik`, `caddy`, `python`
 *   `go` (Job), `node` (Job)
+*   `multicontainer` (StatefulSet with initContainer, app, and sidecar)
 
 --------------------------------------------------------------------------------
 
