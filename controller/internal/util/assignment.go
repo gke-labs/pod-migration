@@ -83,8 +83,8 @@ func FormatPSMTName(podName, uid string) string {
 // DistilledPodSpecDigest computes a deterministic SHA256 hex digest of a PodSpec
 // stripped of mutable runtime and resource attributes:
 // DistilledDigest = SHA256(PodSpec \ {Resources, NodeName, NodeSelector, Tolerations, SchedulingGates})
-// This allows LPM to match replacement pods whose pod-template-hash or resources
-// deviated due to Vertical Pod Autoscaler (VPA) admission mutation or resizing.
+// It also normalizes projected service account volume names (kube-api-access-*) and clears
+// runtime-attached ephemeral debug containers so replacement pods match despite random volume suffixes.
 func DistilledPodSpecDigest(spec *corev1.PodSpec) (string, error) {
 	if spec == nil {
 		return "", nil
@@ -98,15 +98,42 @@ func DistilledPodSpecDigest(spec *corev1.PodSpec) (string, error) {
 	for i := range cloned.InitContainers {
 		cloned.InitContainers[i].Resources = corev1.ResourceRequirements{}
 	}
-	for i := range cloned.EphemeralContainers {
-		cloned.EphemeralContainers[i].Resources = corev1.ResourceRequirements{}
-	}
+
+	// Ephemeral debug containers are runtime-attached and never part of the declared template
+	cloned.EphemeralContainers = nil
 
 	// Strip runtime placement, node, and gate fields
 	cloned.NodeName = ""
 	cloned.NodeSelector = nil
 	cloned.Tolerations = nil
 	cloned.SchedulingGates = nil
+
+	// Normalize Kubernetes default service account projected volumes (kube-api-access-<random>)
+	// and their container volume mounts so random 5-character suffixes don't invalidate digests.
+	const canonicalKubeAPIAccess = "kube-api-access-canonical"
+	saVolumeNames := make(map[string]bool)
+	for i := range cloned.Volumes {
+		v := &cloned.Volumes[i]
+		if strings.HasPrefix(v.Name, "kube-api-access-") {
+			saVolumeNames[v.Name] = true
+			v.Name = canonicalKubeAPIAccess
+		}
+	}
+	if len(saVolumeNames) > 0 {
+		normalizeMounts := func(mounts []corev1.VolumeMount) {
+			for j := range mounts {
+				if saVolumeNames[mounts[j].Name] {
+					mounts[j].Name = canonicalKubeAPIAccess
+				}
+			}
+		}
+		for i := range cloned.Containers {
+			normalizeMounts(cloned.Containers[i].VolumeMounts)
+		}
+		for i := range cloned.InitContainers {
+			normalizeMounts(cloned.InitContainers[i].VolumeMounts)
+		}
+	}
 
 	data, err := json.Marshal(cloned)
 	if err != nil {
@@ -132,7 +159,8 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 		return "", err
 	}
 
-	var candidates []pmv1alpha1.PodMigrationJob
+	var exactCandidates []pmv1alpha1.PodMigrationJob
+	var fallbackCandidates []pmv1alpha1.PodMigrationJob
 	for _, job := range jobList.Items {
 		if job.Status.Consumed {
 			continue
@@ -182,10 +210,16 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 			phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
 			phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
-			candidates = append(candidates, job)
+			isFallback := (parentKind == "Deployment" || parentKind == "ReplicaSet") && job.Labels[LabelPodTemplateHash] != podTemplateHash
+			if isFallback {
+				fallbackCandidates = append(fallbackCandidates, job)
+			} else {
+				exactCandidates = append(exactCandidates, job)
+			}
 		}
 	}
 
+	candidates := append(exactCandidates, fallbackCandidates...)
 	if len(candidates) == 0 {
 		return "", nil // Overwhelmingly common path: no matching active PMJ
 	}

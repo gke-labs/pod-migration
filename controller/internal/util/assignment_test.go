@@ -968,6 +968,63 @@ func TestDistilledPodSpecDigest(t *testing.T) {
 		t.Errorf("expected different image to produce different digest, got same %q", diffDigest)
 	}
 
+	// ServiceAccount projected volume random suffix normalization test
+	saSpec1 := baseSpec.DeepCopy()
+	saSpec1.Volumes = append(saSpec1.Volumes, corev1.Volume{
+		Name: "kube-api-access-abc12",
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{},
+		},
+	})
+	saSpec1.Containers[0].VolumeMounts = append(saSpec1.Containers[0].VolumeMounts, corev1.VolumeMount{
+		Name:      "kube-api-access-abc12",
+		MountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
+		ReadOnly:  true,
+	})
+
+	saSpec2 := baseSpec.DeepCopy()
+	saSpec2.Volumes = append(saSpec2.Volumes, corev1.Volume{
+		Name: "kube-api-access-xyz89",
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{},
+		},
+	})
+	saSpec2.Containers[0].VolumeMounts = append(saSpec2.Containers[0].VolumeMounts, corev1.VolumeMount{
+		Name:      "kube-api-access-xyz89",
+		MountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
+		ReadOnly:  true,
+	})
+
+	saDigest1, err := DistilledPodSpecDigest(saSpec1)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed for saSpec1: %v", err)
+	}
+	saDigest2, err := DistilledPodSpecDigest(saSpec2)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed for saSpec2: %v", err)
+	}
+	if saDigest1 != saDigest2 {
+		t.Errorf("expected SA projected volume suffix to normalize to identical digest, got %q vs %q", saDigest1, saDigest2)
+	}
+
+	// Ephemeral debug container normalization test
+	ephemSpec := baseSpec.DeepCopy()
+	ephemSpec.EphemeralContainers = []corev1.EphemeralContainer{
+		{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+				Name:  "debugger",
+				Image: "busybox:latest",
+			},
+		},
+	}
+	ephemDigest, err := DistilledPodSpecDigest(ephemSpec)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed for ephemSpec: %v", err)
+	}
+	if ephemDigest != digest1 {
+		t.Errorf("expected ephemeral debug containers to be cleared, got %q vs %q", ephemDigest, digest1)
+	}
+
 	// Nil spec returns empty string
 	nilDigest, err := DistilledPodSpecDigest(nil)
 	if err != nil || nilDigest != "" {
@@ -1052,5 +1109,34 @@ func TestFindUnassignedActivePMJ_VPADistilledSpecMatching(t *testing.T) {
 	got4, err := FindUnassignedActivePMJ(ctx, c, "default", "web-deploy-new", "web-deploy", "Deployment", "deploy-uid-111", "hash-vpa-scaled", "", diffDigest)
 	if err != nil || got4 != "" {
 		t.Errorf("differing template hash with mismatched distilledDigest expected empty string, got %q, err=%v", got4, err)
+	}
+
+	// 5. Candidate priority: exact template hash match takes precedence over distilled spec fallback match
+	pmjExact := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-web-deploy-exact",
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelParentName:          "web-deploy",
+				LabelParentKind:          "Deployment",
+				LabelParentUID:           "deploy-uid-111",
+				LabelPodTemplateHash:     "hash-target-revision",
+				LabelDistilledSpecDigest: originDigest[:63],
+			},
+			Annotations: map[string]string{
+				AnnotationDistilledSpecDigest: originDigest,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "web-deploy-exact"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+	cPriority := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pmj, pmjExact).Build()
+	got5, err := FindUnassignedActivePMJ(ctx, cPriority, "default", "web-deploy-new", "web-deploy", "Deployment", "deploy-uid-111", "hash-target-revision", "", originDigest)
+	if err != nil || got5 != pmjExact.Name {
+		t.Errorf("candidate priority expected exact match %q over distilled fallback %q, got %q, err=%v", pmjExact.Name, pmj.Name, got5, err)
 	}
 }

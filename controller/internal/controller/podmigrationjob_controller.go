@@ -771,40 +771,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	case pmv1alpha1.PodMigrationJobPhasePending:
 		var annotationUpdated bool
 		// Capture PV Names, origin node name, and migration timeout before starting checkpoint (pod is guaranteed to exist)
-		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" || (job.Annotations == nil || job.Annotations[util.AnnotationMigrationTimeout] == "") {
-			originPod := &corev1.Pod{}
-			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					logger.Info("Origin pod no longer exists in Pending state, failing migration job")
-					job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
-					now := metav1.Now()
-					job.Status.CompletionTime = &now
-
-					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-						Type:               "Ready",
-						Status:             metav1.ConditionFalse,
-						Reason:             "PodNotFound",
-						Message:            "Origin pod no longer exists in Pending state",
-						ObservedGeneration: job.Generation,
-					})
-
-					if err := r.patchStatus(ctx, job, origJob); err != nil {
-						return r.handleStatusError(ctx, err, "Failed to update job status to Failed on missing origin pod")
-					}
-					metrics.MarkPMJInactive(req.NamespacedName.String())
-					metrics.RecordPhaseDuration("pending", time.Since(job.CreationTimestamp.Time).Seconds())
-					metrics.RecordOutcome("failed")
-					r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Origin pod no longer exists in Pending state")
-					return ctrl.Result{}, nil
-				}
-				logger.Error(err, "Failed to get origin pod for PV analysis in Pending state")
-				return ctrl.Result{}, err
-			}
-
-			// If the pod was replaced with a new instance (UID changed), fail the migration job.
-			if string(originPod.UID) != job.Spec.TargetPodUID {
-				logger.Info("Origin pod UID mismatch in Pending state, failing migration job", "expectedUID", job.Spec.TargetPodUID, "actualUID", originPod.UID)
+		originPod := &corev1.Pod{}
+		err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("Origin pod no longer exists in Pending state, failing migration job")
 				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 				now := metav1.Now()
 				job.Status.CompletionTime = &now
@@ -813,101 +784,104 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					Type:               "Ready",
 					Status:             metav1.ConditionFalse,
 					Reason:             "PodNotFound",
-					Message:            "Origin pod UID mismatch in Pending state",
+					Message:            "Origin pod no longer exists in Pending state",
 					ObservedGeneration: job.Generation,
 				})
 
 				if err := r.patchStatus(ctx, job, origJob); err != nil {
-					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on origin pod UID mismatch")
+					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on missing origin pod")
 				}
 				metrics.MarkPMJInactive(req.NamespacedName.String())
 				metrics.RecordPhaseDuration("pending", time.Since(job.CreationTimestamp.Time).Seconds())
 				metrics.RecordOutcome("failed")
-				r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Origin pod UID mismatch in Pending state")
+				r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Origin pod no longer exists in Pending state")
 				return ctrl.Result{}, nil
 			}
+			logger.Error(err, "Failed to get origin pod for PV analysis in Pending state")
+			return ctrl.Result{}, err
+		}
 
-			// VPA Resize State Handshake: if the origin pod has an in-place resize in progress,
-			// defer taking snapshot until the resize completes to prevent checkpointing inconsistent
-			// cgroups / memory bounds or VFS dirty pages.
-			if originPod.Status.Resize == corev1.PodResizeStatusInProgress {
-				cond := meta.FindStatusCondition(job.Status.Conditions, "Ready")
-				if cond == nil || cond.Reason != "VPAResizeInProgress" {
-					logger.Info("Origin pod has in-place resize in progress, deferring snapshot trigger until resize completes",
-						"pod", originPod.Name, "resizeStatus", originPod.Status.Resize)
-					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-						Type:               "Ready",
-						Status:             metav1.ConditionFalse,
-						Reason:             "VPAResizeInProgress",
-						Message:            fmt.Sprintf("Origin pod %s has in-place resize in progress (%s); deferring snapshot", originPod.Name, originPod.Status.Resize),
-						ObservedGeneration: job.Generation,
-					})
-					if err := r.patchStatus(ctx, job, origJob); err != nil {
-						return r.handleStatusError(ctx, err, "Failed to update job status on VPAResizeInProgress")
-					}
-					r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "VPAResizeWaiting",
-						"Deferring snapshot trigger for pod %s while in-place resize is InProgress", originPod.Name)
-				}
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-			}
+		// If the pod was replaced with a new instance (UID changed), fail the migration job.
+		if string(originPod.UID) != job.Spec.TargetPodUID {
+			logger.Info("Origin pod UID mismatch in Pending state, failing migration job", "expectedUID", job.Spec.TargetPodUID, "actualUID", originPod.UID)
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+			now := metav1.Now()
+			job.Status.CompletionTime = &now
 
-			if job.Status.OriginNodeName == "" && originPod.Spec.NodeName != "" {
-				job.Status.OriginNodeName = originPod.Spec.NodeName
-			}
+			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "PodNotFound",
+				Message:            "Origin pod UID mismatch in Pending state",
+				ObservedGeneration: job.Generation,
+			})
 
-			if job.Annotations == nil {
-				job.Annotations = make(map[string]string)
+			if err := r.patchStatus(ctx, job, origJob); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to update job status to Failed on origin pod UID mismatch")
 			}
-			if job.Annotations[util.AnnotationDistilledSpecDigest] == "" {
-				if d, err := util.DistilledPodSpecDigest(&originPod.Spec); err == nil && d != "" {
-					job.Annotations[util.AnnotationDistilledSpecDigest] = d
-					if job.Labels == nil {
-						job.Labels = make(map[string]string)
-					}
-					if job.Labels[util.LabelDistilledSpecDigest] == "" {
-						job.Labels[util.LabelDistilledSpecDigest] = d[:63]
-					}
-					annotationUpdated = true
-				}
-			}
-			if job.Annotations[util.AnnotationMigrationTimeout] == "" {
-				var rawTimeout string
-				if originPod.Annotations != nil {
-					rawTimeout = originPod.Annotations[util.AnnotationMigrationTimeout]
-				}
-				memBytes := util.CalculatePodMemoryRequest(originPod)
-				calculated := util.CalculateMigrationTimeout(rawTimeout, memBytes, r.DefaultMigrationTimeout)
-				base := r.DefaultMigrationTimeout
-				if base <= 0 {
-					base = util.DefaultMigrationTimeout
-				}
-				if calculated != base {
-					job.Annotations[util.AnnotationMigrationTimeout] = calculated.String()
-					annotationUpdated = true
-				}
-			}
+			metrics.MarkPMJInactive(req.NamespacedName.String())
+			metrics.RecordPhaseDuration("pending", time.Since(job.CreationTimestamp.Time).Seconds())
+			metrics.RecordOutcome("failed")
+			r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Origin pod UID mismatch in Pending state")
+			return ctrl.Result{}, nil
+		}
 
-			if len(job.Status.PVsToDetach) == 0 {
-				var pvs []string
-				for _, vol := range originPod.Spec.Volumes {
-					if vol.PersistentVolumeClaim != nil {
-						pvc := &corev1.PersistentVolumeClaim{}
-						err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
-						if err != nil {
-							if apierrors.IsNotFound(err) {
-								logger.Info("PVC not found, skipping volume", "pvc", vol.PersistentVolumeClaim.ClaimName)
-								continue
-							}
-							logger.Error(err, "Failed to get PVC for volume analysis", "pvc", vol.PersistentVolumeClaim.ClaimName)
-							return ctrl.Result{}, err // Return error to trigger manager retry
+		if job.Status.OriginNodeName == "" && originPod.Spec.NodeName != "" {
+			job.Status.OriginNodeName = originPod.Spec.NodeName
+		}
+
+		if job.Annotations == nil {
+			job.Annotations = make(map[string]string)
+		}
+		if job.Annotations[util.AnnotationDistilledSpecDigest] == "" {
+			if d, err := util.DistilledPodSpecDigest(&originPod.Spec); err == nil && d != "" {
+				job.Annotations[util.AnnotationDistilledSpecDigest] = d
+				if job.Labels == nil {
+					job.Labels = make(map[string]string)
+				}
+				if job.Labels[util.LabelDistilledSpecDigest] == "" {
+					job.Labels[util.LabelDistilledSpecDigest] = d[:63]
+				}
+				annotationUpdated = true
+			}
+		}
+		if job.Annotations[util.AnnotationMigrationTimeout] == "" {
+			var rawTimeout string
+			if originPod.Annotations != nil {
+				rawTimeout = originPod.Annotations[util.AnnotationMigrationTimeout]
+			}
+			memBytes := util.CalculatePodMemoryRequest(originPod)
+			calculated := util.CalculateMigrationTimeout(rawTimeout, memBytes, r.DefaultMigrationTimeout)
+			base := r.DefaultMigrationTimeout
+			if base <= 0 {
+				base = util.DefaultMigrationTimeout
+			}
+			if calculated != base {
+				job.Annotations[util.AnnotationMigrationTimeout] = calculated.String()
+				annotationUpdated = true
+			}
+		}
+
+		if len(job.Status.PVsToDetach) == 0 {
+			var pvs []string
+			for _, vol := range originPod.Spec.Volumes {
+				if vol.PersistentVolumeClaim != nil {
+					pvc := &corev1.PersistentVolumeClaim{}
+					err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: vol.PersistentVolumeClaim.ClaimName}, pvc)
+					if err != nil {
+						if apierrors.IsNotFound(err) {
+							logger.Info("PVC not found, skipping volume", "pvc", vol.PersistentVolumeClaim.ClaimName)
+							continue
 						}
-						if pvc.Spec.VolumeName != "" {
-							pvs = append(pvs, pvc.Spec.VolumeName)
-						}
+						logger.Error(err, "Failed to get PVC for volume analysis", "pvc", vol.PersistentVolumeClaim.ClaimName)
+						return ctrl.Result{}, err // Return error to trigger manager retry
+					}
+					if pvc.Spec.VolumeName != "" {
+						pvs = append(pvs, pvc.Spec.VolumeName)
 					}
 				}
-				job.Status.PVsToDetach = pvs
 			}
+			job.Status.PVsToDetach = pvs
 		}
 
 		if annotationUpdated {
@@ -919,6 +893,30 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			job.ObjectMeta = *jobToUpdate.ObjectMeta.DeepCopy()
 			job.Status = *savedStatus
 			origJob.ObjectMeta = *jobToUpdate.ObjectMeta.DeepCopy()
+		}
+
+		// VPA Resize State Handshake: if the origin pod has an in-place resize in progress,
+		// defer taking snapshot until the resize completes to prevent checkpointing inconsistent
+		// cgroups / memory bounds or VFS dirty pages.
+		if originPod.Status.Resize == corev1.PodResizeStatusInProgress {
+			cond := meta.FindStatusCondition(job.Status.Conditions, "Ready")
+			if cond == nil || cond.Reason != "VPAResizeInProgress" {
+				logger.Info("Origin pod has in-place resize in progress, deferring snapshot trigger until resize completes",
+					"pod", originPod.Name, "resizeStatus", originPod.Status.Resize)
+				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "VPAResizeInProgress",
+					Message:            fmt.Sprintf("Origin pod %s has in-place resize in progress (%s); deferring snapshot", originPod.Name, originPod.Status.Resize),
+					ObservedGeneration: job.Generation,
+				})
+				if err := r.patchStatus(ctx, job, origJob); err != nil {
+					return r.handleStatusError(ctx, err, "Failed to update job status on VPAResizeInProgress")
+				}
+				r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "VPAResizeWaiting",
+					"Deferring snapshot trigger for pod %s while in-place resize is InProgress", originPod.Name)
+			}
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
