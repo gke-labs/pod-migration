@@ -495,9 +495,11 @@ func TestPodGateInjector(t *testing.T) {
 				WithRuntimeObjects(tt.initObjs...).
 				Build()
 
+			emptyReader := fake.NewClientBuilder().WithScheme(scheme).Build()
+
 			handler := &PodGateInjector{
 				Client:    cl,
-				APIReader: cl,
+				APIReader: emptyReader,
 				decoder:   dec,
 			}
 
