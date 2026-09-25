@@ -153,8 +153,10 @@ func main() {
 	}
 
 	// Cache indexes must be registered before any controller starts:
-	// 1. Pods by assigned PMJ (used by gate mapper and restore-timeout deferral)
+	// 1. Pods by assigned PMJ (used by gate mapper, collision resolution, and admission assignment)
 	// 2. VolumeAttachments by persistent volume name (used by PMJ detachment wait)
+	// 3. PodMigrationJobs by parent workload key (used by replacement webhook admission)
+	// 4. PodMigrationJobs by snapshot reference (used by cleanup)
 	if err := controller.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		setupLog.Error(err, "unable to register field indexes")
 		os.Exit(1)

@@ -5065,9 +5065,14 @@ func TestFindUnassignedActivePMJ_DoesNotReadoptConcludedRestoreCrashPMJ(t *testi
 					Consumed: tc.consumed,
 				},
 			}
-			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pmj).Build()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+				WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+				WithObjects(pmj).
+				Build()
 
-			got, err := util.FindUnassignedActivePMJ(context.Background(), cl, namespace, podName, "", "", "", "", "")
+			got, err := util.FindUnassignedActivePMJ(context.Background(), cl, namespace, podName, "", "", "", "", "", true)
 			if err != nil {
 				t.Fatalf("FindUnassignedActivePMJ failed: %v", err)
 			}
