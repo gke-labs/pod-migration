@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -605,6 +606,197 @@ func TestEvictionGate_APIReaderFallback(t *testing.T) {
 		expectedMsg := "migration job already exists, retrying"
 		if resp.Result.Message != expectedMsg {
 			t.Errorf("Expected message %q, got %q", expectedMsg, resp.Result.Message)
+		}
+	})
+}
+
+func TestEvictionGate_ExcludedPodSelectors_Coexistence(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "kubeflow-ws-pod"
+	podUID := "uid-ws-1234"
+	gvisorRuntime := "gvisor"
+	jobName := util.FormatPMJName(podName, podUID)
+
+	dualLabeledPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled":          "true",
+				"notebooks.kubeflow.org/workspace-name": "my-workspace",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+	}
+
+	// PSP generated from PodMigration with spec.excludedPodSelectors (DoesNotExist on workspace-name)
+	pspWithExclusion := &unstructured.Unstructured{}
+	pspWithExclusion.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	pspWithExclusion.SetName("psp-default-manual")
+	pspWithExclusion.SetNamespace(namespace)
+	pspWithExclusion.Object["spec"] = map[string]interface{}{
+		"selector": map[string]interface{}{
+			"matchExpressions": []interface{}{
+				map[string]interface{}{
+					"key":      "pod-migration.gke.io/enabled",
+					"operator": "In",
+					"values":   []interface{}{"true"},
+				},
+				map[string]interface{}{
+					"key":      "notebooks.kubeflow.org/workspace-name",
+					"operator": "DoesNotExist",
+				},
+			},
+		},
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+	}
+	pspWithExclusion.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	// External Kubeflow PSP targeting the workspace pod
+	kubeflowPSP := &unstructured.Unstructured{}
+	kubeflowPSP.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	kubeflowPSP.SetName("ws-my-workspace-policy")
+	kubeflowPSP.SetNamespace(namespace)
+	kubeflowPSP.Object["spec"] = map[string]interface{}{
+		"selector": map[string]interface{}{
+			"matchExpressions": []interface{}{
+				map[string]interface{}{
+					"key":      "notebooks.kubeflow.org/workspace-name",
+					"operator": "In",
+					"values":   []interface{}{"my-workspace"},
+				},
+			},
+		},
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+	}
+	kubeflowPSP.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	evictionJSON := []byte(`{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"` + podName + `","namespace":"` + namespace + `"}}`)
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Create,
+			Kind: metav1.GroupVersionKind{
+				Group:   "policy",
+				Version: "v1",
+				Kind:    "Eviction",
+			},
+			Resource: metav1.GroupVersionResource{
+				Group:    "",
+				Version:  "v1",
+				Resource: "pods",
+			},
+			SubResource: "eviction",
+			Name:        podName,
+			Namespace:   namespace,
+			Object: runtime.RawExtension{
+				Raw: evictionJSON,
+			},
+		},
+	}
+
+	t.Run("Only excluded PSP exists: cold eviction allowed with Warning event", func(t *testing.T) {
+		recorder := record.NewFakeRecorder(10)
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(dualLabeledPod, pspWithExclusion).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			Build()
+
+		handler := &EvictionGate{
+			Client:    fakeClient,
+			APIReader: fakeClient,
+			Recorder:  recorder,
+		}
+
+		resp := handler.Handle(context.Background(), req)
+		if !resp.Allowed {
+			t.Fatalf("Expected eviction to be allowed when no policy matches due to selector exclusion, got denied")
+		}
+
+		// Verify Warning event emitted
+		select {
+		case ev := <-recorder.Events:
+			if !strings.Contains(ev, "MigrationSkippedNoPolicy") {
+				t.Errorf("Expected MigrationSkippedNoPolicy event, got: %s", ev)
+			}
+		default:
+			t.Errorf("Expected Warning MigrationSkippedNoPolicy event, but none was recorded")
+		}
+
+		// Verify no PMJ was created
+		pmj := &pmv1alpha1.PodMigrationJob{}
+		err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: jobName}, pmj)
+		if err == nil || !apierrors.IsNotFound(err) {
+			t.Errorf("Expected PMJ to not exist, got: %v", err)
+		}
+	})
+
+	t.Run("Both excluded PSP and external PSP exist: adopts external PSP and denies eviction", func(t *testing.T) {
+		recorder := record.NewFakeRecorder(10)
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(dualLabeledPod, pspWithExclusion, kubeflowPSP).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			Build()
+
+		handler := &EvictionGate{
+			Client:    fakeClient,
+			APIReader: fakeClient,
+			Recorder:  recorder,
+		}
+
+		resp := handler.Handle(context.Background(), req)
+		if resp.Allowed {
+			t.Fatalf("Expected eviction to be denied (429) when external PSP matches, got allowed")
+		}
+		if resp.Result == nil || resp.Result.Code != http.StatusTooManyRequests {
+			t.Fatalf("Expected status code 429, got: %+v", resp.Result)
+		}
+
+		// Verify PMJ was created
+		pmj := &pmv1alpha1.PodMigrationJob{}
+		err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: jobName}, pmj)
+		if err != nil {
+			t.Fatalf("Failed to find created PMJ: %v", err)
+		}
+		if pmj.Spec.TargetPodUID != podUID {
+			t.Errorf("Expected TargetPodUID %s, got %s", podUID, pmj.Spec.TargetPodUID)
 		}
 	})
 }

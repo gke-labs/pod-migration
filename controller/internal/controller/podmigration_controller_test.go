@@ -339,6 +339,402 @@ func TestPodMigrationReconciler_Reconcile_InvalidGCSPath(t *testing.T) {
 	}
 }
 
+func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_Success(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	configName := "test-migration-exclusions"
+
+	config := &pmv1alpha1.PodMigration{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigration",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  namespace,
+			Name:       configName,
+			Generation: 1,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://my-test-bucket/snapshots/path",
+			},
+			ExcludedPodSelectors: []metav1.LabelSelectorRequirement{
+				{
+					Key:      "notebooks.kubeflow.org/workspace-name",
+					Operator: metav1.LabelSelectorOpDoesNotExist,
+				},
+				{
+					Key:      "tier",
+					Operator: metav1.LabelSelectorOpNotIn,
+					Values:   []string{"cache", "batch"},
+				},
+			},
+		},
+	}
+
+	psscMock := &unstructured.Unstructured{}
+	psscMock.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotStorageConfig",
+	})
+	pspMock := &unstructured.Unstructured{}
+	pspMock.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		WithStatusSubresource(psscMock).
+		WithStatusSubresource(pspMock).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      configName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// Verify status condition Ready=True
+	updatedConfig := &pmv1alpha1.PodMigration{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, updatedConfig)
+	if err != nil {
+		t.Fatalf("Failed to get updated config: %v", err)
+	}
+
+	cond := meta.FindStatusCondition(updatedConfig.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatalf("Ready condition not found in status")
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("Expected status True, got %s. Message: %s", cond.Status, cond.Message)
+	}
+	if cond.Reason != "Reconciled" {
+		t.Errorf("Expected reason Reconciled, got %s", cond.Reason)
+	}
+
+	// Verify PodSnapshotPolicy selector has 3 matchExpressions
+	pspList := &unstructured.UnstructuredList{}
+	pspList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicyList",
+	})
+	if err := fakeClient.List(context.Background(), pspList); err != nil {
+		t.Fatalf("Failed to list PSPs: %v", err)
+	}
+	if len(pspList.Items) != 1 {
+		t.Fatalf("Expected 1 PSP, got %d", len(pspList.Items))
+	}
+	psp := pspList.Items[0]
+
+	pspSpec, ok := psp.Object["spec"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("PSP spec is not a map")
+	}
+	selector, ok := pspSpec["selector"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("PSP selector is not a map")
+	}
+	matchExpressions, ok := selector["matchExpressions"].([]interface{})
+	if !ok {
+		t.Fatalf("PSP selector matchExpressions is not a slice, got %T", selector["matchExpressions"])
+	}
+	if len(matchExpressions) != 3 {
+		t.Fatalf("Expected 3 matchExpressions, got %d: %+v", len(matchExpressions), matchExpressions)
+	}
+
+	// 1. Opt-in expr
+	expr0 := matchExpressions[0].(map[string]interface{})
+	if expr0["key"] != "pod-migration.gke.io/enabled" || expr0["operator"] != "In" {
+		t.Errorf("Unexpected expr0: %+v", expr0)
+	}
+
+	// 2. DoesNotExist expr
+	expr1 := matchExpressions[1].(map[string]interface{})
+	if expr1["key"] != "notebooks.kubeflow.org/workspace-name" || expr1["operator"] != "DoesNotExist" {
+		t.Errorf("Unexpected expr1: %+v", expr1)
+	}
+	if _, ok := expr1["values"]; ok {
+		t.Errorf("DoesNotExist expression should not have values field: %+v", expr1)
+	}
+
+	// 3. NotIn expr
+	expr2 := matchExpressions[2].(map[string]interface{})
+	if expr2["key"] != "tier" || expr2["operator"] != "NotIn" {
+		t.Errorf("Unexpected expr2: %+v", expr2)
+	}
+	vals, ok := expr2["values"].([]interface{})
+	if !ok || len(vals) != 2 || vals[0] != "cache" || vals[1] != "batch" {
+		t.Errorf("Unexpected values in expr2: %+v", expr2)
+	}
+}
+
+func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_Update(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	configName := "test-migration-update"
+
+	config := &pmv1alpha1.PodMigration{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigration",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  namespace,
+			Name:       configName,
+			Generation: 1,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://my-test-bucket/snapshots/path",
+			},
+		},
+	}
+
+	psscMock := &unstructured.Unstructured{}
+	psscMock.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotStorageConfig",
+	})
+	pspMock := &unstructured.Unstructured{}
+	pspMock.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		WithStatusSubresource(psscMock).
+		WithStatusSubresource(pspMock).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// First reconcile without ExcludedPodSelectors
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      configName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("First reconcile failed: %v", err)
+	}
+
+	// Update config with ExcludedPodSelectors
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, config)
+	if err != nil {
+		t.Fatalf("Failed to get config: %v", err)
+	}
+	config.Spec.ExcludedPodSelectors = []metav1.LabelSelectorRequirement{
+		{
+			Key:      "notebooks.kubeflow.org/workspace-name",
+			Operator: metav1.LabelSelectorOpDoesNotExist,
+		},
+	}
+	config.Generation = 2
+	if err := fakeClient.Update(context.Background(), config); err != nil {
+		t.Fatalf("Failed to update config: %v", err)
+	}
+
+	// Second reconcile
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      configName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Second reconcile failed: %v", err)
+	}
+
+	// Verify PSP was updated in-place
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	pspName := getPSPManualName(configName)
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pspName}, psp); err != nil {
+		t.Fatalf("Failed to get updated PSP: %v", err)
+	}
+
+	pspSpec := psp.Object["spec"].(map[string]interface{})
+	selector := pspSpec["selector"].(map[string]interface{})
+	matchExpressions := selector["matchExpressions"].([]interface{})
+	if len(matchExpressions) != 2 {
+		t.Fatalf("Expected 2 matchExpressions after update, got %d: %+v", len(matchExpressions), matchExpressions)
+	}
+}
+
+func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErrors(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+
+	tests := []struct {
+		name        string
+		requirement metav1.LabelSelectorRequirement
+		errSubstr   string
+	}{
+		{
+			name: "empty key",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "",
+				Operator: metav1.LabelSelectorOpDoesNotExist,
+			},
+			errSubstr: "key must not be empty",
+		},
+		{
+			name: "override opt-in key",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "pod-migration.gke.io/enabled",
+				Operator: metav1.LabelSelectorOpDoesNotExist,
+			},
+			errSubstr: "cannot be overridden",
+		},
+		{
+			name: "invalid operator",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "app",
+				Operator: "InvalidOperator",
+			},
+			errSubstr: "invalid operator",
+		},
+		{
+			name: "In operator with empty values",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{},
+			},
+			errSubstr: "requires non-empty values",
+		},
+		{
+			name: "NotIn operator with empty values",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpNotIn,
+				Values:   nil,
+			},
+			errSubstr: "requires non-empty values",
+		},
+		{
+			name: "Exists operator with non-empty values",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpExists,
+				Values:   []string{"val"},
+			},
+			errSubstr: "requires empty values",
+		},
+		{
+			name: "DoesNotExist operator with non-empty values",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpDoesNotExist,
+				Values:   []string{"val"},
+			},
+			errSubstr: "requires empty values",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configName := "invalid-selector-" + strings.ReplaceAll(tt.name, " ", "-")
+			config := &pmv1alpha1.PodMigration{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "podmigration.gke.io/v1alpha1",
+					Kind:       "PodMigration",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:  namespace,
+					Name:       configName,
+					Generation: 1,
+				},
+				Spec: pmv1alpha1.PodMigrationSpec{
+					Storage: pmv1alpha1.StorageSpec{
+						Location: "gs://my-test-bucket/snapshots",
+					},
+					ExcludedPodSelectors: []metav1.LabelSelectorRequirement{
+						tt.requirement,
+					},
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(config).
+				WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+				Build()
+
+			r := &PodMigrationReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			_, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: namespace,
+					Name:      configName,
+				},
+			})
+			if err == nil {
+				t.Fatalf("Expected reconcile error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.errSubstr) {
+				t.Errorf("Expected error to contain %q, got: %v", tt.errSubstr, err)
+			}
+
+			updatedConfig := &pmv1alpha1.PodMigration{}
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, updatedConfig); err != nil {
+				t.Fatalf("Failed to get updated config: %v", err)
+			}
+
+			cond := meta.FindStatusCondition(updatedConfig.Status.Conditions, "Ready")
+			if cond == nil {
+				t.Fatalf("Ready condition not found in status")
+			}
+			if cond.Status != metav1.ConditionFalse {
+				t.Errorf("Expected status False, got %s", cond.Status)
+			}
+			if cond.Reason != "InvalidExcludedPodSelectors" {
+				t.Errorf("Expected reason InvalidExcludedPodSelectors, got %s", cond.Reason)
+			}
+			if !strings.Contains(cond.Message, tt.errSubstr) {
+				t.Errorf("Expected condition message to contain %q, got: %s", tt.errSubstr, cond.Message)
+			}
+		})
+	}
+}
+
 func TestPodMigrationReconciler_Finalizer_AddedOnReconcile(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = pmv1alpha1.AddToScheme(scheme)

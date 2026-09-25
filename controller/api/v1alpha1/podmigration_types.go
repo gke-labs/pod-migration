@@ -13,6 +13,12 @@ type StorageSpec struct {
 // PodMigrationSpec defines the desired config.
 type PodMigrationSpec struct {
 	Storage StorageSpec `json:"storage"`
+
+	// ExcludedPodSelectors specifies label selector requirements to exclude pods from
+	// the automatically generated PodSnapshotPolicy. Useful when coexisting with external
+	// controllers that reconcile their own PodSnapshotPolicies (e.g. Kubeflow Notebooks).
+	// +optional
+	ExcludedPodSelectors []metav1.LabelSelectorRequirement `json:"excludedPodSelectors,omitempty"`
 }
 
 // PodMigrationStatus defines the observed state.
