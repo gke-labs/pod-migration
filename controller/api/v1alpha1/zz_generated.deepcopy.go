@@ -143,6 +143,10 @@ func (in *PodMigrationJobStatus) DeepCopyInto(out *PodMigrationJobStatus) {
 		in, out := &in.SnapshottingStartTime, &out.SnapshottingStartTime
 		*out = (*in).DeepCopy()
 	}
+	if in.EvictingStartTime != nil {
+		in, out := &in.EvictingStartTime, &out.EvictingStartTime
+		*out = (*in).DeepCopy()
+	}
 	if in.RestoringStartTime != nil {
 		in, out := &in.RestoringStartTime, &out.RestoringStartTime
 		*out = (*in).DeepCopy()

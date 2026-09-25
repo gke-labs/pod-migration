@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -31,9 +32,11 @@ import (
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
 // EvictionGate handles eviction requests and creates PodMigrationJobs.
 type EvictionGate struct {
-	Client    client.Client
-	APIReader client.Reader
-	decoder   admission.Decoder
+	Client                  client.Client
+	APIReader               client.Reader
+	Recorder                record.EventRecorder
+	DefaultMigrationTimeout time.Duration
+	decoder                 admission.Decoder
 }
 
 // Handle intercepts eviction requests.
@@ -132,6 +135,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if hash, ok := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]; ok && hash != "" {
 		jobLabels[util.LabelPodTemplateHash] = hash
 	}
+	if rev, ok := pod.Labels[appsv1.ControllerRevisionHashLabelKey]; ok && rev != "" {
+		jobLabels[util.LabelControllerRevisionHash] = rev
+	}
 	if idx, ok := pod.Labels[util.LabelJobCompletionIndex]; ok && idx != "" {
 		jobLabels[util.LabelJobCompletionIndex] = idx
 	}
@@ -145,16 +151,43 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 
 	if matchingPSP == nil {
 		logger.Info("No matching ready manual+stop policy found, skipping migration and allowing eviction", "pod", req.Name)
+		if a.Recorder != nil {
+			a.Recorder.Event(pod, corev1.EventTypeWarning, "MigrationSkippedNoPolicy",
+				"Pod is opted into live migration, but no matching Ready manual+stop PodSnapshotPolicy was found; allowing cold eviction")
+		}
 		return admission.Allowed("skipping migration: no valid manual+stop policy found")
 	}
 
 	// Create new PodMigrationJob
 	logger.Info("Creating PodMigrationJob", "job", jobName)
+	var jobAnnotations map[string]string
+	baseTimeout := a.DefaultMigrationTimeout
+	if baseTimeout <= 0 {
+		baseTimeout = util.DefaultMigrationTimeout
+	}
+	var rawTimeout string
+	if pod.Annotations != nil {
+		rawTimeout = pod.Annotations[util.AnnotationMigrationTimeout]
+	}
+	memBytes := util.CalculatePodMemoryRequest(pod)
+	effectiveTimeout := util.CalculateMigrationTimeout(rawTimeout, memBytes, baseTimeout)
+	if effectiveTimeout != baseTimeout || rawTimeout != "" {
+		if jobAnnotations == nil {
+			jobAnnotations = make(map[string]string)
+		}
+		if _, ok := util.ParseClampedTimeout(rawTimeout); ok {
+			jobAnnotations[util.AnnotationMigrationTimeout] = rawTimeout
+		} else if effectiveTimeout != baseTimeout {
+			jobAnnotations[util.AnnotationMigrationTimeout] = effectiveTimeout.String()
+		}
+	}
+
 	newJob := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: req.Namespace,
-			Labels:    jobLabels,
+			Name:        jobName,
+			Namespace:   req.Namespace,
+			Labels:      jobLabels,
+			Annotations: jobAnnotations,
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef: corev1.LocalObjectReference{
@@ -197,15 +230,17 @@ func (a *EvictionGate) InjectDecoder(d admission.Decoder) error {
 }
 
 // SetupEvictionWebhookWithManager registers the webhook on the manager.
-func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader) error {
+func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, defaultTimeout time.Duration) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/validate-v1-pod-eviction",
 		&admission.Webhook{
 			Handler: &EvictionGate{
-				Client:    mgr.GetClient(),
-				APIReader: apiReader,
-				decoder:   dec,
+				Client:                  mgr.GetClient(),
+				APIReader:               apiReader,
+				Recorder:                mgr.GetEventRecorderFor("pod-migration-controller"),
+				DefaultMigrationTimeout: defaultTimeout,
+				decoder:                 dec,
 			},
 		},
 	)

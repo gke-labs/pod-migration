@@ -9,11 +9,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -65,15 +67,17 @@ func TestEvictionGate(t *testing.T) {
 	otherRuntime := "other"
 
 	tests := []struct {
-		name               string
-		pod                *corev1.Pod
-		initObjects        []client.Object
-		subResource        string
-		expectedAllowed    bool
-		expectedStatusCode int32
-		expectedMessage    string
-		verifyPMJCreated   bool
-		expectedLabels     map[string]string
+		name                string
+		pod                 *corev1.Pod
+		initObjects         []client.Object
+		subResource         string
+		expectedAllowed     bool
+		expectedStatusCode  int32
+		expectedMessage     string
+		verifyPMJCreated    bool
+		expectedLabels      map[string]string
+		expectedAnnotations map[string]string
+		expectNoPolicyWarn  bool
 	}{
 		{
 			name: "Not an eviction request",
@@ -229,9 +233,10 @@ func TestEvictionGate(t *testing.T) {
 					RuntimeClassName: &gvisorRuntime,
 				},
 			},
-			subResource:     "eviction",
-			expectedAllowed: true,
-			expectedMessage: "skipping migration: no valid manual+stop policy found",
+			subResource:        "eviction",
+			expectedAllowed:    true,
+			expectedMessage:    "skipping migration: no valid manual+stop policy found",
+			expectNoPolicyWarn: true,
 		},
 		{
 			name: "Bypass migration when policy has resume instead of stop",
@@ -251,9 +256,10 @@ func TestEvictionGate(t *testing.T) {
 			initObjects: []client.Object{
 				createPSP("psp-test-manual-resume", "manual", "resume"),
 			},
-			subResource:     "eviction",
-			expectedAllowed: true,
-			expectedMessage: "skipping migration: no valid manual+stop policy found",
+			subResource:        "eviction",
+			expectedAllowed:    true,
+			expectedMessage:    "skipping migration: no valid manual+stop policy found",
+			expectNoPolicyWarn: true,
 		},
 		{
 			name: "Pod lacks runtimeClassName",
@@ -372,6 +378,113 @@ func TestEvictionGate(t *testing.T) {
 			expectedAllowed: true,
 			expectedMessage: "skipping migration: prior migration timed out on PDB budget",
 		},
+		{
+			name: "Trigger migration propagates explicit timeout annotation from pod",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "timeout-annotated-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					Annotations: map[string]string{
+						util.AnnotationMigrationTimeout: "25m",
+					},
+					UID: "test-uid-timeout-annotated",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectedAnnotations: map[string]string{
+				util.AnnotationMigrationTimeout: "25m",
+			},
+		},
+		{
+			name: "Trigger migration scales timeout for pod with memory request",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "large-memory-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-large-memory",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+					Containers: []corev1.Container{
+						{
+							Name: "redis",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("16Gi"),
+								},
+							},
+						},
+					},
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectedAnnotations: map[string]string{
+				util.AnnotationMigrationTimeout: "15m27s",
+			},
+		},
+		{
+			name: "Trigger migration with malformed timeout annotation falls back to memory-request scaling",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "malformed-timeout-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					Annotations: map[string]string{
+						util.AnnotationMigrationTimeout: "invalid-duration",
+					},
+					UID: "test-uid-malformed-timeout",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+					Containers: []corev1.Container{
+						{
+							Name: "redis",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("16Gi"),
+								},
+							},
+						},
+					},
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectedAnnotations: map[string]string{
+				util.AnnotationMigrationTimeout: "15m27s",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -383,8 +496,9 @@ func TestEvictionGate(t *testing.T) {
 
 			initObjs := append(tt.initObjects, tt.pod)
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).Build()
+			recorder := record.NewFakeRecorder(10)
 
-			handler := &EvictionGate{Client: fakeClient, APIReader: fakeClient}
+			handler := &EvictionGate{Client: fakeClient, APIReader: fakeClient, Recorder: recorder}
 
 			req := admission.Request{}
 			req.Namespace = tt.pod.Namespace
@@ -419,6 +533,20 @@ func TestEvictionGate(t *testing.T) {
 				}
 			}
 
+			gotNoPolicyWarn := false
+			select {
+			case ev := <-recorder.Events:
+				if ev == "Warning MigrationSkippedNoPolicy Pod is opted into live migration, but no matching Ready manual+stop PodSnapshotPolicy was found; allowing cold eviction" {
+					gotNoPolicyWarn = true
+				} else {
+					t.Errorf("Unexpected event recorded: %s", ev)
+				}
+			default:
+			}
+			if tt.expectNoPolicyWarn != gotNoPolicyWarn {
+				t.Errorf("Expected expectNoPolicyWarn=%t, got %t", tt.expectNoPolicyWarn, gotNoPolicyWarn)
+			}
+
 			if tt.verifyPMJCreated {
 				pmj := &pmv1alpha1.PodMigrationJob{}
 				err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: tt.pod.Namespace, Name: util.FormatPMJName(tt.pod.Name, string(tt.pod.UID))}, pmj)
@@ -428,6 +556,11 @@ func TestEvictionGate(t *testing.T) {
 				for k, v := range tt.expectedLabels {
 					if pmj.Labels[k] != v {
 						t.Errorf("Expected label %s=%s, got %s", k, v, pmj.Labels[k])
+					}
+				}
+				for k, v := range tt.expectedAnnotations {
+					if pmj.Annotations[k] != v {
+						t.Errorf("Expected annotation %s=%s, got %s", k, v, pmj.Annotations[k])
 					}
 				}
 				// Verify that PodSnapshot was NOT created in the webhook
@@ -589,3 +722,98 @@ func TestEvictionGate_APIReaderFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestEvictionGate_PropagatesControllerRevisionHashLabel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "sts-web-0"
+	podUID := "uid-sts-web-0"
+
+	gvisorRuntime := "gvisor"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"app":                          "sts-web",
+				"controller-revision-hash":     "sts-web-6b7f8c9d4",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "StatefulSet",
+					Name: "sts-web",
+					UID:  types.UID("uid-sts-parent"),
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	psp.SetName("psp-sts")
+	psp.SetNamespace(namespace)
+	psp.Object["spec"] = map[string]interface{}{
+		"selector": map[string]interface{}{
+			"matchLabels": map[string]interface{}{
+				"app": "sts-web",
+			},
+		},
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+	}
+	psp.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+	if resp.Allowed {
+		t.Fatalf("Expected initial eviction to create PMJ and return 429, got allowed")
+	}
+
+	jobName := util.FormatPMJName(podName, podUID)
+	createdJob := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: jobName}, createdJob); err != nil {
+		t.Fatalf("Expected PMJ %s to be created, got error: %v", jobName, err)
+	}
+	if got := createdJob.Labels[util.LabelControllerRevisionHash]; got != "sts-web-6b7f8c9d4" {
+		t.Fatalf("Expected PMJ label %s=%q, got %q", util.LabelControllerRevisionHash, "sts-web-6b7f8c9d4", got)
+	}
+}
+

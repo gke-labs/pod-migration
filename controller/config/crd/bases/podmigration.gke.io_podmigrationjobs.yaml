@@ -147,6 +147,11 @@ spec:
                   a subsequent replacement pod may recover and re-adopt this PMJ. Once GateReleased is true, subsequent
                   pods will ignore this PMJ, preventing cross-generational stale state resurrection.
                 type: boolean
+              evictingStartTime:
+                description: EvictingStartTime is the timestamp when this job transitioned
+                  to the Evicting phase.
+                format: date-time
+                type: string
               gateReleased:
                 description: |-
                   GateReleased indicates whether the scheduling gate on the replacement pod has been

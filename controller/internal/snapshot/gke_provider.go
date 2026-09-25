@@ -3,6 +3,8 @@ package snapshot
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -117,13 +119,16 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	if psmtConditions, ok := psmtStatus["conditions"].([]interface{}); ok {
 		for _, c := range psmtConditions {
 			if cond, ok := c.(map[string]interface{}); ok {
-				if cond["type"] == "Triggered" && cond["status"] == "False" && cond["reason"] == "Failed" {
+				cType, _ := cond["type"].(string)
+				cStatus, _ := cond["status"].(string)
+				cReason, _ := cond["reason"].(string)
+				if cType == "Triggered" && cStatus == "False" && isTerminalSnapshotFailureReason(cReason) {
 					errMsg, _ := cond["message"].(string)
-					logger.Info("PSMT reported terminal failure", "trigger", triggerName, "reason", errMsg)
+					logger.Info("PSMT reported terminal failure", "trigger", triggerName, "reason", cReason, "message", errMsg)
 					return &Status{
 						Phase:   PhaseFailed,
 						Reason:  "SnapshotTriggerFailed",
-						Message: fmt.Sprintf("GKE PodSnapshotManualTrigger failed: %s", errMsg),
+						Message: fmt.Sprintf("GKE PodSnapshotManualTrigger failed (%s): %s", cReason, errMsg),
 					}, nil
 				}
 			}
@@ -177,6 +182,20 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	}
 
 	conditions, _ := snapStatus["conditions"].([]interface{})
+	var lastProgress time.Time
+	for _, c := range conditions {
+		if cond, ok := c.(map[string]interface{}); ok {
+			if lttStr, ok := cond["lastTransitionTime"].(string); ok {
+				if t, err := time.Parse(time.RFC3339, lttStr); err == nil && t.After(lastProgress) {
+					lastProgress = t
+				}
+			}
+		}
+	}
+	if lastProgress.IsZero() {
+		lastProgress = targetSnapshot.GetCreationTimestamp().Time
+	}
+
 	// Pass 1: Scan all conditions for terminal failures
 	for _, c := range conditions {
 		cond, ok := c.(map[string]interface{})
@@ -185,15 +204,28 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 			cStatus, _ := cond["status"].(string)
 			cReason, _ := cond["reason"].(string)
 			cMsg, _ := cond["message"].(string)
-			if cStatus == "False" && (cReason == "Failed" || cReason == "Error") && (cType == "Checkpoint" || cType == "StorageReplicated" || cType == "Ready") {
-				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", cType, "reason", cMsg)
+			if cStatus == "False" && isTerminalSnapshotFailureReason(cReason) && (cType == "Checkpoint" || cType == "StorageReplicated" || cType == "Ready") {
+				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", cType, "reason", cReason, "message", cMsg)
 				return &Status{
 					Phase:       PhaseFailed,
 					SnapshotRef: snapshotName,
 					Reason:      "SnapshotFailed",
-					Message:     fmt.Sprintf("GKE PodSnapshot %s failed: %s", cType, cMsg),
+					Message:     fmt.Sprintf("GKE PodSnapshot %s failed (%s): %s", cType, cReason, cMsg),
 				}, nil
 			}
+		}
+	}
+
+	// Check top-level phase if present on PodSnapshot
+	if topPhase, ok := snapStatus["phase"].(string); ok {
+		if isTerminalSnapshotFailureReason(topPhase) {
+			logger.Info("PodSnapshot reported terminal failure via phase", "snapshot", snapshotName, "phase", topPhase)
+			return &Status{
+				Phase:       PhaseFailed,
+				SnapshotRef: snapshotName,
+				Reason:      "SnapshotFailed",
+				Message:     fmt.Sprintf("GKE PodSnapshot failed with phase=%s", topPhase),
+			}, nil
 		}
 	}
 
@@ -221,10 +253,11 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 
 	logger.Info("Snapshot is not ready yet, waiting...")
 	return &Status{
-		Phase:       PhaseInProgress,
-		SnapshotRef: snapshotName,
-		Reason:      "Snapshotting",
-		Message:     fmt.Sprintf("Waiting for GKE PodSnapshot %q checkpoint to complete", snapshotName),
+		Phase:            PhaseInProgress,
+		SnapshotRef:      snapshotName,
+		Reason:           "Snapshotting",
+		Message:          fmt.Sprintf("Waiting for GKE PodSnapshot %q checkpoint to complete", snapshotName),
+		LastProgressTime: lastProgress,
 	}, nil
 }
 
@@ -249,4 +282,22 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 	}
 	logger.Info("Successfully deleted trigger")
 	return nil
+}
+
+// isTerminalSnapshotFailureReason checks if a condition reason indicates that the snapshot operation
+// has terminally failed and will not recover or complete.
+// Note on retries (#21): When a snapshot provider emits a terminal failure reason (such as Checkpoint failed or
+// DeadlineExceeded), retrying trigger creation within the same PMJ prolongs migration disruption and risks
+// double-checkpointing an actively degrading pod; failing fast allows the controller or workload controller
+// to cleanly initiate fallback or reschedule rather than burning the migration deadline on known terminal states.
+func isTerminalSnapshotFailureReason(reason string) bool {
+	r := strings.ToLower(reason)
+	if r == "" || r == "noerror" || strings.HasPrefix(r, "not") || strings.HasPrefix(r, "non") {
+		return false
+	}
+	switch r {
+	case "failed", "error", "deadlineexceeded":
+		return true
+	}
+	return false
 }
