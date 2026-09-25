@@ -16,11 +16,11 @@ import (
 type Mode string
 
 const (
-	// ModeDisabled turns off invariant evaluation completely.
+	// ModeDisabled (default) turns off invariant evaluation completely.
 	ModeDisabled Mode = "disabled"
-	// ModeObserve (default in production) records Prometheus metrics, emits Kubernetes
-	// Warning Events (Reason: InvariantViolation), and logs structured ERROR entries
-	// without interrupting active migrations.
+	// ModeObserve records Prometheus metrics, emits Kubernetes Warning Events
+	// (Reason: InvariantViolation), and logs structured ERROR entries without
+	// interrupting active migrations.
 	ModeObserve Mode = "observe"
 	// ModeStrict (enabled in per-merge CI T1/T2 and nightly T3) performs all observe
 	// actions and immediately transitions offending PodMigrationJobs to PhaseFailed.
@@ -30,10 +30,10 @@ const (
 // ParseMode validates and normalizes the --invariant-mode CLI flag.
 func ParseMode(raw string) (Mode, error) {
 	switch Mode(strings.ToLower(strings.TrimSpace(raw))) {
-	case "", ModeObserve:
-		return ModeObserve, nil
-	case ModeDisabled:
+	case "", ModeDisabled:
 		return ModeDisabled, nil
+	case ModeObserve:
+		return ModeObserve, nil
 	case ModeStrict:
 		return ModeStrict, nil
 	default:
@@ -53,13 +53,12 @@ type ReconcileSnapshot struct {
 	PrimaryPod       *corev1.Pod
 	PrimaryMigration *pmv1alpha1.PodMigration
 
-	// Optional contextual slices populated when already available in memory or in tests.
+	// Optional contextual slices populated from the informer cache for PMJ reconciles.
 	NamespacePMJs []pmv1alpha1.PodMigrationJob
 	NamespacePods []corev1.Pod
 
 	// Explicit state signals captured during the reconcile step.
 	HasOrphanedTrigger           bool
-	UsedBareDeleteBeforeDeadline bool
 	RestoreCrashSignatureMatched bool
 }
 

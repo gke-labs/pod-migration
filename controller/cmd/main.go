@@ -87,7 +87,7 @@ func main() {
 	flag.Float64Var(&clientGoQPS, "client-go-qps", 500.0, "QPS for client-go REST config")
 	flag.IntVar(&clientGoBurst, "client-go-burst", 1000, "Burst for client-go REST config")
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
-	flag.StringVar(&invariantModeRaw, "invariant-mode", string(invariants.ModeObserve), "Correctness invariant evaluation mode: disabled, observe (default in prod), or strict (CI gate)")
+	flag.StringVar(&invariantModeRaw, "invariant-mode", string(invariants.ModeDisabled), "Correctness invariant evaluation mode: disabled (default), observe, or strict (CI gate)")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)

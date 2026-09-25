@@ -44,31 +44,17 @@ type PodMigrationReconciler struct {
 }
 
 func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config *pmv1alpha1.PodMigration, reconcileErr *error) {
-	if r.InvariantEngine == nil || config == nil {
+	if !r.InvariantEngine.Enabled() || config == nil {
 		return
 	}
-	if reconcileErr != nil && *reconcileErr != nil {
+	if reconcileErr != nil && *reconcileErr != nil && config.DeletionTimestamp.IsZero() {
 		return
-	}
-
-	var namespacePMJs []pmv1alpha1.PodMigrationJob
-	pmjList := &pmv1alpha1.PodMigrationJobList{}
-	if err := r.List(ctx, pmjList, client.InNamespace(config.Namespace)); err == nil {
-		namespacePMJs = pmjList.Items
-	}
-
-	var namespacePods []corev1.Pod
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(config.Namespace)); err == nil {
-		namespacePods = podList.Items
 	}
 
 	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
 		Now:              time.Now(),
 		Reconciler:       "PodMigrationReconciler",
 		PrimaryMigration: config,
-		NamespacePMJs:    namespacePMJs,
-		NamespacePods:    namespacePods,
 	})
 }
 
@@ -87,6 +73,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	err := r.Get(ctx, req.NamespacedName, config)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.InvariantEngine.ForgetObject("PodMigrationReconciler", "mig", req.Namespace, req.Name)
 			logger.Info("PodMigration resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}

@@ -16,6 +16,9 @@ const (
 	// EventReasonInvariantViolation is the Kubernetes Warning Event reason emitted
 	// whenever an invariant (I1-I9) is violated in observe or strict mode.
 	EventReasonInvariantViolation = "InvariantViolation"
+
+	// maxActiveViolationScopes caps the size of the in-memory deduplication map.
+	maxActiveViolationScopes = 4096
 )
 
 // Engine evaluates a set of stateless invariant Rules against ReconcileSnapshots
@@ -34,7 +37,7 @@ type Engine struct {
 // NewEngine constructs an invariant Engine with DefaultRules.
 func NewEngine(mode Mode, recorder record.EventRecorder) *Engine {
 	if mode == "" {
-		mode = ModeObserve
+		mode = ModeDisabled
 	}
 	return &Engine{
 		Mode:             mode,
@@ -42,6 +45,24 @@ func NewEngine(mode Mode, recorder record.EventRecorder) *Engine {
 		Recorder:         recorder,
 		activeViolations: make(map[string]map[string]string),
 	}
+}
+
+// Enabled reports whether the engine is active (observe or strict mode).
+// Reconcilers check Enabled() before building a ReconcileSnapshot or listing
+// namespace objects from the informer cache.
+func (e *Engine) Enabled() bool {
+	return e != nil && e.Mode != "" && e.Mode != ModeDisabled
+}
+
+// ForgetObject removes any cached deduplication state for a deleted object.
+func (e *Engine) ForgetObject(reconciler, kind, namespace, name string) {
+	if e == nil {
+		return
+	}
+	scopeKey := fmt.Sprintf("%s/%s/%s/%s", reconciler, kind, namespace, name)
+	e.mu.Lock()
+	delete(e.activeViolations, scopeKey)
+	e.mu.Unlock()
 }
 
 // ResetDeduplication clears the in-memory violation deduplication state.
@@ -78,7 +99,7 @@ func violationDedupKey(v Violation) string {
 // It returns all detected violations and a boolean indicating whether strict mode
 // requires failing the active migration job immediately.
 func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violation, bool) {
-	if e == nil || e.Mode == ModeDisabled || s == nil {
+	if !e.Enabled() || s == nil {
 		return nil, false
 	}
 
@@ -105,6 +126,14 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 		delete(e.activeViolations, scopeKey)
 		e.mu.Unlock()
 		return nil, false
+	}
+
+	if _, exists := e.activeViolations[scopeKey]; !exists && len(e.activeViolations) >= maxActiveViolationScopes {
+		// Evict one arbitrary entry if the deduplication map hits its cap.
+		for k := range e.activeViolations {
+			delete(e.activeViolations, k)
+			break
+		}
 	}
 
 	prevSet := e.activeViolations[scopeKey]

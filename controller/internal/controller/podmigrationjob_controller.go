@@ -320,8 +320,6 @@ func (r *PodMigrationJobReconciler) concludeRestoreCrash(
 	// "unrecognised" report is superseded.
 	r.clearUnrecognizedRestoreCrash(job)
 
-	_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
-
 	// The status write MUST land before the Delete.  If we deleted first and
 	// then crashed, the PMJ would stay in its pre-fallback phase with its
 	// recorded pod gone and no record of why.
@@ -405,10 +403,10 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
 // evaluateInvariants evaluates the PodMigrationJob and local informer-cached namespace state
-// against the invariant engine. It runs only when the reconcile step completed without error.
-// In strict mode, any violation cleans up triggers, patches the PMJ to PhaseFailed, and suppresses requeue.
+// against the invariant engine when enabled. It runs only when the reconcile step completed without error.
+// In strict mode, any violation patches a non-terminal PMJ to PhaseFailed, cleans up triggers, and suppresses requeue.
 func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job *pmv1alpha1.PodMigrationJob, res *ctrl.Result, reconcileErr *error) {
-	if r.InvariantEngine == nil || job == nil {
+	if !r.InvariantEngine.Enabled() || job == nil {
 		return
 	}
 	if reconcileErr != nil && *reconcileErr != nil {
@@ -439,7 +437,8 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 	}
 
 	hasOrphanedTrigger := false
-	if invariants.IsTerminalPhase(job.Status.Phase) && job.Spec.PodRef.Name != "" {
+	if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
+		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed) && job.Spec.PodRef.Name != "" {
 		triggerName := util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(schema.GroupVersionKind{
@@ -471,7 +470,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		HasOrphanedTrigger:           hasOrphanedTrigger,
 		RestoreCrashSignatureMatched: restoreCrashMatched,
 	})
-	if shouldFailStrict && len(violations) > 0 && job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+	if shouldFailStrict && len(violations) > 0 && !invariants.IsTerminalPhase(job.Status.Phase) {
 		orig := job.DeepCopy()
 		prevPhase := job.Status.Phase
 		v := violations[0]
@@ -485,13 +484,15 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 			Message:            fmt.Sprintf("[%s:%s] %s", v.InvariantID, v.InvariantName, v.Message),
 			ObservedGeneration: job.Generation,
 		})
-		_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
+		// Persist status BEFORE Cleanup so a status patch failure never leaves the PMJ
+		// in an active phase with its trigger already deleted.
 		if patchErr := r.patchStatus(ctx, job, orig); patchErr != nil {
 			if reconcileErr != nil {
 				*reconcileErr = patchErr
 			}
 			return
 		}
+		_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
 		metrics.MarkPMJInactive(job.Namespace + "/" + job.Name)
 		metrics.RecordOutcome("failed")
 		r.recordPreviousPhaseDuration(job, prevPhase)
@@ -512,6 +513,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			r.fallbackEventChecks.Delete(req.NamespacedName.String())
+			r.InvariantEngine.ForgetObject("PodMigrationJobReconciler", "pmj", req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get PodMigrationJob")
@@ -1397,7 +1399,6 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 	// The job is concluding, so a standing "unrecognised start failure" report
 	// no longer describes anything actionable.
 	r.clearUnrecognizedRestoreCrash(job)
-	_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
 	if err := r.patchStatus(ctx, job, orig); err != nil {
 		return err
 	}

@@ -6007,3 +6007,167 @@ func TestPodMigrationJobReconciler_StrictInvariantMode_CleansUpTriggerAndSuppres
 	}
 }
 
+func TestReconcilers_LiveInvariantEvaluation_I1_PodGate_And_PodMigration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+
+	// 1. PodMigrationJobReconciler live I1 evaluation from cached NamespacePods (duplicate snapshot consumption)
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "pmj-i1-live",
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "origin-i1"},
+			TargetPodUID: "uid-origin-i1",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:    "snap-shared-1",
+			Consumed:       true,
+			GateReleased:   true,
+			RestoredPodUID: "uid-consumer-1",
+		},
+	}
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        "consumer-1",
+			UID:         types.UID("uid-consumer-1"),
+			Annotations: map[string]string{"podsnapshot.gke.io/ps-name": "snap-shared-1"},
+		},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        "consumer-2",
+			UID:         types.UID("uid-consumer-2"),
+			Annotations: map[string]string{"podsnapshot.gke.io/ps-name": "snap-shared-1"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj, pod1, pod2).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	recorder := record.NewFakeRecorder(10)
+	pmjRec := &PodMigrationJobReconciler{
+		Client:          fakeClient,
+		Scheme:          scheme,
+		Recorder:        recorder,
+		InvariantEngine: invariants.NewEngine(invariants.ModeStrict, recorder),
+	}
+	if _, err := pmjRec.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: "pmj-i1-live"},
+	}); err != nil {
+		t.Fatalf("PodMigrationJobReconciler.Reconcile failed: %v", err)
+	}
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	_ = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: "pmj-i1-live"}, updatedPMJ)
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Fatalf("Expected live I1 duplicate snapshot consumption to fail PMJ in strict mode, got phase %s", updatedPMJ.Status.Phase)
+	}
+
+	// 2. PodGateReconciler live evaluation (I8 gated system pod assigned to an active PMJ emits Warning event)
+	sysPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-system",
+			Name:      "pmj-coredns",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+	sysPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-system",
+			Name:      "coredns-gated",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ: "pmj-coredns",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{{Name: MigrationGateName}},
+		},
+	}
+	gateRecorder := record.NewFakeRecorder(10)
+	gateClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, func(obj client.Object) []string {
+			pod, ok := obj.(*corev1.Pod)
+			if !ok || pod.Annotations == nil {
+				return nil
+			}
+			if val, exists := pod.Annotations[util.AnnotationAssignedPMJ]; exists && val != "" {
+				return []string{val}
+			}
+			return nil
+		}).
+		WithObjects(sysPMJ, sysPod).
+		Build()
+	gateRec := &PodGateReconciler{
+		Client:          gateClient,
+		Scheme:          scheme,
+		Recorder:        gateRecorder,
+		InvariantEngine: invariants.NewEngine(invariants.ModeObserve, gateRecorder),
+	}
+	if _, err := gateRec.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "kube-system", Name: "coredns-gated"},
+	}); err != nil {
+		t.Fatalf("PodGateReconciler.Reconcile failed: %v", err)
+	}
+	if len(gateRecorder.Events) == 0 {
+		t.Fatalf("Expected PodGateReconciler to emit InvariantViolation Warning event on gated kube-system pod")
+	}
+
+	// 3. PodMigrationReconciler live evaluation (I4 stuck deletion deferral finalizer emits Warning event)
+	oldDel := metav1.NewTime(time.Now().Add(-15 * time.Minute))
+	mig := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "mig-stuck-finalizer",
+			DeletionTimestamp: &oldDel,
+			Finalizers:        []string{StorageCleanupFinalizer},
+		},
+	}
+	migRecorder := record.NewFakeRecorder(10)
+	migClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mig).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				return fmt.Errorf("simulated storage cleanup error")
+			},
+		}).
+		Build()
+	migRec := &PodMigrationReconciler{
+		Client:          migClient,
+		Scheme:          scheme,
+		Recorder:        migRecorder,
+		InvariantEngine: invariants.NewEngine(invariants.ModeObserve, migRecorder),
+	}
+	_, _ = migRec.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mig-stuck-finalizer"},
+	})
+	foundI4 := false
+	for len(migRecorder.Events) > 0 {
+		ev := <-migRecorder.Events
+		if strings.Contains(ev, "[I4:TerminalProgress]") {
+			foundI4 = true
+		}
+	}
+	if !foundI4 {
+		t.Fatalf("Expected PodMigrationReconciler to emit [I4:TerminalProgress] Warning event on stuck deletion finalizer")
+	}
+}
+
+

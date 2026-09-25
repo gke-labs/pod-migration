@@ -24,6 +24,7 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 type testSnapshotProvider struct {
@@ -702,7 +703,8 @@ func TestInvariantEngine_ReconcilerStrictAndObserveIntegration(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
 
-	// Construct a PMJ that violates I2 (Phase=Succeeded with empty SnapshotRef)
+	// Construct a non-terminal PMJ in Restoring whose assigned pod had its gate removed
+	// without a snapshot or cold-start bypass -> triggers I2 in strict mode and transitions to Failed.
 	pmj := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "pmj-invariant-i2",
@@ -713,14 +715,26 @@ func TestInvariantEngine_ReconcilerStrictAndObserveIntegration(t *testing.T) {
 			PodRef: corev1.LocalObjectReference{Name: "source-pod"},
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
-			// SnapshotRef intentionally empty -> triggers I2
+			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snap-1",
+			RestoredPodName: "ungated-pod-no-ps",
+			RestoredPodUID:  "uid-ungated-1",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ungated-pod-no-ps",
+			Namespace: "default",
+			UID:       types.UID("uid-ungated-1"),
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ: "pmj-invariant-i2",
+			},
 		},
 	}
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pmj).
+		WithObjects(pmj, pod).
 		WithStatusSubresource(pmj).
 		Build()
 
@@ -753,7 +767,7 @@ func TestInvariantEngine_ReconcilerStrictAndObserveIntegration(t *testing.T) {
 		t.Fatalf("Failed to get updated PMJ: %v", err)
 	}
 	if updated.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
-		t.Errorf("Expected strict mode to transition PMJ to PhaseFailed, got %s", updated.Status.Phase)
+		t.Errorf("Expected strict mode to transition non-terminal PMJ to PhaseFailed, got %s", updated.Status.Phase)
 	}
 }
 

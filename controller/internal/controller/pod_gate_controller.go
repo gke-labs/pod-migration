@@ -47,42 +47,27 @@ type PodGateReconciler struct {
 }
 
 func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, reconcileErr *error) {
-	if r.InvariantEngine == nil || pod == nil {
+	if !r.InvariantEngine.Enabled() || pod == nil {
 		return
 	}
 	if reconcileErr != nil && *reconcileErr != nil {
 		return
 	}
 
-	var namespacePMJs []pmv1alpha1.PodMigrationJob
-	pmjList := &pmv1alpha1.PodMigrationJobList{}
-	if err := r.List(ctx, pmjList, client.InNamespace(pod.Namespace)); err == nil {
-		namespacePMJs = pmjList.Items
-		if job == nil && pod.Annotations != nil {
-			if assigned := pod.Annotations[util.AnnotationAssignedPMJ]; assigned != "" {
-				for i := range namespacePMJs {
-					if namespacePMJs[i].Name == assigned {
-						job = &namespacePMJs[i]
-						break
-					}
-				}
+	if job == nil && pod.Annotations != nil {
+		if assigned := pod.Annotations[util.AnnotationAssignedPMJ]; assigned != "" {
+			fetched := &pmv1alpha1.PodMigrationJob{}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assigned}, fetched); err == nil {
+				job = fetched
 			}
 		}
 	}
 
-	var namespacePods []corev1.Pod
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(pod.Namespace)); err == nil {
-		namespacePods = podList.Items
-	}
-
 	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
-		Now:           time.Now(),
-		Reconciler:    "PodGateReconciler",
-		PrimaryPod:    pod,
-		PrimaryPMJ:    job,
-		NamespacePMJs: namespacePMJs,
-		NamespacePods: namespacePods,
+		Now:        time.Now(),
+		Reconciler: "PodGateReconciler",
+		PrimaryPod: pod,
+		PrimaryPMJ: job,
 	})
 }
 
@@ -100,6 +85,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	err := r.Get(ctx, req.NamespacedName, pod)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.InvariantEngine.ForgetObject("PodGateReconciler", "pod", req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get Pod")

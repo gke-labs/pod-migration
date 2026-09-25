@@ -25,7 +25,7 @@ const (
 	// An explicit empty string value ("") is the cold-start bypass signal written by
 	// releaseWithColdStartBypass and the replacement webhook.
 	AnnotationPSName = "podsnapshot.gke.io/ps-name"
-	// AnnotationMigrationTimeout is the workload-configurable migration timeout annotation (PR #57).
+	// AnnotationMigrationTimeout is the effective migration timeout annotation stamped on PMJs (#57).
 	AnnotationMigrationTimeout = "pod-migration.gke.io/timeout"
 	// AnnotationEvictingSince records when the Evicting phase started waiting for deletion.
 	AnnotationEvictingSince = "pod-migration.gke.io/evicting-since"
@@ -47,12 +47,6 @@ const (
 	StorageCleanupFinalizer = "podmigration.gke.io/storage-cleanup"
 	// MaxMigrationDuration is the default 10-minute baseline upper bound for active PMJs and deletion deferral.
 	MaxMigrationDuration = 10 * time.Minute
-	// MinMigrationTimeout is the minimum allowable migration timeout when overridden via annotation.
-	MinMigrationTimeout = 1 * time.Minute
-	// MaxMigrationTimeout is the maximum allowable migration timeout ceiling (2h) for memory-scaled workloads.
-	MaxMigrationTimeout = 2 * time.Hour
-	// DefaultThroughputBytesPerSec is the baseline checkpoint upload throughput (50 MiB/s) for memory-scaled deadlines.
-	DefaultThroughputBytesPerSec = int64(50 * 1024 * 1024)
 	// GateReleaseGraceWindow is the grace window allowed between patching Status.GateReleased=true on the PMJ
 	// and updating the replacement Pod to remove gke.io/pod-migration-gate.
 	GateReleaseGraceWindow = 30 * time.Second
@@ -364,70 +358,15 @@ func EvaluateI3(s *ReconcileSnapshot) []Violation {
 	return violations
 }
 
-func calculatePodMemoryBytes(pod *corev1.Pod) int64 {
-	if pod == nil {
-		return 0
-	}
-	var total int64
-	for _, c := range pod.Spec.Containers {
-		if req := c.Resources.Requests.Memory(); req != nil {
-			total += req.Value()
-		}
-	}
-	for _, c := range pod.Spec.InitContainers {
-		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
-			if req := c.Resources.Requests.Memory(); req != nil {
-				total += req.Value()
+// EffectiveMigrationTimeout reads the effective migration deadline stamped on the PMJ's
+// `pod-migration.gke.io/timeout` annotation (which PR #57 stamps at creation / Pending),
+// falling back to MaxMigrationDuration (10m) when unset or invalid.
+func EffectiveMigrationTimeout(job *pmv1alpha1.PodMigrationJob) time.Duration {
+	if job != nil && job.Annotations != nil {
+		if raw := job.Annotations[AnnotationMigrationTimeout]; raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+				return d
 			}
-		}
-	}
-	return total
-}
-
-func parseClampedTimeout(raw string) (time.Duration, bool) {
-	if raw == "" {
-		return 0, false
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		return 0, false
-	}
-	if d < MinMigrationTimeout {
-		return MinMigrationTimeout, true
-	}
-	if d > MaxMigrationTimeout {
-		return MaxMigrationTimeout, true
-	}
-	return d, true
-}
-
-// EffectiveMigrationTimeout computes the effective migration deadline for job,
-// aligning with PR #57's workload-configurable `pod-migration.gke.io/timeout` annotation
-// and memory-scaled deadline calculation (50 MiB/s throughput, clamped to [1m, 2h]).
-func EffectiveMigrationTimeout(job *pmv1alpha1.PodMigrationJob, s *ReconcileSnapshot) time.Duration {
-	if job == nil {
-		return MaxMigrationDuration
-	}
-	if job.Annotations != nil {
-		if d, ok := parseClampedTimeout(job.Annotations[AnnotationMigrationTimeout]); ok {
-			return d
-		}
-	}
-	for _, pod := range allPods(s) {
-		if pod.Namespace == job.Namespace && pod.Name == job.Spec.PodRef.Name {
-			if pod.Annotations != nil {
-				if d, ok := parseClampedTimeout(pod.Annotations[AnnotationMigrationTimeout]); ok {
-					return d
-				}
-			}
-			if memBytes := calculatePodMemoryBytes(&pod); memBytes > 0 {
-				scaled := MaxMigrationDuration + time.Duration(memBytes/DefaultThroughputBytesPerSec)*time.Second
-				if scaled > MaxMigrationTimeout {
-					return MaxMigrationTimeout
-				}
-				return scaled
-			}
-			break
 		}
 	}
 	return MaxMigrationDuration
@@ -435,7 +374,7 @@ func EffectiveMigrationTimeout(job *pmv1alpha1.PodMigrationJob, s *ReconcileSnap
 
 // EvaluateI4 enforces I4 (Terminal Progress):
 // Active PMJs in Pending/Snapshotting/Evicting must not exceed their effective migration
-// timeout (from `pod-migration.gke.io/timeout`, memory-scaled budget, or 10m baseline)
+// timeout (`pod-migration.gke.io/timeout` annotation on the PMJ, or 10m default)
 // without transitioning to a terminal phase, and a deleting PodMigration CR with
 // StorageCleanupFinalizer must not remain un-finalized past MaxMigrationDuration (10m).
 func EvaluateI4(s *ReconcileSnapshot) []Violation {
@@ -453,7 +392,7 @@ func EvaluateI4(s *ReconcileSnapshot) []Violation {
 		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhasePending ||
 			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
-			effectiveTimeout := EffectiveMigrationTimeout(&job, s)
+			effectiveTimeout := EffectiveMigrationTimeout(&job)
 			budget := effectiveTimeout + progressGraceSlack
 
 			// During Evicting, if `pod-migration.gke.io/evicting-since` is set, PR #57
@@ -512,13 +451,15 @@ func EvaluateI4(s *ReconcileSnapshot) []Violation {
 }
 
 // EvaluateI5 enforces I5 (Zero Resource Leak):
-// Terminal PMJs must not retain orphaned PodSnapshotManualTrigger objects past cleanup.
+// Terminal PMJs in Succeeded or Failed must not retain orphaned PodSnapshotManualTrigger
+// objects past cleanup (SucceededWithoutRestore deliberately preserves snapshot state per #32).
 func EvaluateI5(s *ReconcileSnapshot) []Violation {
 	if s == nil || !s.HasOrphanedTrigger || s.PrimaryPMJ == nil {
 		return nil
 	}
 	job := s.PrimaryPMJ
-	if isTerminalPhase(job.Status.Phase) {
+	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
+		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 		return []Violation{{
 			InvariantID:   "I5",
 			InvariantName: "ZeroResourceLeak",
@@ -609,10 +550,6 @@ func EvaluateI6(s *ReconcileSnapshot) []Violation {
 		if expectedParentUID != "" {
 			for _, ref := range pod.OwnerReferences {
 				if ref.Controller != nil && *ref.Controller && string(ref.UID) != "" {
-					// Direct comparison applies when the Pod's immediate controller owner Kind
-					// matches the PMJ's recorded parent Kind (e.g. StatefulSet or Job, or when
-					// ParentKind is unspecified). For Deployments, Pod.OwnerReferences points to
-					// the intermediate ReplicaSet rather than the Deployment.
 					if (expectedParentKind == "" || ref.Kind == expectedParentKind) && string(ref.UID) != expectedParentUID {
 						violations = append(violations, Violation{
 							InvariantID:   "I6",
@@ -633,28 +570,13 @@ func EvaluateI6(s *ReconcileSnapshot) []Violation {
 }
 
 // EvaluateI7 enforces I7 (Disruption Bounding / PDB Compliance):
-// Origin Pod termination during PhaseEvicting must invoke the policy/v1 Eviction subresource
-// (never raw Delete before the migration timeout deadline expires), and a PMJ must never
-// advance to Restoring or Succeeded while BlockedByPDB/EvictionMisconfigured is True or
-// while the non-terminating origin Pod is still running.
+// A PMJ must never advance to Restoring or Succeeded while BlockedByPDB/EvictionMisconfigured
+// is True or while the non-terminating origin Pod (TargetPodUID) is still running without eviction.
 func EvaluateI7(s *ReconcileSnapshot) []Violation {
 	if s == nil {
 		return nil
 	}
 	var violations []Violation
-	if s.UsedBareDeleteBeforeDeadline && s.PrimaryPMJ != nil {
-		job := s.PrimaryPMJ
-		violations = append(violations, Violation{
-			InvariantID:   "I7",
-			InvariantName: "DisruptionBoundingPDBCompliance",
-			Reason:        "RawDeleteBypassedEvictionSubresource",
-			Message:       fmt.Sprintf("PMJ %s/%s invoked raw Pod Delete during Evicting phase before deadline expiry, bypassing PodDisruptionBudgets", job.Namespace, job.Name),
-			Namespace:     job.Namespace,
-			PMJName:       job.Name,
-			PodName:       job.Spec.PodRef.Name,
-		})
-	}
-
 	pods := allPods(s)
 	for _, job := range allPMJs(s) {
 		if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring &&
