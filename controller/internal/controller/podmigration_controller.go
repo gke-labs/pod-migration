@@ -12,10 +12,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -232,7 +234,24 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// 2. Reconcile PodSnapshotPolicy for manual (Namespaced)
+	// 2. Validate ExcludedPodSelectors if specified
+	if err := validateExcludedPodSelectors(config.Spec.ExcludedPodSelectors); err != nil {
+		logger.Error(err, "Invalid excludedPodSelectors", "name", req.Name)
+		meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "InvalidExcludedPodSelectors",
+			Message:            err.Error(),
+			ObservedGeneration: config.Generation,
+		})
+		if updateErr := r.Status().Update(ctx, config); updateErr != nil {
+			logger.Error(updateErr, "Failed to update status on invalid excludedPodSelectors")
+			return ctrl.Result{}, updateErr
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 3. Reconcile PodSnapshotPolicy for manual (Namespaced)
 	pspManualName := getPSPManualName(req.Name)
 	pspManual := &unstructured.Unstructured{}
 	pspManual.SetGroupVersionKind(schema.GroupVersionKind{
@@ -243,16 +262,32 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	pspManual.SetName(pspManualName)
 	pspManual.SetNamespace(req.Namespace)
 
+	matchExpressions := []interface{}{
+		map[string]interface{}{
+			"key":      "pod-migration.gke.io/enabled",
+			"operator": "In",
+			"values":   []interface{}{"true"},
+		},
+	}
+	for _, req := range config.Spec.ExcludedPodSelectors {
+		expr := map[string]interface{}{
+			"key":      req.Key,
+			"operator": string(req.Operator),
+		}
+		if len(req.Values) > 0 {
+			values := make([]interface{}, len(req.Values))
+			for i, v := range req.Values {
+				values[i] = v
+			}
+			expr["values"] = values
+		}
+		matchExpressions = append(matchExpressions, expr)
+	}
+
 	specPayloadManual := map[string]interface{}{
 		"storageConfigName": psscName,
 		"selector": map[string]interface{}{
-			"matchExpressions": []interface{}{
-				map[string]interface{}{
-					"key":      "pod-migration.gke.io/enabled",
-					"operator": "In",
-					"values":   []interface{}{"true"},
-				},
-			},
+			"matchExpressions": matchExpressions,
 		},
 		"triggerConfig": map[string]interface{}{
 			"type":           "manual",
@@ -289,6 +324,33 @@ func getPSSCName(namespace, name string) string {
 	h := sha256.New()
 	h.Write([]byte(fmt.Sprintf("%s/%s", namespace, name)))
 	return fmt.Sprintf("pssc-%s", hex.EncodeToString(h.Sum(nil))[:16])
+}
+
+func validateExcludedPodSelectors(selectors []metav1.LabelSelectorRequirement) error {
+	for i, req := range selectors {
+		fldPath := field.NewPath("spec", "excludedPodSelectors").Index(i)
+		if errs := metav1validation.ValidateLabelSelectorRequirement(req, metav1validation.LabelSelectorValidationOptions{}, fldPath); len(errs) > 0 {
+			return errs.ToAggregate()
+		}
+		if req.Key == "pod-migration.gke.io/enabled" {
+			return fmt.Errorf("excludedPodSelectors[%d]: key %q cannot be overridden in excludedPodSelectors", i, req.Key)
+		}
+		switch req.Operator {
+		case metav1.LabelSelectorOpNotIn:
+			if len(req.Values) == 0 {
+				return fmt.Errorf("excludedPodSelectors[%d]: operator %q requires non-empty values", i, req.Operator)
+			}
+		case metav1.LabelSelectorOpDoesNotExist:
+			if len(req.Values) > 0 {
+				return fmt.Errorf("excludedPodSelectors[%d]: operator %q requires empty values, got %v", i, req.Operator, req.Values)
+			}
+		case metav1.LabelSelectorOpIn, metav1.LabelSelectorOpExists:
+			return fmt.Errorf("excludedPodSelectors[%d]: operator %q is not allowed for exclusions (only NotIn and DoesNotExist are supported)", i, req.Operator)
+		default:
+			return fmt.Errorf("excludedPodSelectors[%d]: invalid operator %q (must be NotIn or DoesNotExist)", i, req.Operator)
+		}
+	}
+	return nil
 }
 
 func getPSPManualName(name string) string {

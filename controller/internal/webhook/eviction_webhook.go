@@ -160,7 +160,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 
 	// Create new PodMigrationJob
 	logger.Info("Creating PodMigrationJob", "job", jobName)
-	var jobAnnotations map[string]string
+	jobAnnotations := map[string]string{
+		util.AnnotationPodSnapshotPolicy: matchingPSP.GetName(),
+	}
 	baseTimeout := a.DefaultMigrationTimeout
 	if baseTimeout <= 0 {
 		baseTimeout = util.DefaultMigrationTimeout
@@ -172,9 +174,6 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	memBytes := util.CalculatePodMemoryRequest(pod)
 	effectiveTimeout := util.CalculateMigrationTimeout(rawTimeout, memBytes, baseTimeout)
 	if effectiveTimeout != baseTimeout || rawTimeout != "" {
-		if jobAnnotations == nil {
-			jobAnnotations = make(map[string]string)
-		}
 		if _, ok := util.ParseClampedTimeout(rawTimeout); ok {
 			jobAnnotations[util.AnnotationMigrationTimeout] = rawTimeout
 		} else if effectiveTimeout != baseTimeout {

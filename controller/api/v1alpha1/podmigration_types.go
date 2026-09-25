@@ -13,6 +13,16 @@ type StorageSpec struct {
 // PodMigrationSpec defines the desired config.
 type PodMigrationSpec struct {
 	Storage StorageSpec `json:"storage"`
+
+	// ExcludedPodSelectors specifies label selector requirements to exclude pods from
+	// the automatically generated PodSnapshotPolicy. Only exclusion operators ('NotIn' and 'DoesNotExist')
+	// are permitted. Useful when coexisting with external controllers that reconcile their own
+	// PodSnapshotPolicies (e.g. Kubeflow Notebooks).
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self.all(e, e.operator in ['NotIn', 'DoesNotExist'])",message="excludedPodSelectors operator must be NotIn or DoesNotExist"
+	// +kubebuilder:validation:XValidation:rule="self.all(e, e.key != 'pod-migration.gke.io/enabled')",message="key 'pod-migration.gke.io/enabled' is reserved and cannot be excluded"
+	// +kubebuilder:validation:XValidation:rule="self.all(e, (e.operator == 'NotIn' && size(e.values) > 0) || (e.operator == 'DoesNotExist' && (!has(e.values) || size(e.values) == 0)))",message="NotIn requires non-empty values; DoesNotExist requires empty values"
+	ExcludedPodSelectors []metav1.LabelSelectorRequirement `json:"excludedPodSelectors,omitempty"`
 }
 
 // PodMigrationStatus defines the observed state.
