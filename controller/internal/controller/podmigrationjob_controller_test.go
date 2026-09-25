@@ -14,6 +14,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -6170,4 +6171,830 @@ func TestReconcilers_LiveInvariantEvaluation_I1_PodGate_And_PodMigration(t *test
 	}
 }
 
+func TestPodMigrationJobReconciler_CustomTimeout_Annotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
 
+	namespace := "default"
+	podName := "annotated-pod"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-annotated",
+		},
+	}
+
+	// Job created 15 minutes ago, but annotated with 25m timeout
+	creationTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: creationTime,
+			Annotations: map[string]string{
+				util.AnnotationMigrationTimeout: "25m",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-annotated",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("Expected Requeue: true, got %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSnapshotting, updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Pending_PropagatesPodTimeoutAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "annotated-pod-source"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-source",
+			Annotations: map[string]string{
+				util.AnnotationMigrationTimeout: "35m",
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-source",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+		}); err != nil {
+			t.Fatalf("Second Reconcile failed: %v", err)
+		}
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Annotations[util.AnnotationMigrationTimeout] != "35m0s" {
+		t.Errorf("Expected annotation 35m0s, got %q", updatedPMJ.Annotations[util.AnnotationMigrationTimeout])
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected phase to transition to Snapshotting, got %s", updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Pending_ScalesMemoryRequestTimeout(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "large-mem-pod"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-mem",
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "redis",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("16Gi"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-mem",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("Expected reconcile to requeue")
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Annotations[util.AnnotationMigrationTimeout] != "15m27s" {
+		t.Errorf("Expected annotation 15m27s, got %q", updatedPMJ.Annotations[util.AnnotationMigrationTimeout])
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected phase to transition to Snapshotting, got %s", updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Pending_WithMemoryScalingAndPVC_PreservesOriginNodeAndPVsToDetach(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "redis-pod"
+	jobName := "pmj-" + podName
+	pvcName := "redis-pvc"
+	pvName := "redis-pv"
+	originNode := "worker-node-42"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-redis-123",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: originNode,
+			Containers: []corev1.Container{
+				{
+					Name: "redis",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("16Gi"),
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "redis-data",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pvcName,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: pvName,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-redis-123",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pvc, pmj).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// Exactly one reconcile: must update timeout annotation, backfill OriginNodeName & PVsToDetach,
+	// and transition to Snapshotting without clobbering unpersisted status.
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("Expected reconcile to requeue")
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected phase Snapshotting on single reconcile, got %s", updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Annotations[util.AnnotationMigrationTimeout] != "15m27s" {
+		t.Errorf("Expected annotation 15m27s, got %q", updatedPMJ.Annotations[util.AnnotationMigrationTimeout])
+	}
+	if updatedPMJ.Status.OriginNodeName != originNode {
+		t.Errorf("Expected OriginNodeName %q, got %q", originNode, updatedPMJ.Status.OriginNodeName)
+	}
+	if len(updatedPMJ.Status.PVsToDetach) != 1 || updatedPMJ.Status.PVsToDetach[0] != pvName {
+		t.Errorf("Expected PVsToDetach [%q], got %v", pvName, updatedPMJ.Status.PVsToDetach)
+	}
+}
+
+func TestPodMigrationJobReconciler_Snapshotting_Progressing_ExtendsDeadline(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "progressing-pod"
+	jobName := "pmj-" + podName
+	snapName := "snap-active-upload"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-progressing",
+		},
+	}
+
+	// Job was created 15 minutes ago (baseline timeout 10m has elapsed)
+	creationTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: creationTime,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-progressing",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			SnapshotRef: snapName,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	// Snapshot is actively progressing (last progress was 1 minute ago)
+	mockProvider := &fakeSnapshotProvider{
+		checkStatusResult: &snapshot.Status{
+			Phase:            snapshot.PhaseInProgress,
+			SnapshotRef:      snapName,
+			Reason:           "Snapshotting",
+			Message:          "Uploading chunk 42/100",
+			LastProgressTime: time.Now().Add(-1 * time.Minute),
+		},
+	}
+
+	r := &PodMigrationJobReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		SnapshotProvider: mockProvider,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Errorf("Expected RequeueAfter 30s, got %v", res.RequeueAfter)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected PMJ to remain in Snapshotting, got %s", updatedPMJ.Status.Phase)
+	}
+}
+
+func TestPodMigrationJobReconciler_Snapshotting_Stalled_TimesOut(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "stalled-pod"
+	jobName := "pmj-" + podName
+	snapName := "snap-stalled"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-stalled",
+		},
+	}
+
+	// Job was created 15 minutes ago
+	creationTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: creationTime,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-stalled",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			SnapshotRef: snapName,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	// Snapshot is stalled (last progress was 12 minutes ago, exceeding 10m baseline)
+	mockProvider := &fakeSnapshotProvider{
+		checkStatusResult: &snapshot.Status{
+			Phase:            snapshot.PhaseInProgress,
+			SnapshotRef:      snapName,
+			Reason:           "Snapshotting",
+			Message:          "Stuck upload",
+			LastProgressTime: time.Now().Add(-12 * time.Minute),
+		},
+	}
+
+	r := &PodMigrationJobReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		SnapshotProvider: mockProvider,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected PMJ to transition to Failed, got %s", updatedPMJ.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "Timeout" {
+		t.Errorf("Expected Ready condition Reason=Timeout, got %+v", cond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Snapshotting_FastFail_CheckpointTerminalError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "fast-fail-pod"
+	jobName := "pmj-" + podName
+	snapName := "snap-terminal-error"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-fast-fail",
+		},
+	}
+
+	// Job was just created (well within 10-minute timeout)
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-fast-fail",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			SnapshotRef: snapName,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	mockProvider := &fakeSnapshotProvider{
+		checkStatusResult: &snapshot.Status{
+			Phase:       snapshot.PhaseFailed,
+			SnapshotRef: snapName,
+			Reason:      "SnapshotFailed",
+			Message:     "GKE PodSnapshot Checkpoint failed (DeadlineExceeded): snapshot agent timed out writing checkpoint stream",
+		},
+	}
+
+	r := &PodMigrationJobReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		SnapshotProvider: mockProvider,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected PMJ to transition immediately to Failed, got %s", updatedPMJ.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "SnapshotFailed" {
+		t.Errorf("Expected Ready condition Reason=SnapshotFailed, got %+v", cond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeoutImmediately(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "evicting-pod"
+	jobName := "pmj-" + podName
+	snapName := "snap-large-completed"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-evicting",
+		},
+	}
+
+	// Job was created 25 minutes ago (snapshot upload took 25 minutes with baseline 10m timeout)
+	creationTime := metav1.NewTime(time.Now().Add(-25 * time.Minute))
+
+	// PMJ starts in PhaseSnapshotting without pre-populated evicting-since annotation
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: creationTime,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-evicting",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			SnapshotRef: snapName,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "Snapshotting",
+					LastTransitionTime: creationTime,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	mockProvider := &fakeSnapshotProvider{
+		checkStatusResult: &snapshot.Status{
+			Phase:            snapshot.PhaseReady,
+			SnapshotRef:      snapName,
+			LastProgressTime: time.Now().Add(-1 * time.Minute),
+		},
+	}
+
+	r := &PodMigrationJobReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		SnapshotProvider: mockProvider,
+	}
+
+	// First reconcile: handles Snapshotting -> Evicting transition
+	res1, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile 1 (Snapshotting -> Evicting) failed: %v", err)
+	}
+	if !res1.Requeue {
+		t.Fatalf("Expected Reconcile 1 to requeue on transition to Evicting, got %+v", res1)
+	}
+
+	// Second reconcile: handles top-of-reconcile timeout guard and entries into Evicting phase
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile 2 (Evicting handoff) failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	// Must NOT fail immediately upon entering Evicting phase post-snapshot-extension
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		t.Errorf("Expected PMJ to remain in Evicting, got %s", updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Status.EvictingStartTime == nil {
+		t.Errorf("Expected EvictingStartTime to be set, got nil")
+	}
+	if updatedPMJ.Annotations == nil || updatedPMJ.Annotations[util.AnnotationEvictingSince] == "" {
+		t.Errorf("Expected evicting-since annotation to be stamped, got annotations=%v", updatedPMJ.Annotations)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_UpgradeInFlightJob_SeedsEvictingStartTimeFromAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "in-flight-pod"
+	jobName := "pmj-" + podName
+	pastEvictingTime := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			UID:       types.UID("pod-uid-42"),
+		},
+	}
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              jobName,
+			Namespace:         namespace,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
+			Annotations: map[string]string{
+				util.AnnotationEvictingSince: pastEvictingTime.Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: "pod-uid-42",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:             pmv1alpha1.PodMigrationJobPhaseEvicting,
+			EvictingStartTime: nil, // Simulating an in-flight job prior to upgrade
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "Evicting",
+					LastTransitionTime: metav1.NewTime(pastEvictingTime),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj, pod).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	if updatedPMJ.Status.EvictingStartTime == nil {
+		t.Fatalf("Expected EvictingStartTime to be populated from annotation, got nil")
+	}
+	if !updatedPMJ.Status.EvictingStartTime.Time.Equal(pastEvictingTime) {
+		t.Errorf("Expected EvictingStartTime to equal %v, got %v", pastEvictingTime, updatedPMJ.Status.EvictingStartTime.Time)
+	}
+}
+
+func TestPodMigrationJobReconciler_Evicting_PhaseTimeout_AfterExtendedSnapshot(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "evicting-stuck-pod"
+	jobName := "pmj-" + podName
+	snapName := "snap-large-completed"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-evicting-stuck",
+		},
+	}
+
+	// Job was created 35 minutes ago
+	creationTime := metav1.NewTime(time.Now().Add(-35 * time.Minute))
+	// Transitioned to Evicting 12 minutes ago (exceeding baseline 10m eviction window)
+	evictingTransitionTime := metav1.NewTime(time.Now().Add(-12 * time.Minute))
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: creationTime,
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": evictingTransitionTime.Time.Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-evicting-stuck",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseEvicting,
+			SnapshotRef: snapName,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "Evicting",
+					Message:            "Snapshot durable; waiting for origin pod eviction and volume detachment",
+					LastTransitionTime: evictingTransitionTime,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	mockProvider := &fakeSnapshotProvider{}
+
+	r := &PodMigrationJobReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		SnapshotProvider: mockProvider,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+	// Must time out because Evicting phase exceeded its budget
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected PMJ to transition to Failed, got %s", updatedPMJ.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "Timeout" {
+		t.Errorf("Expected Ready condition Reason=Timeout, got %+v", cond)
+	}
+}

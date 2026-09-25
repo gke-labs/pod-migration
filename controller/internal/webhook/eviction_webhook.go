@@ -32,10 +32,11 @@ import (
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
 // EvictionGate handles eviction requests and creates PodMigrationJobs.
 type EvictionGate struct {
-	Client    client.Client
-	APIReader client.Reader
-	Recorder  record.EventRecorder
-	decoder   admission.Decoder
+	Client                  client.Client
+	APIReader               client.Reader
+	Recorder                record.EventRecorder
+	DefaultMigrationTimeout time.Duration
+	decoder                 admission.Decoder
 }
 
 // Handle intercepts eviction requests.
@@ -159,11 +160,34 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 
 	// Create new PodMigrationJob
 	logger.Info("Creating PodMigrationJob", "job", jobName)
+	var jobAnnotations map[string]string
+	baseTimeout := a.DefaultMigrationTimeout
+	if baseTimeout <= 0 {
+		baseTimeout = util.DefaultMigrationTimeout
+	}
+	var rawTimeout string
+	if pod.Annotations != nil {
+		rawTimeout = pod.Annotations[util.AnnotationMigrationTimeout]
+	}
+	memBytes := util.CalculatePodMemoryRequest(pod)
+	effectiveTimeout := util.CalculateMigrationTimeout(rawTimeout, memBytes, baseTimeout)
+	if effectiveTimeout != baseTimeout || rawTimeout != "" {
+		if jobAnnotations == nil {
+			jobAnnotations = make(map[string]string)
+		}
+		if _, ok := util.ParseClampedTimeout(rawTimeout); ok {
+			jobAnnotations[util.AnnotationMigrationTimeout] = rawTimeout
+		} else if effectiveTimeout != baseTimeout {
+			jobAnnotations[util.AnnotationMigrationTimeout] = effectiveTimeout.String()
+		}
+	}
+
 	newJob := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: req.Namespace,
-			Labels:    jobLabels,
+			Name:        jobName,
+			Namespace:   req.Namespace,
+			Labels:      jobLabels,
+			Annotations: jobAnnotations,
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef: corev1.LocalObjectReference{
@@ -206,16 +230,17 @@ func (a *EvictionGate) InjectDecoder(d admission.Decoder) error {
 }
 
 // SetupEvictionWebhookWithManager registers the webhook on the manager.
-func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader) error {
+func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, defaultTimeout time.Duration) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/validate-v1-pod-eviction",
 		&admission.Webhook{
 			Handler: &EvictionGate{
-				Client:    mgr.GetClient(),
-				APIReader: apiReader,
-				Recorder:  mgr.GetEventRecorderFor("pod-migration-controller"),
-				decoder:   dec,
+				Client:                  mgr.GetClient(),
+				APIReader:               apiReader,
+				Recorder:                mgr.GetEventRecorderFor("pod-migration-controller"),
+				DefaultMigrationTimeout: defaultTimeout,
+				decoder:                 dec,
 			},
 		},
 	)
