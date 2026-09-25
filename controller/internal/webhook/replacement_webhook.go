@@ -38,6 +38,13 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	if pod.Namespace == "" {
 		pod.Namespace = req.Namespace
 	}
+	if req.Name == "" {
+		if pod.Name != "" {
+			logger = log.FromContext(ctx).WithValues("pod", pod.Name, "namespace", pod.Namespace)
+		} else if pod.GenerateName != "" {
+			logger = log.FromContext(ctx).WithValues("pod", pod.GenerateName, "namespace", pod.Namespace)
+		}
+	}
 
 	// Check if pod opted in
 	if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
@@ -95,8 +102,14 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 
 	// If there is no active unassigned migration job, this is a scale-up or unrelated pod.
-	// We do NOT inject the scheduling gate and bypass native GKE restore unless an
-	// upstream admission webhook or user explicitly set podsnapshot.gke.io/ps-name.
+	// The cold-start bypass stamps podsnapshot.gke.io/ps-name="" to scrub any stale
+	// snapshot reference that our own controller may have written for an earlier assignment
+	// that did not complete. However, if a non-empty ps-name is already present on the pod,
+	// it is either a user/template explicitly requesting a native GKE restore or an upstream
+	// mutating webhook (such as Kubeflow's gke-workspace-snapshot-mutating-webhook /
+	// mutate-pod.podsnapshot.gke.kubeflow.org, which sorts alphabetically before our
+	// mutating-webhook-configuration / mpodgate.podmigration.gke.io) restoring a paused
+	// Workspace. That restore request is not ours to override, so we preserve it.
 	if assignedPMJ == "" {
 		if existingPS := pod.Annotations["podsnapshot.gke.io/ps-name"]; existingPS != "" {
 			logger.Info("Preserving pre-existing snapshot annotation (no active PMJ)", "snapshotName", existingPS)

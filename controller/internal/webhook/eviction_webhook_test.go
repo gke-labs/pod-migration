@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -24,7 +25,7 @@ import (
 )
 
 func TestEvictionGate(t *testing.T) {
-	// Helper to create a fake PodSnapshotPolicy
+	// Helper to create a fake namespace-wide PodMigration PodSnapshotPolicy (psp-<name>-manual)
 	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
 		psp := &unstructured.Unstructured{}
 		psp.SetGroupVersionKind(schema.GroupVersionKind{
@@ -42,6 +43,10 @@ func TestEvictionGate(t *testing.T) {
 						"operator": "In",
 						"values":   []interface{}{"true"},
 					},
+					map[string]interface{}{
+						"key":      "notebooks.kubeflow.org/workspace-name",
+						"operator": "DoesNotExist",
+					},
 				},
 			},
 			"triggerConfig": map[string]interface{}{
@@ -50,6 +55,39 @@ func TestEvictionGate(t *testing.T) {
 			},
 		}
 		// Inject Ready=True condition in status
+		psp.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+		return psp
+	}
+
+	// Helper to create a fake Kubeflow per-Workspace PodSnapshotPolicy (ws-<name>-policy)
+	createWorkspacePSP := func(workspaceName, triggerType, postCheckpoint string) *unstructured.Unstructured {
+		psp := &unstructured.Unstructured{}
+		psp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		psp.SetName("ws-" + workspaceName + "-policy")
+		psp.SetNamespace("default")
+		psp.Object["spec"] = map[string]interface{}{
+			"storageConfigName": "kubeflow-pod-snapshot-storage-config",
+			"selector": map[string]interface{}{
+				"matchLabels": map[string]interface{}{
+					"notebooks.kubeflow.org/workspace-name": workspaceName,
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           triggerType,
+				"postCheckpoint": postCheckpoint,
+			},
+		}
 		psp.Object["status"] = map[string]interface{}{
 			"conditions": []interface{}{
 				map[string]interface{}{
@@ -74,6 +112,7 @@ func TestEvictionGate(t *testing.T) {
 		expectedMessage    string
 		verifyPMJCreated   bool
 		expectedLabels     map[string]string
+		expectNoPolicyWarn bool
 	}{
 		{
 			name: "Not an eviction request",
@@ -229,9 +268,10 @@ func TestEvictionGate(t *testing.T) {
 					RuntimeClassName: &gvisorRuntime,
 				},
 			},
-			subResource:     "eviction",
-			expectedAllowed: true,
-			expectedMessage: "skipping migration: no valid manual+stop policy found",
+			subResource:        "eviction",
+			expectedAllowed:    true,
+			expectedMessage:    "skipping migration: no valid manual+stop policy found",
+			expectNoPolicyWarn: true,
 		},
 		{
 			name: "Bypass migration when policy has resume instead of stop",
@@ -251,9 +291,62 @@ func TestEvictionGate(t *testing.T) {
 			initObjects: []client.Object{
 				createPSP("psp-test-manual-resume", "manual", "resume"),
 			},
-			subResource:     "eviction",
-			expectedAllowed: true,
-			expectedMessage: "skipping migration: no valid manual+stop policy found",
+			subResource:        "eviction",
+			expectedAllowed:    true,
+			expectedMessage:    "skipping migration: no valid manual+stop policy found",
+			expectNoPolicyWarn: true,
+		},
+		{
+			name: "Dual-labeled Kubeflow Workspace pod with ready ws-<name>-policy adopts workspace policy and spawns PMJ",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "ws-my-nb-0",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":          "true",
+						"notebooks.kubeflow.org/workspace-name": "my-nb",
+					},
+					UID: "ws-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+				createWorkspacePSP("my-nb", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+			expectNoPolicyWarn: false,
+		},
+		{
+			name: "Dual-labeled Kubeflow Workspace pod with only psp-<name>-manual skips migration, emits Warning event, and allows cold eviction",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "ws-my-nb-0",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled":          "true",
+						"notebooks.kubeflow.org/workspace-name": "my-nb",
+					},
+					UID: "ws-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    true,
+			expectedMessage:    "skipping migration: no valid manual+stop policy found",
+			verifyPMJCreated:   false,
+			expectNoPolicyWarn: true,
 		},
 		{
 			name: "Pod lacks runtimeClassName",
@@ -383,8 +476,9 @@ func TestEvictionGate(t *testing.T) {
 
 			initObjs := append(tt.initObjects, tt.pod)
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).Build()
+			recorder := record.NewFakeRecorder(10)
 
-			handler := &EvictionGate{Client: fakeClient, APIReader: fakeClient}
+			handler := &EvictionGate{Client: fakeClient, APIReader: fakeClient, Recorder: recorder}
 
 			req := admission.Request{}
 			req.Namespace = tt.pod.Namespace
@@ -417,6 +511,20 @@ func TestEvictionGate(t *testing.T) {
 				if gotMsg != tt.expectedMessage {
 					t.Errorf("Expected message %q, got %q", tt.expectedMessage, gotMsg)
 				}
+			}
+
+			gotNoPolicyWarn := false
+			select {
+			case ev := <-recorder.Events:
+				if ev == "Warning MigrationSkippedNoPolicy Pod is opted into live migration, but no matching Ready manual+stop PodSnapshotPolicy was found; allowing cold eviction" {
+					gotNoPolicyWarn = true
+				} else {
+					t.Errorf("Unexpected event recorded: %s", ev)
+				}
+			default:
+			}
+			if tt.expectNoPolicyWarn != gotNoPolicyWarn {
+				t.Errorf("Expected expectNoPolicyWarn=%t, got %t", tt.expectNoPolicyWarn, gotNoPolicyWarn)
 			}
 
 			if tt.verifyPMJCreated {

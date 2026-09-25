@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -33,6 +34,7 @@ import (
 type EvictionGate struct {
 	Client    client.Client
 	APIReader client.Reader
+	Recorder  record.EventRecorder
 	decoder   admission.Decoder
 }
 
@@ -145,6 +147,10 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 
 	if matchingPSP == nil {
 		logger.Info("No matching ready manual+stop policy found, skipping migration and allowing eviction", "pod", req.Name)
+		if a.Recorder != nil {
+			a.Recorder.Event(pod, corev1.EventTypeWarning, "MigrationSkippedNoPolicy",
+				"Pod is opted into live migration, but no matching Ready manual+stop PodSnapshotPolicy was found; allowing cold eviction")
+		}
 		return admission.Allowed("skipping migration: no valid manual+stop policy found")
 	}
 
@@ -205,6 +211,7 @@ func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader) 
 			Handler: &EvictionGate{
 				Client:    mgr.GetClient(),
 				APIReader: apiReader,
+				Recorder:  mgr.GetEventRecorderFor("pod-migration-controller"),
 				decoder:   dec,
 			},
 		},
