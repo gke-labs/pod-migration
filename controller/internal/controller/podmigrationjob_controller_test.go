@@ -6998,3 +6998,117 @@ func TestPodMigrationJobReconciler_Evicting_PhaseTimeout_AfterExtendedSnapshot(t
 		t.Errorf("Expected Ready condition Reason=Timeout, got %+v", cond)
 	}
 }
+
+func TestPodMigrationJobReconciler_Pending_VPAResizeInProgress_DefersSnapshot(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "vpa-resize-pod"
+	podUID := "uid-vpa-resize-1234"
+	jobName := util.FormatPMJName(podName, podUID)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "gke-node-1",
+		},
+		Status: corev1.PodStatus{
+			Resize: corev1.PodResizeStatusInProgress,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// 1. Reconcile while resize is InProgress
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 2*time.Second {
+		t.Errorf("Expected RequeueAfter 2s while VPA resize is InProgress, got %v", res.RequeueAfter)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	// Phase must remain Pending
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
+		t.Errorf("Expected phase to remain Pending while VPA resize is InProgress, got %s", updatedPMJ.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "VPAResizeInProgress" {
+		t.Errorf("Expected condition Ready=False Reason=VPAResizeInProgress, got %+v", cond)
+	}
+
+	// 2. Simulate resize completion on origin pod
+	pod.Status.Resize = ""
+	if err := fakeClient.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("Failed to update pod resize status: %v", err)
+	}
+
+	// 3. Next reconcile: must transition to Snapshotting
+	res2, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Second reconcile failed: %v", err)
+	}
+	if !res2.Requeue {
+		t.Errorf("Expected immediate Requeue after transitioning to Snapshotting")
+	}
+
+	resumedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, resumedPMJ); err != nil {
+		t.Fatalf("Failed to get PMJ: %v", err)
+	}
+
+	if resumedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Errorf("Expected phase to transition to Snapshotting after VPA resize finished, got %s", resumedPMJ.Status.Phase)
+	}
+	condResumed := meta.FindStatusCondition(resumedPMJ.Status.Conditions, "Ready")
+	if condResumed == nil || condResumed.Reason != "Snapshotting" {
+		t.Errorf("Expected condition Ready=False Reason=Snapshotting, got %+v", condResumed)
+	}
+}

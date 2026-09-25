@@ -10,8 +10,10 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -855,4 +857,175 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 			t.Fatalf("Expected status code 500, got: %+v", resp.Result)
 		}
 	})
+}
+
+func TestPodGateInjector_VPAResizedReplacementPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	deployName := "vpa-web-deploy"
+	deployUID := "deploy-uid-vpa-777"
+	rsName := "vpa-web-deploy-rs-1"
+	rsUID := "rs-uid-vpa-777"
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      rsName,
+			UID:       types.UID(rsUID),
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "Deployment",
+					Name:       deployName,
+					UID:        types.UID(deployUID),
+				},
+			},
+		},
+	}
+
+	// Origin pod spec (1Gi request, hash-v1)
+	originSpec := corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:  "web",
+				Image: "redis:7.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
+					},
+				},
+			},
+		},
+	}
+	originDigest, err := util.DistilledPodSpecDigest(&originSpec)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed: %v", err)
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pmj-vpa-web-origin",
+			Labels: map[string]string{
+				util.LabelParentName:          deployName,
+				util.LabelParentKind:          "Deployment",
+				util.LabelParentUID:           deployUID,
+				util.LabelPodTemplateHash:     "hash-v1-original",
+				util.LabelDistilledSpecDigest: originDigest[:63],
+			},
+			Annotations: map[string]string{
+				util.AnnotationDistilledSpecDigest: originDigest,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "vpa-web-orig"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rs, pmj).Build()
+	handler := &PodGateInjector{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+	}
+	_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+	// Case 1: Replacement pod with VPA-resized memory (4Gi vs 1Gi) and differing pod-template-hash
+	vpaResizedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "vpa-web-replacement",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled":         "true",
+				appsv1.DefaultDeploymentUniqueLabelKey: "hash-v2-vpa-resized",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       rsName,
+					UID:        types.UID(rsUID),
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "web",
+					Image: "redis:7.0",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("4Gi"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	rawPod, _ := json.Marshal(vpaResizedPod)
+	req := admission.Request{}
+	req.Namespace = namespace
+	req.Name = vpaResizedPod.Name
+	req.Object = runtime.RawExtension{Raw: rawPod}
+
+	resp := handler.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("Expected allowed, got denied: %+v", resp.Result)
+	}
+
+	// Verify JSON patch injected scheduling gate and assigned PMJ
+	if len(resp.Patches) == 0 {
+		t.Fatalf("Expected admission patches on VPA resized pod matching PMJ, got 0 patches")
+	}
+
+	hasGatePatch := false
+	hasAssignedPMJPatch := false
+	for _, p := range resp.Patches {
+		if p.Path == "/spec/schedulingGates" || p.Path == "/spec/schedulingGates/-" {
+			hasGatePatch = true
+		}
+		if p.Path == "/metadata/annotations" || p.Path == "/metadata/annotations/pod-migration.gke.io~1assigned-pmj" {
+			hasAssignedPMJPatch = true
+		}
+	}
+	if !hasGatePatch {
+		t.Errorf("Expected scheduling gate patch for VPA resized pod, patches: %+v", resp.Patches)
+	}
+	if !hasAssignedPMJPatch {
+		t.Errorf("Expected assigned-pmj patch for VPA resized pod, patches: %+v", resp.Patches)
+	}
+
+	// Case 2: Replacement pod has genuinely different container image (e.g. rollout) -> must bypass gate
+	rolloutPod := vpaResizedPod.DeepCopy()
+	rolloutPod.Spec.Containers[0].Image = "redis:7.2"
+	rawRollout, _ := json.Marshal(rolloutPod)
+	reqRollout := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace: namespace,
+			Name:      rolloutPod.Name,
+			Object:    runtime.RawExtension{Raw: rawRollout},
+		},
+	}
+	respRollout := handler.Handle(context.Background(), reqRollout)
+	if !respRollout.Allowed {
+		t.Fatalf("Expected allowed for rollout pod, got denied")
+	}
+
+	// For rollout pod (distilled spec mismatch), gate should NOT be injected; cold-start bypass ps-name: "" stamped
+	hasGatePatchRollout := false
+	for _, p := range respRollout.Patches {
+		if p.Path == "/spec/schedulingGates" || p.Path == "/spec/schedulingGates/-" {
+			hasGatePatchRollout = true
+		}
+	}
+	if hasGatePatchRollout {
+		t.Errorf("Rollout pod with different image should NOT have scheduling gate injected")
+	}
 }

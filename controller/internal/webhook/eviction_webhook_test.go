@@ -817,3 +817,112 @@ func TestEvictionGate_PropagatesControllerRevisionHashLabel(t *testing.T) {
 	}
 }
 
+func TestEvictionGate_StampsDistilledSpecDigest(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-vpa-pod"
+	podUID := "uid-vpa-evict-1234"
+	gvisorRuntime := "gvisor"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled":         "true",
+				appsv1.DefaultDeploymentUniqueLabelKey: "hash-deploy-v1",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+			Containers: []corev1.Container{
+				{
+					Name:  "app",
+					Image: "redis:7.0",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	expectedDigest, err := util.DistilledPodSpecDigest(&pod.Spec)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed: %v", err)
+	}
+
+	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		u.SetName(name)
+		u.SetNamespace("default")
+		u.Object["spec"] = map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      "pod-migration.gke.io/enabled",
+						"operator": "In",
+						"values":   []interface{}{"true"},
+					},
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           triggerType,
+				"postCheckpoint": postCheckpoint,
+			},
+		}
+		u.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+		return u
+	}
+	psp := createPSP("psp-test-manual", "manual", "stop")
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+	if resp.Allowed {
+		t.Fatalf("Expected eviction to trigger migration and return 429, got allowed")
+	}
+
+	jobName := util.FormatPMJName(podName, podUID)
+	createdJob := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: jobName}, createdJob); err != nil {
+		t.Fatalf("Expected PMJ %s to be created, got error: %v", jobName, err)
+	}
+
+	if got := createdJob.Annotations[util.AnnotationDistilledSpecDigest]; got != expectedDigest {
+		t.Errorf("Expected PMJ annotation %s=%q, got %q", util.AnnotationDistilledSpecDigest, expectedDigest, got)
+	}
+	if got := createdJob.Labels[util.LabelDistilledSpecDigest]; got != expectedDigest[:63] {
+		t.Errorf("Expected PMJ label %s=%q, got %q", util.LabelDistilledSpecDigest, expectedDigest[:63], got)
+	}
+}

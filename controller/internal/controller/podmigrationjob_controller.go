@@ -827,12 +827,48 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, nil
 			}
 
+			// VPA Resize State Handshake: if the origin pod has an in-place resize in progress,
+			// defer taking snapshot until the resize completes to prevent checkpointing inconsistent
+			// cgroups / memory bounds or VFS dirty pages.
+			if originPod.Status.Resize == corev1.PodResizeStatusInProgress {
+				cond := meta.FindStatusCondition(job.Status.Conditions, "Ready")
+				if cond == nil || cond.Reason != "VPAResizeInProgress" {
+					logger.Info("Origin pod has in-place resize in progress, deferring snapshot trigger until resize completes",
+						"pod", originPod.Name, "resizeStatus", originPod.Status.Resize)
+					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+						Type:               "Ready",
+						Status:             metav1.ConditionFalse,
+						Reason:             "VPAResizeInProgress",
+						Message:            fmt.Sprintf("Origin pod %s has in-place resize in progress (%s); deferring snapshot", originPod.Name, originPod.Status.Resize),
+						ObservedGeneration: job.Generation,
+					})
+					if err := r.patchStatus(ctx, job, origJob); err != nil {
+						return r.handleStatusError(ctx, err, "Failed to update job status on VPAResizeInProgress")
+					}
+					r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "VPAResizeWaiting",
+						"Deferring snapshot trigger for pod %s while in-place resize is InProgress", originPod.Name)
+				}
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+
 			if job.Status.OriginNodeName == "" && originPod.Spec.NodeName != "" {
 				job.Status.OriginNodeName = originPod.Spec.NodeName
 			}
 
 			if job.Annotations == nil {
 				job.Annotations = make(map[string]string)
+			}
+			if job.Annotations[util.AnnotationDistilledSpecDigest] == "" {
+				if d, err := util.DistilledPodSpecDigest(&originPod.Spec); err == nil && d != "" {
+					job.Annotations[util.AnnotationDistilledSpecDigest] = d
+					if job.Labels == nil {
+						job.Labels = make(map[string]string)
+					}
+					if job.Labels[util.LabelDistilledSpecDigest] == "" {
+						job.Labels[util.LabelDistilledSpecDigest] = d[:63]
+					}
+					annotationUpdated = true
+				}
 			}
 			if job.Annotations[util.AnnotationMigrationTimeout] == "" {
 				var rawTimeout string

@@ -2,8 +2,12 @@ package util
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -16,16 +20,18 @@ import (
 )
 
 const (
-	LabelParentName              = "pod-migration.gke.io/parent-name"
-	LabelParentKind              = "pod-migration.gke.io/parent-kind"
-	LabelParentUID               = "pod-migration.gke.io/parent-uid"
-	LabelPodTemplateHash         = "pod-migration.gke.io/pod-template-hash"
-	LabelControllerRevisionHash  = appsv1.ControllerRevisionHashLabelKey
-	LabelJobCompletionIndex      = batchv1.JobCompletionIndexAnnotation
-	LabelOriginPodName           = "pod-migration.gke.io/origin-pod-name"
-	AnnotationAssignedPMJ        = "pod-migration.gke.io/assigned-pmj"
-	AnnotationMismatchSince      = "pod-migration.gke.io/mismatch-since"
-	AnnotationPDBEvictionTimeout = "pod-migration.gke.io/pdb-eviction-timeout"
+	LabelParentName               = "pod-migration.gke.io/parent-name"
+	LabelParentKind               = "pod-migration.gke.io/parent-kind"
+	LabelParentUID                = "pod-migration.gke.io/parent-uid"
+	LabelPodTemplateHash          = "pod-migration.gke.io/pod-template-hash"
+	LabelControllerRevisionHash   = appsv1.ControllerRevisionHashLabelKey
+	LabelJobCompletionIndex       = batchv1.JobCompletionIndexAnnotation
+	LabelOriginPodName            = "pod-migration.gke.io/origin-pod-name"
+	LabelDistilledSpecDigest      = "pod-migration.gke.io/distilled-spec-digest"
+	AnnotationAssignedPMJ         = "pod-migration.gke.io/assigned-pmj"
+	AnnotationMismatchSince       = "pod-migration.gke.io/mismatch-since"
+	AnnotationPDBEvictionTimeout  = "pod-migration.gke.io/pdb-eviction-timeout"
+	AnnotationDistilledSpecDigest = "pod-migration.gke.io/distilled-spec-digest"
 
 	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
 	// in their assigned-pmj annotation.  Registered at manager startup via
@@ -74,8 +80,52 @@ func FormatPSMTName(podName, uid string) string {
 	return fmt.Sprintf("psmt-%s-%s", podName, ShortUID(uid))
 }
 
+// DistilledPodSpecDigest computes a deterministic SHA256 hex digest of a PodSpec
+// stripped of mutable runtime and resource attributes:
+// DistilledDigest = SHA256(PodSpec \ {Resources, NodeName, NodeSelector, Tolerations, SchedulingGates})
+// This allows LPM to match replacement pods whose pod-template-hash or resources
+// deviated due to Vertical Pod Autoscaler (VPA) admission mutation or resizing.
+func DistilledPodSpecDigest(spec *corev1.PodSpec) (string, error) {
+	if spec == nil {
+		return "", nil
+	}
+	cloned := spec.DeepCopy()
+
+	// Strip Resources from all container collections
+	for i := range cloned.Containers {
+		cloned.Containers[i].Resources = corev1.ResourceRequirements{}
+	}
+	for i := range cloned.InitContainers {
+		cloned.InitContainers[i].Resources = corev1.ResourceRequirements{}
+	}
+	for i := range cloned.EphemeralContainers {
+		cloned.EphemeralContainers[i].Resources = corev1.ResourceRequirements{}
+	}
+
+	// Strip runtime placement, node, and gate fields
+	cloned.NodeName = ""
+	cloned.NodeSelector = nil
+	cloned.Tolerations = nil
+	cloned.SchedulingGates = nil
+
+	data, err := json.Marshal(cloned)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal distilled pod spec: %w", err)
+	}
+
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:]), nil
+}
+
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string) (string, error) {
+// If podTemplateHash mismatches for a Deployment/ReplicaSet workload (e.g. because VPA admission mutated
+// container resources on the replacement pod), distilledDigest is matched against the PMJ's distilled spec digest.
+func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string, distilledDigest ...string) (string, error) {
+	var targetDigest string
+	if len(distilledDigest) > 0 {
+		targetDigest = distilledDigest[0]
+	}
+
 	jobList := &pmv1alpha1.PodMigrationJobList{}
 	err := c.List(ctx, jobList, client.InNamespace(namespace))
 	if err != nil {
@@ -102,8 +152,20 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 				continue
 			}
 
-			if parentKind == "Deployment" && job.Labels[LabelPodTemplateHash] != podTemplateHash {
-				continue
+			if (parentKind == "Deployment" || parentKind == "ReplicaSet") && job.Labels[LabelPodTemplateHash] != podTemplateHash {
+				if targetDigest == "" {
+					continue
+				}
+				jobDigest := ""
+				if job.Annotations != nil {
+					jobDigest = job.Annotations[AnnotationDistilledSpecDigest]
+				}
+				if jobDigest == "" && job.Labels != nil {
+					jobDigest = job.Labels[LabelDistilledSpecDigest]
+				}
+				if jobDigest == "" || (jobDigest != targetDigest && !strings.HasPrefix(targetDigest, jobDigest)) {
+					continue
+				}
 			}
 
 			if parentKind == "Job" && jobCompletionIndex != "" && job.Labels[LabelJobCompletionIndex] != jobCompletionIndex {
@@ -238,7 +300,12 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	}
 
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex)
+	var distilledDigest string
+	if d, err := DistilledPodSpecDigest(&pod.Spec); err == nil {
+		distilledDigest = d
+	}
+
+	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, distilledDigest)
 	if err != nil {
 		return "", false, err
 	}

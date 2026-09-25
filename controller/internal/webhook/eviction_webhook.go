@@ -182,6 +182,15 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		}
 	}
 
+	distDigest, err := util.DistilledPodSpecDigest(&pod.Spec)
+	if err == nil && distDigest != "" {
+		if jobAnnotations == nil {
+			jobAnnotations = make(map[string]string)
+		}
+		jobAnnotations[util.AnnotationDistilledSpecDigest] = distDigest
+		jobLabels[util.LabelDistilledSpecDigest] = distDigest[:63]
+	}
+
 	newJob := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        jobName,

@@ -8,12 +8,14 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestParseMode(t *testing.T) {
@@ -321,6 +323,87 @@ func TestInvariants_I6_RevisionAndIdentityFidelity(t *testing.T) {
 	})
 	if len(vs) != 4 {
 		t.Fatalf("expected all 4 I6 identity checks (pod-template-hash, controller-revision-hash, job-completion-index, parent-uid) to fire, got %d: %+v", len(vs), vs)
+	}
+}
+
+func TestInvariants_I6_VPAResizeMatchingDistilledSpecAllowsTemplateHashDifference(t *testing.T) {
+	isCtrl := true
+	originSpec := corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:  "app",
+				Image: "redis:7.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
+					},
+				},
+			},
+		},
+	}
+	digest, err := util.DistilledPodSpecDigest(&originSpec)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed: %v", err)
+	}
+
+	// Replacement pod has VPA-mutated memory (4Gi) and different pod-template-hash ("hash-v2")
+	replacementSpec := corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:  "app",
+				Image: "redis:7.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("4Gi"),
+					},
+				},
+			},
+		},
+	}
+
+	vs := EvaluateI6(&ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "pmj-vpa",
+				Labels: map[string]string{
+					LabelPMJPodTemplateHash: "hash-v1",
+					LabelPMJParentKind:      "Deployment",
+					LabelPMJParentUID:       "deploy-uid-1",
+				},
+				Annotations: map[string]string{
+					util.AnnotationDistilledSpecDigest: digest,
+				},
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+				RestoredPodName: "pod-repl",
+			},
+		},
+		PrimaryPod: &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "pod-repl",
+				Labels: map[string]string{
+					LabelPodTemplateHash: "hash-v2", // different due to VPA mutation
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Kind:       "Deployment",
+						Name:       "my-deploy",
+						UID:        types.UID("deploy-uid-1"),
+						Controller: &isCtrl,
+					},
+				},
+			},
+			Spec: replacementSpec,
+		},
+	})
+
+	for _, v := range vs {
+		if v.Reason == "PodTemplateHashMismatch" {
+			t.Fatalf("unexpected PodTemplateHashMismatch violation for VPA pod with matching distilled spec: %+v", v)
+		}
 	}
 }
 

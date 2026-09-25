@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -847,5 +848,209 @@ func TestResolveParentWorkload_StandaloneReplicaSet(t *testing.T) {
 	}
 	if parentUID != rsUID {
 		t.Errorf("expected parentUID %q, got %q", rsUID, parentUID)
+	}
+}
+
+func TestDistilledPodSpecDigest(t *testing.T) {
+	baseSpec := &corev1.PodSpec{
+		NodeName: "gke-node-01",
+		NodeSelector: map[string]string{
+			"cloud.google.com/gke-nodepool": "default-pool",
+		},
+		Tolerations: []corev1.Toleration{
+			{
+				Key:      "example-key",
+				Operator: corev1.TolerationOpExists,
+			},
+		},
+		SchedulingGates: []corev1.PodSchedulingGate{
+			{
+				Name: "gke.io/pod-migration-gate",
+			},
+		},
+		InitContainers: []corev1.Container{
+			{
+				Name:  "init-setup",
+				Image: "busybox:latest",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU: resource.MustParse("100m"),
+					},
+				},
+			},
+		},
+		Containers: []corev1.Container{
+			{
+				Name:  "app",
+				Image: "redis:7.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("500m"),
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("1000m"),
+						corev1.ResourceMemory: resource.MustParse("2Gi"),
+					},
+				},
+			},
+		},
+	}
+
+	digest1, err := DistilledPodSpecDigest(baseSpec)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed: %v", err)
+	}
+	if len(digest1) != 64 {
+		t.Fatalf("expected 64-char sha256 hex digest, got %q (len %d)", digest1, len(digest1))
+	}
+
+	// Determinism check: same spec produces identical digest
+	digest2, err := DistilledPodSpecDigest(baseSpec)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed: %v", err)
+	}
+	if digest1 != digest2 {
+		t.Errorf("expected deterministic digest, got %q vs %q", digest1, digest2)
+	}
+
+	// VPA mutated spec: altered CPU/memory requests and limits, empty nodeName/selector/tolerations/gates
+	vpaSpec := &corev1.PodSpec{
+		NodeName:        "",
+		NodeSelector:    nil,
+		Tolerations:     nil,
+		SchedulingGates: nil,
+		InitContainers: []corev1.Container{
+			{
+				Name:  "init-setup",
+				Image: "busybox:latest",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU: resource.MustParse("250m"),
+					},
+				},
+			},
+		},
+		Containers: []corev1.Container{
+			{
+				Name:  "app",
+				Image: "redis:7.0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("1500m"),
+						corev1.ResourceMemory: resource.MustParse("4Gi"),
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("2000m"),
+						corev1.ResourceMemory: resource.MustParse("8Gi"),
+					},
+				},
+			},
+		},
+	}
+
+	vpaDigest, err := DistilledPodSpecDigest(vpaSpec)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed: %v", err)
+	}
+	if vpaDigest != digest1 {
+		t.Errorf("expected VPA mutated spec to produce identical distilled digest %q, got %q", digest1, vpaDigest)
+	}
+
+	// Genuinely different spec (image changed) -> must produce different digest
+	diffSpec := vpaSpec.DeepCopy()
+	diffSpec.Containers[0].Image = "redis:7.2"
+	diffDigest, err := DistilledPodSpecDigest(diffSpec)
+	if err != nil {
+		t.Fatalf("DistilledPodSpecDigest failed: %v", err)
+	}
+	if diffDigest == digest1 {
+		t.Errorf("expected different image to produce different digest, got same %q", diffDigest)
+	}
+
+	// Nil spec returns empty string
+	nilDigest, err := DistilledPodSpecDigest(nil)
+	if err != nil || nilDigest != "" {
+		t.Errorf("expected empty string and nil error for nil spec, got %q, %v", nilDigest, err)
+	}
+}
+
+func TestFindUnassignedActivePMJ_VPADistilledSpecMatching(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	originSpec := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{
+				Name:  "web",
+				Image: "nginx:1.25",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("256Mi"),
+					},
+				},
+			},
+		},
+	}
+	originDigest, err := DistilledPodSpecDigest(originSpec)
+	if err != nil {
+		t.Fatalf("failed to compute origin digest: %v", err)
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-web-deploy-origin",
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelParentName:          "web-deploy",
+				LabelParentKind:          "Deployment",
+				LabelParentUID:           "deploy-uid-111",
+				LabelPodTemplateHash:     "hash-v1-original",
+				LabelDistilledSpecDigest: originDigest[:63],
+			},
+			Annotations: map[string]string{
+				AnnotationDistilledSpecDigest: originDigest,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "web-deploy-orig"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pmj).Build()
+	ctx := context.Background()
+
+	// 1. Same template hash matches directly
+	got1, err := FindUnassignedActivePMJ(ctx, c, "default", "web-deploy-new", "web-deploy", "Deployment", "deploy-uid-111", "hash-v1-original", "")
+	if err != nil || got1 != pmj.Name {
+		t.Errorf("exact template hash match expected %q, got %q, err=%v", pmj.Name, got1, err)
+	}
+
+	// 2. VPA mutated replacement pod: pod-template-hash differs (hash-vpa-scaled), but distilledDigest matches
+	got2, err := FindUnassignedActivePMJ(ctx, c, "default", "web-deploy-new", "web-deploy", "Deployment", "deploy-uid-111", "hash-vpa-scaled", "", originDigest)
+	if err != nil || got2 != pmj.Name {
+		t.Errorf("VPA mutated pod with matching distilledDigest expected %q, got %q, err=%v", pmj.Name, got2, err)
+	}
+
+	// 3. VPA mutated replacement pod WITHOUT passing distilledDigest: rejected (returns empty string)
+	got3, err := FindUnassignedActivePMJ(ctx, c, "default", "web-deploy-new", "web-deploy", "Deployment", "deploy-uid-111", "hash-vpa-scaled", "")
+	if err != nil || got3 != "" {
+		t.Errorf("differing template hash without distilledDigest expected empty string, got %q, err=%v", got3, err)
+	}
+
+	// 4. Differing template hash with completely different distilledDigest (e.g. image rollout): rejected
+	differentSpec := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{Name: "web", Image: "nginx:1.26"},
+		},
+	}
+	diffDigest, _ := DistilledPodSpecDigest(differentSpec)
+	got4, err := FindUnassignedActivePMJ(ctx, c, "default", "web-deploy-new", "web-deploy", "Deployment", "deploy-uid-111", "hash-vpa-scaled", "", diffDigest)
+	if err != nil || got4 != "" {
+		t.Errorf("differing template hash with mismatched distilledDigest expected empty string, got %q, err=%v", got4, err)
 	}
 }

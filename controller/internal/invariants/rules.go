@@ -500,16 +500,32 @@ func EvaluateI6(s *ReconcileSnapshot) []Violation {
 		if expectedHash := job.Labels[LabelPMJPodTemplateHash]; expectedHash != "" {
 			actualHash := pod.Labels[LabelPodTemplateHash]
 			if actualHash != "" && actualHash != expectedHash {
-				violations = append(violations, Violation{
-					InvariantID:   "I6",
-					InvariantName: "RevisionAndIdentityFidelity",
-					Reason:        "PodTemplateHashMismatch",
-					Message: fmt.Sprintf("PMJ %s/%s expects pod-template-hash %q but replacement pod %s has %q",
-						job.Namespace, job.Name, expectedHash, pod.Name, actualHash),
-					Namespace: job.Namespace,
-					PMJName:   job.Name,
-					PodName:   pod.Name,
-				})
+				distilledMatch := false
+				jobDigest := ""
+				if job.Annotations != nil {
+					jobDigest = job.Annotations[util.AnnotationDistilledSpecDigest]
+				}
+				if jobDigest == "" && job.Labels != nil {
+					jobDigest = job.Labels[util.LabelDistilledSpecDigest]
+				}
+				if jobDigest != "" {
+					podDigest, err := util.DistilledPodSpecDigest(&pod.Spec)
+					if err == nil && podDigest != "" && (jobDigest == podDigest || strings.HasPrefix(podDigest, jobDigest)) {
+						distilledMatch = true
+					}
+				}
+				if !distilledMatch {
+					violations = append(violations, Violation{
+						InvariantID:   "I6",
+						InvariantName: "RevisionAndIdentityFidelity",
+						Reason:        "PodTemplateHashMismatch",
+						Message: fmt.Sprintf("PMJ %s/%s expects pod-template-hash %q but replacement pod %s has %q",
+							job.Namespace, job.Name, expectedHash, pod.Name, actualHash),
+						Namespace: job.Namespace,
+						PMJName:   job.Name,
+						PodName:   pod.Name,
+					})
+				}
 			}
 		}
 		// 2. Check StatefulSet controller-revision-hash (util.LabelControllerRevisionHash on PMJ vs Pod)

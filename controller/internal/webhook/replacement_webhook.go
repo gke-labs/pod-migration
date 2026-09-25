@@ -70,8 +70,13 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		jobCompletionIndex = pod.Labels[util.LabelJobCompletionIndex]
 	}
 
+	var distilledDigest string
+	if d, err := util.DistilledPodSpecDigest(&pod.Spec); err == nil {
+		distilledDigest = d
+	}
+
 	// Find active unassigned PMJ
-	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex)
+	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, distilledDigest)
 	if err != nil {
 		logger.Error(err, "Failed to check unassigned active PMJs")
 		return admission.Errored(http.StatusInternalServerError, err)
@@ -91,7 +96,7 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 				return admission.Errored(http.StatusInternalServerError, err)
 			}
 		}
-		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex)
+		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex, distilledDigest)
 		if err != nil {
 			logger.Error(err, "Failed to check unassigned active PMJs via APIReader fallback")
 			return admission.Errored(http.StatusInternalServerError, err)
