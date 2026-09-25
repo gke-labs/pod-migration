@@ -162,3 +162,73 @@ func TestCalculateMigrationTimeout(t *testing.T) {
 		})
 	}
 }
+
+func TestParseClampedTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		expected time.Duration
+		ok       bool
+	}{
+		{
+			name:     "Empty string",
+			raw:      "",
+			expected: 0,
+			ok:       false,
+		},
+		{
+			name:     "Invalid duration string",
+			raw:      "not-a-duration",
+			expected: 0,
+			ok:       false,
+		},
+		{
+			name:     "Zero duration",
+			raw:      "0s",
+			expected: 0,
+			ok:       false,
+		},
+		{
+			name:     "Negative duration",
+			raw:      "-5m",
+			expected: 0,
+			ok:       false,
+		},
+		{
+			name:     "Sub-minute duration clamped to MinMigrationTimeout",
+			raw:      "30s",
+			expected: MinMigrationTimeout,
+			ok:       true,
+		},
+		{
+			name:     "Valid duration in range",
+			raw:      "15m",
+			expected: 15 * time.Minute,
+			ok:       true,
+		},
+		{
+			name:     "Exact max duration",
+			raw:      "2h",
+			expected: MaxMigrationTimeout,
+			ok:       true,
+		},
+		{
+			name:     "Duration exceeding max clamped to MaxMigrationTimeout",
+			raw:      "5h",
+			expected: MaxMigrationTimeout,
+			ok:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseClampedTimeout(tc.raw)
+			if ok != tc.ok {
+				t.Errorf("ParseClampedTimeout(%q) ok = %v; want %v", tc.raw, ok, tc.ok)
+			}
+			if got != tc.expected {
+				t.Errorf("ParseClampedTimeout(%q) = %v; want %v", tc.raw, got, tc.expected)
+			}
+		})
+	}
+}

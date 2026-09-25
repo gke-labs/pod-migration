@@ -130,6 +130,10 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 		return false
 	}
 	evictionBudget := r.getMigrationTimeout(job)
+	if job.Status.EvictingStartTime != nil {
+		return time.Since(job.Status.EvictingStartTime.Time) < evictionBudget
+	}
+	// Fallback to evicting-since annotation for in-flight jobs during upgrade
 	if job.Annotations != nil {
 		if evictingSinceStr := job.Annotations[util.AnnotationEvictingSince]; evictingSinceStr != "" {
 			evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
@@ -140,12 +144,6 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 				return time.Since(evictingSince) < evictionBudget
 			}
 		}
-	}
-	// Fallback when evicting-since annotation is not yet stamped (e.g. handoff from Snapshotting,
-	// or pod already deleted when entering Evicting during volume detachment):
-	// Check the LastTransitionTime of the Ready condition stamped when entering Evicting phase.
-	if cond := meta.FindStatusCondition(job.Status.Conditions, "Ready"); cond != nil && (cond.Reason == "Evicting" || cond.Reason == "WaitingForVolumeDetach") {
-		return time.Since(cond.LastTransitionTime.Time) < evictionBudget
 	}
 	return false
 }
@@ -211,11 +209,9 @@ func (r *PodMigrationJobReconciler) recordPreviousPhaseDuration(job *pmv1alpha1.
 			metrics.RecordPhaseDuration("snapshotting", time.Since(job.Status.SnapshottingStartTime.Time).Seconds())
 		}
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
-		// The evicting anchor is the pod-migration.gke.io/evicting-since annotation,
-		// which is only written while the origin pod still exists. If the origin pod was
-		// already gone when entering Evicting, this annotation is absent and no evicting
-		// sample is recorded.
-		if job.Annotations != nil {
+		if job.Status.EvictingStartTime != nil {
+			metrics.RecordPhaseDuration("evicting", time.Since(job.Status.EvictingStartTime.Time).Seconds())
+		} else if job.Annotations != nil {
 			if s := job.Annotations["pod-migration.gke.io/evicting-since"]; s != "" {
 				if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 					metrics.RecordPhaseDuration("evicting", time.Since(t).Seconds())
@@ -808,7 +804,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		case snapshot.PhaseReady:
 			logger.Info("GKE PodSnapshot is Ready, transitioning to Evicting phase", "snapshot", snapStatus.SnapshotRef)
+			now := metav1.Now()
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
+			job.Status.EvictingStartTime = &now
 			job.Status.SnapshotRef = snapStatus.SnapshotRef
 			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 				Type:               "Ready",
@@ -849,6 +847,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
+		// Ensure EvictingStartTime is initialized
+		if job.Status.EvictingStartTime == nil {
+			now := metav1.Now()
+			job.Status.EvictingStartTime = &now
+			if err := r.patchStatus(ctx, job, origJob); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to initialize EvictingStartTime")
+			}
+		}
+
 		// Proactively clean up the manual trigger once the PMJ is durably Evicting.
 		// This frees the target pod lock in the snapshot agent for sequential 2-hop migrations,
 		// and runs idempotently without risk of trigger re-creation on Status().Update retry.
@@ -882,6 +889,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					job.Annotations = make(map[string]string)
 				}
 				if job.Annotations[util.AnnotationEvictingSince] == "" {
+					// Status must be flushed above this line before calling r.Update on the main resource.
 					job.Annotations[util.AnnotationEvictingSince] = time.Now().Format(time.RFC3339Nano)
 					_ = r.Update(ctx, job)
 				}

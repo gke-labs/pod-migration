@@ -6506,6 +6506,14 @@ func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeout
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase:       pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 			SnapshotRef: snapName,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "Snapshotting",
+					LastTransitionTime: creationTime,
+				},
+			},
 		},
 	}
 
@@ -6556,6 +6564,9 @@ func TestPodMigrationJobReconciler_Evicting_PostDeadlineExtension_DoesNotTimeout
 	// Must NOT fail immediately upon entering Evicting phase post-snapshot-extension
 	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		t.Errorf("Expected PMJ to remain in Evicting, got %s", updatedPMJ.Status.Phase)
+	}
+	if updatedPMJ.Status.EvictingStartTime == nil {
+		t.Errorf("Expected EvictingStartTime to be set, got nil")
 	}
 	if updatedPMJ.Annotations == nil || updatedPMJ.Annotations[util.AnnotationEvictingSince] == "" {
 		t.Errorf("Expected evicting-since annotation to be stamped, got annotations=%v", updatedPMJ.Annotations)
