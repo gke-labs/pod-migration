@@ -170,12 +170,12 @@ func TestPodMigrationReconciler_Reconcile_Success(t *testing.T) {
 	if !ok {
 		t.Fatalf("PSP selector matchExpressions is not a slice, got %T", selector["matchExpressions"])
 	}
-	if len(matchExpressions) != 2 {
-		t.Fatalf("Expected 2 matchExpressions, got %d", len(matchExpressions))
+	if len(matchExpressions) != 1 {
+		t.Fatalf("Expected 1 matchExpression, got %d", len(matchExpressions))
 	}
 	expr, ok := matchExpressions[0].(map[string]interface{})
 	if !ok {
-		t.Fatalf("matchExpression[0] is not a map")
+		t.Fatalf("matchExpression is not a map")
 	}
 	if expr["key"] != "pod-migration.gke.io/enabled" {
 		t.Errorf("Expected key pod-migration.gke.io/enabled, got %v", expr["key"])
@@ -189,16 +189,6 @@ func TestPodMigrationReconciler_Reconcile_Success(t *testing.T) {
 	}
 	if len(values) != 1 || values[0] != "true" {
 		t.Errorf("Expected values [true], got %v", values)
-	}
-	expr1, ok := matchExpressions[1].(map[string]interface{})
-	if !ok {
-		t.Fatalf("matchExpression[1] is not a map")
-	}
-	if expr1["key"] != "notebooks.kubeflow.org/workspace-name" {
-		t.Errorf("Expected key notebooks.kubeflow.org/workspace-name, got %v", expr1["key"])
-	}
-	if expr1["operator"] != "DoesNotExist" {
-		t.Errorf("Expected operator DoesNotExist, got %v", expr1["operator"])
 	}
 }
 

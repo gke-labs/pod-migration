@@ -221,16 +221,6 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	pspManual.SetName(pspManualName)
 	pspManual.SetNamespace(req.Namespace)
 
-	// Exclude Kubeflow Workspace pods (notebooks.kubeflow.org/workspace-name) even when
-	// they also opt into migration via pod-migration.gke.io/enabled="true".
-	// In Kubeflow Notebooks (gke-standalone), gke-workspace-snapshot-addon reconciles a
-	// per-Workspace PodSnapshotPolicy (ws-<name>-policy) with manual+stop and Ready=True
-	// backed by kubeflow-pod-snapshot-storage-config. Excluding Workspace pods from
-	// psp-<name>-manual ensures both EvictionGate (findLatestReadyManualStopPSP) and
-	// gke-pod-snapshot-agent deterministically select ws-<name>-policy and migrate the
-	// Workspace pod using Kubeflow's snapshot bucket rather than racing on ByLatestUpdated.
-	// If ws-<name>-policy is absent or not Ready, EvictionGate emits a Warning event
-	// (MigrationSkippedNoPolicy) and falls back to cold eviction.
 	specPayloadManual := map[string]interface{}{
 		"storageConfigName": psscName,
 		"selector": map[string]interface{}{
@@ -239,10 +229,6 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 					"key":      "pod-migration.gke.io/enabled",
 					"operator": "In",
 					"values":   []interface{}{"true"},
-				},
-				map[string]interface{}{
-					"key":      "notebooks.kubeflow.org/workspace-name",
-					"operator": "DoesNotExist",
 				},
 			},
 		},

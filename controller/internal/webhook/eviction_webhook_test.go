@@ -25,7 +25,7 @@ import (
 )
 
 func TestEvictionGate(t *testing.T) {
-	// Helper to create a fake namespace-wide PodMigration PodSnapshotPolicy (psp-<name>-manual)
+	// Helper to create a fake PodSnapshotPolicy
 	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
 		psp := &unstructured.Unstructured{}
 		psp.SetGroupVersionKind(schema.GroupVersionKind{
@@ -43,10 +43,6 @@ func TestEvictionGate(t *testing.T) {
 						"operator": "In",
 						"values":   []interface{}{"true"},
 					},
-					map[string]interface{}{
-						"key":      "notebooks.kubeflow.org/workspace-name",
-						"operator": "DoesNotExist",
-					},
 				},
 			},
 			"triggerConfig": map[string]interface{}{
@@ -55,39 +51,6 @@ func TestEvictionGate(t *testing.T) {
 			},
 		}
 		// Inject Ready=True condition in status
-		psp.Object["status"] = map[string]interface{}{
-			"conditions": []interface{}{
-				map[string]interface{}{
-					"type":   "Ready",
-					"status": "True",
-				},
-			},
-		}
-		return psp
-	}
-
-	// Helper to create a fake Kubeflow per-Workspace PodSnapshotPolicy (ws-<name>-policy)
-	createWorkspacePSP := func(workspaceName, triggerType, postCheckpoint string) *unstructured.Unstructured {
-		psp := &unstructured.Unstructured{}
-		psp.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshotPolicy",
-		})
-		psp.SetName("ws-" + workspaceName + "-policy")
-		psp.SetNamespace("default")
-		psp.Object["spec"] = map[string]interface{}{
-			"storageConfigName": "kubeflow-pod-snapshot-storage-config",
-			"selector": map[string]interface{}{
-				"matchLabels": map[string]interface{}{
-					"notebooks.kubeflow.org/workspace-name": workspaceName,
-				},
-			},
-			"triggerConfig": map[string]interface{}{
-				"type":           triggerType,
-				"postCheckpoint": postCheckpoint,
-			},
-		}
 		psp.Object["status"] = map[string]interface{}{
 			"conditions": []interface{}{
 				map[string]interface{}{
@@ -294,58 +257,6 @@ func TestEvictionGate(t *testing.T) {
 			subResource:        "eviction",
 			expectedAllowed:    true,
 			expectedMessage:    "skipping migration: no valid manual+stop policy found",
-			expectNoPolicyWarn: true,
-		},
-		{
-			name: "Dual-labeled Kubeflow Workspace pod with ready ws-<name>-policy adopts workspace policy and spawns PMJ",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "default",
-					Name:      "ws-my-nb-0",
-					Labels: map[string]string{
-						"pod-migration.gke.io/enabled":          "true",
-						"notebooks.kubeflow.org/workspace-name": "my-nb",
-					},
-					UID: "ws-uid-12345",
-				},
-				Spec: corev1.PodSpec{
-					RuntimeClassName: &gvisorRuntime,
-				},
-			},
-			initObjects: []client.Object{
-				createPSP("psp-test-manual", "manual", "stop"),
-				createWorkspacePSP("my-nb", "manual", "stop"),
-			},
-			subResource:        "eviction",
-			expectedAllowed:    false,
-			expectedStatusCode: 429,
-			expectedMessage:    "migration job spawned",
-			verifyPMJCreated:   true,
-			expectNoPolicyWarn: false,
-		},
-		{
-			name: "Dual-labeled Kubeflow Workspace pod with only psp-<name>-manual skips migration, emits Warning event, and allows cold eviction",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "default",
-					Name:      "ws-my-nb-0",
-					Labels: map[string]string{
-						"pod-migration.gke.io/enabled":          "true",
-						"notebooks.kubeflow.org/workspace-name": "my-nb",
-					},
-					UID: "ws-uid-12345",
-				},
-				Spec: corev1.PodSpec{
-					RuntimeClassName: &gvisorRuntime,
-				},
-			},
-			initObjects: []client.Object{
-				createPSP("psp-test-manual", "manual", "stop"),
-			},
-			subResource:        "eviction",
-			expectedAllowed:    true,
-			expectedMessage:    "skipping migration: no valid manual+stop policy found",
-			verifyPMJCreated:   false,
 			expectNoPolicyWarn: true,
 		},
 		{
