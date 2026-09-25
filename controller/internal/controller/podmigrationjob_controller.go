@@ -3,10 +3,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -453,6 +455,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 	return snapshot.NewGKEProvider(r.Client, r.Scheme)
 }
 
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch;create;update;patch;delete
@@ -730,6 +733,34 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 				return ctrl.Result{}, nil
 			}
+		}
+
+		// Proactively clean up unassigned SucceededWithoutRestore PMJs if the parent workload has scaled down.
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore && !job.Status.Consumed {
+			cleanedUp, err := r.cleanupScaleDownZombie(ctx, job)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if cleanedUp {
+				return ctrl.Result{}, nil
+			}
+
+			// Only requeue at 1m for supported workloads (Deployment, ReplicaSet, StatefulSet) where scale-down cleanup can apply.
+			kind := job.Labels[util.LabelParentKind]
+			if kind == "Deployment" || kind == "ReplicaSet" || kind == "StatefulSet" {
+				if job.Status.CompletionTime != nil {
+					ttl := time.Minute * 30
+					requeueIn := ttl - time.Since(job.Status.CompletionTime.Time)
+					if requeueIn <= 1*time.Minute {
+						return ctrl.Result{RequeueAfter: requeueIn}, nil
+					}
+				}
+				return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+			}
+		}
+
+		if job.Status.CompletionTime != nil {
+			ttl := time.Minute * 30
 			requeueIn := ttl - time.Since(job.Status.CompletionTime.Time)
 			return ctrl.Result{RequeueAfter: requeueIn}, nil
 		}
@@ -1585,6 +1616,257 @@ func (r *PodMigrationJobReconciler) hasGatedClaimant(ctx context.Context, job *p
 			return true, nil
 		}
 	}
+	return false, nil
+}
+
+// hasAssignedClaimant reports whether any pod is annotated as assigned to this PMJ.
+func (r *PodMigrationJobReconciler) hasAssignedClaimant(ctx context.Context, job *pmv1alpha1.PodMigrationJob) (bool, error) {
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods,
+		client.InNamespace(job.Namespace),
+		client.MatchingFields{PodAssignedPMJIndex: job.Name}); err != nil {
+		return false, fmt.Errorf("failed to list pods assigned to PMJ %s: %w", job.Name, err)
+	}
+	return len(pods.Items) > 0, nil
+}
+
+func getOrdinalFromPodName(podName, stsName string) (int32, bool) {
+	if !strings.HasPrefix(podName, stsName+"-") {
+		lastDash := strings.LastIndex(podName, "-")
+		if lastDash == -1 || lastDash == len(podName)-1 {
+			return -1, false
+		}
+		ord, err := strconv.Atoi(podName[lastDash+1:])
+		if err != nil || ord < 0 {
+			return -1, false
+		}
+		return int32(ord), true
+	}
+	ordStr := strings.TrimPrefix(podName, stsName+"-")
+	ord, err := strconv.Atoi(ordStr)
+	if err != nil || ord < 0 {
+		return -1, false
+	}
+	return int32(ord), true
+}
+
+// countActiveWorkloadPods counts non-terminating, non-failed/succeeded pods for a workload,
+// explicitly excluding the origin pod that was evicted/migrated by this PMJ.
+func (r *PodMigrationJobReconciler) countActiveWorkloadPods(pods []corev1.Pod, job *pmv1alpha1.PodMigrationJob) int32 {
+	active := int32(0)
+	for i := range pods {
+		p := &pods[i]
+		if p.DeletionTimestamp != nil ||
+			p.Status.Phase == corev1.PodFailed ||
+			p.Status.Phase == corev1.PodSucceeded {
+			continue
+		}
+		// Exclude the origin pod of this PMJ if still lingering in cache.
+		// For StatefulSets, replacement pods have the exact same name as the origin pod,
+		// so only fall back to name matching when TargetPodUID is empty.
+		if job.Spec.TargetPodUID != "" && string(p.UID) == job.Spec.TargetPodUID {
+			continue
+		} else if job.Spec.TargetPodUID == "" && job.Spec.PodRef.Name != "" && p.Name == job.Spec.PodRef.Name {
+			continue
+		}
+		active++
+	}
+	return active
+}
+
+// cleanupScaleDownZombie proactively deletes unassigned completed PMJs in SucceededWithoutRestore
+// whose parent workload has scaled down and already has all target replicas satisfied by active pods.
+func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, job *pmv1alpha1.PodMigrationJob) (bool, error) {
+	if job.Status.Consumed {
+		return false, nil
+	}
+
+	parentName := job.Labels[util.LabelParentName]
+	parentKind := job.Labels[util.LabelParentKind]
+	if parentName == "" || parentKind == "" {
+		return false, nil
+	}
+
+	gated, err := r.hasGatedClaimant(ctx, job)
+	if err != nil {
+		return false, err
+	}
+	if gated {
+		return false, nil
+	}
+
+	assigned, err := r.hasAssignedClaimant(ctx, job)
+	if err != nil {
+		return false, err
+	}
+	if assigned {
+		return false, nil
+	}
+
+	var targetReplicas int32
+	var selector *metav1.LabelSelector
+
+	switch parentKind {
+	case "Deployment":
+		podTemplateHash := job.Labels[util.LabelPodTemplateHash]
+		if podTemplateHash != "" {
+			rs := &appsv1.ReplicaSet{}
+			rsName := fmt.Sprintf("%s-%s", parentName, podTemplateHash)
+			err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: rsName}, rs)
+			if err != nil && apierrors.IsNotFound(err) {
+				rsList := &appsv1.ReplicaSetList{}
+				if listErr := r.liveReader().List(ctx, rsList,
+					client.InNamespace(job.Namespace),
+					client.MatchingLabels{appsv1.DefaultDeploymentUniqueLabelKey: podTemplateHash}); listErr != nil {
+					return false, listErr
+				} else {
+					found := false
+					for i := range rsList.Items {
+						for _, ref := range rsList.Items[i].OwnerReferences {
+							if ref.Kind == "Deployment" && ref.Name == parentName {
+								rs = &rsList.Items[i]
+								found = true
+								err = nil
+								break
+							}
+						}
+						if found {
+							break
+						}
+					}
+					if !found {
+						// ReplicaSet not found; return false to avoid premature deletion and defer to 30m TTL.
+						return false, nil
+					}
+				}
+			}
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			targetReplicas = 1
+			if rs.Spec.Replicas != nil {
+				targetReplicas = *rs.Spec.Replicas
+			}
+			selector = rs.Spec.Selector
+		} else {
+			deploy := &appsv1.Deployment{}
+			if err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, deploy); err != nil {
+				if apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			targetReplicas = 1
+			if deploy.Spec.Replicas != nil {
+				targetReplicas = *deploy.Spec.Replicas
+			}
+			selector = deploy.Spec.Selector
+		}
+
+	case "ReplicaSet":
+		rs := &appsv1.ReplicaSet{}
+		if err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, rs); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		targetReplicas = 1
+		if rs.Spec.Replicas != nil {
+			targetReplicas = *rs.Spec.Replicas
+		}
+		selector = rs.Spec.Selector
+
+	case "StatefulSet":
+		sts := &appsv1.StatefulSet{}
+		if err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, sts); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		targetReplicas = 1
+		if sts.Spec.Replicas != nil {
+			targetReplicas = *sts.Spec.Replicas
+		}
+		selector = sts.Spec.Selector
+
+	default:
+		return false, nil
+	}
+
+	var activeCount int32
+	var hasRunningReplacementPod bool
+	if selector != nil {
+		sel, err := metav1.LabelSelectorAsSelector(selector)
+		if err != nil {
+			return false, err
+		}
+
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList, client.InNamespace(job.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
+			return false, err
+		}
+
+		// Fail-open guard: If the origin pod is still running and non-terminating (e.g. SWR entered due to
+		// PDBEvictionTimeout or EvictionMisconfiguredTimeout), preserve the PMJ as a fail-open guard for eviction webhook.
+		if job.Spec.TargetPodUID != "" {
+			for _, p := range podList.Items {
+				if string(p.UID) == job.Spec.TargetPodUID && p.DeletionTimestamp == nil {
+					return false, nil
+				}
+			}
+		}
+
+		for _, p := range podList.Items {
+			if p.DeletionTimestamp == nil &&
+				p.Status.Phase != corev1.PodFailed &&
+				p.Status.Phase != corev1.PodSucceeded &&
+				p.Name == job.Spec.PodRef.Name &&
+				(job.Spec.TargetPodUID == "" || string(p.UID) != job.Spec.TargetPodUID) {
+				hasRunningReplacementPod = true
+				break
+			}
+		}
+
+		activeCount = r.countActiveWorkloadPods(podList.Items, job)
+	}
+
+	// For StatefulSets, pods are ordered by ordinal (0 .. targetReplicas-1).
+	// A pod with ordinal < targetReplicas has NOT been scaled down. If no replacement pod is running yet,
+	// do not clean up the PMJ.
+	if parentKind == "StatefulSet" {
+		if ord, ok := getOrdinalFromPodName(job.Spec.PodRef.Name, parentName); ok {
+			if ord < targetReplicas && !hasRunningReplacementPod {
+				return false, nil
+			}
+		}
+	}
+
+	// If active pods satisfy or exceed target replicas, the workload has scaled down and no replacement pod will be created.
+	if activeCount >= targetReplicas {
+		logger := log.FromContext(ctx)
+		logger.Info("Proactively deleting unassigned completed PodMigrationJob after parent workload scale-down",
+			"job", job.Name,
+			"parentKind", parentKind,
+			"parentName", parentName,
+			"activePods", activeCount,
+			"targetReplicas", targetReplicas)
+
+		if err := r.Delete(ctx, job); err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+
+		r.eventf(job, corev1.EventTypeNormal, "ScaleDownZombieCleaned",
+			"Proactively deleted unassigned completed PMJ for scaled-down %s %s (active pods: %d, target replicas: %d)",
+			parentKind, parentName, activeCount, targetReplicas)
+
+		return true, nil
+	}
+
 	return false, nil
 }
 

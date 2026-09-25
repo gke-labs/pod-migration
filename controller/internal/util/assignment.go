@@ -45,6 +45,7 @@ func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod
 						return rsRef.Name, "Deployment", string(rsRef.UID), nil
 					}
 				}
+				return rs.Name, "ReplicaSet", string(rs.UID), nil
 			} else {
 				return "", "", "", err
 			}
