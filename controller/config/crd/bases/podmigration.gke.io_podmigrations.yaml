@@ -43,8 +43,9 @@ spec:
               excludedPodSelectors:
                 description: |-
                   ExcludedPodSelectors specifies label selector requirements to exclude pods from
-                  the automatically generated PodSnapshotPolicy. Useful when coexisting with external
-                  controllers that reconcile their own PodSnapshotPolicies (e.g. Kubeflow Notebooks).
+                  the automatically generated PodSnapshotPolicy. Only exclusion operators ('NotIn' and 'DoesNotExist')
+                  are permitted. Useful when coexisting with external controllers that reconcile their own
+                  PodSnapshotPolicies (e.g. Kubeflow Notebooks).
                 items:
                   description: |-
                     A label selector requirement is a selector that contains values, a key, and an operator that
@@ -74,6 +75,17 @@ spec:
                   - operator
                   type: object
                 type: array
+                x-kubernetes-validations:
+                - message: excludedPodSelectors operator must be NotIn or DoesNotExist
+                  rule: self.all(e, e.operator in ['NotIn', 'DoesNotExist'])
+                - message: key 'pod-migration.gke.io/enabled' is reserved and cannot
+                    be excluded
+                  rule: self.all(e, e.key != 'pod-migration.gke.io/enabled')
+                - message: NotIn requires non-empty values; DoesNotExist requires
+                    empty values
+                  rule: self.all(e, (e.operator == 'NotIn' && size(e.values) > 0)
+                    || (e.operator == 'DoesNotExist' && (!has(e.values) || size(e.values)
+                    == 0)))
               storage:
                 description: StorageSpec defines the snapshot storage target configuration.
                 properties:

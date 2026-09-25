@@ -798,5 +798,8 @@ func TestEvictionGate_ExcludedPodSelectors_Coexistence(t *testing.T) {
 		if pmj.Spec.TargetPodUID != podUID {
 			t.Errorf("Expected TargetPodUID %s, got %s", podUID, pmj.Spec.TargetPodUID)
 		}
+		if pmj.Annotations[util.AnnotationPodSnapshotPolicy] != kubeflowPSP.GetName() {
+			t.Errorf("Expected PMJ to be annotated with policy %s, got %s", kubeflowPSP.GetName(), pmj.Annotations[util.AnnotationPodSnapshotPolicy])
+		}
 	})
 }

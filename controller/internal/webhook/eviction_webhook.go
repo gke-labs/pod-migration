@@ -161,6 +161,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			Name:      jobName,
 			Namespace: req.Namespace,
 			Labels:    jobLabels,
+			Annotations: map[string]string{
+				util.AnnotationPodSnapshotPolicy: matchingPSP.GetName(),
+			},
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
 			PodRef: corev1.LocalObjectReference{

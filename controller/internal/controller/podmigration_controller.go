@@ -172,22 +172,6 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		pathPrefix = parts[1]
 	}
 
-	// Validate ExcludedPodSelectors if specified
-	if err := validateExcludedPodSelectors(config.Spec.ExcludedPodSelectors); err != nil {
-		logger.Error(err, "Invalid excludedPodSelectors", "name", req.Name)
-		meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			Reason:             "InvalidExcludedPodSelectors",
-			Message:            err.Error(),
-			ObservedGeneration: config.Generation,
-		})
-		if updateErr := r.Status().Update(ctx, config); updateErr != nil {
-			logger.Error(updateErr, "Failed to update status on invalid excludedPodSelectors")
-		}
-		return ctrl.Result{}, err
-	}
-
 	// Hash-based unique name for cluster-scoped PSSC to prevent namespace conflicts
 	psscName := getPSSCName(req.Namespace, req.Name)
 
@@ -226,7 +210,24 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// 2. Reconcile PodSnapshotPolicy for manual (Namespaced)
+	// 2. Validate ExcludedPodSelectors if specified
+	if err := validateExcludedPodSelectors(config.Spec.ExcludedPodSelectors); err != nil {
+		logger.Error(err, "Invalid excludedPodSelectors", "name", req.Name)
+		meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "InvalidExcludedPodSelectors",
+			Message:            err.Error(),
+			ObservedGeneration: config.Generation,
+		})
+		if updateErr := r.Status().Update(ctx, config); updateErr != nil {
+			logger.Error(updateErr, "Failed to update status on invalid excludedPodSelectors")
+			return ctrl.Result{}, updateErr
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 3. Reconcile PodSnapshotPolicy for manual (Namespaced)
 	pspManualName := getPSPManualName(req.Name)
 	pspManual := &unstructured.Unstructured{}
 	pspManual.SetGroupVersionKind(schema.GroupVersionKind{
@@ -310,16 +311,18 @@ func validateExcludedPodSelectors(selectors []metav1.LabelSelectorRequirement) e
 			return fmt.Errorf("excludedPodSelectors[%d]: key %q cannot be overridden in excludedPodSelectors", i, req.Key)
 		}
 		switch req.Operator {
-		case metav1.LabelSelectorOpIn, metav1.LabelSelectorOpNotIn:
+		case metav1.LabelSelectorOpNotIn:
 			if len(req.Values) == 0 {
 				return fmt.Errorf("excludedPodSelectors[%d]: operator %q requires non-empty values", i, req.Operator)
 			}
-		case metav1.LabelSelectorOpExists, metav1.LabelSelectorOpDoesNotExist:
+		case metav1.LabelSelectorOpDoesNotExist:
 			if len(req.Values) > 0 {
 				return fmt.Errorf("excludedPodSelectors[%d]: operator %q requires empty values, got %v", i, req.Operator, req.Values)
 			}
+		case metav1.LabelSelectorOpIn, metav1.LabelSelectorOpExists:
+			return fmt.Errorf("excludedPodSelectors[%d]: operator %q is not allowed for exclusions (only NotIn and DoesNotExist are supported)", i, req.Operator)
 		default:
-			return fmt.Errorf("excludedPodSelectors[%d]: invalid operator %q (must be In, NotIn, Exists, or DoesNotExist)", i, req.Operator)
+			return fmt.Errorf("excludedPodSelectors[%d]: invalid operator %q (must be NotIn or DoesNotExist)", i, req.Operator)
 		}
 	}
 	return nil

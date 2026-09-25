@@ -591,6 +591,84 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_Update(t *tes
 	if len(matchExpressions) != 2 {
 		t.Fatalf("Expected 2 matchExpressions after update, got %d: %+v", len(matchExpressions), matchExpressions)
 	}
+
+	// 3. Change ExcludedPodSelectors (modify existing exclusion)
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, config)
+	if err != nil {
+		t.Fatalf("Failed to get config before change: %v", err)
+	}
+	config.Spec.ExcludedPodSelectors = []metav1.LabelSelectorRequirement{
+		{
+			Key:      "tier",
+			Operator: metav1.LabelSelectorOpNotIn,
+			Values:   []string{"cache", "batch"},
+		},
+	}
+	config.Generation = 3
+	if err := fakeClient.Update(context.Background(), config); err != nil {
+		t.Fatalf("Failed to update config for change: %v", err)
+	}
+
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      configName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Third reconcile (change) failed: %v", err)
+	}
+
+	// Verify PSP selector was updated with changed requirement
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pspName}, psp); err != nil {
+		t.Fatalf("Failed to get changed PSP: %v", err)
+	}
+	pspSpec = psp.Object["spec"].(map[string]interface{})
+	selector = pspSpec["selector"].(map[string]interface{})
+	matchExpressions = selector["matchExpressions"].([]interface{})
+	if len(matchExpressions) != 2 {
+		t.Fatalf("Expected 2 matchExpressions after change, got %d: %+v", len(matchExpressions), matchExpressions)
+	}
+	changedExpr := matchExpressions[1].(map[string]interface{})
+	if changedExpr["key"] != "tier" || changedExpr["operator"] != "NotIn" {
+		t.Errorf("Unexpected changedExpr: %+v", changedExpr)
+	}
+
+	// 4. Remove ExcludedPodSelectors (revert to default opt-in only)
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, config)
+	if err != nil {
+		t.Fatalf("Failed to get config before removal: %v", err)
+	}
+	config.Spec.ExcludedPodSelectors = nil
+	config.Generation = 4
+	if err := fakeClient.Update(context.Background(), config); err != nil {
+		t.Fatalf("Failed to update config for removal: %v", err)
+	}
+
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      configName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Fourth reconcile (removal) failed: %v", err)
+	}
+
+	// Verify PSP selector reverted to 1 matchExpression (opt-in only)
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pspName}, psp); err != nil {
+		t.Fatalf("Failed to get reverted PSP: %v", err)
+	}
+	pspSpec = psp.Object["spec"].(map[string]interface{})
+	selector = pspSpec["selector"].(map[string]interface{})
+	matchExpressions = selector["matchExpressions"].([]interface{})
+	if len(matchExpressions) != 1 {
+		t.Fatalf("Expected 1 matchExpression after removal, got %d: %+v", len(matchExpressions), matchExpressions)
+	}
+	optInExpr := matchExpressions[0].(map[string]interface{})
+	if optInExpr["key"] != "pod-migration.gke.io/enabled" || optInExpr["operator"] != "In" {
+		t.Errorf("Unexpected optInExpr after removal: %+v", optInExpr)
+	}
 }
 
 func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErrors(t *testing.T) {
@@ -629,13 +707,21 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 			errSubstr: "invalid operator",
 		},
 		{
-			name: "In operator with empty values",
+			name: "In operator rejected",
 			requirement: metav1.LabelSelectorRequirement{
 				Key:      "app",
 				Operator: metav1.LabelSelectorOpIn,
-				Values:   []string{},
+				Values:   []string{"val"},
 			},
-			errSubstr: "requires non-empty values",
+			errSubstr: "operator \"In\" is not allowed for exclusions",
+		},
+		{
+			name: "Exists operator rejected",
+			requirement: metav1.LabelSelectorRequirement{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpExists,
+			},
+			errSubstr: "operator \"Exists\" is not allowed for exclusions",
 		},
 		{
 			name: "NotIn operator with empty values",
@@ -645,15 +731,6 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 				Values:   nil,
 			},
 			errSubstr: "requires non-empty values",
-		},
-		{
-			name: "Exists operator with non-empty values",
-			requirement: metav1.LabelSelectorRequirement{
-				Key:      "app",
-				Operator: metav1.LabelSelectorOpExists,
-				Values:   []string{"val"},
-			},
-			errSubstr: "requires empty values",
 		},
 		{
 			name: "DoesNotExist operator with non-empty values",
@@ -689,10 +766,25 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 				},
 			}
 
+			psscMock := &unstructured.Unstructured{}
+			psscMock.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "podsnapshot.gke.io",
+				Version: "v1",
+				Kind:    "PodSnapshotStorageConfig",
+			})
+			pspMock := &unstructured.Unstructured{}
+			pspMock.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "podsnapshot.gke.io",
+				Version: "v1",
+				Kind:    "PodSnapshotPolicy",
+			})
+
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(config).
 				WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+				WithStatusSubresource(psscMock).
+				WithStatusSubresource(pspMock).
 				Build()
 
 			r := &PodMigrationReconciler{
@@ -700,17 +792,17 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 				Scheme: scheme,
 			}
 
-			_, err := r.Reconcile(context.Background(), ctrl.Request{
+			res, err := r.Reconcile(context.Background(), ctrl.Request{
 				NamespacedName: types.NamespacedName{
 					Namespace: namespace,
 					Name:      configName,
 				},
 			})
-			if err == nil {
-				t.Fatalf("Expected reconcile error, got nil")
+			if err != nil {
+				t.Fatalf("Expected nil error from Reconcile (spec error should not requeue), got: %v", err)
 			}
-			if !strings.Contains(err.Error(), tt.errSubstr) {
-				t.Errorf("Expected error to contain %q, got: %v", tt.errSubstr, err)
+			if res.Requeue || res.RequeueAfter != 0 {
+				t.Errorf("Expected no requeue on spec validation error, got: %+v", res)
 			}
 
 			updatedConfig := &pmv1alpha1.PodMigration{}
@@ -730,6 +822,30 @@ func TestPodMigrationReconciler_Reconcile_WithExcludedPodSelectors_ValidationErr
 			}
 			if !strings.Contains(cond.Message, tt.errSubstr) {
 				t.Errorf("Expected condition message to contain %q, got: %s", tt.errSubstr, cond.Message)
+			}
+
+			// Verify PSSC was created (storage config is not blocked by selector error)
+			psscName := getPSSCName(namespace, configName)
+			pssc := &unstructured.Unstructured{}
+			pssc.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "podsnapshot.gke.io",
+				Version: "v1",
+				Kind:    "PodSnapshotStorageConfig",
+			})
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: psscName}, pssc); err != nil {
+				t.Errorf("Expected PSSC %s to be created despite invalid selector, got error: %v", psscName, err)
+			}
+
+			// Verify PSP was NOT created
+			pspName := getPSPManualName(configName)
+			psp := &unstructured.Unstructured{}
+			psp.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "podsnapshot.gke.io",
+				Version: "v1",
+				Kind:    "PodSnapshotPolicy",
+			})
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pspName}, psp); err == nil {
+				t.Errorf("Expected PSP to NOT be created on invalid selector")
 			}
 		})
 	}
