@@ -43,14 +43,32 @@ type PodMigrationReconciler struct {
 	InvariantEngine *invariants.Engine
 }
 
-func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config *pmv1alpha1.PodMigration) {
+func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config *pmv1alpha1.PodMigration, reconcileErr *error) {
 	if r.InvariantEngine == nil || config == nil {
 		return
 	}
+	if reconcileErr != nil && *reconcileErr != nil {
+		return
+	}
+
+	var namespacePMJs []pmv1alpha1.PodMigrationJob
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := r.List(ctx, pmjList, client.InNamespace(config.Namespace)); err == nil {
+		namespacePMJs = pmjList.Items
+	}
+
+	var namespacePods []corev1.Pod
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(config.Namespace)); err == nil {
+		namespacePods = podList.Items
+	}
+
 	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
 		Now:              time.Now(),
 		Reconciler:       "PodMigrationReconciler",
 		PrimaryMigration: config,
+		NamespacePMJs:    namespacePMJs,
+		NamespacePods:    namespacePods,
 	})
 }
 
@@ -61,7 +79,7 @@ func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config 
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch;delete
 
-func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx)
 
 	// Fetch the PodMigration instance
@@ -76,7 +94,9 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	defer r.evaluateInvariants(ctx, config)
+	defer func() {
+		r.evaluateInvariants(ctx, config, &reconcileErr)
+	}()
 
 	// Examine DeletionTimestamp to determine if object is under deletion
 	if !config.ObjectMeta.DeletionTimestamp.IsZero() {

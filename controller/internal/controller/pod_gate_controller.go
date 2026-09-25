@@ -46,15 +46,43 @@ type PodGateReconciler struct {
 	InvariantEngine *invariants.Engine
 }
 
-func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) {
+func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, reconcileErr *error) {
 	if r.InvariantEngine == nil || pod == nil {
 		return
 	}
+	if reconcileErr != nil && *reconcileErr != nil {
+		return
+	}
+
+	var namespacePMJs []pmv1alpha1.PodMigrationJob
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := r.List(ctx, pmjList, client.InNamespace(pod.Namespace)); err == nil {
+		namespacePMJs = pmjList.Items
+		if job == nil && pod.Annotations != nil {
+			if assigned := pod.Annotations[util.AnnotationAssignedPMJ]; assigned != "" {
+				for i := range namespacePMJs {
+					if namespacePMJs[i].Name == assigned {
+						job = &namespacePMJs[i]
+						break
+					}
+				}
+			}
+		}
+	}
+
+	var namespacePods []corev1.Pod
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(pod.Namespace)); err == nil {
+		namespacePods = podList.Items
+	}
+
 	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
-		Now:        time.Now(),
-		Reconciler: "PodGateReconciler",
-		PrimaryPod: pod,
-		PrimaryPMJ: job,
+		Now:           time.Now(),
+		Reconciler:    "PodGateReconciler",
+		PrimaryPod:    pod,
+		PrimaryPMJ:    job,
+		NamespacePMJs: namespacePMJs,
+		NamespacePods: namespacePods,
 	})
 }
 
@@ -64,7 +92,7 @@ func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
 
 // Reconcile checks for active migration jobs and removes the scheduling gate if none exist.
-func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx).WithValues("pod", req.Name, "namespace", req.Namespace)
 
 	// Fetch Pod
@@ -80,7 +108,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var observedJob *pmv1alpha1.PodMigrationJob
 	defer func() {
-		r.evaluateInvariants(ctx, pod, observedJob)
+		r.evaluateInvariants(ctx, pod, observedJob, &reconcileErr)
 	}()
 
 	// Check if pod has the scheduling gate

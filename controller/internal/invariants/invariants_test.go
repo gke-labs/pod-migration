@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -41,7 +42,6 @@ func TestParseMode(t *testing.T) {
 }
 
 func TestInvariants_I1_AtMostOnceRestore(t *testing.T) {
-	// Clean: single replacement pod bound to snapshot-1
 	clean := &ReconcileSnapshot{
 		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-1"},
@@ -68,7 +68,6 @@ func TestInvariants_I1_AtMostOnceRestore(t *testing.T) {
 		t.Fatalf("expected 0 violations on clean I1 state, got %+v", vs)
 	}
 
-	// Violating: two distinct pods bound to snapshot-1
 	violating := &ReconcileSnapshot{
 		PrimaryPMJ: clean.PrimaryPMJ,
 		NamespacePods: []corev1.Pod{
@@ -90,7 +89,7 @@ func TestInvariants_I1_AtMostOnceRestore(t *testing.T) {
 }
 
 func TestInvariants_I2_NoSilentColdStart(t *testing.T) {
-	// Violating: PMJ Succeeded with empty SnapshotRef
+	// 1. Violating: PMJ Succeeded with empty SnapshotRef
 	v1 := EvaluateI2(&ReconcileSnapshot{
 		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-empty-snap"},
@@ -103,7 +102,7 @@ func TestInvariants_I2_NoSilentColdStart(t *testing.T) {
 		t.Fatalf("expected I2 violation for Succeeded without SnapshotRef, got %+v", v1)
 	}
 
-	// Violating: PMJ Succeeded but replacement pod carries cold-start-bypass=true
+	// 2. Violating: PMJ Succeeded but replacement pod carries explicit cold-start bypass (`podsnapshot.gke.io/ps-name: ""`)
 	v2 := EvaluateI2(&ReconcileSnapshot{
 		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-cold-pod"},
@@ -118,26 +117,48 @@ func TestInvariants_I2_NoSilentColdStart(t *testing.T) {
 				Namespace: "default",
 				Name:      "repl-pod",
 				Annotations: map[string]string{
-					AnnotationColdStartBypass: "true",
+					AnnotationPSName: "",
 				},
 			},
 		},
 	})
-	if len(v2) != 1 || v2[0].InvariantID != "I2" {
-		t.Fatalf("expected I2 violation for Succeeded with cold-start replacement pod, got %+v", v2)
+	if len(v2) != 1 || v2[0].InvariantID != "I2" || v2[0].Reason != "SucceededPodMissingRestoreAnnotation" {
+		t.Fatalf("expected I2 violation for Succeeded with ps-name=\"\" cold-start bypass, got %+v", v2)
+	}
+
+	// 3. Violating: Bare gate removal on a pod still carrying assigned-pmj without ps-name key
+	v3 := EvaluateI2(&ReconcileSnapshot{
+		PrimaryPod: &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "bare-ungated-pod",
+				Annotations: map[string]string{
+					AnnotationAssignedPMJ: "pmj-active",
+				},
+			},
+		},
+	})
+	if len(v3) != 1 || v3[0].Reason != "GateReleasedWithoutSnapshotOrColdStartBypass" {
+		t.Fatalf("expected I2 GateReleasedWithoutSnapshotOrColdStartBypass violation, got %+v", v3)
 	}
 }
 
-func TestInvariants_I3_GateLiveness(t *testing.T) {
-	// Violating: Pod still has scheduling gate after PMJ marked GateReleased=true
-	vs := EvaluateI3(&ReconcileSnapshot{
+func TestInvariants_I3_GateLivenessAndGraceWindow(t *testing.T) {
+	now := time.Now()
+	justNow := metav1.NewTime(now.Add(-5 * time.Second))
+	longAgo := metav1.NewTime(now.Add(-45 * time.Second))
+
+	// 1. Within 30s two-step release grace window: no false positive
+	withinGrace := EvaluateI3(&ReconcileSnapshot{
+		Now: now,
 		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-3"},
 			Status: pmv1alpha1.PodMigrationJobStatus{
-				Phase:          pmv1alpha1.PodMigrationJobPhaseRestoring,
-				Consumed:       true,
-				GateReleased:   true,
-				RestoredPodUID: "uid-3",
+				Phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+				Consumed:           true,
+				GateReleased:       true,
+				RestoredPodUID:     "uid-3",
+				RestoringStartTime: &justNow,
 			},
 		},
 		PrimaryPod: &corev1.Pod{
@@ -152,47 +173,102 @@ func TestInvariants_I3_GateLiveness(t *testing.T) {
 			},
 		},
 	})
-	if len(vs) != 1 || vs[0].InvariantID != "I3" {
-		t.Fatalf("expected I3 violation for gated pod after GateReleased=true, got %+v", vs)
+	if len(withinGrace) != 0 {
+		t.Fatalf("expected 0 violations within 30s gate release grace window, got %+v", withinGrace)
+	}
+
+	// 2. Past 30s grace window: flags PodGatedAfterGateReleasedStatus
+	pastGrace := EvaluateI3(&ReconcileSnapshot{
+		Now: now,
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-3"},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+				Consumed:           true,
+				GateReleased:       true,
+				RestoredPodUID:     "uid-3",
+				RestoringStartTime: &longAgo,
+			},
+		},
+		PrimaryPod: &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "default",
+				Name:        "pod-3",
+				UID:         types.UID("uid-3"),
+				Annotations: map[string]string{AnnotationAssignedPMJ: "pmj-3"},
+			},
+			Spec: corev1.PodSpec{
+				SchedulingGates: []corev1.PodSchedulingGate{{Name: MigrationGateName}},
+			},
+		},
+	})
+	if len(pastGrace) != 1 || pastGrace[0].InvariantID != "I3" {
+		t.Fatalf("expected I3 violation past 30s grace window, got %+v", pastGrace)
 	}
 }
 
-func TestInvariants_I4_TerminalProgress(t *testing.T) {
+func TestInvariants_I4_DynamicTimeoutAndStaticMessage(t *testing.T) {
 	now := time.Now()
-	old := metav1.NewTime(now.Add(-12 * time.Minute))
+	created12mAgo := metav1.NewTime(now.Add(-12 * time.Minute))
 
-	// Violating: PMJ in Snapshotting for 12m (> 10m30s)
-	vs := EvaluateI4(&ReconcileSnapshot{
-		Now: now,
-		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:         "default",
-				Name:              "pmj-stuck",
-				CreationTimestamp: old,
-			},
-			Status: pmv1alpha1.PodMigrationJobStatus{
-				Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
-			},
+	// 1. Default 10m timeout exceeded at 12m -> triggers I4 with static message
+	pmjDefault := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              "pmj-stuck",
+			CreationTimestamp: created12mAgo,
 		},
-	})
-	if len(vs) != 1 || vs[0].InvariantID != "I4" {
-		t.Fatalf("expected I4 violation for stuck active PMJ, got %+v", vs)
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+	vs1 := EvaluateI4(&ReconcileSnapshot{Now: now, PrimaryPMJ: pmjDefault})
+	vs2 := EvaluateI4(&ReconcileSnapshot{Now: now.Add(5 * time.Second), PrimaryPMJ: pmjDefault})
+	if len(vs1) != 1 || len(vs2) != 1 {
+		t.Fatalf("expected I4 violation at 12m on default 10m deadline, got %+v", vs1)
+	}
+	if vs1[0].Message != vs2[0].Message {
+		t.Fatalf("expected I4 violation message to be static across reconcile ticks for client-go EventAggregator; got %q vs %q",
+			vs1[0].Message, vs2[0].Message)
 	}
 
-	// Violating: PodMigration deleting with finalizer for 12m (> 10m30s)
-	vsMig := EvaluateI4(&ReconcileSnapshot{
-		Now: now,
-		PrimaryMigration: &pmv1alpha1.PodMigration{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:         "default",
-				Name:              "mig-stuck",
-				DeletionTimestamp: &old,
-				Finalizers:        []string{StorageCleanupFinalizer},
+	// 2. PR #57 explicit `pod-migration.gke.io/timeout: "25m"` annotation -> 12m is within budget!
+	pmjExtended := pmjDefault.DeepCopy()
+	pmjExtended.Annotations = map[string]string{AnnotationMigrationTimeout: "25m"}
+	if vs := EvaluateI4(&ReconcileSnapshot{Now: now, PrimaryPMJ: pmjExtended}); len(vs) != 0 {
+		t.Fatalf("expected 0 violations at 12m when pod-migration.gke.io/timeout=25m, got %+v", vs)
+	}
+
+	// 3. PR #57 memory-scaled pod (16Gi -> 15m27s budget) -> 12m is within budget!
+	pmjMemScaled := pmjDefault.DeepCopy()
+	pmjMemScaled.Spec.PodRef.Name = "redis-16gi"
+	originPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "redis-16gi"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "redis",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("16Gi"),
+						},
+					},
+				},
 			},
 		},
-	})
-	if len(vsMig) != 1 || vsMig[0].InvariantID != "I4" {
-		t.Fatalf("expected I4 violation for stuck deleting PodMigration finalizer, got %+v", vsMig)
+	}
+	if vs := EvaluateI4(&ReconcileSnapshot{Now: now, PrimaryPMJ: pmjMemScaled, NamespacePods: []corev1.Pod{originPod}}); len(vs) != 0 {
+		t.Fatalf("expected 0 violations at 12m for 16Gi memory-scaled pod (15m27s deadline), got %+v", vs)
+	}
+
+	// 4. PR #57 Evicting phase anchored on `pod-migration.gke.io/evicting-since` (30s ago) -> within budget!
+	pmjEvicting := pmjDefault.DeepCopy()
+	pmjEvicting.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
+	pmjEvicting.Annotations = map[string]string{
+		AnnotationEvictingSince: now.Add(-30 * time.Second).Format(time.RFC3339Nano),
+	}
+	if vs := EvaluateI4(&ReconcileSnapshot{Now: now, PrimaryPMJ: pmjEvicting}); len(vs) != 0 {
+		t.Fatalf("expected 0 violations when Evicting phase started 30s ago via evicting-since, got %+v", vs)
 	}
 }
 
@@ -212,13 +288,18 @@ func TestInvariants_I5_ZeroResourceLeak(t *testing.T) {
 }
 
 func TestInvariants_I6_RevisionAndIdentityFidelity(t *testing.T) {
+	isCtrl := true
 	vs := EvaluateI6(&ReconcileSnapshot{
 		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: "default",
 				Name:      "pmj-rev",
 				Labels: map[string]string{
-					LabelPMJPodTemplateHash: "hash-v1",
+					LabelPMJPodTemplateHash:     "hash-v1",
+					LabelControllerRevisionHash: "sts-rev-1",
+					LabelJobCompletionIndex:     "0",
+					LabelPMJParentKind:          "StatefulSet",
+					LabelPMJParentUID:           "sts-uid-1",
 				},
 			},
 			Status: pmv1alpha1.PodMigrationJobStatus{
@@ -231,17 +312,28 @@ func TestInvariants_I6_RevisionAndIdentityFidelity(t *testing.T) {
 				Namespace: "default",
 				Name:      "pod-v2",
 				Labels: map[string]string{
-					LabelPodTemplateHash: "hash-v2",
+					LabelPodTemplateHash:        "hash-v2",
+					LabelControllerRevisionHash: "sts-rev-2",
+					LabelJobCompletionIndex:     "1",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Kind:       "StatefulSet",
+						Name:       "web",
+						UID:        types.UID("sts-uid-2"),
+						Controller: &isCtrl,
+					},
 				},
 			},
 		},
 	})
-	if len(vs) != 1 || vs[0].InvariantID != "I6" {
-		t.Fatalf("expected I6 violation for pod-template-hash mismatch, got %+v", vs)
+	if len(vs) != 4 {
+		t.Fatalf("expected all 4 I6 identity checks (pod-template-hash, controller-revision-hash, job-completion-index, parent-uid) to fire, got %d: %+v", len(vs), vs)
 	}
 }
 
 func TestInvariants_I7_DisruptionBoundingPDBCompliance(t *testing.T) {
+	// 1. Bare delete before deadline
 	vs := EvaluateI7(&ReconcileSnapshot{
 		UsedBareDeleteBeforeDeadline: true,
 		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
@@ -256,6 +348,32 @@ func TestInvariants_I7_DisruptionBoundingPDBCompliance(t *testing.T) {
 	})
 	if len(vs) != 1 || vs[0].InvariantID != "I7" {
 		t.Fatalf("expected I7 violation for bare delete before deadline, got %+v", vs)
+	}
+
+	// 2. Live detection: PMJ in Restoring while origin pod (TargetPodUID) is still running without eviction
+	vsLive := EvaluateI7(&ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-premature-restore"},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "origin-pod"},
+				TargetPodUID: "origin-uid-1",
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+			},
+		},
+		NamespacePods: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "origin-pod",
+					UID:       types.UID("origin-uid-1"),
+				},
+			},
+		},
+	})
+	if len(vsLive) != 1 || vsLive[0].Reason != "OriginPodStillRunningInRestoringPhase" {
+		t.Fatalf("expected live I7 OriginPodStillRunningInRestoringPhase violation, got %+v", vsLive)
 	}
 }
 
@@ -273,23 +391,47 @@ func TestInvariants_I8_PlatformAndControlPlaneIsolation(t *testing.T) {
 	}
 }
 
-func TestInvariants_I9_DeterministicFallbackOverCrashloop(t *testing.T) {
+func TestInvariants_I9_DeterministicFallbackOverCrashloop_LiveClassifier(t *testing.T) {
+	// Live detection directly from pod ContainerStatuses via restore.Classify (no synthetic flag required)
 	vs := EvaluateI9(&ReconcileSnapshot{
-		RestoreCrashSignatureMatched: true,
 		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-crash"},
 			Status: pmv1alpha1.PodMigrationJobStatus{
-				Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+				Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
 				RestoredPodName: "crash-pod",
+				RestoredPodUID:  "crash-uid-1",
+			},
+		},
+		NamespacePods: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "crash-pod",
+					UID:       types.UID("crash-uid-1"),
+				},
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "app",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									ExitCode: 128,
+									Reason:   "StartError",
+									Message:  "failed to start containerd task: OCI runtime restore failed: bad image",
+								},
+							},
+						},
+					},
+				},
 			},
 		},
 	})
 	if len(vs) != 1 || vs[0].InvariantID != "I9" {
-		t.Fatalf("expected I9 violation when matched restore crash remains in Restoring, got %+v", vs)
+		t.Fatalf("expected live I9 violation when restore.Classify detects StartError/128 restore crash, got %+v", vs)
 	}
 }
 
-func TestEngine_ObserveAndStrictTelemetry(t *testing.T) {
+func TestEngine_ObserveStrictAndDeduplication(t *testing.T) {
 	recorder := record.NewFakeRecorder(10)
 	pmj := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-test"},
@@ -305,33 +447,46 @@ func TestEngine_ObserveAndStrictTelemetry(t *testing.T) {
 
 	beforeCount := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2"))
 
-	// 1. Observe mode: increments counter, emits Warning Event, returns shouldFailStrict=false
+	// 1. Observe mode: 5 consecutive reconcile evaluations of the same stuck PMJ
+	// must increment the counter and emit the Warning event ONLY ONCE.
 	obsEngine := NewEngine(ModeObserve, recorder)
-	vs, strict := obsEngine.Evaluate(context.Background(), snap)
-	if len(vs) != 1 || strict {
-		t.Fatalf("Observe mode: len(vs)=%d, strict=%v; want 1, false", len(vs), strict)
+	for i := 0; i < 5; i++ {
+		vs, strict := obsEngine.Evaluate(context.Background(), snap)
+		if len(vs) != 1 || strict {
+			t.Fatalf("iter %d: len(vs)=%d, strict=%v; want 1, false", i, len(vs), strict)
+		}
 	}
 	afterObsCount := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2"))
 	if afterObsCount != beforeCount+1 {
-		t.Fatalf("Observe mode: metric count=%v, want %v", afterObsCount, beforeCount+1)
+		t.Fatalf("Deduplication failed: metric count=%v after 5 identical evaluations, want %v", afterObsCount, beforeCount+1)
 	}
-	select {
-	case ev := <-recorder.Events:
-		if !strings.Contains(ev, EventReasonInvariantViolation) || !strings.Contains(ev, "[I2:NoSilentColdStart]") {
-			t.Fatalf("unexpected event: %s", ev)
-		}
-	default:
-		t.Fatal("expected Warning event in observe mode, got none")
+	if len(recorder.Events) != 1 {
+		t.Fatalf("Deduplication failed: expected exactly 1 Warning event across 5 evaluations, got %d", len(recorder.Events))
+	}
+	ev := <-recorder.Events
+	if !strings.Contains(ev, EventReasonInvariantViolation) || !strings.Contains(ev, "[I2:NoSilentColdStart]") {
+		t.Fatalf("unexpected event: %s", ev)
 	}
 
-	// 2. Strict mode: increments counter, emits Warning Event, returns shouldFailStrict=true
+	// 2. When violation resolves and then re-occurs, Engine records the new occurrence.
+	pmjResolved := pmj.DeepCopy()
+	pmjResolved.Status.SnapshotRef = "snap-valid"
+	if vs, _ := obsEngine.Evaluate(context.Background(), &ReconcileSnapshot{
+		Reconciler: "PodMigrationJobReconciler",
+		PrimaryPMJ: pmjResolved,
+	}); len(vs) != 0 {
+		t.Fatalf("expected 0 violations after resolution, got %+v", vs)
+	}
+	obsEngine.Evaluate(context.Background(), snap)
+	afterReoccurCount := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2"))
+	if afterReoccurCount != afterObsCount+1 {
+		t.Fatalf("expected counter to increment after resolution + re-occurrence; got %v, want %v", afterReoccurCount, afterObsCount+1)
+	}
+
+	// 3. Strict mode returns shouldFailStrict=true
 	strictEngine := NewEngine(ModeStrict, recorder)
-	vs, strict = strictEngine.Evaluate(context.Background(), snap)
+	vs, strict := strictEngine.Evaluate(context.Background(), snap)
 	if len(vs) != 1 || !strict {
 		t.Fatalf("Strict mode: len(vs)=%d, strict=%v; want 1, true", len(vs), strict)
-	}
-	afterStrictCount := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2"))
-	if afterStrictCount != afterObsCount+1 {
-		t.Fatalf("Strict mode: metric count=%v, want %v", afterStrictCount, afterObsCount+1)
 	}
 }

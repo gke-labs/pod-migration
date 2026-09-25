@@ -320,6 +320,8 @@ func (r *PodMigrationJobReconciler) concludeRestoreCrash(
 	// "unrecognised" report is superseded.
 	r.clearUnrecognizedRestoreCrash(job)
 
+	_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
+
 	// The status write MUST land before the Delete.  If we deleted first and
 	// then crashed, the PMJ would stay in its pre-fallback phase with its
 	// recorded pod gone and no record of why.
@@ -402,19 +404,76 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
-// evaluateInvariants evaluates the in-memory PodMigrationJob against the invariant engine
-// with zero extra API reads. In strict mode, any violation transitions the PMJ to PhaseFailed.
-func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job *pmv1alpha1.PodMigrationJob) {
+// evaluateInvariants evaluates the PodMigrationJob and local informer-cached namespace state
+// against the invariant engine. It runs only when the reconcile step completed without error.
+// In strict mode, any violation cleans up triggers, patches the PMJ to PhaseFailed, and suppresses requeue.
+func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job *pmv1alpha1.PodMigrationJob, res *ctrl.Result, reconcileErr *error) {
 	if r.InvariantEngine == nil || job == nil {
 		return
 	}
+	if reconcileErr != nil && *reconcileErr != nil {
+		return
+	}
+
+	var namespacePMJs []pmv1alpha1.PodMigrationJob
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := r.List(ctx, pmjList, client.InNamespace(job.Namespace)); err == nil {
+		namespacePMJs = pmjList.Items
+	}
+
+	var namespacePods []corev1.Pod
+	var primaryPod *corev1.Pod
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(job.Namespace)); err == nil {
+		namespacePods = podList.Items
+		targetName := job.Status.RestoredPodName
+		if targetName == "" {
+			targetName = job.Spec.PodRef.Name
+		}
+		for i := range namespacePods {
+			if namespacePods[i].Name == targetName {
+				primaryPod = &namespacePods[i]
+				break
+			}
+		}
+	}
+
+	hasOrphanedTrigger := false
+	if invariants.IsTerminalPhase(job.Status.Phase) && job.Spec.PodRef.Name != "" {
+		triggerName := util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger); err == nil && trigger.GetDeletionTimestamp() == nil {
+			hasOrphanedTrigger = true
+		}
+	}
+
+	restoreCrashMatched := false
+	if primaryPod != nil && job.Status.RestoredPodName != "" && primaryPod.Name == job.Status.RestoredPodName {
+		if job.Status.RestoredPodUID == "" || string(primaryPod.UID) == job.Status.RestoredPodUID {
+			if verdict := restore.Classify(primaryPod, r.restoreEngines()...); verdict.Class == restore.FailureFatal {
+				restoreCrashMatched = true
+			}
+		}
+	}
+
 	violations, shouldFailStrict := r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
-		Now:        time.Now(),
-		Reconciler: "PodMigrationJobReconciler",
-		PrimaryPMJ: job,
+		Now:                          time.Now(),
+		Reconciler:                   "PodMigrationJobReconciler",
+		PrimaryPMJ:                   job,
+		PrimaryPod:                   primaryPod,
+		NamespacePMJs:                namespacePMJs,
+		NamespacePods:                namespacePods,
+		HasOrphanedTrigger:           hasOrphanedTrigger,
+		RestoreCrashSignatureMatched: restoreCrashMatched,
 	})
 	if shouldFailStrict && len(violations) > 0 && job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
 		orig := job.DeepCopy()
+		prevPhase := job.Status.Phase
 		v := violations[0]
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 		now := metav1.Now()
@@ -426,14 +485,24 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 			Message:            fmt.Sprintf("[%s:%s] %s", v.InvariantID, v.InvariantName, v.Message),
 			ObservedGeneration: job.Generation,
 		})
-		_ = r.patchStatus(ctx, job, orig)
+		_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
+		if patchErr := r.patchStatus(ctx, job, orig); patchErr != nil {
+			if reconcileErr != nil {
+				*reconcileErr = patchErr
+			}
+			return
+		}
 		metrics.MarkPMJInactive(job.Namespace + "/" + job.Name)
 		metrics.RecordOutcome("failed")
+		r.recordPreviousPhaseDuration(job, prevPhase)
+		if res != nil {
+			*res = ctrl.Result{}
+		}
 	}
 }
 
 // Reconcile drives the state machine of the PodMigrationJob.
-func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx).WithValues("job", req.NamespacedName)
 	logger.Info("Reconciling PodMigrationJob")
 
@@ -449,7 +518,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	defer r.evaluateInvariants(ctx, job)
+	defer func() {
+		r.evaluateInvariants(ctx, job, &res, &reconcileErr)
+	}()
 
 	podName := job.Spec.PodRef.Name
 	origJob := job.DeepCopy()
@@ -1326,6 +1397,7 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 	// The job is concluding, so a standing "unrecognised start failure" report
 	// no longer describes anything actionable.
 	r.clearUnrecognizedRestoreCrash(job)
+	_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
 	if err := r.patchStatus(ctx, job, orig); err != nil {
 		return err
 	}
