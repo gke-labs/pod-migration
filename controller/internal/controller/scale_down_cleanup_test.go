@@ -744,3 +744,321 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenConsumedOrClaimed(
 		t.Fatalf("Expected pmjClaimed to NOT be deleted, got err=%v", err)
 	}
 }
+
+func TestPodMigrationJobReconciler_ScaleDown_StatefulSet_OrdinalChecks(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	stsName := "redis"
+	replicas := int32(2)
+
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      stsName,
+			Namespace: namespace,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "redis"},
+			},
+		},
+	}
+
+	// Active pods: redis-1 and lingering redis-2
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "redis-1",
+			Namespace: namespace,
+			UID:       "uid-redis-1",
+			Labels:    map[string]string{"app": "redis"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "redis-2",
+			Namespace: namespace,
+			UID:       "uid-redis-2",
+			Labels:    map[string]string{"app": "redis"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	now := metav1.Now()
+	// PMJ for redis-0 (ordinal 0 < replicas 2): was NOT scaled down!
+	pmj0 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-redis-0",
+			Namespace: namespace,
+			Labels: map[string]string{
+				util.LabelParentKind: "StatefulSet",
+				util.LabelParentName: stsName,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "redis-0"},
+			TargetPodUID: "uid-redis-0-origin",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime: &now,
+		},
+	}
+
+	// PMJ for redis-2 (ordinal 2 >= replicas 2): WAS scaled down!
+	pmj2 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-redis-2",
+			Namespace: namespace,
+			Labels: map[string]string{
+				util.LabelParentKind: "StatefulSet",
+				util.LabelParentName: stsName,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "redis-2"},
+			TargetPodUID: "uid-redis-2-origin",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime: &now,
+		},
+	}
+
+	recorder := record.NewFakeRecorder(10)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithObjects(sts, pod1, pod2, pmj0, pmj2).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   c,
+		Scheme:   scheme,
+		Recorder: recorder,
+	}
+
+	// 1. Reconcile pmj0: ordinal 0 < 2, no replacement pod running -> MUST NOT be deleted
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: pmj0.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile pmj0 failed: %v", err)
+	}
+	fetched0 := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pmj0.Name}, fetched0); err != nil {
+		t.Fatalf("Expected pmj0 to NOT be deleted because ordinal 0 is within target replicas (2), got err=%v", err)
+	}
+
+	// 2. Reconcile pmj2: ordinal 2 >= 2, active pods (redis-1, redis-2 = 2) >= targetReplicas (2) -> MUST be deleted
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: pmj2.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile pmj2 failed: %v", err)
+	}
+	fetched2 := &pmv1alpha1.PodMigrationJob{}
+	err = c.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pmj2.Name}, fetched2)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("Expected pmj2 to be deleted because ordinal 2 was scaled down, got err=%v", err)
+	}
+}
+
+func TestPodMigrationJobReconciler_ScaleDown_DeploymentReplicaSetNotFound_DoesNotDelete(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	hash := "missinghash"
+	now := metav1.Now()
+
+	// PMJ for Deployment where RS is completely absent from API
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-missing-rs",
+			Namespace: namespace,
+			Labels: map[string]string{
+				util.LabelParentKind:         "Deployment",
+				util.LabelParentName:         "long-deployment-name-that-is-missing-its-replicaset-object",
+				util.LabelPodTemplateHash:    hash,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "pod-1"},
+			TargetPodUID: "uid-1-origin",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime: &now,
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   c,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: pmj.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	fetched := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pmj.Name}, fetched); err != nil {
+		t.Fatalf("Expected PMJ to NOT be deleted when RS is NotFound, got err=%v", err)
+	}
+}
+
+func TestPodMigrationJobReconciler_ScaleDown_OriginPodStillRunning_FailOpenPreserved(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	hash := "hash-v1"
+	replicas := int32(1)
+	now := metav1.Now()
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-rs",
+			Namespace: namespace,
+			Labels: map[string]string{
+				appsv1.DefaultDeploymentUniqueLabelKey: hash,
+			},
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "web", appsv1.DefaultDeploymentUniqueLabelKey: hash},
+			},
+		},
+	}
+
+	// Origin pod is still running (DeletionTimestamp == nil) e.g. after PDBEvictionTimeout
+	originPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-origin",
+			Namespace: namespace,
+			UID:       "uid-origin-alive",
+			Labels: map[string]string{
+				"app":                               "web",
+				appsv1.DefaultDeploymentUniqueLabelKey: hash,
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-pdb-timeout",
+			Namespace: namespace,
+			Labels: map[string]string{
+				util.LabelParentKind:      "ReplicaSet",
+				util.LabelParentName:      "web-rs",
+				util.LabelPodTemplateHash: hash,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-origin"},
+			TargetPodUID: "uid-origin-alive",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime: &now,
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithObjects(rs, originPod, pmj).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   c,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: pmj.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	fetched := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pmj.Name}, fetched); err != nil {
+		t.Fatalf("Expected PMJ to NOT be deleted while origin pod is still alive, got err=%v", err)
+	}
+}
+
+func TestPodMigrationJobReconciler_ScaleDown_UnsupportedParentKind_ShortCircuitsRequeue(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	now := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-daemonset",
+			Namespace: namespace,
+			Labels: map[string]string{
+				util.LabelParentKind: "DaemonSet",
+				util.LabelParentName: "node-exporter",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "exporter-0"},
+			TargetPodUID: "uid-exporter-0",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime: &now,
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   c,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: pmj.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// Should NOT requeue at 1m. Expected requeue around 25 minutes (30m - 5m)
+	if res.RequeueAfter < 20*time.Minute {
+		t.Errorf("Expected requeue around 25m for unsupported parentKind, got %v", res.RequeueAfter)
+	}
+}

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -560,8 +561,19 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if cleanedUp {
 				return ctrl.Result{}, nil
 			}
-			// Requeue periodically to check if the parent workload scales down before the 30-minute GC TTL.
-			return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+
+			// Only requeue at 1m for supported workloads (Deployment, ReplicaSet, StatefulSet) where scale-down cleanup can apply.
+			kind := job.Labels[util.LabelParentKind]
+			if kind == "Deployment" || kind == "ReplicaSet" || kind == "StatefulSet" {
+				if job.Status.CompletionTime != nil {
+					ttl := time.Minute * 30
+					requeueIn := ttl - time.Since(job.Status.CompletionTime.Time)
+					if requeueIn <= 1*time.Minute {
+						return ctrl.Result{RequeueAfter: requeueIn}, nil
+					}
+				}
+				return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+			}
 		}
 
 		if job.Status.CompletionTime != nil {
@@ -1376,6 +1388,26 @@ func (r *PodMigrationJobReconciler) hasAssignedClaimant(ctx context.Context, job
 	return len(pods.Items) > 0, nil
 }
 
+func getOrdinalFromPodName(podName, stsName string) (int32, bool) {
+	if !strings.HasPrefix(podName, stsName+"-") {
+		lastDash := strings.LastIndex(podName, "-")
+		if lastDash == -1 || lastDash == len(podName)-1 {
+			return -1, false
+		}
+		ord, err := strconv.Atoi(podName[lastDash+1:])
+		if err != nil || ord < 0 {
+			return -1, false
+		}
+		return int32(ord), true
+	}
+	ordStr := strings.TrimPrefix(podName, stsName+"-")
+	ord, err := strconv.Atoi(ordStr)
+	if err != nil || ord < 0 {
+		return -1, false
+	}
+	return int32(ord), true
+}
+
 // countActiveWorkloadPods counts non-terminating, non-failed/succeeded pods for a workload,
 // explicitly excluding the origin pod that was evicted/migrated by this PMJ.
 func (r *PodMigrationJobReconciler) countActiveWorkloadPods(pods []corev1.Pod, job *pmv1alpha1.PodMigrationJob) int32 {
@@ -1387,11 +1419,12 @@ func (r *PodMigrationJobReconciler) countActiveWorkloadPods(pods []corev1.Pod, j
 			p.Status.Phase == corev1.PodSucceeded {
 			continue
 		}
-		// Exclude the origin pod of this PMJ if still lingering in cache
+		// Exclude the origin pod of this PMJ if still lingering in cache.
+		// For StatefulSets, replacement pods have the exact same name as the origin pod,
+		// so only fall back to name matching when TargetPodUID is empty.
 		if job.Spec.TargetPodUID != "" && string(p.UID) == job.Spec.TargetPodUID {
 			continue
-		}
-		if job.Spec.PodRef.Name != "" && p.Name == job.Spec.PodRef.Name {
+		} else if job.Spec.TargetPodUID == "" && job.Spec.PodRef.Name != "" && p.Name == job.Spec.PodRef.Name {
 			continue
 		}
 		active++
@@ -1442,34 +1475,40 @@ func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, 
 				rsList := &appsv1.ReplicaSetList{}
 				if listErr := r.liveReader().List(ctx, rsList,
 					client.InNamespace(job.Namespace),
-					client.MatchingLabels{appsv1.DefaultDeploymentUniqueLabelKey: podTemplateHash}); listErr == nil {
+					client.MatchingLabels{appsv1.DefaultDeploymentUniqueLabelKey: podTemplateHash}); listErr != nil {
+					return false, listErr
+				} else {
+					found := false
 					for i := range rsList.Items {
 						for _, ref := range rsList.Items[i].OwnerReferences {
 							if ref.Kind == "Deployment" && ref.Name == parentName {
 								rs = &rsList.Items[i]
+								found = true
 								err = nil
 								break
 							}
 						}
-						if err == nil {
+						if found {
 							break
 						}
+					}
+					if !found {
+						// ReplicaSet not found; return false to avoid premature deletion and defer to 30m TTL.
+						return false, nil
 					}
 				}
 			}
 			if err != nil {
 				if apierrors.IsNotFound(err) {
-					targetReplicas = 0
-				} else {
-					return false, err
+					return false, nil
 				}
-			} else {
-				targetReplicas = 1
-				if rs.Spec.Replicas != nil {
-					targetReplicas = *rs.Spec.Replicas
-				}
-				selector = rs.Spec.Selector
+				return false, err
 			}
+			targetReplicas = 1
+			if rs.Spec.Replicas != nil {
+				targetReplicas = *rs.Spec.Replicas
+			}
+			selector = rs.Spec.Selector
 		} else {
 			deploy := &appsv1.Deployment{}
 			if err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: parentName}, deploy); err != nil {
@@ -1518,6 +1557,7 @@ func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, 
 	}
 
 	var activeCount int32
+	var hasRunningReplacementPod bool
 	if selector != nil {
 		sel, err := metav1.LabelSelectorAsSelector(selector)
 		if err != nil {
@@ -1528,7 +1568,40 @@ func (r *PodMigrationJobReconciler) cleanupScaleDownZombie(ctx context.Context, 
 		if err := r.List(ctx, podList, client.InNamespace(job.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
 			return false, err
 		}
+
+		// Fail-open guard: If the origin pod is still running and non-terminating (e.g. SWR entered due to
+		// PDBEvictionTimeout or EvictionMisconfiguredTimeout), preserve the PMJ as a fail-open guard for eviction webhook.
+		if job.Spec.TargetPodUID != "" {
+			for _, p := range podList.Items {
+				if string(p.UID) == job.Spec.TargetPodUID && p.DeletionTimestamp == nil {
+					return false, nil
+				}
+			}
+		}
+
+		for _, p := range podList.Items {
+			if p.DeletionTimestamp == nil &&
+				p.Status.Phase != corev1.PodFailed &&
+				p.Status.Phase != corev1.PodSucceeded &&
+				p.Name == job.Spec.PodRef.Name &&
+				(job.Spec.TargetPodUID == "" || string(p.UID) != job.Spec.TargetPodUID) {
+				hasRunningReplacementPod = true
+				break
+			}
+		}
+
 		activeCount = r.countActiveWorkloadPods(podList.Items, job)
+	}
+
+	// For StatefulSets, pods are ordered by ordinal (0 .. targetReplicas-1).
+	// A pod with ordinal < targetReplicas has NOT been scaled down. If no replacement pod is running yet,
+	// do not clean up the PMJ.
+	if parentKind == "StatefulSet" {
+		if ord, ok := getOrdinalFromPodName(job.Spec.PodRef.Name, parentName); ok {
+			if ord < targetReplicas && !hasRunningReplacementPod {
+				return false, nil
+			}
+		}
 	}
 
 	// If active pods satisfy or exceed target replicas, the workload has scaled down and no replacement pod will be created.
