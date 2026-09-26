@@ -23,6 +23,25 @@ exec_with_retry() {
   done
 }
 
+exec_json_with_retry() {
+  local max_attempts=5
+  local attempt=1
+  local output=""
+  while [ $attempt -le $max_attempts ]; do
+    if output=$("$@") && [ -n "$output" ] && echo "$output" | jq -e . >/dev/null 2>&1; then
+      echo "$output"
+      return 0
+    fi
+    if [ $attempt -eq $max_attempts ]; then
+      echo "[ERROR] Command failed, returned empty output, or invalid JSON after $max_attempts attempts: $*" >&2
+      exit 1
+    fi
+    echo "[*] Command returned empty/invalid response, retrying in 3 seconds (Attempt $attempt/$max_attempts)..." >&2
+    sleep 3
+    attempt=$((attempt + 1))
+  done
+}
+
 wait_for_pod_ready() {
   local pod_name="$1"
   local timeout="${2:-120}"
@@ -1001,8 +1020,8 @@ case "$APP" in
     wait_for_pod_ready "$POD_NAME" 120
 
     echo "[*] Verifying initContainer execution and reading initial state..."
-    INIT_APP_STATUS=$(exec_with_retry kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/status').read().decode())")
-    INIT_SIDECAR_STATUS=$(exec_with_retry kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:9090/status').read().decode())")
+    INIT_APP_STATUS=$(exec_json_with_retry kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/status').read().decode())")
+    INIT_SIDECAR_STATUS=$(exec_json_with_retry kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:9090/status').read().decode())")
 
     echo "[+] Initial app status: $INIT_APP_STATUS"
     echo "[+] Initial sidecar status: $INIT_SIDECAR_STATUS"
@@ -1051,8 +1070,8 @@ case "$APP" in
     wait_for_pod_ready "$POD_NAME" 120
 
     echo "[*] Verifying restored state on both containers..."
-    RESTORED_APP_STATUS=$(exec_with_retry kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/status').read().decode())")
-    RESTORED_SIDECAR_STATUS=$(exec_with_retry kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:9090/status').read().decode())")
+    RESTORED_APP_STATUS=$(exec_json_with_retry kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/status').read().decode())")
+    RESTORED_SIDECAR_STATUS=$(exec_json_with_retry kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:9090/status').read().decode())")
 
     echo "[+] Restored app status: $RESTORED_APP_STATUS"
     echo "[+] Restored sidecar status: $RESTORED_SIDECAR_STATUS"
@@ -1073,8 +1092,8 @@ case "$APP" in
       echo "[ERROR] Primary app container cold-started! Expected $INIT_APP_ID, got $RESTORED_APP_ID"
       FAILED=1
     fi
-    if [ "$RESTORED_APP_COUNTER" -ne 2 ]; then
-      echo "[ERROR] Primary app counter lost! Expected 2, got $RESTORED_APP_COUNTER"
+    if ! [[ "$RESTORED_APP_COUNTER" =~ ^[0-9]+$ ]] || [ "$RESTORED_APP_COUNTER" -ne 2 ]; then
+      echo "[ERROR] Primary app counter lost! Expected 2, got '$RESTORED_APP_COUNTER'"
       FAILED=1
     fi
 
@@ -1083,8 +1102,8 @@ case "$APP" in
       echo "[ERROR] Sidecar container cold-started! Expected $INIT_SIDECAR_ID, got $RESTORED_SIDECAR_ID"
       FAILED=1
     fi
-    if [ "$RESTORED_SIDECAR_COUNTER" -ne 3 ]; then
-      echo "[ERROR] Sidecar counter lost! Expected 3, got $RESTORED_SIDECAR_COUNTER"
+    if ! [[ "$RESTORED_SIDECAR_COUNTER" =~ ^[0-9]+$ ]] || [ "$RESTORED_SIDECAR_COUNTER" -ne 3 ]; then
+      echo "[ERROR] Sidecar counter lost! Expected 3, got '$RESTORED_SIDECAR_COUNTER'"
       FAILED=1
     fi
 
