@@ -370,3 +370,193 @@ func TestClassifyEngineOrder(t *testing.T) {
 		t.Errorf("expected the first engine in list to win, got %q", got.Engine)
 	}
 }
+
+func TestClassify_MultiContainerAndSidecar(t *testing.T) {
+	tests := []struct {
+		name              string
+		initStatus        corev1.ContainerStatus
+		appStatus         corev1.ContainerStatus
+		sidecarStatus     corev1.ContainerStatus
+		expectedClass     FailureClass
+		expectedContainer string
+	}{
+		{
+			name: "All containers healthy and running",
+			initStatus: corev1.ContainerStatus{
+				Name: "init-seed",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 0,
+						Reason:   "Completed",
+					},
+				},
+			},
+			appStatus: corev1.ContainerStatus{
+				Name: "app",
+				State: corev1.ContainerState{
+					Running: &corev1.ContainerStateRunning{},
+				},
+			},
+			sidecarStatus: corev1.ContainerStatus{
+				Name: "sidecar",
+				State: corev1.ContainerState{
+					Running: &corev1.ContainerStateRunning{},
+				},
+			},
+			expectedClass: FailureNone,
+		},
+		{
+			name: "Sidecar fails runtime restore while app is running",
+			initStatus: corev1.ContainerStatus{
+				Name: "init-seed",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 0,
+						Reason:   "Completed",
+					},
+				},
+			},
+			appStatus: corev1.ContainerStatus{
+				Name: "app",
+				State: corev1.ContainerState{
+					Running: &corev1.ContainerStateRunning{},
+				},
+			},
+			sidecarStatus: corev1.ContainerStatus{
+				Name: "sidecar",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason: "RunContainerError",
+					},
+				},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 128,
+						Reason:   "StartError",
+						Message:  restoreCrashOCIMessage,
+					},
+				},
+			},
+			expectedClass:     FailureFatal,
+			expectedContainer: "sidecar",
+		},
+		{
+			name: "App fails runtime restore while sidecar is waiting",
+			initStatus: corev1.ContainerStatus{
+				Name: "init-seed",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 0,
+						Reason:   "Completed",
+					},
+				},
+			},
+			appStatus: corev1.ContainerStatus{
+				Name: "app",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 128,
+						Reason:   "StartError",
+						Message:  restoreCrashOCIMessage,
+					},
+				},
+			},
+			sidecarStatus: corev1.ContainerStatus{
+				Name: "sidecar",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason: "ContainerCreating",
+					},
+				},
+			},
+			expectedClass:     FailureFatal,
+			expectedContainer: "app",
+		},
+		{
+			name: "Init container fails runtime restore",
+			initStatus: corev1.ContainerStatus{
+				Name: "init-seed",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 128,
+						Reason:   "StartError",
+						Message:  restoreCrashOCIMessage,
+					},
+				},
+			},
+			appStatus: corev1.ContainerStatus{
+				Name: "app",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason: "PodInitializing",
+					},
+				},
+			},
+			sidecarStatus: corev1.ContainerStatus{
+				Name: "sidecar",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason: "PodInitializing",
+					},
+				},
+			},
+			expectedClass:     FailureFatal,
+			expectedContainer: "init-seed",
+		},
+		{
+			name: "Sidecar has genuine application bug (exit 1 CrashLoopBackOff), not restore failure",
+			initStatus: corev1.ContainerStatus{
+				Name: "init-seed",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 0,
+						Reason:   "Completed",
+					},
+				},
+			},
+			appStatus: corev1.ContainerStatus{
+				Name: "app",
+				State: corev1.ContainerState{
+					Running: &corev1.ContainerStateRunning{},
+				},
+			},
+			sidecarStatus: corev1.ContainerStatus{
+				Name: "sidecar",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason: "CrashLoopBackOff",
+					},
+				},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 1,
+						Reason:   "Error",
+						Message:  "fatal: connection refused to redis",
+					},
+				},
+			},
+			expectedClass: FailureNone,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pm-multicontainer-0"},
+				Status: corev1.PodStatus{
+					Phase:                 corev1.PodRunning,
+					InitContainerStatuses: []corev1.ContainerStatus{tc.initStatus},
+					ContainerStatuses:     []corev1.ContainerStatus{tc.appStatus, tc.sidecarStatus},
+				},
+			}
+
+			failure := Classify(pod, DefaultEngines()...)
+			if failure.Class != tc.expectedClass {
+				t.Fatalf("expected class %v, got %v (failure: %+v)", tc.expectedClass, failure.Class, failure)
+			}
+			if tc.expectedContainer != "" && failure.Container != tc.expectedContainer {
+				t.Errorf("expected container %q, got %q", tc.expectedContainer, failure.Container)
+			}
+		})
+	}
+}
