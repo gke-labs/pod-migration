@@ -33,10 +33,10 @@ const (
 
 // IsNodePreempting returns true if the Node exhibits any verified GKE or Kubernetes
 // preemption, impending termination, or graceful shutdown signal:
-// 1. GKE host maintenance taint: cloud.google.com/impending-node-termination
-// 2. GKE host maintenance label: cloud.google.com/active-node-maintenance=ONGOING
-// 3. Kubelet graceful node shutdown: NodeReady condition Status=False with
-//    Reason "KubeletNotReady" or "NodeShuttingDown", and message containing "node is shutting down".
+//  1. GKE host maintenance taint: cloud.google.com/impending-node-termination
+//  2. GKE host maintenance label: cloud.google.com/active-node-maintenance=ONGOING
+//  3. Kubelet graceful node shutdown: NodeReady condition Status=False with
+//     Reason "KubeletNotReady", and message containing "node is shutting down".
 func IsNodePreempting(node *corev1.Node) bool {
 	if node == nil {
 		return false
@@ -55,10 +55,10 @@ func IsNodePreempting(node *corev1.Node) bool {
 	}
 
 	// 3. Conditions: Kubelet Graceful Node Shutdown sets NodeReady to False with reason
-	// KubeletNotReady or NodeShuttingDown and message indicating the node is shutting down.
+	// KubeletNotReady and message indicating the node is shutting down.
 	for _, cond := range node.Status.Conditions {
 		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionFalse {
-			if cond.Reason == "KubeletNotReady" || cond.Reason == "NodeShuttingDown" {
+			if cond.Reason == "KubeletNotReady" {
 				if strings.Contains(strings.ToLower(cond.Message), "node is shutting down") {
 					return true
 				}
@@ -78,18 +78,31 @@ func IsPodFailedDueToNodeShutdown(pod *corev1.Pod) bool {
 	if pod.Status.Phase != corev1.PodFailed {
 		return false
 	}
-	if pod.Status.Reason == "NodeShutdown" || pod.Status.Reason == "Terminated" {
+
+	// Kubelet sets Reason to "NodeShutdown" specifically for graceful node shutdown.
+	if pod.Status.Reason == "NodeShutdown" {
 		return true
 	}
+
 	msg := strings.ToLower(pod.Status.Message)
-	if strings.Contains(msg, "node is shutting down") || strings.Contains(msg, "node shutdown") || strings.Contains(msg, "imminent node shutdown") {
-		return true
-	}
+	isShutdownMsg := strings.Contains(msg, "node is shutting down") ||
+		strings.Contains(msg, "node shutdown") ||
+		strings.Contains(msg, "imminent node shutdown")
+
+	hasShutdownDisruption := false
 	for _, cond := range pod.Status.Conditions {
 		if cond.Type == corev1.DisruptionTarget && cond.Reason == "TerminationByKubelet" {
-			return true
+			hasShutdownDisruption = true
+			break
 		}
 	}
+
+	// Kubelet can also mark Reason as "Terminated", but other kill paths use bare "Terminated" as well.
+	// We require the imminent shutdown message or DisruptionTarget condition alongside it (or on its own).
+	if isShutdownMsg || hasShutdownDisruption {
+		return true
+	}
+
 	return false
 }
 

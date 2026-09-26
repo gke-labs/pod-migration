@@ -80,23 +80,6 @@ func TestIsNodePreempting(t *testing.T) {
 			expected: true,
 		},
 		{
-			name: "node with Kubelet Graceful Node Shutdown condition (NodeShuttingDown)",
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: "graceful-shutdown-node-2"},
-				Status: corev1.NodeStatus{
-					Conditions: []corev1.NodeCondition{
-						{
-							Type:    corev1.NodeReady,
-							Status:  corev1.ConditionFalse,
-							Reason:  "NodeShuttingDown",
-							Message: "Node is shutting down shortly",
-						},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
 			name: "node with generic NotReady condition (e.g. network failure) does not trigger preemption",
 			node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: "network-failed-node"},
@@ -178,6 +161,17 @@ func TestIsPodFailedDueToNodeShutdown(t *testing.T) {
 				},
 			},
 			expected: true,
+		},
+		{
+			name: "failed pod with Reason Terminated but no shutdown message or disruption condition",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:   corev1.PodFailed,
+					Reason:  "Terminated",
+					Message: "Container execution stopped unexpectedly.",
+				},
+			},
+			expected: false,
 		},
 		{
 			name: "failed pod with DisruptionTarget condition TerminationByKubelet",

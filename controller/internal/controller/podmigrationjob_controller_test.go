@@ -1415,6 +1415,17 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 		if cond == nil || cond.Reason != "NodeShutdown" {
 			t.Errorf("Expected Ready condition Reason=NodeShutdown, got %+v", cond)
 		}
+
+		cleanedTrigger := &unstructured.Unstructured{}
+		cleanedTrigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, cleanedTrigger)
+		if err == nil || !apierrors.IsNotFound(err) {
+			t.Errorf("Expected PSMT trigger to be cleaned up on node shutdown fast-fail, got error: %v", err)
+		}
 	})
 }
 
