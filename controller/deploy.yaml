@@ -300,7 +300,7 @@ webhooks:
     admissionReviewVersions: ["v1"]
     sideEffects: NoneOnDryRun
     failurePolicy: Ignore
-    timeoutSeconds: 5
+    timeoutSeconds: 10
     clientConfig:
       service:
         namespace: pod-migration-system
@@ -394,5 +394,53 @@ spec:
   selector:
     matchLabels:
       app: pod-migration-controller
-
+---
+# API Priority and Fairness: without this, the controller's service account
+# matches the default "service-accounts" FlowSchema (workload-low), which is the
+# same priority level as most evicting clients. During a multi-pod drain the
+# pending evictions hold workload-low seats while they wait on the eviction
+# webhook, and the webhook's own API calls queue behind them until the webhook
+# times out and fails open. A dedicated, non-lendable level keeps those calls
+# moving. (GKE rejects user FlowSchemas that reference workload-high.)
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: pod-migration-controller
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 15
+    lendablePercent: 0
+    limitResponse:
+      type: Queue
+      queuing:
+        queues: 16
+        handSize: 4
+        queueLengthLimit: 50
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: pod-migration-controller
+spec:
+  matchingPrecedence: 5500
+  priorityLevelConfiguration:
+    name: pod-migration-controller
+  distinguisherMethod:
+    type: ByUser
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount:
+            name: pod-migration-controller
+            namespace: pod-migration-system
+      resourceRules:
+        - verbs: ["*"]
+          apiGroups: ["*"]
+          resources: ["*"]
+          namespaces: ["*"]
+          clusterScope: true
+      nonResourceRules:
+        - verbs: ["*"]
+          nonResourceURLs: ["*"]
 
