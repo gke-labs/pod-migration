@@ -41,6 +41,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlruntime "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -81,6 +82,7 @@ func main() {
 		maxConcurrent        int
 		migrationTimeout     time.Duration
 		invariantModeRaw     string
+		spotPreemptionBudget int64
 		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -91,6 +93,7 @@ func main() {
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
 	flag.DurationVar(&migrationTimeout, "migration-timeout", util.DefaultMigrationTimeout, "Default timeout for active migrations (Pending, Snapshotting, Evicting)")
 	flag.StringVar(&invariantModeRaw, "invariant-mode", string(invariants.ModeDisabled), "Correctness invariant evaluation mode: disabled (default), observe, or strict (CI gate)")
+	flag.Int64Var(&spotPreemptionBudget, "spot-preemption-node-budget", util.DefaultSpotPreemptionNodeBudget, "Total memory request budget in bytes per node for spot preemption migrations (default 15GiB)")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -143,6 +146,20 @@ func main() {
 		LeaderElectionReleaseOnCancel: true,
 		Cache: cache.Options{
 			DefaultTransform: cache.TransformStripManagedFields(),
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Node{}: {
+					Transform: func(obj interface{}) (interface{}, error) {
+						node, ok := obj.(*corev1.Node)
+						if !ok {
+							return obj, nil
+						}
+						// Strip heavy cached image metadata not needed by node preemption controller
+						node.Status.Images = nil
+						node.ManagedFields = nil
+						return node, nil
+					},
+				},
+			},
 		},
 		// Webhook server is on :9443 by default.
 		WebhookServer: webhook.NewServer(webhook.Options{Port: 9443}),
@@ -154,7 +171,9 @@ func main() {
 
 	// Cache indexes must be registered before any controller starts:
 	// 1. Pods by assigned PMJ (used by gate mapper and restore-timeout deferral)
-	// 2. VolumeAttachments by persistent volume name (used by PMJ detachment wait)
+	// 2. Pods by spec.nodeName (used by node preemption reconciler)
+	// 3. VolumeAttachments by persistent volume name (used by PMJ detachment wait)
+	// 4. PodMigrationJobs by Status.SnapshotRef (used by snapshot watcher)
 	if err := controller.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		setupLog.Error(err, "unable to register field indexes")
 		os.Exit(1)
@@ -198,6 +217,18 @@ func main() {
 		InvariantEngine: invariantEngine,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
+		os.Exit(1)
+	}
+
+	if err := (&controller.NodePreemptionReconciler{
+		Client:                  mgr.GetClient(),
+		APIReader:               mgr.GetAPIReader(),
+		Scheme:                  mgr.GetScheme(),
+		Recorder:                eventRecorder,
+		DefaultMigrationTimeout: migrationTimeout,
+		SpotPreemptionBudget:    spotPreemptionBudget,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create NodePreemptionReconciler")
 		os.Exit(1)
 	}
 

@@ -553,6 +553,16 @@ func TestEvictionGate(t *testing.T) {
 				if err != nil {
 					t.Errorf("Failed to find expected PodMigrationJob: %v", err)
 				}
+				// Verify standardized trigger-source and policy-provenance stamps
+				if pmj.Labels[util.LabelTriggerSource] != util.TriggerSourceEviction {
+					t.Errorf("Expected label %s=%s, got %s", util.LabelTriggerSource, util.TriggerSourceEviction, pmj.Labels[util.LabelTriggerSource])
+				}
+				if pmj.Annotations[util.AnnotationTriggerSource] != util.TriggerSourceEviction {
+					t.Errorf("Expected annotation %s=%s, got %s", util.AnnotationTriggerSource, util.TriggerSourceEviction, pmj.Annotations[util.AnnotationTriggerSource])
+				}
+				if pmj.Annotations[util.AnnotationPodSnapshotPolicy] != "psp-test-manual" {
+					t.Errorf("Expected annotation %s=psp-test-manual, got %s", util.AnnotationPodSnapshotPolicy, pmj.Annotations[util.AnnotationPodSnapshotPolicy])
+				}
 				for k, v := range tt.expectedLabels {
 					if pmj.Labels[k] != v {
 						t.Errorf("Expected label %s=%s, got %s", k, v, pmj.Labels[k])
