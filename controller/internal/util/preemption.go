@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -18,52 +19,109 @@ import (
 )
 
 const (
-	// GKE & Kubernetes preemption and shutdown taints
+	// TaintImpendingNodeTermination is applied by GKE during scheduled host maintenance / node termination.
 	TaintImpendingNodeTermination = "cloud.google.com/impending-node-termination"
-	TaintOutOfService             = "node.kubernetes.io/out-of-service"
 
-	// GKE node conditions
-	ConditionImpendingNodeTermination = "cloud.google.com/impending-node-termination"
-	ConditionTerminating              = "Terminating"
-
-	// GKE node labels
+	// LabelActiveNodeMaintenance is applied by GKE during active host maintenance.
 	LabelActiveNodeMaintenance = "cloud.google.com/active-node-maintenance"
 	ValueMaintenanceOngoing    = "ONGOING"
+
+	// PreemptionDefaultTimeout is the migration deadline for spot preemption triggers (2 minutes),
+	// bounding PMJ duration so doomed migrations fail fast rather than waiting on departed nodes.
+	PreemptionDefaultTimeout = 2 * time.Minute
 )
 
-// IsNodePreempting returns true if the Node exhibits any known GKE or Kubernetes
-// preemption, impending termination, or graceful shutdown signal.
+// IsNodePreempting returns true if the Node exhibits any verified GKE or Kubernetes
+// preemption, impending termination, or graceful shutdown signal:
+// 1. GKE host maintenance taint: cloud.google.com/impending-node-termination
+// 2. GKE host maintenance label: cloud.google.com/active-node-maintenance=ONGOING
+// 3. Kubelet graceful node shutdown: NodeReady condition Status=False with
+//    Reason "KubeletNotReady" or "NodeShuttingDown", and message containing "node is shutting down".
 func IsNodePreempting(node *corev1.Node) bool {
 	if node == nil {
 		return false
 	}
 
-	// 1. Taints: cloud.google.com/impending-node-termination or node.kubernetes.io/out-of-service
+	// 1. Taints: GKE impending node termination taint
 	for _, taint := range node.Spec.Taints {
-		if taint.Key == TaintImpendingNodeTermination || taint.Key == TaintOutOfService {
+		if taint.Key == TaintImpendingNodeTermination {
 			return true
 		}
 	}
 
-	// 2. Conditions: cloud.google.com/impending-node-termination or Terminating set to True
-	for _, cond := range node.Status.Conditions {
-		if (cond.Type == ConditionImpendingNodeTermination || cond.Type == ConditionTerminating) &&
-			cond.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-
-	// 3. Labels: GKE active host maintenance
+	// 2. Labels: GKE active host maintenance
 	if node.Labels != nil && node.Labels[LabelActiveNodeMaintenance] == ValueMaintenanceOngoing {
 		return true
 	}
 
-	// 4. Annotations: explicit preemption signal annotation
-	if node.Annotations != nil && node.Annotations[TaintImpendingNodeTermination] == "true" {
-		return true
+	// 3. Conditions: Kubelet Graceful Node Shutdown sets NodeReady to False with reason
+	// KubeletNotReady or NodeShuttingDown and message indicating the node is shutting down.
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionFalse {
+			if cond.Reason == "KubeletNotReady" || cond.Reason == "NodeShuttingDown" {
+				if strings.Contains(strings.ToLower(cond.Message), "node is shutting down") {
+					return true
+				}
+			}
+		}
 	}
 
 	return false
+}
+
+// IsPodFailedDueToNodeShutdown returns true if the pod phase is Failed and the reason, condition,
+// or status message indicates it was terminated by kubelet during node graceful shutdown.
+func IsPodFailedDueToNodeShutdown(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	if pod.Status.Phase != corev1.PodFailed {
+		return false
+	}
+	if pod.Status.Reason == "NodeShutdown" || pod.Status.Reason == "Terminated" {
+		return true
+	}
+	msg := strings.ToLower(pod.Status.Message)
+	if strings.Contains(msg, "node is shutting down") || strings.Contains(msg, "node shutdown") || strings.Contains(msg, "imminent node shutdown") {
+		return true
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.DisruptionTarget && cond.Reason == "TerminationByKubelet" {
+			return true
+		}
+	}
+	return false
+}
+
+// CalculatePodMemoryFootprint returns the memory footprint of a pod in bytes, and true if known.
+// It first checks container and persistent sidecar init container memory requests.
+// If requests are zero, it falls back to memory limits.
+// If both requests and limits are zero (e.g. BestEffort QoS), it returns (0, false).
+func CalculatePodMemoryFootprint(pod *corev1.Pod) (int64, bool) {
+	if pod == nil {
+		return 0, false
+	}
+	reqBytes := CalculatePodMemoryRequest(pod)
+	if reqBytes > 0 {
+		return reqBytes, true
+	}
+	var limitBytes int64
+	for _, c := range pod.Spec.Containers {
+		if lim := c.Resources.Limits.Memory(); lim != nil {
+			limitBytes += lim.Value()
+		}
+	}
+	for _, c := range pod.Spec.InitContainers {
+		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			if lim := c.Resources.Limits.Memory(); lim != nil {
+				limitBytes += lim.Value()
+			}
+		}
+	}
+	if limitBytes > 0 {
+		return limitBytes, true
+	}
+	return 0, false
 }
 
 // FindLatestReadyManualStopPSP finds the latest ready manual PodSnapshotPolicy in the namespace

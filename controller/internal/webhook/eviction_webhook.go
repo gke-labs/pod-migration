@@ -7,7 +7,6 @@ import (
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -117,24 +116,6 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if err != nil && !apierrors.IsNotFound(err) {
 		logger.Error(err, "Failed to resolve parent workload")
 		return denied429("transient error resolving parent workload, retrying")
-	}
-
-	jobLabels := map[string]string{}
-	if parentName != "" {
-		jobLabels[util.LabelParentName] = parentName
-		jobLabels[util.LabelParentKind] = parentKind
-		if parentUID != "" {
-			jobLabels[util.LabelParentUID] = parentUID
-		}
-	}
-	if hash, ok := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]; ok && hash != "" {
-		jobLabels[util.LabelPodTemplateHash] = hash
-	}
-	if rev, ok := pod.Labels[appsv1.ControllerRevisionHashLabelKey]; ok && rev != "" {
-		jobLabels[util.LabelControllerRevisionHash] = rev
-	}
-	if idx, ok := pod.Labels[util.LabelJobCompletionIndex]; ok && idx != "" {
-		jobLabels[util.LabelJobCompletionIndex] = idx
 	}
 
 	// 1. Find matching PodSnapshotPolicy (manual + stop)

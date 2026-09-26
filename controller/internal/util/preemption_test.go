@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,43 +51,7 @@ func TestIsNodePreempting(t *testing.T) {
 			expected: true,
 		},
 		{
-			name: "node with node.kubernetes.io/out-of-service taint",
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: "out-of-service-node"},
-				Spec: corev1.NodeSpec{
-					Taints: []corev1.Taint{
-						{Key: TaintOutOfService, Effect: corev1.TaintEffectNoExecute},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "node with impending-node-termination condition True",
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: "cond-node"},
-				Status: corev1.NodeStatus{
-					Conditions: []corev1.NodeCondition{
-						{Type: ConditionImpendingNodeTermination, Status: corev1.ConditionTrue},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "node with Terminating condition True",
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: "terminating-cond-node"},
-				Status: corev1.NodeStatus{
-					Conditions: []corev1.NodeCondition{
-						{Type: ConditionTerminating, Status: corev1.ConditionTrue},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "node with maintenance label ongoing",
+			name: "node with GKE active maintenance label ONGOING",
 			node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "maintenance-node",
@@ -98,16 +63,68 @@ func TestIsNodePreempting(t *testing.T) {
 			expected: true,
 		},
 		{
-			name: "node with preemption annotation true",
+			name: "node with Kubelet Graceful Node Shutdown condition (KubeletNotReady + message)",
 			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "annotated-node",
-					Annotations: map[string]string{
-						TaintImpendingNodeTermination: "true",
+				ObjectMeta: metav1.ObjectMeta{Name: "graceful-shutdown-node"},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:    corev1.NodeReady,
+							Status:  corev1.ConditionFalse,
+							Reason:  "KubeletNotReady",
+							Message: "Kubelet is not ready: node is shutting down",
+						},
 					},
 				},
 			},
 			expected: true,
+		},
+		{
+			name: "node with Kubelet Graceful Node Shutdown condition (NodeShuttingDown)",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "graceful-shutdown-node-2"},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:    corev1.NodeReady,
+							Status:  corev1.ConditionFalse,
+							Reason:  "NodeShuttingDown",
+							Message: "Node is shutting down shortly",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "node with generic NotReady condition (e.g. network failure) does not trigger preemption",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "network-failed-node"},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:    corev1.NodeReady,
+							Status:  corev1.ConditionFalse,
+							Reason:  "KubeletNotReady",
+							Message: "container runtime network not ready: NetworkPluginNotReady",
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "node with other pressure conditions does not trigger preemption",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "memory-pressure-node"},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: corev1.NodeMemoryPressure, Status: corev1.ConditionTrue},
+						{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			expected: false,
 		},
 	}
 
@@ -116,6 +133,190 @@ func TestIsNodePreempting(t *testing.T) {
 			got := IsNodePreempting(tt.node)
 			if got != tt.expected {
 				t.Errorf("IsNodePreempting() = %v, expected %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsPodFailedDueToNodeShutdown(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		expected bool
+	}{
+		{
+			name:     "nil pod",
+			pod:      nil,
+			expected: false,
+		},
+		{
+			name: "running pod",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "failed pod with Reason NodeShutdown",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:  corev1.PodFailed,
+					Reason: "NodeShutdown",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "failed pod with Reason Terminated and imminent node shutdown message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:   corev1.PodFailed,
+					Reason:  "Terminated",
+					Message: "Pod was terminated in response to imminent node shutdown.",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "failed pod with DisruptionTarget condition TerminationByKubelet",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodFailed,
+					Conditions: []corev1.PodCondition{
+						{
+							Type:   corev1.DisruptionTarget,
+							Reason: "TerminationByKubelet",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "failed pod due to OOMKilled",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:  corev1.PodFailed,
+					Reason: "OOMKilled",
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsPodFailedDueToNodeShutdown(tt.pod)
+			if got != tt.expected {
+				t.Errorf("IsPodFailedDueToNodeShutdown() = %v, expected %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCalculatePodMemoryFootprint(t *testing.T) {
+	alwaysRestart := corev1.ContainerRestartPolicyAlways
+
+	tests := []struct {
+		name          string
+		pod           *corev1.Pod
+		expectedBytes int64
+		expectedKnown bool
+	}{
+		{
+			name:          "nil pod",
+			pod:           nil,
+			expectedBytes: 0,
+			expectedKnown: false,
+		},
+		{
+			name: "pod with container requests",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("2Gi"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBytes: 2 * 1024 * 1024 * 1024,
+			expectedKnown: true,
+		},
+		{
+			name: "pod with zero requests falls back to limits",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("4Gi"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBytes: 4 * 1024 * 1024 * 1024,
+			expectedKnown: true,
+		},
+		{
+			name: "pod with persistent sidecar init container request",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("1Gi"),
+								},
+							},
+						},
+					},
+					InitContainers: []corev1.Container{
+						{
+							RestartPolicy: &alwaysRestart,
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("512Mi"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBytes: 1536 * 1024 * 1024,
+			expectedKnown: true,
+		},
+		{
+			name: "BestEffort pod with zero requests and zero limits",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "unbounded",
+						},
+					},
+				},
+			},
+			expectedBytes: 0,
+			expectedKnown: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, known := CalculatePodMemoryFootprint(tt.pod)
+			if known != tt.expectedKnown || b != tt.expectedBytes {
+				t.Errorf("CalculatePodMemoryFootprint() = (%d, %t), expected (%d, %t)",
+					b, known, tt.expectedBytes, tt.expectedKnown)
 			}
 		})
 	}

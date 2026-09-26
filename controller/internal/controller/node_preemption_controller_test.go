@@ -43,23 +43,18 @@ func createTestNode(name string, preempting bool, signalType string) *corev1.Nod
 		node.Spec.Taints = []corev1.Taint{
 			{Key: util.TaintImpendingNodeTermination, Effect: corev1.TaintEffectNoSchedule},
 		}
-	case "taint-out-of-service":
-		node.Spec.Taints = []corev1.Taint{
-			{Key: util.TaintOutOfService, Effect: corev1.TaintEffectNoExecute},
-		}
-	case "condition-gke":
-		node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
-			Type:   util.ConditionImpendingNodeTermination,
-			Status: corev1.ConditionTrue,
-		})
-	case "condition-terminating":
-		node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
-			Type:   util.ConditionTerminating,
-			Status: corev1.ConditionTrue,
-		})
 	case "label-maintenance":
 		node.Labels = map[string]string{
 			util.LabelActiveNodeMaintenance: util.ValueMaintenanceOngoing,
+		}
+	case "condition-shutdown":
+		node.Status.Conditions = []corev1.NodeCondition{
+			{
+				Type:    corev1.NodeReady,
+				Status:  corev1.ConditionFalse,
+				Reason:  "KubeletNotReady",
+				Message: "Kubelet is not ready: node is shutting down",
+			},
 		}
 	default:
 		node.Spec.Taints = []corev1.Taint{
@@ -248,6 +243,10 @@ func TestNodePreemptionReconciler_AscendingBudgetOrdering(t *testing.T) {
 			t.Errorf("expected PMJ %s to have psp annotation psp-default, got %s",
 				pmj.Name, pmj.Annotations[util.AnnotationPodSnapshotPolicy])
 		}
+		if pmj.Annotations[util.AnnotationMigrationTimeout] != "2m" && pmj.Annotations[util.AnnotationMigrationTimeout] != "2m0s" {
+			t.Errorf("expected PMJ %s to have migration timeout 2m, got %s",
+				pmj.Name, pmj.Annotations[util.AnnotationMigrationTimeout])
+		}
 	}
 
 	if !createdPods["pod-1gi"] || !createdPods["pod-4gi"] || !createdPods["pod-8gi"] {
@@ -348,6 +347,11 @@ func TestNodePreemptionReconciler_PodEligibilityFiltering(t *testing.T) {
 	// 10. Valid eligible pod
 	podValid := createTestPod("pod-valid", "default", "spot-node-eligibility", "1Gi", "uid-valid")
 
+	// 11. BestEffort pod with zero request and limit - skipped
+	podBestEffort := createTestPod("pod-best-effort", "default", "spot-node-eligibility", "1Gi", "uid-best-effort")
+	podBestEffort.Spec.Containers[0].Resources.Requests = nil
+	podBestEffort.Spec.Containers[0].Resources.Limits = nil
+
 	recorder := record.NewFakeRecorder(20)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -356,7 +360,7 @@ func TestNodePreemptionReconciler_PodEligibilityFiltering(t *testing.T) {
 			node, psp,
 			podOtherNode, podKubeSystem, podNotEnabled, podRunc,
 			podTerminating, podPending, podPDBTimeout, podWithPMJ, existingPMJ,
-			podNoPSP, podValid,
+			podNoPSP, podValid, podBestEffort,
 		).
 		Build()
 
@@ -420,18 +424,32 @@ closeLoop:
 		t.Errorf("expected MigrationSkippedNoPolicy event for podNoPSP, got events: %v", events)
 	}
 
+	foundUnknownMemoryEvent := false
+	for _, ev := range events {
+		if ev == "Warning MigrationSkippedUnknownMemory Pod has zero memory request and limit (BestEffort QoS); cannot budget spot preemption migration" {
+			foundUnknownMemoryEvent = true
+			break
+		}
+	}
+	if !foundUnknownMemoryEvent {
+		t.Errorf("expected MigrationSkippedUnknownMemory event for podBestEffort, got events: %v", events)
+	}
+
 	if testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("no_policy")) < 1 {
 		t.Errorf("expected SpotPreemptionSkippedTotal[no_policy] >= 1, got %v",
 			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("no_policy")))
+	}
+	if testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unknown_memory")) < 1 {
+		t.Errorf("expected SpotPreemptionSkippedTotal[unknown_memory] >= 1, got %v",
+			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unknown_memory")))
 	}
 }
 
 func TestNodePreemptionReconciler_AlternativePreemptionSignals(t *testing.T) {
 	signals := []string{
-		"taint-out-of-service",
-		"condition-gke",
-		"condition-terminating",
+		"taint-gke",
 		"label-maintenance",
+		"condition-shutdown",
 	}
 
 	for _, sig := range signals {

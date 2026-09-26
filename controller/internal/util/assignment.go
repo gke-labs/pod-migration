@@ -26,6 +26,7 @@ const (
 	AnnotationAssignedPMJ        = "pod-migration.gke.io/assigned-pmj"
 	AnnotationMismatchSince      = "pod-migration.gke.io/mismatch-since"
 	AnnotationPDBEvictionTimeout = "pod-migration.gke.io/pdb-eviction-timeout"
+	AnnotationPodSnapshotPolicy  = "pod-migration.gke.io/pod-snapshot-policy"
 
 	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
 	// in their assigned-pmj annotation.  Registered at manager startup via
@@ -34,7 +35,6 @@ const (
 
 	LabelTriggerSource          = "pod-migration.gke.io/trigger-source"
 	AnnotationTriggerSource     = "pod-migration.gke.io/trigger-source"
-	AnnotationPodSnapshotPolicy = "pod-migration.gke.io/pod-snapshot-policy"
 	TriggerSourceSpotPreemption = "spot-preemption"
 	TriggerSourceEviction       = "eviction-webhook"
 

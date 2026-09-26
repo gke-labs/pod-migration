@@ -41,6 +41,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlruntime "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -145,6 +146,20 @@ func main() {
 		LeaderElectionReleaseOnCancel: true,
 		Cache: cache.Options{
 			DefaultTransform: cache.TransformStripManagedFields(),
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Node{}: {
+					Transform: func(obj interface{}) (interface{}, error) {
+						node, ok := obj.(*corev1.Node)
+						if !ok {
+							return obj, nil
+						}
+						// Strip heavy cached image metadata not needed by node preemption controller
+						node.Status.Images = nil
+						node.ManagedFields = nil
+						return node, nil
+					},
+				},
+			},
 		},
 		// Webhook server is on :9443 by default.
 		WebhookServer: webhook.NewServer(webhook.Options{Port: 9443}),

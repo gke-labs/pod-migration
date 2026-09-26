@@ -62,10 +62,11 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		logger.Error(err, "Failed to get Node")
+		logger.Error(err, "Failed to get node")
 		return ctrl.Result{}, err
 	}
 
+	// Fast-path: check if node is undergoing preemption or termination
 	if !util.IsNodePreempting(node) {
 		return ctrl.Result{}, nil
 	}
@@ -81,16 +82,12 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return true
 	})
 
-	// List pods scheduled on this node
+	// List pods scheduled on this node using the registered field index
 	podList := &corev1.PodList{}
 	err = r.Client.List(ctx, podList, client.MatchingFields{PodNodeNameIndex: node.Name})
 	if err != nil {
-		// Fallback to unindexed list if index is not registered
-		err = r.Client.List(ctx, podList)
-		if err != nil {
-			logger.Error(err, "Failed to list pods on preempting node", "node", node.Name)
-			return ctrl.Result{}, err
-		}
+		logger.Error(err, "Failed to list pods on preempting node", "node", node.Name)
+		return ctrl.Result{}, err
 	}
 
 	var candidates []preemptionCandidate
@@ -171,11 +168,25 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 
-		size := util.CalculatePodMemoryRequest(pod)
+		// Calculate memory footprint (requests falling back to limits).
+		// BestEffort pods with zero request and limit cannot be budgeted.
+		footprintBytes, known := util.CalculatePodMemoryFootprint(pod)
+		if !known || footprintBytes <= 0 {
+			logger.Info("Skipping pod on preempting node: zero memory request and limit (BestEffort)",
+				"pod", pod.Name, "namespace", pod.Namespace)
+			if r.Recorder != nil {
+				r.Recorder.Event(pod, corev1.EventTypeWarning, "MigrationSkippedUnknownMemory",
+					"Pod has zero memory request and limit (BestEffort QoS); cannot budget spot preemption migration")
+			}
+			metrics.RecordSpotPreemptionSkipped("unknown_memory")
+			r.processedPods.Store(pod.UID, time.Now())
+			continue
+		}
+
 		candidates = append(candidates, preemptionCandidate{
 			pod:  pod,
 			psp:  matchingPSP,
-			size: size,
+			size: footprintBytes,
 		})
 	}
 
@@ -183,7 +194,9 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	// Order candidate pods by memory footprint ascending so the most pods possible reach durability
+	// Order candidate pods by memory footprint ascending so smaller workloads fit under
+	// the node's recovery budget before the budget is exhausted, maximizing the count of
+	// preserved workloads. All admitted PMJs are created concurrently in this reconcile pass.
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].size != candidates[j].size {
 			return candidates[i].size < candidates[j].size
@@ -205,7 +218,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		reqBytes := cand.size
 
 		if reqBytes > remainingBudget {
-			logger.Info("Skipping pod preemption migration: memory request exceeds remaining node budget",
+			logger.Info("Skipping pod preemption migration: memory footprint exceeds remaining node budget",
 				"pod", pod.Name, "namespace", pod.Namespace,
 				"requestedBytes", reqBytes, "remainingBudgetBytes", remainingBudget)
 			if r.Recorder != nil {
@@ -214,6 +227,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					util.FormatBytes(reqBytes), util.FormatBytes(remainingBudget), util.FormatBytes(totalBudget))
 			}
 			metrics.RecordSpotPreemptionSkipped("budget_exceeded")
+			// Remember skipped pod to avoid spamming duplicate warning events during the ~30s shutdown window
 			r.processedPods.Store(pod.UID, time.Now())
 			continue
 		}
@@ -228,9 +242,19 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 
 		jobName := util.FormatPMJName(pod.Name, string(pod.UID))
+		// For spot preemption, enforce a short 2-minute deadline so doomed migrations
+		// fail fast rather than waiting up to 2 hours on a node that will vanish in seconds.
+		preemptionTimeout := util.PreemptionDefaultTimeout
 		jobLabels, jobAnnotations := util.BuildPMJLabelsAndAnnotations(
-			pod, parentName, parentKind, parentUID, cand.psp, r.DefaultMigrationTimeout, util.TriggerSourceSpotPreemption,
+			pod, parentName, parentKind, parentUID, cand.psp, preemptionTimeout, util.TriggerSourceSpotPreemption,
 		)
+		if jobAnnotations == nil {
+			jobAnnotations = make(map[string]string)
+		}
+		// If the pod did not have an explicit timeout override annotation, enforce the short 2m preemption deadline
+		if pod.Annotations == nil || pod.Annotations[util.AnnotationMigrationTimeout] == "" {
+			jobAnnotations[util.AnnotationMigrationTimeout] = preemptionTimeout.String()
+		}
 
 		newJob := &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{
@@ -263,7 +287,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			logger.Info("Successfully created PodMigrationJob for spot preemption", "job", jobName, "pod", pod.Name)
 			if r.Recorder != nil {
 				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "PreemptionMigrationTriggered",
-					"Triggered spot preemption migration for pod on node %s (memory request: %s, remaining node budget: %s)",
+					"Triggered spot preemption migration for pod on node %s (memory footprint: %s, remaining node budget: %s)",
 					node.Name, util.FormatBytes(reqBytes), util.FormatBytes(remainingBudget))
 				r.Recorder.Eventf(node, corev1.EventTypeNormal, "PreemptionMigrationInitiated",
 					"Initiated preemption migration for pod %s/%s (job %s)",
