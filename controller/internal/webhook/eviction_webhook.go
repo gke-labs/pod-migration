@@ -2,21 +2,16 @@ package webhook
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"slices"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -160,27 +155,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 
 	// Create new PodMigrationJob
 	logger.Info("Creating PodMigrationJob", "job", jobName)
-	var jobAnnotations map[string]string
-	baseTimeout := a.DefaultMigrationTimeout
-	if baseTimeout <= 0 {
-		baseTimeout = util.DefaultMigrationTimeout
-	}
-	var rawTimeout string
-	if pod.Annotations != nil {
-		rawTimeout = pod.Annotations[util.AnnotationMigrationTimeout]
-	}
-	memBytes := util.CalculatePodMemoryRequest(pod)
-	effectiveTimeout := util.CalculateMigrationTimeout(rawTimeout, memBytes, baseTimeout)
-	if effectiveTimeout != baseTimeout || rawTimeout != "" {
-		if jobAnnotations == nil {
-			jobAnnotations = make(map[string]string)
-		}
-		if _, ok := util.ParseClampedTimeout(rawTimeout); ok {
-			jobAnnotations[util.AnnotationMigrationTimeout] = rawTimeout
-		} else if effectiveTimeout != baseTimeout {
-			jobAnnotations[util.AnnotationMigrationTimeout] = effectiveTimeout.String()
-		}
-	}
+	jobLabels, jobAnnotations := util.BuildPMJLabelsAndAnnotations(
+		pod, parentName, parentKind, parentUID, matchingPSP, a.DefaultMigrationTimeout, util.TriggerSourceEviction,
+	)
 
 	newJob := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
@@ -247,110 +224,8 @@ func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, 
 	return nil
 }
 
-// latestUpdate extracts the most recent "Update" timestamp from managed fields of unstructured object.
-// Falls back to creation time if no update operation is found.
-func latestUpdate(obj *unstructured.Unstructured) time.Time {
-	var latest = obj.GetCreationTimestamp().Time
-	for _, field := range obj.GetManagedFields() {
-		if field.Operation != metav1.ManagedFieldsOperationUpdate {
-			continue
-		}
-		if field.Time != nil && field.Time.After(latest) {
-			latest = field.Time.Time
-		}
-	}
-	return latest
-}
-
 // findLatestReadyManualStopPSP finds the latest ready manual PodSnapshotPolicy in the namespace matching the labels,
 // and verifies that its postCheckpoint behavior is set to "stop".
 func findLatestReadyManualStopPSP(ctx context.Context, c client.Client, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {
-	pspList := &unstructured.UnstructuredList{}
-	pspList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotPolicyList",
-	})
-	if err := c.List(ctx, pspList, client.InNamespace(namespace)); err != nil {
-		if meta.IsNoMatchError(err) {
-			// Tolerate missing CRDs (fail-open)
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to list PSPs: %w", err)
-	}
-
-	var matchingPSPs []*unstructured.Unstructured
-	podLabelSet := labels.Set(podLabels)
-
-	for i := range pspList.Items {
-		psp := &pspList.Items[i]
-
-		// 1. Verify trigger type is manual
-		triggerType, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "type")
-		if err != nil || !found || triggerType != "manual" {
-			continue
-		}
-
-		// 2. Verify labels selector matches
-		selectorMap, found, err := unstructured.NestedMap(psp.Object, "spec", "selector")
-		if err != nil || !found {
-			continue
-		}
-		jsonBytes, err := json.Marshal(selectorMap)
-		if err != nil {
-			continue
-		}
-		var labelSelector metav1.LabelSelector
-		if err := json.Unmarshal(jsonBytes, &labelSelector); err != nil {
-			continue
-		}
-		selector, err := metav1.LabelSelectorAsSelector(&labelSelector)
-		if err != nil {
-			continue
-		}
-		if !selector.Matches(podLabelSet) {
-			continue
-		}
-
-		// 3. Verify status is Ready (condition Ready=True)
-		conditions, found, err := unstructured.NestedSlice(psp.Object, "status", "conditions")
-		if err != nil || !found {
-			continue
-		}
-		isReady := false
-		for _, condVal := range conditions {
-			cond, ok := condVal.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if cond["type"] == "Ready" && cond["status"] == "True" {
-				isReady = true
-				break
-			}
-		}
-		if !isReady {
-			continue
-		}
-
-		matchingPSPs = append(matchingPSPs, psp)
-	}
-
-	if len(matchingPSPs) == 0 {
-		return nil, nil // No matching ready policy found
-	}
-
-	// Sort by latest updated time (descending)
-	slices.SortStableFunc(matchingPSPs, func(a, b *unstructured.Unstructured) int {
-		return latestUpdate(b).Compare(latestUpdate(a))
-	})
-
-	latestPSP := matchingPSPs[0]
-
-	// 4. Validate latest policy for "stop" behavior
-	postCheckpoint, found, err := unstructured.NestedString(latestPSP.Object, "spec", "triggerConfig", "postCheckpoint")
-	if err == nil && found && postCheckpoint == "stop" {
-		return latestPSP, nil
-	}
-
-	return nil, nil // Return nil if the latest policy is not a "stop" policy
+	return util.FindLatestReadyManualStopPSP(ctx, c, namespace, podLabels)
 }

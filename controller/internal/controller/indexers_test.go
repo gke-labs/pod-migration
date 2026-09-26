@@ -169,10 +169,62 @@ func TestVolumeAttachmentPVIndex_ListsOnlyMatchingAttachments(t *testing.T) {
 	}
 }
 
+func TestPodNodeNameIndex_ListsOnlyMatchingPods(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	podNode1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-node-1",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+		},
+	}
+	podNode2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-node-2",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-2",
+		},
+	}
+	podUnassigned := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-unassigned",
+			Namespace: "default",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(podNode1, podNode2, podUnassigned).
+		Build()
+
+	podList := &corev1.PodList{}
+	err := cl.List(context.Background(), podList, client.MatchingFields{PodNodeNameIndex: "node-1"})
+	if err != nil {
+		t.Fatalf("indexed list failed: %v", err)
+	}
+
+	if len(podList.Items) != 1 {
+		t.Fatalf("expected exactly 1 pod indexed under node-1, got %d", len(podList.Items))
+	}
+	if podList.Items[0].Name != "pod-node-1" {
+		t.Errorf("expected pod-node-1, got %s", podList.Items[0].Name)
+	}
+}
+
 func TestIndexValues_NilSafety(t *testing.T) {
 	// Untyped nil interface
 	if got := PodAssignedPMJIndexValue(nil); got != nil {
 		t.Errorf("expected nil for untyped nil pod, got %v", got)
+	}
+	if got := PodNodeNameIndexValue(nil); got != nil {
+		t.Errorf("expected nil for untyped nil pod node name, got %v", got)
 	}
 	if got := VolumeAttachmentPVIndexValue(nil); got != nil {
 		t.Errorf("expected nil for untyped nil VolumeAttachment, got %v", got)
@@ -182,6 +234,9 @@ func TestIndexValues_NilSafety(t *testing.T) {
 	var nilPod *corev1.Pod
 	if got := PodAssignedPMJIndexValue(nilPod); got != nil {
 		t.Errorf("expected nil for typed nil pod, got %v", got)
+	}
+	if got := PodNodeNameIndexValue(nilPod); got != nil {
+		t.Errorf("expected nil for typed nil pod node name, got %v", got)
 	}
 	var nilVA *storagev1.VolumeAttachment
 	if got := VolumeAttachmentPVIndexValue(nilVA); got != nil {
