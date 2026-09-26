@@ -28,6 +28,39 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
+// defaultHandlerBudget bounds Handle when the request carries no "timeout"
+// parameter. It fits inside the webhook's timeoutSeconds whether that is 5s or
+// 10s.
+const defaultHandlerBudget = 4 * time.Second
+
+// admissionTimeoutKey is the context key for the API server's per-call webhook
+// timeout.
+type admissionTimeoutKey struct{}
+
+// contextWithAdmissionTimeout is the webhook's WithContextFunc. The API server
+// appends the time it will wait for this webhook call as the "timeout" query
+// parameter (e.g. "?timeout=10s", rounded up to whole seconds); record it so
+// Handle can answer before the API server gives up.
+func contextWithAdmissionTimeout(ctx context.Context, r *http.Request) context.Context {
+	if r == nil || r.URL == nil {
+		return ctx
+	}
+	d, err := time.ParseDuration(r.URL.Query().Get("timeout"))
+	if err != nil || d <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, admissionTimeoutKey{}, d)
+}
+
+// handlerBudget returns how long Handle may spend on API calls: 80% of the API
+// server's webhook timeout, keeping the rest as headroom to send the answer.
+func handlerBudget(ctx context.Context) time.Duration {
+	if d, ok := ctx.Value(admissionTimeoutKey{}).(time.Duration); ok {
+		return d - d/5
+	}
+	return defaultHandlerBudget
+}
+
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
 // EvictionGate handles eviction requests and creates PodMigrationJobs.
@@ -53,6 +86,14 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		logger.Info("Dry-run eviction request, bypassing migration side-effects")
 		return admission.Allowed("dry-run allowed")
 	}
+
+	// Answer before the API server gives up on this call: with failurePolicy
+	// Ignore, a timed-out call admits the eviction and an opted-in pod is evicted
+	// cold. Our API calls can be slow when API Priority and Fairness queues them
+	// behind the very evictions being gated. Once the budget runs out, the
+	// migration-path calls below fail and answer 429, so the evictor retries.
+	ctx, cancel := context.WithTimeout(ctx, handlerBudget(ctx))
+	defer cancel()
 
 	// Fetch the Pod
 	pod := &corev1.Pod{}
@@ -234,17 +275,24 @@ func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, 
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/validate-v1-pod-eviction",
-		&admission.Webhook{
-			Handler: &EvictionGate{
-				Client:                  mgr.GetClient(),
-				APIReader:               apiReader,
-				Recorder:                mgr.GetEventRecorderFor("pod-migration-controller"),
-				DefaultMigrationTimeout: defaultTimeout,
-				decoder:                 dec,
-			},
-		},
+		newEvictionWebhook(&EvictionGate{
+			Client:                  mgr.GetClient(),
+			APIReader:               apiReader,
+			Recorder:                mgr.GetEventRecorderFor("pod-migration-controller"),
+			DefaultMigrationTimeout: defaultTimeout,
+			decoder:                 dec,
+		}),
 	)
 	return nil
+}
+
+// newEvictionWebhook wraps the EvictionGate in the admission.Webhook served at
+// /validate-v1-pod-eviction.
+func newEvictionWebhook(gate *EvictionGate) *admission.Webhook {
+	return &admission.Webhook{
+		Handler:         gate,
+		WithContextFunc: contextWithAdmissionTimeout,
+	}
 }
 
 // latestUpdate extracts the most recent "Update" timestamp from managed fields of unstructured object.
