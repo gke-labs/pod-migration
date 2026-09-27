@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -198,11 +197,6 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 				"Pod is opted into live migration, but no matching Ready manual+stop PodSnapshotPolicy was found; allowing cold eviction")
 		}
 		return admission.Allowed("skipping migration: no valid manual+stop policy found")
-	}
-	if pspName := matchingPSP.GetName(); strings.HasPrefix(pspName, "psp-") && strings.HasSuffix(pspName, "-manual") {
-		if pmName := strings.TrimSuffix(strings.TrimPrefix(pspName, "psp-"), "-manual"); pmName != "" {
-			jobLabels["pod-migration.gke.io/podmigration-name"] = pmName
-		}
 	}
 
 	// Create new PodMigrationJob

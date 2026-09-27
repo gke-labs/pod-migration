@@ -781,13 +781,25 @@ run_scenario_s3() {
   done
   [[ -n "${snap_name}" ]] || die "S3: timed out waiting for PodSnapshot reference on PMJ for ${src_pod}"
 
-  # Wait until source pod is deleted and replacement pod is created (held Pending on cordoned nodes)
-  sleep 3
+  # Poll until the replacement pod is created and held Pending on the cordoned nodes
+  local repl_pod=""
+  local repl_deadline=$((SECONDS + 60))
+  while [[ ${SECONDS} -lt ${repl_deadline} ]]; do
+    repl_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-counter -o json 2>/dev/null \
+      | jq -r --arg src "${src_pod}" '.items[] | select(.metadata.name != $src and .metadata.deletionTimestamp == null) | .metadata.name' | head -n 1)"
+    if [[ -n "${repl_pod}" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  [[ -n "${repl_pod}" ]] || die "S3: timed out waiting for replacement pod after checkpoint of ${src_pod}"
 
   # Remove the newly uploaded checkpoint artifacts in GCS so restore fails and triggers
   # deterministic I9 cold-start fallback (SucceededWithoutRestore / FallbackToColdStart).
-  log "Removing GCS checkpoint artifacts at ${GCS_BUCKET}/${snap_name}"
-  gcloud storage rm -r "${GCS_BUCKET}/${snap_name}" >/dev/null 2>&1
+  log "Removing GCS checkpoint artifacts at ${GCS_BUCKET}/${snap_name} (replacement pod ${repl_pod} held Pending)"
+  if ! gcloud storage rm -r "${GCS_BUCKET}/${snap_name}" >/dev/null; then
+    die "S3: failed to remove GCS checkpoint artifacts at ${GCS_BUCKET}/${snap_name}"
+  fi
 
   log "Uncordoning gVisor nodes so replacement pod attempts restore from missing/corrupted checkpoint"
   uncordon_all_tracked_nodes
