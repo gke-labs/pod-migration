@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -172,6 +173,9 @@ func buildDynamicPodSnapshotCRDs() []*apiextensionsv1.CustomResourceDefinition {
 	}
 }
 
+// totalInvariantViolations sums the process-global Prometheus counter across I1-I9.
+// NOTE: Subtests in TestT1_EnvtestFaultInjectionMatrix must remain sequential (do not call
+// t.Parallel()) because each subtest asserts before/after deltas against this shared counter.
 func totalInvariantViolations() float64 {
 	var sum float64
 	for _, id := range []string{"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9"} {
@@ -197,6 +201,10 @@ func createTestNamespace(t *testing.T, ctx context.Context, k8sClient client.Cli
 // exercising Invariants I1-I9 against a real kube-apiserver + etcd (envtest) under
 // --invariant-mode=strict.
 func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		t.Skip("KUBEBUILDER_ASSETS not set; skipping envtest T1 fault-injection matrix")
+	}
+
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{"../../config/crd/bases"},
 		CRDs:                  buildDynamicPodSnapshotCRDs(),
@@ -205,7 +213,7 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 
 	cfg, err := testEnv.Start()
 	if err != nil {
-		t.Skipf("envtest assets unavailable (%v); run via `make test` or set KUBEBUILDER_ASSETS", err)
+		t.Fatalf("Failed to start envtest environment: %v", err)
 	}
 	t.Cleanup(func() {
 		if stopErr := testEnv.Stop(); stopErr != nil {
@@ -230,8 +238,9 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 
 	// -------------------------------------------------------------------------
 	// Scenario 1: Concurrent PodGate Contenders (I1: AtMostOnceRestore, I3: GateLiveness)
-	// Two replacement pods contend simultaneously for a single PodSnapshot in Restoring phase.
-	// Verify exactly one warm restore and zero stranded gates.
+	// Two replacement pods contend simultaneously for a single PodSnapshot in Restoring phase,
+	// followed by a post-consumption third contender testing the Status.Consumed single-use
+	// guard (#11) and strict-mode PMJ invariant enforcement.
 	// -------------------------------------------------------------------------
 	t.Run("S1_ConcurrentPodGateContenders_I1_I3", func(t *testing.T) {
 		ns := createTestNamespace(t, ctx, k8sClient, "t1-s1-contend")
@@ -297,8 +306,8 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 						appsv1.DefaultDeploymentUniqueLabelKey: "hash-s1",
 					},
 					Annotations: map[string]string{
-						// Simulate admission/informer race where both replacement pods initially
-						// claim the same unconsumed PMJ before ResolveCollision arbitrates.
+						// Simulate admission/informer race where replacement pods claim
+						// the same PMJ.
 						util.AnnotationAssignedPMJ: pmj.Name,
 					},
 					OwnerReferences: []metav1.OwnerReference{
@@ -403,7 +412,56 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			t.Fatalf("I1 breach: expected 1 warm restore and 1 cold-start bypass, got warm=%d cold=%d", warmCount, coldBypassCount)
 		}
 
+		// Leg 2 (#11 regression probe): Strip AnnotationAssignedPMJ from winnerPod (while winnerPod
+		// remains active with ps-name="snap-s1-unique" and PMJ is still in PhaseRestoring) so a
+		// subsequent contender podC is NOT caught by ResolveCollision and directly exercises the
+		// Status.Consumed single-use guard in pod_gate_controller.go:219.
+		delete(winnerPod.Annotations, util.AnnotationAssignedPMJ)
+		if err := k8sClient.Update(ctx, winnerPod); err != nil {
+			t.Fatalf("strip AnnotationAssignedPMJ from winnerPod: %v", err)
+		}
+		podC := makeContenderPod("web-contender-c")
+		if err := k8sClient.Create(ctx, podC); err != nil {
+			t.Fatalf("create podC: %v", err)
+		}
+		if _, err := gateRec.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: podC.Name},
+		}); err != nil {
+			t.Fatalf("PodGateReconciler.Reconcile(podC) failed: %v", err)
+		}
+		// Reconcile PMJ while still in PhaseRestoring so strict-mode EvaluateI1 runs on the
+		// post-podC state (if Status.Consumed guard in pod_gate_controller.go is disabled,
+		// podC binds "snap-s1-unique" and strict-mode EvaluateI1 aborts PMJ to Failed here).
+		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmj.Name},
+		}); err != nil {
+			t.Fatalf("pmjRec.Reconcile after podC failed: %v", err)
+		}
+		var midPMJ pmv1alpha1.PodMigrationJob
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: pmj.Name}, &midPMJ); err != nil {
+			t.Fatalf("get midPMJ after podC: %v", err)
+		}
+		if midPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+			readyCond := meta.FindStatusCondition(midPMJ.Status.Conditions, "Ready")
+			t.Fatalf("PMJ aborted under --invariant-mode=strict after contender podC: phase=%s readyCondition=%+v",
+				midPMJ.Status.Phase, readyCond)
+		}
+
+		var gotC corev1.Pod
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: podC.Name}, &gotC); err != nil {
+			t.Fatalf("get podC: %v", err)
+		}
+		if podHasMigrationGate(&gotC) {
+			t.Fatalf("I3 breach: expected podC scheduling gate removed, got %v", gotC.Spec.SchedulingGates)
+		}
+		if psVal, exists := gotC.Annotations["podsnapshot.gke.io/ps-name"]; !exists || psVal != "" {
+			t.Fatalf("I1 breach (#11 Status.Consumed guard): expected podC cold-start bypass \"\", got %q (exists=%v)", psVal, exists)
+		}
+
 		// Mark the winner pod Ready and drive PMJ to Succeeded
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: winnerPod.Name}, winnerPod); err != nil {
+			t.Fatalf("re-fetch winnerPod: %v", err)
+		}
 		winnerPod.Status.Phase = corev1.PodRunning
 		winnerPod.Status.Conditions = []corev1.PodCondition{
 			{Type: corev1.PodReady, Status: corev1.ConditionTrue},
@@ -422,10 +480,74 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			t.Fatalf("get finalPMJ: %v", err)
 		}
 		if finalPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
-			t.Fatalf("expected PMJ phase Succeeded, got %s", finalPMJ.Status.Phase)
+			t.Fatalf("expected PMJ phase Succeeded, got %s (conditions=%+v)",
+				finalPMJ.Status.Phase, finalPMJ.Status.Conditions)
 		}
 		if delta := totalInvariantViolations() - beforeViolations; delta != 0 {
-			t.Fatalf("expected 0 invariant violations in S1, got delta=%v", delta)
+			t.Fatalf("expected 0 invariant violations on guarded S1 path, got delta=%v", delta)
+		}
+
+		// Leg 3 (Engine enforcement probe on S1 contenders): Verify that if a contender bypasses
+		// the Status.Consumed guard and binds "snap-s1-unique" while an active Restoring PMJ tracks
+		// an in-progress (non-Ready) winnerPod, a strict-mode PMJ reconcile detects the duplicate
+		// consumption via EvaluateI1 and aborts the PMJ to Failed (Reason: InvariantViolation).
+		winnerPod.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+		}
+		if err := k8sClient.Status().Update(ctx, winnerPod); err != nil {
+			t.Fatalf("reset winnerPod Ready=False for Leg 3: %v", err)
+		}
+		gotC.Annotations["podsnapshot.gke.io/ps-name"] = "snap-s1-unique"
+		if err := k8sClient.Update(ctx, &gotC); err != nil {
+			t.Fatalf("inject Consumed-bypass annotation on gotC: %v", err)
+		}
+		pmjBypass := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "pmj-web-s1-consumed-bypass",
+				Labels: map[string]string{
+					util.LabelParentUID:       string(rs.UID),
+					util.LabelParentKind:      "ReplicaSet",
+					util.LabelPodTemplateHash: "hash-s1",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "web-origin-0"},
+				TargetPodUID: "uid-origin-s1",
+			},
+		}
+		if err := k8sClient.Create(ctx, pmjBypass); err != nil {
+			t.Fatalf("create pmjBypass: %v", err)
+		}
+		pmjBypass.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+		pmjBypass.Status.SnapshotRef = "snap-s1-unique"
+		pmjBypass.Status.Consumed = true
+		pmjBypass.Status.GateReleased = true
+		pmjBypass.Status.RestoredPodName = winnerPod.Name
+		pmjBypass.Status.RestoredPodUID = string(winnerPod.UID)
+		pmjBypass.Status.RestoringStartTime = &now
+		if err := k8sClient.Status().Update(ctx, pmjBypass); err != nil {
+			t.Fatalf("update pmjBypass status: %v", err)
+		}
+		beforeBypassI1 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I1"))
+		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjBypass.Name},
+		}); err != nil {
+			t.Fatalf("pmjRec.Reconcile(pmjBypass) failed: %v", err)
+		}
+		var abortedBypassPMJ pmv1alpha1.PodMigrationJob
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: pmjBypass.Name}, &abortedBypassPMJ); err != nil {
+			t.Fatalf("get abortedBypassPMJ: %v", err)
+		}
+		if abortedBypassPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+			t.Fatalf("expected S1 Consumed-bypass PMJ to abort to Failed, got phase=%s", abortedBypassPMJ.Status.Phase)
+		}
+		bypassCond := meta.FindStatusCondition(abortedBypassPMJ.Status.Conditions, "Ready")
+		if bypassCond == nil || bypassCond.Status != metav1.ConditionFalse || bypassCond.Reason != invariants.EventReasonInvariantViolation || !strings.Contains(bypassCond.Message, "[I1:AtMostOnceRestore]") {
+			t.Fatalf("expected S1 Consumed-bypass Ready=False condition with Reason=InvariantViolation and [I1:AtMostOnceRestore], got %+v", bypassCond)
+		}
+		if afterBypassI1 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I1")); afterBypassI1-beforeBypassI1 < 1 {
+			t.Fatalf("expected I1 counter to increment on S1 Consumed-bypass, delta=%v", afterBypassI1-beforeBypassI1)
 		}
 	})
 

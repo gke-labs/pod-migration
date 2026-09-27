@@ -31,7 +31,3 @@ jobs:
 
     - name: Run Unit Tests
       run: make -C controller test
-
-    - name: Run T1 Guardrail Fault-Injection Matrix (I1-I9)
-      run: make -C controller test-t1-invariants
-

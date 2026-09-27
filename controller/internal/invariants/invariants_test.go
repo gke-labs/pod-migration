@@ -513,6 +513,18 @@ func TestEvaluateI4_EvictingStartTimeAnchor(t *testing.T) {
 	if len(vs) != 1 || vs[0].Reason != "ActivePMJExceededDeadline" {
 		t.Fatalf("expected Status.EvictingStartTime past 10m30s budget to violate I4, got %+v", vs)
 	}
+
+	// Hard 2h cap: created 2h1m ago, even with a fresh EvictingStartTime 30s ago, must violate I4.
+	job.CreationTimestamp = metav1.NewTime(now.Add(-121 * time.Minute))
+	freshEvictStart := metav1.NewTime(now.Add(-30 * time.Second))
+	job.Status.EvictingStartTime = &freshEvictStart
+	vs = EvaluateI4(&ReconcileSnapshot{
+		Now:        now,
+		PrimaryPMJ: job,
+	})
+	if len(vs) != 1 || vs[0].Reason != "ActivePMJExceededDeadline" {
+		t.Fatalf("expected PMJ created 2h1m ago to violate I4 2h hard cap despite recent EvictingStartTime, got %+v", vs)
+	}
 }
 
 func TestEngine_MaxActiveViolationScopesCap(t *testing.T) {
@@ -539,4 +551,3 @@ func TestEngine_MaxActiveViolationScopesCap(t *testing.T) {
 		t.Fatalf("expected activeViolations map size <= %d, got %d", maxActiveViolationScopes, len(eng.activeViolations))
 	}
 }
-
