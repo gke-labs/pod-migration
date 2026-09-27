@@ -3767,6 +3767,219 @@ func TestPodMigrationJobReconciler_Evicting_PDBSafeEvictionFallback(t *testing.T
 	}
 }
 
+func TestPodMigrationJobReconciler_Evicting_ImmediatePDBSafeEvictionWithout30sWait(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "immediate-evict-pod"
+	podUID := "12345678-immediate"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+	}
+
+	// Start with no evicting-since annotation (fresh entry into PhaseEvicting)
+	pmj := &pmv1alpha1.PodMigrationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigrationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	evictionCalled := false
+	var evictedPodName string
+	var evictedNamespace string
+	var evictedGracePeriod *int64
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+				if subResourceName == "eviction" {
+					evictionCalled = true
+					if eviction, ok := subResource.(*policyv1.Eviction); ok {
+						evictedPodName = eviction.Name
+						evictedNamespace = eviction.Namespace
+						if eviction.DeleteOptions != nil {
+							evictedGracePeriod = eviction.DeleteOptions.GracePeriodSeconds
+						}
+					}
+					return nil
+				}
+				return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+			},
+		}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	}
+
+	// Pass 1: Stamps evicting-since and returns Requeue: true
+	res1, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Pass 1 Reconcile failed: %v", err)
+	}
+	if !res1.Requeue {
+		t.Fatalf("Expected Pass 1 to return Requeue=true after stamping evicting-since, got %+v", res1)
+	}
+
+	// Pass 2 (immediately, 0s elapsed): Must invoke PDB-safe eviction subresource without waiting 30s
+	res2, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Pass 2 Reconcile failed: %v", err)
+	}
+	if !evictionCalled {
+		t.Fatalf("Expected eviction subresource to be called immediately without 30s wait, but was not")
+	}
+	if evictedPodName != podName || evictedNamespace != namespace {
+		t.Errorf("Expected eviction for %s/%s, got %s/%s", namespace, podName, evictedNamespace, evictedPodName)
+	}
+	// The checkpointed origin pod must not be held for its full terminationGracePeriodSeconds.
+	if evictedGracePeriod == nil || *evictedGracePeriod != postCheckpointEvictionGracePeriodSeconds {
+		t.Errorf("Expected eviction DeleteOptions.GracePeriodSeconds=%d, got %v", postCheckpointEvictionGracePeriodSeconds, evictedGracePeriod)
+	}
+	if res2.RequeueAfter != 2*time.Second {
+		t.Errorf("Expected RequeueAfter 2s, got %v", res2.RequeueAfter)
+	}
+}
+
+// An external evictor (kubectl drain, node upgrade) that wins the race deletes the checkpointed
+// origin pod with the pod's full grace period. The controller shortens a long pending grace
+// period to postCheckpointEvictionGracePeriodSeconds via the eviction subresource, and leaves an
+// already-short (or unknown) grace period alone.
+func TestPodMigrationJobReconciler_Evicting_TerminatingOriginPod_ShortensLongGracePeriod(t *testing.T) {
+	grace := func(s int64) *int64 { return &s }
+	tests := []struct {
+		name             string
+		deletionGrace    *int64
+		wantEvictionCall bool
+	}{
+		{name: "external drain used 30s grace period", deletionGrace: grace(30), wantEvictionCall: true},
+		{name: "grace period already 1s", deletionGrace: grace(1), wantEvictionCall: false},
+		{name: "grace period unknown", deletionGrace: nil, wantEvictionCall: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			_ = policyv1.AddToScheme(scheme)
+			_ = storagev1.AddToScheme(scheme)
+			_ = pmv1alpha1.AddToScheme(scheme)
+
+			namespace := "default"
+			podName := "drained-pod"
+			podUID := "uid-drained-123"
+			jobName := "pmj-" + podName
+			now := metav1.Now()
+
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:                  namespace,
+					Name:                       podName,
+					UID:                        types.UID(podUID),
+					DeletionTimestamp:          &now,
+					DeletionGracePeriodSeconds: tc.deletionGrace,
+					Finalizers:                 []string{"kubernetes.io/test-finalizer"},
+				},
+			}
+			pmj := &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:         namespace,
+					Name:              jobName,
+					CreationTimestamp: now,
+					Annotations: map[string]string{
+						"pod-migration.gke.io/evicting-since": time.Now().Format(time.RFC3339Nano),
+					},
+				},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef:       corev1.LocalObjectReference{Name: podName},
+					TargetPodUID: podUID,
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+				},
+			}
+
+			evictionCalls := 0
+			var evictedGracePeriod *int64
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(pod, pmj).
+				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+						if subResourceName == "eviction" {
+							evictionCalls++
+							if eviction, ok := subResource.(*policyv1.Eviction); ok && eviction.DeleteOptions != nil {
+								evictedGracePeriod = eviction.DeleteOptions.GracePeriodSeconds
+							}
+							return nil
+						}
+						return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+					},
+				}).
+				Build()
+
+			r := &PodMigrationJobReconciler{Client: fakeClient, Scheme: scheme}
+			res, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+			})
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if gotCall := evictionCalls > 0; gotCall != tc.wantEvictionCall {
+				t.Fatalf("eviction called = %v (%d calls), want %v", gotCall, evictionCalls, tc.wantEvictionCall)
+			}
+			if tc.wantEvictionCall && (evictedGracePeriod == nil || *evictedGracePeriod != postCheckpointEvictionGracePeriodSeconds) {
+				t.Errorf("Expected shortening eviction with GracePeriodSeconds=%d, got %v", postCheckpointEvictionGracePeriodSeconds, evictedGracePeriod)
+			}
+			// Still waiting for the origin pod to disappear before Restoring.
+			if res.RequeueAfter != 2*time.Second {
+				t.Errorf("Expected RequeueAfter 2s while waiting for terminating pod, got %v", res.RequeueAfter)
+			}
+		})
+	}
+}
+
 func TestPodMigrationJobReconciler_Evicting_PDBBlocked_429_Requeues(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
