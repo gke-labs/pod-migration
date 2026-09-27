@@ -6221,7 +6221,7 @@ func TestPodMigrationJobReconciler_StrictInvariantMode_CleansUpTriggerAndSuppres
 	}
 }
 
-func TestReconcilers_LiveInvariantEvaluation_I1_PodGate_And_PodMigration(t *testing.T) {
+func TestReconcilers_LiveInvariantEvaluation_I1_I8_I4(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
