@@ -395,16 +395,24 @@ func EvaluateI4(s *ReconcileSnapshot) []Violation {
 			effectiveTimeout := EffectiveMigrationTimeout(&job)
 			budget := effectiveTimeout + progressGraceSlack
 
-			// During Evicting, if `pod-migration.gke.io/evicting-since` is set, PR #57
-			// anchors the eviction phase budget on evicting-since.
-			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting && job.Annotations != nil {
-				if evictingSinceStr := job.Annotations[AnnotationEvictingSince]; evictingSinceStr != "" {
-					evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
-					if err != nil {
-						evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)
-					}
-					if err == nil && now.Sub(evictingSince) <= budget {
+			// During Evicting, PR #57 anchors the eviction phase budget on Status.EvictingStartTime
+			// (with fallback to the `pod-migration.gke.io/evicting-since` annotation for in-flight jobs),
+			// bounded by the hard MaxMigrationTimeout (2h) wall-clock cap.
+			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
+				(job.CreationTimestamp.IsZero() || now.Sub(job.CreationTimestamp.Time) <= util.MaxMigrationTimeout+progressGraceSlack) {
+				if job.Status.EvictingStartTime != nil && !job.Status.EvictingStartTime.IsZero() {
+					if now.Sub(job.Status.EvictingStartTime.Time) <= budget {
 						continue
+					}
+				} else if job.Annotations != nil {
+					if evictingSinceStr := job.Annotations[AnnotationEvictingSince]; evictingSinceStr != "" {
+						evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
+						if err != nil {
+							evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)
+						}
+						if err == nil && now.Sub(evictingSince) <= budget {
+							continue
+						}
 					}
 				}
 			}

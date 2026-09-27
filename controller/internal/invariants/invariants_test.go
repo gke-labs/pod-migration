@@ -2,6 +2,7 @@ package invariants
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -480,3 +481,62 @@ func TestEngine_ObserveStrictDeduplicationAndForgetObject(t *testing.T) {
 		t.Fatalf("Strict mode: len(vs)=%d, strict=%v; want 1, true", len(vs), strict)
 	}
 }
+
+func TestEvaluateI4_EvictingStartTimeAnchor(t *testing.T) {
+	now := time.Now()
+	evictingStart := metav1.NewTime(now.Add(-2 * time.Minute))
+	job := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              "pmj-evicting-status-anchor",
+			CreationTimestamp: metav1.NewTime(now.Add(-12 * time.Minute)),
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:             pmv1alpha1.PodMigrationJobPhaseEvicting,
+			EvictingStartTime: &evictingStart,
+		},
+	}
+	vs := EvaluateI4(&ReconcileSnapshot{
+		Now:        now,
+		PrimaryPMJ: job,
+	})
+	if len(vs) != 0 {
+		t.Fatalf("expected Status.EvictingStartTime within 10m budget to satisfy I4, got %+v", vs)
+	}
+
+	expiredStart := metav1.NewTime(now.Add(-12 * time.Minute))
+	job.Status.EvictingStartTime = &expiredStart
+	vs = EvaluateI4(&ReconcileSnapshot{
+		Now:        now,
+		PrimaryPMJ: job,
+	})
+	if len(vs) != 1 || vs[0].Reason != "ActivePMJExceededDeadline" {
+		t.Fatalf("expected Status.EvictingStartTime past 10m30s budget to violate I4, got %+v", vs)
+	}
+}
+
+func TestEngine_MaxActiveViolationScopesCap(t *testing.T) {
+	eng := NewEngine(ModeObserve, nil)
+	for i := 0; i < maxActiveViolationScopes+25; i++ {
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      fmt.Sprintf("pmj-cap-%d", i),
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseSucceeded,
+				// Empty SnapshotRef triggers I2
+			},
+		}
+		eng.Evaluate(context.Background(), &ReconcileSnapshot{
+			Reconciler: "PodMigrationJobReconciler",
+			PrimaryPMJ: pmj,
+		})
+	}
+	eng.mu.Lock()
+	defer eng.mu.Unlock()
+	if len(eng.activeViolations) > maxActiveViolationScopes {
+		t.Fatalf("expected activeViolations map size <= %d, got %d", maxActiveViolationScopes, len(eng.activeViolations))
+	}
+}
+
