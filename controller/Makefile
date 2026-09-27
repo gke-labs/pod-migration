@@ -124,6 +124,7 @@ test-t1-invariants: envtest ## Run T1 per-merge envtest fault-injection matrix (
 	KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test -v -race -count=1 ./internal/controller -run TestT1_EnvtestFaultInjectionMatrix
 
 test-pmprofiler: ## Run unit tests for tools/pmprofiler.
+	@test "$$(awk '/^go / {print $$2}' go.mod)" = "$$(awk '/^go / {print $$2}' ../tools/pmprofiler/go.mod)" || { echo "Error: go version mismatch between controller/go.mod and tools/pmprofiler/go.mod" >&2; exit 1; }
 	cd ../tools/pmprofiler && go test -v -race ./...
 
 test-t2-guardrail: test-pmprofiler ## Run T2 guardrail scenario runner offline self-test.

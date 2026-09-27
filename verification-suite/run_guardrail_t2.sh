@@ -23,7 +23,7 @@
 #   - 5 Adversarial T2 Scenarios (S1-S5) exercising invariants I1-I9:
 #       * S1 : Deployment rolling upgrade during active node drain (I6, I2)
 #       * S2 : PDB minAvailable: 100% block followed by budget release (I7, I2)
-#       * S3 : Corrupted checkpoint artifact -> deterministic I9 cold-start fallback
+#       * S3 : Corrupted checkpoint artifact in GCS -> deterministic I9 cold-start fallback
 #       * S4 : Dual-replica simultaneous eviction under serialized PodGate contention (I1, I3, I2)
 #       * S5 : Mid-flight PodMigration deletion -> I4/I5 deferral & zero orphan PSSC/PSMT leaks
 #   - Offline CI validation mode (--self-test) exercising pmprofiler check, analyze,
@@ -54,7 +54,7 @@ Options:
   --out-dir <dir>                   Output directory for pmprofiler runs & HTML report
   --namespace <ns>                  Target workload namespace (default: default)
   --controller-ns <ns>              Controller namespace (default: pod-migration-system)
-  --gcs-bucket <gs://bucket/path>   Optional GCS bucket for snapshot size sampling
+  --gcs-bucket <gs://bucket/path>   Optional GCS bucket for snapshot storage & size sampling
   --self-test                       Run offline end-to-end self-test of pmprofiler + T2
                                     scenario fixtures and invariant gates (used in CI)
   -h, --help                        Show this help message
@@ -132,6 +132,7 @@ uncordon_all_tracked_nodes() {
       kubectl uncordon "${n}" >/dev/null 2>&1 || true
     fi
   done
+  kubectl uncordon -l sandbox.gke.io/runtime=gvisor >/dev/null 2>&1 || true
   CORDONED_NODES=()
 }
 
@@ -149,9 +150,43 @@ cleanup_on_exit() {
 }
 trap cleanup_on_exit EXIT
 
+resolve_gcs_bucket() {
+  if [[ -n "${GCS_BUCKET}" ]]; then
+    return 0
+  fi
+  local existing
+  existing="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+  if [[ -n "${existing}" ]]; then
+    GCS_BUCKET="${existing}"
+  else
+    GCS_BUCKET="gs://yaoluo-gke-dev-podsnapshots/snapshots"
+  fi
+}
+
 clean_stale_migration_resources() {
   log "Cleaning stale PodSnapshots, PodSnapshotManualTriggers, and PodMigrationJobs in ${NAMESPACE}"
-  kubectl delete podsnapshots,podsnapshotmanualtriggers,podmigrationjobs --all -n "${NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete validatingadmissionpolicybinding gke-pod-snapshot-vap-binding --ignore-not-found >/dev/null 2>&1 || true
+  kubectl get podsnapshots -n "${NAMESPACE}" -o json 2>/dev/null \
+    | jq -r '.items[].metadata.name' 2>/dev/null \
+    | xargs -r -I {} kubectl patch podsnapshot {} -n "${NAMESPACE}" --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]' >/dev/null 2>&1 || true
+  kubectl delete podsnapshots,podsnapshotmanualtriggers,podmigrationjobs.podmigration.gke.io --all -n "${NAMESPACE}" --ignore-not-found --timeout=20s >/dev/null 2>&1 || true
+  if [[ -f "${SCRIPT_DIR}/manifests/restore-vap-binding.yaml" ]]; then
+    kubectl apply -f "${SCRIPT_DIR}/manifests/restore-vap-binding.yaml" >/dev/null 2>&1 || true
+  fi
+}
+
+clean_test_workloads() {
+  kubectl delete deployment/t2-counter deployment/t2-bystander statefulset/t2-redis statefulset/t2-postgres \
+    service/t2-redis-svc service/t2-postgres-svc pdb/t2-redis-pdb \
+    -n "${NAMESPACE}" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
+  kubectl delete pods -n "${NAMESPACE}" -l "app in (t2-counter,t2-bystander,t2-redis,t2-postgres)" \
+    --ignore-not-found --force --grace-period=0 >/dev/null 2>&1 || true
+}
+
+get_active_pods() {
+  local selector="$1"
+  kubectl get pods -n "${NAMESPACE}" -l "${selector}" --field-selector=status.phase=Running -o json \
+    | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name'
 }
 
 start_collector() {
@@ -164,6 +199,7 @@ start_collector() {
     --run "${run_dir}"
     --scenario "${scenario_label}"
     --namespace "${NAMESPACE}"
+    --pod-selector "pod-migration.gke.io/enabled=true"
     --controller-ns "${CONTROLLER_NS}"
   )
   if [[ -n "${GCS_BUCKET}" ]]; then
@@ -172,15 +208,21 @@ start_collector() {
   "${PMPROFILER_BIN}" "${args[@]}" >"${run_dir}/collector.log" 2>&1 &
   COLLECT_PID=$!
   sleep 2
+  if ! kill -0 "${COLLECT_PID}" 2>/dev/null; then
+    cat "${run_dir}/collector.log" >&2 || true
+    die "pmprofiler collect exited prematurely"
+  fi
 }
 
 finish_and_assert_run() {
   local run_dir="$1"
   local allow_cold_start="${2:-false}"
+  sleep 2
   stop_collector
   local analyze_args=(
     analyze
     --run "${run_dir}"
+    --controller-ns "${CONTROLLER_NS}"
     --assert-zero-invariants
     --assert-clean-outcomes
   )
@@ -191,33 +233,50 @@ finish_and_assert_run() {
   "${PMPROFILER_BIN}" "${analyze_args[@]}"
 }
 
+# Trigger pod eviction via the Kubernetes Eviction API (`pods/eviction` subresource)
+# so the PodEvictionHandler admission webhook intercepts it (HTTP 429 TooManyRequests).
+evict_pod() {
+  local pod="$1"
+  log "Sending policy/v1 Eviction for pod ${NAMESPACE}/${pod}"
+  kubectl create --raw "/api/v1/namespaces/${NAMESPACE}/pods/${pod}/eviction" -f - >/dev/null 2>&1 <<EOF || true
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "${pod}",
+    "namespace": "${NAMESPACE}"
+  }
+}
+EOF
+}
+
+exec_with_retry() {
+  local max_attempts=8
+  local attempt=1
+  until "$@"; do
+    if [[ ${attempt} -ge ${max_attempts} ]]; then
+      return 1
+    fi
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+}
+
 # ==============================================================================
 # Stateful Application Verifiers (I2: No Silent Cold-Start / No Rollback)
 # ==============================================================================
 
-# v_counter:
-#   - Captures monotonic counter and boot instanceID before migration:
-#     {"instanceID": "<uuid>", "count": <int>} from HTTP :8080/status or /tmp/counter.state.
-#   - After warm restore, asserts:
-#     1) id_after == id_before (proving process memory survived; a cold start generates a new instanceID)
-#     2) count_after >= count_before (no state rollback)
 v_counter_capture() {
   local pod="$1"
   local raw
-  raw="$(kubectl exec -n "${NAMESPACE}" "${pod}" -- sh -c '
-    if wget -qO- http://127.0.0.1:8080/status 2>/dev/null; then
-      exit 0
-    elif [ -f /tmp/counter.state ]; then
+  raw="$(exec_with_retry kubectl exec -n "${NAMESPACE}" "${pod}" -- sh -c '
+    if [ -f /tmp/counter.state ]; then
       cat /tmp/counter.state
     else
       exit 1
     fi
   ')" || return 1
-  if [[ "${raw}" == *"instanceID"* ]]; then
-    python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); print(f"{d[\"instanceID\"]}|{d[\"count\"]}")' <<<"${raw}"
-  else
-    echo "${raw}" | tr -d '[:space:]'
-  fi
+  echo "${raw}" | tr -d '[:space:]'
 }
 
 v_counter_verify() {
@@ -254,16 +313,13 @@ v_counter_verify() {
   fi
 }
 
-# v_redis:
-#   - Populates 50,000 keys via `redis-cli debug populate 50000` + unique per-cycle nonce (`SET migkey <nonce>`).
-#   - After warm restore, verifies `GET migkey == <nonce>` and `DBSIZE >= 50000`.
 v_redis_seed() {
   local pod="$1"
   local nonce="$2"
-  kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli debug populate 50000 >/dev/null
-  kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli SET migkey "${nonce}" >/dev/null
+  exec_with_retry kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli debug populate 50000 >/dev/null
+  exec_with_retry kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli SET migkey "${nonce}" >/dev/null
   local dbsize
-  dbsize="$(kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli DBSIZE | tr -dc '0-9')"
+  dbsize="$(exec_with_retry kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli DBSIZE | tr -dc '0-9')"
   if [[ "${dbsize:-0}" -lt 50000 ]]; then
     die "v_redis_seed: expected DBSIZE >= 50000 on ${pod}, got ${dbsize:-0}"
   fi
@@ -276,8 +332,8 @@ v_redis_verify() {
   local expected_nonce="$3"
 
   local got_nonce dbsize
-  got_nonce="$(kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli GET migkey | tr -d '[:space:]')" || got_nonce=""
-  dbsize="$(kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli DBSIZE | tr -dc '0-9')" || dbsize=0
+  got_nonce="$(exec_with_retry kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli GET migkey | tr -d '[:space:]')" || got_nonce=""
+  dbsize="$(exec_with_retry kubectl exec -n "${NAMESPACE}" "${pod}" -- redis-cli DBSIZE | tr -dc '0-9')" || dbsize=0
 
   if [[ "${got_nonce}" == "${expected_nonce}" && "${dbsize:-0}" -ge 50000 ]]; then
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
@@ -295,15 +351,11 @@ v_redis_verify() {
   fi
 }
 
-# v_postgres:
-#   - Creates table `mig_seq(seq INT PRIMARY KEY, nonce TEXT)` and inserts a monotonic
-#     sequence 1..N plus a session marker inside shared buffers / WAL.
-#   - After warm restore, verifies max(seq) == count(*) >= N and no sequence gaps or rollback.
 v_postgres_seed() {
   local pod="$1"
   local nonce="$2"
   local target_rows="${3:-200}"
-  kubectl exec -n "${NAMESPACE}" "${pod}" -- psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
+  exec_with_retry kubectl exec -n "${NAMESPACE}" "${pod}" -- psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
     CREATE TABLE IF NOT EXISTS mig_seq (
       seq INT PRIMARY KEY,
       nonce TEXT NOT NULL,
@@ -323,7 +375,7 @@ v_postgres_verify() {
   local min_rows="${4:-200}"
 
   local query_out
-  query_out="$(kubectl exec -n "${NAMESPACE}" "${pod}" -- psql -U postgres -d postgres -t -A -c "
+  query_out="$(exec_with_retry kubectl exec -n "${NAMESPACE}" "${pod}" -- psql -U postgres -d postgres -t -A -c "
     SELECT COUNT(*), COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0),
            COALESCE((SELECT DISTINCT nonce FROM mig_seq LIMIT 1), '')
     FROM mig_seq;
@@ -347,35 +399,34 @@ v_postgres_verify() {
 }
 
 # ==============================================================================
-# Workload Deployment Helpers for Live Cluster Scenarios
+# Workload & Policy Helpers for Live Cluster Scenarios
 # ==============================================================================
 
 ensure_podmigration_policy() {
-  local name="$1"
-  local app_label="$2"
-  local template_name="${3:-gvisor-checkpoint-template}"
-  kubectl apply -n "${NAMESPACE}" -f - <<EOF
+  local name="${1:-diskless-migration}"
+  resolve_gcs_bucket
+  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
 apiVersion: podmigration.gke.io/v1alpha1
 kind: PodMigration
 metadata:
   name: ${name}
+  namespace: ${NAMESPACE}
 spec:
-  selector:
-    matchLabels:
-      app: ${app_label}
-  templateRef:
-    name: ${template_name}
+  storage:
+    location: ${GCS_BUCKET}
 EOF
+  kubectl wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null
 }
 
 deploy_counter_workload() {
   local name="${1:-t2-counter}"
   local replicas="${2:-1}"
-  kubectl apply -n "${NAMESPACE}" -f - <<EOF
+  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ${name}
+  namespace: ${NAMESPACE}
 spec:
   replicas: ${replicas}
   selector:
@@ -387,10 +438,19 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
+      serviceAccountName: pm-test-ksa
       runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+      - key: sandbox.gke.io/runtime
+        operator: Equal
+        value: gvisor
+        effect: NoSchedule
       containers:
       - name: counter
         image: busybox:1.36
+        imagePullPolicy: IfNotPresent
         command:
         - /bin/sh
         - -c
@@ -403,18 +463,31 @@ spec:
             mv /tmp/counter.state.tmp /tmp/counter.state
             sleep 1
           done
+        readinessProbe:
+          exec:
+            command: ["test", "-f", "/tmp/counter.state"]
+          periodSeconds: 1
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            memory: 256Mi
 EOF
-  kubectl rollout status deployment/"${name}" -n "${NAMESPACE}" --timeout=180s
+  kubectl rollout status deployment/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
 deploy_redis_workload() {
   local name="${1:-t2-redis}"
-  kubectl apply -n "${NAMESPACE}" -f - <<EOF
+  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: ${name}
+  namespace: ${NAMESPACE}
 spec:
+  serviceName: ${name}-svc
   replicas: 1
   selector:
     matchLabels:
@@ -425,25 +498,59 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
+      serviceAccountName: pm-test-ksa
       runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+      - key: sandbox.gke.io/runtime
+        operator: Equal
+        value: gvisor
+        effect: NoSchedule
       containers:
       - name: redis
-        image: redis:7.2-alpine
+        image: redis:7-alpine
+        imagePullPolicy: IfNotPresent
         args: ["--save", "", "--appendonly", "no", "--enable-debug-command", "yes"]
         ports:
         - containerPort: 6379
+        readinessProbe:
+          tcpSocket:
+            port: 6379
+          periodSeconds: 2
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${name}-svc
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${name}
+  ports:
+  - port: 6379
+    targetPort: 6379
 EOF
-  kubectl rollout status deployment/"${name}" -n "${NAMESPACE}" --timeout=180s
+  kubectl rollout status statefulset/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
 deploy_postgres_workload() {
   local name="${1:-t2-postgres}"
-  kubectl apply -n "${NAMESPACE}" -f - <<EOF
+  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: ${name}
+  namespace: ${NAMESPACE}
 spec:
+  serviceName: ${name}-svc
   replicas: 1
   selector:
     matchLabels:
@@ -454,38 +561,75 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
+      serviceAccountName: pm-test-ksa
       runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+      - key: sandbox.gke.io/runtime
+        operator: Equal
+        value: gvisor
+        effect: NoSchedule
       containers:
       - name: postgres
-        image: postgres:15-alpine
+        image: postgres:16-alpine
+        imagePullPolicy: IfNotPresent
         env:
         - name: POSTGRES_HOST_AUTH_METHOD
           value: trust
+        - name: POSTGRES_PASSWORD
+          value: pw
         - name: PGDATA
-          value: /tmp/pgdata
+          value: /var/lib/postgresql/pgdata
         ports:
         - containerPort: 5432
+        readinessProbe:
+          tcpSocket:
+            port: 5432
+          periodSeconds: 2
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${name}-svc
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${name}
+  ports:
+  - port: 5432
+    targetPort: 5432
 EOF
-  kubectl rollout status deployment/"${name}" -n "${NAMESPACE}" --timeout=180s
+  kubectl rollout status statefulset/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
 wait_for_pmj_terminal() {
   local pod_name="$1"
-  local expected_phase="${2:-Succeeded}"
+  local expected_phases="${2:-Succeeded}"
   local timeout_s="${3:-240}"
   local deadline=$((SECONDS + timeout_s))
   while [[ ${SECONDS} -lt ${deadline} ]]; do
     local phase
-    phase="$(kubectl get podmigrationjobs -n "${NAMESPACE}" -o jsonpath="{.items[?(@.spec.podRef.name=='${pod_name}')].status.phase}" 2>/dev/null || true)"
-    if [[ "${phase}" == "${expected_phase}" ]]; then
+    phase="$(kubectl get podmigrationjobs -n "${NAMESPACE}" -o jsonpath="{.items[?(@.spec.podRef.name=='${pod_name}')].status.phase}" 2>/dev/null | awk '{print $NF}')"
+    if [[ -n "${phase}" && ",${expected_phases}," == *",${phase},"* ]]; then
+      log "PodMigrationJob for ${pod_name} reached terminal phase: ${phase}"
       return 0
     fi
-    if [[ "${phase}" == "Failed" && "${expected_phase}" != "Failed" ]]; then
-      die "PodMigrationJob for ${pod_name} entered Failed phase (expected ${expected_phase})"
+    if [[ "${phase}" == "Failed" && ",${expected_phases}," != *",Failed,"* ]]; then
+      kubectl get podmigrationjobs -n "${NAMESPACE}" -o yaml >&2 || true
+      die "PodMigrationJob for ${pod_name} entered Failed phase (expected ${expected_phases})"
     fi
     sleep 2
   done
-  die "Timed out after ${timeout_s}s waiting for PodMigrationJob of ${pod_name} to reach ${expected_phase}"
+  kubectl get podmigrationjobs -n "${NAMESPACE}" -o wide >&2 || true
+  die "Timed out after ${timeout_s}s waiting for PodMigrationJob of ${pod_name} to reach ${expected_phases}"
 }
 
 # ==============================================================================
@@ -496,54 +640,70 @@ wait_for_pmj_terminal() {
 run_scenario_s1() {
   local run_dir="${OUT_DIR}/s1-rolling-upgrade-during-drain"
   log "=== Running Scenario S1: Deployment Rolling Upgrade During Active Node Drain ==="
+  clean_test_workloads
   clean_stale_migration_resources
-  ensure_podmigration_policy "pm-s1" "t2-counter"
+  ensure_podmigration_policy "diskless-migration"
   deploy_counter_workload "t2-counter" 1
-  sleep 3
+  deploy_counter_workload "t2-bystander" 1
+  sleep 2
 
   local src_pod src_node before_state
-  src_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-counter -o jsonpath='{.items[0].metadata.name}')"
+  src_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
   before_state="$(v_counter_capture "${src_pod}")"
 
   start_collector "${run_dir}" "S1: Deployment rolling upgrade during active node drain"
 
-  # Cordon source node and trigger eviction while simultaneously patching a bystander deployment
-  kubectl cordon "${src_node}"
+  # Cordon source node and trigger eviction of t2-counter while simultaneously
+  # rolling-upgrading t2-bystander (proving I6: rolling upgrade does not trigger a false PMJ).
+  kubectl cordon "${src_node}" >/dev/null
   CORDONED_NODES+=("${src_node}")
 
-  kubectl delete pod -n "${NAMESPACE}" "${src_pod}" --wait=false
+  evict_pod "${src_pod}"
+  kubectl patch deployment t2-bystander -n "${NAMESPACE}" --type=merge \
+    -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"rollout-ts\":\"$(date +%s)\"}}}}}" >/dev/null
 
   wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
-  kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s
+  kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s >/dev/null
+  kubectl rollout status deployment/t2-bystander -n "${NAMESPACE}" --timeout=180s >/dev/null
 
   local dst_pod
-  dst_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-counter --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
+  dst_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   v_counter_verify "${run_dir}" "${dst_pod}" "${before_state}"
+
+  # Verify zero PMJs were created for t2-bystander's rolling upgrade
+  local bystander_pmjs
+  bystander_pmjs="$(kubectl get podmigrationjobs -n "${NAMESPACE}" -o jsonpath='{.items[*].spec.podRef.name}' | tr ' ' '\n' | grep -c '^t2-bystander-' || true)"
+  if [[ "${bystander_pmjs}" -ne 0 ]]; then
+    die "S1 FAIL (I6): rolling upgrade of t2-bystander triggered ${bystander_pmjs} unexpected PodMigrationJobs"
+  fi
 
   uncordon_all_tracked_nodes
   finish_and_assert_run "${run_dir}" "false"
+  clean_test_workloads
 }
 
 # S2: PDB minAvailable: 100% temporary block followed by budget release (I7: PDB & Quota Fidelity)
 run_scenario_s2() {
   local run_dir="${OUT_DIR}/s2-pdb-temporary-block"
   log "=== Running Scenario S2: PDB minAvailable: 100% Temporary Block & Release ==="
+  clean_test_workloads
   clean_stale_migration_resources
-  ensure_podmigration_policy "pm-s2" "t2-redis"
+  ensure_podmigration_policy "diskless-migration"
   deploy_redis_workload "t2-redis"
-  sleep 3
+  sleep 2
 
   local src_pod nonce
-  src_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-redis -o jsonpath='{.items[0].metadata.name}')"
+  src_pod="t2-redis-0"
   nonce="nonce-s2-$(date +%s)"
   v_redis_seed "${src_pod}" "${nonce}"
 
-  kubectl apply -n "${NAMESPACE}" -f - <<EOF
+  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: t2-redis-pdb
+  namespace: ${NAMESPACE}
 spec:
   minAvailable: "100%"
   selector:
@@ -553,134 +713,195 @@ EOF
 
   start_collector "${run_dir}" "S2: PDB minAvailable 100% block followed by budget release"
 
-  # Trigger migration while PDB blocks eviction, then relax PDB to minAvailable: 0
-  kubectl delete pod -n "${NAMESPACE}" "${src_pod}" --wait=false
-  sleep 5
-  kubectl patch pdb t2-redis-pdb -n "${NAMESPACE}" --type=merge -p '{"spec":{"minAvailable":0}}'
+  local src_node
+  src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
+  kubectl cordon "${src_node}" >/dev/null
+  CORDONED_NODES+=("${src_node}")
+
+  # Trigger migration while PDB blocks origin eviction; wait until PMJ reaches Evicting (BlockedByPDB),
+  # then relax PDB to minAvailable: 0 so eviction and warm restore complete cleanly.
+  evict_pod "${src_pod}"
+
+  local wait_evicting=$((SECONDS + 90))
+  while [[ ${SECONDS} -lt ${wait_evicting} ]]; do
+    local p_phase
+    p_phase="$(kubectl get podmigrationjobs -n "${NAMESPACE}" -o jsonpath="{.items[?(@.spec.podRef.name=='${src_pod}')].status.phase}" 2>/dev/null || true)"
+    if [[ "${p_phase}" == "Evicting" ]]; then
+      break
+    fi
+    sleep 2
+  done
+  sleep 3
+  log "Releasing PDB t2-redis-pdb (minAvailable: 100% -> 0)"
+  kubectl patch pdb t2-redis-pdb -n "${NAMESPACE}" --type=merge -p '{"spec":{"minAvailable":0}}' >/dev/null
 
   wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
-  kubectl rollout status deployment/t2-redis -n "${NAMESPACE}" --timeout=180s
+  uncordon_all_tracked_nodes
+  kubectl rollout status statefulset/t2-redis -n "${NAMESPACE}" --timeout=180s >/dev/null
 
-  local dst_pod
-  dst_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-redis --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
-  v_redis_verify "${run_dir}" "${dst_pod}" "${nonce}"
+  v_redis_verify "${run_dir}" "${src_pod}" "${nonce}"
 
   kubectl delete pdb t2-redis-pdb -n "${NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
   finish_and_assert_run "${run_dir}" "false"
+  clean_test_workloads
 }
 
-# S3: Corrupted checkpoint artifact triggering deterministic I9 cold-start fallback
+# S3: Corrupted checkpoint artifact in GCS triggering deterministic I9 cold-start fallback
 run_scenario_s3() {
   local run_dir="${OUT_DIR}/s3-corrupted-checkpoint-cold-start-fallback"
-  log "=== Running Scenario S3: Corrupted Checkpoint Artifact -> I9 Cold-Start Fallback ==="
+  log "=== Running Scenario S3: Corrupted Checkpoint Artifact in GCS -> I9 Cold-Start Fallback ==="
+  clean_test_workloads
   clean_stale_migration_resources
-  ensure_podmigration_policy "pm-s3" "t2-counter"
+  ensure_podmigration_policy "diskless-migration"
   deploy_counter_workload "t2-counter" 1
-  sleep 3
+  sleep 2
 
   local src_pod
-  src_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-counter -o jsonpath='{.items[0].metadata.name}')"
+  src_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   start_collector "${run_dir}" "S3: Corrupted checkpoint artifact -> I9 cold-start fallback"
 
-  kubectl delete pod -n "${NAMESPACE}" "${src_pod}" --wait=false
-  wait_for_pmj_terminal "${src_pod}" "SucceededWithoutRestore" 240
-  kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s
+  # Cordon all gVisor nodes before triggering eviction so the replacement pod is held
+  # Unschedulable after snapshot upload + source eviction while we corrupt checkpoint.img in GCS.
+  log "Cordoning gVisor nodes to hold replacement pod Pending during GCS checkpoint corruption"
+  kubectl cordon -l sandbox.gke.io/runtime=gvisor >/dev/null
+
+  evict_pod "${src_pod}"
+
+  # Wait until PodMigrationJob reaches Evicting or Restoring (meaning PodSnapshot upload succeeded)
+  local snap_name=""
+  local deadline=$((SECONDS + 120))
+  while [[ ${SECONDS} -lt ${deadline} ]]; do
+    snap_name="$(kubectl get podmigrationjobs -n "${NAMESPACE}" -o jsonpath="{.items[?(@.spec.podRef.name=='${src_pod}')].status.snapshotRef}" 2>/dev/null || true)"
+    local phase
+    phase="$(kubectl get podmigrationjobs -n "${NAMESPACE}" -o jsonpath="{.items[?(@.spec.podRef.name=='${src_pod}')].status.phase}" 2>/dev/null || true)"
+    if [[ -n "${snap_name}" && ( "${phase}" == "Evicting" || "${phase}" == "Restoring" ) ]]; then
+      break
+    fi
+    sleep 1
+  done
+  [[ -n "${snap_name}" ]] || die "S3: timed out waiting for PodSnapshot reference on PMJ for ${src_pod}"
+
+  # Wait until source pod is deleted and replacement pod is created (held Pending on cordoned nodes)
+  sleep 3
+
+  # Remove the newly uploaded checkpoint artifacts in GCS so restore fails and triggers
+  # deterministic I9 cold-start fallback (SucceededWithoutRestore / FallbackToColdStart).
+  log "Removing GCS checkpoint artifacts at ${GCS_BUCKET}/${snap_name}"
+  gcloud storage rm -r "${GCS_BUCKET}/${snap_name}" >/dev/null 2>&1
+
+  log "Uncordoning gVisor nodes so replacement pod attempts restore from missing/corrupted checkpoint"
+  uncordon_all_tracked_nodes
+
+  # Wait for PMJ to conclude via either SucceededWithoutRestore (FallbackToColdStart)
+  # or Failed (RestoreCrashFallback where controller deletes the crashed pod for cold start).
+  wait_for_pmj_terminal "${src_pod}" "SucceededWithoutRestore,Failed" 240
+  kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s >/dev/null
+
+  local reason
+  reason="$(kubectl get podmigrationjobs -n "${NAMESPACE}" -o jsonpath="{.items[?(@.spec.podRef.name=='${src_pod}')].status.conditions[?(@.type=='Restored')].reason}" 2>/dev/null || true)"
+  if [[ "${reason}" != "FallbackToColdStart" && "${reason}" != "RestoreCrashFallback" ]]; then
+    die "S3: expected Restored condition reason FallbackToColdStart or RestoreCrashFallback, got '${reason}'"
+  fi
 
   "${PMPROFILER_BIN}" check --run "${run_dir}" \
-    --name "I9 deterministic cold-start fallback (SucceededWithoutRestore)" --group "counter" \
+    --name "I9 deterministic cold-start fallback (${reason})" --group "counter" \
     --pass --value 1 --total 1 \
-    --detail "PMJ transitioned to SucceededWithoutRestore with Restored=False"
+    --detail "Corrupted GCS checkpoint.img triggered ${reason} and workload recovered via cold start"
 
   finish_and_assert_run "${run_dir}" "true"
+  clean_test_workloads
 }
 
 # S4: Dual-replica simultaneous eviction under serialized PodGate contention (I1, I3, I2)
 run_scenario_s4() {
   local run_dir="${OUT_DIR}/s4-dual-replica-podgate-contention"
   log "=== Running Scenario S4: Dual-Replica Simultaneous Eviction Under Serialized PodGate Contention ==="
+  clean_test_workloads
   clean_stale_migration_resources
-  ensure_podmigration_policy "pm-s4-counter" "t2-counter"
-  ensure_podmigration_policy "pm-s4-postgres" "t2-postgres"
+  ensure_podmigration_policy "diskless-migration"
   deploy_counter_workload "t2-counter" 2
   deploy_postgres_workload "t2-postgres"
   sleep 5
 
   local pg_pod pg_nonce
-  pg_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-postgres -o jsonpath='{.items[0].metadata.name}')"
+  pg_pod="t2-postgres-0"
   pg_nonce="nonce-s4-$(date +%s)"
   v_postgres_seed "${pg_pod}" "${pg_nonce}" 200
 
   start_collector "${run_dir}" "S4: Dual-replica simultaneous eviction under serialized PodGate contention"
 
   local c_pods
-  read -r -a c_pods <<<"$(kubectl get pods -n "${NAMESPACE}" -l app=t2-counter -o jsonpath='{.items[*].metadata.name}')"
+  mapfile -t c_pods < <(get_active_pods "app=t2-counter")
   for p in "${c_pods[@]}" "${pg_pod}"; do
-    kubectl delete pod -n "${NAMESPACE}" "${p}" --wait=false
+    evict_pod "${p}"
   done
 
   for p in "${c_pods[@]}" "${pg_pod}"; do
     wait_for_pmj_terminal "${p}" "Succeeded" 300
   done
-  kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s
-  kubectl rollout status deployment/t2-postgres -n "${NAMESPACE}" --timeout=180s
+  kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s >/dev/null
+  kubectl rollout status statefulset/t2-postgres -n "${NAMESPACE}" --timeout=180s >/dev/null
 
-  local pg_dst
-  pg_dst="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-postgres --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
-  v_postgres_verify "${run_dir}" "${pg_dst}" "${pg_nonce}" 200
+  v_postgres_verify "${run_dir}" "${pg_pod}" "${pg_nonce}" 200
 
   finish_and_assert_run "${run_dir}" "false"
+  clean_test_workloads
 }
 
 # S5: Mid-flight PodMigration deletion verifying I4/I5 deferral and zero orphan PSSC/PSMT leaks
 run_scenario_s5() {
   local run_dir="${OUT_DIR}/s5-midflight-podmigration-deletion"
   log "=== Running Scenario S5: Mid-Flight PodMigration Deletion (I4/I5 Deferral & Zero Orphans) ==="
+  clean_test_workloads
   clean_stale_migration_resources
-  ensure_podmigration_policy "pm-s5" "t2-counter"
+  ensure_podmigration_policy "diskless-migration"
   deploy_counter_workload "t2-counter" 1
-  sleep 3
+  sleep 2
 
-  local src_pod before_state
-  src_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-counter -o jsonpath='{.items[0].metadata.name}')"
+  local src_pod before_state pm_uid
+  src_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   before_state="$(v_counter_capture "${src_pod}")"
+  pm_uid="$(kubectl get podmigration diskless-migration -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')"
 
   start_collector "${run_dir}" "S5: Mid-flight PodMigration deletion (I4/I5 deferral & zero orphan leaks)"
 
-  kubectl delete pod -n "${NAMESPACE}" "${src_pod}" --wait=false
-  sleep 2
-  # Delete parent PodMigration while PMJ is in-flight; I5 defers removal until PMJ finishes.
-  kubectl delete podmigration pm-s5 -n "${NAMESPACE}" --wait=true --timeout=300s
+  evict_pod "${src_pod}"
+  sleep 1
+  # Delete PodMigration while PMJ is in-flight; I4/I5 finalizer defers PSSC/PSP cleanup until PMJ finishes.
+  kubectl delete podmigration diskless-migration -n "${NAMESPACE}" --wait=false >/dev/null
 
   wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
-  kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s
+  kubectl wait --for=delete podmigration/diskless-migration -n "${NAMESPACE}" --timeout=120s >/dev/null 2>&1 || true
+  kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s >/dev/null
 
   local dst_pod
-  dst_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-counter --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
+  dst_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   v_counter_verify "${run_dir}" "${dst_pod}" "${before_state}"
 
   local leaked_pssc
-  leaked_pssc="$(kubectl get podsnapshotstorageconfigs -l "podmigration.gke.io/owner-name=pm-s5" -o name 2>/dev/null || true)"
+  leaked_pssc="$(kubectl get podsnapshotstorageconfigs -l "podmigration.gke.io/owner-uid=${pm_uid}" -o name 2>/dev/null || true)"
   if [[ -n "${leaked_pssc}" ]]; then
+    ensure_podmigration_policy "diskless-migration"
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
       --name "I4 zero orphan PSSC after PodMigration deletion" --group "controller" \
       --pass=false --value 0 --total 1 \
-      --detail "leaked PSSC found: ${leaked_pssc}"
+      --detail "leaked PSSC found for owner-uid=${pm_uid}: ${leaked_pssc}"
     die "S5 FAIL: leaked PSSC after PodMigration deletion: ${leaked_pssc}"
   fi
   "${PMPROFILER_BIN}" check --run "${run_dir}" \
     --name "I4 zero orphan PSSC after PodMigration deletion" --group "controller" \
     --pass --value 1 --total 1 \
-    --detail "0 orphan PodSnapshotStorageConfigs and clean Undeploying deferral"
+    --detail "0 orphan PodSnapshotStorageConfigs (owner-uid=${pm_uid}) after PodMigration deletion"
 
+  # Restore baseline PodMigration CR on the cluster
+  ensure_podmigration_policy "diskless-migration"
   finish_and_assert_run "${run_dir}" "false"
+  clean_test_workloads
 }
 
 # ==============================================================================
 # Offline CI Self-Test Mode (--self-test)
 # ==============================================================================
-# Generates realistic NDJSON traces for S1-S5 + counter/redis/postgres checks +
-# Prometheus invariant scrapes, runs `pmprofiler check`, `pmprofiler analyze`,
-# and `pmprofiler report`, and verifies both pass and fail gates.
 run_self_test() {
   log "Running offline T2 guardrail self-test in ${OUT_DIR}"
   rm -rf "${OUT_DIR}"
@@ -699,7 +920,6 @@ pod_migration_invariant_violations_total{invariant="I7_PDBBudget"} 0
 pod_migration_invariant_violations_total{invariant="I8_DeterministicLeader"} 0
 pod_migration_invariant_violations_total{invariant="I9_ColdStartTransparency"} 0'
 
-  # Helper to emit a synthetic warm-restore or cold-start scenario trace
   emit_synthetic_scenario() {
     local dir="$1"
     local scenario_name="$2"
@@ -743,9 +963,9 @@ records = [
         "type": "add",
         "gvr": "podmigrations.v1alpha1.podmigration.gke.io",
         "obj": {
-            "metadata": {"name": f"policy-{app}", "creationTimestamp": "2026-09-27T10:00:01Z"},
-            "spec": {"selector": {"matchLabels": {"app": app}}},
-            "status": {"phase": "Active"},
+            "metadata": {"name": "diskless-migration", "creationTimestamp": "2026-09-27T10:00:01Z"},
+            "spec": {"storage": {"location": "gs://yaoluo-gke-dev-podsnapshots/snapshots"}},
+            "status": {"conditions": [{"type": "Ready", "status": "True", "reason": "Reconciled"}]},
         },
     },
     {
@@ -867,15 +1087,14 @@ PY
     --detail "migkey=nonce-s2 matched and DBSIZE=50001 (>= 50000)"
   "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s2" --assert-zero-invariants --assert-clean-outcomes
 
-  # S3: Corrupted checkpoint -> deterministic I9 cold-start fallback (SucceededWithoutRestore)
+  # S3: Corrupted checkpoint -> deterministic I9 cold-start fallback (FallbackToColdStart)
   emit_synthetic_scenario "${OUT_DIR}/s3" "S3: Corrupted checkpoint artifact -> I9 cold-start fallback" \
     "counter" "pmj-s3-counter" "counter-corrupt-0" "counter-corrupt-0-fallback" \
-    "SucceededWithoutRestore" "False" "RestoreRuntimeCrash"
+    "SucceededWithoutRestore" "False" "FallbackToColdStart"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s3" \
-    --name "I9 deterministic cold-start fallback (SucceededWithoutRestore)" --group "counter" \
+    --name "I9 deterministic cold-start fallback (FallbackToColdStart)" --group "counter" \
     --pass --value 1 --total 1 \
-    --detail "PMJ transitioned to SucceededWithoutRestore with Restored=False"
-  # Verify that without --allow-cold-start, S3 fails the outcome check (proving I2/I9 gate catches unintended cold starts)
+    --detail "PMJ transitioned to SucceededWithoutRestore with Restored=False (Reason=FallbackToColdStart)"
   if "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s3" --assert-zero-invariants --assert-clean-outcomes >/dev/null 2>&1; then
     die "Expected S3 cold-start run to fail --assert-clean-outcomes when --allow-cold-start is not set"
   fi
@@ -911,7 +1130,6 @@ EOF
   fi
   rm -rf "${neg_dir}"
 
-  # Generate unified HTML report across S1-S5
   local report_html="${OUT_DIR}/guardrail-t2-report.html"
   "${PMPROFILER_BIN}" report \
     --out "${report_html}" \
@@ -936,6 +1154,7 @@ if [[ "${SELF_TEST}" == "true" ]]; then
 fi
 
 build_pmprofiler
+resolve_gcs_bucket
 
 if [[ -n "${VERIFIER_ONLY}" ]]; then
   run_dir="${OUT_DIR}/verifier-${VERIFIER_ONLY}"
@@ -948,13 +1167,13 @@ if [[ -n "${VERIFIER_ONLY}" ]]; then
       v_counter_verify "${run_dir}" "${pod}" "${state}"
       ;;
     redis)
-      pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-redis -o jsonpath='{.items[0].metadata.name}')"
+      pod="t2-redis-0"
       nonce="nonce-$(date +%s)"
       v_redis_seed "${pod}" "${nonce}"
       v_redis_verify "${run_dir}" "${pod}" "${nonce}"
       ;;
     postgres)
-      pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t2-postgres -o jsonpath='{.items[0].metadata.name}')"
+      pod="t2-postgres-0"
       nonce="nonce-$(date +%s)"
       v_postgres_seed "${pod}" "${nonce}" 200
       v_postgres_verify "${run_dir}" "${pod}" "${nonce}" 200

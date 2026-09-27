@@ -428,8 +428,10 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 		for _, i := range ordered {
 			if i.uid == j.targetUID {
 				src = i
-			} else if src != nil && inWindow(i.created) && dst == nil {
-				dst = i
+			} else if src != nil && inWindow(i.created) {
+				if dst == nil || (dst.readyLTT.IsZero() && !i.readyLTT.IsZero()) {
+					dst = i
+				}
 			}
 		}
 		if src == nil { // fall back: last incarnation created before the PMJ
@@ -485,6 +487,17 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 					if dst == nil || i.created.Before(dst.created) {
 						dst = i
 					}
+				}
+			}
+		}
+	}
+	// If #41 RestoreCrashFallback deleted a crashed Deployment pod (readyLTT is zero),
+	// prefer a subsequent Ready pod of the same app created after the crashed pod.
+	if dst != nil && dst.readyLTT.IsZero() && j.restoredCondReason == "RestoreCrashFallback" && src != nil && src.app != "" {
+		for _, incs := range pods {
+			for _, i := range incs {
+				if i.app == src.app && i.uid != src.uid && i.uid != dst.uid && i.created.After(dst.created) && inWindow(i.created) && !i.readyLTT.IsZero() {
+					dst = i
 				}
 			}
 		}
@@ -573,7 +586,7 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 			m.Restored = false
 			reason := j.restoredCondReason
 			if reason == "" {
-				reason = "SucceededWithoutRestore"
+				reason = "FallbackToColdStart"
 			}
 			m.RestoreSignal = "pmj:" + reason
 		} else {
@@ -631,7 +644,11 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 			m.Outcome = OutcomeColdStart
 		}
 	case "Failed":
-		m.Outcome = OutcomeFailed
+		if (j.restoredCondReason == "RestoreCrashFallback" || j.restoredCondReason == "FallbackToColdStart") && dst != nil {
+			m.Outcome = OutcomeColdStart
+		} else {
+			m.Outcome = OutcomeFailed
+		}
 	default:
 		// Wedge = no phase progress within the threshold. A long-running
 		// PMJ that is still transitioning is in-flight, not wedged.

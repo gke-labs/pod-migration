@@ -523,7 +523,7 @@ func TestGKEPodMigrationJobNativeFields(t *testing.T) {
 	}
 	rec(t, f, 15*time.Second, "add", pmjGVR, pmjWarm)
 
-	// 2. Cold-start fallback (I9) via SucceededWithoutRestore
+	// 2. Cold-start fallback (I9) via SucceededWithoutRestore (FallbackToColdStart)
 	rec(t, f, -time.Minute, "list", podGVR, podObj("redis-0", "uid-red-src", -time.Minute, nil))
 	rec(t, f, 20*time.Second, "add", podGVR, podObj("redis-0-fallback", "uid-red-dst", 20*time.Second, func(o map[string]any) {
 		o["spec"] = map[string]any{"nodeName": "node-b"}
@@ -538,18 +538,42 @@ func TestGKEPodMigrationJobNativeFields(t *testing.T) {
 		map[string]any{
 			"type":   "Restored",
 			"status": "False",
-			"reason": "RestoreRuntimeCrash",
+			"reason": "FallbackToColdStart",
 		},
 	}
 	rec(t, f, 26*time.Second, "add", pmjGVR, pmjCold)
+
+	// 3. Cold-start fallback (#41 concludeRestoreCrash) via Failed + RestoreCrashFallback
+	// where the first replacement pod crashes and is replaced by a cold-started pod.
+	rec(t, f, -time.Minute, "list", podGVR, podObj("pg-0", "uid-pg-src", -time.Minute, nil))
+	rec(t, f, 30*time.Second, "add", podGVR, podObj("pg-0", "uid-pg-crashed", 30*time.Second, func(o map[string]any) {
+		o["spec"] = map[string]any{"nodeName": "node-b"}
+	}))
+	rec(t, f, 35*time.Second, "add", podGVR, podObj("pg-0", "uid-pg-cold", 35*time.Second, func(o map[string]any) {
+		o["spec"] = map[string]any{"nodeName": "node-b"}
+		o["status"] = map[string]any{"conditions": []any{
+			map[string]any{"type": "Ready", "status": "True", "lastTransitionTime": ts(40 * time.Second)},
+		}}
+	}))
+	pmjCrashFallback := pmjObj("pmj-pg-0", "pg-0", "uid-pg-src", "Failed", "snap-pg-0")
+	pmjCrashFallback["status"].(map[string]any)["restoredPodName"] = "pg-0"
+	pmjCrashFallback["status"].(map[string]any)["restoredPodUID"] = "uid-pg-crashed"
+	pmjCrashFallback["status"].(map[string]any)["conditions"] = []any{
+		map[string]any{
+			"type":   "Restored",
+			"status": "False",
+			"reason": "RestoreCrashFallback",
+		},
+	}
+	rec(t, f, 33*time.Second, "add", pmjGVR, pmjCrashFallback)
 	f.Close()
 
 	run, err := Analyze(Options{RunDir: dir, WedgeThreshold: 10 * time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(run.Migrations) != 2 {
-		t.Fatalf("want 2 migrations (parent PodMigration policy CR ignored), got %d: %+v", len(run.Migrations), run.Migrations)
+	if len(run.Migrations) != 3 {
+		t.Fatalf("want 3 migrations (parent PodMigration policy CR ignored), got %d: %+v", len(run.Migrations), run.Migrations)
 	}
 
 	byPMJ := map[string]Migration{}
@@ -575,8 +599,19 @@ func TestGKEPodMigrationJobNativeFields(t *testing.T) {
 	if cold.Outcome != OutcomeColdStart {
 		t.Errorf("redis-0 outcome = %q, want %q", cold.Outcome, OutcomeColdStart)
 	}
-	if cold.RestoreSignal != "pmj:RestoreRuntimeCrash" {
-		t.Errorf("redis-0 restoreSignal = %q, want pmj:RestoreRuntimeCrash", cold.RestoreSignal)
+	if cold.RestoreSignal != "pmj:FallbackToColdStart" {
+		t.Errorf("redis-0 restoreSignal = %q, want pmj:FallbackToColdStart", cold.RestoreSignal)
+	}
+
+	crashCold := byPMJ["pmj-pg-0"]
+	if crashCold.Outcome != OutcomeColdStart {
+		t.Errorf("pg-0 outcome = %q, want %q", crashCold.Outcome, OutcomeColdStart)
+	}
+	if crashCold.RestoreSignal != "pmj:RestoreCrashFallback" {
+		t.Errorf("pg-0 restoreSignal = %q, want pmj:RestoreCrashFallback", crashCold.RestoreSignal)
+	}
+	if crashCold.E2ES != 40 {
+		t.Errorf("pg-0 e2eS = %v, want 40 (from cold-started Ready pod)", crashCold.E2ES)
 	}
 
 	// VerifyOutcomes should fail when allowColdStart=false, and pass when allowColdStart=true.

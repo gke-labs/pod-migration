@@ -33,6 +33,7 @@ type Options struct {
 	RunDir       string
 	Kubeconfig   string
 	Context      string
+	Namespace    string // optional workload namespace filter ("" = all namespaces)
 	PodSelector  string // label selector for workload pods
 	ControllerNS string // namespace of the pod-migration controller
 	GCSBucket    string // optional gs:// URL for snapshot-size sampling
@@ -83,7 +84,7 @@ func Run(ctx context.Context, o Options) error {
 	}
 
 	targets := []watchTarget{
-		{gvr: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}, selector: o.PodSelector},
+		{gvr: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}, selector: o.PodSelector, ns: o.Namespace},
 		{gvr: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}, ns: o.ControllerNS},
 		{gvr: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "events"}},
 		{gvr: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}},
@@ -288,6 +289,7 @@ func prune(u *unstructured.Unstructured) {
 func writeMeta(ctx context.Context, o Options, cs *kubernetes.Clientset, disc discovery.DiscoveryInterface) error {
 	meta := map[string]any{
 		"scenario":  o.Scenario,
+		"namespace": o.Namespace,
 		"startedAt": time.Now().UTC().Format(time.RFC3339),
 		"gcsBucket": o.GCSBucket,
 	}

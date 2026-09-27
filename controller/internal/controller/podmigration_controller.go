@@ -343,22 +343,30 @@ func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, nam
 }
 
 func isPMJOwnedByPodMigration(pmj *pmv1alpha1.PodMigrationJob, config *pmv1alpha1.PodMigration) bool {
+	hasExplicitOwner := false
 	for _, ref := range pmj.OwnerReferences {
 		if ref.Kind == "PodMigration" {
+			hasExplicitOwner = true
 			if (ref.UID != "" && ref.UID == config.UID) || ref.Name == config.Name {
 				return true
 			}
 		}
 	}
 	if pmj.Labels != nil {
-		if name, ok := pmj.Labels["pod-migration.gke.io/podmigration-name"]; ok && name == config.Name {
-			return true
+		if name, ok := pmj.Labels["pod-migration.gke.io/podmigration-name"]; ok && name != "" {
+			hasExplicitOwner = true
+			if name == config.Name {
+				return true
+			}
 		}
-		if uid, ok := pmj.Labels[OwnerUIDLabelKey]; ok && string(config.UID) != "" && uid == string(config.UID) {
-			return true
+		if uid, ok := pmj.Labels[OwnerUIDLabelKey]; ok && uid != "" {
+			hasExplicitOwner = true
+			if string(config.UID) != "" && uid == string(config.UID) {
+				return true
+			}
 		}
 	}
-	return false
+	return !hasExplicitOwner
 }
 
 func (r *PodMigrationReconciler) syncResource(ctx context.Context, obj *unstructured.Unstructured) error {

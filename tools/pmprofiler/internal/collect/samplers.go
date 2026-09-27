@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -105,20 +106,33 @@ func streamControllerLogs(ctx context.Context, cs *kubernetes.Clientset, runDir,
 	if ns == "" {
 		return
 	}
+	var mu sync.Mutex
 	active := map[string]context.CancelFunc{}
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
+	defer func() {
+		mu.Lock()
+		for _, cancel := range active {
+			cancel()
+		}
+		mu.Unlock()
+	}()
 	for {
 		pods, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 		if err == nil {
 			seen := map[string]bool{}
+			mu.Lock()
 			for _, p := range pods.Items {
 				seen[p.Name] = true
 				if _, ok := active[p.Name]; !ok && p.Status.Phase == "Running" {
 					sctx, cancel := context.WithCancel(ctx)
 					active[p.Name] = cancel
 					go func(pod string) {
-						defer func() { delete(active, pod) }()
+						defer func() {
+							mu.Lock()
+							delete(active, pod)
+							mu.Unlock()
+						}()
 						streamOnePodLog(sctx, cs, runDir, ns, pod)
 					}(p.Name)
 				}
@@ -129,6 +143,7 @@ func streamControllerLogs(ctx context.Context, cs *kubernetes.Clientset, runDir,
 					delete(active, name)
 				}
 			}
+			mu.Unlock()
 		}
 		select {
 		case <-ctx.Done():
