@@ -115,6 +115,14 @@ test: generate fmt vet manifests envtest ## Run unit + envtest suite.
 	fi; \
 	KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test ./... -coverprofile cover.out
 
+test-t1-invariants: envtest ## Run T1 per-merge envtest fault-injection matrix (I1-I9) under strict mode.
+	@KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path || $(SETUP_ENVTEST) use -p path)"; \
+	if [ -z "$$KUBEBUILDER_ASSETS" ]; then \
+		echo "Error: setup-envtest failed to locate Kubernetes assets for version $(ENVTEST_K8S_VERSION)." >&2; \
+		exit 1; \
+	fi; \
+	KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test -v -race -count=1 ./internal/controller -run TestT1_EnvtestFaultInjectionMatrix
+
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.
 	kubectl apply -f config/crd/bases/
 	kubectl wait --for=condition=established --timeout=60s crd/podmigrations.podmigration.gke.io crd/podmigrationjobs.podmigration.gke.io

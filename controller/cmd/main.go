@@ -92,7 +92,7 @@ func main() {
 	flag.IntVar(&clientGoBurst, "client-go-burst", 1000, "Burst for client-go REST config")
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
 	flag.DurationVar(&migrationTimeout, "migration-timeout", util.DefaultMigrationTimeout, "Default timeout for active migrations (Pending, Snapshotting, Evicting)")
-	flag.StringVar(&invariantModeRaw, "invariant-mode", string(invariants.ModeDisabled), "Correctness invariant evaluation mode: disabled (default), observe, or strict (CI gate)")
+	flag.StringVar(&invariantModeRaw, "invariant-mode", string(invariants.ModeDisabled), "Correctness invariant evaluation mode: disabled (default), observe, or strict (CI gate). Enabling observe/strict adds one informer namespace List of Pods and PMJs per PodMigrationJob reconcile.")
 	flag.Int64Var(&spotPreemptionBudget, "spot-preemption-node-budget", util.DefaultSpotPreemptionNodeBudget, "Total memory request budget in bytes per node for spot preemption migrations (default 15GiB)")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}

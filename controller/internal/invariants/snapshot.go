@@ -86,6 +86,6 @@ type funcRule struct {
 	fn   func(s *ReconcileSnapshot) []Violation
 }
 
-func (r funcRule) ID() string                             { return r.id }
-func (r funcRule) Name() string                           { return r.name }
+func (r funcRule) ID() string                                { return r.id }
+func (r funcRule) Name() string                              { return r.name }
 func (r funcRule) Evaluate(s *ReconcileSnapshot) []Violation { return r.fn(s) }
