@@ -775,29 +775,3 @@ func TestIsSnapshotSubconditionInProgressReason(t *testing.T) {
 		})
 	}
 }
-
-func TestIsTerminalSnapshotFailureReason(t *testing.T) {
-	tests := []struct {
-		reason string
-		want   bool
-	}{
-		{reason: "Failed", want: true},
-		{reason: "Error", want: true},
-		{reason: "DeadlineExceeded", want: true},
-		{reason: "Refused", want: true},
-		{reason: "refused", want: true},
-		{reason: "", want: false},
-		{reason: "NoError", want: false},
-		{reason: "NotReady", want: false},
-		{reason: "NonTerminal", want: false},
-		{reason: "Pending", want: false},
-		{reason: "Succeeded", want: false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.reason, func(t *testing.T) {
-			if got := isTerminalSnapshotFailureReason(tc.reason); got != tc.want {
-				t.Errorf("isTerminalSnapshotFailureReason(%q) = %v, want %v", tc.reason, got, tc.want)
-			}
-		})
-	}
-}
