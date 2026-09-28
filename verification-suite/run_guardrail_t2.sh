@@ -41,6 +41,11 @@ OUT_DIR="${OUT_DIR:-/tmp/pmprofiler-t2-runs}"
 NAMESPACE="${NAMESPACE:-default}"
 CONTROLLER_NS="${CONTROLLER_NS:-pod-migration-system}"
 GCS_BUCKET="${GCS_BUCKET:-}"
+RUNTIME_CLASS="${RUNTIME_CLASS:-gvisor}"
+NODE_SELECTOR="${NODE_SELECTOR:-sandbox.gke.io/runtime=gvisor}"
+TOLERATION="${TOLERATION:-sandbox.gke.io/runtime=gvisor:NoSchedule}"
+SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-pm-test-ksa}"
+SKIP_PODMIGRATION_CREATE="${SKIP_PODMIGRATION_CREATE:-false}"
 SELF_TEST="false"
 
 usage() {
@@ -55,6 +60,11 @@ Options:
   --namespace <ns>                  Target workload namespace (default: default)
   --controller-ns <ns>              Controller namespace (default: pod-migration-system)
   --gcs-bucket <gs://bucket/path>   Optional GCS bucket for snapshot storage & size sampling
+  --runtime-class <name|none>       Pod runtimeClassName (default: gvisor; 'none' or '' omits it)
+  --node-selector <k=v|none>        Pod nodeSelector key=value (default: sandbox.gke.io/runtime=gvisor; 'none' or '' omits it)
+  --toleration <k=v:effect|none>    Pod toleration (default: sandbox.gke.io/runtime=gvisor:NoSchedule; 'none' or '' omits it)
+  --service-account <name|none>     Pod serviceAccountName (default: pm-test-ksa; 'none' or '' omits it)
+  --skip-podmigration-create        Use a pre-created snapshot policy instead of applying a PodMigration CR
   --self-test                       Run offline end-to-end self-test of pmprofiler + T2
                                     scenario fixtures and invariant gates (used in CI)
   -h, --help                        Show this help message
@@ -87,6 +97,26 @@ while [[ $# -gt 0 ]]; do
       GCS_BUCKET="$2"
       shift 2
       ;;
+    --runtime-class)
+      RUNTIME_CLASS="$2"
+      shift 2
+      ;;
+    --node-selector)
+      NODE_SELECTOR="$2"
+      shift 2
+      ;;
+    --toleration)
+      TOLERATION="$2"
+      shift 2
+      ;;
+    --service-account)
+      SERVICE_ACCOUNT="$2"
+      shift 2
+      ;;
+    --skip-podmigration-create)
+      SKIP_PODMIGRATION_CREATE="true"
+      shift
+      ;;
     --self-test|--dry-run)
       SELF_TEST="true"
       shift
@@ -115,6 +145,7 @@ die() {
 PMPROFILER_BIN=""
 COLLECT_PID=""
 CORDONED_NODES=()
+KUBECTL_CMD="${KUBECTL_CMD:-kubectl}"
 
 build_pmprofiler() {
   mkdir -p "${OUT_DIR}/bin"
@@ -123,16 +154,42 @@ build_pmprofiler() {
   (cd "${PMPROFILER_SRC}" && go build -o "${PMPROFILER_BIN}" ./cmd/pmprofiler)
 }
 
-uncordon_all_tracked_nodes() {
-  if [[ "${SELF_TEST}" == "true" ]]; then
-    return 0
-  fi
-  for n in "${CORDONED_NODES[@]:-}"; do
-    if [[ -n "${n}" ]]; then
-      kubectl uncordon "${n}" >/dev/null 2>&1 || true
+cordon_node() {
+  local node="$1"
+  [[ -n "${node}" ]] || return 0
+  "${KUBECTL_CMD}" cordon "${node}" >/dev/null
+  local existing
+  for existing in "${CORDONED_NODES[@]:-}"; do
+    if [[ "${existing}" == "${node}" ]]; then
+      return 0
     fi
   done
-  kubectl uncordon -l sandbox.gke.io/runtime=gvisor >/dev/null 2>&1 || true
+  CORDONED_NODES+=("${node}")
+}
+
+cordon_target_pool_nodes() {
+  local nodes=()
+  if [[ -n "${NODE_SELECTOR}" && "${NODE_SELECTOR}" != "none" ]]; then
+    mapfile -t nodes < <("${KUBECTL_CMD}" get nodes -l "${NODE_SELECTOR}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  else
+    mapfile -t nodes < <("${KUBECTL_CMD}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  fi
+  local n
+  for n in "${nodes[@]:-}"; do
+    [[ -n "${n}" ]] && cordon_node "${n}"
+  done
+}
+
+uncordon_all_tracked_nodes() {
+  if [[ "${SELF_TEST}" == "true" && "${T2_TEST_UNCONDITIONAL_UNCORDON:-false}" != "true" ]]; then
+    return 0
+  fi
+  local n
+  for n in "${CORDONED_NODES[@]:-}"; do
+    if [[ -n "${n}" ]]; then
+      "${KUBECTL_CMD}" uncordon "${n}" >/dev/null 2>&1 || true
+    fi
+  done
   CORDONED_NODES=()
 }
 
@@ -158,6 +215,17 @@ resolve_gcs_bucket() {
   existing="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
   if [[ -n "${existing}" ]]; then
     GCS_BUCKET="${existing}"
+    return 0
+  fi
+  local pssc_bucket pssc_prefix
+  pssc_bucket="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotLocationConfig.gcs.bucket}' 2>/dev/null || true)"
+  pssc_prefix="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotLocationConfig.gcs.prefix}' 2>/dev/null || true)"
+  if [[ -n "${pssc_bucket}" ]]; then
+    if [[ -n "${pssc_prefix}" ]]; then
+      GCS_BUCKET="gs://${pssc_bucket}/${pssc_prefix#/}"
+    else
+      GCS_BUCKET="gs://${pssc_bucket}"
+    fi
   else
     GCS_BUCKET="gs://yaoluo-gke-dev-podsnapshots/snapshots"
   fi
@@ -404,7 +472,12 @@ v_postgres_verify() {
 
 ensure_podmigration_policy() {
   local name="${1:-diskless-migration}"
+  local force_create="${2:-false}"
   resolve_gcs_bucket
+  if [[ "${SKIP_PODMIGRATION_CREATE}" == "true" && "${force_create}" != "true" ]]; then
+    log "Skipping PodMigration CR creation (--skip-podmigration-create; using pre-created policy with GCS_BUCKET=${GCS_BUCKET})"
+    return 0
+  fi
   kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
 apiVersion: podmigration.gke.io/v1alpha1
 kind: PodMigration
@@ -418,10 +491,46 @@ EOF
   kubectl wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null
 }
 
-deploy_counter_workload() {
+render_pod_runtime_spec() {
+  if [[ -n "${SERVICE_ACCOUNT}" && "${SERVICE_ACCOUNT}" != "none" ]]; then
+    printf "      serviceAccountName: %s\n" "${SERVICE_ACCOUNT}"
+  fi
+  if [[ -n "${RUNTIME_CLASS}" && "${RUNTIME_CLASS}" != "none" ]]; then
+    printf "      runtimeClassName: %s\n" "${RUNTIME_CLASS}"
+  fi
+  if [[ -n "${NODE_SELECTOR}" && "${NODE_SELECTOR}" != "none" ]]; then
+    local ns_key="${NODE_SELECTOR%%=*}"
+    local ns_val="${NODE_SELECTOR#*=}"
+    printf "      nodeSelector:\n        %s: %s\n" "${ns_key}" "${ns_val}"
+  fi
+  if [[ -n "${TOLERATION}" && "${TOLERATION}" != "none" ]]; then
+    local tol_kv="${TOLERATION%:*}"
+    local tol_effect="${TOLERATION##*:}"
+    if [[ "${tol_kv}" == *"="* ]]; then
+      local tol_key="${tol_kv%%=*}"
+      local tol_val="${tol_kv#*=}"
+      cat <<EOF
+      tolerations:
+      - key: ${tol_key}
+        operator: Equal
+        value: ${tol_val}
+        effect: ${tol_effect}
+EOF
+    else
+      cat <<EOF
+      tolerations:
+      - key: ${tol_kv}
+        operator: Exists
+        effect: ${tol_effect}
+EOF
+    fi
+  fi
+}
+
+render_counter_manifest() {
   local name="${1:-t2-counter}"
   local replicas="${2:-1}"
-  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
+  cat <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -438,15 +547,7 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
-      serviceAccountName: pm-test-ksa
-      runtimeClassName: gvisor
-      nodeSelector:
-        sandbox.gke.io/runtime: gvisor
-      tolerations:
-      - key: sandbox.gke.io/runtime
-        operator: Equal
-        value: gvisor
-        effect: NoSchedule
+$(render_pod_runtime_spec)
       containers:
       - name: counter
         image: busybox:1.36
@@ -475,12 +576,18 @@ spec:
           limits:
             memory: 256Mi
 EOF
+}
+
+deploy_counter_workload() {
+  local name="${1:-t2-counter}"
+  local replicas="${2:-1}"
+  render_counter_manifest "${name}" "${replicas}" | kubectl apply -n "${NAMESPACE}" -f - >/dev/null
   kubectl rollout status deployment/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
-deploy_redis_workload() {
+render_redis_manifest() {
   local name="${1:-t2-redis}"
-  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
+  cat <<EOF
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -498,19 +605,12 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
-      serviceAccountName: pm-test-ksa
-      runtimeClassName: gvisor
-      nodeSelector:
-        sandbox.gke.io/runtime: gvisor
-      tolerations:
-      - key: sandbox.gke.io/runtime
-        operator: Equal
-        value: gvisor
-        effect: NoSchedule
+$(render_pod_runtime_spec)
       containers:
       - name: redis
         image: redis:7-alpine
         imagePullPolicy: IfNotPresent
+        command: ["redis-server"]
         args: ["--save", "", "--appendonly", "no", "--enable-debug-command", "yes"]
         ports:
         - containerPort: 6379
@@ -538,12 +638,17 @@ spec:
   - port: 6379
     targetPort: 6379
 EOF
+}
+
+deploy_redis_workload() {
+  local name="${1:-t2-redis}"
+  render_redis_manifest "${name}" | kubectl apply -n "${NAMESPACE}" -f - >/dev/null
   kubectl rollout status statefulset/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
-deploy_postgres_workload() {
+render_postgres_manifest() {
   local name="${1:-t2-postgres}"
-  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
+  cat <<EOF
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -561,19 +666,13 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
-      serviceAccountName: pm-test-ksa
-      runtimeClassName: gvisor
-      nodeSelector:
-        sandbox.gke.io/runtime: gvisor
-      tolerations:
-      - key: sandbox.gke.io/runtime
-        operator: Equal
-        value: gvisor
-        effect: NoSchedule
+$(render_pod_runtime_spec)
       containers:
       - name: postgres
         image: postgres:16-alpine
         imagePullPolicy: IfNotPresent
+        command: ["docker-entrypoint.sh"]
+        args: ["postgres"]
         env:
         - name: POSTGRES_HOST_AUTH_METHOD
           value: trust
@@ -607,6 +706,11 @@ spec:
   - port: 5432
     targetPort: 5432
 EOF
+}
+
+deploy_postgres_workload() {
+  local name="${1:-t2-postgres}"
+  render_postgres_manifest "${name}" | kubectl apply -n "${NAMESPACE}" -f - >/dev/null
   kubectl rollout status statefulset/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
@@ -656,8 +760,7 @@ run_scenario_s1() {
 
   # Cordon source node and trigger eviction of t2-counter while simultaneously
   # rolling-upgrading t2-bystander (proving I6: rolling upgrade does not trigger a false PMJ).
-  kubectl cordon "${src_node}" >/dev/null
-  CORDONED_NODES+=("${src_node}")
+  cordon_node "${src_node}"
 
   evict_pod "${src_pod}"
   kubectl patch deployment t2-bystander -n "${NAMESPACE}" --type=merge \
@@ -715,8 +818,7 @@ EOF
 
   local src_node
   src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
-  kubectl cordon "${src_node}" >/dev/null
-  CORDONED_NODES+=("${src_node}")
+  cordon_node "${src_node}"
 
   # Trigger migration while PDB blocks origin eviction; wait until PMJ reaches Evicting (BlockedByPDB),
   # then relax PDB to minAvailable: 0 so eviction and warm restore complete cleanly.
@@ -760,10 +862,10 @@ run_scenario_s3() {
   src_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   start_collector "${run_dir}" "S3: Corrupted checkpoint artifact -> I9 cold-start fallback"
 
-  # Cordon all gVisor nodes before triggering eviction so the replacement pod is held
+  # Cordon target node pool before triggering eviction so the replacement pod is held
   # Unschedulable after snapshot upload + source eviction while we corrupt checkpoint.img in GCS.
-  log "Cordoning gVisor nodes to hold replacement pod Pending during GCS checkpoint corruption"
-  kubectl cordon -l sandbox.gke.io/runtime=gvisor >/dev/null
+  log "Cordoning target pool nodes (NODE_SELECTOR=${NODE_SELECTOR:-all}) to hold replacement pod Pending during GCS checkpoint corruption"
+  cordon_target_pool_nodes
 
   evict_pod "${src_pod}"
 
@@ -801,7 +903,7 @@ run_scenario_s3() {
     die "S3: failed to remove GCS checkpoint artifacts at ${GCS_BUCKET}/${snap_name}"
   fi
 
-  log "Uncordoning gVisor nodes so replacement pod attempts restore from missing/corrupted checkpoint"
+  log "Uncordoning tracked nodes so replacement pod attempts restore from missing/corrupted checkpoint"
   uncordon_all_tracked_nodes
 
   # Wait for PMJ to conclude via either SucceededWithoutRestore (FallbackToColdStart)
@@ -873,12 +975,17 @@ run_scenario_s5() {
   local src_pod before_state pm_uid
   src_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   before_state="$(v_counter_capture "${src_pod}")"
-  pm_uid="$(kubectl get podmigration diskless-migration -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')"
 
   start_collector "${run_dir}" "S5: Mid-flight PodMigration deletion (I4/I5 deferral & zero orphan leaks)"
 
   evict_pod "${src_pod}"
   sleep 1
+  # Ensure a PodMigration CR exists to exercise I4/I5 deletion deferral even when
+  # --skip-podmigration-create was used prior to eviction.
+  if ! kubectl get podmigration diskless-migration -n "${NAMESPACE}" >/dev/null 2>&1; then
+    ensure_podmigration_policy "diskless-migration" "true"
+  fi
+  pm_uid="$(kubectl get podmigration diskless-migration -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')"
   # Delete PodMigration while PMJ is in-flight; I4/I5 finalizer defers PSSC/PSP cleanup until PMJ finishes.
   kubectl delete podmigration diskless-migration -n "${NAMESPACE}" --wait=false >/dev/null
 
@@ -905,7 +1012,7 @@ run_scenario_s5() {
     --pass --value 1 --total 1 \
     --detail "0 orphan PodSnapshotStorageConfigs (owner-uid=${pm_uid}) after PodMigration deletion"
 
-  # Restore baseline PodMigration CR on the cluster
+  # Restore baseline PodMigration CR on the cluster unless --skip-podmigration-create is set
   ensure_podmigration_policy "diskless-migration"
   finish_and_assert_run "${run_dir}" "false"
   clean_test_workloads
@@ -1153,7 +1260,46 @@ EOF
     "${OUT_DIR}/s5/run.json"
 
   [[ -s "${report_html}" ]] || die "Expected non-empty HTML report at ${report_html}"
-  log "Self-test PASSED: S1-S5 analyzed with 0 invariant violations and report generated at ${report_html}"
+
+  # Verify runtime-agnostic manifest rendering & explicit command arrays (#82)
+  local gvisor_counter gvisor_redis gvisor_pg
+  gvisor_counter="$(RUNTIME_CLASS=gvisor NODE_SELECTOR="sandbox.gke.io/runtime=gvisor" TOLERATION="sandbox.gke.io/runtime=gvisor:NoSchedule" SERVICE_ACCOUNT="pm-test-ksa" render_counter_manifest)"
+  gvisor_redis="$(RUNTIME_CLASS=gvisor NODE_SELECTOR="sandbox.gke.io/runtime=gvisor" TOLERATION="sandbox.gke.io/runtime=gvisor:NoSchedule" SERVICE_ACCOUNT="pm-test-ksa" render_redis_manifest)"
+  gvisor_pg="$(RUNTIME_CLASS=gvisor NODE_SELECTOR="sandbox.gke.io/runtime=gvisor" TOLERATION="sandbox.gke.io/runtime=gvisor:NoSchedule" SERVICE_ACCOUNT="pm-test-ksa" render_postgres_manifest)"
+  grep -q 'runtimeClassName: gvisor' <<<"${gvisor_counter}" || die "Expected runtimeClassName: gvisor in default counter manifest"
+  grep -q 'command: \["redis-server"\]' <<<"${gvisor_redis}" || die "Expected explicit command: [\"redis-server\"] in redis manifest"
+  grep -q 'command: \["docker-entrypoint.sh"\]' <<<"${gvisor_pg}" || die "Expected explicit command: [\"docker-entrypoint.sh\"] in postgres manifest"
+
+  local runc_counter runc_redis runc_pg
+  runc_counter="$(RUNTIME_CLASS=none NODE_SELECTOR=none TOLERATION=none SERVICE_ACCOUNT=none render_counter_manifest)"
+  runc_redis="$(RUNTIME_CLASS=none NODE_SELECTOR=none TOLERATION=none SERVICE_ACCOUNT=none render_redis_manifest)"
+  runc_pg="$(RUNTIME_CLASS=none NODE_SELECTOR=none TOLERATION=none SERVICE_ACCOUNT=none render_postgres_manifest)"
+  if grep -qE 'runtimeClassName:|nodeSelector:|tolerations:|serviceAccountName:' <<<"${runc_counter}${runc_redis}${runc_pg}"; then
+    die "Expected runtime-agnostic ('none') manifests to omit runtimeClassName, nodeSelector, tolerations, and serviceAccountName"
+  fi
+  grep -q 'command: \["redis-server"\]' <<<"${runc_redis}" || die "Expected explicit command in runtime-agnostic redis manifest"
+  grep -q 'command: \["docker-entrypoint.sh"\]' <<<"${runc_pg}" || die "Expected explicit command in runtime-agnostic postgres manifest"
+
+  # Verify tracked node cordon/uncordon only uncordons nodes cordoned during the run (#82)
+  local kubectl_log="${OUT_DIR}/kubectl-calls.log"
+  local fake_kubectl="${OUT_DIR}/fake-kubectl.sh"
+  cat >"${fake_kubectl}" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${kubectl_log}"
+EOF
+  chmod +x "${fake_kubectl}"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-1"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-2"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-1"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" uncordon_all_tracked_nodes
+  grep -q '^uncordon runc-pool-node-1$' "${kubectl_log}" || die "Expected tracked node runc-pool-node-1 to be uncordoned"
+  grep -q '^uncordon runc-pool-node-2$' "${kubectl_log}" || die "Expected tracked node runc-pool-node-2 to be uncordoned"
+  if grep -q 'sandbox.gke.io/runtime=gvisor' "${kubectl_log}"; then
+    die "Expected uncordon_all_tracked_nodes not to hardcode sandbox.gke.io/runtime=gvisor"
+  fi
+  rm -f "${kubectl_log}" "${fake_kubectl}"
+
+  log "Self-test PASSED: S1-S5 analyzed with 0 invariant violations, runtime-agnostic templates & tracked node uncordon verified, and report generated at ${report_html}"
 }
 
 # ==============================================================================
