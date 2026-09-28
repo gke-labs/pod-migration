@@ -1,0 +1,81 @@
+name: Invariant Evolution Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      invariant_id:
+        description: 'Candidate invariant ID (e.g. I10)'
+        required: false
+        default: 'I10'
+      extract_comment:
+        description: 'Optional /extract-invariant directive (Trigger C) or bugfix summary (Trigger B)'
+        required: false
+        default: ''
+      run_dir:
+        description: 'Optional path to pmprofiler run directory for blind-spot detection (Trigger A)'
+        required: false
+        default: ''
+  issue_comment:
+    types: [ created ]
+
+permissions:
+  contents: read
+
+jobs:
+  evolve-invariant:
+    name: Synthesize & Verify Candidate Invariant
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '/extract-invariant') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'))
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+      with:
+        go-version-file: 'controller/go.mod'
+        check-latest: false
+        cache: false
+
+    - name: Verify Two-Lane CODEOWNERS Governance (T0)
+      run: ./verification-suite/verify_invariant_governance.sh --self-test
+
+    - name: Run Invariant Evolution Pipeline
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        INPUT_INVARIANT_ID: ${{ inputs.invariant_id }}
+        INPUT_COMMENT: ${{ inputs.extract_comment }}
+        INPUT_RUN_DIR: ${{ inputs.run_dir }}
+        ISSUE_COMMENT_BODY: ${{ github.event.comment.body }}
+      run: |
+        set -euo pipefail
+        OUT_DIR="/tmp/invariant-evolution-out"
+        INV_ID="${INPUT_INVARIANT_ID:-I10}"
+        if [[ "${EVENT_NAME}" == "issue_comment" ]]; then
+          ./verification-suite/run_guardrail_t5_evolution.sh \
+            --comment "${ISSUE_COMMENT_BODY}" \
+            --invariant-id "${INV_ID}" \
+            --out-dir "${OUT_DIR}"
+        elif [[ -n "${INPUT_COMMENT}" ]]; then
+          ./verification-suite/run_guardrail_t5_evolution.sh \
+            --comment "${INPUT_COMMENT}" \
+            --invariant-id "${INV_ID}" \
+            --out-dir "${OUT_DIR}"
+        elif [[ -n "${INPUT_RUN_DIR}" ]]; then
+          ./verification-suite/run_guardrail_t5_evolution.sh \
+            --run "${INPUT_RUN_DIR}" \
+            --invariant-id "${INV_ID}" \
+            --out-dir "${OUT_DIR}"
+        else
+          ./verification-suite/run_guardrail_t5_evolution.sh --self-test
+        fi

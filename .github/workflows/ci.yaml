@@ -18,6 +18,7 @@ jobs:
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
+        fetch-depth: 0
 
     - name: Set up Go
       uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
@@ -27,6 +28,9 @@ jobs:
         cache-dependency-path: |
           controller/go.sum
           tools/pmprofiler/go.sum
+
+    - name: Verify Invariant Governance (T0)
+      run: make -C controller verify-invariant-governance
 
     - name: Verify Generated Code Freshness
       run: make -C controller verify-generate
@@ -39,3 +43,6 @@ jobs:
 
     - name: Run T3 SLO Guardrail & scalesim Capacity Model Self-Test
       run: make -C controller test-t3-guardrail
+
+    - name: Run T5 Invariant Evolution Pipeline Self-Test
+      run: make -C controller test-t5-guardrail
