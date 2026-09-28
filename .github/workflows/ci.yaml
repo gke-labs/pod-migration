@@ -30,6 +30,8 @@ jobs:
           tools/pmprofiler/go.sum
 
     - name: Verify Invariant Governance (T0)
+      env:
+        ALLOW_INVARIANT_COCHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'allow-invariant-cochange') }}
       run: make -C controller verify-invariant-governance
 
     - name: Verify Generated Code Freshness

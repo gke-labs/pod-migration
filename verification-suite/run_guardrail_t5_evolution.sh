@@ -153,17 +153,18 @@ EOF
   [[ "${clean_count}" -eq 0 ]] || die "Expected 0 blind spots on clean run, got ${clean_count}"
   log "Verified clean trace produces 0 blind spots"
 
-  # 3. Trigger A (Blind-Spot Detector): Issue #75 Premature Snapshot Failed while Checkpoint=InProgress
-  local bs1_dir="${base_dir}/blindspot_issue75"
+  # 3. Trigger A (Blind-Spot Detector): Synthetic self-test for wedged-restoring-orphan
+  local bs1_dir="${base_dir}/blindspot_wedged_restoring"
   mkdir -p "${bs1_dir}"
   cat > "${bs1_dir}/meta.json" <<EOF
-{"scenario":"T5 blind spot: premature snapshot failure (#75)","startedAt":"2026-09-28T00:26:55Z"}
+{"scenario":"T5 synthetic self-test: wedged-restoring-orphan blind spot","startedAt":"2026-09-28T00:26:55Z"}
 EOF
   cat > "${bs1_dir}/records.ndjson" <<EOF
-{"ts":"2026-09-28T00:26:50Z","type":"list","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-counter-0","uid":"uid-race-src","creationTimestamp":"2026-09-28T00:25:00Z","labels":{"app":"t3-counter","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-a"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T00:25:05Z"}]}}}
-{"ts":"2026-09-28T00:26:58Z","type":"add","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-race-0","uid":"uid-pmj-race","creationTimestamp":"2026-09-28T00:26:58Z"},"spec":{"podRef":{"name":"t3-counter-0"},"targetPodUID":"uid-race-src"},"status":{"phase":"Snapshotting","snapshotName":"ps-race-0"}}}
-{"ts":"2026-09-28T00:26:59Z","type":"add","gvr":"${ps_gvr}","obj":{"metadata":{"name":"ps-race-0","namespace":"default"},"spec":{"podName":"t3-counter-0"},"status":{"conditions":[{"type":"Checkpoint","status":"False","reason":"InProgress"},{"type":"StorageReplicated","status":"False","reason":"AwaitingCheckpoint"},{"type":"Ready","status":"False","reason":"Failed","message":"Failed to take snapshot (1)."}]}}}
-{"ts":"2026-09-28T00:27:00Z","type":"update","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-race-0","uid":"uid-pmj-race","creationTimestamp":"2026-09-28T00:26:58Z"},"spec":{"podRef":{"name":"t3-counter-0"},"targetPodUID":"uid-race-src"},"status":{"phase":"Failed","reason":"SnapshotFailed","message":"PodSnapshot ps-race-0 condition Ready failed: Failed to take snapshot (1).","snapshotName":"ps-race-0"}}}
+{"ts":"2026-09-28T00:26:50Z","type":"list","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-counter-0","uid":"uid-wedge-src","creationTimestamp":"2026-09-28T00:25:00Z","labels":{"app":"t3-counter","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-a"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T00:25:05Z"}]}}}
+{"ts":"2026-09-28T00:26:58Z","type":"add","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-wedge-0","uid":"uid-pmj-wedge","creationTimestamp":"2026-09-28T00:26:58Z"},"spec":{"podRef":{"name":"t3-counter-0"},"targetPodUID":"uid-wedge-src"},"status":{"phase":"Snapshotting","snapshotRef":"ps-wedge-0"}}}
+{"ts":"2026-09-28T00:27:05Z","type":"update","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-wedge-0","uid":"uid-pmj-wedge","creationTimestamp":"2026-09-28T00:26:58Z"},"spec":{"podRef":{"name":"t3-counter-0"},"targetPodUID":"uid-wedge-src"},"status":{"phase":"Restoring","snapshotRef":"ps-wedge-0","restoredPodName":"t3-counter-0-dst","restoringStartTime":"2026-09-28T00:27:05Z"}}}
+{"ts":"2026-09-28T00:27:06Z","type":"add","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-counter-0-dst","uid":"uid-wedge-dst","creationTimestamp":"2026-09-28T00:27:06Z","labels":{"app":"t3-counter","pod-migration.gke.io/enabled":"true"}},"spec":{"schedulingGates":[{"name":"pod-migration.gke.io/restoring"}]},"status":{"phase":"Pending"}}}
+{"ts":"2026-09-28T00:38:00Z","type":"delete","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-counter-0-dst","uid":"uid-wedge-dst"}}}
 EOF
   "${PMPROFILER_BIN}" analyze --run "${bs1_dir}" --assert-zero-invariants
   local i10_out="${base_dir}/out_i10"
@@ -173,21 +174,24 @@ EOF
     --green-records "${clean_dir}/records.ndjson" \
     --invariant-id "I10" \
     --out-dir "${i10_out}"
+  [[ "$(jq -r '.compiledAndTested' "${i10_out}/proof.json")" == "true" ]] || die "I10 was not compiled and tested via go test"
   [[ "$(jq -r '.redPassed' "${i10_out}/proof.json")" == "true" ]] || die "I10 RED proof did not pass"
   [[ "$(jq -r '.greenPassed' "${i10_out}/proof.json")" == "true" ]] || die "I10 GREEN proof did not pass"
-  [[ -s "${i10_out}/testdata/i10_premature_snapshot_failed_snapshot.json" ]] || die "Missing I10 snapshot fixture"
-  [[ -s "${i10_out}/i10_premature_snapshot_failed_rule.go" ]] || die "Missing I10 rule.go"
-  [[ -s "${i10_out}/i10_premature_snapshot_failed_test.go" ]] || die "Missing I10 test.go"
+  [[ -s "${i10_out}/testdata/i10_wedged_restoring_orphan_snapshot.json" ]] || die "Missing I10 snapshot fixture"
+  [[ -s "${i10_out}/testdata/i10_wedged_restoring_orphan_green_snapshots.json" ]] || die "Missing I10 green snapshots fixture"
+  [[ -s "${i10_out}/i10_wedged_restoring_orphan_rule.go" ]] || die "Missing I10 rule.go"
+  [[ -s "${i10_out}/i10_wedged_restoring_orphan_test.go" ]] || die "Missing I10 test.go"
   [[ -s "${i10_out}/pr_body.md" ]] || die "Missing I10 pr_body.md"
-  log "Verified Trigger A (Issue #75 blind spot) -> I10 RED/GREEN proof PASSED"
+  log "Verified Trigger A (wedged-restoring-orphan blind spot) -> I10 compiled go test RED/GREEN proof PASSED"
 
   # 4. Trigger C (/extract-invariant slash command) + Negative Honesty Gate
   local i11_out="${base_dir}/out_i11"
   "${INVARIANT_GEN_BIN}" \
     --mode extract-comment \
-    --comment "/extract-invariant I11 wedged-restoring-orphan PMJ stuck in Restoring after replacement pod deleted" \
+    --comment "/extract-invariant I11 unintended-cold-start-active-pmj Replacement pod cold-started while PMJ remained in PhaseRestoring" \
     --green-records "${clean_dir}/records.ndjson" \
     --out-dir "${i11_out}"
+  [[ "$(jq -r '.compiledAndTested' "${i11_out}/proof.json")" == "true" ]] || die "I11 was not compiled and tested via go test"
   [[ "$(jq -r '.redPassed' "${i11_out}/proof.json")" == "true" ]] || die "I11 RED proof did not pass"
   [[ "$(jq -r '.greenPassed' "${i11_out}/proof.json")" == "true" ]] || die "I11 GREEN proof did not pass"
 
@@ -199,7 +203,7 @@ EOF
     --out-dir "${i12_custom_out}" >/dev/null 2>&1; then
     die "Negative gate failed: custom scaffold without predicate should fail --require-red-green=true"
   fi
-  log "Verified negative gate: unauthored custom scaffold rejects --require-red-green=true"
+  log "Verified negative gate: unauthored custom scaffold fails compiled go test RED proof under --require-red-green=true"
   log "=== Track 5 Invariant Evolution Pipeline Self-Test PASSED ==="
 }
 

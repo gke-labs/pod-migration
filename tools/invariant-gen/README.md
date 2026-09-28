@@ -1,8 +1,8 @@
-# `invariant-gen` — Blind-Spot Detector, Snapshot Extractor & Red/Green Replay Verifier
+# `invariant-gen` — Blind-Spot Detector, Snapshot Extractor & Compiled `go test` Verifier
 
-`invariant-gen` implements **Track 5 (`PR E` — [Issue #54](https://github.com/gke-labs/pod-migration/issues/54))** of the LPM Correctness Guard Rail ([Epic #49](https://github.com/gke-labs/pod-migration/issues/49)).
+`invariant-gen` implements the deterministic CLI and T0 CI governance foundation of **Track 5 (`PR E` — [Issue #54](https://github.com/gke-labs/pod-migration/issues/54))** of the LPM Correctness Guard Rail ([Epic #49](https://github.com/gke-labs/pod-migration/issues/49)).
 
-It bridges `tools/pmprofiler` trace classification and `controller/internal/invariants` (`I1`–`I9` -> `I10+`) under a strict **Two-Lane `CODEOWNERS` Governance** model.
+It bridges `tools/pmprofiler` trace classification and `controller/internal/invariants` (`I1`–`I9` -> `I10+`) under a **Two-Lane CI Governance** model.
 
 ---
 
@@ -11,34 +11,47 @@ It bridges `tools/pmprofiler` trace classification and `controller/internal/inva
 `invariant-gen` is a **deterministic offline Go CLI** (zero external dependencies, no LLM calls, no arbitrary Go AST synthesis from free-form prose):
 
 1. **Deterministic Blind-Spot Detection (`Trigger A`)**:
-   - Inspects `<run-dir>/run.json` and `<run-dir>/records.ndjson` produced by `pmprofiler`.
-   - Identifies any migration ending in an unhealthy outcome (`wedged`, `failed`, `no-replacement`, `restore_crash_unmatched`, or unintended `cold-start`) **while `invariantViolations == 0`** (meaning `I1`–`I9` did not fire).
-   - Reconstructs the point-in-time Kubernetes state from `records.ndjson` at the migration's failure timestamp (`tEnd`) and writes a minimized `SnapshotFixture` (`testdata/i<N>_<slug>_snapshot.json`).
-2. **Built-In Structural Predicate Templates vs. Author Scaffolds**:
-   - Classifies each blind spot (or `Trigger B` bugfix PR / `Trigger C` `/extract-invariant` directive) against 3 built-in structural predicate templates covering the blind-spot classes observed outside `I1`–`I9`:
-     - `premature-snapshot-failed` (`PrematureSnapshotFailureIsolation`): `PMJ` enters `PhaseFailed` (`Reason=SnapshotFailed`) while its `PodSnapshot` still has `Checkpoint` or `StorageReplicated` in `InProgress` / `AwaitingCheckpoint` / `Succeeded` (the live GKE race filed in **[Issue #75](https://github.com/gke-labs/pod-migration/issues/75)**).
-     - `wedged-restoring-orphan` (`RestoringReplacementLiveness`): `PMJ` remains in `PhaseRestoring` after source pod eviction while its bound `restoredPodName` has been deleted or is missing past the progress window.
-     - `unintended-cold-start-active-pmj` (`ActivePMJReplacementColdStartGuard`): Replacement pod becomes `Ready` without a snapshot restore annotation while its `PMJ` is still active (`Snapshotting`, `Evicting`, `Restoring`).
-   - For novel `/extract-invariant` directives or bugfix PRs outside these 3 structural classes, `invariant-gen` emits `custom-invariant-scaffold` with `requiresAuthorBody: true` and **`redPassed: false` / `greenPassed: false`** (exiting non-zero when `--require-red-green=true` until a human or coding agent authors the domain predicate).
-3. **Automated RED / GREEN Replay Verification**:
-   - **RED Proof**: Evaluates the candidate predicate against the extracted offending `SnapshotFixture` and asserts `>= 1` violation.
-   - **GREEN Proof**: Replays the candidate predicate across canonical healthy lifecycle snapshots (`Pending`, `Snapshotting`, `Evicting`, `Restoring`, `Succeeded`, plus genuine `Checkpoint=Failed`) **and** across every reconstructed PMJ event step in clean `records.ndjson` traces (`--green-records`), asserting `0` false-positive violations.
+   - Inspects `<run-dir>/run.json` and `<run-dir>/records.ndjson` produced by `pmprofiler` (supporting `pmprofiler`'s `map[string]float64` `invariantViolations`, `totalInvariantViolations`, and `pod` / `snapshotName` / `phase` / `tTerminal` fields).
+   - Identifies any migration ending in an unhealthy outcome (`wedged`, `stalled`, `failed`, `no-replacement`, `restore_crash_unmatched`, or unintended `cold-start`) **while `invariantViolations == 0`** (meaning `I1`–`I9` did not fire).
+   - Reconstructs the point-in-time Kubernetes state from `records.ndjson` into a JSON fixture wire-compatible with `invariants.ReconcileSnapshot` (`testdata/i<N>_<slug>_snapshot.json`).
+2. **Built-In `ReconcileSnapshot`-Native Templates vs. Author Scaffolds**:
+   - Classifies each blind spot (or `Trigger B` bugfix PR / `Trigger C` `/extract-invariant` directive) against 3 built-in structural predicate templates that evaluate strictly over fields present on `invariants.ReconcileSnapshot`, `pmv1alpha1.PodMigrationJob`, and `corev1.Pod`:
+     - `wedged-restoring-orphan` (`RestoringReplacementLiveness`): `PMJ` remains in `PhaseRestoring` `>= 30s` (`s.Now.Sub(pmj.Status.RestoringStartTime.Time) >= 30s`) while its bound `restoredPodName` has been deleted or is missing from `NamespacePods`.
+     - `no-replacement-evicting-stall` (`EvictingNoReplacementLiveness`): `PMJ` remains in `PhaseEvicting` `>= 30s` (`s.Now.Sub(pmj.Status.EvictingStartTime.Time) >= 30s`) with no `restoredPodName` after the source pod (`pmj.Spec.PodRef.Name`) has disappeared from `NamespacePods`.
+     - `unintended-cold-start-active-pmj` (`ActivePMJReplacementColdStartGuard`): Replacement pod (`pmj.Status.RestoredPodName`) becomes `Ready` with no scheduling gates and an empty snapshot restore annotation while its `PMJ` is in `PhaseRestoring`.
+   - For blind spots that require cross-CRD fields not yet carried on `invariants.ReconcileSnapshot` (for example, `PodSnapshot` `Checkpoint`/`StorageReplicated` sub-conditions in **[Issue #75](https://github.com/gke-labs/pod-migration/issues/75)**) or novel `/extract-invariant` directives, `invariant-gen` emits `custom-invariant-scaffold` with `requiresAuthorBody: true`. Its generated `_rule.go` compiles cleanly inside `controller/internal/invariants` and intentionally returns `nil` so the compiled `go test` RED proof fails (`redPassed: false`, `greenPassed: false`) until a human/agent extends `ReconcileSnapshot` and supplies the predicate body.
+3. **Compiled `go test` RED / GREEN Replay Verification**:
+   - Rather than evaluating an internal proxy predicate, `SynthesizeAndVerify` stages the emitted `testdata/i<N>_<slug>_snapshot.json`, `testdata/i<N>_<slug>_green_snapshots.json`, `i<N>_<slug>_rule.go`, and `i<N>_<slug>_test.go` into a temporary copy of `controller/internal/invariants` and executes `go test`:
+     - **RED Proof (`TestI<N>_<Name>_RedProof`)**: Unmarshals `testdata/i<N>_<slug>_snapshot.json` into `invariants.ReconcileSnapshot`, calls `RuleI<N>().Evaluate(&snap)`, and asserts `>= 1` violation with `InvariantID == "I<N>"`.
+     - **GREEN Proof (`TestI<N>_<Name>_GreenProof`)**: Unmarshals `testdata/i<N>_<slug>_green_snapshots.json` (containing canonical healthy lifecycle snapshots plus every reconstructed PMJ event step from `--green-records` `records.ndjson` traces) into `[]invariants.ReconcileSnapshot` and asserts `0` false-positive violations across all steps.
 
 ---
 
-## Two-Lane `CODEOWNERS` Governance (`verification-suite/verify_invariant_governance.sh`)
+## Two-Lane CI Governance Gate (`verification-suite/verify_invariant_governance.sh`)
 
 | Lane | Branch Pattern | Rule Enforced in `T0` CI | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Lane 1** | All non-`invariant/*` branches (`feature/*`, `fix/*`, etc.) | **Forbids** modifying any file under `controller/internal/invariants/**` or `.github/CODEOWNERS` | Prevents feature or bugfix PRs from weakening or deleting `I1`–`I9` to turn a failing test green |
-| **Lane 2** | `invariant/*` (e.g. `invariant/i10-premature-snapshot-failed`) | **Requires** all modified files to be strictly inside `controller/internal/invariants/**` (with `@yaoluo` / `@bnaylor` `CODEOWNERS` approval) | Keeps invariant additions self-contained (`rules.go`, `invariants_test.go`, `testdata/`) for 60-second human review |
+| **Lane 1** | All non-`invariant/*` branches (`feature/*`, `fix/*`, etc.) | **Forbids** modifying any file under `controller/internal/invariants/**` or `.github/CODEOWNERS` unless an explicit co-change override is present | Prevents feature or bugfix PRs from silently weakening or deleting `I1`–`I9` to turn a failing test green |
+| **Lane 2** | `invariant/*` (e.g. `invariant/i10-wedged-restoring-orphan`) | **Requires** all modified files to be strictly inside `controller/internal/invariants/**` | Keeps invariant additions self-contained (`rules.go`, `invariants_test.go`, `testdata/`) for fast human review |
+| **Escape Hatch** | Any branch with `--allow-cochange`, PR label `allow-invariant-cochange` (`ALLOW_INVARIANT_COCHANGE=true`), or commit trailer `Invariant-Cochange: <reason>` | Permits co-dependent `ReconcileSnapshot` / reconciler + invariant changes in a single PR when explicitly justified | Unblocks legitimate `ReconcileSnapshot` struct extensions without bypassing CI visibility |
+
+> **Governance Enforcement Note:** `.github/CODEOWNERS` and `verify_invariant_governance.sh` operate as a **T0 CI governance check** (plus GitHub auto-reviewer assignment). Server-side GitHub branch protection / required CODEOWNERS review rulesets on `main` are tracked separately at the repository settings level.
+
+### Remaining Scope in Issue #54
+- **Delivered here (`Part of #54`)**:
+  - `.github/CODEOWNERS` + `verification-suite/verify_invariant_governance.sh` (T0 CI gate, fail-closed base-ref resolution, co-change escape hatch, 8-case self-test).
+  - `tools/invariant-gen` CLI (Trigger A blind-spot detector, Trigger B/C directive parser, `ReconcileSnapshot` fixture extractor, compiled `go test` RED/GREEN verifier, and PR body generator).
+  - `.github/workflows/invariant-evolution.yaml` (`workflow_dispatch` + `/extract-invariant` `issue_comment` trigger with `actions/upload-artifact` output bundle).
+- **Tracked for follow-up in `#54`**:
+  - Automated Trigger B `pull_request: types: [closed]` workflow hook on merged `bug`/`regression` PRs.
+  - Automated bot branch push (`invariant/i<N>-<slug>`) and GitHub PR creation (`gh pr create`) once repository write-token / GitHub App permissions are configured.
 
 ---
 
 ## Usage
 
 ```bash
-# 1. Run full pipeline (detect blind spot -> extract fixture -> RED/GREEN replay -> emit rule, test & PR body)
+# 1. Run full pipeline (detect blind spot -> extract ReconcileSnapshot fixture -> compiled go test RED/GREEN -> emit rule, test & PR body)
 go run . \
   --mode pipeline \
   --run /tmp/pmprofiler-blindspot-run \
@@ -49,6 +62,6 @@ go run . \
 # 2. Extract from a /extract-invariant review slash command (Trigger C)
 go run . \
   --mode extract-comment \
-  --comment "/extract-invariant I10 premature-snapshot-failed PMJ failed while PodSnapshot Checkpoint=InProgress" \
+  --comment "/extract-invariant I10 wedged-restoring-orphan PMJ stuck in Restoring after replacement pod deleted" \
   --out-dir /tmp/invariant-i10-comment
 ```

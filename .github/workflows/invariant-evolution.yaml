@@ -77,5 +77,16 @@ jobs:
             --invariant-id "${INV_ID}" \
             --out-dir "${OUT_DIR}"
         else
-          ./verification-suite/run_guardrail_t5_evolution.sh --self-test
+          ./verification-suite/run_guardrail_t5_evolution.sh \
+            --self-test \
+            --out-dir "${OUT_DIR}"
         fi
+        rm -rf "${OUT_DIR}/bin"
+
+    - name: Upload Candidate Invariant Artifacts
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: candidate-invariant-artifacts
+        path: /tmp/invariant-evolution-out/
+        if-no-files-found: warn

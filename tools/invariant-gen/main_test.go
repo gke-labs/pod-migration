@@ -21,46 +21,46 @@ import (
 	"testing"
 )
 
-func TestDetectAndVerifyPrematureSnapshotFailedBlindSpot(t *testing.T) {
+func TestDetectAndVerifyWedgedRestoringOrphanWithCompiledGoTest(t *testing.T) {
 	runDir := t.TempDir()
 	outDir := t.TempDir()
 
 	// Write a clean green trace for GREEN replay verification.
 	greenTrace := filepath.Join(t.TempDir(), "clean_records.ndjson")
 	cleanNDJSON := strings.Join([]string{
-		`{"ts":"2026-09-28T12:00:01Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-clean-0","namespace":"default"},"spec":{"podRef":{"name":"app-0"}},"status":{"phase":"Snapshotting","snapshotName":"ps-clean-0"}}}`,
-		`{"ts":"2026-09-28T12:00:02Z","type":"add","gvr":"podsnapshots.v1alpha1.podsnapshot.gke.io","obj":{"metadata":{"name":"ps-clean-0","namespace":"default"},"spec":{"podName":"app-0"},"status":{"conditions":[{"type":"Checkpoint","status":"False","reason":"InProgress"},{"type":"Ready","status":"False","reason":"InProgress"}]}}}`,
-		`{"ts":"2026-09-28T12:00:05Z","type":"update","gvr":"podsnapshots.v1alpha1.podsnapshot.gke.io","obj":{"metadata":{"name":"ps-clean-0","namespace":"default"},"spec":{"podName":"app-0"},"status":{"conditions":[{"type":"Checkpoint","status":"True","reason":"Succeeded"},{"type":"StorageReplicated","status":"True","reason":"Succeeded"},{"type":"Ready","status":"True","reason":"AllSnapshotsAvailable"}]}}}`,
-		`{"ts":"2026-09-28T12:00:10Z","type":"update","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-clean-0","namespace":"default"},"spec":{"podRef":{"name":"app-0"}},"status":{"phase":"Succeeded","snapshotName":"ps-clean-0","restoredPodName":"app-0-dst"}}}`,
+		`{"ts":"2026-09-28T12:00:01Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"app-0","namespace":"default","uid":"uid-src-0"},"spec":{"nodeName":"node-a"},"status":{"phase":"Running"}}}`,
+		`{"ts":"2026-09-28T12:00:02Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-clean-0","namespace":"default"},"spec":{"podRef":{"name":"app-0"}},"status":{"phase":"Snapshotting","snapshotRef":"ps-clean-0"}}}`,
+		`{"ts":"2026-09-28T12:00:05Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"app-0-dst","namespace":"default","uid":"uid-dst-0","annotations":{"gke.io/pod-snapshot-restore-name":"ps-clean-0"}},"spec":{"nodeName":"node-b"},"status":{"phase":"Running"}}}`,
+		`{"ts":"2026-09-28T12:00:10Z","type":"update","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-clean-0","namespace":"default"},"spec":{"podRef":{"name":"app-0"}},"status":{"phase":"Succeeded","snapshotRef":"ps-clean-0","restoredPodName":"app-0-dst"}}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(greenTrace, []byte(cleanNDJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Write a blind-spot run.json + records.ndjson reproducing Issue #75:
-	// PMJ transitions to Failed (SnapshotFailed) while PodSnapshot Checkpoint=InProgress,
-	// and invariantViolations == 0.
+	// Write a blind-spot run.json using pmprofiler's exact schema:
+	// invariantViolations is map[string]float64 ({}), totalInvariantViolations is 0,
+	// and MigrationRecord uses pod, snapshotName, phase, tTerminal.
 	runJSON := `{
-  "scenario": "T3-S2 burst drain blind spot (#75)",
-  "outcomes": {"failed": 1},
-  "invariantViolations": 0,
+  "scenario": "synthetic-self-test: wedged-restoring-orphan",
+  "outcomes": {"stalled": 1},
+  "invariantViolations": {},
+  "totalInvariantViolations": 0,
   "migrations": [
     {
       "app": "t3-counter",
-      "srcPod": "t3-counter-0",
-      "pmj": "pmj-race-0",
-      "snapshot": "ps-race-0",
-      "outcome": "failed",
-      "finalPhase": "Failed",
+      "pod": "t3-counter-0",
+      "pmj": "pmj-wedge-0",
+      "snapshotName": "ps-wedge-0",
+      "outcome": "stalled",
+      "phase": "Restoring",
       "t0": "2026-09-28T00:26:58Z",
-      "tEnd": "2026-09-28T00:27:00Z"
+      "tTerminal": "2026-09-28T00:29:58Z"
     }
   ]
 }`
 	recordsNDJSON := strings.Join([]string{
-		`{"ts":"2026-09-28T00:26:58Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-race-0","namespace":"default"},"spec":{"podRef":{"name":"t3-counter-0"}},"status":{"phase":"Snapshotting","snapshotName":"ps-race-0"}}}`,
-		`{"ts":"2026-09-28T00:26:59Z","type":"add","gvr":"podsnapshots.v1alpha1.podsnapshot.gke.io","obj":{"metadata":{"name":"ps-race-0","namespace":"default"},"spec":{"podName":"t3-counter-0"},"status":{"conditions":[{"type":"Checkpoint","status":"False","reason":"InProgress"},{"type":"StorageReplicated","status":"False","reason":"AwaitingCheckpoint"},{"type":"Ready","status":"False","reason":"Failed","message":"Failed to take snapshot (1)."}]}}}`,
-		`{"ts":"2026-09-28T00:27:00Z","type":"update","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-race-0","namespace":"default"},"spec":{"podRef":{"name":"t3-counter-0"}},"status":{"phase":"Failed","reason":"SnapshotFailed","message":"PodSnapshot ps-race-0 condition Ready failed: Failed to take snapshot (1).","snapshotName":"ps-race-0"}}}`,
+		`{"ts":"2026-09-28T00:26:58Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"t3-counter-0","namespace":"default","uid":"uid-src-wedge"},"spec":{"nodeName":"node-a"},"status":{"phase":"Running"}}}`,
+		`{"ts":"2026-09-28T00:27:05Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-wedge-0","namespace":"default"},"spec":{"podRef":{"name":"t3-counter-0"}},"status":{"phase":"Restoring","snapshotRef":"ps-wedge-0","restoredPodName":"t3-counter-0-dst","restoringStartTime":"2026-09-28T00:27:05Z"}}}`,
 	}, "\n") + "\n"
 
 	if err := os.WriteFile(filepath.Join(runDir, "run.json"), []byte(runJSON), 0o644); err != nil {
@@ -77,40 +77,118 @@ func TestDetectAndVerifyPrematureSnapshotFailedBlindSpot(t *testing.T) {
 	if len(findings) != 1 {
 		t.Fatalf("expected 1 blind spot finding, got %d", len(findings))
 	}
-	if findings[0].Template != TemplatePrematureSnapshotFailed {
-		t.Fatalf("expected template %q, got %q", TemplatePrematureSnapshotFailed, findings[0].Template)
+	if findings[0].Template != TemplateWedgedRestoringOrphan {
+		t.Fatalf("expected template %q, got %q", TemplateWedgedRestoringOrphan, findings[0].Template)
+	}
+	if findings[0].SourcePod != "t3-counter-0" || findings[0].Snapshot.PrimaryPMJ == nil || findings[0].Snapshot.PrimaryPMJ.Status.SnapshotRef != "ps-wedge-0" {
+		t.Fatalf("expected pmprofiler field mapping (pod/snapshotName) to populate SourcePod and PrimaryPMJ.Status.SnapshotRef, got sourcePod=%q primaryPMJ=%+v",
+			findings[0].SourcePod, findings[0].Snapshot.PrimaryPMJ)
 	}
 
-	proof, err := SynthesizeAndVerify(findings[0], outDir, []string{greenTrace})
+	proof, err := SynthesizeAndVerify(findings[0], outDir, "", []string{greenTrace})
 	if err != nil {
 		t.Fatalf("SynthesizeAndVerify failed: %v", err)
 	}
-	if !proof.RedPassed || len(proof.RedViolations) != 1 {
-		t.Fatalf("expected RED proof to pass with 1 violation, got passed=%v violations=%v", proof.RedPassed, proof.RedViolations)
+	if !proof.CompiledAndTested {
+		t.Fatalf("expected compiled go test verification to run, redOut=%s greenOut=%s", proof.RedTestOutput, proof.GreenTestOutput)
 	}
-	if !proof.GreenPassed || len(proof.GreenViolations) != 0 {
-		t.Fatalf("expected GREEN proof to pass with 0 violations, got passed=%v violations=%v", proof.GreenPassed, proof.GreenViolations)
+	if !proof.RedPassed {
+		t.Fatalf("expected RED proof to pass via go test, got redOut:\n%s", proof.RedTestOutput)
+	}
+	if !proof.GreenPassed {
+		t.Fatalf("expected GREEN proof to pass via go test, got greenOut:\n%s", proof.GreenTestOutput)
 	}
 	if proof.GreenTraceStepsChecked != 2 {
 		t.Fatalf("expected 2 PMJ trace steps checked in clean_records.ndjson, got %d", proof.GreenTraceStepsChecked)
 	}
-	for _, p := range []string{proof.SnapshotFixturePath, proof.RuleFilePath, proof.TestFilePath, proof.PRBodyPath} {
+	if !strings.Contains(proof.RedTestOutput, "PASS: TestI10_RestoringReplacementLiveness_RedProof") ||
+		!strings.Contains(proof.GreenTestOutput, "PASS: TestI10_RestoringReplacementLiveness_GreenProof") {
+		t.Fatalf("expected compiled go test output to include RedProof and GreenProof PASS lines, got:\nRED:\n%s\nGREEN:\n%s",
+			proof.RedTestOutput, proof.GreenTestOutput)
+	}
+	for _, p := range []string{proof.SnapshotFixturePath, proof.GreenFixturesPath, proof.RuleFilePath, proof.TestFilePath, proof.PRBodyPath} {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("expected generated artifact %s to exist: %v", p, err)
 		}
 	}
 }
 
+func TestDetectAndVerifyEvictingStallAndColdStartTemplates(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		invID    string
+		runJSON  string
+		ndjson   string
+		template TemplateClass
+	}{
+		{
+			name:  "no-replacement-evicting-stall",
+			invID: "I11",
+			runJSON: `{
+  "scenario": "synthetic-self-test: evicting-stall",
+  "outcomes": {"stalled": 1},
+  "invariantViolations": {},
+  "totalInvariantViolations": 0,
+  "migrations": [{"app": "zk", "pod": "zk-0", "pmj": "pmj-evict-0", "outcome": "stalled", "phase": "Evicting"}]
+}`,
+			ndjson:   `{"ts":"2026-09-28T01:00:00Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-evict-0","namespace":"default"},"spec":{"podRef":{"name":"zk-0"}},"status":{"phase":"Evicting","snapshotRef":"ps-evict-0","evictingStartTime":"2026-09-28T01:00:00Z"}}}` + "\n",
+			template: TemplateNoReplacementEvictingStall,
+		},
+		{
+			name:  "unintended-cold-start-active-pmj",
+			invID: "I12",
+			runJSON: `{
+  "scenario": "synthetic-self-test: unintended-cold-start",
+  "outcomes": {"cold-start": 1},
+  "invariantViolations": {},
+  "totalInvariantViolations": 0,
+  "migrations": [{"app": "pg", "pod": "pg-0", "pmj": "pmj-cold-0", "snapshotName": "ps-cold-0", "outcome": "cold-start", "phase": "Running"}]
+}`,
+			ndjson: strings.Join([]string{
+				`{"ts":"2026-09-28T01:00:00Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"pg-0-new","namespace":"default","uid":"uid-cold-new","annotations":{"gke.io/pod-snapshot-restore-name":""}},"spec":{"nodeName":"node-b"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}}`,
+				`{"ts":"2026-09-28T01:00:01Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-cold-0","namespace":"default"},"spec":{"podRef":{"name":"pg-0"}},"status":{"phase":"Restoring","snapshotRef":"ps-cold-0","restoredPodName":"pg-0-new"}}}`,
+			}, "\n") + "\n",
+			template: TemplateUnintendedColdStartActivePMJ,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(runDir, "run.json"), []byte(tc.runJSON), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(runDir, "records.ndjson"), []byte(tc.ndjson), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			findings, err := DetectBlindSpots(runDir, tc.invID, false)
+			if err != nil {
+				t.Fatalf("DetectBlindSpots failed: %v", err)
+			}
+			if len(findings) != 1 || findings[0].Template != tc.template {
+				t.Fatalf("expected 1 finding with template %s, got %+v", tc.template, findings)
+			}
+			proof, err := SynthesizeAndVerify(findings[0], t.TempDir(), "", nil)
+			if err != nil {
+				t.Fatalf("SynthesizeAndVerify failed: %v", err)
+			}
+			if !proof.CompiledAndTested || !proof.RedPassed || !proof.GreenPassed {
+				t.Fatalf("expected compiled go test RED and GREEN to pass for %s, got compiled=%v red=%v green=%v\nRED:\n%s\nGREEN:\n%s",
+					tc.name, proof.CompiledAndTested, proof.RedPassed, proof.GreenPassed, proof.RedTestOutput, proof.GreenTestOutput)
+			}
+		})
+	}
+}
+
 func TestDetectBlindSpotsSkipsAlreadyCaughtAndHealthyRuns(t *testing.T) {
 	runDir := t.TempDir()
-	// 1. Run where I1-I9 already recorded invariantViolations > 0: not a blind spot.
-	caughtJSON := `{
-  "scenario": "already-caught",
+	// 1. Run where I1-I9 already recorded invariantViolations map (real pmprofiler schema): not a blind spot.
+	caughtMapJSON := `{
+  "scenario": "already-caught-map",
   "outcomes": {"failed": 1},
-  "invariantViolations": 1,
+  "invariantViolations": {"I3": 1},
+  "totalInvariantViolations": 1,
   "migrations": [{"app": "a", "pmj": "pmj-1", "outcome": "failed"}]
 }`
-	if err := os.WriteFile(filepath.Join(runDir, "run.json"), []byte(caughtJSON), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(runDir, "run.json"), []byte(caughtMapJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(runDir, "records.ndjson"), []byte(""), 0o644); err != nil {
@@ -121,14 +199,15 @@ func TestDetectBlindSpotsSkipsAlreadyCaughtAndHealthyRuns(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(findings) != 0 {
-		t.Fatalf("expected 0 blind spots when invariantViolations > 0, got %d", len(findings))
+		t.Fatalf("expected 0 blind spots when invariantViolations map has entries, got %d", len(findings))
 	}
 
 	// 2. Run with cold-start when allowColdStart=true: not a blind spot.
 	expectedColdJSON := `{
   "scenario": "expected-cold-start",
   "outcomes": {"cold-start": 1},
-  "invariantViolations": 0,
+  "invariantViolations": {},
+  "totalInvariantViolations": 0,
   "migrations": [{"app": "a", "pmj": "pmj-1", "outcome": "cold-start"}]
 }`
 	if err := os.WriteFile(filepath.Join(runDir, "run.json"), []byte(expectedColdJSON), 0o644); err != nil {
@@ -144,7 +223,7 @@ func TestDetectBlindSpotsSkipsAlreadyCaughtAndHealthyRuns(t *testing.T) {
 }
 
 func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
-	// 1. Trigger C (/extract-invariant) for wedged restoring orphan: passes RED & GREEN.
+	// 1. Trigger C (/extract-invariant) for wedged restoring orphan: passes compiled go test RED & GREEN.
 	f1, err := ParseTriggerCommentOrPR("I10", "/extract-invariant I11 wedged-restoring-orphan PMJ stuck in Restoring after replacement pod deleted", "")
 	if err != nil {
 		t.Fatalf("ParseTriggerCommentOrPR failed: %v", err)
@@ -152,16 +231,17 @@ func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 	if f1.InvariantID != "I11" || f1.Template != TemplateWedgedRestoringOrphan {
 		t.Fatalf("unexpected finding: id=%s template=%s", f1.InvariantID, f1.Template)
 	}
-	p1, err := SynthesizeAndVerify(f1, t.TempDir(), nil)
+	p1, err := SynthesizeAndVerify(f1, t.TempDir(), "", nil)
 	if err != nil {
 		t.Fatalf("SynthesizeAndVerify failed: %v", err)
 	}
-	if !p1.RedPassed || !p1.GreenPassed {
-		t.Fatalf("expected wedged-restoring-orphan template to pass RED and GREEN, got red=%v green=%v", p1.RedPassed, p1.GreenPassed)
+	if !p1.CompiledAndTested || !p1.RedPassed || !p1.GreenPassed {
+		t.Fatalf("expected wedged-restoring-orphan template to pass compiled go test RED and GREEN, got compiled=%v red=%v green=%v",
+			p1.CompiledAndTested, p1.RedPassed, p1.GreenPassed)
 	}
 
-	// 2. Custom novel directive: must set RequiresAuthorBody=true and RedPassed=false
-	// (never falsely claiming RED/GREEN passed on an unauthored scaffold).
+	// 2. Custom novel directive (or premature-snapshot-failed before ReconcileSnapshot carries PodSnapshot):
+	// must set RequiresAuthorBody=true and fail the compiled RED proof (RedPassed=false, GreenPassed=false).
 	f2, err := ParseTriggerCommentOrPR("I12", "/extract-invariant I12 custom-novel-check some brand new cross-resource invariant", "")
 	if err != nil {
 		t.Fatalf("ParseTriggerCommentOrPR custom failed: %v", err)
@@ -169,11 +249,11 @@ func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 	if f2.Template != TemplateCustomScaffold {
 		t.Fatalf("expected TemplateCustomScaffold, got %s", f2.Template)
 	}
-	p2, err := SynthesizeAndVerify(f2, t.TempDir(), nil)
+	p2, err := SynthesizeAndVerify(f2, t.TempDir(), "", nil)
 	if err != nil {
 		t.Fatalf("SynthesizeAndVerify custom failed: %v", err)
 	}
-	if !p2.RequiresAuthorBody || p2.RedPassed || p2.GreenPassed {
-		t.Fatalf("expected custom scaffold to require author body and report redPassed=false greenPassed=false, got %+v", p2)
+	if !p2.RequiresAuthorBody || !p2.CompiledAndTested || p2.RedPassed || p2.GreenPassed {
+		t.Fatalf("expected custom scaffold to compile and run go test, require author body, and report redPassed=false greenPassed=false, got %+v", p2)
 	}
 }

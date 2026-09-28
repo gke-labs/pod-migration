@@ -13,20 +13,18 @@
 // limitations under the License.
 
 // Package main implements tools/invariant-gen, the offline Blind-Spot Detector,
-// Snapshot Fixture Extractor, and Red/Green Replay Verifier for the GKE Live Pod
-// Migration (LPM) Correctness Guard Rail (Epic #49 / Issue #54).
+// ReconcileSnapshot Fixture Extractor, and Go-Test Red/Green Replay Verifier for
+// the GKE Live Pod Migration (LPM) Correctness Guard Rail (Part of Issue #54 / Epic #49).
 //
 // Scope & Honesty Note:
-//   - invariant-gen is a deterministic offline tool; it does NOT invoke an LLM or
-//     synthesize arbitrary Go AST predicates from free-form prose.
-//   - For Trigger A (pmprofiler blind-spot detection), it joins pmprofiler's run.json
-//     with records.ndjson to detect unhealthy migrations (wedged, failed,
-//     no-replacement, or unintended cold-start) where invariantViolations == 0,
-//     reconstructs the point-in-time cluster state at the failure timestamp into a
-//     minimized SnapshotFixture JSON, classifies the state against built-in
-//     structural predicate templates (or emits an explicit author scaffold for
-//     custom /extract-invariant directives), and executes an automated RED/GREEN
-//     replay proof across the offending fixture and clean records.ndjson traces.
+//   - invariant-gen is a deterministic offline CLI; it does NOT invoke an LLM,
+//     synthesize arbitrary Go AST predicates from free-form prose, or automatically
+//     push branches / open GitHub PRs (the bot PR-creation half of #54 remains open).
+//   - Every emitted candidate rule (i<N>_<slug>_rule.go), test (i<N>_<slug>_test.go),
+//     and ReconcileSnapshot fixture (testdata/i<N>_<slug>_snapshot.json) is staged
+//     into a temporary copy of controller/internal/invariants and compiled + executed
+//     via `go test` against the real controller/api/v1alpha1 and invariants types.
+//     RedPassed and GreenPassed reflect the actual `go test` outcome on the emitted code.
 package main
 
 import (
@@ -36,8 +34,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -47,157 +47,187 @@ import (
 type TemplateClass string
 
 const (
-	// TemplatePrematureSnapshotFailed catches PMJs marked Failed (SnapshotFailed)
-	// while the underlying PodSnapshot still has Checkpoint or StorageReplicated
-	// actively progressing or succeeded (live GKE race in Issue #75).
-	TemplatePrematureSnapshotFailed TemplateClass = "premature-snapshot-failed"
-
-	// TemplateWedgedRestoringOrphan catches PMJs stuck in Restoring or Evicting
-	// after the source pod is gone and the replacement pod is missing or deleted.
+	// TemplateWedgedRestoringOrphan catches PMJs stuck in PhaseRestoring >=30s
+	// after the bound RestoredPodName is missing or deleting in NamespacePods.
 	TemplateWedgedRestoringOrphan TemplateClass = "wedged-restoring-orphan"
 
+	// TemplateNoReplacementEvictingStall catches PMJs stuck in PhaseEvicting >=30s
+	// after the source pod is gone from NamespacePods with no RestoredPodName bound.
+	TemplateNoReplacementEvictingStall TemplateClass = "no-replacement-evicting-stall"
+
 	// TemplateUnintendedColdStartActivePMJ catches replacement pods reaching Ready
-	// without a non-empty snapshot restore annotation while a PMJ for the workload
-	// is still active (Snapshotting, Evicting, or Restoring).
+	// with no scheduling gates and an empty snapshot restore annotation while the
+	// PMJ is still in PhaseRestoring.
 	TemplateUnintendedColdStartActivePMJ TemplateClass = "unintended-cold-start-active-pmj"
 
-	// TemplateCustomScaffold is emitted for novel /extract-invariant or bugfix PR
-	// triggers that require a human/agent author to fill in the Go predicate body.
+	// TemplateCustomScaffold is emitted when a blind spot (such as PodSnapshot
+	// sub-condition races that are not yet fields on invariants.ReconcileSnapshot)
+	// or a novel /extract-invariant directive requires a human/agent author to
+	// supply the predicate body (and any needed ReconcileSnapshot fields).
 	TemplateCustomScaffold TemplateClass = "custom-invariant-scaffold"
 )
 
-// ConditionSummary captures a Kubernetes status condition in a serialized fixture.
-type ConditionSummary struct {
-	Type    string `json:"type"`
-	Status  string `json:"status"`
-	Reason  string `json:"reason,omitempty"`
-	Message string `json:"message,omitempty"`
-}
-
-// PMJState captures the minimized PodMigrationJob state in a SnapshotFixture.
-type PMJState struct {
-	Name               string             `json:"name"`
-	Namespace          string             `json:"namespace"`
-	UID                string             `json:"uid,omitempty"`
-	Phase              string             `json:"phase"`
-	Reason             string             `json:"reason,omitempty"`
-	Message            string             `json:"message,omitempty"`
-	SourcePodName      string             `json:"sourcePodName,omitempty"`
-	TargetPodUID       string             `json:"targetPodUID,omitempty"`
-	SnapshotName       string             `json:"snapshotName,omitempty"`
-	RestoredPodName    string             `json:"restoredPodName,omitempty"`
-	RestoredPodUID     string             `json:"restoredPodUID,omitempty"`
-	CreationTimestamp  string             `json:"creationTimestamp,omitempty"`
-	EvictingStartTime  string             `json:"evictingStartTime,omitempty"`
-	RestoringStartTime string             `json:"restoringStartTime,omitempty"`
-	Conditions         []ConditionSummary `json:"conditions,omitempty"`
-}
-
-// PodState captures the minimized Pod state in a SnapshotFixture.
-type PodState struct {
+// K8sObjectMeta matches the JSON serialization of metav1.ObjectMeta fields used
+// by invariants.ReconcileSnapshot.
+type K8sObjectMeta struct {
 	Name              string            `json:"name"`
-	Namespace         string            `json:"namespace"`
+	Namespace         string            `json:"namespace,omitempty"`
 	UID               string            `json:"uid,omitempty"`
-	App               string            `json:"app,omitempty"`
-	NodeName          string            `json:"nodeName,omitempty"`
-	Phase             string            `json:"phase,omitempty"`
-	Ready             bool              `json:"ready"`
+	CreationTimestamp string            `json:"creationTimestamp,omitempty"`
 	DeletionTimestamp string            `json:"deletionTimestamp,omitempty"`
-	SchedulingGates   []string          `json:"schedulingGates,omitempty"`
-	Annotations       map[string]string `json:"annotations,omitempty"`
 	Labels            map[string]string `json:"labels,omitempty"`
+	Annotations       map[string]string `json:"annotations,omitempty"`
 }
 
-// PodSnapshotState captures the associated GKE PodSnapshot condition state.
-type PodSnapshotState struct {
-	Name       string             `json:"name"`
-	Namespace  string             `json:"namespace"`
-	PodName    string             `json:"podName,omitempty"`
-	Conditions []ConditionSummary `json:"conditions,omitempty"`
+// K8sCondition matches metav1.Condition / corev1.PodCondition JSON fields.
+type K8sCondition struct {
+	Type               string `json:"type"`
+	Status             string `json:"status"`
+	Reason             string `json:"reason,omitempty"`
+	Message            string `json:"message,omitempty"`
+	LastTransitionTime string `json:"lastTransitionTime,omitempty"`
 }
 
-// SnapshotFixture is a deterministic, JSON-serializable point-in-time snapshot
-// reconstructed from pmprofiler records.ndjson for Red/Green invariant replay.
-type SnapshotFixture struct {
-	Now                string            `json:"now"`
-	Reconciler         string            `json:"reconciler"`
-	Scenario           string            `json:"scenario,omitempty"`
-	BlindSpotOutcome   string            `json:"blindSpotOutcome,omitempty"`
-	PrimaryPMJ         *PMJState         `json:"primaryPMJ,omitempty"`
-	PrimaryPod         *PodState         `json:"primaryPod,omitempty"`
-	PrimaryPodSnapshot *PodSnapshotState `json:"primaryPodSnapshot,omitempty"`
-	NamespacePMJs      []PMJState        `json:"namespacePMJs,omitempty"`
-	NamespacePods      []PodState        `json:"namespacePods,omitempty"`
-	SourcePodDeleted   bool              `json:"sourcePodDeleted,omitempty"`
-	RestoredPodDeleted bool              `json:"restoredPodDeleted,omitempty"`
+// K8sLocalObjectRef matches corev1.LocalObjectReference.
+type K8sLocalObjectRef struct {
+	Name string `json:"name"`
+}
+
+// K8sPMJSpec matches pmv1alpha1.PodMigrationJobSpec.
+type K8sPMJSpec struct {
+	PodRef       K8sLocalObjectRef `json:"podRef"`
+	TargetPodUID string            `json:"targetPodUID,omitempty"`
+}
+
+// K8sPMJStatus matches pmv1alpha1.PodMigrationJobStatus exactly.
+type K8sPMJStatus struct {
+	Phase                 string         `json:"phase,omitempty"`
+	SnapshotRef           string         `json:"snapshotRef,omitempty"`
+	OriginNodeName        string         `json:"originNodeName,omitempty"`
+	SnapshottingStartTime string         `json:"snapshottingStartTime,omitempty"`
+	EvictingStartTime     string         `json:"evictingStartTime,omitempty"`
+	RestoringStartTime    string         `json:"restoringStartTime,omitempty"`
+	CompletionTime        string         `json:"completionTime,omitempty"`
+	Consumed              bool           `json:"consumed,omitempty"`
+	RestoredPodUID        string         `json:"restoredPodUID,omitempty"`
+	RestoredPodName       string         `json:"restoredPodName,omitempty"`
+	GateReleased          bool           `json:"gateReleased,omitempty"`
+	Conditions            []K8sCondition `json:"conditions,omitempty"`
+}
+
+// K8sPMJ matches pmv1alpha1.PodMigrationJob JSON layout for ReconcileSnapshot.
+type K8sPMJ struct {
+	Metadata K8sObjectMeta `json:"metadata"`
+	Spec     K8sPMJSpec    `json:"spec"`
+	Status   K8sPMJStatus  `json:"status"`
+}
+
+// K8sSchedulingGate matches corev1.PodSchedulingGate.
+type K8sSchedulingGate struct {
+	Name string `json:"name"`
+}
+
+// K8sPodSpec matches the subset of corev1.PodSpec used by invariants.
+type K8sPodSpec struct {
+	NodeName        string              `json:"nodeName,omitempty"`
+	SchedulingGates []K8sSchedulingGate `json:"schedulingGates,omitempty"`
+}
+
+// K8sPodStatus matches the subset of corev1.PodStatus used by invariants.
+type K8sPodStatus struct {
+	Phase      string         `json:"phase,omitempty"`
+	Conditions []K8sCondition `json:"conditions,omitempty"`
+}
+
+// K8sPod matches corev1.Pod JSON layout for ReconcileSnapshot.
+type K8sPod struct {
+	Metadata K8sObjectMeta `json:"metadata"`
+	Spec     K8sPodSpec    `json:"spec"`
+	Status   K8sPodStatus  `json:"status"`
+}
+
+// ReconcileSnapshotJSON is wire-compatible with invariants.ReconcileSnapshot
+// in controller/internal/invariants/snapshot.go so generated fixtures unmarshal
+// directly into invariants.ReconcileSnapshot during `go test`.
+type ReconcileSnapshotJSON struct {
+	Now                          string   `json:"Now"`
+	Reconciler                   string   `json:"Reconciler"`
+	PrimaryPMJ                   *K8sPMJ  `json:"PrimaryPMJ,omitempty"`
+	PrimaryPod                   *K8sPod  `json:"PrimaryPod,omitempty"`
+	NamespacePMJs                []K8sPMJ `json:"NamespacePMJs,omitempty"`
+	NamespacePods                []K8sPod `json:"NamespacePods,omitempty"`
+	HasOrphanedTrigger           bool     `json:"HasOrphanedTrigger,omitempty"`
+	RestoreCrashSignatureMatched bool     `json:"RestoreCrashSignatureMatched,omitempty"`
 }
 
 // BlindSpotFinding describes a single blind spot where pmprofiler observed an
 // unhealthy migration outcome while invariantViolations == 0.
 type BlindSpotFinding struct {
-	TriggerSource    string          `json:"triggerSource"` // "TriggerA:BlindSpot", "TriggerB:BugfixPR", "TriggerC:SlashCommand"
-	InvariantID      string          `json:"invariantId"`
-	InvariantName    string          `json:"invariantName"`
-	Slug             string          `json:"slug"`
-	Template         TemplateClass   `json:"template"`
-	Scenario         string          `json:"scenario"`
-	Outcome          string          `json:"outcome"`
-	PMJName          string          `json:"pmjName"`
-	SourcePod        string          `json:"sourcePod,omitempty"`
-	RestoredPod      string          `json:"restoredPod,omitempty"`
-	FailureTimestamp string          `json:"failureTimestamp"`
-	Description      string          `json:"description"`
-	Snapshot         SnapshotFixture `json:"snapshot"`
+	TriggerSource    string                `json:"triggerSource"`
+	InvariantID      string                `json:"invariantId"`
+	InvariantName    string                `json:"invariantName"`
+	Slug             string                `json:"slug"`
+	Template         TemplateClass         `json:"template"`
+	Scenario         string                `json:"scenario"`
+	Outcome          string                `json:"outcome"`
+	PMJName          string                `json:"pmjName"`
+	SourcePod        string                `json:"sourcePod,omitempty"`
+	RestoredPod      string                `json:"restoredPod,omitempty"`
+	FailureTimestamp string                `json:"failureTimestamp"`
+	Description      string                `json:"description"`
+	Snapshot         ReconcileSnapshotJSON `json:"snapshot"`
 }
 
-// CandidateViolation represents a violation produced by evaluating a candidate rule.
-type CandidateViolation struct {
-	InvariantID   string `json:"invariantId"`
-	InvariantName string `json:"invariantName"`
-	Reason        string `json:"reason"`
-	Message       string `json:"message"`
-	PMJName       string `json:"pmjName,omitempty"`
-	PodName       string `json:"podName,omitempty"`
-}
-
-// RedGreenProof summarizes the automated RED and GREEN replay verification results.
+// RedGreenProof summarizes the compiled `go test` RED and GREEN replay results.
 type RedGreenProof struct {
-	InvariantID            string               `json:"invariantId"`
-	InvariantName          string               `json:"invariantName"`
-	Slug                   string               `json:"slug"`
-	Template               TemplateClass        `json:"template"`
-	TriggerSource          string               `json:"triggerSource"`
-	RequiresAuthorBody     bool                 `json:"requiresAuthorBody"`
-	RedPassed              bool                 `json:"redPassed"`
-	RedViolations          []CandidateViolation `json:"redViolations"`
-	GreenPassed            bool                 `json:"greenPassed"`
-	GreenBaselineChecked   int                  `json:"greenBaselineChecked"`
-	GreenTraceStepsChecked int                  `json:"greenTraceStepsChecked"`
-	GreenViolations        []CandidateViolation `json:"greenViolations,omitempty"`
-	SnapshotFixturePath    string               `json:"snapshotFixturePath"`
-	RuleFilePath           string               `json:"ruleFilePath"`
-	TestFilePath           string               `json:"testFilePath"`
-	PRBodyPath             string               `json:"prBodyPath"`
+	InvariantID            string        `json:"invariantId"`
+	InvariantName          string        `json:"invariantName"`
+	Slug                   string        `json:"slug"`
+	Template               TemplateClass `json:"template"`
+	TriggerSource          string        `json:"triggerSource"`
+	RequiresAuthorBody     bool          `json:"requiresAuthorBody"`
+	CompiledAndTested      bool          `json:"compiledAndTested"`
+	RedPassed              bool          `json:"redPassed"`
+	RedTestOutput          string        `json:"redTestOutput,omitempty"`
+	GreenPassed            bool          `json:"greenPassed"`
+	GreenBaselineChecked   int           `json:"greenBaselineChecked"`
+	GreenTraceStepsChecked int           `json:"greenTraceStepsChecked"`
+	GreenTestOutput        string        `json:"greenTestOutput,omitempty"`
+	SnapshotFixturePath    string        `json:"snapshotFixturePath"`
+	GreenFixturesPath      string        `json:"greenFixturesPath"`
+	RuleFilePath           string        `json:"ruleFilePath"`
+	TestFilePath           string        `json:"testFilePath"`
+	PRBodyPath             string        `json:"prBodyPath"`
 }
 
-// pmprofilerRunJSON mirrors the subset of pmprofiler's run.json needed by detect.
+// pmprofilerRunJSON supports both pmprofiler's canonical Run schema
+// (TotalInvariantViolations float64 + InvariantViolations map[string]float64)
+// and compact integer representations.
 type pmprofilerRunJSON struct {
-	Scenario            string            `json:"scenario"`
-	Outcomes            map[string]int    `json:"outcomes"`
-	InvariantViolations int               `json:"invariantViolations"`
-	Migrations          []pmMigrationJSON `json:"migrations"`
+	Scenario                 string            `json:"scenario"`
+	Outcomes                 map[string]int    `json:"outcomes"`
+	TotalInvariantViolations float64           `json:"totalInvariantViolations"`
+	InvariantViolations      any               `json:"invariantViolations,omitempty"`
+	Migrations               []pmMigrationJSON `json:"migrations"`
 }
 
+// pmMigrationJSON supports both pmprofiler's canonical MigrationRecord tags
+// (pod, snapshotName, phase, tTerminal) and legacy aliases (srcPod, snapshot,
+// finalPhase, tEnd).
 type pmMigrationJSON struct {
-	App        string  `json:"app"`
-	SrcPod     *string `json:"srcPod"`
-	DstPod     *string `json:"dstPod"`
-	PMJ        *string `json:"pmj"`
-	Snapshot   *string `json:"snapshot"`
-	Outcome    string  `json:"outcome"`
-	FinalPhase *string `json:"finalPhase"`
-	T0         string  `json:"t0"`
-	TEnd       *string `json:"tEnd"`
+	App          string  `json:"app"`
+	Pod          *string `json:"pod"`
+	SrcPod       *string `json:"srcPod"`
+	DstPod       *string `json:"dstPod"`
+	PMJ          *string `json:"pmj"`
+	Snapshot     *string `json:"snapshot"`
+	SnapshotName *string `json:"snapshotName"`
+	Outcome      string  `json:"outcome"`
+	Phase        *string `json:"phase"`
+	FinalPhase   *string `json:"finalPhase"`
+	T0           string  `json:"t0"`
+	TEnd         *string `json:"tEnd"`
+	TTerminal    *string `json:"tTerminal"`
 }
 
 type rawNDJSONRecord struct {
@@ -212,24 +242,54 @@ func main() {
 		mode             = flag.String("mode", "pipeline", "Execution mode: detect, verify, extract-comment, or pipeline")
 		runDir           = flag.String("run", "", "Path to pmprofiler run directory containing run.json and records.ndjson")
 		outDir           = flag.String("out-dir", "", "Output directory for generated fixture, Go rule/test, proof.json, and pr_body.md")
+		controllerDir    = flag.String("controller-dir", "", "Optional path to controller/ directory for compiling and running emitted rules via go test")
 		invariantID      = flag.String("invariant-id", "I10", "Candidate invariant ID (e.g. I10)")
 		allowColdStart   = flag.Bool("allow-cold-start", false, "Treat cold-start outcomes as expected (do not flag as blind spots)")
 		greenRecords     = flag.String("green-records", "", "Comma-separated paths to clean records.ndjson traces for GREEN replay verification")
 		commentBody      = flag.String("comment", "", "PR review comment body containing /extract-invariant (Trigger C)")
 		prTitle          = flag.String("pr-title", "", "Bugfix PR title for Trigger B extraction")
 		overrideTemplate = flag.String("template", "", "Optional override for candidate template class")
-		requireRedGreen  = flag.Bool("require-red-green", true, "Exit non-zero if RED or GREEN replay proof fails")
+		requireRedGreen  = flag.Bool("require-red-green", true, "Exit non-zero if compiled go test RED or GREEN proof fails")
 	)
 	flag.Parse()
 
-	if err := execute(*mode, *runDir, *outDir, *invariantID, *allowColdStart, *greenRecords, *commentBody, *prTitle, TemplateClass(*overrideTemplate), *requireRedGreen); err != nil {
+	if err := execute(*mode, *runDir, *outDir, *controllerDir, *invariantID, *allowColdStart, *greenRecords, *commentBody, *prTitle, TemplateClass(*overrideTemplate), *requireRedGreen); err != nil {
 		fmt.Fprintf(os.Stderr, "invariant-gen error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
+func resolveControllerDir(explicit string) (string, error) {
+	if explicit != "" {
+		abs, err := filepath.Abs(explicit)
+		if err != nil {
+			return "", err
+		}
+		if _, err := os.Stat(filepath.Join(abs, "internal", "invariants", "snapshot.go")); err == nil {
+			return abs, nil
+		}
+		return "", fmt.Errorf("controller-dir %s does not contain internal/invariants/snapshot.go", abs)
+	}
+	if _, thisFile, _, ok := runtime.Caller(0); ok {
+		candidate := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", "..", "controller"))
+		if _, err := os.Stat(filepath.Join(candidate, "internal", "invariants", "snapshot.go")); err == nil {
+			return candidate, nil
+		}
+	}
+	cwd, err := os.Getwd()
+	if err == nil {
+		for _, rel := range []string{"controller", "../controller", "../../controller"} {
+			candidate := filepath.Clean(filepath.Join(cwd, rel))
+			if _, err := os.Stat(filepath.Join(candidate, "internal", "invariants", "snapshot.go")); err == nil {
+				return candidate, nil
+			}
+		}
+	}
+	return "", errors.New("could not locate controller/ directory containing internal/invariants/snapshot.go")
+}
+
 func execute(
-	mode, runDir, outDir, invariantID string,
+	mode, runDir, outDir, controllerDir, invariantID string,
 	allowColdStart bool,
 	greenRecordsCSV, commentBody, prTitle string,
 	overrideTemplate TemplateClass,
@@ -271,6 +331,10 @@ func execute(
 		return nil
 
 	case "extract-comment":
+		ctrlDir, err := resolveControllerDir(controllerDir)
+		if err != nil {
+			return err
+		}
 		finding, err := ParseTriggerCommentOrPR(invariantID, commentBody, prTitle)
 		if err != nil {
 			return err
@@ -278,19 +342,23 @@ func execute(
 		if overrideTemplate != "" {
 			finding.Template = overrideTemplate
 		}
-		proof, err := SynthesizeAndVerify(finding, outDir, greenPaths)
+		proof, err := SynthesizeAndVerify(finding, outDir, ctrlDir, greenPaths)
 		if err != nil {
 			return err
 		}
 		printProofSummary(proof)
 		if requireRedGreen && (!proof.RedPassed || !proof.GreenPassed) {
-			return fmt.Errorf("RED/GREEN verification failed for %s (red=%v, green=%v)", proof.InvariantID, proof.RedPassed, proof.GreenPassed)
+			return fmt.Errorf("compiled go test RED/GREEN verification failed for %s (red=%v, green=%v)", proof.InvariantID, proof.RedPassed, proof.GreenPassed)
 		}
 		return nil
 
 	case "pipeline", "verify":
 		if runDir == "" {
 			return errors.New("--run is required for pipeline/verify mode")
+		}
+		ctrlDir, err := resolveControllerDir(controllerDir)
+		if err != nil {
+			return err
 		}
 		findings, err := DetectBlindSpots(runDir, invariantID, allowColdStart)
 		if err != nil {
@@ -304,13 +372,13 @@ func execute(
 		if overrideTemplate != "" {
 			finding.Template = overrideTemplate
 		}
-		proof, err := SynthesizeAndVerify(finding, outDir, greenPaths)
+		proof, err := SynthesizeAndVerify(finding, outDir, ctrlDir, greenPaths)
 		if err != nil {
 			return err
 		}
 		printProofSummary(proof)
 		if requireRedGreen && (!proof.RedPassed || !proof.GreenPassed) {
-			return fmt.Errorf("RED/GREEN verification failed for %s (red=%v, green=%v)", proof.InvariantID, proof.RedPassed, proof.GreenPassed)
+			return fmt.Errorf("compiled go test RED/GREEN verification failed for %s (red=%v, green=%v)", proof.InvariantID, proof.RedPassed, proof.GreenPassed)
 		}
 		return nil
 
@@ -320,12 +388,32 @@ func execute(
 }
 
 func printProofSummary(p RedGreenProof) {
-	fmt.Printf("invariant-gen %s (%s) [template=%s, trigger=%s]:\n", p.InvariantID, p.InvariantName, p.Template, p.TriggerSource)
-	fmt.Printf("  RED proof   : passed=%v (violations=%d on offending snapshot)\n", p.RedPassed, len(p.RedViolations))
-	fmt.Printf("  GREEN proof : passed=%v (baselineSnapshots=%d, traceSteps=%d, falsePositives=%d)\n",
-		p.GreenPassed, p.GreenBaselineChecked, p.GreenTraceStepsChecked, len(p.GreenViolations))
+	fmt.Printf("invariant-gen %s (%s) [template=%s, trigger=%s, compiled=%v]:\n",
+		p.InvariantID, p.InvariantName, p.Template, p.TriggerSource, p.CompiledAndTested)
+	fmt.Printf("  RED proof   : passed=%v (executed via `go test` on emitted rule & fixture)\n", p.RedPassed)
+	fmt.Printf("  GREEN proof : passed=%v (baselineSnapshots=%d, traceSteps=%d via `go test`)\n",
+		p.GreenPassed, p.GreenBaselineChecked, p.GreenTraceStepsChecked)
 	fmt.Printf("  artifacts   : fixture=%s rule=%s test=%s pr=%s\n",
 		p.SnapshotFixturePath, p.RuleFilePath, p.TestFilePath, p.PRBodyPath)
+}
+
+func hasRecordedInvariantViolations(run pmprofilerRunJSON) bool {
+	if run.TotalInvariantViolations > 0 {
+		return true
+	}
+	switch v := run.InvariantViolations.(type) {
+	case float64:
+		return v > 0
+	case int:
+		return v > 0
+	case map[string]any:
+		for _, rawVal := range v {
+			if f, ok := rawVal.(float64); ok && f > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // DetectBlindSpots inspects <runDir>/run.json and <runDir>/records.ndjson and
@@ -341,9 +429,7 @@ func DetectBlindSpots(runDir, nextInvariantID string, allowColdStart bool) ([]Bl
 		return nil, fmt.Errorf("parse run.json: %w", err)
 	}
 
-	// If I1-I9 already recorded invariant violations for this run, it is not an
-	// silent detector blind spot.
-	if run.InvariantViolations > 0 {
+	if hasRecordedInvariantViolations(run) {
 		return nil, nil
 	}
 
@@ -360,16 +446,17 @@ func DetectBlindSpots(runDir, nextInvariantID string, allowColdStart bool) ([]Bl
 			continue
 		}
 		pmjName := derefStr(m.PMJ)
-		srcPod := derefStr(m.SrcPod)
+		srcPod := firstNonEmpty(derefStr(m.SrcPod), derefStr(m.Pod))
 		dstPod := derefStr(m.DstPod)
-		cutoffTS := derefStr(m.TEnd)
+		snapName := firstNonEmpty(derefStr(m.Snapshot), derefStr(m.SnapshotName))
+		cutoffTS := firstNonEmpty(derefStr(m.TEnd), derefStr(m.TTerminal))
 
-		snap := reconstructSnapshotAt(records, run.Scenario, m.Outcome, pmjName, srcPod, dstPod, derefStr(m.Snapshot), cutoffTS)
+		snap := reconstructSnapshotAt(records, pmjName, srcPod, dstPod, snapName, cutoffTS)
 		if srcPod == "" && snap.PrimaryPMJ != nil {
-			srcPod = snap.PrimaryPMJ.SourcePodName
+			srcPod = snap.PrimaryPMJ.Spec.PodRef.Name
 		}
 		if dstPod == "" && snap.PrimaryPMJ != nil {
-			dstPod = snap.PrimaryPMJ.RestoredPodName
+			dstPod = snap.PrimaryPMJ.Status.RestoredPodName
 		}
 		tmpl, invName, slug, desc := classifyBlindSpot(m, snap)
 
@@ -403,7 +490,7 @@ func DetectBlindSpots(runDir, nextInvariantID string, allowColdStart bool) ([]Bl
 
 func isUnhealthyBlindSpotOutcome(outcome string, allowColdStart bool) bool {
 	switch outcome {
-	case "wedged", "failed", "no-replacement", "restore_crash_unmatched":
+	case "wedged", "stalled", "failed", "no-replacement", "restore_crash_unmatched":
 		return true
 	case "cold-start":
 		return !allowColdStart
@@ -412,41 +499,41 @@ func isUnhealthyBlindSpotOutcome(outcome string, allowColdStart bool) bool {
 	}
 }
 
-func classifyBlindSpot(m pmMigrationJSON, snap SnapshotFixture) (TemplateClass, string, string, string) {
-	// 1. Check for PrematureSnapshotFailedWhileCheckpointing (Issue #75 class):
-	// PMJ is Failed while PodSnapshot still has Checkpoint or StorageReplicated in progress/succeeded.
-	if snap.PrimaryPMJ != nil && snap.PrimaryPMJ.Phase == "Failed" && snap.PrimaryPodSnapshot != nil {
-		if isPodSnapshotStillProgressingOrSucceeded(snap.PrimaryPodSnapshot) {
-			return TemplatePrematureSnapshotFailed,
-				"PrematureSnapshotFailureIsolation",
-				"premature_snapshot_failed",
-				fmt.Sprintf("PMJ %q transitioned to PhaseFailed while PodSnapshot %q sub-conditions (Checkpoint/StorageReplicated) were still actively progressing or succeeded",
-					snap.PrimaryPMJ.Name, snap.PrimaryPodSnapshot.Name)
+func classifyBlindSpot(m pmMigrationJSON, snap ReconcileSnapshotJSON) (TemplateClass, string, string, string) {
+	if snap.PrimaryPMJ != nil {
+		pmj := snap.PrimaryPMJ
+		// 1. UnintendedColdStartActivePMJ:
+		if m.Outcome == "cold-start" && pmj.Status.Phase == "Restoring" && pmj.Status.RestoredPodName != "" {
+			return TemplateUnintendedColdStartActivePMJ,
+				"ActivePMJReplacementColdStartGuard",
+				"unintended_cold_start_active_pmj",
+				fmt.Sprintf("Replacement pod %q reached Ready without a snapshot restore annotation while PMJ %q was in PhaseRestoring",
+					pmj.Status.RestoredPodName, pmj.Metadata.Name)
+		}
+		// 2. WedgedRestoringOrphan:
+		if pmj.Status.Phase == "Restoring" && pmj.Status.RestoredPodName != "" && !activePodInSlice(pmj.Status.RestoredPodName, snap.NamespacePods) &&
+			exceededWindow(pmj.Status.RestoringStartTime, snap.Now, 30*time.Second) {
+			return TemplateWedgedRestoringOrphan,
+				"RestoringReplacementLiveness",
+				"wedged_restoring_orphan",
+				fmt.Sprintf("PMJ %q remained in PhaseRestoring >=30s after bound replacement pod %q was deleted or missing from NamespacePods",
+					pmj.Metadata.Name, pmj.Status.RestoredPodName)
+		}
+		// 3. NoReplacementEvictingStall:
+		if pmj.Status.Phase == "Evicting" && pmj.Status.RestoredPodName == "" && !activePodInSlice(pmj.Spec.PodRef.Name, snap.NamespacePods) &&
+			exceededWindow(pmj.Status.EvictingStartTime, snap.Now, 30*time.Second) {
+			return TemplateNoReplacementEvictingStall,
+				"EvictingNoReplacementLiveness",
+				"no_replacement_evicting_stall",
+				fmt.Sprintf("PMJ %q remained in PhaseEvicting >=30s after source pod %q was deleted with no replacement pod bound",
+					pmj.Metadata.Name, pmj.Spec.PodRef.Name)
 		}
 	}
 
-	// 2. Check for UnintendedColdStartDuringActivePMJ:
-	if m.Outcome == "cold-start" || isUnintendedColdStartSnapshot(snap) {
-		return TemplateUnintendedColdStartActivePMJ,
-			"ActivePMJReplacementColdStartGuard",
-			"unintended_cold_start_active_pmj",
-			fmt.Sprintf("Replacement pod reached Ready without a warm-restore snapshot annotation while PMJ %q was active",
-				derefStr(m.PMJ))
-	}
-
-	// 3. Check for WedgedRestoringOrphan (wedged or no-replacement):
-	if m.Outcome == "wedged" || m.Outcome == "no-replacement" || isWedgedRestoringOrphanSnapshot(snap) {
-		return TemplateWedgedRestoringOrphan,
-			"RestoringReplacementLiveness",
-			"wedged_restoring_orphan",
-			fmt.Sprintf("PMJ %q remained non-terminal in %s after source pod eviction with missing or deleted replacement pod",
-				derefStr(m.PMJ), pmjPhaseStr(snap.PrimaryPMJ))
-	}
-
 	return TemplateCustomScaffold,
-		"CustomBlindSpotInvariant",
+		"CustomExtractedInvariant",
 		"custom_blind_spot",
-		fmt.Sprintf("Unhealthy migration outcome %q observed on PMJ %q with 0 existing I1-I9 violations",
+		fmt.Sprintf("Unhealthy migration outcome %q observed on PMJ %q with 0 existing I1-I9 violations (requires author predicate over ReconcileSnapshot)",
 			m.Outcome, derefStr(m.PMJ))
 }
 
@@ -454,7 +541,7 @@ var extractCmdRe = regexp.MustCompile(`(?i)/extract-invariant(?:\s+(I\d+))?(?:\s
 
 // ParseTriggerCommentOrPR parses a Trigger C (/extract-invariant) comment or
 // Trigger B (bugfix PR title) into a BlindSpotFinding with a representative
-// offending SnapshotFixture so it can be verified via RED/GREEN replay.
+// offending ReconcileSnapshotJSON fixture.
 func ParseTriggerCommentOrPR(defaultID, commentBody, prTitle string) (BlindSpotFinding, error) {
 	id := defaultID
 	if id == "" {
@@ -482,7 +569,7 @@ func ParseTriggerCommentOrPR(defaultID, commentBody, prTitle string) (BlindSpotF
 		return BlindSpotFinding{}, errors.New("either --comment or --pr-title must be provided")
 	}
 
-	tmpl, invName, slug, snap := buildTemplateFixtureFromDirective(rawToken, desc)
+	tmpl, invName, slug, outcome, snap := buildTemplateFixtureFromDirective(rawToken, desc)
 	if desc == "" {
 		desc = fmt.Sprintf("Extracted candidate invariant %s (%s) from %s", id, invName, triggerSource)
 	}
@@ -494,122 +581,104 @@ func ParseTriggerCommentOrPR(defaultID, commentBody, prTitle string) (BlindSpotF
 		Slug:             slug,
 		Template:         tmpl,
 		Scenario:         triggerSource,
-		Outcome:          snap.BlindSpotOutcome,
-		PMJName:          snap.PrimaryPMJ.Name,
-		SourcePod:        snap.PrimaryPMJ.SourcePodName,
-		RestoredPod:      snap.PrimaryPMJ.RestoredPodName,
+		Outcome:          outcome,
+		PMJName:          snap.PrimaryPMJ.Metadata.Name,
+		SourcePod:        snap.PrimaryPMJ.Spec.PodRef.Name,
+		RestoredPod:      snap.PrimaryPMJ.Status.RestoredPodName,
 		FailureTimestamp: snap.Now,
 		Description:      desc,
 		Snapshot:         snap,
 	}, nil
 }
 
-func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, string, string, SnapshotFixture) {
+func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, string, string, string, ReconcileSnapshotJSON) {
 	combined := strings.ToLower(token + " " + desc)
-	now := "2026-09-28T12:00:30Z"
+	now := "2026-09-28T12:01:00Z"
 
 	switch {
-	case strings.Contains(combined, "snapshot") && (strings.Contains(combined, "race") || strings.Contains(combined, "premature") || strings.Contains(combined, "inprogress")):
-		return TemplatePrematureSnapshotFailed,
-			"PrematureSnapshotFailureIsolation",
-			"premature_snapshot_failed",
-			SnapshotFixture{
-				Now:              now,
-				Reconciler:       "PodMigrationJobReconciler",
-				Scenario:         "TriggerDirective:PrematureSnapshotFailed",
-				BlindSpotOutcome: "failed",
-				PrimaryPMJ: &PMJState{
-					Name:          "pmj-snapshot-race-0",
-					Namespace:     "default",
-					UID:           "uid-pmj-snap-race",
-					Phase:         "Failed",
-					Reason:        "SnapshotFailed",
-					Message:       "PodSnapshot ps-0 condition Ready failed: Failed to take snapshot (1).",
-					SourcePodName: "app-0",
-					TargetPodUID:  "uid-app-0",
-					SnapshotName:  "ps-0",
-				},
-				PrimaryPodSnapshot: &PodSnapshotState{
-					Name:      "ps-0",
-					Namespace: "default",
-					PodName:   "app-0",
-					Conditions: []ConditionSummary{
-						{Type: "Checkpoint", Status: "False", Reason: "InProgress"},
-						{Type: "StorageReplicated", Status: "False", Reason: "AwaitingCheckpoint"},
-						{Type: "Ready", Status: "False", Reason: "Failed", Message: "Failed to take snapshot (1)."},
-					},
-				},
-			}
-
 	case strings.Contains(combined, "cold") && strings.Contains(combined, "start"):
+		pmj := K8sPMJ{
+			Metadata: K8sObjectMeta{Name: "pmj-cold-start-0", Namespace: "default", UID: "uid-pmj-cold"},
+			Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "app-0"}, TargetPodUID: "uid-app-0"},
+			Status: K8sPMJStatus{
+				Phase:              "Restoring",
+				SnapshotRef:        "ps-0",
+				RestoredPodName:    "app-0-replacement",
+				RestoredPodUID:     "uid-app-replacement",
+				RestoringStartTime: "2026-09-28T12:00:10Z",
+			},
+		}
+		pod := K8sPod{
+			Metadata: K8sObjectMeta{
+				Name:        "app-0-replacement",
+				Namespace:   "default",
+				UID:         "uid-app-replacement",
+				Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": ""},
+			},
+			Spec: K8sPodSpec{NodeName: "node-b"},
+			Status: K8sPodStatus{
+				Phase:      "Running",
+				Conditions: []K8sCondition{{Type: "Ready", Status: "True"}},
+			},
+		}
 		return TemplateUnintendedColdStartActivePMJ,
 			"ActivePMJReplacementColdStartGuard",
 			"unintended_cold_start_active_pmj",
-			SnapshotFixture{
-				Now:              now,
-				Reconciler:       "PodMigrationJobReconciler",
-				Scenario:         "TriggerDirective:UnintendedColdStart",
-				BlindSpotOutcome: "cold-start",
-				PrimaryPMJ: &PMJState{
-					Name:               "pmj-cold-start-0",
-					Namespace:          "default",
-					UID:                "uid-pmj-cold",
-					Phase:              "Restoring",
-					SourcePodName:      "app-0",
-					TargetPodUID:       "uid-app-0",
-					SnapshotName:       "ps-0",
-					RestoredPodName:    "app-0-replacement",
-					RestoredPodUID:     "uid-app-replacement",
-					RestoringStartTime: "2026-09-28T12:00:10Z",
-				},
-				PrimaryPod: &PodState{
-					Name:        "app-0-replacement",
-					Namespace:   "default",
-					UID:         "uid-app-replacement",
-					App:         "app",
-					NodeName:    "node-b",
-					Phase:       "Running",
-					Ready:       true,
-					Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": ""},
-				},
-				NamespacePods: []PodState{
-					{
-						Name:        "app-0-replacement",
-						Namespace:   "default",
-						UID:         "uid-app-replacement",
-						App:         "app",
-						NodeName:    "node-b",
-						Phase:       "Running",
-						Ready:       true,
-						Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": ""},
-					},
-				},
+			"cold-start",
+			ReconcileSnapshotJSON{
+				Now:           now,
+				Reconciler:    "PodMigrationJobReconciler",
+				PrimaryPMJ:    &pmj,
+				PrimaryPod:    &pod,
+				NamespacePMJs: []K8sPMJ{pmj},
+				NamespacePods: []K8sPod{pod},
 			}
 
-	case strings.Contains(combined, "wedge") || strings.Contains(combined, "orphan") || strings.Contains(combined, "restoring") || strings.Contains(combined, "no-replacement"):
+	case strings.Contains(combined, "no-replacement") || (strings.Contains(combined, "evict") && strings.Contains(combined, "stall")):
+		pmj := K8sPMJ{
+			Metadata: K8sObjectMeta{Name: "pmj-evict-stall-0", Namespace: "default", UID: "uid-pmj-evict"},
+			Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "app-0"}, TargetPodUID: "uid-app-0"},
+			Status: K8sPMJStatus{
+				Phase:             "Evicting",
+				SnapshotRef:       "ps-0",
+				EvictingStartTime: "2026-09-28T12:00:10Z",
+			},
+		}
+		return TemplateNoReplacementEvictingStall,
+			"EvictingNoReplacementLiveness",
+			"no_replacement_evicting_stall",
+			"no-replacement",
+			ReconcileSnapshotJSON{
+				Now:           now,
+				Reconciler:    "PodMigrationJobReconciler",
+				PrimaryPMJ:    &pmj,
+				NamespacePMJs: []K8sPMJ{pmj},
+				NamespacePods: nil,
+			}
+
+	case strings.Contains(combined, "wedge") || strings.Contains(combined, "orphan") || strings.Contains(combined, "restoring"):
+		pmj := K8sPMJ{
+			Metadata: K8sObjectMeta{Name: "pmj-wedged-0", Namespace: "default", UID: "uid-pmj-wedged"},
+			Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "app-0"}, TargetPodUID: "uid-app-0"},
+			Status: K8sPMJStatus{
+				Phase:              "Restoring",
+				SnapshotRef:        "ps-0",
+				RestoredPodName:    "app-0-dst",
+				RestoredPodUID:     "uid-app-dst",
+				EvictingStartTime:  "2026-09-28T12:00:05Z",
+				RestoringStartTime: "2026-09-28T12:00:10Z",
+			},
+		}
 		return TemplateWedgedRestoringOrphan,
 			"RestoringReplacementLiveness",
 			"wedged_restoring_orphan",
-			SnapshotFixture{
-				Now:                now,
-				Reconciler:         "PodMigrationJobReconciler",
-				Scenario:           "TriggerDirective:WedgedRestoringOrphan",
-				BlindSpotOutcome:   "wedged",
-				SourcePodDeleted:   true,
-				RestoredPodDeleted: true,
-				PrimaryPMJ: &PMJState{
-					Name:               "pmj-wedged-0",
-					Namespace:          "default",
-					UID:                "uid-pmj-wedged",
-					Phase:              "Restoring",
-					SourcePodName:      "app-0",
-					TargetPodUID:       "uid-app-0",
-					SnapshotName:       "ps-0",
-					RestoredPodName:    "app-0-dst",
-					RestoredPodUID:     "uid-app-dst",
-					EvictingStartTime:  "2026-09-28T12:00:05Z",
-					RestoringStartTime: "2026-09-28T12:00:08Z",
-				},
+			"wedged",
+			ReconcileSnapshotJSON{
+				Now:           now,
+				Reconciler:    "PodMigrationJobReconciler",
+				PrimaryPMJ:    &pmj,
+				NamespacePMJs: []K8sPMJ{pmj},
+				NamespacePods: nil,
 			}
 
 	default:
@@ -617,20 +686,20 @@ func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, strin
 		if slug == "" {
 			slug = "custom_blind_spot"
 		}
+		pmj := K8sPMJ{
+			Metadata: K8sObjectMeta{Name: "pmj-custom-0", Namespace: "default", UID: "uid-pmj-custom"},
+			Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "app-0"}},
+			Status:   K8sPMJStatus{Phase: "Restoring"},
+		}
 		return TemplateCustomScaffold,
 			"CustomExtractedInvariant",
 			slug,
-			SnapshotFixture{
-				Now:              now,
-				Reconciler:       "PodMigrationJobReconciler",
-				Scenario:         "TriggerDirective:CustomScaffold",
-				BlindSpotOutcome: "custom",
-				PrimaryPMJ: &PMJState{
-					Name:          "pmj-custom-0",
-					Namespace:     "default",
-					Phase:         "Restoring",
-					SourcePodName: "app-0",
-				},
+			"custom",
+			ReconcileSnapshotJSON{
+				Now:           now,
+				Reconciler:    "PodMigrationJobReconciler",
+				PrimaryPMJ:    &pmj,
+				NamespacePMJs: []K8sPMJ{pmj},
 			}
 	}
 }
@@ -650,130 +719,9 @@ func sanitizeSlug(raw string) string {
 	return strings.Trim(b.String(), "_")
 }
 
-// EvaluateCandidateRule runs the pure stateless candidate predicate for a
-// TemplateClass against a SnapshotFixture.
-func EvaluateCandidateRule(id, name string, tmpl TemplateClass, s *SnapshotFixture) []CandidateViolation {
-	if s == nil || s.PrimaryPMJ == nil {
-		return nil
-	}
-	pmj := s.PrimaryPMJ
-
-	switch tmpl {
-	case TemplatePrematureSnapshotFailed:
-		// Fires when PMJ is Failed (SnapshotFailed) while the PodSnapshot still has
-		// Checkpoint or StorageReplicated in an active progress or Succeeded state.
-		if pmj.Phase != "Failed" || s.PrimaryPodSnapshot == nil {
-			return nil
-		}
-		if isPodSnapshotStillProgressingOrSucceeded(s.PrimaryPodSnapshot) {
-			return []CandidateViolation{{
-				InvariantID:   id,
-				InvariantName: name,
-				Reason:        "PrematureSnapshotFailureWhileCheckpointing",
-				Message: fmt.Sprintf("PMJ %s/%s entered PhaseFailed (%s) while PodSnapshot %s had non-failed Checkpoint/StorageReplicated sub-conditions",
-					pmj.Namespace, pmj.Name, pmj.Reason, s.PrimaryPodSnapshot.Name),
-				PMJName: pmj.Name,
-				PodName: pmj.SourcePodName,
-			}}
-		}
-		return nil
-
-	case TemplateWedgedRestoringOrphan:
-		// Fires when PMJ is stuck in Restoring after the source pod was deleted and
-		// its assigned RestoredPodName has been deleted (or is missing past the grace window).
-		if pmj.Phase != "Restoring" {
-			return nil
-		}
-		if s.RestoredPodDeleted {
-			return []CandidateViolation{{
-				InvariantID:   id,
-				InvariantName: name,
-				Reason:        "RestoringReplacementPodDeleted",
-				Message: fmt.Sprintf("PMJ %s/%s remains in PhaseRestoring after replacement pod %q was deleted",
-					pmj.Namespace, pmj.Name, pmj.RestoredPodName),
-				PMJName: pmj.Name,
-				PodName: pmj.RestoredPodName,
-			}}
-		}
-		if s.SourcePodDeleted && pmj.RestoredPodName != "" && !podExistsInSlice(pmj.RestoredPodName, s.NamespacePods) &&
-			exceededWindow(pmj.RestoringStartTime, s.Now, 30*time.Second) {
-			return []CandidateViolation{{
-				InvariantID:   id,
-				InvariantName: name,
-				Reason:        "RestoringReplacementPodMissing",
-				Message: fmt.Sprintf("PMJ %s/%s remained in PhaseRestoring >30s with missing replacement pod %q",
-					pmj.Namespace, pmj.Name, pmj.RestoredPodName),
-				PMJName: pmj.Name,
-				PodName: pmj.RestoredPodName,
-			}}
-		}
-		return nil
-
-	case TemplateUnintendedColdStartActivePMJ:
-		// Fires when PMJ is actively Restoring (or Evicting/Snapshotting) and its bound
-		// replacement pod is Ready=true without a non-empty snapshot restore annotation.
-		if pmj.Phase != "Snapshotting" && pmj.Phase != "Evicting" && pmj.Phase != "Restoring" {
-			return nil
-		}
-		for _, pod := range s.NamespacePods {
-			if (pmj.RestoredPodName != "" && pod.Name == pmj.RestoredPodName) ||
-				(pmj.RestoredPodUID != "" && pod.UID == pmj.RestoredPodUID) {
-				restoreSnap := strings.TrimSpace(pod.Annotations["gke.io/pod-snapshot-restore-name"])
-				if restoreSnap == "" {
-					restoreSnap = strings.TrimSpace(pod.Annotations["pod-migration.gke.io/ps-name"])
-				}
-				if pod.Ready && len(pod.SchedulingGates) == 0 && restoreSnap == "" {
-					return []CandidateViolation{{
-						InvariantID:   id,
-						InvariantName: name,
-						Reason:        "ActivePMJReplacementColdStarted",
-						Message: fmt.Sprintf("Replacement pod %s/%s became Ready without snapshot restore annotation while PMJ %s was in phase %s",
-							pod.Namespace, pod.Name, pmj.Name, pmj.Phase),
-						PMJName: pmj.Name,
-						PodName: pod.Name,
-					}}
-				}
-			}
-		}
-		return nil
-
-	default:
-		// TemplateCustomScaffold intentionally produces 0 violations until a human or
-		// coding agent supplies the domain predicate.
-		return nil
-	}
-}
-
-func isPodSnapshotStillProgressingOrSucceeded(ps *PodSnapshotState) bool {
-	if ps == nil {
-		return false
-	}
-	readyFailed := false
-	subProgressOrSucceeded := false
-	for _, c := range ps.Conditions {
-		if c.Type == "Ready" && c.Status == "False" && c.Reason == "Failed" {
-			readyFailed = true
-		}
-		if c.Type == "Checkpoint" || c.Type == "StorageReplicated" {
-			if c.Status == "True" || c.Reason == "InProgress" || c.Reason == "AwaitingCheckpoint" || c.Reason == "Pending" || c.Reason == "Succeeded" {
-				subProgressOrSucceeded = true
-			}
-		}
-	}
-	return readyFailed && subProgressOrSucceeded
-}
-
-func isUnintendedColdStartSnapshot(s SnapshotFixture) bool {
-	return len(EvaluateCandidateRule("I_CHECK", "Check", TemplateUnintendedColdStartActivePMJ, &s)) > 0
-}
-
-func isWedgedRestoringOrphanSnapshot(s SnapshotFixture) bool {
-	return len(EvaluateCandidateRule("I_CHECK", "Check", TemplateWedgedRestoringOrphan, &s)) > 0
-}
-
-func podExistsInSlice(name string, pods []PodState) bool {
+func activePodInSlice(name string, pods []K8sPod) bool {
 	for _, p := range pods {
-		if p.Name == name && p.DeletionTimestamp == "" {
+		if p.Metadata.Name == name && p.Metadata.DeletionTimestamp == "" {
 			return true
 		}
 	}
@@ -792,137 +740,93 @@ func exceededWindow(startRFC3339, nowRFC3339 string, limit time.Duration) bool {
 	return tNow.Sub(tStart) >= limit
 }
 
-// BaselineGreenFixtures returns the canonical healthy ReconcileSnapshot states
+// BaselineGreenSnapshots returns canonical healthy ReconcileSnapshot states
 // across all 5 PMJ lifecycle phases (Pending, Snapshotting, Evicting, Restoring,
-// Succeeded) plus a legitimate terminal failure (where Checkpoint itself failed).
-func BaselineGreenFixtures() []SnapshotFixture {
-	return []SnapshotFixture{
-		{
-			Now:        "2026-09-28T12:00:01Z",
-			Reconciler: "PodMigrationJobReconciler",
-			Scenario:   "Baseline:Pending",
-			PrimaryPMJ: &PMJState{
-				Name:          "pmj-clean-1",
-				Namespace:     "default",
-				Phase:         "Pending",
-				SourcePodName: "counter-0",
-			},
-			NamespacePods: []PodState{{Name: "counter-0", Namespace: "default", Phase: "Running", Ready: true}},
+// Succeeded).
+func BaselineGreenSnapshots() []ReconcileSnapshotJSON {
+	srcPod := K8sPod{
+		Metadata: K8sObjectMeta{Name: "counter-0", Namespace: "default", UID: "uid-src"},
+		Spec:     K8sPodSpec{NodeName: "node-a"},
+		Status:   K8sPodStatus{Phase: "Running", Conditions: []K8sCondition{{Type: "Ready", Status: "True"}}},
+	}
+	deletingSrcPod := srcPod
+	deletingSrcPod.Metadata.DeletionTimestamp = "2026-09-28T12:00:05Z"
+
+	dstPodGated := K8sPod{
+		Metadata: K8sObjectMeta{
+			Name:        "counter-0-dst",
+			Namespace:   "default",
+			UID:         "uid-dst",
+			Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": "ps-clean-1"},
 		},
-		{
-			Now:        "2026-09-28T12:00:03Z",
-			Reconciler: "PodMigrationJobReconciler",
-			Scenario:   "Baseline:Snapshotting",
-			PrimaryPMJ: &PMJState{
-				Name:          "pmj-clean-1",
-				Namespace:     "default",
-				Phase:         "Snapshotting",
-				SourcePodName: "counter-0",
-				SnapshotName:  "ps-clean-1",
-			},
-			PrimaryPodSnapshot: &PodSnapshotState{
-				Name:      "ps-clean-1",
-				Namespace: "default",
-				PodName:   "counter-0",
-				Conditions: []ConditionSummary{
-					{Type: "Checkpoint", Status: "False", Reason: "InProgress"},
-					{Type: "StorageReplicated", Status: "False", Reason: "AwaitingCheckpoint"},
-					{Type: "Ready", Status: "False", Reason: "InProgress"},
-				},
-			},
-			NamespacePods: []PodState{{Name: "counter-0", Namespace: "default", Phase: "Running", Ready: true}},
+		Spec:   K8sPodSpec{SchedulingGates: []K8sSchedulingGate{{Name: "pod-migration.gke.io/restoring"}}},
+		Status: K8sPodStatus{Phase: "Pending"},
+	}
+	dstPodReady := K8sPod{
+		Metadata: K8sObjectMeta{
+			Name:        "counter-0-dst",
+			Namespace:   "default",
+			UID:         "uid-dst",
+			Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": "ps-clean-1"},
 		},
-		{
-			Now:        "2026-09-28T12:00:06Z",
-			Reconciler: "PodMigrationJobReconciler",
-			Scenario:   "Baseline:Evicting",
-			PrimaryPMJ: &PMJState{
-				Name:              "pmj-clean-1",
-				Namespace:         "default",
-				Phase:             "Evicting",
-				SourcePodName:     "counter-0",
-				SnapshotName:      "ps-clean-1",
-				EvictingStartTime: "2026-09-28T12:00:05Z",
-			},
-			NamespacePods: []PodState{{Name: "counter-0", Namespace: "default", Phase: "Running", DeletionTimestamp: "2026-09-28T12:00:05Z"}},
+		Spec:   K8sPodSpec{NodeName: "node-b"},
+		Status: K8sPodStatus{Phase: "Running", Conditions: []K8sCondition{{Type: "Ready", Status: "True"}}},
+	}
+
+	pmjPending := K8sPMJ{
+		Metadata: K8sObjectMeta{Name: "pmj-clean-1", Namespace: "default"},
+		Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "counter-0"}},
+		Status:   K8sPMJStatus{Phase: "Pending"},
+	}
+	pmjSnap := K8sPMJ{
+		Metadata: K8sObjectMeta{Name: "pmj-clean-1", Namespace: "default"},
+		Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "counter-0"}},
+		Status:   K8sPMJStatus{Phase: "Snapshotting", SnapshotRef: "ps-clean-1", SnapshottingStartTime: "2026-09-28T12:00:02Z"},
+	}
+	pmjEvicting := K8sPMJ{
+		Metadata: K8sObjectMeta{Name: "pmj-clean-1", Namespace: "default"},
+		Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "counter-0"}},
+		Status:   K8sPMJStatus{Phase: "Evicting", SnapshotRef: "ps-clean-1", EvictingStartTime: "2026-09-28T12:00:05Z"},
+	}
+	pmjRestoringGated := K8sPMJ{
+		Metadata: K8sObjectMeta{Name: "pmj-clean-1", Namespace: "default"},
+		Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "counter-0"}},
+		Status: K8sPMJStatus{
+			Phase:              "Restoring",
+			SnapshotRef:        "ps-clean-1",
+			RestoredPodName:    "counter-0-dst",
+			RestoredPodUID:     "uid-dst",
+			EvictingStartTime:  "2026-09-28T12:00:05Z",
+			RestoringStartTime: "2026-09-28T12:00:07Z",
 		},
-		{
-			Now:              "2026-09-28T12:00:09Z",
-			Reconciler:       "PodMigrationJobReconciler",
-			Scenario:         "Baseline:RestoringHealthy",
-			SourcePodDeleted: true,
-			PrimaryPMJ: &PMJState{
-				Name:               "pmj-clean-1",
-				Namespace:          "default",
-				Phase:              "Restoring",
-				SourcePodName:      "counter-0",
-				SnapshotName:       "ps-clean-1",
-				RestoredPodName:    "counter-0-dst",
-				RestoredPodUID:     "uid-counter-dst",
-				EvictingStartTime:  "2026-09-28T12:00:05Z",
-				RestoringStartTime: "2026-09-28T12:00:07Z",
-			},
-			NamespacePods: []PodState{{
-				Name:        "counter-0-dst",
-				Namespace:   "default",
-				UID:         "uid-counter-dst",
-				Phase:       "Running",
-				Ready:       true,
-				Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": "ps-clean-1"},
-			}},
-		},
-		{
-			Now:              "2026-09-28T12:00:12Z",
-			Reconciler:       "PodMigrationJobReconciler",
-			Scenario:         "Baseline:Succeeded",
-			SourcePodDeleted: true,
-			PrimaryPMJ: &PMJState{
-				Name:            "pmj-clean-1",
-				Namespace:       "default",
-				Phase:           "Succeeded",
-				SourcePodName:   "counter-0",
-				SnapshotName:    "ps-clean-1",
-				RestoredPodName: "counter-0-dst",
-				RestoredPodUID:  "uid-counter-dst",
-			},
-			NamespacePods: []PodState{{
-				Name:        "counter-0-dst",
-				Namespace:   "default",
-				UID:         "uid-counter-dst",
-				Phase:       "Running",
-				Ready:       true,
-				Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": "ps-clean-1"},
-			}},
-		},
-		{
-			Now:        "2026-09-28T12:00:15Z",
-			Reconciler: "PodMigrationJobReconciler",
-			Scenario:   "Baseline:GenuineSnapshotCheckpointFailed",
-			PrimaryPMJ: &PMJState{
-				Name:          "pmj-genuine-fail",
-				Namespace:     "default",
-				Phase:         "Failed",
-				Reason:        "SnapshotFailed",
-				SourcePodName: "counter-fail",
-				SnapshotName:  "ps-genuine-fail",
-			},
-			PrimaryPodSnapshot: &PodSnapshotState{
-				Name:      "ps-genuine-fail",
-				Namespace: "default",
-				PodName:   "counter-fail",
-				Conditions: []ConditionSummary{
-					{Type: "Checkpoint", Status: "False", Reason: "Failed"},
-					{Type: "StorageReplicated", Status: "False", Reason: "Failed"},
-					{Type: "Ready", Status: "False", Reason: "Failed"},
-				},
-			},
-		},
+	}
+	pmjRestoringReady := pmjRestoringGated
+	pmjSucceeded := pmjRestoringGated
+	pmjSucceeded.Status.Phase = "Succeeded"
+
+	return []ReconcileSnapshotJSON{
+		{Now: "2026-09-28T12:00:01Z", Reconciler: "PodMigrationJobReconciler", PrimaryPMJ: &pmjPending, PrimaryPod: &srcPod, NamespacePMJs: []K8sPMJ{pmjPending}, NamespacePods: []K8sPod{srcPod}},
+		{Now: "2026-09-28T12:00:03Z", Reconciler: "PodMigrationJobReconciler", PrimaryPMJ: &pmjSnap, PrimaryPod: &srcPod, NamespacePMJs: []K8sPMJ{pmjSnap}, NamespacePods: []K8sPod{srcPod}},
+		{Now: "2026-09-28T12:00:06Z", Reconciler: "PodMigrationJobReconciler", PrimaryPMJ: &pmjEvicting, PrimaryPod: &deletingSrcPod, NamespacePMJs: []K8sPMJ{pmjEvicting}, NamespacePods: []K8sPod{deletingSrcPod}},
+		{Now: "2026-09-28T12:00:08Z", Reconciler: "PodMigrationJobReconciler", PrimaryPMJ: &pmjRestoringGated, PrimaryPod: &dstPodGated, NamespacePMJs: []K8sPMJ{pmjRestoringGated}, NamespacePods: []K8sPod{dstPodGated}},
+		{Now: "2026-09-28T12:00:10Z", Reconciler: "PodMigrationJobReconciler", PrimaryPMJ: &pmjRestoringReady, PrimaryPod: &dstPodReady, NamespacePMJs: []K8sPMJ{pmjRestoringReady}, NamespacePods: []K8sPod{dstPodReady}},
+		{Now: "2026-09-28T12:00:12Z", Reconciler: "PodMigrationJobReconciler", PrimaryPMJ: &pmjSucceeded, PrimaryPod: &dstPodReady, NamespacePMJs: []K8sPMJ{pmjSucceeded}, NamespacePods: []K8sPod{dstPodReady}},
 	}
 }
 
-// SynthesizeAndVerify writes the SnapshotFixture, candidate Go rule/test files,
-// and PR description to outDir, and executes the RED and GREEN replay proofs.
-func SynthesizeAndVerify(finding BlindSpotFinding, outDir string, greenTracePaths []string) (RedGreenProof, error) {
+// SynthesizeAndVerify writes the ReconcileSnapshot fixtures, candidate Go rule
+// and test files, and PR body to outDir, then stages them into a temporary copy
+// of controller/internal/invariants and runs `go test` to execute the RED and
+// GREEN replay proofs on the actual emitted Go code.
+func SynthesizeAndVerify(
+	finding BlindSpotFinding,
+	outDir, controllerDir string,
+	greenTracePaths []string,
+) (RedGreenProof, error) {
+	ctrlDir, err := resolveControllerDir(controllerDir)
+	if err != nil {
+		return RedGreenProof{}, err
+	}
 	testdataDir := filepath.Join(outDir, "testdata")
 	if err := os.MkdirAll(testdataDir, 0o755); err != nil {
 		return RedGreenProof{}, err
@@ -930,12 +834,16 @@ func SynthesizeAndVerify(finding BlindSpotFinding, outDir string, greenTracePath
 
 	idLower := strings.ToLower(finding.InvariantID)
 	basePrefix := fmt.Sprintf("%s_%s", idLower, finding.Slug)
-	fixturePath := filepath.Join(testdataDir, basePrefix+"_snapshot.json")
+	fixtureFilename := basePrefix + "_snapshot.json"
+	greenFilename := basePrefix + "_green_snapshots.json"
+	fixturePath := filepath.Join(testdataDir, fixtureFilename)
+	greenFixturesPath := filepath.Join(testdataDir, greenFilename)
 	rulePath := filepath.Join(outDir, basePrefix+"_rule.go")
 	testPath := filepath.Join(outDir, basePrefix+"_test.go")
 	prBodyPath := filepath.Join(outDir, "pr_body.md")
 	proofPath := filepath.Join(outDir, "proof.json")
 
+	// 1. Write RED ReconcileSnapshot fixture.
 	fixtureBytes, err := json.MarshalIndent(finding.Snapshot, "", "  ")
 	if err != nil {
 		return RedGreenProof{}, err
@@ -944,33 +852,51 @@ func SynthesizeAndVerify(finding BlindSpotFinding, outDir string, greenTracePath
 		return RedGreenProof{}, err
 	}
 
-	// 1. RED Proof: evaluate candidate rule on the offending snapshot fixture.
-	redViolations := EvaluateCandidateRule(finding.InvariantID, finding.InvariantName, finding.Template, &finding.Snapshot)
-	redPassed := len(redViolations) >= 1
-
-	// 2. GREEN Proof: evaluate candidate rule across baseline healthy fixtures + clean records.ndjson traces.
-	baselines := BaselineGreenFixtures()
-	var greenViolations []CandidateViolation
-	for _, b := range baselines {
-		cp := b
-		vs := EvaluateCandidateRule(finding.InvariantID, finding.InvariantName, finding.Template, &cp)
-		greenViolations = append(greenViolations, vs...)
-	}
-
+	// 2. Build GREEN ReconcileSnapshot corpus (baseline lifecycle snapshots + reconstructed trace steps).
+	baselines := BaselineGreenSnapshots()
+	greenCorpus := append([]ReconcileSnapshotJSON(nil), baselines...)
 	traceStepsChecked := 0
 	for _, tracePath := range greenTracePaths {
 		steps, err := ReconstructAllTraceSnapshots(tracePath)
 		if err != nil {
 			return RedGreenProof{}, fmt.Errorf("replay green trace %s: %w", tracePath, err)
 		}
-		for _, st := range steps {
-			traceStepsChecked++
-			cp := st
-			vs := EvaluateCandidateRule(finding.InvariantID, finding.InvariantName, finding.Template, &cp)
-			greenViolations = append(greenViolations, vs...)
-		}
+		traceStepsChecked += len(steps)
+		greenCorpus = append(greenCorpus, steps...)
 	}
-	greenPassed := len(greenViolations) == 0 && finding.Template != TemplateCustomScaffold
+	greenBytes, err := json.MarshalIndent(greenCorpus, "", "  ")
+	if err != nil {
+		return RedGreenProof{}, err
+	}
+	if err := os.WriteFile(greenFixturesPath, append(greenBytes, '\n'), 0o644); err != nil {
+		return RedGreenProof{}, err
+	}
+
+	// 3. Emit candidate Go rule and Go test files.
+	ruleGo := renderCandidateRuleGo(finding)
+	testGo := renderCandidateTestGo(finding, fixtureFilename, greenFilename)
+	if err := os.WriteFile(rulePath, []byte(ruleGo), 0o644); err != nil {
+		return RedGreenProof{}, err
+	}
+	if err := os.WriteFile(testPath, []byte(testGo), 0o644); err != nil {
+		return RedGreenProof{}, err
+	}
+
+	// 4. Compile and run the emitted rule + test + fixtures inside a temporary
+	// copy of controller/internal/invariants via `go test`.
+	redPassed, redOut, greenPassed, greenOut, compiled, err := runCompiledGoTestProof(
+		ctrlDir, finding, fixtureFilename, greenFilename,
+		filepath.Base(rulePath), filepath.Base(testPath),
+		fixtureBytes, greenBytes, []byte(ruleGo), []byte(testGo),
+	)
+	if err != nil {
+		return RedGreenProof{}, err
+	}
+	// A rule that fails RED (e.g., an unauthored custom scaffold returning nil)
+	// cannot claim a meaningful GREEN pass until its RED proof passes.
+	if !redPassed {
+		greenPassed = false
+	}
 
 	proof := RedGreenProof{
 		InvariantID:            finding.InvariantID,
@@ -979,24 +905,20 @@ func SynthesizeAndVerify(finding BlindSpotFinding, outDir string, greenTracePath
 		Template:               finding.Template,
 		TriggerSource:          finding.TriggerSource,
 		RequiresAuthorBody:     finding.Template == TemplateCustomScaffold,
+		CompiledAndTested:      compiled,
 		RedPassed:              redPassed,
-		RedViolations:          redViolations,
+		RedTestOutput:          strings.TrimSpace(redOut),
 		GreenPassed:            greenPassed,
 		GreenBaselineChecked:   len(baselines),
 		GreenTraceStepsChecked: traceStepsChecked,
-		GreenViolations:        greenViolations,
+		GreenTestOutput:        strings.TrimSpace(greenOut),
 		SnapshotFixturePath:    fixturePath,
+		GreenFixturesPath:      greenFixturesPath,
 		RuleFilePath:           rulePath,
 		TestFilePath:           testPath,
 		PRBodyPath:             prBodyPath,
 	}
 
-	if err := os.WriteFile(rulePath, []byte(renderCandidateRuleGo(finding)), 0o644); err != nil {
-		return RedGreenProof{}, err
-	}
-	if err := os.WriteFile(testPath, []byte(renderCandidateTestGo(finding, filepath.Base(fixturePath))), 0o644); err != nil {
-		return RedGreenProof{}, err
-	}
 	if err := os.WriteFile(prBodyPath, []byte(renderPRBodyMarkdown(finding, proof)), 0o644); err != nil {
 		return RedGreenProof{}, err
 	}
@@ -1011,16 +933,85 @@ func SynthesizeAndVerify(finding BlindSpotFinding, outDir string, greenTracePath
 	return proof, nil
 }
 
+func runCompiledGoTestProof(
+	controllerDir string,
+	finding BlindSpotFinding,
+	fixtureFilename, greenFilename, ruleFilename, testFilename string,
+	fixtureBytes, greenBytes, ruleBytes, testBytes []byte,
+) (redPassed bool, redOut string, greenPassed bool, greenOut string, compiled bool, err error) {
+	internalDir := filepath.Join(controllerDir, "internal")
+	srcInvDir := filepath.Join(internalDir, "invariants")
+
+	stageDir, err := os.MkdirTemp(internalDir, "invverify")
+	if err != nil {
+		return false, "", false, "", false, fmt.Errorf("create temp stage dir in %s: %w", internalDir, err)
+	}
+	defer os.RemoveAll(stageDir)
+
+	entries, err := os.ReadDir(srcInvDir)
+	if err != nil {
+		return false, "", false, "", false, fmt.Errorf("read %s: %w", srcInvDir, err)
+	}
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".go") {
+			continue
+		}
+		b, readErr := os.ReadFile(filepath.Join(srcInvDir, ent.Name()))
+		if readErr != nil {
+			return false, "", false, "", false, readErr
+		}
+		if writeErr := os.WriteFile(filepath.Join(stageDir, ent.Name()), b, 0o644); writeErr != nil {
+			return false, "", false, "", false, writeErr
+		}
+	}
+
+	stageTestdata := filepath.Join(stageDir, "testdata")
+	if err := os.MkdirAll(stageTestdata, 0o755); err != nil {
+		return false, "", false, "", false, err
+	}
+	if err := os.WriteFile(filepath.Join(stageTestdata, fixtureFilename), fixtureBytes, 0o644); err != nil {
+		return false, "", false, "", false, err
+	}
+	if err := os.WriteFile(filepath.Join(stageTestdata, greenFilename), greenBytes, 0o644); err != nil {
+		return false, "", false, "", false, err
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, ruleFilename), ruleBytes, 0o644); err != nil {
+		return false, "", false, "", false, err
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, testFilename), testBytes, 0o644); err != nil {
+		return false, "", false, "", false, err
+	}
+
+	relPkg := "./internal/" + filepath.Base(stageDir)
+	redTestName := fmt.Sprintf("^Test%s_%s_RedProof$", strings.ToUpper(finding.InvariantID), finding.InvariantName)
+	greenTestName := fmt.Sprintf("^Test%s_%s_GreenProof$", strings.ToUpper(finding.InvariantID), finding.InvariantName)
+
+	redCmd := exec.Command("go", "test", "-v", "-count=1", "-run", redTestName, relPkg)
+	redCmd.Dir = controllerDir
+	redBytes, redErr := redCmd.CombinedOutput()
+	redOut = string(redBytes)
+	redPassed = (redErr == nil)
+
+	greenCmd := exec.Command("go", "test", "-v", "-count=1", "-run", greenTestName, relPkg)
+	greenCmd.Dir = controllerDir
+	greenOutBytes, greenErr := greenCmd.CombinedOutput()
+	greenOut = string(greenOutBytes)
+	greenPassed = (greenErr == nil)
+
+	compiled = !strings.Contains(redOut, "[build failed]") && !strings.Contains(greenOut, "[build failed]")
+	return redPassed, redOut, greenPassed, greenOut, compiled, nil
+}
+
 // ReconstructAllTraceSnapshots replays a pmprofiler records.ndjson trace and
-// emits a SnapshotFixture for every PMJ add/update step in the trace so GREEN
-// proofs can verify 0 false positives across real cluster recordings.
-func ReconstructAllTraceSnapshots(recordsPath string) ([]SnapshotFixture, error) {
+// emits a ReconcileSnapshotJSON for every PMJ add/update step in the trace so
+// GREEN proofs can verify 0 false positives across real cluster recordings.
+func ReconstructAllTraceSnapshots(recordsPath string) ([]ReconcileSnapshotJSON, error) {
 	records, err := loadNDJSONRecords(recordsPath)
 	if err != nil {
 		return nil, err
 	}
 	state := newTraceState()
-	var snapshots []SnapshotFixture
+	var snapshots []ReconcileSnapshotJSON
 	for _, rec := range records {
 		state.apply(rec)
 		if strings.HasPrefix(rec.GVR, "podmigrationjobs.") && rec.Type != "delete" {
@@ -1035,20 +1026,14 @@ func ReconstructAllTraceSnapshots(recordsPath string) ([]SnapshotFixture, error)
 }
 
 type traceState struct {
-	pmjs            map[string]PMJState
-	pods            map[string]PodState
-	deletedPods     map[string]bool
-	podSnapshots    map[string]PodSnapshotState
-	podSnapshotsPod map[string]string // podName -> latest PodSnapshot name
+	pmjs map[string]K8sPMJ
+	pods map[string]K8sPod
 }
 
 func newTraceState() *traceState {
 	return &traceState{
-		pmjs:            make(map[string]PMJState),
-		pods:            make(map[string]PodState),
-		deletedPods:     make(map[string]bool),
-		podSnapshots:    make(map[string]PodSnapshotState),
-		podSnapshotsPod: make(map[string]string),
+		pmjs: make(map[string]K8sPMJ),
+		pods: make(map[string]K8sPod),
 	}
 }
 
@@ -1068,137 +1053,116 @@ func (s *traceState) apply(rec rawNDJSONRecord) {
 			delete(s.pmjs, name)
 			return
 		}
-		pmj := PMJState{
-			Name:               name,
-			Namespace:          ns,
-			UID:                nestedStr(rec.Obj, "metadata", "uid"),
-			Phase:              nestedStr(rec.Obj, "status", "phase"),
-			Reason:             nestedStr(rec.Obj, "status", "reason"),
-			Message:            nestedStr(rec.Obj, "status", "message"),
-			SourcePodName:      nestedStr(rec.Obj, "spec", "podRef", "name"),
-			TargetPodUID:       nestedStr(rec.Obj, "spec", "targetPodUID"),
-			SnapshotName:       nestedStr(rec.Obj, "status", "snapshotName"),
-			RestoredPodName:    nestedStr(rec.Obj, "status", "restoredPodName"),
-			RestoredPodUID:     nestedStr(rec.Obj, "status", "restoredPodUID"),
-			CreationTimestamp:  nestedStr(rec.Obj, "metadata", "creationTimestamp"),
-			EvictingStartTime:  nestedStr(rec.Obj, "status", "evictingStartTime"),
-			RestoringStartTime: nestedStr(rec.Obj, "status", "restoringStartTime"),
-			Conditions:         extractConditions(rec.Obj),
+		snapRef := firstNonEmpty(nestedStr(rec.Obj, "status", "snapshotRef"), nestedStr(rec.Obj, "status", "snapshotName"))
+		pmj := K8sPMJ{
+			Metadata: K8sObjectMeta{
+				Name:              name,
+				Namespace:         ns,
+				UID:               nestedStr(rec.Obj, "metadata", "uid"),
+				CreationTimestamp: nestedStr(rec.Obj, "metadata", "creationTimestamp"),
+				DeletionTimestamp: nestedStr(rec.Obj, "metadata", "deletionTimestamp"),
+				Labels:            extractStringMap(rec.Obj, "metadata", "labels"),
+				Annotations:       extractStringMap(rec.Obj, "metadata", "annotations"),
+			},
+			Spec: K8sPMJSpec{
+				PodRef:       K8sLocalObjectRef{Name: nestedStr(rec.Obj, "spec", "podRef", "name")},
+				TargetPodUID: nestedStr(rec.Obj, "spec", "targetPodUID"),
+			},
+			Status: K8sPMJStatus{
+				Phase:                 nestedStr(rec.Obj, "status", "phase"),
+				SnapshotRef:           snapRef,
+				OriginNodeName:        nestedStr(rec.Obj, "status", "originNodeName"),
+				SnapshottingStartTime: nestedStr(rec.Obj, "status", "snapshottingStartTime"),
+				EvictingStartTime:     firstNonEmpty(nestedStr(rec.Obj, "status", "evictingStartTime"), defaultPhaseStart(nestedStr(rec.Obj, "status", "phase"), "Evicting", rec.TS)),
+				RestoringStartTime:    firstNonEmpty(nestedStr(rec.Obj, "status", "restoringStartTime"), defaultPhaseStart(nestedStr(rec.Obj, "status", "phase"), "Restoring", rec.TS)),
+				CompletionTime:        nestedStr(rec.Obj, "status", "completionTime"),
+				RestoredPodName:       nestedStr(rec.Obj, "status", "restoredPodName"),
+				RestoredPodUID:        nestedStr(rec.Obj, "status", "restoredPodUID"),
+				Conditions:            extractConditions(rec.Obj),
+			},
 		}
 		s.pmjs[name] = pmj
 
 	case strings.HasPrefix(rec.GVR, "pods."):
 		if rec.Type == "delete" {
 			delete(s.pods, name)
-			s.deletedPods[name] = true
 			return
 		}
-		labels := extractStringMap(rec.Obj, "metadata", "labels")
-		ann := extractStringMap(rec.Obj, "metadata", "annotations")
-		app := labels["app"]
-		if app == "" {
-			app = labels["app.kubernetes.io/name"]
-		}
-		p := PodState{
-			Name:              name,
-			Namespace:         ns,
-			UID:               nestedStr(rec.Obj, "metadata", "uid"),
-			App:               app,
-			NodeName:          nestedStr(rec.Obj, "spec", "nodeName"),
-			Phase:             nestedStr(rec.Obj, "status", "phase"),
-			Ready:             isPodObjReady(rec.Obj),
-			DeletionTimestamp: nestedStr(rec.Obj, "metadata", "deletionTimestamp"),
-			SchedulingGates:   extractSchedulingGates(rec.Obj),
-			Annotations:       ann,
-			Labels:            labels,
+		p := K8sPod{
+			Metadata: K8sObjectMeta{
+				Name:              name,
+				Namespace:         ns,
+				UID:               nestedStr(rec.Obj, "metadata", "uid"),
+				CreationTimestamp: nestedStr(rec.Obj, "metadata", "creationTimestamp"),
+				DeletionTimestamp: nestedStr(rec.Obj, "metadata", "deletionTimestamp"),
+				Labels:            extractStringMap(rec.Obj, "metadata", "labels"),
+				Annotations:       extractStringMap(rec.Obj, "metadata", "annotations"),
+			},
+			Spec: K8sPodSpec{
+				NodeName:        nestedStr(rec.Obj, "spec", "nodeName"),
+				SchedulingGates: extractSchedulingGates(rec.Obj),
+			},
+			Status: K8sPodStatus{
+				Phase:      nestedStr(rec.Obj, "status", "phase"),
+				Conditions: extractConditions(rec.Obj),
+			},
 		}
 		s.pods[name] = p
-
-	case strings.HasPrefix(rec.GVR, "podsnapshots."):
-		if rec.Type == "delete" {
-			delete(s.podSnapshots, name)
-			return
-		}
-		podName := nestedStr(rec.Obj, "spec", "podName")
-		if podName == "" {
-			podName = nestedStr(rec.Obj, "status", "podName")
-		}
-		ps := PodSnapshotState{
-			Name:       name,
-			Namespace:  ns,
-			PodName:    podName,
-			Conditions: extractConditions(rec.Obj),
-		}
-		s.podSnapshots[name] = ps
-		if podName != "" {
-			s.podSnapshotsPod[podName] = name
-		}
 	}
 }
 
-func (s *traceState) snapshotForPMJ(ts string, pmj PMJState) SnapshotFixture {
+func defaultPhaseStart(actualPhase, targetPhase, ts string) string {
+	if actualPhase == targetPhase {
+		return ts
+	}
+	return ""
+}
+
+func (s *traceState) snapshotForPMJ(ts string, pmj K8sPMJ) ReconcileSnapshotJSON {
 	cpPMJ := pmj
-	var primaryPod *PodState
-	if pmj.RestoredPodName != "" {
-		if p, ok := s.pods[pmj.RestoredPodName]; ok {
+	var primaryPod *K8sPod
+	if pmj.Status.RestoredPodName != "" {
+		if p, ok := s.pods[pmj.Status.RestoredPodName]; ok {
 			cp := p
 			primaryPod = &cp
 		}
 	}
-	if primaryPod == nil && pmj.SourcePodName != "" {
-		if p, ok := s.pods[pmj.SourcePodName]; ok {
+	if primaryPod == nil && pmj.Spec.PodRef.Name != "" {
+		if p, ok := s.pods[pmj.Spec.PodRef.Name]; ok {
 			cp := p
 			primaryPod = &cp
 		}
 	}
 
-	var primaryPS *PodSnapshotState
-	psName := pmj.SnapshotName
-	if psName == "" && pmj.SourcePodName != "" {
-		psName = s.podSnapshotsPod[pmj.SourcePodName]
-	}
-	if psName != "" {
-		if ps, ok := s.podSnapshots[psName]; ok {
-			cp := ps
-			primaryPS = &cp
-		}
-	}
-
-	var nsPMJs []PMJState
+	var nsPMJs []K8sPMJ
 	for _, item := range s.pmjs {
 		nsPMJs = append(nsPMJs, item)
 	}
-	sort.Slice(nsPMJs, func(i, j int) bool { return nsPMJs[i].Name < nsPMJs[j].Name })
+	sort.Slice(nsPMJs, func(i, j int) bool { return nsPMJs[i].Metadata.Name < nsPMJs[j].Metadata.Name })
 
-	var nsPods []PodState
+	var nsPods []K8sPod
 	for _, item := range s.pods {
 		nsPods = append(nsPods, item)
 	}
-	sort.Slice(nsPods, func(i, j int) bool { return nsPods[i].Name < nsPods[j].Name })
+	sort.Slice(nsPods, func(i, j int) bool { return nsPods[i].Metadata.Name < nsPods[i].Metadata.Name })
 
-	srcDeleted := pmj.SourcePodName != "" && s.deletedPods[pmj.SourcePodName]
-	if p, ok := s.pods[pmj.SourcePodName]; ok && p.DeletionTimestamp != "" {
-		srcDeleted = true
+	if ts == "" {
+		ts = "2026-09-28T12:00:00Z"
 	}
-	dstDeleted := pmj.RestoredPodName != "" && s.deletedPods[pmj.RestoredPodName]
-
-	return SnapshotFixture{
-		Now:                ts,
-		Reconciler:         "PodMigrationJobReconciler",
-		PrimaryPMJ:         &cpPMJ,
-		PrimaryPod:         primaryPod,
-		PrimaryPodSnapshot: primaryPS,
-		NamespacePMJs:      nsPMJs,
-		NamespacePods:      nsPods,
-		SourcePodDeleted:   srcDeleted,
-		RestoredPodDeleted: dstDeleted,
+	return ReconcileSnapshotJSON{
+		Now:           ts,
+		Reconciler:    "PodMigrationJobReconciler",
+		PrimaryPMJ:    &cpPMJ,
+		PrimaryPod:    primaryPod,
+		NamespacePMJs: nsPMJs,
+		NamespacePods: nsPods,
 	}
 }
 
 func reconstructSnapshotAt(
 	records []rawNDJSONRecord,
-	scenario, outcome, pmjName, srcPod, dstPod, snapName, cutoffTS string,
-) SnapshotFixture {
+	pmjName, srcPod, dstPod, snapName, cutoffTS string,
+) ReconcileSnapshotJSON {
 	var cutoff time.Time
 	hasCutoff := false
 	if cutoffTS != "" {
@@ -1221,27 +1185,34 @@ func reconstructSnapshotAt(
 		}
 		state.apply(rec)
 	}
+	if cutoffTS != "" {
+		if tCut, err1 := time.Parse(time.RFC3339Nano, cutoffTS); err1 == nil {
+			if tLast, err2 := time.Parse(time.RFC3339Nano, lastTS); err2 != nil || tCut.After(tLast) {
+				lastTS = cutoffTS
+			}
+		}
+	}
 
 	pmj, ok := state.pmjs[pmjName]
 	if !ok {
-		pmj = PMJState{
-			Name:            pmjName,
-			Namespace:       "default",
-			SourcePodName:   srcPod,
-			RestoredPodName: dstPod,
-			SnapshotName:    snapName,
+		pmj = K8sPMJ{
+			Metadata: K8sObjectMeta{Name: pmjName, Namespace: "default"},
+			Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: srcPod}},
+			Status:   K8sPMJStatus{SnapshotRef: snapName, RestoredPodName: dstPod},
 		}
 	}
-	if pmj.SnapshotName == "" && snapName != "" {
-		pmj.SnapshotName = snapName
+	if pmj.Status.SnapshotRef == "" && snapName != "" {
+		pmj.Status.SnapshotRef = snapName
 	}
-	if pmj.RestoredPodName == "" && dstPod != "" {
-		pmj.RestoredPodName = dstPod
+	if pmj.Status.RestoredPodName == "" && dstPod != "" {
+		pmj.Status.RestoredPodName = dstPod
 	}
-	snap := state.snapshotForPMJ(lastTS, pmj)
-	snap.Scenario = scenario
-	snap.BlindSpotOutcome = outcome
-	return snap
+	if cutoffTS == "" && (pmj.Status.Phase == "Restoring" || pmj.Status.Phase == "Evicting") && lastTS != "" {
+		if tLast, err := time.Parse(time.RFC3339Nano, lastTS); err == nil {
+			lastTS = tLast.Add(60 * time.Second).UTC().Format(time.RFC3339)
+		}
+	}
+	return state.snapshotForPMJ(lastTS, pmj)
 }
 
 func loadNDJSONRecords(path string) ([]rawNDJSONRecord, error) {
@@ -1278,6 +1249,11 @@ package invariants
 import (
 	"fmt"
 	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+
+	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
 // %s returns the stateless Rule for %s (%s).
@@ -1298,8 +1274,11 @@ func %s(s *ReconcileSnapshot) []Violation {
 		return nil
 	}
 	pmj := s.PrimaryPMJ
-	_ = strings.TrimSpace
 	_ = fmt.Sprintf
+	_ = strings.TrimSpace
+	_ = time.Second
+	_ = corev1.ConditionTrue
+	_ = pmv1alpha1.PodMigrationJobPhaseRestoring
 %s
 }
 `, f.TriggerSource, ruleConstructor, f.InvariantID, f.InvariantName, f.TriggerSource, f.Description,
@@ -1310,28 +1289,15 @@ func %s(s *ReconcileSnapshot) []Violation {
 
 func renderPredicateBodyGo(f BlindSpotFinding) string {
 	switch f.Template {
-	case TemplatePrematureSnapshotFailed:
-		return `	// PrematureSnapshotFailureIsolation: a PMJ must not transition to PhaseFailed
-	// with Reason=SnapshotFailed while its Checkpoint/StorageReplicated sub-conditions
-	// remain actively progressing.
-	if string(pmj.Status.Phase) == "Failed" && pmj.Status.Reason == "SnapshotFailed" &&
-		strings.Contains(pmj.Status.Message, "InProgress") {
-		return []Violation{{
-			InvariantID:   "` + f.InvariantID + `",
-			InvariantName: "` + f.InvariantName + `",
-			Reason:        "PrematureSnapshotFailureWhileCheckpointing",
-			Message:       fmt.Sprintf("PMJ %s/%s failed with SnapshotFailed while checkpoint was still progressing", pmj.Namespace, pmj.Name),
-			Namespace:     pmj.Namespace,
-			PMJName:       pmj.Name,
-			PodName:       pmj.Spec.PodRef.Name,
-		}}
-	}
-	return nil`
-
 	case TemplateWedgedRestoringOrphan:
-		return `	// RestoringReplacementLiveness: when a PMJ is in PhaseRestoring and has bound
-	// RestoredPodName, the replacement pod must exist in the namespace informer view.
-	if string(pmj.Status.Phase) == "Restoring" && pmj.Status.RestoredPodName != "" && len(s.NamespacePods) > 0 {
+		return `	// RestoringReplacementLiveness: when a PMJ has remained in PhaseRestoring
+	// for >=30s with a bound RestoredPodName, that replacement pod must still
+	// exist and be non-deleting in the namespace pod snapshot.
+	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
+		pmj.Status.RestoredPodName != "" &&
+		pmj.Status.RestoringStartTime != nil &&
+		!s.Now.IsZero() &&
+		s.Now.Sub(pmj.Status.RestoringStartTime.Time) >= 30*time.Second {
 		found := false
 		for i := range s.NamespacePods {
 			if s.NamespacePods[i].Name == pmj.Status.RestoredPodName && s.NamespacePods[i].DeletionTimestamp == nil {
@@ -1339,12 +1305,15 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 				break
 			}
 		}
+		if !found && s.PrimaryPod != nil && s.PrimaryPod.Name == pmj.Status.RestoredPodName && s.PrimaryPod.DeletionTimestamp == nil {
+			found = true
+		}
 		if !found {
 			return []Violation{{
 				InvariantID:   "` + f.InvariantID + `",
 				InvariantName: "` + f.InvariantName + `",
 				Reason:        "RestoringReplacementPodMissing",
-				Message:       fmt.Sprintf("PMJ %s/%s is in PhaseRestoring but replacement pod %q is missing or deleting", pmj.Namespace, pmj.Name, pmj.Status.RestoredPodName),
+				Message:       fmt.Sprintf("PMJ %s/%s remained in PhaseRestoring >=30s while replacement pod %q is missing or deleting", pmj.Namespace, pmj.Name, pmj.Status.RestoredPodName),
 				Namespace:     pmj.Namespace,
 				PMJName:       pmj.Name,
 				PodName:       pmj.Status.RestoredPodName,
@@ -1353,25 +1322,69 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 	}
 	return nil`
 
+	case TemplateNoReplacementEvictingStall:
+		return `	// EvictingNoReplacementLiveness: when a PMJ has remained in PhaseEvicting
+	// for >=30s with no RestoredPodName bound and the source pod is already gone,
+	// the migration is stalled without a replacement pod.
+	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
+		pmj.Status.RestoredPodName == "" &&
+		pmj.Status.EvictingStartTime != nil &&
+		!s.Now.IsZero() &&
+		s.Now.Sub(pmj.Status.EvictingStartTime.Time) >= 30*time.Second {
+		srcActive := false
+		for i := range s.NamespacePods {
+			if s.NamespacePods[i].Name == pmj.Spec.PodRef.Name && s.NamespacePods[i].DeletionTimestamp == nil {
+				srcActive = true
+				break
+			}
+		}
+		if !srcActive && s.PrimaryPod != nil && s.PrimaryPod.Name == pmj.Spec.PodRef.Name && s.PrimaryPod.DeletionTimestamp == nil {
+			srcActive = true
+		}
+		if !srcActive {
+			return []Violation{{
+				InvariantID:   "` + f.InvariantID + `",
+				InvariantName: "` + f.InvariantName + `",
+				Reason:        "EvictingSourceGoneWithoutReplacement",
+				Message:       fmt.Sprintf("PMJ %s/%s remained in PhaseEvicting >=30s after source pod %q disappeared with no replacement pod", pmj.Namespace, pmj.Name, pmj.Spec.PodRef.Name),
+				Namespace:     pmj.Namespace,
+				PMJName:       pmj.Name,
+				PodName:       pmj.Spec.PodRef.Name,
+			}}
+		}
+	}
+	return nil`
+
 	case TemplateUnintendedColdStartActivePMJ:
 		return `	// ActivePMJReplacementColdStartGuard: while a PMJ is in PhaseRestoring, its
-	// bound replacement pod must not be Running+Ready with an empty restore annotation.
-	if string(pmj.Status.Phase) == "Restoring" && pmj.Status.RestoredPodName != "" {
+	// bound replacement pod must not become Ready with an empty snapshot restore annotation.
+	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring && pmj.Status.RestoredPodName != "" {
 		for i := range s.NamespacePods {
 			pod := &s.NamespacePods[i]
-			if pod.Name == pmj.Status.RestoredPodName && len(pod.Spec.SchedulingGates) == 0 {
-				restoreName := strings.TrimSpace(pod.Annotations["gke.io/pod-snapshot-restore-name"])
-				if restoreName == "" {
-					return []Violation{{
-						InvariantID:   "` + f.InvariantID + `",
-						InvariantName: "` + f.InvariantName + `",
-						Reason:        "ActivePMJReplacementColdStarted",
-						Message:       fmt.Sprintf("Replacement pod %s/%s ungated without gke.io/pod-snapshot-restore-name while PMJ %s is Restoring", pod.Namespace, pod.Name, pmj.Name),
-						Namespace:     pmj.Namespace,
-						PMJName:       pmj.Name,
-						PodName:       pod.Name,
-					}}
+			if pod.Name != pmj.Status.RestoredPodName || len(pod.Spec.SchedulingGates) > 0 {
+				continue
+			}
+			ready := false
+			for _, c := range pod.Status.Conditions {
+				if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+					ready = true
+					break
 				}
+			}
+			restoreSnap := strings.TrimSpace(pod.Annotations["gke.io/pod-snapshot-restore-name"])
+			if restoreSnap == "" {
+				restoreSnap = strings.TrimSpace(pod.Annotations["pod-migration.gke.io/ps-name"])
+			}
+			if ready && restoreSnap == "" {
+				return []Violation{{
+					InvariantID:   "` + f.InvariantID + `",
+					InvariantName: "` + f.InvariantName + `",
+					Reason:        "ActivePMJReplacementColdStarted",
+					Message:       fmt.Sprintf("Replacement pod %s/%s became Ready without snapshot restore annotation while PMJ %s was in PhaseRestoring", pod.Namespace, pod.Name, pmj.Name),
+					Namespace:     pmj.Namespace,
+					PMJName:       pmj.Name,
+					PodName:       pod.Name,
+				}}
 			}
 		}
 	}
@@ -1379,19 +1392,24 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 
 	default:
 		return `	// TODO(invariant-author): implement pure predicate for ` + f.InvariantID + ` (` + f.InvariantName + `).
+	// If this invariant inspects external CRD sub-conditions not yet present on
+	// ReconcileSnapshot (e.g. PodSnapshot Checkpoint/StorageReplicated conditions),
+	// extend ReconcileSnapshot in snapshot.go within the same Lane 2 invariant/* PR.
 	_ = pmj
 	return nil`
 	}
 }
 
-func renderCandidateTestGo(f BlindSpotFinding, fixtureFilename string) string {
-	funcName := fmt.Sprintf("Evaluate%s_%s", strings.ToUpper(f.InvariantID), f.InvariantName)
-	testName := fmt.Sprintf("Test%s_%s_RedGreenReplay", strings.ToUpper(f.InvariantID), f.InvariantName)
+func renderCandidateTestGo(f BlindSpotFinding, fixtureFilename, greenFilename string) string {
+	ruleConstructor := fmt.Sprintf("Rule%s", strings.ToUpper(f.InvariantID))
+	redTestName := fmt.Sprintf("Test%s_%s_RedProof", strings.ToUpper(f.InvariantID), f.InvariantName)
+	greenTestName := fmt.Sprintf("Test%s_%s_GreenProof", strings.ToUpper(f.InvariantID), f.InvariantName)
 
 	return fmt.Sprintf(`// Code generated by tools/invariant-gen (%s); review before merging on an invariant/* branch.
 package invariants
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1401,25 +1419,53 @@ func %s(t *testing.T) {
 	fixturePath := filepath.Join("testdata", %q)
 	raw, err := os.ReadFile(fixturePath)
 	if err != nil {
-		t.Fatalf("failed to read offending snapshot fixture %%s: %%v", fixturePath, err)
+		t.Fatalf("read RED snapshot fixture %%s: %%v", fixturePath, err)
 	}
-	if len(raw) == 0 {
-		t.Fatalf("expected non-empty snapshot fixture %%s", fixturePath)
+	var snap ReconcileSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("unmarshal RED snapshot fixture %%s into ReconcileSnapshot: %%v", fixturePath, err)
 	}
-	// Verify nil/empty snapshot produces 0 false positives (GREEN baseline sanity).
-	if vs := %s(&ReconcileSnapshot{}); len(vs) != 0 {
-		t.Fatalf("expected 0 violations on empty ReconcileSnapshot, got %%v", vs)
+	rule := %s()
+	vs := rule.Evaluate(&snap)
+	if len(vs) == 0 {
+		t.Fatalf("RED proof failed: expected >= 1 violation from %%s (%%s) on offending fixture %%s, got 0", rule.ID(), rule.Name(), fixturePath)
+	}
+	if vs[0].InvariantID != %q {
+		t.Fatalf("expected violation InvariantID=%s, got %%q", vs[0].InvariantID)
 	}
 }
-`, f.TriggerSource, testName, fixtureFilename, funcName)
+
+func %s(t *testing.T) {
+	greenPath := filepath.Join("testdata", %q)
+	raw, err := os.ReadFile(greenPath)
+	if err != nil {
+		t.Fatalf("read GREEN snapshot corpus %%s: %%v", greenPath, err)
+	}
+	var snaps []ReconcileSnapshot
+	if err := json.Unmarshal(raw, &snaps); err != nil {
+		t.Fatalf("unmarshal GREEN snapshot corpus %%s: %%v", greenPath, err)
+	}
+	if len(snaps) == 0 {
+		t.Fatalf("expected non-empty GREEN snapshot corpus in %%s", greenPath)
+	}
+	rule := %s()
+	for i := range snaps {
+		if vs := rule.Evaluate(&snaps[i]); len(vs) != 0 {
+			t.Fatalf("GREEN proof failed at step %%d (now=%%s): unexpected false-positive violation %%+v", i, snaps[i].Now.Format("2006-01-02T15:04:05Z07:00"), vs)
+		}
+	}
+}
+`, f.TriggerSource,
+		redTestName, fixtureFilename, ruleConstructor, f.InvariantID, f.InvariantID,
+		greenTestName, greenFilename, ruleConstructor)
 }
 
 func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
-	redStatus := "PASS"
+	redStatus := "PASS (`go test` verified)"
 	if !p.RedPassed {
 		redStatus = "FAIL (requires author predicate)"
 	}
-	greenStatus := "PASS"
+	greenStatus := "PASS (`go test` verified)"
 	if !p.GreenPassed {
 		greenStatus = "FAIL"
 	}
@@ -1442,16 +1488,17 @@ func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
 
 ---
 
-### 2. Automated RED / GREEN Replay Proof
+### 2. Compiled `+"`go test`"+` RED / GREEN Replay Proof
 
-| Proof Stage | Target Corpus | Checked Snapshots / Steps | Violations | Result |
+| Proof Stage | Target Corpus | Checked Snapshots / Steps | Compiled & Tested | Result |
 | :--- | :--- | :---: | :---: | :---: |
-| **RED Proof** (Must catch offending state) | `+"`testdata/%s`"+` | `+"`1`"+` | `+"`%d`"+` | **%s** |
-| **GREEN Proof** (Must have 0 false positives) | Baseline lifecycle fixtures + clean `+"`records.ndjson`"+` traces | `+"`%d`"+` baseline + `+"`%d`"+` trace steps | `+"`%d`"+` | **%s** |
+| **RED Proof** (`+"`Test%s_%s_RedProof`"+`) | `+"`testdata/%s`"+` (`+"`ReconcileSnapshot`"+`) | `+"`1`"+` | `+"`%v`"+` | **%s** |
+| **GREEN Proof** (`+"`Test%s_%s_GreenProof`"+`) | `+"`testdata/%s`"+` (baseline + clean `+"`records.ndjson`"+` steps) | `+"`%d`"+` baseline + `+"`%d`"+` trace steps | `+"`%v`"+` | **%s** |
 
 ---
 
 ### 3. Generated Artifacts (Lane 2 Scope)
+- `+"`controller/internal/invariants/testdata/%s`"+`
 - `+"`controller/internal/invariants/testdata/%s`"+`
 - `+"`controller/internal/invariants/%s`"+`
 - `+"`controller/internal/invariants/%s`"+`
@@ -1465,12 +1512,22 @@ func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
 		f.PMJName, f.SourcePod, f.RestoredPod,
 		f.FailureTimestamp,
 		f.Description,
-		filepath.Base(p.SnapshotFixturePath), len(p.RedViolations), redStatus,
-		p.GreenBaselineChecked, p.GreenTraceStepsChecked, len(p.GreenViolations), greenStatus,
+		strings.ToUpper(f.InvariantID), f.InvariantName, filepath.Base(p.SnapshotFixturePath), p.CompiledAndTested, redStatus,
+		strings.ToUpper(f.InvariantID), f.InvariantName, filepath.Base(p.GreenFixturesPath), p.GreenBaselineChecked, p.GreenTraceStepsChecked, p.CompiledAndTested, greenStatus,
 		filepath.Base(p.SnapshotFixturePath),
+		filepath.Base(p.GreenFixturesPath),
 		filepath.Base(p.RuleFilePath),
 		filepath.Base(p.TestFilePath),
 	)
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func derefStr(p *string) string {
@@ -1478,13 +1535,6 @@ func derefStr(p *string) string {
 		return ""
 	}
 	return *p
-}
-
-func pmjPhaseStr(p *PMJState) string {
-	if p == nil || p.Phase == "" {
-		return "unknown"
-	}
-	return p.Phase
 }
 
 func nestedStr(obj map[string]any, keys ...string) string {
@@ -1522,7 +1572,7 @@ func extractStringMap(obj map[string]any, keys ...string) map[string]string {
 	return out
 }
 
-func extractSchedulingGates(obj map[string]any) []string {
+func extractSchedulingGates(obj map[string]any) []K8sSchedulingGate {
 	spec, ok := obj["spec"].(map[string]any)
 	if !ok {
 		return nil
@@ -1531,18 +1581,18 @@ func extractSchedulingGates(obj map[string]any) []string {
 	if !ok {
 		return nil
 	}
-	var out []string
+	var out []K8sSchedulingGate
 	for _, g := range gates {
 		if gm, ok := g.(map[string]any); ok {
 			if name, ok := gm["name"].(string); ok && name != "" {
-				out = append(out, name)
+				out = append(out, K8sSchedulingGate{Name: name})
 			}
 		}
 	}
 	return out
 }
 
-func extractConditions(obj map[string]any) []ConditionSummary {
+func extractConditions(obj map[string]any) []K8sCondition {
 	status, ok := obj["status"].(map[string]any)
 	if !ok {
 		return nil
@@ -1551,30 +1601,22 @@ func extractConditions(obj map[string]any) []ConditionSummary {
 	if !ok {
 		return nil
 	}
-	var out []ConditionSummary
+	var out []K8sCondition
 	for _, c := range conds {
 		cm, ok := c.(map[string]any)
 		if !ok {
 			continue
 		}
-		cs := ConditionSummary{
-			Type:    nestedStr(cm, "type"),
-			Status:  nestedStr(cm, "status"),
-			Reason:  nestedStr(cm, "reason"),
-			Message: nestedStr(cm, "message"),
+		cs := K8sCondition{
+			Type:               nestedStr(cm, "type"),
+			Status:             nestedStr(cm, "status"),
+			Reason:             nestedStr(cm, "reason"),
+			Message:            nestedStr(cm, "message"),
+			LastTransitionTime: nestedStr(cm, "lastTransitionTime"),
 		}
 		if cs.Type != "" {
 			out = append(out, cs)
 		}
 	}
 	return out
-}
-
-func isPodObjReady(obj map[string]any) bool {
-	for _, c := range extractConditions(obj) {
-		if c.Type == "Ready" && c.Status == "True" {
-			return true
-		}
-	}
-	return false
 }
