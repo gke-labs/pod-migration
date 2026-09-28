@@ -23,7 +23,7 @@ const (
 	AnnotationAssignedPMJ = util.AnnotationAssignedPMJ
 	// AnnotationPSName is the GKE Pod Snapshots restore annotation on replacement Pods.
 	// An explicit empty string value ("") is the cold-start bypass signal written by
-	// releaseWithColdStartBypass on gated replacement pods when a migration completes without restore.
+	// releaseWithColdStartBypass and the replacement webhook.
 	AnnotationPSName = "podsnapshot.gke.io/ps-name"
 	// AnnotationMigrationTimeout is the effective migration timeout annotation stamped on PMJs (#57).
 	AnnotationMigrationTimeout = "pod-migration.gke.io/timeout"
