@@ -700,3 +700,113 @@ pod_migration_invariant_violations_total{invariant="I3_VolumeSafeUngate"} 2
 		t.Fatalf("VerifyInvariants on dirty run succeeded, want non-nil error")
 	}
 }
+
+// TestGateHoldReconstructionAndVerifySLO verifies that gateHoldS is reconstructed
+// from MigrationRestoreReleased events, schedulingGates removal transitions, and
+// PodScheduled condition LTT, that Stats.P95 is computed accurately, and that
+// VerifySLO enforces I3/I4 wall-clock thresholds (T).
+func TestGateHoldReconstructionAndVerifySLO(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.Create(filepath.Join(dir, "records.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const pmjGVR = "podmigrationjobs.v1alpha1.podmigration.gke.io"
+	const podGVR = "pods.v1"
+
+	// Migration 1: gateHoldS reconstructed via schedulingGates removal transition (created +10s, gate removed +13s => gateHoldS=3s).
+	rec(t, f, -time.Minute, "list", podGVR, podObj("w1-0", "uid-w1-src", -time.Minute, nil))
+	rec(t, f, 8*time.Second, "update", podGVR, podObj("w1-0", "uid-w1-src", -time.Minute, func(o map[string]any) {
+		o["metadata"].(map[string]any)["deletionTimestamp"] = ts(8 * time.Second)
+	}))
+	rec(t, f, 10*time.Second, "add", podGVR, podObj("w1-0-dst", "uid-w1-dst", 10*time.Second, func(o map[string]any) {
+		o["spec"] = map[string]any{
+			"schedulingGates": []any{map[string]any{"name": "pod-migration.gke.io/restoring"}},
+		}
+	}))
+	rec(t, f, 13*time.Second, "update", podGVR, podObj("w1-0-dst", "uid-w1-dst", 10*time.Second, func(o map[string]any) {
+		o["spec"] = map[string]any{"nodeName": "node-b"}
+	}))
+	rec(t, f, 20*time.Second, "update", podGVR, podObj("w1-0-dst", "uid-w1-dst", 10*time.Second, func(o map[string]any) {
+		o["spec"] = map[string]any{"nodeName": "node-b"}
+		o["status"] = map[string]any{"conditions": []any{
+			map[string]any{"type": "Ready", "status": "True", "lastTransitionTime": ts(20 * time.Second)},
+		}}
+	}))
+	pmj1 := pmjObj("pmj-w1-0", "w1-0", "uid-w1-src", "Succeeded", "snap-w1")
+	pmj1["status"].(map[string]any)["restoredPodName"] = "w1-0-dst"
+	pmj1["status"].(map[string]any)["restoredPodUID"] = "uid-w1-dst"
+	pmj1["status"].(map[string]any)["conditions"] = []any{
+		map[string]any{"type": "Restored", "status": "True", "reason": "RestoreVerified"},
+	}
+	rec(t, f, 21*time.Second, "add", pmjGVR, pmj1)
+
+	// Migration 2: gateHoldS reconstructed via MigrationRestoreReleased event (created +30s, event +35s => gateHoldS=5s).
+	rec(t, f, -time.Minute, "list", podGVR, podObj("w2-0", "uid-w2-src", -time.Minute, nil))
+	rec(t, f, 28*time.Second, "update", podGVR, podObj("w2-0", "uid-w2-src", -time.Minute, func(o map[string]any) {
+		o["metadata"].(map[string]any)["deletionTimestamp"] = ts(28 * time.Second)
+	}))
+	rec(t, f, 30*time.Second, "add", podGVR, podObj("w2-0-dst", "uid-w2-dst", 30*time.Second, func(o map[string]any) {
+		o["spec"] = map[string]any{"nodeName": "node-b"}
+		o["status"] = map[string]any{"conditions": []any{
+			map[string]any{"type": "Ready", "status": "True", "lastTransitionTime": ts(45 * time.Second)},
+		}}
+	}))
+	rec(t, f, 35*time.Second, "add", "events.v1", map[string]any{
+		"type":           "Normal",
+		"reason":         "MigrationRestoreReleased",
+		"message":        "Scheduling gate removed",
+		"involvedObject": map[string]any{"kind": "Pod", "name": "w2-0-dst"},
+		"lastTimestamp":  ts(35 * time.Second),
+	})
+	pmj2 := pmjObjAt("pmj-w2-0", "w2-0", "uid-w2-src", "Succeeded", "inc-w2", 25*time.Second)
+	pmj2["status"].(map[string]any)["restoredPodName"] = "w2-0-dst"
+	pmj2["status"].(map[string]any)["restoredPodUID"] = "uid-w2-dst"
+	pmj2["status"].(map[string]any)["conditions"] = []any{
+		map[string]any{"type": "Restored", "status": "True", "reason": "RestoreVerified"},
+	}
+	rec(t, f, 46*time.Second, "add", pmjGVR, pmj2)
+	f.Close()
+
+	run, err := Analyze(Options{RunDir: dir, WedgeThreshold: 10 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPMJ := map[string]Migration{}
+	for _, m := range run.Migrations {
+		byPMJ[m.PMJ] = m
+	}
+	if got := byPMJ["pmj-w1-0"].GateHoldS; got != 3 {
+		t.Errorf("pmj-w1-0 gateHoldS = %v, want 3 (from schedulingGates removal transition)", got)
+	}
+	if got := byPMJ["pmj-w2-0"].GateHoldS; got != 5 {
+		t.Errorf("pmj-w2-0 gateHoldS = %v, want 5 (from MigrationRestoreReleased event)", got)
+	}
+	if st := run.Stats["gateHoldS"]; st.N != 2 || st.P95 != 5 {
+		t.Errorf("gateHoldS stats = %+v, want N=2 P95=5", st)
+	}
+
+	// VerifySLO with default thresholds (60s/60s/180s) must pass.
+	if err := VerifySLO(run, DefaultSLOThresholds()); err != nil {
+		t.Fatalf("VerifySLO with DefaultSLOThresholds failed: %v", err)
+	}
+
+	// Tightening GateHoldP95 below 5s must fail I3:GateLiveness.
+	if err := VerifySLO(run, SLOThresholds{GateHoldP95: 4 * time.Second, DowntimeP95: 60 * time.Second, E2EP95: 180 * time.Second}); err == nil {
+		t.Errorf("VerifySLO with GateHoldP95=4s succeeded, want I3:GateLiveness error")
+	}
+	// Tightening DowntimeP95 below 17s must fail I4:BlackoutWindow.
+	if err := VerifySLO(run, SLOThresholds{GateHoldP95: 60 * time.Second, DowntimeP95: 10 * time.Second, E2EP95: 180 * time.Second}); err == nil {
+		t.Errorf("VerifySLO with DowntimeP95=10s succeeded, want I4:BlackoutWindow error")
+	}
+	// Tightening E2EP95 below 21s must fail I4:TerminalProgress.
+	if err := VerifySLO(run, SLOThresholds{GateHoldP95: 60 * time.Second, DowntimeP95: 60 * time.Second, E2EP95: 15 * time.Second}); err == nil {
+		t.Errorf("VerifySLO with E2EP95=15s succeeded, want I4:TerminalProgress error")
+	}
+	// Empty run must fail VerifySLO.
+	emptyRun := &Run{Scenario: "empty", Stats: map[string]Stats{}}
+	if err := VerifySLO(emptyRun, DefaultSLOThresholds()); err == nil {
+		t.Errorf("VerifySLO on empty run succeeded, want error")
+	}
+}
+
