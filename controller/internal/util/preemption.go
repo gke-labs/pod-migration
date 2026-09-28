@@ -32,7 +32,17 @@ const (
 )
 
 // IsNodePreempting returns true if the Node exhibits any verified GKE or Kubernetes
-// preemption, impending termination, or graceful shutdown signal:
+// preemption, impending termination, or graceful shutdown signal.
+//
+// Operational Signal Findings on GKE:
+//   - On GKE Spot VMs, preemption manifests purely as Kubelet Graceful Node Shutdown
+//     (Signal 3: NodeReady=False with Reason "KubeletNotReady" and message "node is shutting down").
+//     Neither GKE host maintenance marker appears for Spot instances.
+//   - Signals 1 & 2 (the impending-node-termination taint and active-node-maintenance label)
+//     are documented and emitted by GKE for host maintenance events (e.g. TPU/GPU maintenance),
+//     not standard Spot preemption.
+//
+// Signals checked:
 //  1. GKE host maintenance taint: cloud.google.com/impending-node-termination
 //  2. GKE host maintenance label: cloud.google.com/active-node-maintenance=ONGOING
 //  3. Kubelet graceful node shutdown: NodeReady condition Status=False with
