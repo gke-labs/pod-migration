@@ -196,7 +196,9 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		lastProgress = targetSnapshot.GetCreationTimestamp().Time
 	}
 
-	// Pass 1: Scan all conditions for terminal failures
+	// Pass 1a: Scan sub-conditions (Checkpoint, StorageReplicated) for definitive terminal failures.
+	// If an underlying constituent operation has terminally failed (e.g. Checkpoint or StorageReplicated
+	// failed/errored/refused), fast-fail immediately.
 	for _, c := range conditions {
 		cond, ok := c.(map[string]interface{})
 		if ok {
@@ -204,7 +206,50 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 			cStatus, _ := cond["status"].(string)
 			cReason, _ := cond["reason"].(string)
 			cMsg, _ := cond["message"].(string)
-			if cStatus == "False" && isTerminalSnapshotFailureReason(cReason) && (cType == "Checkpoint" || cType == "StorageReplicated" || cType == "Ready") {
+			if cStatus == "False" && isTerminalSnapshotFailureReason(cReason) && (cType == "Checkpoint" || cType == "StorageReplicated") {
+				logger.Info("PodSnapshot reported terminal failure in sub-condition", "snapshot", snapshotName, "type", cType, "reason", cReason, "message", cMsg)
+				return &Status{
+					Phase:       PhaseFailed,
+					SnapshotRef: snapshotName,
+					Reason:      "SnapshotFailed",
+					Message:     fmt.Sprintf("GKE PodSnapshot %s failed (%s): %s", cType, cReason, cMsg),
+				}, nil
+			}
+		}
+	}
+
+	// Determine if any sub-condition is actively in progress.
+	// In high-concurrency waves (Issue #75), GKE PodSnapshot may briefly exhibit a transient
+	// Ready=False (Failed) condition while Checkpoint is still InProgress or StorageReplicated is AwaitingCheckpoint.
+	// In this transient state, sub-conditions are actively running and will finish shortly, so Ready=False (Failed)
+	// must not prematurely abort the PodMigrationJob.
+	subconditionsInProgress := false
+	for _, c := range conditions {
+		cond, ok := c.(map[string]interface{})
+		if ok {
+			cType, _ := cond["type"].(string)
+			cStatus, _ := cond["status"].(string)
+			cReason, _ := cond["reason"].(string)
+			if (cType == "Checkpoint" || cType == "StorageReplicated") && cStatus == "False" && isSnapshotSubconditionInProgressReason(cReason) {
+				subconditionsInProgress = true
+				break
+			}
+		}
+	}
+
+	// Pass 1b: Check Ready condition for terminal failure only when no sub-condition is actively in progress.
+	for _, c := range conditions {
+		cond, ok := c.(map[string]interface{})
+		if ok {
+			cType, _ := cond["type"].(string)
+			cStatus, _ := cond["status"].(string)
+			cReason, _ := cond["reason"].(string)
+			cMsg, _ := cond["message"].(string)
+			if cType == "Ready" && cStatus == "False" && isTerminalSnapshotFailureReason(cReason) {
+				if subconditionsInProgress {
+					logger.Info("PodSnapshot reported Ready=False failure while sub-conditions are still in progress; ignoring transient failure", "snapshot", snapshotName, "reason", cReason, "message", cMsg)
+					break
+				}
 				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", cType, "reason", cReason, "message", cMsg)
 				return &Status{
 					Phase:       PhaseFailed,
@@ -219,13 +264,16 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	// Check top-level phase if present on PodSnapshot
 	if topPhase, ok := snapStatus["phase"].(string); ok {
 		if isTerminalSnapshotFailureReason(topPhase) {
-			logger.Info("PodSnapshot reported terminal failure via phase", "snapshot", snapshotName, "phase", topPhase)
-			return &Status{
-				Phase:       PhaseFailed,
-				SnapshotRef: snapshotName,
-				Reason:      "SnapshotFailed",
-				Message:     fmt.Sprintf("GKE PodSnapshot failed with phase=%s", topPhase),
-			}, nil
+			if !subconditionsInProgress {
+				logger.Info("PodSnapshot reported terminal failure via phase", "snapshot", snapshotName, "phase", topPhase)
+				return &Status{
+					Phase:       PhaseFailed,
+					SnapshotRef: snapshotName,
+					Reason:      "SnapshotFailed",
+					Message:     fmt.Sprintf("GKE PodSnapshot failed with phase=%s", topPhase),
+				}, nil
+			}
+			logger.Info("PodSnapshot reported failed phase while sub-conditions are still in progress; ignoring transient failure", "snapshot", snapshotName, "phase", topPhase)
 		}
 	}
 
@@ -290,13 +338,26 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 // DeadlineExceeded), retrying trigger creation within the same PMJ prolongs migration disruption and risks
 // double-checkpointing an actively degrading pod; failing fast allows the controller or workload controller
 // to cleanly initiate fallback or reschedule rather than burning the migration deadline on known terminal states.
+// Refused means the snapshot engine declined to checkpoint this pod (for example, a pod shape it does not
+// support). That is a policy decision that will not change within the same PMJ, so it is terminal as well (#78, #84).
 func isTerminalSnapshotFailureReason(reason string) bool {
 	r := strings.ToLower(reason)
 	if r == "" || r == "noerror" || strings.HasPrefix(r, "not") || strings.HasPrefix(r, "non") {
 		return false
 	}
 	switch r {
-	case "failed", "error", "deadlineexceeded":
+	case "failed", "error", "deadlineexceeded", "refused":
+		return true
+	}
+	return false
+}
+
+// isSnapshotSubconditionInProgressReason checks if a sub-condition reason indicates that the
+// underlying checkpoint or storage replication operation is actively in progress (#75).
+func isSnapshotSubconditionInProgressReason(reason string) bool {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	switch r {
+	case "inprogress", "awaitingcheckpoint", "pending":
 		return true
 	}
 	return false
