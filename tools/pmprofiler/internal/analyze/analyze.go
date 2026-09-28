@@ -837,7 +837,7 @@ func ingestPod(pods map[string]map[string]*podInc, u *unstructured.Unstructured,
 	if gates, ok, _ := unstructured.NestedSlice(u.Object, "spec", "schedulingGates"); ok && len(gates) > 0 {
 		for _, g := range gates {
 			gm, _ := g.(map[string]any)
-			if gn, _ := gm["name"].(string); gn == "gke.io/pod-migration-gate" || gn != "" {
+			if gn, _ := gm["name"].(string); gn == "gke.io/pod-migration-gate" || strings.Contains(gn, "migration") || strings.Contains(gn, "restoring") {
 				currentlyGated = true
 				break
 			}

@@ -401,6 +401,7 @@ EOF
   local new_pod dst_node dst_type post_state post_id post_val
   new_pod="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" \
     -o jsonpath="{.items[?(@.spec.podRef.name=='${target_pod}')].status.restoredPodName}" 2>/dev/null | awk '{print $NF}')"
+  [[ -n "${new_pod}" ]] || die "T3-S1: PMJ did not record restoredPodName (phase=${pmj_phase})"
   kubectl wait --for=condition=Ready "pod/${new_pod}" -n "${NAMESPACE}" --timeout=120s
   dst_node="$(kubectl get pod "${new_pod}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}')"
   dst_type="$(kubectl get node "${dst_node}" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}')"
