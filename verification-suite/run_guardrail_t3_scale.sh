@@ -251,12 +251,14 @@ verify_restored_podmigrations() {
     return 0
   fi
 
+  if [[ "${RESTORE_FAILED}" == "true" ]]; then
+    log "FAIL: Skipping Ready wait because kubectl apply failed for pre-existing PodMigrations; preserving backup file ${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    return 0
+  fi
+
   local names
   mapfile -t names < <(jq -r '.items[].metadata.name' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)
   local restore_err=0
-  if [[ "${RESTORE_FAILED}" == "true" ]]; then
-    restore_err=1
-  fi
   for name in "${names[@]}"; do
     if [[ -n "${name}" ]]; then
       log "Waiting for restored PodMigration '${name}' in namespace ${NAMESPACE} to reach condition Ready=True..."
@@ -307,11 +309,11 @@ backup_preexisting_podmigrations() {
   fi
   mkdir -p "${OUT_DIR}"
   local raw_json
-  raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>/dev/null || true)"
-  if [[ -z "${raw_json}" ]] || ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
-    echo '{"apiVersion":"v1","kind":"List","items":[]}' > "${PREEXISTING_PODMIGRATIONS_BACKUP}"
-    BACKED_UP_PREEXISTING_PODMIGRATIONS="true"
-    return 0
+  if ! raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>&1)"; then
+    die "Cannot list PodMigrations in ${NAMESPACE} (kubectl get failed: ${raw_json}); refusing to delete them without a backup"
+  fi
+  if ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
+    die "Cannot parse PodMigrations list output in ${NAMESPACE} as JSON; refusing to delete them without a backup"
   fi
 
   echo "${raw_json}" | jq "${PODMIGRATIONS_BACKUP_JQ_FILTER}" > "${PREEXISTING_PODMIGRATIONS_BACKUP}"
@@ -328,10 +330,15 @@ resolve_gcs_bucket() {
   if [[ -n "${GCS_BUCKET}" ]]; then
     return 0
   fi
-  local existing
-  existing="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
-  if [[ -z "${existing}" ]] && [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+  local existing=""
+  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
     existing="$(jq -r '.items[0].spec.storage.location // empty' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)"
+  else
+    local raw_loc
+    if ! raw_loc="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>&1)"; then
+      die "Cannot inspect PodMigrations in ${NAMESPACE} for GCS bucket resolution (kubectl get failed: ${raw_loc})"
+    fi
+    existing="${raw_loc}"
   fi
   if [[ -n "${existing}" ]]; then
     GCS_BUCKET="${existing}"
@@ -954,6 +961,7 @@ EOF
 # ==============================================================================
 # Offline CI Self-Test Mode (--self-test)
 # ==============================================================================
+# shellcheck disable=SC2030,SC2031
 run_self_test() {
   log "Running offline T3 self-test (scalesim model + synthetic T3-S1/T3-S2 traces + SLO enforcement)"
   build_binaries
@@ -1132,10 +1140,50 @@ EOF
   fi
   log "PASS [self-test]: stale backup file collision guard verified"
 
+  # 7. Verify backup_preexisting_podmigrations fails closed when kubectl get fails
+  local test_get_fail_dir="${base_dir}/test-get-fail"
+  mkdir -p "${test_get_fail_dir}"
+  local test_get_fail_backup="${test_get_fail_dir}/preexisting-podmigrations.json"
+  if (
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_get_fail_backup}"
+    BACKED_UP_PREEXISTING_PODMIGRATIONS="false"
+    SELF_TEST="false"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        return 1
+      fi
+      command kubectl "$@"
+    }
+    backup_preexisting_podmigrations >/dev/null 2>&1
+  ); then
+    die "Self-test failure: backup_preexisting_podmigrations did not fail when kubectl get fails"
+  fi
+  if [[ -f "${test_get_fail_backup}" ]]; then
+    die "Self-test failure: backup file was created despite kubectl get failure"
+  fi
+  log "PASS [self-test]: backup fails closed when kubectl get fails"
+
+  # 8. Verify resolve_gcs_bucket fails closed when kubectl get fails and no backup exists
+  if (
+    GCS_BUCKET=""
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_get_fail_backup}"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        return 1
+      fi
+      command kubectl "$@"
+    }
+    resolve_gcs_bucket >/dev/null 2>&1
+  ); then
+    die "Self-test failure: resolve_gcs_bucket did not fail when kubectl get fails"
+  fi
+  log "PASS [self-test]: resolve_gcs_bucket fails closed when kubectl get fails"
+
   log "PASS [self-test]: PodMigration backup filter & restore transform verified"
   log "Self-test PASSED: HTML report generated at ${report_html}"
 }
 
+# shellcheck disable=SC2030,SC2031
 main() {
   if [[ "${SELF_TEST}" == "true" ]]; then
     run_self_test
