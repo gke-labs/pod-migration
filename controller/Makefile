@@ -22,7 +22,7 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_GEN_VERSION)
 ENVTEST_K8S_VERSION ?= 1.36.2
 SETUP_ENVTEST_VERSION ?= v0.25.0
 SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest-$(SETUP_ENVTEST_VERSION)
-.PHONY: help generate verify-generate manifests fmt vet build run envtest test install uninstall deploy undeploy docker-build docker-push controller-gen
+.PHONY: help generate verify-generate manifests fmt vet build run envtest test test-t1-invariants test-pmprofiler test-t2-guardrail test-scalesim test-t3-guardrail install uninstall deploy undeploy docker-build docker-push controller-gen
 
 VERIFY_ARTIFACTS := api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml
 
@@ -122,6 +122,20 @@ test-t1-invariants: envtest ## Run T1 per-merge envtest fault-injection matrix (
 		exit 1; \
 	fi; \
 	KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test -v -race -count=1 ./internal/controller -run TestT1_EnvtestFaultInjectionMatrix
+
+test-pmprofiler: ## Run unit tests for tools/pmprofiler.
+	@test "$$(awk '/^go / {print $$2}' go.mod)" = "$$(awk '/^go / {print $$2}' ../tools/pmprofiler/go.mod)" || { echo "Error: go version mismatch between controller/go.mod and tools/pmprofiler/go.mod" >&2; exit 1; }
+	cd ../tools/pmprofiler && go test -v -race ./...
+
+test-t2-guardrail: test-pmprofiler ## Run T2 guardrail scenario runner offline self-test.
+	../verification-suite/run_guardrail_t2.sh --self-test
+
+test-scalesim: ## Run unit tests for tools/scalesim analytical capacity model.
+	@test "$$(awk '/^go / {print $$2}' go.mod)" = "$$(awk '/^go / {print $$2}' ../tools/scalesim/go.mod)" || { echo "Error: go version mismatch between controller/go.mod and tools/scalesim/go.mod" >&2; exit 1; }
+	cd ../tools/scalesim && go test -v -race ./...
+
+test-t3-guardrail: test-pmprofiler test-scalesim ## Run T3 pmprofiler SLO gate self-test and scalesim capacity model.
+	../verification-suite/run_guardrail_t3_scale.sh --self-test
 
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.
 	kubectl apply -f config/crd/bases/

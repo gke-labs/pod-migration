@@ -24,10 +24,18 @@ jobs:
       with:
         go-version-file: 'controller/go.mod'
         check-latest: false
-        cache-dependency-path: 'controller/go.sum'
+        cache-dependency-path: |
+          controller/go.sum
+          tools/pmprofiler/go.sum
 
     - name: Verify Generated Code Freshness
       run: make -C controller verify-generate
 
     - name: Run Unit Tests
       run: make -C controller test
+
+    - name: Run pmprofiler & T2 Guardrail Self-Test
+      run: make -C controller test-t2-guardrail
+
+    - name: Run T3 SLO Guardrail & scalesim Capacity Model Self-Test
+      run: make -C controller test-t3-guardrail
