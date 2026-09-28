@@ -28,4 +28,5 @@ validation_logs/
 patches/containerd-shim-runsc-v1
 controller/bin/
 controller/cover.out
+controller/internal/invverify*/
 patches/crd-*.yaml
