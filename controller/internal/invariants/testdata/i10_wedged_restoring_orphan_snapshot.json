@@ -1,0 +1,96 @@
+{
+  "Now": "2026-09-28T00:39:00Z",
+  "Reconciler": "PodMigrationJobReconciler",
+  "PrimaryPMJ": {
+    "metadata": {
+      "name": "pmj-wedge-0",
+      "namespace": "default",
+      "uid": "uid-pmj-wedge",
+      "creationTimestamp": "2026-09-28T00:26:58Z"
+    },
+    "spec": {
+      "podRef": {
+        "name": "t3-counter-0"
+      },
+      "targetPodUID": "uid-wedge-src"
+    },
+    "status": {
+      "phase": "Restoring",
+      "snapshotRef": "ps-wedge-0",
+      "restoringStartTime": "2026-09-28T00:27:05Z",
+      "restoredPodName": "t3-counter-0-dst"
+    }
+  },
+  "PrimaryPod": {
+    "metadata": {
+      "name": "t3-counter-0",
+      "namespace": "default",
+      "uid": "uid-wedge-src",
+      "creationTimestamp": "2026-09-28T00:25:00Z",
+      "labels": {
+        "app": "t3-counter",
+        "pod-migration.gke.io/enabled": "true"
+      }
+    },
+    "spec": {
+      "nodeName": "node-a"
+    },
+    "status": {
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "lastTransitionTime": "2026-09-28T00:25:05Z"
+        }
+      ]
+    }
+  },
+  "NamespacePMJs": [
+    {
+      "metadata": {
+        "name": "pmj-wedge-0",
+        "namespace": "default",
+        "uid": "uid-pmj-wedge",
+        "creationTimestamp": "2026-09-28T00:26:58Z"
+      },
+      "spec": {
+        "podRef": {
+          "name": "t3-counter-0"
+        },
+        "targetPodUID": "uid-wedge-src"
+      },
+      "status": {
+        "phase": "Restoring",
+        "snapshotRef": "ps-wedge-0",
+        "restoringStartTime": "2026-09-28T00:27:05Z",
+        "restoredPodName": "t3-counter-0-dst"
+      }
+    }
+  ],
+  "NamespacePods": [
+    {
+      "metadata": {
+        "name": "t3-counter-0",
+        "namespace": "default",
+        "uid": "uid-wedge-src",
+        "creationTimestamp": "2026-09-28T00:25:00Z",
+        "labels": {
+          "app": "t3-counter",
+          "pod-migration.gke.io/enabled": "true"
+        }
+      },
+      "spec": {
+        "nodeName": "node-a"
+      },
+      "status": {
+        "conditions": [
+          {
+            "type": "Ready",
+            "status": "True",
+            "lastTransitionTime": "2026-09-28T00:25:05Z"
+          }
+        ]
+      }
+    }
+  ]
+}
