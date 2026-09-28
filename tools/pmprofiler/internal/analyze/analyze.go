@@ -643,12 +643,14 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 		m.TTerminal = fmtTime(t)
 	}
 
-	// Join warning events for the pod and the PMJ.
+	// Join warning events for the pod (source or replacement) and the PMJ
+	// within the migration window so pre-migration scale-up warnings and
+	// post-teardown warnings do not leak into the migration record.
 	for _, ev := range events {
-		if ev.typ != "Warning" {
+		if ev.typ != "Warning" || !inWindow(ev.ts) {
 			continue
 		}
-		if (ev.kind == "Pod" && ev.name == j.pod) ||
+		if (ev.kind == "Pod" && (ev.name == j.pod || (m.DstPod != "" && ev.name == m.DstPod))) ||
 			(ev.kind == "PodMigrationJob" && ev.name == name) {
 			m.Warnings = append(m.Warnings, fmt.Sprintf("%s %s: %s",
 				ev.ts.Format(time.RFC3339), ev.reason, ev.message))

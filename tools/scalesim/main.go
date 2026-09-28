@@ -1,12 +1,11 @@
-// Command scalesim is the T3 offline scale simulator for GKE Live Pod Migration.
-// It synthesizes N pending pod migrations over a multi-node topology and models:
-//   - Cluster-wide and per-node outbound/inbound concurrency admission caps,
-//   - High-priority (spot preemption / node-down) queue preemption over normal drains,
-//   - Controller reconciler queue dynamics (PMJ workers=50, serialized PodGate
-//     worker=1, and client-go token-bucket QPS=500 / Burst=1000 from PR #33),
-// verifying in <2s without a live 50-node cluster that all concurrency caps hold,
-// high-priority migrations drain in early waves, zero migrations are dropped, and
-// serialized I3 scheduling-gate release stays well within the 60s gateHoldS SLO.
+// Command scalesim is a standalone analytical capacity-planning model for GKE Live Pod Migration.
+// It imports no controller packages and is NOT a regression gate for controller code:
+//   - Real controller defaults modeled (PR #33): PMJ workers=50, serialized PodGate
+//     worker=1, and client-go token-bucket QPS=500 / Burst=1000.
+//   - Hypothetical admission-governor rules modeled (#65, not yet implemented in the
+//     controller): cluster-wide (--per-cluster=20) and per-node outbound/inbound
+//     (--per-node-out=2, --per-node-in=4) concurrency caps, plus high-priority spot
+//     preemption (--spot-percent=5).
 package main
 
 import (

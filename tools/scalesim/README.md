@@ -1,10 +1,16 @@
-# `scalesim` — T3 Offline Scale & Queue Simulator
+# `scalesim` — T3 Offline Capacity & Queue Model
 
-`scalesim` synthesizes large-scale pod migration burst waves (`N = 2,000` pods across `50` nodes by default) and models:
+> **Note (`model, not a controller gate`)**: `scalesim` is a standalone analytical capacity-planning model that imports **no** `controller/` packages. Passing `scalesim` verifies the model's own wave-admission math and queue bounds, **not** that the controller currently enforces per-node/per-cluster migration caps or spot priority ordering.
 
-1. **Cluster & Per-Node Concurrency Caps**: Enforces `--per-cluster` (and `--pmj-workers`), `--per-node-out`, and `--per-node-in` admission invariants across waves.
-2. **Spot Preemption Priority**: Verifies that high-priority spot/node-down migrations (`--spot-percent`) preempt normal drain waves and complete strictly ahead of low-priority tail waves.
-3. **Controller Reconciler Queue Dynamics (`PR #33`)**: Models `PodMigrationJobReconciler` (`--pmj-workers=50`), serialized `PodGateReconciler` (`--podgate-workers=1`), and `client-go` token-bucket rate limiting (`--client-qps=500`, `--client-burst=1000`) to verify that serialized `I3` scheduling-gate release stays well within the `60s` `gateHoldS` SLO.
+## Real Controller Parameters vs. Hypothetical Governor Parameters
+
+- **Real controller defaults (`PR #33`)**:
+  - `--pmj-workers=50`: `PodMigrationJobReconciler` `MaxConcurrentReconciles: 50`
+  - `--podgate-workers=1`: Serialized `PodGateReconciler` (`MaxConcurrentReconciles: 1`) for `I3` scheduling-gate removal
+  - `--client-qps=500`, `--client-burst=1000`: `client-go` token-bucket rate limiter settings
+- **Hypothetical admission-governor parameters (planned in `#65`, not yet implemented in the controller)**:
+  - `--per-cluster=20`, `--per-node-out=2`, `--per-node-in=4`: Hypothetical cluster-wide and per-node outbound/inbound migration concurrency caps
+  - `--spot-percent=5`: Hypothetical spot/node-down priority queue preemption over normal drain waves
 
 ## Usage
 

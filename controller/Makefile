@@ -130,11 +130,11 @@ test-pmprofiler: ## Run unit tests for tools/pmprofiler.
 test-t2-guardrail: test-pmprofiler ## Run T2 guardrail scenario runner offline self-test.
 	../verification-suite/run_guardrail_t2.sh --self-test
 
-test-scalesim: ## Run unit tests for tools/scalesim.
+test-scalesim: ## Run unit tests for tools/scalesim analytical capacity model.
 	@test "$$(awk '/^go / {print $$2}' go.mod)" = "$$(awk '/^go / {print $$2}' ../tools/scalesim/go.mod)" || { echo "Error: go version mismatch between controller/go.mod and tools/scalesim/go.mod" >&2; exit 1; }
 	cd ../tools/scalesim && go test -v -race ./...
 
-test-t3-guardrail: test-pmprofiler test-scalesim ## Run T3 scale simulator and SLO benchmark suite offline self-test.
+test-t3-guardrail: test-pmprofiler test-scalesim ## Run T3 pmprofiler SLO gate self-test and scalesim capacity model.
 	../verification-suite/run_guardrail_t3_scale.sh --self-test
 
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.

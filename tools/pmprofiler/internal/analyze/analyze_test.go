@@ -766,6 +766,14 @@ func TestGateHoldReconstructionAndVerifySLO(t *testing.T) {
 		map[string]any{"type": "Restored", "status": "True", "reason": "RestoreVerified"},
 	}
 	rec(t, f, 46*time.Second, "add", pmjGVR, pmj2)
+	// Pre-migration scale-up Warning event (at -30s, before PMJ t0) must NOT be joined.
+	rec(t, f, -30*time.Second, "add", "events.v1", map[string]any{
+		"type":           "Warning",
+		"reason":         "GKEPodSnapshotting",
+		"message":        "falling back to a cold start of pod: resource name may not be empty",
+		"involvedObject": map[string]any{"kind": "Pod", "name": "w1-0"},
+		"lastTimestamp":  ts(-30 * time.Second),
+	})
 	f.Close()
 
 	run, err := Analyze(Options{RunDir: dir, WedgeThreshold: 10 * time.Minute})
@@ -775,6 +783,9 @@ func TestGateHoldReconstructionAndVerifySLO(t *testing.T) {
 	byPMJ := map[string]Migration{}
 	for _, m := range run.Migrations {
 		byPMJ[m.PMJ] = m
+	}
+	if len(byPMJ["pmj-w1-0"].Warnings) != 0 {
+		t.Errorf("pmj-w1-0 warnings = %v, want empty (pre-t0 scale-up warning must be excluded by inWindow)", byPMJ["pmj-w1-0"].Warnings)
 	}
 	if got := byPMJ["pmj-w1-0"].GateHoldS; got != 3 {
 		t.Errorf("pmj-w1-0 gateHoldS = %v, want 3 (from schedulingGates removal transition)", got)

@@ -13,15 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Tier-3 (T3) Nightly Scale, Heterogeneous Node Shape & Latency SLO (T) Suite (Issue #53)
+# Tier-3 (T3) Nightly Scale, Cross-Node Drain & Latency SLO (T) Suite (Part of Issue #53)
 #
 # Orchestrates:
-#   - Offline Scale & Queue Simulator (tools/scalesim):
-#       * 2,000-pod burst drain across 50 nodes with cluster/node concurrency caps,
-#         spot preemption priority, and serialized PodGate queue modeling in <2s.
-#   - T3-S1 : Cross-Node / Heterogeneous Node Shape Drain & Placement Verification (I2, I8)
-#       * Verifies stateful pod warm restore across distinct worker nodes, checks
-#         node instance-type topology, and enforces wall-clock SLO thresholds (T).
+#   - Offline Analytical Capacity Model (tools/scalesim):
+#       * Discrete-event queueing model of a 2,000-pod burst drain across 50 nodes
+#         with hypothetical concurrency caps (#65), spot preemption priority, and
+#         serialized PodGate queue modeling in <2s (does not import controller code).
+#   - T3-S1 : Cross-Node Stateful Drain & Placement Verification (I2; I8 with --require-cross-shape)
+#       * Verifies stateful pod warm restore across distinct worker nodes and enforces
+#         wall-clock SLO thresholds (T). When --require-cross-shape is passed on a
+#         multi-shape gVisor pool, also asserts src_type != dst_type (pending #14).
 #   - T3-S2 : 50-Pod Multi-Workload Concurrent Evacuation Wave & Latency SLO (T) Benchmark
 #       * Deploys a 50-pod fleet across 5 mixed workloads (counter, redis, postgres,
 #         memcached, nginx), executes a concurrent node drain wave with stateful
@@ -49,6 +51,7 @@ REPLICAS_PER_APP="${REPLICAS_PER_APP:-10}"
 SLO_GATE_HOLD_P95="${SLO_GATE_HOLD_P95:-60s}"
 SLO_DOWNTIME_P95="${SLO_DOWNTIME_P95:-60s}"
 SLO_E2E_P95="${SLO_E2E_P95:-180s}"
+REQUIRE_CROSS_SHAPE="${REQUIRE_CROSS_SHAPE:-false}"
 SELF_TEST="false"
 
 usage() {
@@ -66,6 +69,7 @@ Options:
   --slo-gate-hold-p95 <dur>         Max p95 scheduling gate hold duration (default: 60s)
   --slo-downtime-p95 <dur>          Max p95 serving blackout duration (default: 60s)
   --slo-e2e-p95 <dur>               Max p95 end-to-end migration duration (default: 180s)
+  --require-cross-shape             Assert src_type != dst_type in T3-S1 (requires multi-shape gVisor pool)
   --self-test                       Run offline end-to-end self-test of scalesim, pmprofiler
                                     SLO gates, and T3 report generation (used in CI)
   -h, --help                        Show this help message
@@ -109,6 +113,10 @@ while [[ $# -gt 0 ]]; do
     --slo-e2e-p95)
       SLO_E2E_P95="$2"
       shift 2
+      ;;
+    --require-cross-shape)
+      REQUIRE_CROSS_SHAPE="true"
+      shift
       ;;
     --self-test|--dry-run)
       SELF_TEST="true"
@@ -274,8 +282,8 @@ evict_pod() {
 EOF
 }
 
-run_scalesim_gate() {
-  log "=== Running T3 Offline 2,000-Pod Scale Simulator (scalesim) ==="
+run_scalesim_model() {
+  log "=== Running T3 Offline 2,000-Pod Analytical Capacity Model (scalesim) ==="
   mkdir -p "${OUT_DIR}"
   local json_out="${OUT_DIR}/scalesim.json"
   "${SCALESIM_BIN}" \
@@ -292,15 +300,15 @@ run_scalesim_gate() {
     --max-elapsed 2s \
     --json-out "${json_out}"
   [[ -s "${json_out}" ]] || die "scalesim did not write ${json_out}"
-  log "PASS [scalesim]: 2,000-pod burst simulation verified (${json_out})"
+  log "PASS [scalesim]: 2,000-pod analytical capacity model verified (${json_out})"
 }
 
 # ==============================================================================
-# Scenario T3-S1: Cross-Node / Heterogeneous Node Shape Drain & Placement (I2, I8)
+# Scenario T3-S1: Cross-Node Stateful Drain & Placement Verification (I2; I8 with --require-cross-shape)
 # ==============================================================================
 scenario_t3_s1() {
   local run_dir="${OUT_DIR}/t3_s1"
-  log "=== Scenario T3-S1: Cross-Node & Heterogeneous Node Shape Drain Verification ==="
+  log "=== Scenario T3-S1: Cross-Node Stateful Drain Verification ==="
   resolve_gcs_bucket
   clean_t3_workloads
   clean_stale_migration_resources
@@ -373,7 +381,7 @@ EOF
   kubectl rollout status deployment/t3-s1-counter -n "${NAMESPACE}" --timeout=120s
   sleep 4
 
-  start_collector "${run_dir}" "T3-S1 cross-node & shape drain"
+  start_collector "${run_dir}" "T3-S1 cross-node stateful drain"
 
   local target_pod src_node src_type pre_state pre_id pre_val
   target_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t3-s1-counter --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
@@ -416,14 +424,24 @@ EOF
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
       --name "T3-S1 cross-node warm restore state survived" --group "t3-s1-counter" --pass \
       --value 1 --total 1 --detail "src=${src_node}(${src_type}) -> dst=${dst_node}(${dst_type}), id=${post_id}, counter ${pre_val}->${post_val}"
-    "${PMPROFILER_BIN}" check --run "${run_dir}" \
-      --name "T3-S1 node placement & runtime shape compatibility verified" --group "t3-s1-counter" --pass \
-      --detail "clusterTypes=[${all_machine_types}], migrated ${src_node}(${src_type}) -> ${dst_node}(${dst_type})"
   else
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
       --name "T3-S1 cross-node warm restore state survived" --group "t3-s1-counter" --pass=false \
       --value 0 --total 1 --detail "src=${src_node} dst=${dst_node}, pre=${pre_state} post=${post_state}"
     die "T3-S1 failed: src=${src_node} dst=${dst_node} pre='${pre_state}' post='${post_state}'"
+  fi
+
+  if [[ "${REQUIRE_CROSS_SHAPE}" == "true" ]]; then
+    if [[ "${src_type}" != "${dst_type}" ]]; then
+      "${PMPROFILER_BIN}" check --run "${run_dir}" \
+        --name "T3-S1 cross-shape node placement verified" --group "t3-s1-counter" --pass \
+        --detail "clusterTypes=[${all_machine_types}], cross-shape migrated ${src_node}(${src_type}) -> ${dst_node}(${dst_type})"
+    else
+      "${PMPROFILER_BIN}" check --run "${run_dir}" \
+        --name "T3-S1 cross-shape node placement verified" --group "t3-s1-counter" --pass=false \
+        --detail "expected src_type != dst_type, got ${src_node}(${src_type}) -> ${dst_node}(${dst_type})"
+      die "T3-S1: --require-cross-shape set, but source (${src_type}) and destination (${dst_type}) machine types match"
+    fi
   fi
 
   finish_and_assert_slo_run "${run_dir}" "false"
@@ -794,9 +812,9 @@ EOF
 # Offline CI Self-Test Mode (--self-test)
 # ==============================================================================
 run_self_test() {
-  log "Running offline T3 self-test (scalesim + synthetic T3-S1/T3-S2 traces + SLO enforcement)"
+  log "Running offline T3 self-test (scalesim model + synthetic T3-S1/T3-S2 traces + SLO enforcement)"
   build_binaries
-  run_scalesim_gate
+  run_scalesim_model
 
   local base_dir="${OUT_DIR}/self-test"
   rm -rf "${base_dir}"
@@ -805,11 +823,11 @@ run_self_test() {
   local pmj_gvr="podmigrationjobs.v1alpha1.podmigration.gke.io"
   local pod_gvr="pods.v1"
 
-  # 1. Synthetic T3-S1 (cross-node & shape drain)
+  # 1. Synthetic T3-S1 (cross-node stateful drain)
   local s1_dir="${base_dir}/t3_s1"
   mkdir -p "${s1_dir}"
   cat > "${s1_dir}/meta.json" <<EOF
-{"scenario":"T3-S1 cross-node & shape drain","startedAt":"2026-09-28T12:00:00Z"}
+{"scenario":"T3-S1 cross-node stateful drain","startedAt":"2026-09-28T12:00:00Z"}
 EOF
   cat > "${s1_dir}/records.ndjson" <<EOF
 {"ts":"2026-09-28T11:59:00Z","type":"list","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s1-counter-0","uid":"uid-s1-src","creationTimestamp":"2026-09-28T11:59:00Z","labels":{"app":"t3-s1-counter","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-gvisor-a"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T11:59:05Z"}]}}}
@@ -866,7 +884,7 @@ EOF
   local report_html="${OUT_DIR}/guardrail-t3-report.html"
   "${PMPROFILER_BIN}" report \
     --out "${report_html}" \
-    --title "T3 Scale, Node Shape & Latency SLO (T) Benchmark Report" \
+    --title "T3 Scale, Cross-Node Drain & Latency SLO (T) Benchmark Report" \
     "${s1_dir}/run.json" "${s2_dir}/run.json"
   [[ -s "${report_html}" ]] || die "Expected non-empty HTML report at ${report_html}"
   log "Self-test PASSED: HTML report generated at ${report_html}"
@@ -882,7 +900,7 @@ main() {
 
   case "${SCENARIO}" in
     scalesim)
-      run_scalesim_gate
+      run_scalesim_model
       ;;
     T3-S1|s1)
       scenario_t3_s1
@@ -891,7 +909,7 @@ main() {
       scenario_t3_s2
       ;;
     all)
-      run_scalesim_gate
+      run_scalesim_model
       scenario_t3_s1
       scenario_t3_s2
       ;;
@@ -906,7 +924,7 @@ main() {
     local report_html="${OUT_DIR}/guardrail-t3-report.html"
     "${PMPROFILER_BIN}" report \
       --out "${report_html}" \
-      --title "T3 Scale, Node Shape & Latency SLO (T) Benchmark Report" \
+      --title "T3 Scale, Cross-Node Drain & Latency SLO (T) Benchmark Report" \
       "${run_jsons[@]}"
     log "Generated combined T3 report: ${report_html}"
   fi
