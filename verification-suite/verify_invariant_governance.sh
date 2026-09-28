@@ -21,18 +21,23 @@
 #
 # Enforces Two-Lane CI Governance for controller/internal/invariants/**:
 #   1. Verifies .github/CODEOWNERS assigns at least one @owner to
-#      /controller/internal/invariants/ and /.github/CODEOWNERS (without
-#      hardcoding specific usernames in CI).
+#      /controller/internal/invariants/, /.github/CODEOWNERS, and
+#      /verification-suite/verify_invariant_governance.sh (without hardcoding
+#      specific usernames in CI).
 #   2. Lane 1 (Feature & Bugfix PRs — branch does NOT match ^invariant/):
-#      Forbids modifying any file under controller/internal/invariants/** or
-#      .github/CODEOWNERS unless an explicit co-change override is present:
+#      Forbids modifying any file under controller/internal/invariants/**,
+#      .github/CODEOWNERS, or verification-suite/verify_invariant_governance.sh
+#      unless an explicit co-change / admin override is present:
 #        - PR label `allow-invariant-cochange` (ALLOW_INVARIANT_COCHANGE=true),
-#        - Commit trailer `Invariant-Cochange: <reason>`, or
+#        - Commit trailer `Invariant-Cochange: <reason>` in any commit on the PR,
+#        - Dedicated `admin/*` branch, or
 #        - CLI flag `--allow-cochange`.
 #   3. Lane 2 (Dedicated Invariant PRs — branch matches ^invariant/):
 #      Requires all modified files to be strictly scoped to
 #      controller/internal/invariants/** unless a co-change override is present.
-#   4. Fails closed if the git diff against a base ref cannot be resolved.
+#   4. Never exempts detached HEAD (`HEAD` / `DETACHED_HEAD`); only direct
+#      commits on `main` skip per-PR lane diff enforcement.
+#   5. Fails closed if the git diff against a base ref cannot be resolved.
 
 set -euo pipefail
 
@@ -57,9 +62,9 @@ Options:
   --base <git-ref>           Base git ref for diffing changed files (default: auto-detect main/HEAD^1)
   --codeowners <path>        Path to CODEOWNERS file (default: .github/CODEOWNERS)
   --changed-files <list>     Explicit newline/space-separated changed file list (used in tests)
-  --allow-cochange           Allow co-dependent reconciler + invariant changes in a single PR
-  --commit-msg <text>        Override HEAD commit message when checking for Invariant-Cochange trailer
-  --self-test                Run offline self-test covering Lane 1, Lane 2, fail-closed, and co-change cases
+  --allow-cochange           Allow co-dependent reconciler/governance + invariant changes in a single PR
+  --commit-msg <text>        Override commit message text when checking for Invariant-Cochange trailer
+  --self-test                Run offline self-test covering Lane 1, Lane 2, detached HEAD, fail-closed, and co-change cases
   -h, --help                 Show this help message
 EOF
 }
@@ -130,6 +135,10 @@ verify_codeowners_file() {
     fail "${co_file} must assign at least one @owner to /.github/CODEOWNERS"
     return 1
   fi
+  if ! grep -Eq '^/verification-suite/verify_invariant_governance\.sh[[:space:]]+@[^[:space:]]+' "${co_file}"; then
+    fail "${co_file} must assign at least one @owner to /verification-suite/verify_invariant_governance.sh"
+    return 1
+  fi
   return 0
 }
 
@@ -142,7 +151,57 @@ resolve_branch() {
     echo "${GITHUB_HEAD_REF}"
     return 0
   fi
-  git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD"
+  if [[ "${GITHUB_REF:-}" == "refs/heads/main" ]] || [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF_NAME:-}" == "main" ]]; then
+    echo "main"
+    return 0
+  fi
+  git -C "${REPO_ROOT}" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "DETACHED_HEAD"
+}
+
+resolve_base_ref() {
+  if [[ -n "${BASE_REF}" ]]; then
+    if ! git -C "${REPO_ROOT}" rev-parse --verify "${BASE_REF}" >/dev/null 2>&1; then
+      fail "Configured --base ref '${BASE_REF}' cannot be resolved in git repository (failing closed)"
+      return 1
+    fi
+    echo "${BASE_REF}"
+    return 0
+  fi
+
+  # Only use HEAD^1 on GitHub Actions synthetic PR merge commits (refs/pull/<pr>/merge),
+  # never on local feature branch merges (`git merge main`), where HEAD^1 is the
+  # feature branch and HEAD^2 is main.
+  if [[ "${GITHUB_ACTIONS:-}" == "true" && "${GITHUB_REF:-}" =~ ^refs/pull/ ]]; then
+    if git -C "${REPO_ROOT}" rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+      echo "HEAD^1"
+      return 0
+    fi
+  fi
+
+  local candidate
+  if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+    for candidate in "upstream/${GITHUB_BASE_REF}" "origin/${GITHUB_BASE_REF}" "${GITHUB_BASE_REF}"; do
+      if git -C "${REPO_ROOT}" rev-parse --verify "${candidate}" >/dev/null 2>&1; then
+        echo "${candidate}"
+        return 0
+      fi
+    done
+  fi
+
+  for candidate in "upstream/main" "origin/main" "main"; do
+    if git -C "${REPO_ROOT}" rev-parse --verify "${candidate}" >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+
+  if git -C "${REPO_ROOT}" rev-parse --verify HEAD^1 >/dev/null 2>&1; then
+    echo "HEAD^1"
+    return 0
+  fi
+
+  fail "Could not resolve any base git ref (tried GITHUB_BASE_REF, upstream/main, origin/main, main, HEAD^1) to compute changed files; failing closed"
+  return 1
 }
 
 resolve_changed_files() {
@@ -151,49 +210,40 @@ resolve_changed_files() {
     return 0
   fi
 
-  if [[ -n "${BASE_REF}" ]]; then
-    if ! git -C "${REPO_ROOT}" rev-parse --verify "${BASE_REF}" >/dev/null 2>&1; then
-      fail "Configured --base ref '${BASE_REF}' cannot be resolved in git repository (failing closed)"
-      return 1
-    fi
-    git -C "${REPO_ROOT}" diff --name-only "${BASE_REF}...HEAD"
+  local base
+  base="$(resolve_base_ref)" || return 1
+
+  if [[ "${base}" == "HEAD^1" ]]; then
+    git -C "${REPO_ROOT}" diff --name-only HEAD^1 HEAD
     return 0
   fi
 
-  # In GitHub Actions pull_request checkouts, HEAD is a merge commit whose first
-  # parent (HEAD^1) is the target base branch commit.
+  git -C "${REPO_ROOT}" diff --name-only "${base}...HEAD"
+}
+
+collect_pr_commit_messages() {
+  local base=""
+  base="$(resolve_base_ref 2>/dev/null || true)"
+  if [[ -n "${base}" ]]; then
+    git -C "${REPO_ROOT}" log "${base}..HEAD" --format=%B 2>/dev/null || true
+  fi
   if git -C "${REPO_ROOT}" rev-parse --verify HEAD^2 >/dev/null 2>&1; then
-    git -C "${REPO_ROOT}" diff --name-only HEAD^1 HEAD
-    return 0
+    git -C "${REPO_ROOT}" log -1 --format=%B HEAD^2 2>/dev/null || true
   fi
-
-  local candidate
-  for candidate in "upstream/main" "origin/main" "main"; do
-    if git -C "${REPO_ROOT}" rev-parse --verify "${candidate}" >/dev/null 2>&1; then
-      git -C "${REPO_ROOT}" diff --name-only "${candidate}...HEAD"
-      return 0
-    fi
-  done
-
-  if git -C "${REPO_ROOT}" rev-parse --verify HEAD^1 >/dev/null 2>&1; then
-    git -C "${REPO_ROOT}" diff --name-only HEAD^1 HEAD
-    return 0
-  fi
-
-  fail "Could not resolve any base git ref (tried HEAD^2, upstream/main, origin/main, main, HEAD^1) to compute changed files; failing closed"
-  return 1
+  git -C "${REPO_ROOT}" log -1 --format=%B HEAD 2>/dev/null || true
 }
 
 is_cochange_authorized() {
-  local allow_flag="$1"
-  local commit_msg="$2"
-  if [[ "${allow_flag}" == "true" ]]; then
+  local branch="$1"
+  local allow_flag="$2"
+  local commit_msg="$3"
+  if [[ "${allow_flag}" == "true" || "${branch}" =~ ^admin/ ]]; then
     return 0
   fi
   if [[ -z "${commit_msg}" ]]; then
-    commit_msg="$(git -C "${REPO_ROOT}" log -1 --format=%B 2>/dev/null || true)"
+    commit_msg="$(collect_pr_commit_messages)"
   fi
-  if grep -Eiq '^Invariant-Cochange:[[:space:]]*[^[:space:]]+' <<<"${commit_msg}"; then
+  if grep -Eiq '^[[:space:]]*Invariant-Cochange:[[:space:]]*[^[:space:]]+' <<<"${commit_msg}"; then
     return 0
   fi
   return 1
@@ -208,9 +258,10 @@ evaluate_governance() {
 
   verify_codeowners_file "${co_file}" || return 1
 
-  # Direct push/merge commits on main only validate CODEOWNERS file structure.
-  if [[ "${branch}" == "main" || "${branch}" == "HEAD" ]]; then
-    log "PASS: branch '${branch}' CODEOWNERS structure verified"
+  # Only direct push/merge commits on `main` skip per-PR lane diff enforcement.
+  # Detached HEAD (`HEAD` / `DETACHED_HEAD`) is NEVER exempted.
+  if [[ "${branch}" == "main" ]]; then
+    log "PASS: branch 'main' CODEOWNERS structure verified"
     return 0
   fi
 
@@ -219,20 +270,20 @@ evaluate_governance() {
     [[ -n "${line}" ]] && files+=("${line}")
   done < <(tr ' ' '\n' <<<"${changed_raw}" | sed '/^$/d')
 
-  # Never allow non-main branches to modify .github/CODEOWNERS without explicit review,
-  # even when Invariant-Cochange is set.
+  if is_cochange_authorized "${branch}" "${allow_cochange}" "${commit_msg}"; then
+    log "PASS (Co-change / Admin override): branch '${branch}' authorized via allow-invariant-cochange / Invariant-Cochange trailer / admin/* (${#files[@]} changed file(s); CODEOWNERS review still applies)"
+    return 0
+  fi
+
+  # Protect .github/CODEOWNERS and verification-suite/verify_invariant_governance.sh
+  # against unapproved modification on both Lane 1 and Lane 2 branches.
   for f in "${files[@]:-}"; do
     [[ -z "${f}" ]] && continue
-    if [[ "${f}" == ".github/CODEOWNERS" ]]; then
-      fail "Branch '${branch}' modified '.github/CODEOWNERS'; changes to CODEOWNERS must be made in a dedicated repository admin change."
+    if [[ "${f}" == ".github/CODEOWNERS" || "${f}" == "verification-suite/verify_invariant_governance.sh" ]]; then
+      fail "Branch '${branch}' modified protected governance file '${f}' without 'Invariant-Cochange: <reason>' trailer, 'allow-invariant-cochange' label, or 'admin/*' branch."
       return 1
     fi
   done
-
-  if is_cochange_authorized "${allow_cochange}" "${commit_msg}"; then
-    log "PASS (Co-change override): branch '${branch}' authorized via allow-invariant-cochange / Invariant-Cochange trailer (${#files[@]} changed file(s); CODEOWNERS review still applies)"
-    return 0
-  fi
 
   if [[ "${branch}" =~ ^invariant/ ]]; then
     # Lane 2: Dedicated invariant/* branch.
@@ -257,7 +308,7 @@ evaluate_governance() {
     return 0
   fi
 
-  # Lane 1: Feature / bugfix / chore branch (not matching ^invariant/).
+  # Lane 1: Feature / bugfix / chore / detached-HEAD branch (not matching ^invariant/).
   for f in "${files[@]:-}"; do
     [[ -z "${f}" ]] && continue
     if [[ "${f}" =~ ^controller/internal/invariants/ ]]; then
@@ -266,7 +317,7 @@ evaluate_governance() {
     fi
   done
 
-  log "PASS (Lane 1): branch '${branch}' leaves controller/internal/invariants/** and .github/CODEOWNERS untouched (${#files[@]} changed file(s))"
+  log "PASS (Lane 1): branch '${branch}' leaves controller/internal/invariants/** and governance files untouched (${#files[@]} changed file(s))"
   return 0
 }
 
@@ -279,47 +330,54 @@ run_self_test() {
   cat > "${valid_co}" <<'EOF'
 /controller/internal/invariants/ @some-owner
 /.github/CODEOWNERS @some-owner
+/verification-suite/verify_invariant_governance.sh @some-owner
 EOF
 
   local invalid_co="${tmp_dir}/CODEOWNERS.invalid"
   cat > "${invalid_co}" <<'EOF'
-# Missing invariant owner entry
+# Missing verify_invariant_governance.sh owner entry
+/controller/internal/invariants/ @some-owner
 /.github/CODEOWNERS @some-owner
 EOF
 
-  # 1. Negative: malformed CODEOWNERS must be rejected
+  # 1. Negative: incomplete CODEOWNERS must be rejected
   if evaluate_governance "feature/test" "${invalid_co}" "README.md" "false" "" >/dev/null 2>&1; then
     rm -rf "${tmp_dir}"
-    fail "Self-test failed: malformed CODEOWNERS was not rejected"
+    fail "Self-test failed: incomplete CODEOWNERS was not rejected"
     exit 1
   fi
 
-  # 2. Positive (Lane 1): feature branch modifying controller/tools files outside invariants
+  # 2. Positive (Lane 1): feature branch modifying controller/tools files outside invariants and governance files
   evaluate_governance "feature/guardrail-invariant-evolution-pipeline" "${valid_co}" \
-    "tools/invariant-gen/main.go .github/workflows/ci.yaml" "false" "" >/dev/null
+    "tools/invariant-gen/main.go .github/workflows/ci.yaml" "false" "chore: regular commit" >/dev/null
 
   # 3. Negative (Lane 1): feature branch modifying controller/internal/invariants/rules.go without co-change override
   if evaluate_governance "feature/weaken-invariant" "${valid_co}" \
-    "controller/internal/controller/podmigrationjob_controller.go controller/internal/invariants/rules.go" "false" "" >/dev/null 2>&1; then
+    "controller/internal/controller/podmigrationjob_controller.go controller/internal/invariants/rules.go" "false" "feat: normal commit" >/dev/null 2>&1; then
     rm -rf "${tmp_dir}"
     fail "Self-test failed: Lane 1 allowed feature branch to modify controller/internal/invariants/rules.go"
     exit 1
   fi
 
-  # 4. Negative (Lane 1): bugfix branch modifying .github/CODEOWNERS
-  if evaluate_governance "fix/bypass-owners" "${valid_co}" ".github/CODEOWNERS" "false" "" >/dev/null 2>&1; then
+  # 4. Negative (Lane 1): bugfix branch modifying .github/CODEOWNERS or verify_invariant_governance.sh without override
+  if evaluate_governance "fix/bypass-owners" "${valid_co}" ".github/CODEOWNERS" "false" "fix: normal commit" >/dev/null 2>&1; then
     rm -rf "${tmp_dir}"
     fail "Self-test failed: Lane 1 allowed fix branch to modify .github/CODEOWNERS"
+    exit 1
+  fi
+  if evaluate_governance "fix/bypass-script" "${valid_co}" "verification-suite/verify_invariant_governance.sh" "false" "fix: normal commit" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: Lane 1 allowed fix branch to modify verification-suite/verify_invariant_governance.sh"
     exit 1
   fi
 
   # 5. Positive (Lane 2): invariant/* branch modifying only controller/internal/invariants/**
   evaluate_governance "invariant/i10-wedged-restoring-orphan" "${valid_co}" \
-    "controller/internal/invariants/rules.go controller/internal/invariants/invariants_test.go controller/internal/invariants/testdata/i10_snapshot.json" "false" "" >/dev/null
+    "controller/internal/invariants/rules.go controller/internal/invariants/invariants_test.go controller/internal/invariants/testdata/i10_snapshot.json" "false" "feat: add I10" >/dev/null
 
   # 6. Negative (Lane 2): invariant/* branch sneaking in a controller change outside invariants/
   if evaluate_governance "invariant/i10-mixed-change" "${valid_co}" \
-    "controller/internal/invariants/rules.go controller/internal/controller/podmigrationjob_controller.go" "false" "" >/dev/null 2>&1; then
+    "controller/internal/invariants/rules.go controller/internal/controller/podmigrationjob_controller.go" "false" "feat: mixed change" >/dev/null 2>&1; then
     rm -rf "${tmp_dir}"
     fail "Self-test failed: Lane 2 allowed invariant/* branch to modify files outside controller/internal/invariants/**"
     exit 1
@@ -332,13 +390,30 @@ EOF
     exit 1
   fi
 
-  # 8. Positive (Co-change escape hatch): Invariant-Cochange trailer or allow-invariant-cochange allows co-dependent reconciler + invariant edits
+  # 8. Positive (Co-change / Admin escape hatch): Invariant-Cochange trailer or admin/* branch allows co-dependent or governance edits
   evaluate_governance "fix/reconciler-and-invariant-together" "${valid_co}" \
     "controller/internal/controller/podmigrationjob_controller.go controller/internal/invariants/rules.go" \
     "false" $'fix(controller): update state transition and I3 together\n\nInvariant-Cochange: Reconciler state transition and I3 predicate updated atomically' >/dev/null
+  evaluate_governance "admin/update-codeowners" "${valid_co}" \
+    ".github/CODEOWNERS verification-suite/verify_invariant_governance.sh" \
+    "false" "chore(admin): rotate CODEOWNERS" >/dev/null
+
+  # 9. Negative (Detached HEAD): HEAD / DETACHED_HEAD must NEVER bypass Lane 1 checks
+  if evaluate_governance "HEAD" "${valid_co}" \
+    "controller/internal/invariants/rules.go" "false" "feat: detached head edit" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: detached HEAD ('HEAD') bypassed Lane 1 governance check"
+    exit 1
+  fi
+  if evaluate_governance "DETACHED_HEAD" "${valid_co}" \
+    "controller/internal/invariants/rules.go" "false" "feat: detached head edit" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: detached HEAD ('DETACHED_HEAD') bypassed Lane 1 governance check"
+    exit 1
+  fi
 
   rm -rf "${tmp_dir}"
-  log "Self-test PASSED: all 8 Lane 1, Lane 2, fail-closed, and co-change governance cases verified"
+  log "Self-test PASSED: all 10 Lane 1, Lane 2, detached-HEAD, fail-closed, and co-change governance cases verified"
 }
 
 main() {

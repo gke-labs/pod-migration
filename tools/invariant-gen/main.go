@@ -29,6 +29,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -644,6 +645,9 @@ func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, strin
 				EvictingStartTime: "2026-09-28T12:00:10Z",
 			},
 		}
+		deletingSrc := K8sPod{
+			Metadata: K8sObjectMeta{Name: "app-0", Namespace: "default", UID: "uid-app-0", DeletionTimestamp: "2026-09-28T12:00:10Z"},
+		}
 		return TemplateNoReplacementEvictingStall,
 			"EvictingNoReplacementLiveness",
 			"no_replacement_evicting_stall",
@@ -653,7 +657,7 @@ func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, strin
 				Reconciler:    "PodMigrationJobReconciler",
 				PrimaryPMJ:    &pmj,
 				NamespacePMJs: []K8sPMJ{pmj},
-				NamespacePods: nil,
+				NamespacePods: []K8sPod{deletingSrc},
 			}
 
 	case strings.Contains(combined, "wedge") || strings.Contains(combined, "orphan") || strings.Contains(combined, "restoring"):
@@ -669,6 +673,9 @@ func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, strin
 				RestoringStartTime: "2026-09-28T12:00:10Z",
 			},
 		}
+		deletingSrc := K8sPod{
+			Metadata: K8sObjectMeta{Name: "app-0", Namespace: "default", UID: "uid-app-0", DeletionTimestamp: "2026-09-28T12:00:05Z"},
+		}
 		return TemplateWedgedRestoringOrphan,
 			"RestoringReplacementLiveness",
 			"wedged_restoring_orphan",
@@ -678,7 +685,7 @@ func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, strin
 				Reconciler:    "PodMigrationJobReconciler",
 				PrimaryPMJ:    &pmj,
 				NamespacePMJs: []K8sPMJ{pmj},
-				NamespacePods: nil,
+				NamespacePods: []K8sPod{deletingSrc},
 			}
 
 	default:
@@ -742,7 +749,8 @@ func exceededWindow(startRFC3339, nowRFC3339 string, limit time.Duration) bool {
 
 // BaselineGreenSnapshots returns canonical healthy ReconcileSnapshot states
 // across all 5 PMJ lifecycle phases (Pending, Snapshotting, Evicting, Restoring,
-// Succeeded).
+// Succeeded), exercising both podsnapshot.gke.io/ps-name and
+// gke.io/pod-snapshot-restore-name annotations.
 func BaselineGreenSnapshots() []ReconcileSnapshotJSON {
 	srcPod := K8sPod{
 		Metadata: K8sObjectMeta{Name: "counter-0", Namespace: "default", UID: "uid-src"},
@@ -757,7 +765,7 @@ func BaselineGreenSnapshots() []ReconcileSnapshotJSON {
 			Name:        "counter-0-dst",
 			Namespace:   "default",
 			UID:         "uid-dst",
-			Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": "ps-clean-1"},
+			Annotations: map[string]string{"podsnapshot.gke.io/ps-name": "ps-clean-1"},
 		},
 		Spec:   K8sPodSpec{SchedulingGates: []K8sSchedulingGate{{Name: "pod-migration.gke.io/restoring"}}},
 		Status: K8sPodStatus{Phase: "Pending"},
@@ -767,7 +775,7 @@ func BaselineGreenSnapshots() []ReconcileSnapshotJSON {
 			Name:        "counter-0-dst",
 			Namespace:   "default",
 			UID:         "uid-dst",
-			Annotations: map[string]string{"gke.io/pod-snapshot-restore-name": "ps-clean-1"},
+			Annotations: map[string]string{"podsnapshot.gke.io/ps-name": "ps-clean-1"},
 		},
 		Spec:   K8sPodSpec{NodeName: "node-b"},
 		Status: K8sPodStatus{Phase: "Running", Conditions: []K8sCondition{{Type: "Ready", Status: "True"}}},
@@ -986,13 +994,17 @@ func runCompiledGoTestProof(
 	redTestName := fmt.Sprintf("^Test%s_%s_RedProof$", strings.ToUpper(finding.InvariantID), finding.InvariantName)
 	greenTestName := fmt.Sprintf("^Test%s_%s_GreenProof$", strings.ToUpper(finding.InvariantID), finding.InvariantName)
 
-	redCmd := exec.Command("go", "test", "-v", "-count=1", "-run", redTestName, relPkg)
+	redCtx, redCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer redCancel()
+	redCmd := exec.CommandContext(redCtx, "go", "test", "-v", "-count=1", "-run", redTestName, relPkg)
 	redCmd.Dir = controllerDir
 	redBytes, redErr := redCmd.CombinedOutput()
 	redOut = string(redBytes)
 	redPassed = (redErr == nil)
 
-	greenCmd := exec.Command("go", "test", "-v", "-count=1", "-run", greenTestName, relPkg)
+	greenCtx, greenCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer greenCancel()
+	greenCmd := exec.CommandContext(greenCtx, "go", "test", "-v", "-count=1", "-run", greenTestName, relPkg)
 	greenCmd.Dir = controllerDir
 	greenOutBytes, greenErr := greenCmd.CombinedOutput()
 	greenOut = string(greenOutBytes)
@@ -1212,6 +1224,22 @@ func reconstructSnapshotAt(
 			lastTS = tLast.Add(60 * time.Second).UTC().Format(time.RFC3339)
 		}
 	}
+	// Ensure NamespacePods is non-empty when reconstructing a post-eviction
+	// stall so absence predicates guarded by len(s.NamespacePods) > 0 distinguish
+	// an populated informer list from a nil/failed list call.
+	if len(state.pods) == 0 && pmj.Spec.PodRef.Name != "" {
+		delTS := lastTS
+		if delTS == "" {
+			delTS = "2026-09-28T12:00:00Z"
+		}
+		state.pods[pmj.Spec.PodRef.Name] = K8sPod{
+			Metadata: K8sObjectMeta{
+				Name:              pmj.Spec.PodRef.Name,
+				Namespace:         firstNonEmpty(pmj.Metadata.Namespace, "default"),
+				DeletionTimestamp: delTS,
+			},
+		}
+	}
 	return state.snapshotForPMJ(lastTS, pmj)
 }
 
@@ -1291,21 +1319,26 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 	switch f.Template {
 	case TemplateWedgedRestoringOrphan:
 		return `	// RestoringReplacementLiveness: when a PMJ has remained in PhaseRestoring
-	// for >=30s with a bound RestoredPodName, that replacement pod must still
-	// exist and be non-deleting in the namespace pod snapshot.
-	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
+	// for >=30s with a bound RestoredPodName and a populated NamespacePods list,
+	// that replacement pod must still exist and be non-deleting in the namespace.
+	if len(s.NamespacePods) > 0 &&
+		pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
 		pmj.Status.RestoredPodName != "" &&
 		pmj.Status.RestoringStartTime != nil &&
 		!s.Now.IsZero() &&
 		s.Now.Sub(pmj.Status.RestoringStartTime.Time) >= 30*time.Second {
 		found := false
 		for i := range s.NamespacePods {
-			if s.NamespacePods[i].Name == pmj.Status.RestoredPodName && s.NamespacePods[i].DeletionTimestamp == nil {
+			pod := &s.NamespacePods[i]
+			if (pod.Namespace == "" || pmj.Namespace == "" || pod.Namespace == pmj.Namespace) &&
+				pod.Name == pmj.Status.RestoredPodName && pod.DeletionTimestamp == nil {
 				found = true
 				break
 			}
 		}
-		if !found && s.PrimaryPod != nil && s.PrimaryPod.Name == pmj.Status.RestoredPodName && s.PrimaryPod.DeletionTimestamp == nil {
+		if !found && s.PrimaryPod != nil &&
+			(s.PrimaryPod.Namespace == "" || pmj.Namespace == "" || s.PrimaryPod.Namespace == pmj.Namespace) &&
+			s.PrimaryPod.Name == pmj.Status.RestoredPodName && s.PrimaryPod.DeletionTimestamp == nil {
 			found = true
 		}
 		if !found {
@@ -1324,21 +1357,26 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 
 	case TemplateNoReplacementEvictingStall:
 		return `	// EvictingNoReplacementLiveness: when a PMJ has remained in PhaseEvicting
-	// for >=30s with no RestoredPodName bound and the source pod is already gone,
-	// the migration is stalled without a replacement pod.
-	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
+	// for >=30s with no RestoredPodName bound and a populated NamespacePods list
+	// in which the source pod is already gone or deleting, the migration is stalled.
+	if len(s.NamespacePods) > 0 &&
+		pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
 		pmj.Status.RestoredPodName == "" &&
 		pmj.Status.EvictingStartTime != nil &&
 		!s.Now.IsZero() &&
 		s.Now.Sub(pmj.Status.EvictingStartTime.Time) >= 30*time.Second {
 		srcActive := false
 		for i := range s.NamespacePods {
-			if s.NamespacePods[i].Name == pmj.Spec.PodRef.Name && s.NamespacePods[i].DeletionTimestamp == nil {
+			pod := &s.NamespacePods[i]
+			if (pod.Namespace == "" || pmj.Namespace == "" || pod.Namespace == pmj.Namespace) &&
+				pod.Name == pmj.Spec.PodRef.Name && pod.DeletionTimestamp == nil {
 				srcActive = true
 				break
 			}
 		}
-		if !srcActive && s.PrimaryPod != nil && s.PrimaryPod.Name == pmj.Spec.PodRef.Name && s.PrimaryPod.DeletionTimestamp == nil {
+		if !srcActive && s.PrimaryPod != nil &&
+			(s.PrimaryPod.Namespace == "" || pmj.Namespace == "" || s.PrimaryPod.Namespace == pmj.Namespace) &&
+			s.PrimaryPod.Name == pmj.Spec.PodRef.Name && s.PrimaryPod.DeletionTimestamp == nil {
 			srcActive = true
 		}
 		if !srcActive {
@@ -1361,7 +1399,8 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring && pmj.Status.RestoredPodName != "" {
 		for i := range s.NamespacePods {
 			pod := &s.NamespacePods[i]
-			if pod.Name != pmj.Status.RestoredPodName || len(pod.Spec.SchedulingGates) > 0 {
+			if (pod.Namespace != "" && pmj.Namespace != "" && pod.Namespace != pmj.Namespace) ||
+				pod.Name != pmj.Status.RestoredPodName || len(pod.Spec.SchedulingGates) > 0 {
 				continue
 			}
 			ready := false
@@ -1373,7 +1412,7 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 			}
 			restoreSnap := strings.TrimSpace(pod.Annotations["gke.io/pod-snapshot-restore-name"])
 			if restoreSnap == "" {
-				restoreSnap = strings.TrimSpace(pod.Annotations["pod-migration.gke.io/ps-name"])
+				restoreSnap = strings.TrimSpace(pod.Annotations["podsnapshot.gke.io/ps-name"])
 			}
 			if ready && restoreSnap == "" {
 				return []Violation{{
