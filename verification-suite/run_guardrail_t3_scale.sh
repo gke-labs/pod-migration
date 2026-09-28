@@ -308,10 +308,16 @@ backup_preexisting_podmigrations() {
     die "Pre-existing backup file found at ${PREEXISTING_PODMIGRATIONS_BACKUP}. A previous run did not complete restore; inspect/apply or remove this file before re-running."
   fi
   mkdir -p "${OUT_DIR}"
+  local err_file
+  err_file="$(mktemp)"
   local raw_json
-  if ! raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>&1)"; then
-    die "Cannot list PodMigrations in ${NAMESPACE} (kubectl get failed: ${raw_json}); refusing to delete them without a backup"
+  if ! raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>"${err_file}")"; then
+    local err_msg
+    err_msg="$(cat "${err_file}")"
+    rm -f "${err_file}"
+    die "Cannot list PodMigrations in ${NAMESPACE} (kubectl get failed: ${err_msg:-${raw_json}}); refusing to delete them without a backup"
   fi
+  rm -f "${err_file}"
   if ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
     die "Cannot parse PodMigrations list output in ${NAMESPACE} as JSON; refusing to delete them without a backup"
   fi
@@ -334,11 +340,20 @@ resolve_gcs_bucket() {
   if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
     existing="$(jq -r '.items[0].spec.storage.location // empty' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)"
   else
-    local raw_loc
-    if ! raw_loc="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>&1)"; then
-      die "Cannot inspect PodMigrations in ${NAMESPACE} for GCS bucket resolution (kubectl get failed: ${raw_loc})"
+    local err_file
+    err_file="$(mktemp)"
+    local raw_json
+    if ! raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>"${err_file}")"; then
+      local err_msg
+      err_msg="$(cat "${err_file}")"
+      rm -f "${err_file}"
+      die "Cannot inspect PodMigrations in ${NAMESPACE} for GCS bucket resolution (kubectl get failed: ${err_msg:-${raw_json}})"
     fi
-    existing="${raw_loc}"
+    rm -f "${err_file}"
+    if ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
+      die "Cannot parse PodMigrations list output in ${NAMESPACE} as JSON for GCS bucket resolution"
+    fi
+    existing="$(jq -r '.items[0].spec.storage.location // empty' <<<"${raw_json}")"
   fi
   if [[ -n "${existing}" ]]; then
     GCS_BUCKET="${existing}"
@@ -1178,6 +1193,73 @@ EOF
     die "Self-test failure: resolve_gcs_bucket did not fail when kubectl get fails"
   fi
   log "PASS [self-test]: resolve_gcs_bucket fails closed when kubectl get fails"
+
+  # 9. Verify backup_preexisting_podmigrations succeeds when kubectl get emits stderr noise alongside valid JSON
+  local test_stderr_noise_dir="${base_dir}/test-stderr-noise"
+  mkdir -p "${test_stderr_noise_dir}"
+  local test_stderr_noise_backup="${test_stderr_noise_dir}/preexisting-podmigrations.json"
+  (
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_backup}"
+    BACKED_UP_PREEXISTING_PODMIGRATIONS="false"
+    SELF_TEST="false"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        echo "Warning: v1alpha1 podmigration.gke.io is deprecated" >&2
+        echo '{"apiVersion":"v1","kind":"List","items":[]}'
+        return 0
+      fi
+      command kubectl "$@"
+    }
+    backup_preexisting_podmigrations >/dev/null 2>&1
+  ) || die "Self-test failure: backup_preexisting_podmigrations failed when kubectl emitted stderr noise"
+  if [[ ! -f "${test_stderr_noise_backup}" ]]; then
+    die "Self-test failure: backup file was not created when kubectl emitted stderr noise"
+  fi
+  log "PASS [self-test]: backup succeeds when kubectl emits stderr noise"
+
+  # 10. Verify resolve_gcs_bucket returns default bucket on empty List, even with stderr noise
+  local resolved_default_bucket
+  resolved_default_bucket="$(
+    GCS_BUCKET=""
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_dir}/nonexistent.json"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        echo "Warning: v1alpha1 podmigration.gke.io is deprecated" >&2
+        echo '{"apiVersion":"v1","kind":"List","items":[]}'
+        return 0
+      fi
+      command kubectl "$@"
+    }
+    resolve_gcs_bucket >/dev/null 2>&1
+    echo "${GCS_BUCKET}"
+  )" || die "Self-test failure: resolve_gcs_bucket failed on empty List with stderr noise"
+
+  if [[ "${resolved_default_bucket}" != "gs://yaoluo-gke-dev-podsnapshots/snapshots" ]]; then
+    die "Self-test failure: expected default GCS bucket for empty List, got '${resolved_default_bucket}'"
+  fi
+  log "PASS [self-test]: resolve_gcs_bucket defaults correctly on empty List with stderr noise"
+
+  # 11. Verify resolve_gcs_bucket extracts existing location when PodMigration exists with stderr noise
+  local resolved_custom_bucket
+  resolved_custom_bucket="$(
+    GCS_BUCKET=""
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_dir}/nonexistent.json"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        echo "Warning: admission webhook warning" >&2
+        echo '{"apiVersion":"v1","kind":"List","items":[{"spec":{"storage":{"location":"gs://custom-bucket/snaps"}}}]}'
+        return 0
+      fi
+      command kubectl "$@"
+    }
+    resolve_gcs_bucket >/dev/null 2>&1
+    echo "${GCS_BUCKET}"
+  )" || die "Self-test failure: resolve_gcs_bucket failed on existing policy with stderr noise"
+
+  if [[ "${resolved_custom_bucket}" != "gs://custom-bucket/snaps" ]]; then
+    die "Self-test failure: expected 'gs://custom-bucket/snaps', got '${resolved_custom_bucket}'"
+  fi
+  log "PASS [self-test]: resolve_gcs_bucket extracts custom bucket with stderr noise"
 
   log "PASS [self-test]: PodMigration backup filter & restore transform verified"
   log "Self-test PASSED: HTML report generated at ${report_html}"
