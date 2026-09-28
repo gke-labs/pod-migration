@@ -506,13 +506,17 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 	}
 
 	var namespacePMJs []pmv1alpha1.PodMigrationJob
+	pmjListFailed := false
 	pmjList := &pmv1alpha1.PodMigrationJobList{}
 	if err := r.List(ctx, pmjList, client.InNamespace(job.Namespace)); err == nil {
 		namespacePMJs = pmjList.Items
+	} else {
+		pmjListFailed = true
 	}
 
 	var namespacePods []corev1.Pod
 	var primaryPod *corev1.Pod
+	podListFailed := false
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList, client.InNamespace(job.Namespace)); err == nil {
 		namespacePods = podList.Items
@@ -526,11 +530,13 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 				break
 			}
 		}
+	} else {
+		podListFailed = true
 	}
 
 	hasOrphanedTrigger := false
-	if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
-		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed) && job.Spec.PodRef.Name != "" {
+	snapName := job.Status.SnapshotRef
+	if job.Spec.PodRef.Name != "" {
 		triggerName := util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(schema.GroupVersionKind{
@@ -538,8 +544,29 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 			Version: "v1",
 			Kind:    "PodSnapshotManualTrigger",
 		})
-		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger); err == nil && trigger.GetDeletionTimestamp() == nil {
-			hasOrphanedTrigger = true
+		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger); err == nil {
+			if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
+				job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed) && trigger.GetDeletionTimestamp() == nil {
+				hasOrphanedTrigger = true
+			}
+			if snapName == "" {
+				if createdName, found, _ := unstructured.NestedString(trigger.Object, "status", "snapshotCreated", "name"); found {
+					snapName = createdName
+				}
+			}
+		}
+	}
+
+	var primarySnapshotConditions []metav1.Condition
+	if snapName != "" {
+		snapObj := &unstructured.Unstructured{}
+		snapObj.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshot",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
+			primarySnapshotConditions = extractUnstructuredConditions(snapObj)
 		}
 	}
 
@@ -559,8 +586,11 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		PrimaryPod:                   primaryPod,
 		NamespacePMJs:                namespacePMJs,
 		NamespacePods:                namespacePods,
+		PodListFailed:                podListFailed,
+		PMJListFailed:                pmjListFailed,
 		HasOrphanedTrigger:           hasOrphanedTrigger,
 		RestoreCrashSignatureMatched: restoreCrashMatched,
+		PrimarySnapshotConditions:    primarySnapshotConditions,
 	})
 	if shouldFailStrict && len(violations) > 0 && !invariants.IsTerminalPhase(job.Status.Phase) {
 		orig := job.DeepCopy()
@@ -592,6 +622,46 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 			*res = ctrl.Result{}
 		}
 	}
+}
+
+func extractUnstructuredConditions(obj *unstructured.Unstructured) []metav1.Condition {
+	if obj == nil {
+		return nil
+	}
+	rawSlice, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil || !found || len(rawSlice) == 0 {
+		return nil
+	}
+	var out []metav1.Condition
+	for _, item := range rawSlice {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cType, _ := m["type"].(string)
+		cStatus, _ := m["status"].(string)
+		cReason, _ := m["reason"].(string)
+		cMsg, _ := m["message"].(string)
+		cLTT, _ := m["lastTransitionTime"].(string)
+		if cType == "" {
+			continue
+		}
+		cond := metav1.Condition{
+			Type:    cType,
+			Status:  metav1.ConditionStatus(cStatus),
+			Reason:  cReason,
+			Message: cMsg,
+		}
+		if cLTT != "" {
+			if t, err := time.Parse(time.RFC3339Nano, cLTT); err == nil {
+				cond.LastTransitionTime = metav1.NewTime(t)
+			} else if t, err := time.Parse(time.RFC3339, cLTT); err == nil {
+				cond.LastTransitionTime = metav1.NewTime(t)
+			}
+		}
+		out = append(out, cond)
+	}
+	return out
 }
 
 // Reconcile drives the state machine of the PodMigrationJob.
