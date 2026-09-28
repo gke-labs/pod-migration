@@ -105,19 +105,19 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	}
 
 	// Check if feature is enabled for this pod
-	if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
+	if !util.IsPodMigrationEnabled(pod) {
 		logger.Info("Feature not enabled for pod, allowing eviction")
 		return admission.Allowed("feature not enabled")
 	}
 
 	// Check if pod uses gvisor runtime
-	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
+	if !util.UsesMigratableRuntime(pod) {
 		logger.Info("Pod does not use gvisor runtime, allowing eviction immediately", "runtimeClassName", pod.Spec.RuntimeClassName)
 		return admission.Allowed("Pod does not use gvisor runtime, skipping migration")
 	}
 
 	// Check if this pod already had a migration that timed out waiting for PDB
-	if pod.Annotations != nil && pod.Annotations[util.AnnotationPDBEvictionTimeout] == "true" {
+	if util.HasPDBEvictionTimedOut(pod) {
 		logger.Info("Prior migration for pod timed out on PDB budget, skipping re-snapshot and allowing eviction", "pod", req.Name)
 		return admission.Allowed("skipping migration: prior migration timed out on PDB budget")
 	}

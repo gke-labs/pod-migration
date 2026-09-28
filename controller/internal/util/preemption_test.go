@@ -444,3 +444,154 @@ func TestFindLatestReadyManualStopPSP(t *testing.T) {
 		t.Fatalf("expected nil for mismatched labels, got %v", pspMismatch)
 	}
 }
+
+func TestUsesMigratableRuntime(t *testing.T) {
+	gvisor := "gvisor"
+	runc := "runc"
+	empty := ""
+
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		expected bool
+	}{
+		{
+			name:     "nil pod",
+			pod:      nil,
+			expected: false,
+		},
+		{
+			name:     "pod with nil RuntimeClassName",
+			pod:      &corev1.Pod{},
+			expected: false,
+		},
+		{
+			name: "pod with empty RuntimeClassName",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &empty,
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pod with non-gvisor RuntimeClassName (runc)",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &runc,
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pod with gvisor RuntimeClassName",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisor,
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := UsesMigratableRuntime(tt.pod)
+			if got != tt.expected {
+				t.Errorf("UsesMigratableRuntime() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsPodMigrationEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		expected bool
+	}{
+		{
+			name:     "nil pod",
+			pod:      nil,
+			expected: false,
+		},
+		{
+			name:     "pod without labels",
+			pod:      &corev1.Pod{},
+			expected: false,
+		},
+		{
+			name: "pod with enabled=false",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"pod-migration.gke.io/enabled": "false"},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pod with enabled=true",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"pod-migration.gke.io/enabled": "true"},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsPodMigrationEnabled(tt.pod)
+			if got != tt.expected {
+				t.Errorf("IsPodMigrationEnabled() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestHasPDBEvictionTimedOut(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		expected bool
+	}{
+		{
+			name:     "nil pod",
+			pod:      nil,
+			expected: false,
+		},
+		{
+			name:     "pod without annotations",
+			pod:      &corev1.Pod{},
+			expected: false,
+		},
+		{
+			name: "pod with pdb-eviction-timeout=false",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{AnnotationPDBEvictionTimeout: "false"},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pod with pdb-eviction-timeout=true",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{AnnotationPDBEvictionTimeout: "true"},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := HasPDBEvictionTimedOut(tt.pod)
+			if got != tt.expected {
+				t.Errorf("HasPDBEvictionTimedOut() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}

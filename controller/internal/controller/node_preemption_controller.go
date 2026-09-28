@@ -114,17 +114,17 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 
 		// Check opt-in label
-		if pod.Labels == nil || pod.Labels["pod-migration.gke.io/enabled"] != "true" {
+		if !util.IsPodMigrationEnabled(pod) {
 			continue
 		}
 
 		// Check gVisor runtime class
-		if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
+		if !util.UsesMigratableRuntime(pod) {
 			continue
 		}
 
 		// Check if prior migration timed out waiting for PDB
-		if pod.Annotations != nil && pod.Annotations[util.AnnotationPDBEvictionTimeout] == "true" {
+		if util.HasPDBEvictionTimedOut(pod) {
 			logger.Info("Skipping preemption migration for pod: prior migration timed out on PDB budget",
 				"pod", pod.Name, "namespace", pod.Namespace)
 			continue

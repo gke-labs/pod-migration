@@ -334,3 +334,21 @@ func FormatBytes(b int64) string {
 	}
 	return fmt.Sprintf("%dB", b)
 }
+
+// UsesMigratableRuntime reports whether the pod runs on a runtime class the
+// installed snapshot engine can checkpoint. Today that is gVisor only.
+func UsesMigratableRuntime(pod *corev1.Pod) bool {
+	return pod != nil && pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName == "gvisor"
+}
+
+// IsPodMigrationEnabled reports whether the pod has opted into live migration
+// via the pod-migration.gke.io/enabled label.
+func IsPodMigrationEnabled(pod *corev1.Pod) bool {
+	return pod != nil && pod.Labels != nil && pod.Labels["pod-migration.gke.io/enabled"] == "true"
+}
+
+// HasPDBEvictionTimedOut reports whether a prior migration attempt for this pod
+// timed out waiting on PDB budget.
+func HasPDBEvictionTimedOut(pod *corev1.Pod) bool {
+	return pod != nil && pod.Annotations != nil && pod.Annotations[AnnotationPDBEvictionTimeout] == "true"
+}
