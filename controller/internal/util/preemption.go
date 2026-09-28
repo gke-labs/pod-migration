@@ -345,12 +345,6 @@ func FormatBytes(b int64) string {
 	return fmt.Sprintf("%dB", b)
 }
 
-// UsesMigratableRuntime reports whether the pod runs on a runtime class the
-// installed snapshot engine can checkpoint. Today that is gVisor only.
-func UsesMigratableRuntime(pod *corev1.Pod) bool {
-	return pod != nil && pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName == "gvisor"
-}
-
 // IsPodMigrationEnabled reports whether the pod has opted into live migration
 // via the pod-migration.gke.io/enabled label.
 func IsPodMigrationEnabled(pod *corev1.Pod) bool {

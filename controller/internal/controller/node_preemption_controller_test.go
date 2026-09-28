@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -442,6 +443,60 @@ closeLoop:
 	if testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unknown_memory")) < 1 {
 		t.Errorf("expected SpotPreemptionSkippedTotal[unknown_memory] >= 1, got %v",
 			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unknown_memory")))
+	}
+}
+
+func TestNodePreemptionReconciler_CustomRuntimeClassPolicy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	node := createTestNode("spot-node-rc", true, "taint-gke")
+	psp := createTestPSP("psp-default", "default")
+
+	runc := "runc"
+	podRunc := createTestPod("pod-runc-custom", "default", "spot-node-rc", "1Gi", "uid-runc-custom")
+	podRunc.Spec.RuntimeClassName = &runc
+
+	recorder := record.NewFakeRecorder(10)
+	policy, err := eligibility.ParseRuntimeClassPolicy("runc")
+	if err != nil {
+		t.Fatalf("failed to parse policy: %v", err)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(node, psp, podRunc).
+		Build()
+
+	r := &NodePreemptionReconciler{
+		Client:                  cl,
+		Scheme:                  scheme,
+		Recorder:                recorder,
+		DefaultMigrationTimeout: 10 * time.Minute,
+		SpotPreemptionBudget:    15 * 1024 * 1024 * 1024,
+		RuntimeClassPolicy:      policy,
+	}
+
+	_, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "spot-node-rc"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := cl.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("failed to list PMJs: %v", err)
+	}
+
+	if len(pmjList.Items) != 1 {
+		t.Fatalf("expected 1 PMJ created for pod-runc with custom policy, got %d", len(pmjList.Items))
+	}
+	expectedName := util.FormatPMJName("pod-runc-custom", "uid-runc-custom")
+	if pmjList.Items[0].Name != expectedName {
+		t.Errorf("expected PMJ %s, got %s", expectedName, pmjList.Items[0].Name)
 	}
 }
 

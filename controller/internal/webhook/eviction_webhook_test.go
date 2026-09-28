@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -71,6 +72,7 @@ func TestEvictionGate(t *testing.T) {
 		pod                 *corev1.Pod
 		initObjects         []client.Object
 		subResource         string
+		runtimeClasses      string // --migratable-runtime-classes value; empty means the default (nil) policy
 		expectedAllowed     bool
 		expectedStatusCode  int32
 		expectedMessage     string
@@ -275,7 +277,7 @@ func TestEvictionGate(t *testing.T) {
 			},
 			subResource:     "eviction",
 			expectedAllowed: true,
-			expectedMessage: "Pod does not use gvisor runtime, skipping migration",
+			expectedMessage: "Pod runtime class @default is not migratable (allowed: gvisor), skipping migration",
 		},
 		{
 			name: "Pod has non-gvisor runtimeClassName",
@@ -294,7 +296,93 @@ func TestEvictionGate(t *testing.T) {
 			},
 			subResource:     "eviction",
 			expectedAllowed: true,
-			expectedMessage: "Pod does not use gvisor runtime, skipping migration",
+			expectedMessage: "Pod runtime class other is not migratable (allowed: gvisor), skipping migration",
+		},
+		{
+			name: "Default-runtime pod migrates when @default is migratable",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+			},
+			runtimeClasses: "gvisor,@default",
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:        "eviction",
+			expectedAllowed:    false,
+			expectedStatusCode: 429,
+			expectedMessage:    "migration job spawned",
+			verifyPMJCreated:   true,
+		},
+		{
+			name: "Default-runtime pod without a policy is skipped with a warning when @default is migratable",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+			},
+			runtimeClasses:     "gvisor,@default",
+			subResource:        "eviction",
+			expectedAllowed:    true,
+			expectedMessage:    "skipping migration: no valid manual+stop policy found",
+			expectNoPolicyWarn: true,
+		},
+		{
+			name: "gVisor pod is skipped when only @default is migratable",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &gvisorRuntime,
+				},
+			},
+			runtimeClasses: "@default",
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "Pod runtime class gvisor is not migratable (allowed: @default), skipping migration",
+		},
+		{
+			name: "Pod with an unlisted runtimeClassName is skipped under a custom policy",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					UID: "test-uid-12345",
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName: &otherRuntime,
+				},
+			},
+			runtimeClasses: "gvisor,@default",
+			initObjects: []client.Object{
+				createPSP("psp-test-manual", "manual", "stop"),
+			},
+			subResource:     "eviction",
+			expectedAllowed: true,
+			expectedMessage: "Pod runtime class other is not migratable (allowed: gvisor,@default), skipping migration",
 		},
 		{
 			name: "PMJ in SucceededWithoutRestore allows cold eviction with origin pod alive",
@@ -498,7 +586,14 @@ func TestEvictionGate(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).Build()
 			recorder := record.NewFakeRecorder(10)
 
-			handler := &EvictionGate{Client: fakeClient, APIReader: fakeClient, Recorder: recorder}
+			var policy *eligibility.RuntimeClassPolicy
+			if tt.runtimeClasses != "" {
+				var err error
+				if policy, err = eligibility.ParseRuntimeClassPolicy(tt.runtimeClasses); err != nil {
+					t.Fatalf("invalid runtimeClasses %q: %v", tt.runtimeClasses, err)
+				}
+			}
+			handler := &EvictionGate{Client: fakeClient, APIReader: fakeClient, Recorder: recorder, Eligibility: policy}
 
 			req := admission.Request{}
 			req.Namespace = tt.pod.Namespace

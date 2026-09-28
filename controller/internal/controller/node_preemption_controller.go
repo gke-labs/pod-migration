@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -40,6 +41,7 @@ type NodePreemptionReconciler struct {
 	Recorder                record.EventRecorder
 	DefaultMigrationTimeout time.Duration
 	SpotPreemptionBudget    int64
+	RuntimeClassPolicy      *eligibility.RuntimeClassPolicy
 
 	// processedPods tracks pods that have already had a preemption migration triggered or skipped
 	// to avoid spamming duplicate events across subsequent node heartbeat updates.
@@ -118,8 +120,8 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 
-		// Check gVisor runtime class
-		if !util.UsesMigratableRuntime(pod) {
+		// Check migratable runtime class
+		if !r.RuntimeClassPolicy.Allows(pod.Spec.RuntimeClassName) {
 			continue
 		}
 

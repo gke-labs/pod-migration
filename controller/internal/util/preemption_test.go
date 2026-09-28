@@ -445,65 +445,6 @@ func TestFindLatestReadyManualStopPSP(t *testing.T) {
 	}
 }
 
-func TestUsesMigratableRuntime(t *testing.T) {
-	gvisor := "gvisor"
-	runc := "runc"
-	empty := ""
-
-	tests := []struct {
-		name     string
-		pod      *corev1.Pod
-		expected bool
-	}{
-		{
-			name:     "nil pod",
-			pod:      nil,
-			expected: false,
-		},
-		{
-			name:     "pod with nil RuntimeClassName",
-			pod:      &corev1.Pod{},
-			expected: false,
-		},
-		{
-			name: "pod with empty RuntimeClassName",
-			pod: &corev1.Pod{
-				Spec: corev1.PodSpec{
-					RuntimeClassName: &empty,
-				},
-			},
-			expected: false,
-		},
-		{
-			name: "pod with non-gvisor RuntimeClassName (runc)",
-			pod: &corev1.Pod{
-				Spec: corev1.PodSpec{
-					RuntimeClassName: &runc,
-				},
-			},
-			expected: false,
-		},
-		{
-			name: "pod with gvisor RuntimeClassName",
-			pod: &corev1.Pod{
-				Spec: corev1.PodSpec{
-					RuntimeClassName: &gvisor,
-				},
-			},
-			expected: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := UsesMigratableRuntime(tt.pod)
-			if got != tt.expected {
-				t.Errorf("UsesMigratableRuntime() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestIsPodMigrationEnabled(t *testing.T) {
 	tests := []struct {
 		name     string
