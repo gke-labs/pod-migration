@@ -134,6 +134,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+PREEXISTING_PODMIGRATIONS_BACKUP="${OUT_DIR}/preexisting-podmigrations.json"
+
 log() {
   printf "\033[1;36m[%s]\033[0m %s\n" "$(date -u +%H:%M:%S)" "$*"
 }
@@ -180,10 +182,86 @@ stop_collector() {
 }
 
 cleanup_on_exit() {
+  local exit_code=$?
+  trap - EXIT INT TERM
+  restore_preexisting_podmigrations
   stop_collector
   uncordon_all_tracked_nodes
+  if [[ "${exit_code}" -ne 0 ]]; then
+    exit "${exit_code}"
+  fi
 }
 trap cleanup_on_exit EXIT
+trap 'cleanup_on_exit; trap - INT; kill -INT $$' INT
+trap 'cleanup_on_exit; trap - TERM; kill -TERM $$' TERM
+
+backup_preexisting_podmigrations() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    return 0
+  fi
+  mkdir -p "${OUT_DIR}"
+  local raw_json
+  raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>/dev/null || true)"
+  if [[ -z "${raw_json}" ]] || ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
+    echo '{"apiVersion":"v1","kind":"List","items":[]}' > "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    return 0
+  fi
+
+  echo "${raw_json}" | jq '{
+    apiVersion: "v1",
+    kind: "List",
+    items: [
+      .items[]?
+      | select(.metadata.name != "t3-s1-policy" and .metadata.name != "t3-s2-policy")
+      | del(
+          .metadata.uid,
+          .metadata.resourceVersion,
+          .metadata.creationTimestamp,
+          .metadata.generation,
+          .metadata.ownerReferences,
+          .metadata.managedFields,
+          .metadata.finalizers,
+          .status
+        )
+    ]
+  }' > "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+
+  local count
+  count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
+  if [[ "${count}" -gt 0 ]]; then
+    log "Backed up ${count} pre-existing PodMigration(s) in namespace ${NAMESPACE} to ${PREEXISTING_PODMIGRATIONS_BACKUP}"
+  fi
+}
+
+restore_preexisting_podmigrations() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+
+  # Delete T3's own policies first so they never conflict with restored policies.
+  kubectl delete podmigrations.podmigration.gke.io t3-s1-policy t3-s2-policy \
+    -n "${NAMESPACE}" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
+
+  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    local count
+    count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
+    if [[ "${count}" -gt 0 ]]; then
+      log "Restoring ${count} pre-existing PodMigration(s) from ${PREEXISTING_PODMIGRATIONS_BACKUP} into namespace ${NAMESPACE}"
+      kubectl apply -n "${NAMESPACE}" -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" >/dev/null 2>&1 || true
+      local names
+      mapfile -t names < <(jq -r '.items[].metadata.name' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)
+      for name in "${names[@]}"; do
+        if [[ -n "${name}" ]]; then
+          kubectl wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null 2>&1 || true
+        fi
+      done
+      log "Restored pre-existing PodMigration(s) successfully"
+    fi
+  fi
+}
 
 resolve_gcs_bucket() {
   if [[ -n "${GCS_BUCKET}" ]]; then
@@ -191,6 +269,9 @@ resolve_gcs_bucket() {
   fi
   local existing
   existing="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+  if [[ -z "${existing}" ]] && [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    existing="$(jq -r '.items[0].spec.storage.location // empty' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)"
+  fi
   if [[ -n "${existing}" ]]; then
     GCS_BUCKET="${existing}"
   else
@@ -211,6 +292,7 @@ clean_stale_migration_resources() {
 }
 
 clean_t3_workloads() {
+  backup_preexisting_podmigrations
   kubectl delete deployment/t3-s1-counter deployment/t3-counter deployment/t3-redis \
     deployment/t3-postgres deployment/t3-memcached deployment/t3-nginx \
     -n "${NAMESPACE}" --ignore-not-found --wait=true --timeout=45s >/dev/null 2>&1 || true
@@ -887,6 +969,101 @@ EOF
     --title "T3 Scale, Cross-Node Drain & Latency SLO (T) Benchmark Report" \
     "${s1_dir}/run.json" "${s2_dir}/run.json"
   [[ -s "${report_html}" ]] || die "Expected non-empty HTML report at ${report_html}"
+
+  # 5. Offline verification of PodMigration backup filter and restoration transform
+  local test_backup_in="${base_dir}/test-podmigrations-raw.json"
+  local test_backup_out="${base_dir}/test-podmigrations-filtered.json"
+  cat > "${test_backup_in}" <<EOF
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "diskless-migration",
+        "namespace": "${NAMESPACE}",
+        "uid": "1111-2222",
+        "resourceVersion": "12345",
+        "creationTimestamp": "2026-09-28T00:00:00Z",
+        "generation": 1,
+        "finalizers": ["podmigration.gke.io/storage-cleanup"],
+        "managedFields": [{"manager": "kubectl"}]
+      },
+      "spec": {"storage": {"location": "gs://bucket/test"}},
+      "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+    },
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "t3-s1-policy",
+        "namespace": "${NAMESPACE}",
+        "uid": "3333-4444"
+      },
+      "spec": {"storage": {"location": "gs://bucket/t3-s1"}}
+    },
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "t3-s2-policy",
+        "namespace": "${NAMESPACE}",
+        "uid": "5555-6666"
+      },
+      "spec": {"storage": {"location": "gs://bucket/t3-s2"}}
+    },
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "custom-policy",
+        "namespace": "${NAMESPACE}",
+        "uid": "7777-8888",
+        "resourceVersion": "67890",
+        "ownerReferences": [{"apiVersion": "v1", "kind": "Foo", "name": "bar"}]
+      },
+      "spec": {"storage": {"location": "gs://bucket/custom"}}
+    }
+  ]
+}
+EOF
+  jq '{
+    apiVersion: "v1",
+    kind: "List",
+    items: [
+      .items[]?
+      | select(.metadata.name != "t3-s1-policy" and .metadata.name != "t3-s2-policy")
+      | del(
+          .metadata.uid,
+          .metadata.resourceVersion,
+          .metadata.creationTimestamp,
+          .metadata.generation,
+          .metadata.ownerReferences,
+          .metadata.managedFields,
+          .metadata.finalizers,
+          .status
+        )
+    ]
+  }' "${test_backup_in}" > "${test_backup_out}"
+
+  local preserved_count
+  preserved_count="$(jq '.items | length' "${test_backup_out}")"
+  [[ "${preserved_count}" -eq 2 ]] || die "Self-test failure: expected 2 preserved PodMigrations, got ${preserved_count}"
+
+  local has_t3_s1 has_t3_s2 has_uid has_status
+  has_t3_s1="$(jq '[.items[].metadata.name] | index("t3-s1-policy")' "${test_backup_out}")"
+  has_t3_s2="$(jq '[.items[].metadata.name] | index("t3-s2-policy")' "${test_backup_out}")"
+  [[ "${has_t3_s1}" == "null" ]] || die "Self-test failure: t3-s1-policy was not filtered from backup"
+  [[ "${has_t3_s2}" == "null" ]] || die "Self-test failure: t3-s2-policy was not filtered from backup"
+
+  has_uid="$(jq '[.items[].metadata.uid // empty] | length' "${test_backup_out}")"
+  has_status="$(jq '[.items[].status // empty] | length' "${test_backup_out}")"
+  [[ "${has_uid}" -eq 0 ]] || die "Self-test failure: metadata.uid was not stripped from backup"
+  [[ "${has_status}" -eq 0 ]] || die "Self-test failure: status was not stripped from backup"
+
+  log "PASS [self-test]: PodMigration backup filter & restore transform verified"
   log "Self-test PASSED: HTML report generated at ${report_html}"
 }
 
