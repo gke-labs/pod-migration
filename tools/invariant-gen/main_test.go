@@ -30,7 +30,7 @@ func TestDetectAndVerifyWedgedRestoringOrphanWithCompiledGoTest(t *testing.T) {
 	cleanNDJSON := strings.Join([]string{
 		`{"ts":"2026-09-28T12:00:01Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"app-0","namespace":"default","uid":"uid-src-0"},"spec":{"nodeName":"node-a"},"status":{"phase":"Running"}}}`,
 		`{"ts":"2026-09-28T12:00:02Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-clean-0","namespace":"default"},"spec":{"podRef":{"name":"app-0"}},"status":{"phase":"Snapshotting","snapshotRef":"ps-clean-0"}}}`,
-		`{"ts":"2026-09-28T12:00:05Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"app-0-dst","namespace":"default","uid":"uid-dst-0","annotations":{"gke.io/pod-snapshot-restore-name":"ps-clean-0"}},"spec":{"nodeName":"node-b"},"status":{"phase":"Running"}}}`,
+		`{"ts":"2026-09-28T12:00:05Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"app-0-dst","namespace":"default","uid":"uid-dst-0","annotations":{"podsnapshot.gke.io/ps-name":"ps-clean-0"}},"spec":{"nodeName":"node-b"},"status":{"phase":"Running"}}}`,
 		`{"ts":"2026-09-28T12:00:10Z","type":"update","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-clean-0","namespace":"default"},"spec":{"podRef":{"name":"app-0"}},"status":{"phase":"Succeeded","snapshotRef":"ps-clean-0","restoredPodName":"app-0-dst"}}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(greenTrace, []byte(cleanNDJSON), 0o644); err != nil {
@@ -145,7 +145,7 @@ func TestDetectAndVerifyEvictingStallAndColdStartTemplates(t *testing.T) {
   "migrations": [{"app": "pg", "pod": "pg-0", "pmj": "pmj-cold-0", "snapshotName": "ps-cold-0", "outcome": "cold-start", "phase": "Running"}]
 }`,
 			ndjson: strings.Join([]string{
-				`{"ts":"2026-09-28T01:00:00Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"pg-0-new","namespace":"default","uid":"uid-cold-new","annotations":{"gke.io/pod-snapshot-restore-name":""}},"spec":{"nodeName":"node-b"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}}`,
+				`{"ts":"2026-09-28T01:00:00Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"pg-0-new","namespace":"default","uid":"uid-cold-new","annotations":{"podsnapshot.gke.io/ps-name":""}},"spec":{"nodeName":"node-b"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}}`,
 				`{"ts":"2026-09-28T01:00:01Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-cold-0","namespace":"default"},"spec":{"podRef":{"name":"pg-0"}},"status":{"phase":"Restoring","snapshotRef":"ps-cold-0","restoredPodName":"pg-0-new"}}}`,
 			}, "\n") + "\n",
 			template: TemplateUnintendedColdStartActivePMJ,

@@ -47,4 +47,6 @@ jobs:
       run: make -C controller test-t3-guardrail
 
     - name: Run T5 Invariant Evolution Pipeline Self-Test
+      env:
+        ALLOW_INVARIANT_COCHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'allow-invariant-cochange') }}
       run: make -C controller test-t5-guardrail

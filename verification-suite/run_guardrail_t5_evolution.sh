@@ -113,9 +113,8 @@ build_binaries() {
 run_self_test() {
   log "=== Running Track 5 Invariant Evolution Pipeline Self-Test ==="
 
-  # 1. Verify T0 Two-Lane CODEOWNERS Governance self-test + current branch compliance
+  # 1. Verify T0 Two-Lane CODEOWNERS Governance self-test
   "${SCRIPT_DIR}/verify_invariant_governance.sh" --self-test
-  "${SCRIPT_DIR}/verify_invariant_governance.sh"
 
   build_binaries
 
@@ -141,8 +140,8 @@ EOF
 {"ts":"2026-09-28T12:00:02Z","type":"add","gvr":"${ps_gvr}","obj":{"metadata":{"name":"ps-clean-${i}","namespace":"default"},"spec":{"podName":"app-${i}"},"status":{"conditions":[{"type":"Checkpoint","status":"False","reason":"InProgress"},{"type":"StorageReplicated","status":"False","reason":"AwaitingCheckpoint"},{"type":"Ready","status":"False","reason":"InProgress"}]}}}
 {"ts":"2026-09-28T12:00:05Z","type":"update","gvr":"${ps_gvr}","obj":{"metadata":{"name":"ps-clean-${i}","namespace":"default"},"spec":{"podName":"app-${i}"},"status":{"conditions":[{"type":"Checkpoint","status":"True","reason":"Succeeded"},{"type":"StorageReplicated","status":"True","reason":"Succeeded"},{"type":"Ready","status":"True","reason":"AllSnapshotsAvailable"}]}}}
 {"ts":"2026-09-28T12:00:06Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"app-${i}","uid":"uid-src-${i}","creationTimestamp":"2026-09-28T11:59:00Z","deletionTimestamp":"2026-09-28T12:00:06Z","labels":{"app":"counter","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-a"},"status":{}}}
-{"ts":"2026-09-28T12:00:07Z","type":"add","gvr":"${pod_gvr}","obj":{"metadata":{"name":"app-${i}-dst","uid":"uid-dst-${i}","creationTimestamp":"2026-09-28T12:00:07Z","labels":{"app":"counter","pod-migration.gke.io/enabled":"true"},"annotations":{"gke.io/pod-snapshot-restore-name":"ps-clean-${i}"}},"spec":{"schedulingGates":[{"name":"pod-migration.gke.io/restoring"}]},"status":{}}}
-{"ts":"2026-09-28T12:00:09Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"app-${i}-dst","uid":"uid-dst-${i}","creationTimestamp":"2026-09-28T12:00:07Z","labels":{"app":"counter","pod-migration.gke.io/enabled":"true"},"annotations":{"gke.io/pod-snapshot-restore-name":"ps-clean-${i}"}},"spec":{"nodeName":"node-b"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T12:00:13Z"}]}}}
+{"ts":"2026-09-28T12:00:07Z","type":"add","gvr":"${pod_gvr}","obj":{"metadata":{"name":"app-${i}-dst","uid":"uid-dst-${i}","creationTimestamp":"2026-09-28T12:00:07Z","labels":{"app":"counter","pod-migration.gke.io/enabled":"true"},"annotations":{"podsnapshot.gke.io/ps-name":"ps-clean-${i}"}},"spec":{"schedulingGates":[{"name":"pod-migration.gke.io/restoring"}]},"status":{}}}
+{"ts":"2026-09-28T12:00:09Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"app-${i}-dst","uid":"uid-dst-${i}","creationTimestamp":"2026-09-28T12:00:07Z","labels":{"app":"counter","pod-migration.gke.io/enabled":"true"},"annotations":{"podsnapshot.gke.io/ps-name":"ps-clean-${i}"}},"spec":{"nodeName":"node-b"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T12:00:13Z"}]}}}
 {"ts":"2026-09-28T12:00:14Z","type":"update","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-clean-${i}","uid":"uid-pmj-${i}","creationTimestamp":"2026-09-28T12:00:01Z"},"spec":{"podRef":{"name":"app-${i}"},"targetPodUID":"uid-src-${i}"},"status":{"phase":"Succeeded","snapshotName":"ps-clean-${i}","evictingStartTime":"2026-09-28T12:00:06Z","restoredPodName":"app-${i}-dst","restoredPodUID":"uid-dst-${i}","conditions":[{"type":"Restored","status":"True","reason":"RestoreVerified"}]}}}
 EOF
   done

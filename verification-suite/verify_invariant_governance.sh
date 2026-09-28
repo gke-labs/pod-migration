@@ -24,20 +24,24 @@
 #      /controller/internal/invariants/, /.github/CODEOWNERS, and
 #      /verification-suite/verify_invariant_governance.sh (without hardcoding
 #      specific usernames in CI).
-#   2. Lane 1 (Feature & Bugfix PRs — branch does NOT match ^invariant/):
-#      Forbids modifying any file under controller/internal/invariants/**,
-#      .github/CODEOWNERS, or verification-suite/verify_invariant_governance.sh
-#      unless an explicit co-change / admin override is present:
+#   2. Governance-File Protection (.github/CODEOWNERS and
+#      verification-suite/verify_invariant_governance.sh):
+#      Forbids modifying either file on any non-main branch unless a
+#      maintainer-applied PR label (`allow-invariant-cochange` ->
+#      ALLOW_INVARIANT_COCHANGE=true) or local `--allow-cochange` flag is set.
+#      Author-controlled branch names and commit trailers cannot bypass this check.
+#   3. Lane 1 (Feature & Bugfix PRs — branch does NOT match ^invariant/):
+#      Forbids modifying any file under controller/internal/invariants/**
+#      unless an explicit co-change override is present:
 #        - PR label `allow-invariant-cochange` (ALLOW_INVARIANT_COCHANGE=true),
-#        - Commit trailer `Invariant-Cochange: <reason>` in any commit on the PR,
-#        - Dedicated `admin/*` branch, or
+#        - Commit trailer `Invariant-Cochange: <reason>` in any commit on the PR, or
 #        - CLI flag `--allow-cochange`.
-#   3. Lane 2 (Dedicated Invariant PRs — branch matches ^invariant/):
+#   4. Lane 2 (Dedicated Invariant PRs — branch matches ^invariant/):
 #      Requires all modified files to be strictly scoped to
 #      controller/internal/invariants/** unless a co-change override is present.
-#   4. Never exempts detached HEAD (`HEAD` / `DETACHED_HEAD`); only direct
+#   5. Never exempts detached HEAD (`HEAD` / `DETACHED_HEAD`); only direct
 #      commits on `main` skip per-PR lane diff enforcement.
-#   5. Fails closed if the git diff against a base ref cannot be resolved.
+#   6. Fails closed if the git diff against a base ref cannot be resolved.
 
 set -euo pipefail
 
@@ -62,7 +66,7 @@ Options:
   --base <git-ref>           Base git ref for diffing changed files (default: auto-detect main/HEAD^1)
   --codeowners <path>        Path to CODEOWNERS file (default: .github/CODEOWNERS)
   --changed-files <list>     Explicit newline/space-separated changed file list (used in tests)
-  --allow-cochange           Allow co-dependent reconciler/governance + invariant changes in a single PR
+  --allow-cochange           Allow governance-file or reconciler+invariant co-changes (matches PR label allow-invariant-cochange)
   --commit-msg <text>        Override commit message text when checking for Invariant-Cochange trailer
   --self-test                Run offline self-test covering Lane 1, Lane 2, detached HEAD, fail-closed, and co-change cases
   -h, --help                 Show this help message
@@ -233,13 +237,8 @@ collect_pr_commit_messages() {
   git -C "${REPO_ROOT}" log -1 --format=%B HEAD 2>/dev/null || true
 }
 
-is_cochange_authorized() {
-  local branch="$1"
-  local allow_flag="$2"
-  local commit_msg="$3"
-  if [[ "${allow_flag}" == "true" || "${branch}" =~ ^admin/ ]]; then
-    return 0
-  fi
+has_cochange_trailer() {
+  local commit_msg="$1"
   if [[ -z "${commit_msg}" ]]; then
     commit_msg="$(collect_pr_commit_messages)"
   fi
@@ -270,20 +269,32 @@ evaluate_governance() {
     [[ -n "${line}" ]] && files+=("${line}")
   done < <(tr ' ' '\n' <<<"${changed_raw}" | sed '/^$/d')
 
-  if is_cochange_authorized "${branch}" "${allow_cochange}" "${commit_msg}"; then
-    log "PASS (Co-change / Admin override): branch '${branch}' authorized via allow-invariant-cochange / Invariant-Cochange trailer / admin/* (${#files[@]} changed file(s); CODEOWNERS review still applies)"
-    return 0
-  fi
-
-  # Protect .github/CODEOWNERS and verification-suite/verify_invariant_governance.sh
-  # against unapproved modification on both Lane 1 and Lane 2 branches.
+  # 1. Governance-file protection (.github/CODEOWNERS and
+  #    verification-suite/verify_invariant_governance.sh):
+  #    Only a maintainer-applied PR label (ALLOW_INVARIANT_COCHANGE=true) or
+  #    local --allow-cochange flag can authorize edits to these two files.
+  #    Author-typed commit trailers and branch names NEVER bypass this check.
   for f in "${files[@]:-}"; do
     [[ -z "${f}" ]] && continue
     if [[ "${f}" == ".github/CODEOWNERS" || "${f}" == "verification-suite/verify_invariant_governance.sh" ]]; then
-      fail "Branch '${branch}' modified protected governance file '${f}' without 'Invariant-Cochange: <reason>' trailer, 'allow-invariant-cochange' label, or 'admin/*' branch."
-      return 1
+      if [[ "${allow_cochange}" != "true" ]]; then
+        fail "Branch '${branch}' modified protected governance file '${f}'. Modifying .github/CODEOWNERS or verification-suite/verify_invariant_governance.sh requires the 'allow-invariant-cochange' PR label (or --allow-cochange for local runs); commit trailers and branch names do not authorize governance-file edits."
+        return 1
+      fi
     fi
   done
+
+  if [[ "${allow_cochange}" == "true" ]]; then
+    log "PASS (Label / CLI override): branch '${branch}' authorized via allow-invariant-cochange (${#files[@]} changed file(s))"
+    return 0
+  fi
+
+  # 2. Reconciler + Invariant co-change trailer check (applies only when
+  #    governance files are untouched).
+  if has_cochange_trailer "${commit_msg}"; then
+    log "PASS (Co-change trailer override): branch '${branch}' authorized via Invariant-Cochange commit trailer (${#files[@]} changed file(s))"
+    return 0
+  fi
 
   if [[ "${branch}" =~ ^invariant/ ]]; then
     # Lane 2: Dedicated invariant/* branch.
@@ -359,15 +370,20 @@ EOF
     exit 1
   fi
 
-  # 4. Negative (Lane 1): bugfix branch modifying .github/CODEOWNERS or verify_invariant_governance.sh without override
+  # 4. Negative (Governance-file protection): neither normal commits, Invariant-Cochange trailers, nor admin/* branch names may modify .github/CODEOWNERS or verify_invariant_governance.sh
   if evaluate_governance "fix/bypass-owners" "${valid_co}" ".github/CODEOWNERS" "false" "fix: normal commit" >/dev/null 2>&1; then
     rm -rf "${tmp_dir}"
-    fail "Self-test failed: Lane 1 allowed fix branch to modify .github/CODEOWNERS"
+    fail "Self-test failed: allowed fix branch to modify .github/CODEOWNERS"
     exit 1
   fi
-  if evaluate_governance "fix/bypass-script" "${valid_co}" "verification-suite/verify_invariant_governance.sh" "false" "fix: normal commit" >/dev/null 2>&1; then
+  if evaluate_governance "feature/anyone" "${valid_co}" ".github/CODEOWNERS" "false" $'chore: x\n\nInvariant-Cochange: because' >/dev/null 2>&1; then
     rm -rf "${tmp_dir}"
-    fail "Self-test failed: Lane 1 allowed fix branch to modify verification-suite/verify_invariant_governance.sh"
+    fail "Self-test failed: Invariant-Cochange trailer bypassed .github/CODEOWNERS protection"
+    exit 1
+  fi
+  if evaluate_governance "admin/whatever" "${valid_co}" "verification-suite/verify_invariant_governance.sh .github/CODEOWNERS" "false" "chore: y" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: admin/* branch name bypassed governance-file protection"
     exit 1
   fi
 
@@ -390,15 +406,20 @@ EOF
     exit 1
   fi
 
-  # 8. Positive (Co-change / Admin escape hatch): Invariant-Cochange trailer or admin/* branch allows co-dependent or governance edits
+  # 8. Positive (Co-change trailer for reconciler + invariants): Invariant-Cochange trailer allows co-dependent reconciler + invariant edits when governance files are untouched
   evaluate_governance "fix/reconciler-and-invariant-together" "${valid_co}" \
     "controller/internal/controller/podmigrationjob_controller.go controller/internal/invariants/rules.go" \
     "false" $'fix(controller): update state transition and I3 together\n\nInvariant-Cochange: Reconciler state transition and I3 predicate updated atomically' >/dev/null
-  evaluate_governance "admin/update-codeowners" "${valid_co}" \
-    ".github/CODEOWNERS verification-suite/verify_invariant_governance.sh" \
-    "false" "chore(admin): rotate CODEOWNERS" >/dev/null
 
-  # 9. Negative (Detached HEAD): HEAD / DETACHED_HEAD must NEVER bypass Lane 1 checks
+  # 9. Positive (--allow-cochange / ALLOW_INVARIANT_COCHANGE=true): exercises the CLI flag and env var path for governance files and co-changes
+  "${BASH_SOURCE[0]}" --branch "feature/governance-bootstrap" --codeowners "${valid_co}" \
+    --changed-files ".github/CODEOWNERS verification-suite/verify_invariant_governance.sh" \
+    --commit-msg "feat: bootstrap governance" --allow-cochange >/dev/null
+  ALLOW_INVARIANT_COCHANGE=true "${BASH_SOURCE[0]}" --branch "feature/governance-bootstrap" --codeowners "${valid_co}" \
+    --changed-files ".github/CODEOWNERS verification-suite/verify_invariant_governance.sh" \
+    --commit-msg "feat: bootstrap governance" >/dev/null
+
+  # 10. Negative (Detached HEAD): HEAD / DETACHED_HEAD must NEVER bypass Lane 1 checks
   if evaluate_governance "HEAD" "${valid_co}" \
     "controller/internal/invariants/rules.go" "false" "feat: detached head edit" >/dev/null 2>&1; then
     rm -rf "${tmp_dir}"
@@ -413,7 +434,7 @@ EOF
   fi
 
   rm -rf "${tmp_dir}"
-  log "Self-test PASSED: all 10 Lane 1, Lane 2, detached-HEAD, fail-closed, and co-change governance cases verified"
+  log "Self-test PASSED: all 10 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, and co-change cases verified"
 }
 
 main() {
