@@ -135,6 +135,32 @@ while [[ $# -gt 0 ]]; do
 done
 
 PREEXISTING_PODMIGRATIONS_BACKUP="${OUT_DIR}/preexisting-podmigrations.json"
+BACKED_UP_PREEXISTING_PODMIGRATIONS="false"
+RESTORE_FAILED="false"
+
+# Shared JQ filter for backing up pre-existing PodMigrations.
+# Strips cluster-assigned metadata, owner references, managed fields, finalizers,
+# last-applied-configuration annotation, and status block.
+PODMIGRATIONS_BACKUP_JQ_FILTER='{
+  apiVersion: "v1",
+  kind: "List",
+  items: [
+    .items[]?
+    | select(.metadata.name != "t3-s1-policy" and .metadata.name != "t3-s2-policy")
+    | del(
+        .metadata.uid,
+        .metadata.resourceVersion,
+        .metadata.creationTimestamp,
+        .metadata.generation,
+        .metadata.ownerReferences,
+        .metadata.managedFields,
+        .metadata.finalizers,
+        .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"],
+        .status
+      )
+    | if .metadata.annotations == {} then del(.metadata.annotations) else . end
+  ]
+}'
 
 log() {
   printf "\033[1;36m[%s]\033[0m %s\n" "$(date -u +%H:%M:%S)" "$*"
@@ -181,12 +207,86 @@ stop_collector() {
   COLLECT_PID=""
 }
 
+delete_t3_policies() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+  kubectl delete podmigrations.podmigration.gke.io t3-s1-policy t3-s2-policy \
+    -n "${NAMESPACE}" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
+}
+
+apply_preexisting_podmigrations() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    return 0
+  fi
+
+  local count
+  count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
+  if [[ "${count}" -eq 0 ]]; then
+    return 0
+  fi
+
+  log "Restoring ${count} pre-existing PodMigration(s) from ${PREEXISTING_PODMIGRATIONS_BACKUP} into namespace ${NAMESPACE}"
+  if ! kubectl apply -n "${NAMESPACE}" -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" >/dev/null 2>&1; then
+    log "FAIL: kubectl apply failed for pre-existing PodMigrations from ${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    RESTORE_FAILED="true"
+  fi
+}
+
+verify_restored_podmigrations() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    return 0
+  fi
+
+  local count
+  count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
+  if [[ "${count}" -eq 0 ]]; then
+    rm -f "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    return 0
+  fi
+
+  local names
+  mapfile -t names < <(jq -r '.items[].metadata.name' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)
+  local restore_err=0
+  if [[ "${RESTORE_FAILED}" == "true" ]]; then
+    restore_err=1
+  fi
+  for name in "${names[@]}"; do
+    if [[ -n "${name}" ]]; then
+      log "Waiting for restored PodMigration '${name}' in namespace ${NAMESPACE} to reach condition Ready=True..."
+      if ! kubectl wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null 2>&1; then
+        log "FAIL: Restored PodMigration '${name}' in namespace ${NAMESPACE} failed to reach condition Ready=True within 60s"
+        restore_err=1
+      fi
+    fi
+  done
+
+  if [[ "${restore_err}" -eq 0 ]]; then
+    rm -f "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    log "Restored pre-existing PodMigration(s) successfully and verified Ready"
+  else
+    log "FAIL: Pre-existing PodMigration restore incomplete or failed; preserving backup file ${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    RESTORE_FAILED="true"
+  fi
+}
+
 cleanup_on_exit() {
   local exit_code=$?
   trap - EXIT INT TERM
-  restore_preexisting_podmigrations
+  delete_t3_policies
+  apply_preexisting_podmigrations
   stop_collector
   uncordon_all_tracked_nodes
+  verify_restored_podmigrations
+  if [[ "${RESTORE_FAILED}" == "true" && "${exit_code}" -eq 0 ]]; then
+    exit 1
+  fi
   if [[ "${exit_code}" -ne 0 ]]; then
     exit "${exit_code}"
   fi
@@ -199,67 +299,28 @@ backup_preexisting_podmigrations() {
   if [[ "${SELF_TEST}" == "true" ]]; then
     return 0
   fi
-  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+  if [[ "${BACKED_UP_PREEXISTING_PODMIGRATIONS}" == "true" ]]; then
     return 0
+  fi
+  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    die "Pre-existing backup file found at ${PREEXISTING_PODMIGRATIONS_BACKUP}. A previous run did not complete restore; inspect/apply or remove this file before re-running."
   fi
   mkdir -p "${OUT_DIR}"
   local raw_json
   raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>/dev/null || true)"
   if [[ -z "${raw_json}" ]] || ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
     echo '{"apiVersion":"v1","kind":"List","items":[]}' > "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    BACKED_UP_PREEXISTING_PODMIGRATIONS="true"
     return 0
   fi
 
-  echo "${raw_json}" | jq '{
-    apiVersion: "v1",
-    kind: "List",
-    items: [
-      .items[]?
-      | select(.metadata.name != "t3-s1-policy" and .metadata.name != "t3-s2-policy")
-      | del(
-          .metadata.uid,
-          .metadata.resourceVersion,
-          .metadata.creationTimestamp,
-          .metadata.generation,
-          .metadata.ownerReferences,
-          .metadata.managedFields,
-          .metadata.finalizers,
-          .status
-        )
-    ]
-  }' > "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+  echo "${raw_json}" | jq "${PODMIGRATIONS_BACKUP_JQ_FILTER}" > "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+  BACKED_UP_PREEXISTING_PODMIGRATIONS="true"
 
   local count
   count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
   if [[ "${count}" -gt 0 ]]; then
     log "Backed up ${count} pre-existing PodMigration(s) in namespace ${NAMESPACE} to ${PREEXISTING_PODMIGRATIONS_BACKUP}"
-  fi
-}
-
-restore_preexisting_podmigrations() {
-  if [[ "${SELF_TEST}" == "true" ]]; then
-    return 0
-  fi
-
-  # Delete T3's own policies first so they never conflict with restored policies.
-  kubectl delete podmigrations.podmigration.gke.io t3-s1-policy t3-s2-policy \
-    -n "${NAMESPACE}" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
-
-  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
-    local count
-    count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
-    if [[ "${count}" -gt 0 ]]; then
-      log "Restoring ${count} pre-existing PodMigration(s) from ${PREEXISTING_PODMIGRATIONS_BACKUP} into namespace ${NAMESPACE}"
-      kubectl apply -n "${NAMESPACE}" -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" >/dev/null 2>&1 || true
-      local names
-      mapfile -t names < <(jq -r '.items[].metadata.name' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)
-      for name in "${names[@]}"; do
-        if [[ -n "${name}" ]]; then
-          kubectl wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null 2>&1 || true
-        fi
-      done
-      log "Restored pre-existing PodMigration(s) successfully"
-    fi
   fi
 }
 
@@ -989,7 +1050,11 @@ EOF
         "creationTimestamp": "2026-09-28T00:00:00Z",
         "generation": 1,
         "finalizers": ["podmigration.gke.io/storage-cleanup"],
-        "managedFields": [{"manager": "kubectl"}]
+        "managedFields": [{"manager": "kubectl"}],
+        "annotations": {
+          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\"}",
+          "custom.io/policy": "preserve-me"
+        }
       },
       "spec": {"storage": {"location": "gs://bucket/test"}},
       "status": {"conditions": [{"type": "Ready", "status": "True"}]}
@@ -1029,30 +1094,13 @@ EOF
   ]
 }
 EOF
-  jq '{
-    apiVersion: "v1",
-    kind: "List",
-    items: [
-      .items[]?
-      | select(.metadata.name != "t3-s1-policy" and .metadata.name != "t3-s2-policy")
-      | del(
-          .metadata.uid,
-          .metadata.resourceVersion,
-          .metadata.creationTimestamp,
-          .metadata.generation,
-          .metadata.ownerReferences,
-          .metadata.managedFields,
-          .metadata.finalizers,
-          .status
-        )
-    ]
-  }' "${test_backup_in}" > "${test_backup_out}"
+  jq "${PODMIGRATIONS_BACKUP_JQ_FILTER}" "${test_backup_in}" > "${test_backup_out}"
 
   local preserved_count
   preserved_count="$(jq '.items | length' "${test_backup_out}")"
   [[ "${preserved_count}" -eq 2 ]] || die "Self-test failure: expected 2 preserved PodMigrations, got ${preserved_count}"
 
-  local has_t3_s1 has_t3_s2 has_uid has_status
+  local has_t3_s1 has_t3_s2 has_uid has_status has_last_applied has_custom_ann
   has_t3_s1="$(jq '[.items[].metadata.name] | index("t3-s1-policy")' "${test_backup_out}")"
   has_t3_s2="$(jq '[.items[].metadata.name] | index("t3-s2-policy")' "${test_backup_out}")"
   [[ "${has_t3_s1}" == "null" ]] || die "Self-test failure: t3-s1-policy was not filtered from backup"
@@ -1063,6 +1111,27 @@ EOF
   [[ "${has_uid}" -eq 0 ]] || die "Self-test failure: metadata.uid was not stripped from backup"
   [[ "${has_status}" -eq 0 ]] || die "Self-test failure: status was not stripped from backup"
 
+  has_last_applied="$(jq '[.items[].metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"] // empty] | length' "${test_backup_out}")"
+  [[ "${has_last_applied}" -eq 0 ]] || die "Self-test failure: kubectl.kubernetes.io/last-applied-configuration was not stripped from backup"
+
+  has_custom_ann="$(jq -r '.items[] | select(.metadata.name == "diskless-migration") | .metadata.annotations["custom.io/policy"] // empty' "${test_backup_out}")"
+  [[ "${has_custom_ann}" == "preserve-me" ]] || die "Self-test failure: custom annotation was not preserved in backup"
+
+  # 6. Verify stale backup file collision guard fails closed offline
+  local test_stale_dir="${base_dir}/test-stale-backup"
+  mkdir -p "${test_stale_dir}"
+  local test_stale_file="${test_stale_dir}/preexisting-podmigrations.json"
+  echo '{}' > "${test_stale_file}"
+  if (
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stale_file}"
+    BACKED_UP_PREEXISTING_PODMIGRATIONS="false"
+    SELF_TEST="false"
+    backup_preexisting_podmigrations >/dev/null 2>&1
+  ); then
+    die "Self-test failure: backup_preexisting_podmigrations did not fail when stale backup file exists"
+  fi
+  log "PASS [self-test]: stale backup file collision guard verified"
+
   log "PASS [self-test]: PodMigration backup filter & restore transform verified"
   log "Self-test PASSED: HTML report generated at ${report_html}"
 }
@@ -1071,6 +1140,10 @@ main() {
   if [[ "${SELF_TEST}" == "true" ]]; then
     run_self_test
     exit 0
+  fi
+
+  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    die "Pre-existing backup file found at ${PREEXISTING_PODMIGRATIONS_BACKUP}. A previous run did not complete restore; inspect/apply or remove this file before re-running."
   fi
 
   build_binaries
