@@ -153,6 +153,11 @@ func cmdAnalyze(args []string) error {
 	assertZeroInv := fs.Bool("assert-zero-invariants", true, "fail if sum(pod_migration_invariant_violations_total) > 0")
 	assertCleanOutcomes := fs.Bool("assert-clean-outcomes", false, "fail on wedged, failed, no-replacement, or unintended cold-start outcomes")
 	allowColdStart := fs.Bool("allow-cold-start", false, "permit cold-start outcomes when --assert-clean-outcomes is set (e.g. intentional I9 fallback)")
+	enforceSLO := fs.Bool("enforce-slo", false, "enforce wall-clock latency SLO thresholds (T) on p95 gateHoldS, downtimeS, and e2eS")
+	slo := analyze.DefaultSLOThresholds()
+	fs.DurationVar(&slo.GateHoldP95, "slo-gate-hold-p95", slo.GateHoldP95, "max p95 scheduling gate hold duration (gateHoldS) when --enforce-slo is set")
+	fs.DurationVar(&slo.DowntimeP95, "slo-downtime-p95", slo.DowntimeP95, "max p95 serving blackout duration (downtimeS) when --enforce-slo is set")
+	fs.DurationVar(&slo.E2EP95, "slo-e2e-p95", slo.E2EP95, "max p95 end-to-end migration duration (e2eS) when --enforce-slo is set")
 	_ = fs.Parse(args) // ExitOnError: never returns an error
 	if o.RunDir == "" {
 		return fmt.Errorf("--run is required")
@@ -184,8 +189,8 @@ func cmdAnalyze(args []string) error {
 		run.Scenario, len(run.Migrations), run.Outcomes, run.TotalInvariantViolations)
 	for k, s := range run.Stats {
 		if s.N > 0 {
-			fmt.Fprintf(os.Stderr, "  %-12s n=%-4d p50=%.1fs p90=%.1fs p99=%.1fs max=%.1fs\n",
-				k, s.N, s.P50, s.P90, s.P99, s.Max)
+			fmt.Fprintf(os.Stderr, "  %-12s n=%-4d p50=%.1fs p90=%.1fs p95=%.1fs p99=%.1fs max=%.1fs\n",
+				k, s.N, s.P50, s.P90, s.P95, s.P99, s.Max)
 		}
 	}
 	if *assertZeroInv {
@@ -195,6 +200,11 @@ func cmdAnalyze(args []string) error {
 	}
 	if *assertCleanOutcomes {
 		if err := analyze.VerifyOutcomes(run, *allowColdStart); err != nil {
+			return err
+		}
+	}
+	if *enforceSLO {
+		if err := analyze.VerifySLO(run, slo); err != nil {
 			return err
 		}
 	}

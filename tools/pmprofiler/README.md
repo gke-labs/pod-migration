@@ -44,7 +44,11 @@ if `sum(pod_migration_invariant_violations_total) > 0` or any
 `Reason=InvariantViolation` Kubernetes Warning event was observed. Pass
 `--assert-clean-outcomes` (and optionally `--allow-cold-start` for intentional
 `I9` fallback scenarios) to fail if any wedged, failed, no-replacement, or
-failed driver check is present.
+failed driver check is present. Pass `--enforce-slo` to enforce wall-clock
+latency SLO thresholds (`T`) across the measured migration population:
+- `--slo-gate-hold-p95` (default `60s`): `I3` scheduling-gate hold duration (`gateHoldS = tGateReleased - tDstCreated`)
+- `--slo-downtime-p95` (default `60s`): `I4` serving blackout window (`downtimeS = tDstReady - tSrcDeleted`)
+- `--slo-e2e-p95` (default `180s`): `I4` end-to-end migration duration (`e2eS = tDstReady - t0`)
 
 `report` renders one or more `run.json` files into a single offline HTML file
 (inline SVG, no external assets, light and dark themes, hover tooltips, and a
@@ -68,9 +72,9 @@ pmprofiler check --run runs/s1 --name "state survived (token-verified)" \
 pmprofiler check --run runs/s1 --name "p99 latency" --unit ms \
     --series-file latency.txt   # lines: "<unix-seconds> <value>"
 
-# after the scenario (asserts 0 invariant violations and clean outcomes)
-pmprofiler analyze --run runs/s1 --assert-zero-invariants --assert-clean-outcomes
-pmprofiler report --out report.html --title "Guardrail T2 Suite" runs/*/run.json
+# after the scenario (asserts 0 invariant violations, clean outcomes, and wall-clock SLOs)
+pmprofiler analyze --run runs/s1 --assert-zero-invariants --assert-clean-outcomes --enforce-slo
+pmprofiler report --out report.html --title "Guardrail T2/T3 Suite" runs/*/run.json
 ```
 
 ## Files in a run directory

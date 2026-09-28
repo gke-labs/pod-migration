@@ -36,3 +36,6 @@ jobs:
 
     - name: Run pmprofiler & T2 Guardrail Self-Test
       run: make -C controller test-t2-guardrail
+
+    - name: Run T3 SLO Guardrail & scalesim Capacity Model Self-Test
+      run: make -C controller test-t3-guardrail

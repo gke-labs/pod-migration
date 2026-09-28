@@ -55,6 +55,8 @@ type pmjState struct {
 	lastProgress       time.Time
 	completion         time.Time
 	evictingStart      time.Time
+	restoringStart     time.Time
+	gateReleased       bool
 	snapshot           string
 	restoredPodName    string
 	restoredPodUID     string
@@ -63,15 +65,18 @@ type pmjState struct {
 }
 
 type podInc struct {
-	name       string
-	uid        string
-	app        string
-	jobIdx     string // job-idx label: Job replacement pods get new names
-	created    time.Time
-	node       string
-	readyLTT   time.Time
-	deletion   time.Time
-	deleteSeen time.Time
+	name           string
+	uid            string
+	app            string
+	jobIdx         string // job-idx label: Job replacement pods get new names
+	created        time.Time
+	node           string
+	wasGated       bool
+	gateReleasedAt time.Time
+	scheduledLTT   time.Time
+	readyLTT       time.Time
+	deletion       time.Time
+	deleteSeen     time.Time
 	// psRestore is the engine's explicit outcome annotation
 	// (pod-migrate.io/psengine-restore: restored|failed) verbatim. It is
 	// the ONLY pod-carried restore signal: generic snapshot-related keys
@@ -365,6 +370,7 @@ func Analyze(o Options) (*Run, error) {
 	run.Stats["evictedS"] = distribution(run.Migrations, func(m Migration) float64 { return m.EvictedS })
 	run.Stats["e2eS"] = distribution(run.Migrations, func(m Migration) float64 { return m.E2ES })
 	run.Stats["downtimeS"] = distribution(run.Migrations, func(m Migration) float64 { return m.DowntimeS })
+	run.Stats["gateHoldS"] = distribution(run.Migrations, func(m Migration) float64 { return m.GateHoldS })
 	run.Stats["checkpointUploadS"] = distribution(run.Migrations, func(m Migration) float64 {
 		if m.CheckpointUploadS <= 0 {
 			return -1
@@ -380,7 +386,7 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 
 	m := Migration{
 		PMJ: name, Pod: j.pod, T0: fmtTime(j.created), Phase: j.lastPhase,
-		SnapReadyS: -1, EvictedS: -1, E2ES: -1, DowntimeS: -1,
+		SnapReadyS: -1, EvictedS: -1, E2ES: -1, DowntimeS: -1, GateHoldS: -1,
 		SnapshotName: j.snapshot,
 	}
 	if t, ok := j.phaseFirst["Snapshotting"]; ok {
@@ -521,6 +527,32 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 		if m.App == "" {
 			m.App = dst.app
 		}
+		if !dst.created.IsZero() {
+			var gateRel time.Time
+			for _, ev := range events {
+				if ev.kind == "Pod" && ev.name == dst.name && ev.reason == "MigrationRestoreReleased" && !ev.ts.Before(dst.created) {
+					gateRel = ev.ts
+					break
+				}
+			}
+			if gateRel.IsZero() && !dst.gateReleasedAt.IsZero() && !dst.gateReleasedAt.Before(dst.created) {
+				gateRel = dst.gateReleasedAt
+			}
+			if gateRel.IsZero() && (dst.wasGated || j.gateReleased) && !dst.scheduledLTT.IsZero() && !dst.scheduledLTT.Before(dst.created) {
+				gateRel = dst.scheduledLTT
+			}
+			if gateRel.IsZero() && j.gateReleased && !j.restoringStart.IsZero() && !j.restoringStart.Before(dst.created) {
+				gateRel = j.restoringStart
+			}
+			if !gateRel.IsZero() {
+				m.TGateReleased = fmtTime(gateRel)
+				hold := gateRel.Sub(dst.created).Seconds()
+				if hold < 0 {
+					hold = 0
+				}
+				m.GateHoldS = hold
+			}
+		}
 		if !dst.readyLTT.IsZero() {
 			m.TDstReady = fmtTime(dst.readyLTT)
 			m.E2ES = dst.readyLTT.Sub(j.created).Seconds()
@@ -611,12 +643,14 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 		m.TTerminal = fmtTime(t)
 	}
 
-	// Join warning events for the pod and the PMJ.
+	// Join warning events for the pod (source or replacement) and the PMJ
+	// within the migration window so pre-migration scale-up warnings and
+	// post-teardown warnings do not leak into the migration record.
 	for _, ev := range events {
-		if ev.typ != "Warning" {
+		if ev.typ != "Warning" || !inWindow(ev.ts) {
 			continue
 		}
-		if (ev.kind == "Pod" && ev.name == j.pod) ||
+		if (ev.kind == "Pod" && (ev.name == j.pod || (m.DstPod != "" && ev.name == m.DstPod))) ||
 			(ev.kind == "PodMigrationJob" && ev.name == name) {
 			m.Warnings = append(m.Warnings, fmt.Sprintf("%s %s: %s",
 				ev.ts.Format(time.RFC3339), ev.reason, ev.message))
@@ -711,6 +745,14 @@ func ingestPMJ(pmjs map[string]*pmjState, u *unstructured.Unstructured, ts time.
 			j.evictingStart = t
 		}
 	}
+	if rst, ok, _ := unstructured.NestedString(u.Object, "status", "restoringStartTime"); ok && rst != "" {
+		if t := parseTime(rst); !t.IsZero() {
+			j.restoringStart = t
+		}
+	}
+	if gr, ok, _ := unstructured.NestedBool(u.Object, "status", "gateReleased"); ok && gr {
+		j.gateReleased = true
+	}
 	if ct, ok, _ := unstructured.NestedString(u.Object, "status", "completionTime"); ok && ct != "" {
 		j.completion = parseTime(ct)
 	}
@@ -793,6 +835,21 @@ func ingestPod(pods map[string]map[string]*podInc, u *unstructured.Unstructured,
 	if node, ok, _ := unstructured.NestedString(u.Object, "spec", "nodeName"); ok && node != "" {
 		p.node = node
 	}
+	currentlyGated := false
+	if gates, ok, _ := unstructured.NestedSlice(u.Object, "spec", "schedulingGates"); ok && len(gates) > 0 {
+		for _, g := range gates {
+			gm, _ := g.(map[string]any)
+			if gn, _ := gm["name"].(string); gn == "gke.io/pod-migration-gate" || strings.Contains(gn, "migration") || strings.Contains(gn, "restoring") {
+				currentlyGated = true
+				break
+			}
+		}
+	}
+	if currentlyGated {
+		p.wasGated = true
+	} else if p.wasGated && p.gateReleasedAt.IsZero() && !ts.IsZero() {
+		p.gateReleasedAt = ts
+	}
 	if dt := u.GetDeletionTimestamp(); dt != nil {
 		p.deletion = dt.Time
 	}
@@ -809,6 +866,11 @@ func ingestPod(pods map[string]map[string]*podInc, u *unstructured.Unstructured,
 	if conds, ok, _ := unstructured.NestedSlice(u.Object, "status", "conditions"); ok {
 		for _, c := range conds {
 			cm, _ := c.(map[string]any)
+			if cm["type"] == "PodScheduled" && cm["status"] == "True" {
+				if ltt, _ := cm["lastTransitionTime"].(string); ltt != "" {
+					p.scheduledLTT = parseTime(ltt)
+				}
+			}
 			if cm["type"] == "Ready" && cm["status"] == "True" {
 				if ltt, _ := cm["lastTransitionTime"].(string); ltt != "" {
 					p.readyLTT = parseTime(ltt)
@@ -970,7 +1032,7 @@ func distribution(ms []Migration, get func(Migration) float64) Stats {
 		return vals[idx]
 	}
 	return Stats{
-		N: len(vals), P50: pct(0.50), P90: pct(0.90), P99: pct(0.99),
+		N: len(vals), P50: pct(0.50), P90: pct(0.90), P95: pct(0.95), P99: pct(0.99),
 		Max: vals[len(vals)-1], Mean: sum / float64(len(vals)),
 	}
 }
@@ -1108,3 +1170,64 @@ func VerifyOutcomes(run *Run, allowColdStart bool) error {
 	}
 	return nil
 }
+
+// SLOThresholds configures wall-clock latency SLO thresholds (T) for T3 guardrail runs.
+type SLOThresholds struct {
+	// GateHoldP95 is the maximum allowed p95 scheduling-gate hold duration (I3: Gate Liveness).
+	GateHoldP95 time.Duration
+	// DowntimeP95 is the maximum allowed p95 serving blackout window (evict -> Ready, I4).
+	DowntimeP95 time.Duration
+	// E2EP95 is the maximum allowed p95 end-to-end migration duration (T0 -> Ready, I4).
+	E2EP95 time.Duration
+}
+
+// DefaultSLOThresholds returns the canonical T3 wall-clock SLO thresholds (T):
+//   - I3 Gate Liveness: p95(gateHoldS) <= 60s
+//   - I4 Blackout Window: p95(downtimeS) <= 60s
+//   - I4 Terminal Progress: p95(e2eS) <= 180s
+func DefaultSLOThresholds() SLOThresholds {
+	return SLOThresholds{
+		GateHoldP95: 60 * time.Second,
+		DowntimeP95: 60 * time.Second,
+		E2EP95:      180 * time.Second,
+	}
+}
+
+// VerifySLO enforces wall-clock latency thresholds (T) on gateHoldS (I3), downtimeS (I4), and e2eS (I4).
+func VerifySLO(run *Run, slo SLOThresholds) error {
+	if run == nil || run.Populations["measured"] == 0 {
+		return fmt.Errorf("SLO assertion failed: 0 measured migrations in run")
+	}
+	if slo.GateHoldP95 > 0 {
+		s := run.Stats["gateHoldS"]
+		if s.N == 0 {
+			return fmt.Errorf("SLO assertion failed [I3:GateLiveness]: no gateHoldS samples recorded")
+		}
+		if s.P95 > slo.GateHoldP95.Seconds() {
+			return fmt.Errorf("SLO assertion failed [I3:GateLiveness]: gateHoldS p95=%.1fs exceeds threshold %.1fs",
+				s.P95, slo.GateHoldP95.Seconds())
+		}
+	}
+	if slo.DowntimeP95 > 0 {
+		s := run.Stats["downtimeS"]
+		if s.N == 0 {
+			return fmt.Errorf("SLO assertion failed [I4:BlackoutWindow]: no downtimeS samples recorded")
+		}
+		if s.P95 > slo.DowntimeP95.Seconds() {
+			return fmt.Errorf("SLO assertion failed [I4:BlackoutWindow]: downtimeS p95=%.1fs exceeds threshold %.1fs",
+				s.P95, slo.DowntimeP95.Seconds())
+		}
+	}
+	if slo.E2EP95 > 0 {
+		s := run.Stats["e2eS"]
+		if s.N == 0 {
+			return fmt.Errorf("SLO assertion failed [I4:TerminalProgress]: no e2eS samples recorded")
+		}
+		if s.P95 > slo.E2EP95.Seconds() {
+			return fmt.Errorf("SLO assertion failed [I4:TerminalProgress]: e2eS p95=%.1fs exceeds threshold %.1fs",
+				s.P95, slo.E2EP95.Seconds())
+		}
+	}
+	return nil
+}
+

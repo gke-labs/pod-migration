@@ -71,7 +71,7 @@ func reconstructPM(name string, s *pmState, lastTS time.Time, wedge time.Duratio
 		DstNode:    nestedStr(u, "status", "targetNode"),
 		T0:         started,
 		Phase:      phase,
-		SnapReadyS: -1, EvictedS: -1, E2ES: -1, DowntimeS: -1,
+		SnapReadyS: -1, EvictedS: -1, E2ES: -1, DowntimeS: -1, GateHoldS: -1,
 	}
 	if m.T0 == "" {
 		m.T0 = fmtTime(s.created)

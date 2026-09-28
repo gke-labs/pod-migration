@@ -440,6 +440,7 @@ func percentileFigure(r *analyze.Run) *Figure {
 		{"snapReadyS", "snapshot ready (checkpoint + upload)"},
 		{"checkpointUploadS", "checkpoint + upload (engine-measured)"},
 		{"evictedS", "source deleted"},
+		{"gateHoldS", "scheduling gate hold (I3)"},
 		{"downtimeS", "service gap"},
 		{"e2eS", "end-to-end"},
 	}
@@ -458,7 +459,7 @@ func percentileFigure(r *analyze.Run) *Figure {
 		for _, p := range []struct {
 			name string
 			v    float64
-		}{{"p50", st.P50}, {"p90", st.P90}, {"p99", st.P99}, {"max", st.Max}} {
+		}{{"p50", st.P50}, {"p90", st.P90}, {"p95", st.P95}, {"p99", st.P99}, {"max", st.Max}} {
 			stack.Bars = append(stack.Bars, BarGroup{
 				Label: p.name, Value: p.v, Class: cls,
 				Tip: fmt.Sprintf("%s %s = %s (n=%d)", mt.label, p.name, fmtVal(p.v, "s"), st.N),
@@ -533,7 +534,7 @@ func sizeVsTimeFigure(r *analyze.Run) *Figure {
 
 func statsTable(stats map[string]analyze.Stats) template.HTML {
 	var b strings.Builder
-	b.WriteString("<table><thead><tr><th>metric</th><th>n</th><th>p50</th><th>p90</th><th>p99</th><th>max</th><th>mean</th></tr></thead><tbody>")
+	b.WriteString("<table><thead><tr><th>metric</th><th>n</th><th>p50</th><th>p90</th><th>p95</th><th>p99</th><th>max</th><th>mean</th></tr></thead><tbody>")
 	var keys []string
 	for k := range stats {
 		keys = append(keys, k)
@@ -542,8 +543,8 @@ func statsTable(stats map[string]analyze.Stats) template.HTML {
 	for _, k := range keys {
 		s := stats[k]
 		cell := func(v float64) string { return statVal(s, v) }
-		fmt.Fprintf(&b, "<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
-			esc(k), s.N, cell(s.P50), cell(s.P90), cell(s.P99), cell(s.Max), cell(s.Mean))
+		fmt.Fprintf(&b, "<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+			esc(k), s.N, cell(s.P50), cell(s.P90), cell(s.P95), cell(s.P99), cell(s.Max), cell(s.Mean))
 	}
 	b.WriteString("</tbody></table>")
 	return template.HTML(b.String())

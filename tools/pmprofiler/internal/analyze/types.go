@@ -46,6 +46,7 @@ type Migration struct {
 	TEvicting     string `json:"tEvicting,omitempty"`
 	TSrcDeleted   string `json:"tSrcDeleted,omitempty"`
 	TDstCreated   string `json:"tDstCreated,omitempty"`
+	TGateReleased string `json:"tGateReleased,omitempty"`
 	TDstReady     string `json:"tDstReady,omitempty"`
 	TTerminal     string `json:"tTerminal,omitempty"` // PMJ Succeeded/Failed
 
@@ -55,6 +56,8 @@ type Migration struct {
 	E2ES       float64 `json:"e2eS"`
 	// DowntimeS is the serving gap: replacement Ready minus source deleted.
 	DowntimeS float64 `json:"downtimeS"`
+	// GateHoldS is the I3 scheduling-gate hold duration: TGateReleased minus TDstCreated (-1 = unknown).
+	GateHoldS float64 `json:"gateHoldS"`
 
 	Phase   string `json:"phase"` // last observed PMJ phase
 	Outcome string `json:"outcome"`
@@ -102,6 +105,7 @@ type Stats struct {
 	N    int     `json:"n"`
 	P50  float64 `json:"p50"`
 	P90  float64 `json:"p90"`
+	P95  float64 `json:"p95"`
 	P99  float64 `json:"p99"`
 	Max  float64 `json:"max"`
 	Mean float64 `json:"mean"`
