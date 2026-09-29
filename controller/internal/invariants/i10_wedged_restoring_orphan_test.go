@@ -38,6 +38,13 @@ func TestI10_RestoringReplacementLiveness_RedProof(t *testing.T) {
 	if vsEmpty[0].InvariantID != "I10" {
 		t.Fatalf("expected violation InvariantID=I10 on empty NamespacePods fallback path, got %q", vsEmpty[0].InvariantID)
 	}
+
+	// Verify !s.PodListFailed guard suppresses false-positive when NamespacePods list fails (#88 / #90)
+	listFailedSnap := emptyPodsSnap
+	listFailedSnap.PodListFailed = true
+	if vsListFailed := rule.Evaluate(&listFailedSnap); len(vsListFailed) != 0 {
+		t.Fatalf("expected 0 violations when PodListFailed=true, got %+v", vsListFailed)
+	}
 }
 
 func TestI10_RestoringReplacementLiveness_GreenProof(t *testing.T) {

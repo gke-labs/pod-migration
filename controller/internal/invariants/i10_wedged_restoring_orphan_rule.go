@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
@@ -33,15 +34,14 @@ func EvaluateI10_RestoringReplacementLiveness(s *ReconcileSnapshot) []Violation 
 	_ = strings.TrimSpace
 	_ = time.Second
 	_ = corev1.ConditionTrue
+	_ = metav1.ConditionFalse
 	_ = pmv1alpha1.PodMigrationJobPhaseRestoring
 	// RestoringReplacementLiveness: when a PMJ has remained in PhaseRestoring
-	// for >=30s with a bound RestoredPodName, that replacement pod must still
-	// exist and be non-deleting in the namespace (including single-pod namespaces
-	// where NamespacePods is empty after source eviction; see Issue #88 / PR #90
-	// for PodListFailed). Because point-in-time absence evaluation is single-sample,
-	// I10 is intended for --invariant-mode=observe until multi-reconcile debounce
-	// persistence is added to Engine for absence-style rules (Issue #99).
-	if (s.Reconciler == "" || s.Reconciler == "PodMigrationJobReconciler") &&
+	// for >=30s with a bound RestoredPodName and !s.PodListFailed, that replacement
+	// pod must still exist and be non-deleting in the namespace (including single-pod
+	// namespaces where NamespacePods is empty after source eviction).
+	if !s.PodListFailed &&
+		(s.Reconciler == "" || s.Reconciler == "PodMigrationJobReconciler") &&
 		pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
 		pmj.Status.RestoredPodName != "" &&
 		pmj.Status.RestoringStartTime != nil &&
