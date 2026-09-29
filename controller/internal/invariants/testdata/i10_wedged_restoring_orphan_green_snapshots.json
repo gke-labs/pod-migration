@@ -3315,6 +3315,23 @@
         "metadata": {
           "name": "redis-0",
           "namespace": "default",
+          "uid": "uid-sts-src-0",
+          "creationTimestamp": "2026-09-28T11:59:00Z",
+          "deletionTimestamp": "2026-09-28T12:01:59Z",
+          "labels": {
+            "app": "redis",
+            "pod-migration.gke.io/enabled": "true"
+          }
+        },
+        "spec": {
+          "nodeName": "node-a"
+        },
+        "status": {}
+      },
+      {
+        "metadata": {
+          "name": "redis-0",
+          "namespace": "default",
           "uid": "uid-sts-dst-0",
           "creationTimestamp": "2026-09-28T12:02:00Z",
           "labels": {
@@ -3444,5 +3461,77 @@
         }
       }
     ]
+  },
+  {
+    "Now": "2026-09-28T12:04:50Z",
+    "Reconciler": "PodMigrationJobReconciler",
+    "PrimaryPMJ": {
+      "metadata": {
+        "name": "pmj-primarypod-fallback-50s",
+        "namespace": "default",
+        "uid": "uid-pmj-pp-50",
+        "creationTimestamp": "2026-09-28T12:03:50Z"
+      },
+      "spec": {
+        "podRef": {
+          "name": "solo-app-0"
+        },
+        "targetPodUID": "uid-solo-src-0"
+      },
+      "status": {
+        "phase": "Restoring",
+        "snapshotRef": "ps-solo-0",
+        "evictingStartTime": "2026-09-28T12:03:55Z",
+        "restoringStartTime": "2026-09-28T12:04:00Z",
+        "restoredPodUID": "uid-solo-dst-0",
+        "restoredPodName": "solo-app-dst"
+      }
+    },
+    "PrimaryPod": {
+      "metadata": {
+        "name": "solo-app-dst",
+        "namespace": "default",
+        "uid": "uid-solo-dst-0",
+        "creationTimestamp": "2026-09-28T12:04:00Z",
+        "labels": {
+          "app": "solo",
+          "pod-migration.gke.io/enabled": "true"
+        },
+        "annotations": {
+          "podsnapshot.gke.io/ps-name": "ps-solo-0"
+        }
+      },
+      "spec": {
+        "nodeName": "node-b"
+      },
+      "status": {
+        "phase": "Running"
+      }
+    },
+    "NamespacePMJs": [
+      {
+        "metadata": {
+          "name": "pmj-primarypod-fallback-50s",
+          "namespace": "default",
+          "uid": "uid-pmj-pp-50",
+          "creationTimestamp": "2026-09-28T12:03:50Z"
+        },
+        "spec": {
+          "podRef": {
+            "name": "solo-app-0"
+          },
+          "targetPodUID": "uid-solo-src-0"
+        },
+        "status": {
+          "phase": "Restoring",
+          "snapshotRef": "ps-solo-0",
+          "evictingStartTime": "2026-09-28T12:03:55Z",
+          "restoringStartTime": "2026-09-28T12:04:00Z",
+          "restoredPodUID": "uid-solo-dst-0",
+          "restoredPodName": "solo-app-dst"
+        }
+      }
+    ],
+    "NamespacePods": []
   }
 ]

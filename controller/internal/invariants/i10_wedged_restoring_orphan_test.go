@@ -26,6 +26,18 @@ func TestI10_RestoringReplacementLiveness_RedProof(t *testing.T) {
 	if vs[0].InvariantID != "I10" {
 		t.Fatalf("expected violation InvariantID=I10, got %q", vs[0].InvariantID)
 	}
+
+	// RED coverage for PrimaryPod fallback when NamespacePods is empty and PrimaryPod is nil
+	emptyPodsSnap := snap
+	emptyPodsSnap.NamespacePods = nil
+	emptyPodsSnap.PrimaryPod = nil
+	vsEmpty := rule.Evaluate(&emptyPodsSnap)
+	if len(vsEmpty) == 0 {
+		t.Fatalf("RED proof failed on empty NamespacePods + nil PrimaryPod fallback path: expected >= 1 violation, got 0")
+	}
+	if vsEmpty[0].InvariantID != "I10" {
+		t.Fatalf("expected violation InvariantID=I10 on empty NamespacePods fallback path, got %q", vsEmpty[0].InvariantID)
+	}
 }
 
 func TestI10_RestoringReplacementLiveness_GreenProof(t *testing.T) {
@@ -43,6 +55,7 @@ func TestI10_RestoringReplacementLiveness_GreenProof(t *testing.T) {
 	}
 	rule := RuleI10()
 	exercisedPast30s := 0
+	exercisedPrimaryPodFallback := 0
 	for i := range snaps {
 		if vs := rule.Evaluate(&snaps[i]); len(vs) != 0 {
 			t.Fatalf("GREEN proof failed at step %d (now=%s): unexpected false-positive violation %+v", i, snaps[i].Now.Format("2006-01-02T15:04:05Z07:00"), vs)
@@ -51,10 +64,16 @@ func TestI10_RestoringReplacementLiveness_GreenProof(t *testing.T) {
 			snaps[i].PrimaryPMJ.Status.RestoringStartTime != nil &&
 			snaps[i].Now.Sub(snaps[i].PrimaryPMJ.Status.RestoringStartTime.Time).Seconds() >= 30 {
 			exercisedPast30s++
+			if len(snaps[i].NamespacePods) == 0 && snaps[i].PrimaryPod != nil {
+				exercisedPrimaryPodFallback++
+			}
 		}
 	}
-	if exercisedPast30s < 4 {
-		t.Fatalf("expected GREEN corpus to include >= 4 PhaseRestoring snapshots past the 30s gate, got %d", exercisedPast30s)
+	if exercisedPast30s < 5 {
+		t.Fatalf("expected GREEN corpus to include >= 5 PhaseRestoring snapshots past the 30s gate, got %d", exercisedPast30s)
+	}
+	if exercisedPrimaryPodFallback < 1 {
+		t.Fatalf("expected GREEN corpus to exercise the PrimaryPod fallback (empty NamespacePods) at least once, got %d", exercisedPrimaryPodFallback)
 	}
 }
 
