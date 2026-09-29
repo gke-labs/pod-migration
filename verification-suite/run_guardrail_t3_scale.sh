@@ -32,6 +32,14 @@
 #           - I3 Gate Liveness     : p95(gateHoldS) <= 60s
 #           - I4 Blackout Window   : p95(downtimeS) <= 60s
 #           - I4 Terminal Progress : p95(e2eS)      <= 180s
+#   - T3-S3 : Heterogeneous Node-Shape Drain & I9 Cold-Start Fallback Under Scale
+#       * Exercises cross-pool/cross-shape evacuation and controlled I9
+#         (SucceededWithoutRestore / RestoreFailedColdStart) fallback across
+#         multi-replica stateful pods, asserting 100% Ready convergence within SLO (T).
+#   - T3-S4 : Multi-Wave Sequential Rolling Node Drain Soak & I5 Resource Leak Audit
+#       * Executes back-to-back sequential node drain waves (Wave 1 -> Wave 2) on a
+#         multi-replica stateful deployment, verifying cumulative state survival across
+#         multiple migrations and 0 residual scheduling gates / 0 orphaned triggers (I3, I5).
 #   - Offline CI validation mode (--self-test) exercising scalesim, pmprofiler SLO
 #     enforcement (positive + negative gates), and HTML report generation without a cluster.
 
@@ -52,6 +60,7 @@ SLO_GATE_HOLD_P95="${SLO_GATE_HOLD_P95:-60s}"
 SLO_DOWNTIME_P95="${SLO_DOWNTIME_P95:-60s}"
 SLO_E2E_P95="${SLO_E2E_P95:-180s}"
 REQUIRE_CROSS_SHAPE="${REQUIRE_CROSS_SHAPE:-false}"
+ALLOW_SIMULATED_S3="${ALLOW_SIMULATED_S3:-false}"
 SELF_TEST="false"
 
 usage() {
@@ -59,7 +68,7 @@ usage() {
 Usage: $(basename "$0") [options]
 
 Options:
-  --scenario <T3-S1|T3-S2|scalesim|all>
+  --scenario <T3-S1|T3-S2|T3-S3|T3-S4|scalesim|all>
                                     Scenario(s) to execute (default: all)
   --out-dir <dir>                   Output directory for pmprofiler runs & HTML report
   --namespace <ns>                  Target workload namespace (default: default)
@@ -69,7 +78,9 @@ Options:
   --slo-gate-hold-p95 <dur>         Max p95 scheduling gate hold duration (default: 60s)
   --slo-downtime-p95 <dur>          Max p95 serving blackout duration (default: 60s)
   --slo-e2e-p95 <dur>               Max p95 end-to-end migration duration (default: 180s)
-  --require-cross-shape             Assert src_type != dst_type in T3-S1 (requires multi-shape gVisor pool)
+  --require-cross-shape             Assert src_type != dst_type in T3-S1/T3-S3 (requires multi-shape pool)
+  --allow-simulated-s3              Run T3-S3 on a single-shape pool as an explicit simulated exit-128 fallback
+                                    test (otherwise T3-S3 logs SKIPPED when <2 gVisor shapes exist)
   --self-test                       Run offline end-to-end self-test of scalesim, pmprofiler
                                     SLO gates, and T3 report generation (used in CI)
   -h, --help                        Show this help message
@@ -118,6 +129,10 @@ while [[ $# -gt 0 ]]; do
       REQUIRE_CROSS_SHAPE="true"
       shift
       ;;
+    --allow-simulated-s3)
+      ALLOW_SIMULATED_S3="true"
+      shift
+      ;;
     --self-test|--dry-run)
       SELF_TEST="true"
       shift
@@ -133,6 +148,39 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+PREEXISTING_PODMIGRATIONS_BACKUP="${OUT_DIR}/preexisting-podmigrations.json"
+BACKED_UP_PREEXISTING_PODMIGRATIONS="false"
+RESTORE_FAILED="false"
+
+# Shared JQ filter for backing up pre-existing PodMigrations.
+# Strips cluster-assigned metadata, owner references, managed fields, finalizers,
+# last-applied-configuration annotation, and status block.
+PODMIGRATIONS_BACKUP_JQ_FILTER='{
+  apiVersion: "v1",
+  kind: "List",
+  items: [
+    .items[]?
+    | select(
+        .metadata.name != "t3-s1-policy"
+        and .metadata.name != "t3-s2-policy"
+        and .metadata.name != "t3-s3-policy"
+        and .metadata.name != "t3-s4-policy"
+      )
+    | del(
+        .metadata.uid,
+        .metadata.resourceVersion,
+        .metadata.creationTimestamp,
+        .metadata.generation,
+        .metadata.ownerReferences,
+        .metadata.managedFields,
+        .metadata.finalizers,
+        .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"],
+        .status
+      )
+    | if .metadata.annotations == {} then del(.metadata.annotations) else . end
+  ]
+}'
 
 log() {
   printf "\033[1;36m[%s]\033[0m %s\n" "$(date -u +%H:%M:%S)" "$*"
@@ -158,6 +206,19 @@ build_binaries() {
   (cd "${SCALESIM_SRC}" && go build -o "${SCALESIM_BIN}" .)
 }
 
+cordon_node() {
+  local node="$1"
+  if [[ -z "${node}" ]]; then
+    return 0
+  fi
+  local already_unschedulable
+  already_unschedulable="$(kubectl get node "${node}" -o jsonpath='{.spec.unschedulable}' 2>/dev/null || true)"
+  if [[ "${already_unschedulable}" != "true" ]]; then
+    CORDONED_NODES+=("${node}")
+  fi
+  kubectl cordon "${node}" >/dev/null
+}
+
 uncordon_all_tracked_nodes() {
   if [[ "${SELF_TEST}" == "true" ]]; then
     return 0
@@ -167,7 +228,6 @@ uncordon_all_tracked_nodes() {
       kubectl uncordon "${n}" >/dev/null 2>&1 || true
     fi
   done
-  kubectl uncordon -l sandbox.gke.io/runtime=gvisor >/dev/null 2>&1 || true
   CORDONED_NODES=()
 }
 
@@ -179,18 +239,155 @@ stop_collector() {
   COLLECT_PID=""
 }
 
+delete_t3_policies() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+  kubectl delete podmigrations.podmigration.gke.io \
+    t3-s1-policy t3-s2-policy t3-s3-policy t3-s4-policy \
+    -n "${NAMESPACE}" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
+}
+
+apply_preexisting_podmigrations() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    return 0
+  fi
+
+  local count
+  count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
+  if [[ "${count}" -eq 0 ]]; then
+    return 0
+  fi
+
+  log "Restoring ${count} pre-existing PodMigration(s) from ${PREEXISTING_PODMIGRATIONS_BACKUP} into namespace ${NAMESPACE}"
+  if ! kubectl apply -n "${NAMESPACE}" -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" >/dev/null 2>&1; then
+    log "FAIL: kubectl apply failed for pre-existing PodMigrations from ${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    RESTORE_FAILED="true"
+  fi
+}
+
+verify_restored_podmigrations() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    return 0
+  fi
+
+  local count
+  count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
+  if [[ "${count}" -eq 0 ]]; then
+    rm -f "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    return 0
+  fi
+
+  if [[ "${RESTORE_FAILED}" == "true" ]]; then
+    log "FAIL: Skipping Ready wait because kubectl apply failed for pre-existing PodMigrations; preserving backup file ${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    return 0
+  fi
+
+  local names
+  mapfile -t names < <(jq -r '.items[].metadata.name' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)
+  local restore_err=0
+  for name in "${names[@]}"; do
+    if [[ -n "${name}" ]]; then
+      log "Waiting for restored PodMigration '${name}' in namespace ${NAMESPACE} to reach condition Ready=True..."
+      if ! kubectl wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null 2>&1; then
+        log "FAIL: Restored PodMigration '${name}' in namespace ${NAMESPACE} failed to reach condition Ready=True within 60s"
+        restore_err=1
+      fi
+    fi
+  done
+
+  if [[ "${restore_err}" -eq 0 ]]; then
+    rm -f "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    log "Restored pre-existing PodMigration(s) successfully and verified Ready"
+  else
+    log "FAIL: Pre-existing PodMigration restore incomplete or failed; preserving backup file ${PREEXISTING_PODMIGRATIONS_BACKUP}"
+    RESTORE_FAILED="true"
+  fi
+}
+
 cleanup_on_exit() {
+  local exit_code=$?
+  trap - EXIT INT TERM
+  delete_t3_policies
+  apply_preexisting_podmigrations
   stop_collector
   uncordon_all_tracked_nodes
+  verify_restored_podmigrations
+  if [[ "${RESTORE_FAILED}" == "true" && "${exit_code}" -eq 0 ]]; then
+    exit 1
+  fi
+  if [[ "${exit_code}" -ne 0 ]]; then
+    exit "${exit_code}"
+  fi
 }
 trap cleanup_on_exit EXIT
+trap 'cleanup_on_exit; trap - INT; kill -INT $$' INT
+trap 'cleanup_on_exit; trap - TERM; kill -TERM $$' TERM
+
+backup_preexisting_podmigrations() {
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    return 0
+  fi
+  if [[ "${BACKED_UP_PREEXISTING_PODMIGRATIONS}" == "true" ]]; then
+    return 0
+  fi
+  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    die "Pre-existing backup file found at ${PREEXISTING_PODMIGRATIONS_BACKUP}. A previous run did not complete restore; inspect/apply or remove this file before re-running."
+  fi
+  mkdir -p "${OUT_DIR}"
+  local err_file
+  err_file="$(mktemp)"
+  local raw_json
+  if ! raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>"${err_file}")"; then
+    local err_msg
+    err_msg="$(cat "${err_file}")"
+    rm -f "${err_file}"
+    die "Cannot list PodMigrations in ${NAMESPACE} (kubectl get failed: ${err_msg:-${raw_json}}); refusing to delete them without a backup"
+  fi
+  rm -f "${err_file}"
+  if ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
+    die "Cannot parse PodMigrations list output in ${NAMESPACE} as JSON; refusing to delete them without a backup"
+  fi
+
+  echo "${raw_json}" | jq "${PODMIGRATIONS_BACKUP_JQ_FILTER}" > "${PREEXISTING_PODMIGRATIONS_BACKUP}"
+  BACKED_UP_PREEXISTING_PODMIGRATIONS="true"
+
+  local count
+  count="$(jq '.items | length' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || echo 0)"
+  if [[ "${count}" -gt 0 ]]; then
+    log "Backed up ${count} pre-existing PodMigration(s) in namespace ${NAMESPACE} to ${PREEXISTING_PODMIGRATIONS_BACKUP}"
+  fi
+}
 
 resolve_gcs_bucket() {
   if [[ -n "${GCS_BUCKET}" ]]; then
     return 0
   fi
-  local existing
-  existing="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+  local existing=""
+  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    existing="$(jq -r '.items[0].spec.storage.location // empty' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)"
+  else
+    local err_file
+    err_file="$(mktemp)"
+    local raw_json
+    if ! raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>"${err_file}")"; then
+      local err_msg
+      err_msg="$(cat "${err_file}")"
+      rm -f "${err_file}"
+      die "Cannot inspect PodMigrations in ${NAMESPACE} for GCS bucket resolution (kubectl get failed: ${err_msg:-${raw_json}})"
+    fi
+    rm -f "${err_file}"
+    if ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
+      die "Cannot parse PodMigrations list output in ${NAMESPACE} as JSON for GCS bucket resolution"
+    fi
+    existing="$(jq -r '.items[0].spec.storage.location // empty' <<<"${raw_json}")"
+  fi
   if [[ -n "${existing}" ]]; then
     GCS_BUCKET="${existing}"
   else
@@ -211,8 +408,10 @@ clean_stale_migration_resources() {
 }
 
 clean_t3_workloads() {
+  backup_preexisting_podmigrations
   kubectl delete deployment/t3-s1-counter deployment/t3-counter deployment/t3-redis \
     deployment/t3-postgres deployment/t3-memcached deployment/t3-nginx \
+    deployment/t3-s3-hetero deployment/t3-s4-soak \
     -n "${NAMESPACE}" --ignore-not-found --wait=true --timeout=45s >/dev/null 2>&1 || true
   kubectl delete pods -n "${NAMESPACE}" -l "t3-suite=true" \
     --ignore-not-found --force --grace-period=0 >/dev/null 2>&1 || true
@@ -392,8 +591,7 @@ EOF
   pre_val="$(awk '{print $2}' <<<"${pre_state}")"
   log "T3-S1 pre-migration pod=${target_pod} node=${src_node} (${src_type}) id=${pre_id} counter=${pre_val}"
 
-  CORDONED_NODES+=("${src_node}")
-  kubectl cordon "${src_node}"
+  cordon_node "${src_node}"
   evict_pod "${target_pod}"
 
   local pmj_phase=""
@@ -699,8 +897,7 @@ EOF
   [[ -n "${drain_node}" ]] || die "T3-S2: could not determine gVisor node to drain"
 
   log "T3-S2 cordoning ${drain_node} and selecting multi-workload drain wave from ${total_pods} deployed pods"
-  CORDONED_NODES+=("${drain_node}")
-  kubectl cordon "${drain_node}"
+  cordon_node "${drain_node}"
 
   # Pick up to 2 pods per workload on drain_node (up to 10 concurrent migrations across all 5 apps).
   local evicted_pods=()
@@ -809,10 +1006,371 @@ EOF
 }
 
 # ==============================================================================
+# Scenario T3-S3: Heterogeneous Node-Shape Drain & I9 Cold-Start Fallback Under Scale
+# ==============================================================================
+scenario_t3_s3() {
+  local run_dir="${OUT_DIR}/t3_s3"
+  log "=== Scenario T3-S3: Heterogeneous Node-Shape Drain & I9 Fallback Verification ==="
+
+  local shape_lines shape_list distinct_shapes
+  shape_lines="$(kubectl get nodes -l sandbox.gke.io/runtime=gvisor -o jsonpath='{range .items[*]}{.metadata.labels.node\.kubernetes\.io/instance-type}{"\n"}{end}' 2>/dev/null | sort -u || true)"
+  shape_list="$(grep -v '^$' <<<"${shape_lines}" | paste -sd ',' - || true)"
+  distinct_shapes="$(grep -cv '^$' <<<"${shape_lines}" || true)"
+
+  if [[ "${distinct_shapes}" -le 1 ]]; then
+    if [[ "${REQUIRE_CROSS_SHAPE}" == "true" ]]; then
+      die "T3-S3: --require-cross-shape is set, but cluster only has ${distinct_shapes} distinct gVisor machine shape(s) (${shape_list:-unknown})"
+    fi
+    if [[ "${ALLOW_SIMULATED_S3}" != "true" ]]; then
+      log "SKIPPED [T3-S3]: heterogeneous cross-shape drain requires >=2 distinct gVisor machine shapes (found ${distinct_shapes}: ${shape_list:-unknown}); pass --allow-simulated-s3 to run same-shape simulated exit-128 fallback"
+      return 0
+    fi
+    log "SKIPPED [T3-S3 heterogeneous cross-shape claim]: cluster has ${distinct_shapes} gVisor machine shape (${shape_list:-unknown}); running opt-in --allow-simulated-s3 same-shape exit-128 fallback"
+  fi
+
+  resolve_gcs_bucket
+  clean_t3_workloads
+  clean_stale_migration_resources
+
+  kubectl apply -n "${NAMESPACE}" -f - <<EOF || die "Failed to deploy T3-S3 workload"
+apiVersion: podmigration.gke.io/v1alpha1
+kind: PodMigration
+metadata:
+  name: t3-s3-policy
+  namespace: ${NAMESPACE}
+spec:
+  storage:
+    location: ${GCS_BUCKET}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t3-s3-hetero
+  labels:
+    t3-suite: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: t3-s3-hetero
+  template:
+    metadata:
+      labels:
+        app: t3-s3-hetero
+        t3-suite: "true"
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+      - key: sandbox.gke.io/runtime
+        operator: Equal
+        value: gvisor
+        effect: NoSchedule
+      containers:
+      - name: hetero-app
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "hetero-ready-\$(date +%s)" > /tmp/hetero_state
+          while true; do
+            if [ -f /tmp/simulate_restore_exit_128 ]; then
+              rm -f /tmp/simulate_restore_exit_128
+              exit 128
+            fi
+            sleep 1
+          done
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+EOF
+  kubectl wait --for=condition=Ready podmigration/t3-s3-policy -n "${NAMESPACE}" --timeout=60s
+  kubectl rollout status deployment/t3-s3-hetero -n "${NAMESPACE}" --timeout=120s
+  sleep 3
+
+  if [[ "${distinct_shapes}" -gt 1 ]]; then
+    start_collector "${run_dir}" "T3-S3 heterogeneous node-shape drain (${shape_list}) & I9 fallback"
+  else
+    start_collector "${run_dir}" "T3-S3 (simulated fallback, single-shape ${shape_list:-unknown})"
+  fi
+
+  local target_pod src_node src_type
+  target_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t3-s3-hetero --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
+  src_node="$(kubectl get pod "${target_pod}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}')"
+  src_type="$(kubectl get node "${src_node}" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}')"
+
+  if [[ "${distinct_shapes}" -gt 1 ]]; then
+    log "T3-S3 detected ${distinct_shapes} distinct gVisor machine shapes (${shape_list}); cordoning all '${src_type}' nodes to force cross-shape migration"
+    local same_shape_nodes
+    mapfile -t same_shape_nodes < <(kubectl get nodes -l "sandbox.gke.io/runtime=gvisor,node.kubernetes.io/instance-type=${src_type}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+    for n in "${same_shape_nodes[@]:-}"; do
+      cordon_node "${n}"
+    done
+  else
+    log "T3-S3 (simulated fallback) single gVisor machine shape (${src_type}); cordoning ${src_node} and injecting exit-128 restore fallback"
+    cordon_node "${src_node}"
+  fi
+
+  evict_pod "${target_pod}"
+
+  # Wait for replacement pod to appear; when running under --allow-simulated-s3 on a single-shape pool,
+  # inject exit 128 on first restore so I9 (SucceededWithoutRestore / RestoreFailedColdStart) fallback is exercised.
+  local rpod=""
+  for _ in $(seq 1 60); do
+    rpod="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" \
+      -o jsonpath="{.items[?(@.spec.podRef.name=='${target_pod}')].status.restoredPodName}" 2>/dev/null | awk '{print $NF}')"
+    if [[ -n "${rpod}" ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ -n "${rpod}" && "${distinct_shapes}" -le 1 ]]; then
+    for _ in $(seq 1 30); do
+      local rphase
+      rphase="$(kubectl get pod "${rpod}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      if [[ "${rphase}" == "Running" ]]; then
+        kubectl exec -n "${NAMESPACE}" "${rpod}" -- touch /tmp/simulate_restore_exit_128 >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 1
+    done
+  fi
+
+  local pmj_phase=""
+  for _ in $(seq 1 90); do
+    pmj_phase="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" \
+      -o jsonpath="{.items[?(@.spec.podRef.name=='${target_pod}')].status.phase}" 2>/dev/null | awk '{print $NF}')"
+    if [[ "${pmj_phase}" == "Succeeded" || "${pmj_phase}" == "Failed" || "${pmj_phase}" == "SucceededWithoutRestore" ]]; then
+      break
+    fi
+    sleep 2
+  done
+
+  uncordon_all_tracked_nodes
+  kubectl rollout status deployment/t3-s3-hetero -n "${NAMESPACE}" --timeout=120s
+
+  local dst_node="" dst_type=""
+  if [[ -n "${rpod}" ]]; then
+    dst_node="$(kubectl get pod "${rpod}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+    if [[ -n "${dst_node}" ]]; then
+      dst_type="$(kubectl get node "${dst_node}" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}' 2>/dev/null || true)"
+    fi
+  fi
+
+  local s3_check_name s3_scenario_title
+  if [[ "${distinct_shapes}" -gt 1 ]]; then
+    s3_check_name="T3-S3 heterogeneous cross-shape (${src_type} -> ${dst_type}) & I9 fallback convergence"
+    s3_scenario_title="T3-S3 heterogeneous cross-shape (${src_type} -> ${dst_type}) & I9 fallback"
+  else
+    s3_check_name="T3-S3 (simulated fallback: ${src_type} -> ${dst_type}) & I9 convergence"
+    s3_scenario_title="T3-S3 (simulated fallback: ${src_type} -> ${dst_type})"
+  fi
+  if [[ -f "${run_dir}/meta.json" ]]; then
+    local tmp_meta="${run_dir}/meta.json.tmp"
+    jq --arg s "${s3_scenario_title}" '.scenario = $s' "${run_dir}/meta.json" > "${tmp_meta}" && mv "${tmp_meta}" "${run_dir}/meta.json"
+  fi
+
+  if [[ ( "${REQUIRE_CROSS_SHAPE}" == "true" || "${distinct_shapes}" -gt 1 ) && "${src_type}" == "${dst_type}" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "${s3_check_name}" --group "t3-s3-hetero" --pass=false \
+      --value 0 --total 1 --detail "expected src_type != dst_type, got ${src_node}(${src_type}) -> ${dst_node}(${dst_type})"
+    die "T3-S3: expected cross-shape migration, but source (${src_type}) and destination (${dst_type}) match"
+  fi
+
+  if [[ "${pmj_phase}" == "Succeeded" || "${pmj_phase}" == "SucceededWithoutRestore" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "${s3_check_name}" --group "t3-s3-hetero" --pass \
+      --value 1 --total 1 --detail "phase=${pmj_phase}, src=${src_node}(${src_type}) -> dst=${dst_node}(${dst_type})"
+  else
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "${s3_check_name}" --group "t3-s3-hetero" --pass=false \
+      --value 0 --total 1 --detail "unexpected phase=${pmj_phase}, src=${src_node}(${src_type}) -> dst=${dst_node}(${dst_type})"
+    die "T3-S3 failed with unexpected PMJ phase=${pmj_phase}"
+  fi
+
+  finish_and_assert_slo_run "${run_dir}" "true"
+  clean_t3_workloads
+}
+
+# ==============================================================================
+# Scenario T3-S4: Multi-Wave Sequential Rolling Node Drain Soak & I5 Leak Audit
+# ==============================================================================
+scenario_t3_s4() {
+  local run_dir="${OUT_DIR}/t3_s4"
+  log "=== Scenario T3-S4: Multi-Wave Sequential Rolling Node Drain Soak & I5 Audit ==="
+  resolve_gcs_bucket
+  clean_t3_workloads
+  clean_stale_migration_resources
+
+  kubectl apply -n "${NAMESPACE}" -f - <<EOF || die "Failed to deploy T3-S4 soak workload"
+apiVersion: podmigration.gke.io/v1alpha1
+kind: PodMigration
+metadata:
+  name: t3-s4-policy
+  namespace: ${NAMESPACE}
+spec:
+  storage:
+    location: ${GCS_BUCKET}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t3-s4-soak
+  labels:
+    t3-suite: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: t3-s4-soak
+  template:
+    metadata:
+      labels:
+        app: t3-s4-soak
+        t3-suite: "true"
+        pod-migration.gke.io/enabled: "true"
+    spec:
+      serviceAccountName: pm-test-ksa
+      runtimeClassName: gvisor
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+      - key: sandbox.gke.io/runtime
+        operator: Equal
+        value: gvisor
+        effect: NoSchedule
+      containers:
+      - name: soak-counter
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          STATE="/tmp/soak_state"
+          if [ ! -f "\$STATE" ]; then
+            echo "soak-\$(date +%s)-\$\$ 0" > "\$STATE"
+          fi
+          while true; do
+            read -r id val < "\$STATE"
+            val=\$((val + 1))
+            echo "\$id \$val" > "\$STATE"
+            sleep 1
+          done
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+EOF
+  kubectl wait --for=condition=Ready podmigration/t3-s4-policy -n "${NAMESPACE}" --timeout=60s
+  kubectl rollout status deployment/t3-s4-soak -n "${NAMESPACE}" --timeout=120s
+  sleep 4
+
+  start_collector "${run_dir}" "T3-S4 multi-wave sequential rolling node drain soak"
+
+  # Wave 1: Drain pod_w1 from node_w1 -> pod_w2 on node_w2
+  local pod_w1 node_w1 state_0 id_0 val_0
+  pod_w1="$(kubectl get pods -n "${NAMESPACE}" -l app=t3-s4-soak --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
+  node_w1="$(kubectl get pod "${pod_w1}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}')"
+  state_0="$(kubectl exec -n "${NAMESPACE}" "${pod_w1}" -- cat /tmp/soak_state)"
+  id_0="$(awk '{print $1}' <<<"${state_0}")"
+  val_0="$(awk '{print $2}' <<<"${state_0}")"
+  log "T3-S4 Wave 1: draining ${pod_w1} on ${node_w1} (id=${id_0}, val=${val_0})"
+
+  cordon_node "${node_w1}"
+  evict_pod "${pod_w1}"
+
+  local pmj_w1_phase=""
+  for _ in $(seq 1 90); do
+    pmj_w1_phase="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" \
+      -o jsonpath="{.items[?(@.spec.podRef.name=='${pod_w1}')].status.phase}" 2>/dev/null | awk '{print $NF}')"
+    if [[ "${pmj_w1_phase}" == "Succeeded" || "${pmj_w1_phase}" == "Failed" || "${pmj_w1_phase}" == "SucceededWithoutRestore" ]]; then
+      break
+    fi
+    sleep 2
+  done
+
+  local pod_w2 node_w2 state_1 id_1 val_1
+  pod_w2="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" \
+    -o jsonpath="{.items[?(@.spec.podRef.name=='${pod_w1}')].status.restoredPodName}" 2>/dev/null | awk '{print $NF}')"
+  [[ -n "${pod_w2}" ]] || die "T3-S4 Wave 1: PMJ did not record restoredPodName (phase=${pmj_w1_phase})"
+  kubectl wait --for=condition=Ready "pod/${pod_w2}" -n "${NAMESPACE}" --timeout=120s
+  node_w2="$(kubectl get pod "${pod_w2}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}')"
+  uncordon_all_tracked_nodes
+  sleep 3
+  state_1="$(kubectl exec -n "${NAMESPACE}" "${pod_w2}" -- cat /tmp/soak_state)"
+  id_1="$(awk '{print $1}' <<<"${state_1}")"
+  val_1="$(awk '{print $2}' <<<"${state_1}")"
+
+  # Wave 2: Drain the ALREADY-RESTORED pod_w2 from node_w2 -> pod_w3 on node_w3
+  log "T3-S4 Wave 2: draining restored pod ${pod_w2} on ${node_w2} (id=${id_1}, val=${val_1})"
+  cordon_node "${node_w2}"
+  evict_pod "${pod_w2}"
+
+  local pmj_w2_phase=""
+  for _ in $(seq 1 90); do
+    pmj_w2_phase="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" \
+      -o jsonpath="{.items[?(@.spec.podRef.name=='${pod_w2}')].status.phase}" 2>/dev/null | awk '{print $NF}')"
+    if [[ "${pmj_w2_phase}" == "Succeeded" || "${pmj_w2_phase}" == "Failed" || "${pmj_w2_phase}" == "SucceededWithoutRestore" ]]; then
+      break
+    fi
+    sleep 2
+  done
+
+  local pod_w3 node_w3 state_2 id_2 val_2
+  pod_w3="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" \
+    -o jsonpath="{.items[?(@.spec.podRef.name=='${pod_w2}')].status.restoredPodName}" 2>/dev/null | awk '{print $NF}')"
+  [[ -n "${pod_w3}" ]] || die "T3-S4 Wave 2: PMJ did not record restoredPodName (phase=${pmj_w2_phase})"
+  kubectl wait --for=condition=Ready "pod/${pod_w3}" -n "${NAMESPACE}" --timeout=120s
+  node_w3="$(kubectl get pod "${pod_w3}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}')"
+  uncordon_all_tracked_nodes
+  sleep 2
+  state_2="$(kubectl exec -n "${NAMESPACE}" "${pod_w3}" -- cat /tmp/soak_state)"
+  id_2="$(awk '{print $1}' <<<"${state_2}")"
+  val_2="$(awk '{print $2}' <<<"${state_2}")"
+
+  if [[ "${id_1}" == "${id_0}" && "${id_2}" == "${id_0}" && "${val_2}" -ge "${val_1}" && "${val_1}" -ge "${val_0}" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "T3-S4 multi-wave sequential warm migration state continuity" --group "t3-s4-soak" --pass \
+      --value 2 --total 2 --detail "${node_w1} -> ${node_w2} -> ${node_w3}, id=${id_2}, counter ${val_0}->${val_1}->${val_2}"
+  else
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "T3-S4 multi-wave sequential warm migration state continuity" --group "t3-s4-soak" --pass=false \
+      --value 0 --total 2 --detail "state mismatch across waves: w0='${state_0}' w1='${state_1}' w2='${state_2}'"
+    die "T3-S4 failed multi-wave state continuity: w0='${state_0}' w1='${state_1}' w2='${state_2}'"
+  fi
+
+  # Post-Soak I3 (SchedulingGateLiveness) & I5 (BoundedResourceLeak) Audit
+  local gated_pods active_pmjs
+  gated_pods="$(kubectl get pods -n "${NAMESPACE}" -l app=t3-s4-soak -o json \
+    | jq '[.items[] | select((.spec.schedulingGates // []) | length > 0)] | length')"
+  active_pmjs="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" -o json \
+    | jq '[.items[] | select(.status.phase != "Succeeded" and .status.phase != "Failed" and .status.phase != "SucceededWithoutRestore")] | length')"
+
+  if [[ "${gated_pods}" -eq 0 && "${active_pmjs}" -eq 0 ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "T3-S4 post-soak I3/I5 zero residual gates or active PMJs" --group "t3-s4-soak" --pass \
+      --value 1 --total 1 --detail "gatedPods=${gated_pods}, activePMJs=${active_pmjs}"
+  else
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "T3-S4 post-soak I3/I5 zero residual gates or active PMJs" --group "t3-s4-soak" --pass=false \
+      --value 0 --total 1 --detail "gatedPods=${gated_pods}, activePMJs=${active_pmjs}"
+    die "T3-S4 failed I3/I5 hygiene audit: gatedPods=${gated_pods}, activePMJs=${active_pmjs}"
+  fi
+
+  finish_and_assert_slo_run "${run_dir}" "false"
+  clean_t3_workloads
+}
+
+# ==============================================================================
 # Offline CI Self-Test Mode (--self-test)
 # ==============================================================================
+# shellcheck disable=SC2030,SC2031
 run_self_test() {
-  log "Running offline T3 self-test (scalesim model + synthetic T3-S1/T3-S2 traces + SLO enforcement)"
+  log "Running offline T3 self-test (scalesim model + synthetic T3-S1/T3-S2/T3-S3/T3-S4 traces + SLO enforcement)"
   build_binaries
   run_scalesim_model
 
@@ -874,26 +1432,349 @@ EOF
   "${PMPROFILER_BIN}" analyze --run "${s2_dir}" \
     --assert-zero-invariants --assert-clean-outcomes --enforce-slo
 
-  # 3. Negative test: verify --enforce-slo catches a gateHoldS / downtimeS breach
+  # 3. Synthetic T3-S3 (heterogeneous node-shape drain & I9 cold-start fallback)
+  local s3_dir="${base_dir}/t3_s3"
+  mkdir -p "${s3_dir}"
+  cat > "${s3_dir}/meta.json" <<EOF
+{"scenario":"T3-S3 heterogeneous cross-shape (e2-standard-4 -> n2-standard-4) & I9 fallback","startedAt":"2026-09-28T12:00:00Z"}
+EOF
+  cat > "${s3_dir}/records.ndjson" <<EOF
+{"ts":"2026-09-28T11:59:00Z","type":"list","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s3-hetero-0","uid":"uid-s3-src","creationTimestamp":"2026-09-28T11:59:00Z","labels":{"app":"t3-s3-hetero","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-e2-standard-4"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T11:59:05Z"}]}}}
+{"ts":"2026-09-28T12:00:01Z","type":"add","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-s3-0","uid":"uid-pmj-s3","creationTimestamp":"2026-09-28T12:00:01Z"},"spec":{"podRef":{"name":"t3-s3-hetero-0"},"targetPodUID":"uid-s3-src"},"status":{"phase":"Snapshotting"}}}
+{"ts":"2026-09-28T12:00:06Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s3-hetero-0","uid":"uid-s3-src","creationTimestamp":"2026-09-28T11:59:00Z","deletionTimestamp":"2026-09-28T12:00:06Z","labels":{"app":"t3-s3-hetero","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-e2-standard-4"},"status":{}}}
+{"ts":"2026-09-28T12:00:07Z","type":"add","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s3-hetero-dst","uid":"uid-s3-dst","creationTimestamp":"2026-09-28T12:00:07Z","labels":{"app":"t3-s3-hetero","pod-migration.gke.io/enabled":"true"}},"spec":{"schedulingGates":[{"name":"pod-migration.gke.io/restoring"}]},"status":{}}}
+{"ts":"2026-09-28T12:00:10Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s3-hetero-dst","uid":"uid-s3-dst","creationTimestamp":"2026-09-28T12:00:07Z","labels":{"app":"t3-s3-hetero","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-n2-standard-4"},"status":{"containerStatuses":[{"name":"hetero-app","restartCount":1,"lastState":{"terminated":{"exitCode":128,"reason":"Error","finishedAt":"2026-09-28T12:00:12Z"}}}],"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T12:00:16Z"}]}}}
+{"ts":"2026-09-28T12:00:17Z","type":"update","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-s3-0","uid":"uid-pmj-s3","creationTimestamp":"2026-09-28T12:00:01Z"},"spec":{"podRef":{"name":"t3-s3-hetero-0"},"targetPodUID":"uid-s3-src"},"status":{"phase":"SucceededWithoutRestore","evictingStartTime":"2026-09-28T12:00:06Z","restoredPodName":"t3-s3-hetero-dst","restoredPodUID":"uid-s3-dst","conditions":[{"type":"Restored","status":"False","reason":"RestoreFailedColdStart"}]}}}
+EOF
+  "${PMPROFILER_BIN}" check --run "${s3_dir}" \
+    --name "T3-S3 heterogeneous cross-shape (e2-standard-4 -> n2-standard-4) & I9 fallback convergence" --group "t3-s3-hetero" --pass \
+    --value 1 --total 1 --detail "self-test I9 cold-start fallback verified (e2-standard-4 -> n2-standard-4)"
+  "${PMPROFILER_BIN}" analyze --run "${s3_dir}" \
+    --assert-zero-invariants --assert-clean-outcomes --allow-cold-start --enforce-slo
+
+  # 4. Synthetic T3-S4 (multi-wave sequential rolling node drain soak & I3/I5 audit)
+  local s4_dir="${base_dir}/t3_s4"
+  mkdir -p "${s4_dir}"
+  cat > "${s4_dir}/meta.json" <<EOF
+{"scenario":"T3-S4 multi-wave sequential rolling node drain soak","startedAt":"2026-09-28T12:00:00Z"}
+EOF
+  cat > "${s4_dir}/records.ndjson" <<EOF
+{"ts":"2026-09-28T11:59:00Z","type":"list","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s4-soak-0","uid":"uid-s4-w1","creationTimestamp":"2026-09-28T11:59:00Z","labels":{"app":"t3-s4-soak","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-gvisor-a"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T11:59:05Z"}]}}}
+{"ts":"2026-09-28T12:00:01Z","type":"add","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-s4-w1","uid":"uid-pmj-s4-w1","creationTimestamp":"2026-09-28T12:00:01Z"},"spec":{"podRef":{"name":"t3-s4-soak-0"},"targetPodUID":"uid-s4-w1"},"status":{"phase":"Snapshotting"}}}
+{"ts":"2026-09-28T12:00:05Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s4-soak-0","uid":"uid-s4-w1","creationTimestamp":"2026-09-28T11:59:00Z","deletionTimestamp":"2026-09-28T12:00:05Z","labels":{"app":"t3-s4-soak","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-gvisor-a"},"status":{}}}
+{"ts":"2026-09-28T12:00:06Z","type":"add","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s4-soak-1","uid":"uid-s4-w2","creationTimestamp":"2026-09-28T12:00:06Z","labels":{"app":"t3-s4-soak","pod-migration.gke.io/enabled":"true"}},"spec":{"schedulingGates":[{"name":"pod-migration.gke.io/restoring"}]},"status":{}}}
+{"ts":"2026-09-28T12:00:09Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s4-soak-1","uid":"uid-s4-w2","creationTimestamp":"2026-09-28T12:00:06Z","labels":{"app":"t3-s4-soak","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-gvisor-b"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T12:00:14Z"}]}}}
+{"ts":"2026-09-28T12:00:15Z","type":"update","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-s4-w1","uid":"uid-pmj-s4-w1","creationTimestamp":"2026-09-28T12:00:01Z"},"spec":{"podRef":{"name":"t3-s4-soak-0"},"targetPodUID":"uid-s4-w1"},"status":{"phase":"Succeeded","evictingStartTime":"2026-09-28T12:00:05Z","restoredPodName":"t3-s4-soak-1","restoredPodUID":"uid-s4-w2","conditions":[{"type":"Restored","status":"True","reason":"RestoreVerified"}]}}}
+{"ts":"2026-09-28T12:01:01Z","type":"add","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-s4-w2","uid":"uid-pmj-s4-w2","creationTimestamp":"2026-09-28T12:01:01Z"},"spec":{"podRef":{"name":"t3-s4-soak-1"},"targetPodUID":"uid-s4-w2"},"status":{"phase":"Snapshotting"}}}
+{"ts":"2026-09-28T12:01:05Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s4-soak-1","uid":"uid-s4-w2","creationTimestamp":"2026-09-28T12:00:06Z","deletionTimestamp":"2026-09-28T12:01:05Z","labels":{"app":"t3-s4-soak","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-gvisor-b"},"status":{}}}
+{"ts":"2026-09-28T12:01:06Z","type":"add","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s4-soak-2","uid":"uid-s4-w3","creationTimestamp":"2026-09-28T12:01:06Z","labels":{"app":"t3-s4-soak","pod-migration.gke.io/enabled":"true"}},"spec":{"schedulingGates":[{"name":"pod-migration.gke.io/restoring"}]},"status":{}}}
+{"ts":"2026-09-28T12:01:09Z","type":"update","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s4-soak-2","uid":"uid-s4-w3","creationTimestamp":"2026-09-28T12:01:06Z","labels":{"app":"t3-s4-soak","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-gvisor-a"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T12:01:14Z"}]}}}
+{"ts":"2026-09-28T12:01:15Z","type":"update","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-s4-w2","uid":"uid-pmj-s4-w2","creationTimestamp":"2026-09-28T12:01:01Z"},"spec":{"podRef":{"name":"t3-s4-soak-1"},"targetPodUID":"uid-s4-w2"},"status":{"phase":"Succeeded","evictingStartTime":"2026-09-28T12:01:05Z","restoredPodName":"t3-s4-soak-2","restoredPodUID":"uid-s4-w3","conditions":[{"type":"Restored","status":"True","reason":"RestoreVerified"}]}}}
+EOF
+  "${PMPROFILER_BIN}" check --run "${s4_dir}" \
+    --name "T3-S4 multi-wave sequential warm migration state continuity" --group "t3-s4-soak" --pass \
+    --value 2 --total 2 --detail "node-gvisor-a -> node-gvisor-b -> node-gvisor-a verified"
+  "${PMPROFILER_BIN}" check --run "${s4_dir}" \
+    --name "T3-S4 post-soak I3/I5 zero residual gates or active PMJs" --group "t3-s4-soak" --pass \
+    --value 1 --total 1 --detail "gatedPods=0, activePMJs=0"
+  "${PMPROFILER_BIN}" analyze --run "${s4_dir}" \
+    --assert-zero-invariants --assert-clean-outcomes --enforce-slo
+
+  # 5. Negative test: verify --enforce-slo catches a gateHoldS / downtimeS breach
   if "${PMPROFILER_BIN}" analyze --run "${s2_dir}" --enforce-slo --slo-gate-hold-p95 1s >/dev/null 2>&1; then
     die "Self-test failure: --enforce-slo with --slo-gate-hold-p95=1s did NOT fail on 4s gateHoldS"
   fi
   log "Verified negative gate: pmprofiler analyze --enforce-slo rejects SLO breach"
 
-  # 4. Generate combined T3 HTML report
+  # 6. Generate combined T3 HTML report
   local report_html="${OUT_DIR}/guardrail-t3-report.html"
   "${PMPROFILER_BIN}" report \
     --out "${report_html}" \
     --title "T3 Scale, Cross-Node Drain & Latency SLO (T) Benchmark Report" \
-    "${s1_dir}/run.json" "${s2_dir}/run.json"
+    "${s1_dir}/run.json" "${s2_dir}/run.json" "${s3_dir}/run.json" "${s4_dir}/run.json"
   [[ -s "${report_html}" ]] || die "Expected non-empty HTML report at ${report_html}"
+
+  # 7. Offline verification of PodMigration backup filter and restoration transform
+  local test_backup_in="${base_dir}/test-podmigrations-raw.json"
+  local test_backup_out="${base_dir}/test-podmigrations-filtered.json"
+  cat > "${test_backup_in}" <<EOF
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "diskless-migration",
+        "namespace": "${NAMESPACE}",
+        "uid": "1111-2222",
+        "resourceVersion": "12345",
+        "creationTimestamp": "2026-09-28T00:00:00Z",
+        "generation": 1,
+        "finalizers": ["podmigration.gke.io/storage-cleanup"],
+        "managedFields": [{"manager": "kubectl"}],
+        "annotations": {
+          "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\"}",
+          "custom.io/policy": "preserve-me"
+        }
+      },
+      "spec": {"storage": {"location": "gs://bucket/test"}},
+      "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+    },
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "t3-s1-policy",
+        "namespace": "${NAMESPACE}",
+        "uid": "3333-4444"
+      },
+      "spec": {"storage": {"location": "gs://bucket/t3-s1"}}
+    },
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "t3-s2-policy",
+        "namespace": "${NAMESPACE}",
+        "uid": "5555-6666"
+      },
+      "spec": {"storage": {"location": "gs://bucket/t3-s2"}}
+    },
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "t3-s3-policy",
+        "namespace": "${NAMESPACE}",
+        "uid": "5555-7777"
+      },
+      "spec": {"storage": {"location": "gs://bucket/t3-s3"}}
+    },
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "t3-s4-policy",
+        "namespace": "${NAMESPACE}",
+        "uid": "5555-8888"
+      },
+      "spec": {"storage": {"location": "gs://bucket/t3-s4"}}
+    },
+    {
+      "apiVersion": "podmigration.gke.io/v1alpha1",
+      "kind": "PodMigration",
+      "metadata": {
+        "name": "custom-policy",
+        "namespace": "${NAMESPACE}",
+        "uid": "7777-8888",
+        "resourceVersion": "67890",
+        "ownerReferences": [{"apiVersion": "v1", "kind": "Foo", "name": "bar"}]
+      },
+      "spec": {"storage": {"location": "gs://bucket/custom"}}
+    }
+  ]
+}
+EOF
+  jq "${PODMIGRATIONS_BACKUP_JQ_FILTER}" "${test_backup_in}" > "${test_backup_out}"
+
+  local preserved_count
+  preserved_count="$(jq '.items | length' "${test_backup_out}")"
+  [[ "${preserved_count}" -eq 2 ]] || die "Self-test failure: expected 2 preserved PodMigrations, got ${preserved_count}"
+
+  local has_t3_s1 has_t3_s2 has_t3_s3 has_t3_s4 has_uid has_status has_last_applied has_custom_ann
+  has_t3_s1="$(jq '[.items[].metadata.name] | index("t3-s1-policy")' "${test_backup_out}")"
+  has_t3_s2="$(jq '[.items[].metadata.name] | index("t3-s2-policy")' "${test_backup_out}")"
+  has_t3_s3="$(jq '[.items[].metadata.name] | index("t3-s3-policy")' "${test_backup_out}")"
+  has_t3_s4="$(jq '[.items[].metadata.name] | index("t3-s4-policy")' "${test_backup_out}")"
+  [[ "${has_t3_s1}" == "null" ]] || die "Self-test failure: t3-s1-policy was not filtered from backup"
+  [[ "${has_t3_s2}" == "null" ]] || die "Self-test failure: t3-s2-policy was not filtered from backup"
+  [[ "${has_t3_s3}" == "null" ]] || die "Self-test failure: t3-s3-policy was not filtered from backup"
+  [[ "${has_t3_s4}" == "null" ]] || die "Self-test failure: t3-s4-policy was not filtered from backup"
+
+  has_uid="$(jq '[.items[].metadata.uid // empty] | length' "${test_backup_out}")"
+  has_status="$(jq '[.items[].status // empty] | length' "${test_backup_out}")"
+  [[ "${has_uid}" -eq 0 ]] || die "Self-test failure: metadata.uid was not stripped from backup"
+  [[ "${has_status}" -eq 0 ]] || die "Self-test failure: status was not stripped from backup"
+
+  has_last_applied="$(jq '[.items[].metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"] // empty] | length' "${test_backup_out}")"
+  [[ "${has_last_applied}" -eq 0 ]] || die "Self-test failure: kubectl.kubernetes.io/last-applied-configuration was not stripped from backup"
+
+  has_custom_ann="$(jq -r '.items[] | select(.metadata.name == "diskless-migration") | .metadata.annotations["custom.io/policy"] // empty' "${test_backup_out}")"
+  [[ "${has_custom_ann}" == "preserve-me" ]] || die "Self-test failure: custom annotation was not preserved in backup"
+
+  # 8. Verify stale backup file collision guard fails closed offline
+  local test_stale_dir="${base_dir}/test-stale-backup"
+  mkdir -p "${test_stale_dir}"
+  local test_stale_file="${test_stale_dir}/preexisting-podmigrations.json"
+  echo '{}' > "${test_stale_file}"
+  if (
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stale_file}"
+    BACKED_UP_PREEXISTING_PODMIGRATIONS="false"
+    SELF_TEST="false"
+    backup_preexisting_podmigrations >/dev/null 2>&1
+  ); then
+    die "Self-test failure: backup_preexisting_podmigrations did not fail when stale backup file exists"
+  fi
+  log "PASS [self-test]: stale backup file collision guard verified"
+
+  # 7. Verify backup_preexisting_podmigrations fails closed when kubectl get fails
+  local test_get_fail_dir="${base_dir}/test-get-fail"
+  mkdir -p "${test_get_fail_dir}"
+  local test_get_fail_backup="${test_get_fail_dir}/preexisting-podmigrations.json"
+  if (
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_get_fail_backup}"
+    BACKED_UP_PREEXISTING_PODMIGRATIONS="false"
+    SELF_TEST="false"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        return 1
+      fi
+      command kubectl "$@"
+    }
+    backup_preexisting_podmigrations >/dev/null 2>&1
+  ); then
+    die "Self-test failure: backup_preexisting_podmigrations did not fail when kubectl get fails"
+  fi
+  if [[ -f "${test_get_fail_backup}" ]]; then
+    die "Self-test failure: backup file was created despite kubectl get failure"
+  fi
+  log "PASS [self-test]: backup fails closed when kubectl get fails"
+
+  # 8. Verify resolve_gcs_bucket fails closed when kubectl get fails and no backup exists
+  if (
+    GCS_BUCKET=""
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_get_fail_backup}"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        return 1
+      fi
+      command kubectl "$@"
+    }
+    resolve_gcs_bucket >/dev/null 2>&1
+  ); then
+    die "Self-test failure: resolve_gcs_bucket did not fail when kubectl get fails"
+  fi
+  log "PASS [self-test]: resolve_gcs_bucket fails closed when kubectl get fails"
+
+  # 9. Verify backup_preexisting_podmigrations succeeds when kubectl get emits stderr noise alongside valid JSON
+  local test_stderr_noise_dir="${base_dir}/test-stderr-noise"
+  mkdir -p "${test_stderr_noise_dir}"
+  local test_stderr_noise_backup="${test_stderr_noise_dir}/preexisting-podmigrations.json"
+  (
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_backup}"
+    BACKED_UP_PREEXISTING_PODMIGRATIONS="false"
+    SELF_TEST="false"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        echo "Warning: v1alpha1 podmigration.gke.io is deprecated" >&2
+        echo '{"apiVersion":"v1","kind":"List","items":[]}'
+        return 0
+      fi
+      command kubectl "$@"
+    }
+    backup_preexisting_podmigrations >/dev/null 2>&1
+  ) || die "Self-test failure: backup_preexisting_podmigrations failed when kubectl emitted stderr noise"
+  if [[ ! -f "${test_stderr_noise_backup}" ]]; then
+    die "Self-test failure: backup file was not created when kubectl emitted stderr noise"
+  fi
+  log "PASS [self-test]: backup succeeds when kubectl emits stderr noise"
+
+  # 10. Verify resolve_gcs_bucket returns default bucket on empty List, even with stderr noise
+  local resolved_default_bucket
+  resolved_default_bucket="$(
+    GCS_BUCKET=""
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_dir}/nonexistent.json"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        echo "Warning: v1alpha1 podmigration.gke.io is deprecated" >&2
+        echo '{"apiVersion":"v1","kind":"List","items":[]}'
+        return 0
+      fi
+      command kubectl "$@"
+    }
+    resolve_gcs_bucket >/dev/null 2>&1
+    echo "${GCS_BUCKET}"
+  )" || die "Self-test failure: resolve_gcs_bucket failed on empty List with stderr noise"
+
+  if [[ "${resolved_default_bucket}" != "gs://yaoluo-gke-dev-podsnapshots/snapshots" ]]; then
+    die "Self-test failure: expected default GCS bucket for empty List, got '${resolved_default_bucket}'"
+  fi
+  log "PASS [self-test]: resolve_gcs_bucket defaults correctly on empty List with stderr noise"
+
+  # 11. Verify resolve_gcs_bucket extracts existing location when PodMigration exists with stderr noise
+  local resolved_custom_bucket
+  resolved_custom_bucket="$(
+    GCS_BUCKET=""
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_dir}/nonexistent.json"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        echo "Warning: admission webhook warning" >&2
+        echo '{"apiVersion":"v1","kind":"List","items":[{"spec":{"storage":{"location":"gs://custom-bucket/snaps"}}}]}'
+        return 0
+      fi
+      command kubectl "$@"
+    }
+    resolve_gcs_bucket >/dev/null 2>&1
+    echo "${GCS_BUCKET}"
+  )" || die "Self-test failure: resolve_gcs_bucket failed on existing policy with stderr noise"
+
+  if [[ "${resolved_custom_bucket}" != "gs://custom-bucket/snaps" ]]; then
+    die "Self-test failure: expected 'gs://custom-bucket/snaps', got '${resolved_custom_bucket}'"
+  fi
+  log "PASS [self-test]: resolve_gcs_bucket extracts custom bucket with stderr noise"
+
+  # 12. Verify scenario_t3_s3 logs SKIPPED on a single-shape pool by default (without --allow-simulated-s3)
+  # and fails closed when --require-cross-shape is set
+  local s3_skip_out
+  s3_skip_out="$(
+    OUT_DIR="${base_dir}/test-s3-skip"
+    REQUIRE_CROSS_SHAPE="false"
+    ALLOW_SIMULATED_S3="false"
+    kubectl() {
+      if [[ "$*" == *"get nodes -l sandbox.gke.io/runtime=gvisor"* ]]; then
+        printf "n2-standard-4\nn2-standard-4\n"
+        return 0
+      fi
+      return 1
+    }
+    scenario_t3_s3 2>&1
+  )" || die "Self-test failure: scenario_t3_s3 failed instead of skipping on a single-shape pool"
+  grep -q 'SKIPPED \[T3-S3\]' <<<"${s3_skip_out}" || die "Self-test failure: expected SKIPPED [T3-S3] log on single-shape pool, got: ${s3_skip_out}"
+  if [[ -d "${base_dir}/test-s3-skip/t3_s3" ]]; then
+    die "Self-test failure: expected scenario_t3_s3 not to emit a t3_s3 run directory when skipped"
+  fi
+  if (
+    OUT_DIR="${base_dir}/test-s3-require-fail"
+    REQUIRE_CROSS_SHAPE="true"
+    ALLOW_SIMULATED_S3="false"
+    kubectl() {
+      if [[ "$*" == *"get nodes -l sandbox.gke.io/runtime=gvisor"* ]]; then
+        printf "n2-standard-4\n"
+        return 0
+      fi
+      return 1
+    }
+    scenario_t3_s3 >/dev/null 2>&1
+  ); then
+    die "Self-test failure: expected scenario_t3_s3 to fail closed on single-shape pool when --require-cross-shape is set"
+  fi
+  log "PASS [self-test]: scenario_t3_s3 single-shape SKIPPED and --require-cross-shape fail-closed verified"
+
+  log "PASS [self-test]: PodMigration backup filter & restore transform verified"
   log "Self-test PASSED: HTML report generated at ${report_html}"
 }
 
+# shellcheck disable=SC2030,SC2031
 main() {
   if [[ "${SELF_TEST}" == "true" ]]; then
     run_self_test
     exit 0
+  fi
+
+  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+    die "Pre-existing backup file found at ${PREEXISTING_PODMIGRATIONS_BACKUP}. A previous run did not complete restore; inspect/apply or remove this file before re-running."
   fi
 
   build_binaries
@@ -908,10 +1789,18 @@ main() {
     T3-S2|s2)
       scenario_t3_s2
       ;;
+    T3-S3|s3)
+      scenario_t3_s3
+      ;;
+    T3-S4|s4)
+      scenario_t3_s4
+      ;;
     all)
       run_scalesim_model
       scenario_t3_s1
       scenario_t3_s2
+      scenario_t3_s3
+      scenario_t3_s4
       ;;
     *)
       die "Unknown scenario: ${SCENARIO}"
