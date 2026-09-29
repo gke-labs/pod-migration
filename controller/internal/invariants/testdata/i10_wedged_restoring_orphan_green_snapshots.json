@@ -3071,5 +3071,378 @@
         "status": {}
       }
     ]
+  },
+  {
+    "Now": "2026-09-28T12:00:43Z",
+    "Reconciler": "PodMigrationJobReconciler",
+    "PrimaryPMJ": {
+      "metadata": {
+        "name": "pmj-restoring-35s",
+        "namespace": "default",
+        "uid": "uid-pmj-r35",
+        "creationTimestamp": "2026-09-28T12:00:01Z"
+      },
+      "spec": {
+        "podRef": {
+          "name": "app-1"
+        },
+        "targetPodUID": "uid-src-1"
+      },
+      "status": {
+        "phase": "Restoring",
+        "snapshotRef": "ps-clean-1",
+        "evictingStartTime": "2026-09-28T12:00:06Z",
+        "restoringStartTime": "2026-09-28T12:00:08Z",
+        "restoredPodUID": "uid-dst-1",
+        "restoredPodName": "app-1-dst"
+      }
+    },
+    "PrimaryPod": null,
+    "NamespacePMJs": [
+      {
+        "metadata": {
+          "name": "pmj-restoring-35s",
+          "namespace": "default",
+          "uid": "uid-pmj-r35",
+          "creationTimestamp": "2026-09-28T12:00:01Z"
+        },
+        "spec": {
+          "podRef": {
+            "name": "app-1"
+          },
+          "targetPodUID": "uid-src-1"
+        },
+        "status": {
+          "phase": "Restoring",
+          "snapshotRef": "ps-clean-1",
+          "evictingStartTime": "2026-09-28T12:00:06Z",
+          "restoringStartTime": "2026-09-28T12:00:08Z",
+          "restoredPodUID": "uid-dst-1",
+          "restoredPodName": "app-1-dst"
+        }
+      }
+    ],
+    "NamespacePods": [
+      {
+        "metadata": {
+          "name": "app-1-dst",
+          "namespace": "default",
+          "uid": "uid-dst-1",
+          "creationTimestamp": "2026-09-28T12:00:08Z",
+          "labels": {
+            "app": "counter",
+            "pod-migration.gke.io/enabled": "true"
+          },
+          "annotations": {
+            "podsnapshot.gke.io/ps-name": "ps-clean-1"
+          }
+        },
+        "spec": {
+          "nodeName": "node-b"
+        },
+        "status": {
+          "phase": "Pending"
+        }
+      }
+    ]
+  },
+  {
+    "Now": "2026-09-28T12:01:08Z",
+    "Reconciler": "PodMigrationJobReconciler",
+    "PrimaryPMJ": {
+      "metadata": {
+        "name": "pmj-restoring-60s",
+        "namespace": "default",
+        "uid": "uid-pmj-r60",
+        "creationTimestamp": "2026-09-28T12:00:01Z"
+      },
+      "spec": {
+        "podRef": {
+          "name": "app-1"
+        },
+        "targetPodUID": "uid-src-1"
+      },
+      "status": {
+        "phase": "Restoring",
+        "snapshotRef": "ps-clean-1",
+        "evictingStartTime": "2026-09-28T12:00:06Z",
+        "restoringStartTime": "2026-09-28T12:00:08Z",
+        "restoredPodUID": "uid-dst-1",
+        "restoredPodName": "app-1-dst"
+      }
+    },
+    "PrimaryPod": {
+      "metadata": {
+        "name": "app-1-dst",
+        "namespace": "default",
+        "uid": "uid-dst-1",
+        "creationTimestamp": "2026-09-28T12:00:08Z",
+        "labels": {
+          "app": "counter",
+          "pod-migration.gke.io/enabled": "true"
+        },
+        "annotations": {
+          "podsnapshot.gke.io/ps-name": "ps-clean-1"
+        }
+      },
+      "spec": {
+        "nodeName": "node-b"
+      },
+      "status": {
+        "phase": "Running"
+      }
+    },
+    "NamespacePMJs": [
+      {
+        "metadata": {
+          "name": "pmj-restoring-60s",
+          "namespace": "default",
+          "uid": "uid-pmj-r60",
+          "creationTimestamp": "2026-09-28T12:00:01Z"
+        },
+        "spec": {
+          "podRef": {
+            "name": "app-1"
+          },
+          "targetPodUID": "uid-src-1"
+        },
+        "status": {
+          "phase": "Restoring",
+          "snapshotRef": "ps-clean-1",
+          "evictingStartTime": "2026-09-28T12:00:06Z",
+          "restoringStartTime": "2026-09-28T12:00:08Z",
+          "restoredPodUID": "uid-dst-1",
+          "restoredPodName": "app-1-dst"
+        }
+      }
+    ],
+    "NamespacePods": [
+      {
+        "metadata": {
+          "name": "app-1-dst",
+          "namespace": "default",
+          "uid": "uid-dst-1",
+          "creationTimestamp": "2026-09-28T12:00:08Z",
+          "labels": {
+            "app": "counter",
+            "pod-migration.gke.io/enabled": "true"
+          },
+          "annotations": {
+            "podsnapshot.gke.io/ps-name": "ps-clean-1"
+          }
+        },
+        "spec": {
+          "nodeName": "node-b"
+        },
+        "status": {
+          "phase": "Running"
+        }
+      }
+    ]
+  },
+  {
+    "Now": "2026-09-28T12:02:45Z",
+    "Reconciler": "PodMigrationJobReconciler",
+    "PrimaryPMJ": {
+      "metadata": {
+        "name": "pmj-sts-restoring-45s",
+        "namespace": "default",
+        "uid": "uid-pmj-sts-45",
+        "creationTimestamp": "2026-09-28T12:01:50Z"
+      },
+      "spec": {
+        "podRef": {
+          "name": "redis-0"
+        },
+        "targetPodUID": "uid-sts-src-0"
+      },
+      "status": {
+        "phase": "Restoring",
+        "snapshotRef": "ps-sts-0",
+        "evictingStartTime": "2026-09-28T12:01:55Z",
+        "restoringStartTime": "2026-09-28T12:02:00Z",
+        "restoredPodUID": "uid-sts-dst-0",
+        "restoredPodName": "redis-0"
+      }
+    },
+    "PrimaryPod": {
+      "metadata": {
+        "name": "redis-0",
+        "namespace": "default",
+        "uid": "uid-sts-dst-0",
+        "creationTimestamp": "2026-09-28T12:02:00Z",
+        "labels": {
+          "app": "redis",
+          "pod-migration.gke.io/enabled": "true"
+        },
+        "annotations": {
+          "podsnapshot.gke.io/ps-name": "ps-sts-0"
+        }
+      },
+      "spec": {
+        "nodeName": "node-b"
+      },
+      "status": {
+        "phase": "Running"
+      }
+    },
+    "NamespacePMJs": [
+      {
+        "metadata": {
+          "name": "pmj-sts-restoring-45s",
+          "namespace": "default",
+          "uid": "uid-pmj-sts-45",
+          "creationTimestamp": "2026-09-28T12:01:50Z"
+        },
+        "spec": {
+          "podRef": {
+            "name": "redis-0"
+          },
+          "targetPodUID": "uid-sts-src-0"
+        },
+        "status": {
+          "phase": "Restoring",
+          "snapshotRef": "ps-sts-0",
+          "evictingStartTime": "2026-09-28T12:01:55Z",
+          "restoringStartTime": "2026-09-28T12:02:00Z",
+          "restoredPodUID": "uid-sts-dst-0",
+          "restoredPodName": "redis-0"
+        }
+      }
+    ],
+    "NamespacePods": [
+      {
+        "metadata": {
+          "name": "redis-0",
+          "namespace": "default",
+          "uid": "uid-sts-dst-0",
+          "creationTimestamp": "2026-09-28T12:02:00Z",
+          "labels": {
+            "app": "redis",
+            "pod-migration.gke.io/enabled": "true"
+          },
+          "annotations": {
+            "podsnapshot.gke.io/ps-name": "ps-sts-0"
+          }
+        },
+        "spec": {
+          "nodeName": "node-b"
+        },
+        "status": {
+          "phase": "Running"
+        }
+      }
+    ]
+  },
+  {
+    "Now": "2026-09-28T12:03:30Z",
+    "Reconciler": "PodMigrationJobReconciler",
+    "PrimaryPMJ": {
+      "metadata": {
+        "name": "pmj-sts-restoring-90s",
+        "namespace": "default",
+        "uid": "uid-pmj-sts-90",
+        "creationTimestamp": "2026-09-28T12:01:50Z"
+      },
+      "spec": {
+        "podRef": {
+          "name": "redis-0"
+        },
+        "targetPodUID": "uid-sts-src-0"
+      },
+      "status": {
+        "phase": "Restoring",
+        "snapshotRef": "ps-sts-0",
+        "evictingStartTime": "2026-09-28T12:01:55Z",
+        "restoringStartTime": "2026-09-28T12:02:00Z",
+        "restoredPodUID": "uid-sts-dst-0",
+        "restoredPodName": "redis-0"
+      }
+    },
+    "PrimaryPod": {
+      "metadata": {
+        "name": "redis-0",
+        "namespace": "default",
+        "uid": "uid-sts-dst-0",
+        "creationTimestamp": "2026-09-28T12:02:02Z",
+        "labels": {
+          "app": "redis",
+          "pod-migration.gke.io/enabled": "true"
+        },
+        "annotations": {
+          "podsnapshot.gke.io/ps-name": "ps-sts-0"
+        }
+      },
+      "spec": {
+        "nodeName": "node-b"
+      },
+      "status": {
+        "phase": "Running"
+      }
+    },
+    "NamespacePMJs": [
+      {
+        "metadata": {
+          "name": "pmj-sts-restoring-90s",
+          "namespace": "default",
+          "uid": "uid-pmj-sts-90",
+          "creationTimestamp": "2026-09-28T12:01:50Z"
+        },
+        "spec": {
+          "podRef": {
+            "name": "redis-0"
+          },
+          "targetPodUID": "uid-sts-src-0"
+        },
+        "status": {
+          "phase": "Restoring",
+          "snapshotRef": "ps-sts-0",
+          "evictingStartTime": "2026-09-28T12:01:55Z",
+          "restoringStartTime": "2026-09-28T12:02:00Z",
+          "restoredPodUID": "uid-sts-dst-0",
+          "restoredPodName": "redis-0"
+        }
+      }
+    ],
+    "NamespacePods": [
+      {
+        "metadata": {
+          "name": "redis-0",
+          "namespace": "default",
+          "uid": "uid-sts-src-0",
+          "creationTimestamp": "2026-09-28T11:59:00Z",
+          "deletionTimestamp": "2026-09-28T12:01:59Z",
+          "labels": {
+            "app": "redis",
+            "pod-migration.gke.io/enabled": "true"
+          }
+        },
+        "spec": {
+          "nodeName": "node-a"
+        },
+        "status": {}
+      },
+      {
+        "metadata": {
+          "name": "redis-0",
+          "namespace": "default",
+          "uid": "uid-sts-dst-0",
+          "creationTimestamp": "2026-09-28T12:02:02Z",
+          "labels": {
+            "app": "redis",
+            "pod-migration.gke.io/enabled": "true"
+          },
+          "annotations": {
+            "podsnapshot.gke.io/ps-name": "ps-sts-0"
+          }
+        },
+        "spec": {
+          "nodeName": "node-b"
+        },
+        "status": {
+          "phase": "Running"
+        }
+      }
+    ]
   }
 ]

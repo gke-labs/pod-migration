@@ -42,9 +42,19 @@ func TestI10_RestoringReplacementLiveness_GreenProof(t *testing.T) {
 		t.Fatalf("expected non-empty GREEN snapshot corpus in %s", greenPath)
 	}
 	rule := RuleI10()
+	exercisedPast30s := 0
 	for i := range snaps {
 		if vs := rule.Evaluate(&snaps[i]); len(vs) != 0 {
 			t.Fatalf("GREEN proof failed at step %d (now=%s): unexpected false-positive violation %+v", i, snaps[i].Now.Format("2006-01-02T15:04:05Z07:00"), vs)
 		}
+		if snaps[i].PrimaryPMJ != nil &&
+			snaps[i].PrimaryPMJ.Status.RestoringStartTime != nil &&
+			snaps[i].Now.Sub(snaps[i].PrimaryPMJ.Status.RestoringStartTime.Time).Seconds() >= 30 {
+			exercisedPast30s++
+		}
+	}
+	if exercisedPast30s < 4 {
+		t.Fatalf("expected GREEN corpus to include >= 4 PhaseRestoring snapshots past the 30s gate, got %d", exercisedPast30s)
 	}
 }
+

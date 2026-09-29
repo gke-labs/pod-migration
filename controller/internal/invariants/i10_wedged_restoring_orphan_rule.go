@@ -37,8 +37,10 @@ func EvaluateI10_RestoringReplacementLiveness(s *ReconcileSnapshot) []Violation 
 	// RestoringReplacementLiveness: when a PMJ has remained in PhaseRestoring
 	// for >=30s with a bound RestoredPodName, that replacement pod must still
 	// exist and be non-deleting in the namespace (including single-pod namespaces
-	// where NamespacePods is empty after source eviction; see Issue #88 for
-	// adding PodListFailed to ReconcileSnapshot).
+	// where NamespacePods is empty after source eviction; see Issue #88 / PR #90
+	// for PodListFailed). Because point-in-time absence evaluation is single-sample,
+	// I10 is intended for --invariant-mode=observe until multi-reconcile debounce
+	// persistence is added to Engine for absence-style rules.
 	if (s.Reconciler == "" || s.Reconciler == "PodMigrationJobReconciler") &&
 		pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
 		pmj.Status.RestoredPodName != "" &&
