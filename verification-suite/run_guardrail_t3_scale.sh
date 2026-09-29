@@ -182,6 +182,64 @@ PODMIGRATIONS_BACKUP_JQ_FILTER='{
   ]
 }'
 
+# JQ filters for scoping clean_stale_migration_resources to T3-owned controller
+# runtime artifacts (Issue #97), preserving non-T3 PodMigrationJobs,
+# PodSnapshotManualTriggers, and PodSnapshots in shared namespaces.
+T3_PMJ_NAMES_JQ_FILTER='
+  .items[]?
+  | select(
+      (.metadata.labels["t3-suite"] // "") == "true"
+      or ((.spec.podRef.name // "") | startswith("t3-"))
+      or ((.status.restoredPodName // "") | startswith("t3-"))
+      or ((.metadata.name // "") | test("^(pmj-|migrate-)?t3-"))
+    )
+  | .metadata.name // empty
+'
+
+T3_PMJ_SNAP_REFS_JQ_FILTER='[
+  .items[]?
+  | select(
+      (.metadata.labels["t3-suite"] // "") == "true"
+      or ((.spec.podRef.name // "") | startswith("t3-"))
+      or ((.status.restoredPodName // "") | startswith("t3-"))
+      or ((.metadata.name // "") | test("^(pmj-|migrate-)?t3-"))
+    )
+  | .status.snapshotRef // empty
+  | select(length > 0)
+]'
+
+T3_PSMT_NAMES_JQ_FILTER='
+  .items[]?
+  | select(
+      (.metadata.labels["t3-suite"] // "") == "true"
+      or ((.spec.targetPod // "") | startswith("t3-"))
+      or ((.metadata.name // "") | test("^(trigger-)?t3-"))
+    )
+  | .metadata.name // empty
+'
+
+T3_PSMT_SNAP_REFS_JQ_FILTER='[
+  .items[]?
+  | select(
+      (.metadata.labels["t3-suite"] // "") == "true"
+      or ((.spec.targetPod // "") | startswith("t3-"))
+      or ((.metadata.name // "") | test("^(trigger-)?t3-"))
+    )
+  | .status.snapshotCreated.name // empty
+  | select(length > 0)
+]'
+
+T3_PODSNAPSHOT_NAMES_JQ_FILTER='
+  .items[]?
+  | select(
+      (.metadata.name as $n | ($refs | index($n)) != null)
+      or (.metadata.labels["t3-suite"] // "") == "true"
+      or (((.spec.podRef.name // .spec.podName // .spec.source.podName // .spec.sourcePod // .status.podName // "")) | startswith("t3-"))
+      or ((.metadata.name // "") | test("^(snap-)?t3-"))
+    )
+  | .metadata.name // empty
+'
+
 log() {
   printf "\033[1;36m[%s]\033[0m %s\n" "$(date -u +%H:%M:%S)" "$*"
 }
@@ -289,10 +347,13 @@ verify_restored_podmigrations() {
     return 0
   fi
 
-  local names
-  mapfile -t names < <(jq -r '.items[].metadata.name' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)
+  local names=()
+  local name_line
+  while IFS= read -r name_line; do
+    [[ -n "${name_line}" ]] && names+=("${name_line}")
+  done < <(jq -r '.items[].metadata.name' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)
   local restore_err=0
-  for name in "${names[@]}"; do
+  for name in "${names[@]:-}"; do
     if [[ -n "${name}" ]]; then
       log "Waiting for restored PodMigration '${name}' in namespace ${NAMESPACE} to reach condition Ready=True..."
       if ! kubectl wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null 2>&1; then
@@ -396,14 +457,54 @@ resolve_gcs_bucket() {
 }
 
 clean_stale_migration_resources() {
-  log "Cleaning stale PodSnapshots, PodSnapshotManualTriggers, and PodMigrationJobs in ${NAMESPACE}"
-  kubectl delete validatingadmissionpolicybinding gke-pod-snapshot-vap-binding --ignore-not-found >/dev/null 2>&1 || true
-  kubectl get podsnapshots -n "${NAMESPACE}" -o json 2>/dev/null \
-    | jq -r '.items[].metadata.name' 2>/dev/null \
-    | xargs -r -I {} kubectl patch podsnapshot {} -n "${NAMESPACE}" --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]' >/dev/null 2>&1 || true
-  kubectl delete podsnapshots,podsnapshotmanualtriggers,podmigrationjobs.podmigration.gke.io --all -n "${NAMESPACE}" --ignore-not-found --timeout=20s >/dev/null 2>&1 || true
-  if [[ -f "${SCRIPT_DIR}/manifests/restore-vap-binding.yaml" ]]; then
-    kubectl apply -f "${SCRIPT_DIR}/manifests/restore-vap-binding.yaml" >/dev/null 2>&1 || true
+  log "Cleaning stale T3-scoped PodSnapshots, PodSnapshotManualTriggers, and PodMigrationJobs in ${NAMESPACE}"
+
+  local pmj_json psmt_json snap_json
+  pmj_json="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" -o json 2>/dev/null || echo '{"items":[]}')"
+  psmt_json="$(kubectl get podsnapshotmanualtriggers -n "${NAMESPACE}" -o json 2>/dev/null || echo '{"items":[]}')"
+  snap_json="$(kubectl get podsnapshots -n "${NAMESPACE}" -o json 2>/dev/null || echo '{"items":[]}')"
+
+  local t3_pmjs=()
+  local t3_psmts=()
+  local t3_snaps=()
+  local line
+
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && t3_pmjs+=("${line}")
+  done < <(echo "${pmj_json}" | jq -r "${T3_PMJ_NAMES_JQ_FILTER}" 2>/dev/null || true)
+
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && t3_psmts+=("${line}")
+  done < <(echo "${psmt_json}" | jq -r "${T3_PSMT_NAMES_JQ_FILTER}" 2>/dev/null || true)
+
+  local pmj_refs psmt_refs combined_refs
+  pmj_refs="$(echo "${pmj_json}" | jq -c "${T3_PMJ_SNAP_REFS_JQ_FILTER}" 2>/dev/null || echo '[]')"
+  psmt_refs="$(echo "${psmt_json}" | jq -c "${T3_PSMT_SNAP_REFS_JQ_FILTER}" 2>/dev/null || echo '[]')"
+  combined_refs="$(jq -nc --argjson a "${pmj_refs}" --argjson b "${psmt_refs}" '($a + $b) | unique' 2>/dev/null || echo '[]')"
+
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && t3_snaps+=("${line}")
+  done < <(echo "${snap_json}" | jq -r --argjson refs "${combined_refs}" "${T3_PODSNAPSHOT_NAMES_JQ_FILTER}" 2>/dev/null || true)
+
+  if [[ "${#t3_snaps[@]}" -gt 0 ]]; then
+    kubectl delete validatingadmissionpolicybinding gke-pod-snapshot-vap-binding --ignore-not-found >/dev/null 2>&1 || true
+    local snap
+    for snap in "${t3_snaps[@]}"; do
+      kubectl patch podsnapshot "${snap}" -n "${NAMESPACE}" --type=json \
+        -p='[{"op": "remove", "path": "/metadata/finalizers"}]' >/dev/null 2>&1 || true
+    done
+    kubectl delete podsnapshot "${t3_snaps[@]}" -n "${NAMESPACE}" --ignore-not-found --timeout=20s >/dev/null 2>&1 || true
+    if [[ -f "${SCRIPT_DIR}/manifests/restore-vap-binding.yaml" ]]; then
+      kubectl apply -f "${SCRIPT_DIR}/manifests/restore-vap-binding.yaml" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [[ "${#t3_psmts[@]}" -gt 0 ]]; then
+    kubectl delete podsnapshotmanualtrigger "${t3_psmts[@]}" -n "${NAMESPACE}" --ignore-not-found --timeout=20s >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${#t3_pmjs[@]}" -gt 0 ]]; then
+    kubectl delete podmigrationjobs.podmigration.gke.io "${t3_pmjs[@]}" -n "${NAMESPACE}" --ignore-not-found --timeout=20s >/dev/null 2>&1 || true
   fi
 }
 
@@ -902,7 +1003,11 @@ EOF
   # Pick up to 2 pods per workload on drain_node (up to 10 concurrent migrations across all 5 apps).
   local evicted_pods=()
   for app in t3-counter t3-redis t3-postgres t3-memcached t3-nginx; do
-    mapfile -t app_pods < <(kubectl get pods -n "${NAMESPACE}" -l "app=${app}" \
+    local app_pods=()
+    local pod_line
+    while IFS= read -r pod_line; do
+      [[ -n "${pod_line}" ]] && app_pods+=("${pod_line}")
+    done < <(kubectl get pods -n "${NAMESPACE}" -l "app=${app}" \
       --field-selector="status.phase=Running,spec.nodeName=${drain_node}" \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | head -n 2)
     for p in "${app_pods[@]:-}"; do
@@ -1105,8 +1210,11 @@ EOF
 
   if [[ "${distinct_shapes}" -gt 1 ]]; then
     log "T3-S3 detected ${distinct_shapes} distinct gVisor machine shapes (${shape_list}); cordoning all '${src_type}' nodes to force cross-shape migration"
-    local same_shape_nodes
-    mapfile -t same_shape_nodes < <(kubectl get nodes -l "sandbox.gke.io/runtime=gvisor,node.kubernetes.io/instance-type=${src_type}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+    local same_shape_nodes=()
+    local node_line
+    while IFS= read -r node_line; do
+      [[ -n "${node_line}" ]] && same_shape_nodes+=("${node_line}")
+    done < <(kubectl get nodes -l "sandbox.gke.io/runtime=gvisor,node.kubernetes.io/instance-type=${src_type}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
     for n in "${same_shape_nodes[@]:-}"; do
       cordon_node "${n}"
     done
@@ -1761,6 +1869,86 @@ EOF
     die "Self-test failure: expected scenario_t3_s3 to fail closed on single-shape pool when --require-cross-shape is set"
   fi
   log "PASS [self-test]: scenario_t3_s3 single-shape SKIPPED and --require-cross-shape fail-closed verified"
+
+  # 13. Verify clean_stale_migration_resources scopes deletion to T3 artifacts and preserves non-T3 resources (Issue #97)
+  local clean_calls_log="${base_dir}/clean-stale-kubectl.log"
+  : > "${clean_calls_log}"
+  (
+    kubectl() {
+      if [[ "$*" == "get podmigrationjobs.podmigration.gke.io -n ${NAMESPACE} -o json" ]]; then
+        cat <<'JSON'
+{
+  "items": [
+    {"metadata": {"name": "pmj-t3-s1-0"}, "spec": {"podRef": {"name": "t3-s1-counter-0"}}, "status": {"snapshotRef": "snap-opaque-from-pmj"}},
+    {"metadata": {"name": "pmj-prod-db-0"}, "spec": {"podRef": {"name": "prod-db-0"}}, "status": {"snapshotRef": "snap-prod-db-0"}}
+  ]
+}
+JSON
+        return 0
+      fi
+      if [[ "$*" == "get podsnapshotmanualtriggers -n ${NAMESPACE} -o json" ]]; then
+        cat <<'JSON'
+{
+  "items": [
+    {"metadata": {"name": "trigger-t3-s1-0"}, "spec": {"targetPod": "t3-s1-counter-0"}, "status": {"snapshotCreated": {"name": "snap-opaque-from-psmt"}}},
+    {"metadata": {"name": "trigger-prod-db-0"}, "spec": {"targetPod": "prod-db-0"}, "status": {"snapshotCreated": {"name": "snap-prod-db-0"}}}
+  ]
+}
+JSON
+        return 0
+      fi
+      if [[ "$*" == "get podsnapshots -n ${NAMESPACE} -o json" ]]; then
+        cat <<'JSON'
+{
+  "items": [
+    {"metadata": {"name": "snap-opaque-from-pmj"}, "spec": {}},
+    {"metadata": {"name": "snap-opaque-from-psmt"}, "spec": {}},
+    {"metadata": {"name": "snap-direct-t3"}, "spec": {"podName": "t3-redis-0"}},
+    {"metadata": {"name": "snap-prod-db-0"}, "spec": {"podName": "prod-db-0"}}
+  ]
+}
+JSON
+        return 0
+      fi
+      echo "$*" >> "${clean_calls_log}"
+      return 0
+    }
+    clean_stale_migration_resources >/dev/null 2>&1
+  ) || die "Self-test failure: clean_stale_migration_resources failed during T3-scoped cleanup test"
+
+  if grep -q -- '--all' "${clean_calls_log}"; then
+    die "Self-test failure: clean_stale_migration_resources invoked blanket '--all' delete: $(cat "${clean_calls_log}")"
+  fi
+  if grep -qE 'pmj-prod-db-0|trigger-prod-db-0|snap-prod-db-0' "${clean_calls_log}"; then
+    die "Self-test failure: clean_stale_migration_resources touched non-T3 prod resources: $(cat "${clean_calls_log}")"
+  fi
+  grep -q 'patch podsnapshot snap-opaque-from-pmj ' "${clean_calls_log}" || die "Self-test failure: expected snap-opaque-from-pmj finalizer patch"
+  grep -q 'patch podsnapshot snap-opaque-from-psmt ' "${clean_calls_log}" || die "Self-test failure: expected snap-opaque-from-psmt finalizer patch"
+  grep -q 'patch podsnapshot snap-direct-t3 ' "${clean_calls_log}" || die "Self-test failure: expected snap-direct-t3 finalizer patch"
+  grep -q 'delete podsnapshot snap-opaque-from-pmj snap-opaque-from-psmt snap-direct-t3 ' "${clean_calls_log}" || die "Self-test failure: expected T3 podsnapshots delete"
+  grep -q 'delete podsnapshotmanualtrigger trigger-t3-s1-0 ' "${clean_calls_log}" || die "Self-test failure: expected T3 PSMT delete"
+  grep -q 'delete podmigrationjobs.podmigration.gke.io pmj-t3-s1-0 ' "${clean_calls_log}" || die "Self-test failure: expected T3 PMJ delete"
+
+  # Also verify that when only non-T3 resources exist, zero delete/patch calls are issued
+  local empty_clean_log="${base_dir}/clean-stale-empty-kubectl.log"
+  : > "${empty_clean_log}"
+  (
+    kubectl() {
+      if [[ "$*" == "get "* ]]; then
+        cat <<'JSON'
+{"items": [{"metadata": {"name": "prod-only"}, "spec": {"podRef": {"name": "prod-0"}, "targetPod": "prod-0", "podName": "prod-0"}}]}
+JSON
+        return 0
+      fi
+      echo "$*" >> "${empty_clean_log}"
+      return 0
+    }
+    clean_stale_migration_resources >/dev/null 2>&1
+  ) || die "Self-test failure: clean_stale_migration_resources failed when only non-T3 resources exist"
+  if [[ -s "${empty_clean_log}" ]]; then
+    die "Self-test failure: expected zero mutating kubectl calls when only non-T3 resources exist, got: $(cat "${empty_clean_log}")"
+  fi
+  log "PASS [self-test]: T3-scoped clean_stale_migration_resources preserves non-T3 artifacts"
 
   log "PASS [self-test]: PodMigration backup filter & restore transform verified"
   log "Self-test PASSED: HTML report generated at ${report_html}"
