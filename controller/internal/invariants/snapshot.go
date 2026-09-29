@@ -72,13 +72,14 @@ type ReconcileSnapshot struct {
 
 // Violation represents a single detected violation of an invariant (I1-I9).
 type Violation struct {
-	InvariantID   string
-	InvariantName string
-	Reason        string
-	Message       string
-	Namespace     string
-	PMJName       string
-	PodName       string
+	InvariantID         string
+	InvariantName       string
+	Reason              string
+	Message             string
+	Namespace           string
+	PMJName             string
+	PodName             string
+	ConsecutiveRequired int // Optional per-violation consecutive samples required before strict abort (>0)
 }
 
 // Rule is a pure, stateless predicate over a ReconcileSnapshot.
@@ -86,6 +87,35 @@ type Rule interface {
 	ID() string
 	Name() string
 	Evaluate(s *ReconcileSnapshot) []Violation
+}
+
+// DebouncedRule is an optional interface implemented by Invariant Rules
+// that require multiple consecutive reconcile samples detecting a violation
+// before escalating to strict mode abort.
+type DebouncedRule interface {
+	Rule
+	ConsecutiveSamples() int
+}
+
+type debouncedRule struct {
+	Rule
+	consecutive int
+}
+
+func (r debouncedRule) ConsecutiveSamples() int {
+	return r.consecutive
+}
+
+// NewDebouncedRule wraps an existing Rule to require N consecutive reconcile samples
+// before strict mode triggers failure. If consecutive < 1, it defaults to 1.
+func NewDebouncedRule(r Rule, consecutive int) DebouncedRule {
+	if consecutive < 1 {
+		consecutive = 1
+	}
+	return debouncedRule{
+		Rule:        r,
+		consecutive: consecutive,
+	}
 }
 
 type funcRule struct {

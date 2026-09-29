@@ -551,3 +551,362 @@ func TestEngine_MaxActiveViolationScopesCap(t *testing.T) {
 		t.Fatalf("expected activeViolations map size <= %d, got %d", maxActiveViolationScopes, len(eng.activeViolations))
 	}
 }
+
+func TestEngine_MultiReconcileDebounce_StrictEscalation(t *testing.T) {
+	recorder := record.NewFakeRecorder(10)
+	debouncedRule := NewDebouncedRule(funcRule{
+		id:   "I10-Test",
+		name: "RestoringReplacementLiveness",
+		fn: func(s *ReconcileSnapshot) []Violation {
+			return []Violation{{
+				InvariantID:   "I10-Test",
+				InvariantName: "RestoringReplacementLiveness",
+				Reason:        "RestoringReplacementPodMissing",
+				Message:       "replacement pod missing during restore",
+				Namespace:     s.PrimaryPMJ.Namespace,
+				PMJName:       s.PrimaryPMJ.Name,
+			}}
+		},
+	}, 3)
+
+	eng := NewEngine(ModeStrict, recorder)
+	eng.Rules = []Rule{debouncedRule}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-debounce-test",
+			UID:       "uid-pmj-debounce-1",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+	snap := &ReconcileSnapshot{
+		Reconciler: "PodMigrationJobReconciler",
+		PrimaryPMJ: pmj,
+	}
+
+	subjKey := "uid-pmj-debounce-1"
+
+	// Sample 1: first violation. In strict mode, debounce suppresses immediate abort.
+	vs1, strict1 := eng.Evaluate(context.Background(), snap)
+	if len(vs1) != 1 {
+		t.Fatalf("sample 1: expected 1 violation, got %d", len(vs1))
+	}
+	if strict1 {
+		t.Fatalf("sample 1: expected strict=false during debounce window, got true")
+	}
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 1 {
+		t.Fatalf("sample 1: expected ConsecutiveCount=1, got %d", count)
+	}
+	if len(recorder.Events) != 1 {
+		t.Fatalf("sample 1: expected 1 event, got %d", len(recorder.Events))
+	}
+	ev1 := <-recorder.Events
+	if !strings.Contains(ev1, "[sample 1/3]") {
+		t.Fatalf("sample 1: expected event to include [sample 1/3], got: %s", ev1)
+	}
+
+	// Sample 2: second consecutive violation. Still in debounce window.
+	vs2, strict2 := eng.Evaluate(context.Background(), snap)
+	if len(vs2) != 1 {
+		t.Fatalf("sample 2: expected 1 violation, got %d", len(vs2))
+	}
+	if strict2 {
+		t.Fatalf("sample 2: expected strict=false during debounce window, got true")
+	}
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 2 {
+		t.Fatalf("sample 2: expected ConsecutiveCount=2, got %d", count)
+	}
+	// Deduplication should suppress repeat Warning event for identical message on sample 2.
+	if len(recorder.Events) != 0 {
+		t.Fatalf("sample 2: expected 0 new events due to deduplication, got %d", len(recorder.Events))
+	}
+
+	// Sample 3: third consecutive violation reaches threshold (3/3). Escalates to strict abort!
+	vs3, strict3 := eng.Evaluate(context.Background(), snap)
+	if len(vs3) != 1 {
+		t.Fatalf("sample 3: expected 1 violation, got %d", len(vs3))
+	}
+	if !strict3 {
+		t.Fatalf("sample 3: expected strict=true on reaching consecutive threshold 3, got false")
+	}
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 3 {
+		t.Fatalf("sample 3: expected ConsecutiveCount=3, got %d", count)
+	}
+	// An escalating event must be emitted notifying the operator of strict abort.
+	if len(recorder.Events) != 1 {
+		t.Fatalf("sample 3: expected 1 escalation event, got %d", len(recorder.Events))
+	}
+	ev3 := <-recorder.Events
+	if !strings.Contains(ev3, "escalating to strict abort") {
+		t.Fatalf("sample 3: expected escalation event, got: %s", ev3)
+	}
+}
+
+func TestEngine_MultiReconcileDebounce_CleanSampleReset(t *testing.T) {
+	shouldViolate := true
+	debouncedRule := NewDebouncedRule(funcRule{
+		id:   "I10-Test",
+		name: "RestoringReplacementLiveness",
+		fn: func(s *ReconcileSnapshot) []Violation {
+			if !shouldViolate {
+				return nil
+			}
+			return []Violation{{
+				InvariantID:   "I10-Test",
+				InvariantName: "RestoringReplacementLiveness",
+				Reason:        "RestoringReplacementPodMissing",
+				Message:       "replacement pod missing during restore",
+				Namespace:     s.PrimaryPMJ.Namespace,
+				PMJName:       s.PrimaryPMJ.Name,
+			}}
+		},
+	}, 3)
+
+	eng := NewEngine(ModeStrict, nil)
+	eng.Rules = []Rule{debouncedRule}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-reset-test",
+			UID:       "uid-reset-1",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+	snap := &ReconcileSnapshot{
+		Reconciler: "PodMigrationJobReconciler",
+		PrimaryPMJ: pmj,
+	}
+
+	subjKey := "uid-reset-1"
+
+	// Sample 1: violation occurs (count=1).
+	vs1, strict1 := eng.Evaluate(context.Background(), snap)
+	if len(vs1) != 1 || strict1 || eng.ConsecutiveCount(subjKey, "I10-Test") != 1 {
+		t.Fatalf("sample 1: len(vs)=%d, strict=%v, count=%d", len(vs1), strict1, eng.ConsecutiveCount(subjKey, "I10-Test"))
+	}
+
+	// Sample 2: clean reconcile (replacement pod appeared!). Counter resets to 0.
+	shouldViolate = false
+	vs2, strict2 := eng.Evaluate(context.Background(), snap)
+	if len(vs2) != 0 || strict2 {
+		t.Fatalf("sample 2: expected 0 violations, strict=false; got %d, %v", len(vs2), strict2)
+	}
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 0 {
+		t.Fatalf("sample 2: expected ConsecutiveCount to reset to 0 on clean sample, got %d", count)
+	}
+
+	// Sample 3: violation recurs. Counter must start over at 1, NOT 2.
+	shouldViolate = true
+	vs3, strict3 := eng.Evaluate(context.Background(), snap)
+	if len(vs3) != 1 || strict3 {
+		t.Fatalf("sample 3: len(vs)=%d, strict=%v", len(vs3), strict3)
+	}
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 1 {
+		t.Fatalf("sample 3: expected ConsecutiveCount to restart at 1, got %d", count)
+	}
+}
+
+func TestEngine_MultiReconcileDebounce_TerminalPhaseReset(t *testing.T) {
+	debouncedRule := NewDebouncedRule(funcRule{
+		id:   "I10-Test",
+		name: "RestoringReplacementLiveness",
+		fn: func(s *ReconcileSnapshot) []Violation {
+			return []Violation{{
+				InvariantID:   "I10-Test",
+				InvariantName: "RestoringReplacementLiveness",
+				Reason:        "RestoringReplacementPodMissing",
+				Message:       "replacement pod missing during restore",
+				Namespace:     s.PrimaryPMJ.Namespace,
+				PMJName:       s.PrimaryPMJ.Name,
+			}}
+		},
+	}, 3)
+
+	eng := NewEngine(ModeStrict, nil)
+	eng.Rules = []Rule{debouncedRule}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-term-test",
+			UID:       "uid-term-1",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+	snap := &ReconcileSnapshot{
+		Reconciler: "PodMigrationJobReconciler",
+		PrimaryPMJ: pmj,
+	}
+
+	subjKey := "uid-term-1"
+
+	// Sample 1: count=1
+	eng.Evaluate(context.Background(), snap)
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 1 {
+		t.Fatalf("expected count=1, got %d", count)
+	}
+
+	// Sample 2: PMJ reaches terminal phase Succeeded. Debounce counter is cleared.
+	pmj.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+	eng.Evaluate(context.Background(), snap)
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 0 {
+		t.Fatalf("expected debounce counter cleared on terminal phase, got %d", count)
+	}
+}
+
+func TestEngine_MultiReconcileDebounce_PerViolationOverride(t *testing.T) {
+	// A rule that returns Violation with ConsecutiveRequired = 2 override.
+	overrideRule := funcRule{
+		id:   "Custom-Debounce",
+		name: "CustomRule",
+		fn: func(s *ReconcileSnapshot) []Violation {
+			return []Violation{{
+				InvariantID:         "Custom-Debounce",
+				InvariantName:       "CustomRule",
+				Reason:              "TransientFlap",
+				Message:             "transient flap detected",
+				Namespace:           s.PrimaryPMJ.Namespace,
+				PMJName:             s.PrimaryPMJ.Name,
+				ConsecutiveRequired: 2,
+			}}
+		},
+	}
+
+	eng := NewEngine(ModeStrict, nil)
+	eng.Rules = []Rule{overrideRule}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-override-test",
+			UID:       "uid-override-1",
+		},
+	}
+	snap := &ReconcileSnapshot{
+		Reconciler: "PodMigrationJobReconciler",
+		PrimaryPMJ: pmj,
+	}
+
+	// Sample 1: strict=false (count=1 < 2)
+	_, strict1 := eng.Evaluate(context.Background(), snap)
+	if strict1 {
+		t.Fatalf("sample 1: expected strict=false, got true")
+	}
+
+	// Sample 2: strict=true (count=2 >= 2)
+	_, strict2 := eng.Evaluate(context.Background(), snap)
+	if !strict2 {
+		t.Fatalf("sample 2: expected strict=true, got false")
+	}
+}
+
+func TestEngine_MultiReconcileDebounce_MixedRulesImmediateAndDebounced(t *testing.T) {
+	immediateRule := funcRule{
+		id:   "I1-Immediate",
+		name: "ImmediateInvariant",
+		fn: func(s *ReconcileSnapshot) []Violation {
+			return []Violation{{
+				InvariantID:   "I1-Immediate",
+				InvariantName: "ImmediateInvariant",
+				Reason:        "ImmediateFailure",
+				Message:       "immediate violation",
+				Namespace:     s.PrimaryPMJ.Namespace,
+				PMJName:       s.PrimaryPMJ.Name,
+			}}
+		},
+	}
+	debouncedRule := NewDebouncedRule(funcRule{
+		id:   "I10-Debounced",
+		name: "DebouncedInvariant",
+		fn: func(s *ReconcileSnapshot) []Violation {
+			return []Violation{{
+				InvariantID:   "I10-Debounced",
+				InvariantName: "DebouncedInvariant",
+				Reason:        "AbsenceDebounce",
+				Message:       "absence violation in debounce",
+				Namespace:     s.PrimaryPMJ.Namespace,
+				PMJName:       s.PrimaryPMJ.Name,
+			}}
+		},
+	}, 5)
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-mixed-test",
+			UID:       "uid-mixed-1",
+		},
+	}
+	snap := &ReconcileSnapshot{
+		Reconciler: "PodMigrationJobReconciler",
+		PrimaryPMJ: pmj,
+	}
+
+	// Case A: Only debounced rule is active. Sample 1 must NOT fail strict mode.
+	engDebouncedOnly := NewEngine(ModeStrict, nil)
+	engDebouncedOnly.Rules = []Rule{debouncedRule}
+	vsA, strictA := engDebouncedOnly.Evaluate(context.Background(), snap)
+	if len(vsA) != 1 || strictA {
+		t.Fatalf("debounced only: len=%d, strict=%v; want 1, false", len(vsA), strictA)
+	}
+
+	// Case B: Both immediate and debounced rules fire on sample 1.
+	// Strict mode must fail immediately due to the immediate invariant.
+	engMixed := NewEngine(ModeStrict, nil)
+	engMixed.Rules = []Rule{immediateRule, debouncedRule}
+	vsB, strictB := engMixed.Evaluate(context.Background(), snap)
+	if len(vsB) != 2 || !strictB {
+		t.Fatalf("mixed rules: len=%d, strict=%v; want 2, true", len(vsB), strictB)
+	}
+}
+
+func TestEngine_MultiReconcileDebounce_ForgetObject(t *testing.T) {
+	debouncedRule := NewDebouncedRule(funcRule{
+		id:   "I10-Test",
+		name: "RestoringReplacementLiveness",
+		fn: func(s *ReconcileSnapshot) []Violation {
+			return []Violation{{
+				InvariantID:   "I10-Test",
+				InvariantName: "RestoringReplacementLiveness",
+				Reason:        "RestoringReplacementPodMissing",
+				Message:       "replacement pod missing during restore",
+				Namespace:     s.PrimaryPMJ.Namespace,
+				PMJName:       s.PrimaryPMJ.Name,
+			}}
+		},
+	}, 3)
+
+	eng := NewEngine(ModeStrict, nil)
+	eng.Rules = []Rule{debouncedRule}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-forget-test",
+		},
+	}
+	snap := &ReconcileSnapshot{
+		Reconciler: "PodMigrationJobReconciler",
+		PrimaryPMJ: pmj,
+	}
+
+	eng.Evaluate(context.Background(), snap)
+	eng.Evaluate(context.Background(), snap)
+	subjKey := "pmj/default/pmj-forget-test"
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 2 {
+		t.Fatalf("expected count=2 before ForgetObject, got %d", count)
+	}
+
+	eng.ForgetObject("PodMigrationJobReconciler", "pmj", "default", "pmj-forget-test")
+	if count := eng.ConsecutiveCount(subjKey, "I10-Test"); count != 0 {
+		t.Fatalf("expected count=0 after ForgetObject, got %d", count)
+	}
+}
