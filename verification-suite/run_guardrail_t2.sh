@@ -43,6 +43,7 @@ CONTROLLER_NS="${CONTROLLER_NS:-pod-migration-system}"
 GCS_BUCKET="${GCS_BUCKET:-}"
 RUNTIME_CLASS="${RUNTIME_CLASS:-gvisor}"
 NODE_SELECTOR="${NODE_SELECTOR:-sandbox.gke.io/runtime=gvisor}"
+CORDON_SELECTOR="${CORDON_SELECTOR:-}"
 TOLERATION="${TOLERATION:-sandbox.gke.io/runtime=gvisor:NoSchedule}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-pm-test-ksa}"
 SKIP_PODMIGRATION_CREATE="${SKIP_PODMIGRATION_CREATE:-false}"
@@ -62,7 +63,9 @@ Options:
   --gcs-bucket <gs://bucket/path>   Optional GCS bucket for snapshot storage & size sampling
   --runtime-class <name|none>       Pod runtimeClassName (default: gvisor; 'none' or '' omits it)
   --node-selector <k=v|none>        Pod nodeSelector key=value (default: sandbox.gke.io/runtime=gvisor; 'none' or '' omits it)
-  --toleration <k=v:effect|none>    Pod toleration (default: sandbox.gke.io/runtime=gvisor:NoSchedule; 'none' or '' omits it)
+  --cordon-selector <k=v|all|none>  Node label selector for S3 pool cordon (default: uses --node-selector when set;
+                                    requires explicit '<k=v>' or 'all' when --node-selector is 'none')
+  --toleration <k=v:effect|none>    Pod toleration in '<key>[=<value>]:<Effect>' format (default: sandbox.gke.io/runtime=gvisor:NoSchedule; 'none' or '' omits it)
   --service-account <name|none>     Pod serviceAccountName (default: pm-test-ksa; 'none' or '' omits it)
   --skip-podmigration-create        Use a pre-created snapshot policy instead of applying a PodMigration CR
   --self-test                       Run offline end-to-end self-test of pmprofiler + T2
@@ -105,6 +108,10 @@ while [[ $# -gt 0 ]]; do
       NODE_SELECTOR="$2"
       shift 2
       ;;
+    --cordon-selector)
+      CORDON_SELECTOR="$2"
+      shift 2
+      ;;
     --toleration)
       TOLERATION="$2"
       shift 2
@@ -142,6 +149,22 @@ die() {
   exit 1
 }
 
+validate_toleration_format() {
+  if [[ -z "${TOLERATION}" || "${TOLERATION}" == "none" ]]; then
+    return 0
+  fi
+  if [[ "${TOLERATION}" != *:* ]]; then
+    die "Invalid --toleration '${TOLERATION}': expected '<key>[=<value>]:<Effect>' (missing ':Effect') or 'none'"
+  fi
+  local tol_kv="${TOLERATION%:*}"
+  local tol_effect="${TOLERATION##*:}"
+  if [[ -z "${tol_kv}" || -z "${tol_effect}" ]]; then
+    die "Invalid --toleration '${TOLERATION}': both key and Effect must be non-empty in '<key>[=<value>]:<Effect>'"
+  fi
+}
+
+validate_toleration_format
+
 PMPROFILER_BIN=""
 COLLECT_PID=""
 CORDONED_NODES=()
@@ -157,22 +180,42 @@ build_pmprofiler() {
 cordon_node() {
   local node="$1"
   [[ -n "${node}" ]] || return 0
-  "${KUBECTL_CMD}" cordon "${node}" >/dev/null
   local existing
   for existing in "${CORDONED_NODES[@]:-}"; do
     if [[ "${existing}" == "${node}" ]]; then
       return 0
     fi
   done
-  CORDONED_NODES+=("${node}")
+  local already_unschedulable
+  already_unschedulable="$("${KUBECTL_CMD}" get node "${node}" -o jsonpath='{.spec.unschedulable}' 2>/dev/null || true)"
+  if [[ "${already_unschedulable}" != "true" ]]; then
+    CORDONED_NODES+=("${node}")
+  else
+    log "Node ${node} was already unschedulable prior to T2; will not uncordon on cleanup"
+  fi
+  "${KUBECTL_CMD}" cordon "${node}" >/dev/null
 }
 
 cordon_target_pool_nodes() {
+  local effective_selector="${CORDON_SELECTOR}"
+  if [[ -z "${effective_selector}" && -n "${NODE_SELECTOR}" && "${NODE_SELECTOR}" != "none" ]]; then
+    effective_selector="${NODE_SELECTOR}"
+  fi
+  if [[ -z "${effective_selector}" ]]; then
+    die "cordon_target_pool_nodes: refusing to cordon all cluster nodes when --node-selector is 'none' without an explicit --cordon-selector <k=v|all>"
+  fi
+  if [[ "${effective_selector}" == "none" ]]; then
+    log "Skipping pool cordon because --cordon-selector is set to 'none'"
+    return 0
+  fi
+
   local nodes=()
-  if [[ -n "${NODE_SELECTOR}" && "${NODE_SELECTOR}" != "none" ]]; then
-    mapfile -t nodes < <("${KUBECTL_CMD}" get nodes -l "${NODE_SELECTOR}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
-  else
+  if [[ "${effective_selector}" == "all" ]]; then
     mapfile -t nodes < <("${KUBECTL_CMD}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    log "Cordoning ${#nodes[@]} node(s) across cluster (--cordon-selector=all): ${nodes[*]:-none}"
+  else
+    mapfile -t nodes < <("${KUBECTL_CMD}" get nodes -l "${effective_selector}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    log "Cordoning ${#nodes[@]} node(s) matching selector '${effective_selector}': ${nodes[*]:-none}"
   fi
   local n
   for n in "${nodes[@]:-}"; do
@@ -212,23 +255,26 @@ resolve_gcs_bucket() {
     return 0
   fi
   local existing
-  existing="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+  existing="$("${KUBECTL_CMD}" get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
   if [[ -n "${existing}" ]]; then
     GCS_BUCKET="${existing}"
     return 0
   fi
-  local pssc_bucket pssc_prefix
-  pssc_bucket="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotLocationConfig.gcs.bucket}' 2>/dev/null || true)"
-  pssc_prefix="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotLocationConfig.gcs.prefix}' 2>/dev/null || true)"
+  local pssc_bucket pssc_path
+  pssc_bucket="$("${KUBECTL_CMD}" get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
+  pssc_path="$("${KUBECTL_CMD}" get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
   if [[ -n "${pssc_bucket}" ]]; then
-    if [[ -n "${pssc_prefix}" ]]; then
-      GCS_BUCKET="gs://${pssc_bucket}/${pssc_prefix#/}"
+    if [[ -n "${pssc_path}" ]]; then
+      GCS_BUCKET="gs://${pssc_bucket}/${pssc_path#/}"
     else
       GCS_BUCKET="gs://${pssc_bucket}"
     fi
-  else
-    GCS_BUCKET="gs://yaoluo-gke-dev-podsnapshots/snapshots"
+    return 0
   fi
+  if [[ "${SKIP_PODMIGRATION_CREATE}" == "true" ]]; then
+    die "--skip-podmigration-create is set, but no GCS bucket could be resolved from --gcs-bucket, PodMigrations in '${NAMESPACE}', or cluster PodSnapshotStorageConfigs (.spec.snapshotStorageConfig.gcs.{bucket,path})"
+  fi
+  GCS_BUCKET="gs://yaoluo-gke-dev-podsnapshots/snapshots"
 }
 
 clean_stale_migration_resources() {
@@ -504,6 +550,7 @@ render_pod_runtime_spec() {
     printf "      nodeSelector:\n        %s: %s\n" "${ns_key}" "${ns_val}"
   fi
   if [[ -n "${TOLERATION}" && "${TOLERATION}" != "none" ]]; then
+    validate_toleration_format
     local tol_kv="${TOLERATION%:*}"
     local tol_effect="${TOLERATION##*:}"
     if [[ "${tol_kv}" == *"="* ]]; then
@@ -864,7 +911,7 @@ run_scenario_s3() {
 
   # Cordon target node pool before triggering eviction so the replacement pod is held
   # Unschedulable after snapshot upload + source eviction while we corrupt checkpoint.img in GCS.
-  log "Cordoning target pool nodes (NODE_SELECTOR=${NODE_SELECTOR:-all}) to hold replacement pod Pending during GCS checkpoint corruption"
+  log "Cordoning target pool nodes (CORDON_SELECTOR=${CORDON_SELECTOR:-${NODE_SELECTOR}}) to hold replacement pod Pending during GCS checkpoint corruption"
   cordon_target_pool_nodes
 
   evict_pod "${src_pod}"
@@ -1280,26 +1327,114 @@ EOF
   grep -q 'command: \["redis-server"\]' <<<"${runc_redis}" || die "Expected explicit command in runtime-agnostic redis manifest"
   grep -q 'command: \["docker-entrypoint.sh"\]' <<<"${runc_pg}" || die "Expected explicit command in runtime-agnostic postgres manifest"
 
-  # Verify tracked node cordon/uncordon only uncordons nodes cordoned during the run (#82)
+  # Verify --toleration format validation rejects missing ':Effect' or empty Effect
+  if (TOLERATION="foo=bar" validate_toleration_format >/dev/null 2>&1); then
+    die "Expected validate_toleration_format to reject --toleration without ':Effect'"
+  fi
+  if (TOLERATION="foo:" validate_toleration_format >/dev/null 2>&1); then
+    die "Expected validate_toleration_format to reject --toleration with empty Effect"
+  fi
+  if (TOLERATION=":NoSchedule" validate_toleration_format >/dev/null 2>&1); then
+    die "Expected validate_toleration_format to reject --toleration with empty key"
+  fi
+
+  # Verify tracked node cordon/uncordon only uncordons nodes cordoned during the run
+  # and skips nodes that were already unschedulable prior to T2 (#82)
   local kubectl_log="${OUT_DIR}/kubectl-calls.log"
   local fake_kubectl="${OUT_DIR}/fake-kubectl.sh"
   cat >"${fake_kubectl}" <<EOF
 #!/usr/bin/env bash
+if [[ "\$*" == "get node pre-cordoned-node -o jsonpath={.spec.unschedulable}" ]]; then
+  printf "true"
+  exit 0
+fi
+if [[ "\$*" == "get node "* ]]; then
+  exit 0
+fi
+if [[ "\$*" == "get nodes -l pool=runc -o jsonpath="* ]]; then
+  printf "runc-pool-node-1\nrunc-pool-node-2\n"
+  exit 0
+fi
+if [[ "\$*" == "get nodes -o jsonpath="* ]]; then
+  printf "single-pool-node-1\n"
+  exit 0
+fi
 echo "\$*" >> "${kubectl_log}"
 EOF
   chmod +x "${fake_kubectl}"
+  CORDONED_NODES=()
   KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-1"
   KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-2"
   KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-1"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "pre-cordoned-node"
   KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" uncordon_all_tracked_nodes
   grep -q '^uncordon runc-pool-node-1$' "${kubectl_log}" || die "Expected tracked node runc-pool-node-1 to be uncordoned"
   grep -q '^uncordon runc-pool-node-2$' "${kubectl_log}" || die "Expected tracked node runc-pool-node-2 to be uncordoned"
+  if grep -q '^uncordon pre-cordoned-node$' "${kubectl_log}"; then
+    die "Expected pre-existing unschedulable node pre-cordoned-node NOT to be uncordoned"
+  fi
   if grep -q 'sandbox.gke.io/runtime=gvisor' "${kubectl_log}"; then
     die "Expected uncordon_all_tracked_nodes not to hardcode sandbox.gke.io/runtime=gvisor"
   fi
-  rm -f "${kubectl_log}" "${fake_kubectl}"
 
-  log "Self-test PASSED: S1-S5 analyzed with 0 invariant violations, runtime-agnostic templates & tracked node uncordon verified, and report generated at ${report_html}"
+  # Verify cordon_target_pool_nodes refuses NODE_SELECTOR=none without explicit --cordon-selector,
+  # and honors explicit --cordon-selector <k=v> and --cordon-selector all
+  if (KUBECTL_CMD="${fake_kubectl}" NODE_SELECTOR="none" CORDON_SELECTOR="" cordon_target_pool_nodes >/dev/null 2>&1); then
+    die "Expected cordon_target_pool_nodes to fail closed when NODE_SELECTOR=none and CORDON_SELECTOR is unset"
+  fi
+  : >"${kubectl_log}"
+  CORDONED_NODES=()
+  KUBECTL_CMD="${fake_kubectl}" NODE_SELECTOR="none" CORDON_SELECTOR="pool=runc" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_target_pool_nodes >/dev/null
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" uncordon_all_tracked_nodes
+  grep -q '^cordon runc-pool-node-1$' "${kubectl_log}" || die "Expected cordon_target_pool_nodes with CORDON_SELECTOR=pool=runc to cordon runc-pool-node-1"
+  grep -q '^uncordon runc-pool-node-2$' "${kubectl_log}" || die "Expected cordon_target_pool_nodes with CORDON_SELECTOR=pool=runc to track and uncordon runc-pool-node-2"
+
+  : >"${kubectl_log}"
+  CORDONED_NODES=()
+  KUBECTL_CMD="${fake_kubectl}" NODE_SELECTOR="none" CORDON_SELECTOR="all" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_target_pool_nodes >/dev/null
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" uncordon_all_tracked_nodes
+  grep -q '^cordon single-pool-node-1$' "${kubectl_log}" || die "Expected cordon_target_pool_nodes with CORDON_SELECTOR=all to cordon single-pool-node-1"
+
+  # Verify resolve_gcs_bucket reads .spec.snapshotStorageConfig.gcs.{bucket,path} on PodSnapshotStorageConfig
+  # and fails closed when --skip-podmigration-create is set and no bucket can be resolved
+  local fake_pssc_kubectl="${OUT_DIR}/fake-pssc-kubectl.sh"
+  cat >"${fake_pssc_kubectl}" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.bucket}"* ]]; then
+  printf "custom-pssc-bucket"
+  exit 0
+fi
+if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.path}"* ]]; then
+  printf "/custom-pssc-path"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${fake_pssc_kubectl}"
+  local resolved_pssc_bucket
+  resolved_pssc_bucket="$(
+    GCS_BUCKET=""
+    SKIP_PODMIGRATION_CREATE="true"
+    KUBECTL_CMD="${fake_pssc_kubectl}"
+    resolve_gcs_bucket
+    echo "${GCS_BUCKET}"
+  )"
+  if [[ "${resolved_pssc_bucket}" != "gs://custom-pssc-bucket/custom-pssc-path" ]]; then
+    die "Expected resolve_gcs_bucket to resolve 'gs://custom-pssc-bucket/custom-pssc-path' from PodSnapshotStorageConfig, got '${resolved_pssc_bucket}'"
+  fi
+
+  local fake_empty_kubectl="${OUT_DIR}/fake-empty-kubectl.sh"
+  cat >"${fake_empty_kubectl}" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${fake_empty_kubectl}"
+  if (GCS_BUCKET="" SKIP_PODMIGRATION_CREATE="true" KUBECTL_CMD="${fake_empty_kubectl}" resolve_gcs_bucket >/dev/null 2>&1); then
+    die "Expected resolve_gcs_bucket to fail closed when --skip-podmigration-create is set and no bucket is found"
+  fi
+  rm -f "${kubectl_log}" "${fake_kubectl}" "${fake_pssc_kubectl}" "${fake_empty_kubectl}"
+
+  log "Self-test PASSED: S1-S5 analyzed with 0 invariant violations, runtime-agnostic templates, PSSC resolution, --cordon-selector & tracked node uncordon verified, and report generated at ${report_html}"
 }
 
 # ==============================================================================
