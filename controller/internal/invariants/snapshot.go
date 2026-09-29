@@ -8,6 +8,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
@@ -42,7 +43,7 @@ func ParseMode(raw string) (Mode, error) {
 }
 
 // ReconcileSnapshot holds the point-in-time, in-memory state evaluated by pure
-// invariant predicates (I1-I9) at the end of a reconcile cycle without issuing
+// invariant predicates (I1-I9+) at the end of a reconcile cycle without issuing
 // any extra Kubernetes API server requests.
 type ReconcileSnapshot struct {
 	Now        time.Time
@@ -58,8 +59,15 @@ type ReconcileSnapshot struct {
 	NamespacePods []corev1.Pod
 
 	// Explicit state signals captured during the reconcile step.
+	PodListFailed                bool
+	PMJListFailed                bool
 	HasOrphanedTrigger           bool
 	RestoreCrashSignatureMatched bool
+
+	// PrimarySnapshotConditions holds the status.conditions of the active PodSnapshot
+	// (when present in the informer cache) so cross-CRD invariants can inspect
+	// Checkpoint / StorageReplicated / Ready sub-conditions without extra API calls.
+	PrimarySnapshotConditions []metav1.Condition
 }
 
 // Violation represents a single detected violation of an invariant (I1-I9).

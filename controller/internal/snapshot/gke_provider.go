@@ -290,13 +290,15 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 // DeadlineExceeded), retrying trigger creation within the same PMJ prolongs migration disruption and risks
 // double-checkpointing an actively degrading pod; failing fast allows the controller or workload controller
 // to cleanly initiate fallback or reschedule rather than burning the migration deadline on known terminal states.
+// Refused means the snapshot engine declined to checkpoint this pod (for example, a pod shape it does not
+// support). That is a policy decision that will not change within the same PMJ, so it is terminal as well.
 func isTerminalSnapshotFailureReason(reason string) bool {
 	r := strings.ToLower(reason)
 	if r == "" || r == "noerror" || strings.HasPrefix(r, "not") || strings.HasPrefix(r, "non") {
 		return false
 	}
 	switch r {
-	case "failed", "error", "deadlineexceeded":
+	case "failed", "error", "deadlineexceeded", "refused":
 		return true
 	}
 	return false

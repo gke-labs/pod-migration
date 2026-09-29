@@ -240,9 +240,36 @@ func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 			p1.CompiledAndTested, p1.RedPassed, p1.GreenPassed)
 	}
 
-	// 2. Custom novel directive (or premature-snapshot-failed before ReconcileSnapshot carries PodSnapshot):
-	// must set RequiresAuthorBody=true and fail the compiled RED proof (RedPassed=false, GreenPassed=false).
-	f2, err := ParseTriggerCommentOrPR("I12", "/extract-invariant I12 custom-novel-check some brand new cross-resource invariant", "")
+	// 2. Premature-snapshot-failed directive: now supported natively via PrimarySnapshotConditions (#88).
+	fPremature, err := ParseTriggerCommentOrPR("I12", "/extract-invariant I12 premature-snapshot-failed PMJ failed while Checkpoint=False(InProgress)", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR premature-snapshot-failed failed: %v", err)
+	}
+	if fPremature.Template != TemplatePrematureSnapshotFailed {
+		t.Fatalf("expected TemplatePrematureSnapshotFailed, got %s", fPremature.Template)
+	}
+	pPremature, err := SynthesizeAndVerify(fPremature, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify premature-snapshot-failed failed: %v", err)
+	}
+	if pPremature.RequiresAuthorBody || !pPremature.CompiledAndTested || !pPremature.RedPassed || !pPremature.GreenPassed {
+		t.Fatalf("expected premature-snapshot-failed template to pass compiled go test RED and GREEN, got %+v\nRED:\n%s\nGREEN:\n%s",
+			pPremature, pPremature.RedTestOutput, pPremature.GreenTestOutput)
+	}
+
+	// 3. PodListFailed=true on a wedged-restoring-orphan snapshot must suppress false-positive violations.
+	fListFailed := f1
+	fListFailed.Snapshot.PodListFailed = true
+	pListFailed, err := SynthesizeAndVerify(fListFailed, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify with PodListFailed=true failed: %v", err)
+	}
+	if pListFailed.RedPassed {
+		t.Fatalf("expected PodListFailed=true to suppress RestoringReplacementPodMissing violation, but RED still fired")
+	}
+
+	// 4. Custom novel directive: must set RequiresAuthorBody=true and fail the compiled RED proof (RedPassed=false, GreenPassed=false).
+	f2, err := ParseTriggerCommentOrPR("I13", "/extract-invariant I13 custom-novel-check some brand new cross-resource invariant", "")
 	if err != nil {
 		t.Fatalf("ParseTriggerCommentOrPR custom failed: %v", err)
 	}
@@ -257,3 +284,43 @@ func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 		t.Fatalf("expected custom scaffold to compile and run go test, require author body, and report redPassed=false greenPassed=false, got %+v", p2)
 	}
 }
+
+func TestDetectBlindSpot_PrematureSnapshotFailedFromTrace(t *testing.T) {
+	runDir := t.TempDir()
+	runJSON := `{
+  "scenario": "synthetic-self-test: premature-snapshot-failed",
+  "outcomes": {"failed": 1},
+  "invariantViolations": {},
+  "totalInvariantViolations": 0,
+  "migrations": [{"app": "redis", "pod": "redis-0", "pmj": "pmj-snap-0", "snapshotName": "ps-snap-0", "outcome": "failed", "phase": "Failed"}]
+}`
+	ndjson := strings.Join([]string{
+		`{"ts":"2026-09-28T02:00:00Z","type":"add","gvr":"podsnapshots.v1.podsnapshot.gke.io","obj":{"metadata":{"name":"ps-snap-0","namespace":"default"},"status":{"conditions":[{"type":"Ready","status":"False","reason":"CheckpointFailed"},{"type":"Checkpoint","status":"False","reason":"InProgress"},{"type":"StorageReplicated","status":"False","reason":"Pending"}]}}}`,
+		`{"ts":"2026-09-28T02:00:01Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-snap-0","namespace":"default"},"spec":{"podRef":{"name":"redis-0"}},"status":{"phase":"Failed","snapshotRef":"ps-snap-0","conditions":[{"type":"Completed","status":"True","reason":"SnapshotFailed"}]}}}`,
+	}, "\n") + "\n"
+
+	if err := os.WriteFile(filepath.Join(runDir, "run.json"), []byte(runJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "records.ndjson"), []byte(ndjson), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := DetectBlindSpots(runDir, "I13", false)
+	if err != nil {
+		t.Fatalf("DetectBlindSpots failed: %v", err)
+	}
+	if len(findings) != 1 || findings[0].Template != TemplatePrematureSnapshotFailed {
+		t.Fatalf("expected 1 finding with TemplatePrematureSnapshotFailed, got %+v", findings)
+	}
+	if len(findings[0].Snapshot.PrimarySnapshotConditions) != 3 {
+		t.Fatalf("expected 3 PrimarySnapshotConditions extracted from podsnapshots trace event, got %+v", findings[0].Snapshot.PrimarySnapshotConditions)
+	}
+	proof, err := SynthesizeAndVerify(findings[0], t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify failed: %v", err)
+	}
+	if !proof.CompiledAndTested || !proof.RedPassed || !proof.GreenPassed {
+		t.Fatalf("expected compiled go test RED and GREEN to pass for premature-snapshot-failed trace, got %+v", proof)
+	}
+}
+

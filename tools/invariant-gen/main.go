@@ -61,10 +61,14 @@ const (
 	// PMJ is still in PhaseRestoring.
 	TemplateUnintendedColdStartActivePMJ TemplateClass = "unintended-cold-start-active-pmj"
 
-	// TemplateCustomScaffold is emitted when a blind spot (such as PodSnapshot
-	// sub-condition races that are not yet fields on invariants.ReconcileSnapshot)
-	// or a novel /extract-invariant directive requires a human/agent author to
-	// supply the predicate body (and any needed ReconcileSnapshot fields).
+	// TemplatePrematureSnapshotFailed catches PMJs that transitioned to PhaseFailed
+	// with Reason=SnapshotFailed while PrimarySnapshotConditions shows Ready=False
+	// alongside an in-progress Checkpoint or StorageReplicated sub-condition.
+	TemplatePrematureSnapshotFailed TemplateClass = "premature-snapshot-failed"
+
+	// TemplateCustomScaffold is emitted when a blind spot or novel
+	// /extract-invariant directive requires a human/agent author to supply the
+	// predicate body.
 	TemplateCustomScaffold TemplateClass = "custom-invariant-scaffold"
 )
 
@@ -151,14 +155,17 @@ type K8sPod struct {
 // in controller/internal/invariants/snapshot.go so generated fixtures unmarshal
 // directly into invariants.ReconcileSnapshot during `go test`.
 type ReconcileSnapshotJSON struct {
-	Now                          string   `json:"Now"`
-	Reconciler                   string   `json:"Reconciler"`
-	PrimaryPMJ                   *K8sPMJ  `json:"PrimaryPMJ,omitempty"`
-	PrimaryPod                   *K8sPod  `json:"PrimaryPod,omitempty"`
-	NamespacePMJs                []K8sPMJ `json:"NamespacePMJs,omitempty"`
-	NamespacePods                []K8sPod `json:"NamespacePods,omitempty"`
-	HasOrphanedTrigger           bool     `json:"HasOrphanedTrigger,omitempty"`
-	RestoreCrashSignatureMatched bool     `json:"RestoreCrashSignatureMatched,omitempty"`
+	Now                          string         `json:"Now"`
+	Reconciler                   string         `json:"Reconciler"`
+	PrimaryPMJ                   *K8sPMJ        `json:"PrimaryPMJ,omitempty"`
+	PrimaryPod                   *K8sPod        `json:"PrimaryPod,omitempty"`
+	NamespacePMJs                []K8sPMJ       `json:"NamespacePMJs,omitempty"`
+	NamespacePods                []K8sPod       `json:"NamespacePods,omitempty"`
+	PodListFailed                bool           `json:"PodListFailed,omitempty"`
+	PMJListFailed                bool           `json:"PMJListFailed,omitempty"`
+	HasOrphanedTrigger           bool           `json:"HasOrphanedTrigger,omitempty"`
+	RestoreCrashSignatureMatched bool           `json:"RestoreCrashSignatureMatched,omitempty"`
+	PrimarySnapshotConditions    []K8sCondition `json:"PrimarySnapshotConditions,omitempty"`
 }
 
 // BlindSpotFinding describes a single blind spot where pmprofiler observed an
@@ -529,6 +536,14 @@ func classifyBlindSpot(m pmMigrationJSON, snap ReconcileSnapshotJSON) (TemplateC
 				fmt.Sprintf("PMJ %q remained in PhaseEvicting >=30s after source pod %q was deleted with no replacement pod bound",
 					pmj.Metadata.Name, pmj.Spec.PodRef.Name)
 		}
+		// 4. PrematureSnapshotFailed:
+		if pmj.Status.Phase == "Failed" && hasPrematureSnapshotFailure(pmj.Status.Conditions, snap.PrimarySnapshotConditions) {
+			return TemplatePrematureSnapshotFailed,
+				"SnapshotSubconditionConsistency",
+				"premature_snapshot_failed",
+				fmt.Sprintf("PMJ %q transitioned to PhaseFailed (SnapshotFailed) while PodSnapshot %q still had an in-progress sub-condition",
+					pmj.Metadata.Name, pmj.Status.SnapshotRef)
+		}
 	}
 
 	return TemplateCustomScaffold,
@@ -536,6 +551,39 @@ func classifyBlindSpot(m pmMigrationJSON, snap ReconcileSnapshotJSON) (TemplateC
 		"custom_blind_spot",
 		fmt.Sprintf("Unhealthy migration outcome %q observed on PMJ %q with 0 existing I1-I9 violations (requires author predicate over ReconcileSnapshot)",
 			m.Outcome, derefStr(m.PMJ))
+}
+
+func hasPrematureSnapshotFailure(pmjConds []K8sCondition, snapConds []K8sCondition) bool {
+	if len(snapConds) == 0 {
+		return false
+	}
+	pmjSnapshotFailed := false
+	for _, c := range pmjConds {
+		if c.Reason == "SnapshotFailed" {
+			pmjSnapshotFailed = true
+			break
+		}
+	}
+	if !pmjSnapshotFailed {
+		return false
+	}
+	subInProgress := false
+	for _, c := range snapConds {
+		if (c.Type == "Checkpoint" || c.Type == "StorageReplicated") && c.Status == "False" && isSnapshotSubconditionInProgress(c.Reason) {
+			subInProgress = true
+			break
+		}
+	}
+	return subInProgress
+}
+
+func isSnapshotSubconditionInProgress(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "inprogress", "pending", "running", "uploading", "triggering", "replicating":
+		return true
+	default:
+		return false
+	}
 }
 
 var extractCmdRe = regexp.MustCompile(`(?i)/extract-invariant(?:\s+(I\d+))?(?:\s+([a-z0-9_-]+))?(?:\s+(.*))?`)
@@ -678,6 +726,34 @@ func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, strin
 				Reconciler:    "PodMigrationJobReconciler",
 				PrimaryPMJ:    &pmj,
 				NamespacePMJs: []K8sPMJ{pmj},
+			}
+
+	case strings.Contains(combined, "premature") || strings.Contains(combined, "subcondition") || (strings.Contains(combined, "snapshot") && strings.Contains(combined, "failed")):
+		pmj := K8sPMJ{
+			Metadata: K8sObjectMeta{Name: "pmj-snap-race-0", Namespace: "default", UID: "uid-pmj-snap-race"},
+			Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "app-0"}, TargetPodUID: "uid-app-0"},
+			Status: K8sPMJStatus{
+				Phase:       "Failed",
+				SnapshotRef: "ps-race-0",
+				Conditions: []K8sCondition{
+					{Type: "Ready", Status: "False", Reason: "SnapshotFailed", Message: "GKE PodSnapshot Ready failed (Failed)"},
+				},
+			},
+		}
+		snapConds := []K8sCondition{
+			{Type: "Ready", Status: "False", Reason: "Failed"},
+			{Type: "Checkpoint", Status: "False", Reason: "InProgress"},
+		}
+		return TemplatePrematureSnapshotFailed,
+			"SnapshotSubconditionConsistency",
+			"premature_snapshot_failed",
+			"failed",
+			ReconcileSnapshotJSON{
+				Now:                       now,
+				Reconciler:                "PodMigrationJobReconciler",
+				PrimaryPMJ:                &pmj,
+				NamespacePMJs:             []K8sPMJ{pmj},
+				PrimarySnapshotConditions: snapConds,
 			}
 
 	default:
@@ -1035,14 +1111,16 @@ func ReconstructAllTraceSnapshots(recordsPath string) ([]ReconcileSnapshotJSON, 
 }
 
 type traceState struct {
-	pmjs map[string]K8sPMJ
-	pods map[string]K8sPod
+	pmjs      map[string]K8sPMJ
+	pods      map[string]K8sPod
+	snapshots map[string][]K8sCondition
 }
 
 func newTraceState() *traceState {
 	return &traceState{
-		pmjs: make(map[string]K8sPMJ),
-		pods: make(map[string]K8sPod),
+		pmjs:      make(map[string]K8sPMJ),
+		pods:      make(map[string]K8sPod),
+		snapshots: make(map[string][]K8sCondition),
 	}
 }
 
@@ -1117,6 +1195,13 @@ func (s *traceState) apply(rec rawNDJSONRecord) {
 			},
 		}
 		s.pods[name] = p
+
+	case strings.HasPrefix(rec.GVR, "podsnapshots."):
+		if rec.Type == "delete" {
+			delete(s.snapshots, name)
+			return
+		}
+		s.snapshots[name] = extractConditions(rec.Obj)
 	}
 }
 
@@ -1155,16 +1240,24 @@ func (s *traceState) snapshotForPMJ(ts string, pmj K8sPMJ) ReconcileSnapshotJSON
 	}
 	sort.Slice(nsPods, func(i, j int) bool { return nsPods[i].Metadata.Name < nsPods[i].Metadata.Name })
 
+	var snapConds []K8sCondition
+	if pmj.Status.SnapshotRef != "" {
+		if conds, ok := s.snapshots[pmj.Status.SnapshotRef]; ok && len(conds) > 0 {
+			snapConds = append([]K8sCondition(nil), conds...)
+		}
+	}
+
 	if ts == "" {
 		ts = "2026-09-28T12:00:00Z"
 	}
 	return ReconcileSnapshotJSON{
-		Now:           ts,
-		Reconciler:    "PodMigrationJobReconciler",
-		PrimaryPMJ:    &cpPMJ,
-		PrimaryPod:    primaryPod,
-		NamespacePMJs: nsPMJs,
-		NamespacePods: nsPods,
+		Now:                       ts,
+		Reconciler:                "PodMigrationJobReconciler",
+		PrimaryPMJ:                &cpPMJ,
+		PrimaryPod:                primaryPod,
+		NamespacePMJs:             nsPMJs,
+		NamespacePods:             nsPods,
+		PrimarySnapshotConditions: snapConds,
 	}
 }
 
@@ -1261,6 +1354,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
@@ -1287,6 +1381,7 @@ func %s(s *ReconcileSnapshot) []Violation {
 	_ = strings.TrimSpace
 	_ = time.Second
 	_ = corev1.ConditionTrue
+	_ = metav1.ConditionFalse
 	_ = pmv1alpha1.PodMigrationJobPhaseRestoring
 %s
 }
@@ -1300,11 +1395,12 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 	switch f.Template {
 	case TemplateWedgedRestoringOrphan:
 		return `	// RestoringReplacementLiveness: when a PMJ has remained in PhaseRestoring
-	// for >=30s with a bound RestoredPodName, that replacement pod must still
-	// exist and be non-deleting in the namespace (including single-pod namespaces
-	// where NamespacePods is empty after source eviction; see Issue #88 for
-	// adding PodListFailed to ReconcileSnapshot).
-	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
+	// for >=30s with a bound RestoredPodName and !s.PodListFailed, that replacement
+	// pod must still exist and be non-deleting in the namespace (including single-pod
+	// namespaces where NamespacePods is empty after source eviction).
+	if !s.PodListFailed &&
+		(s.Reconciler == "" || s.Reconciler == "PodMigrationJobReconciler") &&
+		pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
 		pmj.Status.RestoredPodName != "" &&
 		pmj.Status.RestoringStartTime != nil &&
 		!s.Now.IsZero() &&
@@ -1339,11 +1435,12 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 
 	case TemplateNoReplacementEvictingStall:
 		return `	// EvictingNoReplacementLiveness: when a PMJ has remained in PhaseEvicting
-	// for >=30s with no RestoredPodName bound and the source pod is already gone
-	// or deleting (including single-pod namespaces where NamespacePods is empty
-	// after source eviction; see Issue #88 for adding PodListFailed to ReconcileSnapshot),
-	// the migration is stalled.
-	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
+	// for >=30s with no RestoredPodName bound, !s.PodListFailed, and the source
+	// pod is already gone or deleting (including single-pod namespaces where
+	// NamespacePods is empty after source eviction), the migration is stalled.
+	if !s.PodListFailed &&
+		(s.Reconciler == "" || s.Reconciler == "PodMigrationJobReconciler") &&
+		pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
 		pmj.Status.RestoredPodName == "" &&
 		pmj.Status.EvictingStartTime != nil &&
 		!s.Now.IsZero() &&
@@ -1409,11 +1506,41 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 	}
 	return nil`
 
+	case TemplatePrematureSnapshotFailed:
+		return `	// SnapshotSubconditionConsistency: a PMJ must not transition to PhaseFailed
+	// with Reason=SnapshotFailed while PrimarySnapshotConditions reports an
+	// active in-progress Checkpoint or StorageReplicated sub-condition (#75, #88).
+	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed && len(s.PrimarySnapshotConditions) > 0 {
+		snapshotFailed := false
+		for _, c := range pmj.Status.Conditions {
+			if c.Reason == "SnapshotFailed" {
+				snapshotFailed = true
+				break
+			}
+		}
+		if snapshotFailed {
+			for _, sc := range s.PrimarySnapshotConditions {
+				if (sc.Type == "Checkpoint" || sc.Type == "StorageReplicated") && sc.Status == metav1.ConditionFalse {
+					r := strings.ToLower(strings.TrimSpace(sc.Reason))
+					if r == "inprogress" || r == "pending" || r == "running" || r == "uploading" || r == "triggering" || r == "replicating" {
+						return []Violation{{
+							InvariantID:   "` + f.InvariantID + `",
+							InvariantName: "` + f.InvariantName + `",
+							Reason:        "PrematureSnapshotFailedWhileSubconditionInProgress",
+							Message:       fmt.Sprintf("PMJ %s/%s failed with SnapshotFailed while PodSnapshot %q sub-condition %s=%s (Reason=%s) was still in progress", pmj.Namespace, pmj.Name, pmj.Status.SnapshotRef, sc.Type, sc.Status, sc.Reason),
+							Namespace:     pmj.Namespace,
+							PMJName:       pmj.Name,
+							PodName:       pmj.Spec.PodRef.Name,
+						}}
+					}
+				}
+			}
+		}
+	}
+	return nil`
+
 	default:
 		return `	// TODO(invariant-author): implement pure predicate for ` + f.InvariantID + ` (` + f.InvariantName + `).
-	// If this invariant inspects external CRD sub-conditions not yet present on
-	// ReconcileSnapshot (e.g. PodSnapshot Checkpoint/StorageReplicated conditions; see Issue #88),
-	// extend ReconcileSnapshot in snapshot.go within an authorized co-change PR.
 	_ = pmj
 	return nil`
 	}

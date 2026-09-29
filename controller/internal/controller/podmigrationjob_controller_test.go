@@ -7211,3 +7211,143 @@ func TestPodMigrationJobReconciler_Evicting_PhaseTimeout_AfterExtendedSnapshot(t
 		t.Errorf("Expected Ready condition Reason=Timeout, got %+v", cond)
 	}
 }
+
+type snapshotCaptureRule struct {
+	captured *invariants.ReconcileSnapshot
+}
+
+func (r *snapshotCaptureRule) ID() string   { return "TEST" }
+func (r *snapshotCaptureRule) Name() string { return "SnapshotCapture" }
+func (r *snapshotCaptureRule) Evaluate(s *invariants.ReconcileSnapshot) []invariants.Violation {
+	cp := *s
+	r.captured = &cp
+	return nil
+}
+
+func TestPodMigrationJobReconciler_EvaluateInvariants_PopulatesListFailedAndPodSnapshotConditions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "redis-snap-cond"
+	targetUID := "uid-snap-cond"
+	jobName := util.FormatPMJName(podName, targetUID)
+	triggerName := util.FormatPSMTName(podName, targetUID)
+	snapName := "ps-snap-cond-1"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: targetUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseFailed,
+		},
+	}
+
+	trigger := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "podsnapshot.gke.io/v1",
+			"kind":       "PodSnapshotManualTrigger",
+			"metadata": map[string]any{
+				"namespace": namespace,
+				"name":      triggerName,
+			},
+			"status": map[string]any{
+				"snapshotCreated": map[string]any{
+					"name": snapName,
+				},
+			},
+		},
+	}
+	podSnapshot := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "podsnapshot.gke.io/v1",
+			"kind":       "PodSnapshot",
+			"metadata": map[string]any{
+				"namespace": namespace,
+				"name":      snapName,
+			},
+			"status": map[string]any{
+				"conditions": []any{
+					map[string]any{
+						"type":               "Checkpoint",
+						"status":             "False",
+						"reason":             "InProgress",
+						"message":            "Checkpointing memory pages",
+						"lastTransitionTime": "2026-09-28T12:00:00Z",
+					},
+					map[string]any{
+						"type":   "StorageReplicated",
+						"status": "False",
+						"reason": "Pending",
+					},
+				},
+			},
+		},
+	}
+
+	failLists := false
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj, trigger, podSnapshot).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, client client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if failLists {
+					return fmt.Errorf("simulated informer cache list failure")
+				}
+				return client.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+
+	capture := &snapshotCaptureRule{}
+	eng := invariants.NewEngine(invariants.ModeObserve, nil)
+	eng.Rules = []invariants.Rule{capture}
+
+	r := &PodMigrationJobReconciler{
+		Client:          fakeClient,
+		Scheme:          scheme,
+		InvariantEngine: eng,
+	}
+
+	// 1. Healthy list + fallback from PodSnapshotManualTrigger.status.snapshotCreated.name -> PodSnapshot conditions extracted.
+	var recErr error
+	var res ctrl.Result
+	r.evaluateInvariants(context.Background(), pmj, &res, &recErr)
+	if capture.captured == nil {
+		t.Fatalf("expected evaluateInvariants to invoke Engine.Evaluate")
+	}
+	if capture.captured.PodListFailed || capture.captured.PMJListFailed {
+		t.Fatalf("expected PodListFailed=false and PMJListFailed=false on healthy list, got pod=%v pmj=%v",
+			capture.captured.PodListFailed, capture.captured.PMJListFailed)
+	}
+	if len(capture.captured.PrimarySnapshotConditions) != 2 {
+		t.Fatalf("expected 2 PrimarySnapshotConditions extracted from PodSnapshot, got %+v",
+			capture.captured.PrimarySnapshotConditions)
+	}
+	if capture.captured.PrimarySnapshotConditions[0].Type != "Checkpoint" ||
+		capture.captured.PrimarySnapshotConditions[0].Reason != "InProgress" {
+		t.Fatalf("unexpected PrimarySnapshotConditions[0]: %+v", capture.captured.PrimarySnapshotConditions[0])
+	}
+
+	// 2. Simulated List failure -> PodListFailed=true and PMJListFailed=true populated on ReconcileSnapshot.
+	failLists = true
+	capture.captured = nil
+	pmj.Status.SnapshotRef = snapName
+	r.evaluateInvariants(context.Background(), pmj, &res, &recErr)
+	if capture.captured == nil {
+		t.Fatalf("expected evaluateInvariants to invoke Engine.Evaluate when List fails")
+	}
+	if !capture.captured.PodListFailed || !capture.captured.PMJListFailed {
+		t.Fatalf("expected PodListFailed=true and PMJListFailed=true when List errors, got pod=%v pmj=%v",
+			capture.captured.PodListFailed, capture.captured.PMJListFailed)
+	}
+}
+

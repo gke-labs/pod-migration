@@ -546,4 +546,96 @@ func TestGKEProvider_CheckStatus(t *testing.T) {
 			t.Errorf("expected Reason=SnapshotTriggerFailed, got %s", status.Reason)
 		}
 	})
+
+	t.Run("PodSnapshot_Refused_FastFail", func(t *testing.T) {
+		trigger := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshotManualTrigger",
+				"metadata": map[string]interface{}{
+					"name":      triggerName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"snapshotCreated": map[string]interface{}{
+						"name": snapshotName,
+					},
+				},
+			},
+		}
+		// An engine that declines the pod marks both Checkpoint and Ready False with reason Refused.
+		refusal := "pod has 2 containers; only single-container pods are supported"
+		snapshot := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshot",
+				"metadata": map[string]interface{}{
+					"name":      snapshotName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{
+							"type":    "Checkpoint",
+							"status":  "False",
+							"reason":  "Refused",
+							"message": refusal,
+						},
+						map[string]interface{}{
+							"type":    "Ready",
+							"status":  "False",
+							"reason":  "Refused",
+							"message": refusal,
+						},
+					},
+				},
+			},
+		}
+
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(trigger, snapshot).Build()
+		provider := NewGKEProvider(client, scheme)
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
+			Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "pod-uid-456"},
+		}
+		status, err := provider.CheckStatus(context.Background(), job, "test-pod")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status.Phase != PhaseFailed {
+			t.Fatalf("expected PhaseFailed for Refused, got %v", status.Phase)
+		}
+		if status.Reason != "SnapshotFailed" {
+			t.Errorf("expected Reason=SnapshotFailed, got %s", status.Reason)
+		}
+		if !strings.Contains(status.Message, "Refused") || !strings.Contains(status.Message, refusal) {
+			t.Errorf("expected message to contain the Refused reason and the engine's message, got %s", status.Message)
+		}
+	})
+}
+
+func TestIsTerminalSnapshotFailureReason(t *testing.T) {
+	tests := []struct {
+		reason string
+		want   bool
+	}{
+		{reason: "Failed", want: true},
+		{reason: "Error", want: true},
+		{reason: "DeadlineExceeded", want: true},
+		{reason: "Refused", want: true},
+		{reason: "refused", want: true},
+		{reason: "", want: false},
+		{reason: "NoError", want: false},
+		{reason: "NotReady", want: false},
+		{reason: "NonTerminal", want: false},
+		{reason: "Pending", want: false},
+		{reason: "Succeeded", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.reason, func(t *testing.T) {
+			if got := isTerminalSnapshotFailureReason(tc.reason); got != tc.want {
+				t.Errorf("isTerminalSnapshotFailureReason(%q) = %v, want %v", tc.reason, got, tc.want)
+			}
+		})
+	}
 }
