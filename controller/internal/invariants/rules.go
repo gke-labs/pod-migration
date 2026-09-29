@@ -52,7 +52,7 @@ const (
 	GateReleaseGraceWindow = 30 * time.Second
 )
 
-// DefaultRules is the canonical ordered registry of the 9 Core Invariants (I1-I9).
+// DefaultRules is the canonical ordered registry of the Core & Evolved Invariants (I1-I10).
 var DefaultRules = []Rule{
 	funcRule{id: "I1", name: "AtMostOnceRestore", fn: EvaluateI1},
 	funcRule{id: "I2", name: "NoSilentColdStart", fn: EvaluateI2},
@@ -63,6 +63,7 @@ var DefaultRules = []Rule{
 	funcRule{id: "I7", name: "DisruptionBoundingPDBCompliance", fn: EvaluateI7},
 	funcRule{id: "I8", name: "PlatformAndControlPlaneIsolation", fn: EvaluateI8},
 	funcRule{id: "I9", name: "DeterministicFallbackOverCrashloop", fn: EvaluateI9},
+	RuleI10(),
 }
 
 func allPMJs(s *ReconcileSnapshot) []pmv1alpha1.PodMigrationJob {
