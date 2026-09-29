@@ -79,7 +79,8 @@ type Violation struct {
 	Namespace           string
 	PMJName             string
 	PodName             string
-	ConsecutiveRequired int // Optional per-violation consecutive samples required before strict abort (>0)
+	ConsecutiveRequired int           // Optional per-violation consecutive samples required before strict abort (>0)
+	DurationRequired    time.Duration // Optional per-violation minimum duration required before strict abort (>0)
 }
 
 // Rule is a pure, stateless predicate over a ReconcileSnapshot.
@@ -90,31 +91,42 @@ type Rule interface {
 }
 
 // DebouncedRule is an optional interface implemented by Invariant Rules
-// that require multiple consecutive reconcile samples detecting a violation
-// before escalating to strict mode abort.
+// that require multiple consecutive reconcile samples and a minimum elapsed
+// duration detecting a violation before escalating to strict mode abort.
 type DebouncedRule interface {
 	Rule
 	ConsecutiveSamples() int
+	MinimumDuration() time.Duration
 }
 
 type debouncedRule struct {
 	Rule
-	consecutive int
+	consecutive     int
+	minimumDuration time.Duration
 }
 
 func (r debouncedRule) ConsecutiveSamples() int {
 	return r.consecutive
 }
 
+func (r debouncedRule) MinimumDuration() time.Duration {
+	return r.minimumDuration
+}
+
 // NewDebouncedRule wraps an existing Rule to require N consecutive reconcile samples
-// before strict mode triggers failure. If consecutive < 1, it defaults to 1.
-func NewDebouncedRule(r Rule, consecutive int) DebouncedRule {
+// and a minimum duration since first observation before strict mode triggers failure.
+// If consecutive < 1, it defaults to 1. If minDuration < 0, it defaults to 0.
+func NewDebouncedRule(r Rule, consecutive int, minDuration time.Duration) DebouncedRule {
 	if consecutive < 1 {
 		consecutive = 1
 	}
+	if minDuration < 0 {
+		minDuration = 0
+	}
 	return debouncedRule{
-		Rule:        r,
-		consecutive: consecutive,
+		Rule:            r,
+		consecutive:     consecutive,
+		minimumDuration: minDuration,
 	}
 }
 

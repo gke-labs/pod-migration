@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -33,9 +34,11 @@ type Engine struct {
 	Rules    []Rule
 	Recorder record.EventRecorder
 
-	mu                sync.Mutex
-	activeViolations  map[string]map[string]string // scopeKey -> violationKey -> message
-	consecutiveCounts map[string]map[string]int    // subjectKey -> invariantID -> consecutive count
+	mu                   sync.Mutex
+	activeViolations     map[string]map[string]string    // scopeKey -> violationKey -> message
+	consecutiveCounts    map[string]map[string]int        // subjectKey -> invariantID -> consecutive count
+	consecutiveFirstSeen map[string]map[string]time.Time  // subjectKey -> invariantID -> first seen timestamp
+	consecutiveEscalated map[string]map[string]bool       // subjectKey -> invariantID -> whether escalation event was emitted
 }
 
 // NewEngine constructs an invariant Engine with DefaultRules.
@@ -44,11 +47,13 @@ func NewEngine(mode Mode, recorder record.EventRecorder) *Engine {
 		mode = ModeDisabled
 	}
 	return &Engine{
-		Mode:              mode,
-		Rules:             DefaultRules,
-		Recorder:          recorder,
-		activeViolations:  make(map[string]map[string]string),
-		consecutiveCounts: make(map[string]map[string]int),
+		Mode:                 mode,
+		Rules:                DefaultRules,
+		Recorder:             recorder,
+		activeViolations:     make(map[string]map[string]string),
+		consecutiveCounts:    make(map[string]map[string]int),
+		consecutiveFirstSeen: make(map[string]map[string]time.Time),
+		consecutiveEscalated: make(map[string]map[string]bool),
 	}
 }
 
@@ -65,12 +70,22 @@ func (e *Engine) ForgetObject(reconciler, kind, namespace, name string) {
 		return
 	}
 	scopeKey := fmt.Sprintf("%s/%s/%s/%s", reconciler, kind, namespace, name)
-	target := fmt.Sprintf("%s/%s", namespace, name)
+	prefix := scopeKey + "/"
 	e.mu.Lock()
 	delete(e.activeViolations, scopeKey)
 	for k := range e.consecutiveCounts {
-		if strings.Contains(k, target) {
+		if k == scopeKey || strings.HasPrefix(k, prefix) {
 			delete(e.consecutiveCounts, k)
+		}
+	}
+	for k := range e.consecutiveFirstSeen {
+		if k == scopeKey || strings.HasPrefix(k, prefix) {
+			delete(e.consecutiveFirstSeen, k)
+		}
+	}
+	for k := range e.consecutiveEscalated {
+		if k == scopeKey || strings.HasPrefix(k, prefix) {
+			delete(e.consecutiveEscalated, k)
 		}
 	}
 	e.mu.Unlock()
@@ -85,6 +100,8 @@ func (e *Engine) ResetDeduplication() {
 	defer e.mu.Unlock()
 	e.activeViolations = make(map[string]map[string]string)
 	e.consecutiveCounts = make(map[string]map[string]int)
+	e.consecutiveFirstSeen = make(map[string]map[string]time.Time)
+	e.consecutiveEscalated = make(map[string]map[string]bool)
 }
 
 // ConsecutiveCount returns the consecutive violation sample count for a subject key and invariant ID.
@@ -99,6 +116,20 @@ func (e *Engine) ConsecutiveCount(subjectKey, invariantID string) int {
 		return 0
 	}
 	return e.consecutiveCounts[subjectKey][invariantID]
+}
+
+// FirstSeen returns the first-seen timestamp for a subject key and invariant ID.
+// Used primarily for verification and testing.
+func (e *Engine) FirstSeen(subjectKey, invariantID string) time.Time {
+	if e == nil {
+		return time.Time{}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.consecutiveFirstSeen == nil {
+		return time.Time{}
+	}
+	return e.consecutiveFirstSeen[subjectKey][invariantID]
 }
 
 func snapshotScopeKey(s *ReconcileSnapshot) string {
@@ -121,31 +152,19 @@ func debounceSubjectKey(s *ReconcileSnapshot) string {
 	if s == nil {
 		return ""
 	}
-	if s.PrimaryPMJ != nil {
-		if s.PrimaryPMJ.UID != "" {
-			return string(s.PrimaryPMJ.UID)
-		}
-		if s.PrimaryPMJ.Namespace != "" || s.PrimaryPMJ.Name != "" {
-			return fmt.Sprintf("pmj/%s/%s", s.PrimaryPMJ.Namespace, s.PrimaryPMJ.Name)
-		}
+	scopeKey := snapshotScopeKey(s)
+	var uid string
+	if s.PrimaryPMJ != nil && s.PrimaryPMJ.UID != "" {
+		uid = string(s.PrimaryPMJ.UID)
+	} else if s.PrimaryPod != nil && s.PrimaryPod.UID != "" {
+		uid = string(s.PrimaryPod.UID)
+	} else if s.PrimaryMigration != nil && s.PrimaryMigration.UID != "" {
+		uid = string(s.PrimaryMigration.UID)
 	}
-	if s.PrimaryPod != nil {
-		if s.PrimaryPod.UID != "" {
-			return string(s.PrimaryPod.UID)
-		}
-		if s.PrimaryPod.Namespace != "" || s.PrimaryPod.Name != "" {
-			return fmt.Sprintf("pod/%s/%s", s.PrimaryPod.Namespace, s.PrimaryPod.Name)
-		}
+	if uid != "" {
+		return fmt.Sprintf("%s/%s", scopeKey, uid)
 	}
-	if s.PrimaryMigration != nil {
-		if s.PrimaryMigration.UID != "" {
-			return string(s.PrimaryMigration.UID)
-		}
-		if s.PrimaryMigration.Namespace != "" || s.PrimaryMigration.Name != "" {
-			return fmt.Sprintf("mig/%s/%s", s.PrimaryMigration.Namespace, s.PrimaryMigration.Name)
-		}
-	}
-	return fmt.Sprintf("global/%s", s.Reconciler)
+	return scopeKey
 }
 
 func isPMJTerminal(pmj *pmv1alpha1.PodMigrationJob) bool {
@@ -166,16 +185,32 @@ func violationDedupKey(v Violation) string {
 	return fmt.Sprintf("%s/%s/%s/%s/%s", v.InvariantID, v.Reason, v.Namespace, v.PMJName, v.PodName)
 }
 
-func violationThreshold(v Violation, r Rule) int {
-	if v.ConsecutiveRequired > 0 {
-		return v.ConsecutiveRequired
-	}
+func violationThreshold(v Violation, r Rule) (int, time.Duration) {
+	count := 1
+	var minDuration time.Duration
+
 	if dr, ok := r.(DebouncedRule); ok {
 		if c := dr.ConsecutiveSamples(); c > 0 {
-			return c
+			count = c
+		}
+		if d := dr.MinimumDuration(); d > 0 {
+			minDuration = d
 		}
 	}
-	return 1
+
+	// Per-violation overrides take precedence if set.
+	if v.ConsecutiveRequired > 0 {
+		count = v.ConsecutiveRequired
+	}
+	if v.DurationRequired > 0 {
+		minDuration = v.DurationRequired
+	}
+
+	return count, minDuration
+}
+
+func isDegraded(s *ReconcileSnapshot) bool {
+	return s != nil && (s.PodListFailed || s.PMJListFailed)
 }
 
 // Evaluate runs all registered invariant rules against s.
@@ -203,6 +238,11 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 
 	scopeKey := snapshotScopeKey(s)
 	subjKey := debounceSubjectKey(s)
+	degraded := isDegraded(s)
+	now := s.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
 
 	e.mu.Lock()
 	if e.activeViolations == nil {
@@ -211,15 +251,29 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 	if e.consecutiveCounts == nil {
 		e.consecutiveCounts = make(map[string]map[string]int)
 	}
+	if e.consecutiveFirstSeen == nil {
+		e.consecutiveFirstSeen = make(map[string]map[string]time.Time)
+	}
+	if e.consecutiveEscalated == nil {
+		e.consecutiveEscalated = make(map[string]map[string]bool)
+	}
 
 	// Terminal PMJ: clear debounce state for this subject so terminal jobs do not persist counts.
 	if s.PrimaryPMJ != nil && isPMJTerminal(s.PrimaryPMJ) {
 		delete(e.consecutiveCounts, subjKey)
+		delete(e.consecutiveFirstSeen, subjKey)
+		delete(e.consecutiveEscalated, subjKey)
 	}
 
 	if len(violations) == 0 {
 		delete(e.activeViolations, scopeKey)
-		delete(e.consecutiveCounts, subjKey)
+		// Only clear debounce counters if this sample was not degraded by informer list errors.
+		// A flapping list failure must not reset the debounce persistence of an active wedge.
+		if !degraded {
+			delete(e.consecutiveCounts, subjKey)
+			delete(e.consecutiveFirstSeen, subjKey)
+			delete(e.consecutiveEscalated, subjKey)
+		}
 		e.mu.Unlock()
 		return nil, false
 	}
@@ -233,6 +287,8 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 	if _, exists := e.consecutiveCounts[subjKey]; !exists && len(e.consecutiveCounts) >= maxActiveViolationScopes {
 		for k := range e.consecutiveCounts {
 			delete(e.consecutiveCounts, k)
+			delete(e.consecutiveFirstSeen, k)
+			delete(e.consecutiveEscalated, k)
 			break
 		}
 	}
@@ -251,7 +307,7 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 
 	// Debounce persistence tracking:
 	// Update consecutive counters for active invariants on non-terminal subjects.
-	// Invariants that evaluated clean on this sample are reset to 0.
+	// Invariants that evaluated clean on this sample are reset to 0, unless the sample is degraded.
 	activeInvIDs := make(map[string]bool, len(violations))
 	for _, v := range violations {
 		activeInvIDs[v.InvariantID] = true
@@ -261,20 +317,36 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 	if subjCounts == nil {
 		subjCounts = make(map[string]int)
 		e.consecutiveCounts[subjKey] = subjCounts
-	} else {
+	}
+	subjFirstSeen := e.consecutiveFirstSeen[subjKey]
+	if subjFirstSeen == nil {
+		subjFirstSeen = make(map[string]time.Time)
+		e.consecutiveFirstSeen[subjKey] = subjFirstSeen
+	}
+	subjEscalated := e.consecutiveEscalated[subjKey]
+	if subjEscalated == nil {
+		subjEscalated = make(map[string]bool)
+		e.consecutiveEscalated[subjKey] = subjEscalated
+	}
+
+	if !degraded {
 		for invID := range subjCounts {
 			if !activeInvIDs[invID] {
 				delete(subjCounts, invID)
+				delete(subjFirstSeen, invID)
+				delete(subjEscalated, invID)
 			}
 		}
 	}
 
 	shouldFail := false
 	countedThisReconcile := make(map[string]int, len(violations))
+	elapsedThisReconcile := make(map[string]time.Duration, len(violations))
 	var escalatingViolations []Violation
+
 	for _, v := range violations {
-		threshold := violationThreshold(v, ruleByID[v.InvariantID])
-		if threshold <= 1 {
+		thresholdCount, minDuration := violationThreshold(v, ruleByID[v.InvariantID])
+		if thresholdCount <= 1 && minDuration <= 0 {
 			// Immediate invariant: requires no debounce.
 			if e.Mode == ModeStrict {
 				shouldFail = true
@@ -287,14 +359,35 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 			continue
 		}
 
-		if _, seen := countedThisReconcile[v.InvariantID]; !seen {
-			subjCounts[v.InvariantID]++
-			countedThisReconcile[v.InvariantID] = subjCounts[v.InvariantID]
+		if !degraded {
+			if _, seen := countedThisReconcile[v.InvariantID]; !seen {
+				if subjFirstSeen[v.InvariantID].IsZero() {
+					subjFirstSeen[v.InvariantID] = now
+				}
+				subjCounts[v.InvariantID]++
+				countedThisReconcile[v.InvariantID] = subjCounts[v.InvariantID]
+				elapsedThisReconcile[v.InvariantID] = now.Sub(subjFirstSeen[v.InvariantID])
+			}
+		} else {
+			// Inconclusive degraded sample: neither increment nor reset debounce counters.
+			if _, seen := countedThisReconcile[v.InvariantID]; !seen {
+				countedThisReconcile[v.InvariantID] = subjCounts[v.InvariantID]
+				if !subjFirstSeen[v.InvariantID].IsZero() {
+					elapsedThisReconcile[v.InvariantID] = now.Sub(subjFirstSeen[v.InvariantID])
+				}
+			}
 		}
+
 		count := countedThisReconcile[v.InvariantID]
-		if e.Mode == ModeStrict && count >= threshold {
-			shouldFail = true
-			if count == threshold {
+		elapsed := elapsedThisReconcile[v.InvariantID]
+		thresholdMet := count >= thresholdCount && (minDuration <= 0 || elapsed >= minDuration)
+
+		if thresholdMet {
+			if e.Mode == ModeStrict {
+				shouldFail = true
+			}
+			if !subjEscalated[v.InvariantID] {
+				subjEscalated[v.InvariantID] = true
 				escalatingViolations = append(escalatingViolations, v)
 			}
 		}
@@ -306,7 +399,7 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 		metrics.RecordInvariantViolation(v.InvariantID)
 
 		count := countedThisReconcile[v.InvariantID]
-		threshold := violationThreshold(v, ruleByID[v.InvariantID])
+		thresholdCount, minDuration := violationThreshold(v, ruleByID[v.InvariantID])
 
 		logger.Error(nil, "Invariant violation detected",
 			"invariant", v.InvariantID,
@@ -314,7 +407,8 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 			"reason", v.Reason,
 			"mode", string(e.Mode),
 			"consecutive", count,
-			"threshold", threshold,
+			"thresholdCount", thresholdCount,
+			"minDuration", minDuration.String(),
 			"reconciler", s.Reconciler,
 			"namespace", v.Namespace,
 			"pmj", v.PMJName,
@@ -324,8 +418,14 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 
 		if e.Recorder != nil {
 			msg := fmt.Sprintf("[%s:%s] %s (%s)", v.InvariantID, v.InvariantName, v.Message, v.Reason)
-			if threshold > 1 {
-				msg = fmt.Sprintf("[%s:%s] %s (%s) [sample %d/%d]", v.InvariantID, v.InvariantName, v.Message, v.Reason, count, threshold)
+			if thresholdCount > 1 || minDuration > 0 {
+				if minDuration > 0 {
+					msg = fmt.Sprintf("[%s:%s] %s (%s) [sample %d/%d, min %s]",
+						v.InvariantID, v.InvariantName, v.Message, v.Reason, count, thresholdCount, minDuration)
+				} else {
+					msg = fmt.Sprintf("[%s:%s] %s (%s) [sample %d/%d]",
+						v.InvariantID, v.InvariantName, v.Message, v.Reason, count, thresholdCount)
+				}
 			}
 			if s.PrimaryPMJ != nil {
 				e.Recorder.Event(s.PrimaryPMJ, corev1.EventTypeWarning, EventReasonInvariantViolation, msg)
@@ -341,23 +441,50 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 
 	for _, v := range escalatingViolations {
 		count := countedThisReconcile[v.InvariantID]
-		threshold := violationThreshold(v, ruleByID[v.InvariantID])
-		logger.Error(nil, "Invariant violation escalated to strict mode abort",
-			"invariant", v.InvariantID,
-			"name", v.InvariantName,
-			"reason", v.Reason,
-			"consecutive", count,
-			"threshold", threshold,
-			"reconciler", s.Reconciler,
-			"namespace", v.Namespace,
-			"pmj", v.PMJName,
-			"pod", v.PodName,
-		)
-		if e.Recorder != nil {
-			msg := fmt.Sprintf("[%s:%s] Invariant violation persisted across %d consecutive samples; escalating to strict abort: %s",
-				v.InvariantID, v.InvariantName, count, v.Message)
-			if s.PrimaryPMJ != nil {
-				e.Recorder.Event(s.PrimaryPMJ, corev1.EventTypeWarning, EventReasonInvariantViolation, msg)
+		elapsed := elapsedThisReconcile[v.InvariantID]
+		thresholdCount, minDuration := violationThreshold(v, ruleByID[v.InvariantID])
+
+		if e.Mode == ModeStrict {
+			logger.Error(nil, "Invariant violation escalated to strict mode abort",
+				"invariant", v.InvariantID,
+				"name", v.InvariantName,
+				"reason", v.Reason,
+				"consecutive", count,
+				"elapsed", elapsed.String(),
+				"thresholdCount", thresholdCount,
+				"minDuration", minDuration.String(),
+				"reconciler", s.Reconciler,
+				"namespace", v.Namespace,
+				"pmj", v.PMJName,
+				"pod", v.PodName,
+			)
+			if e.Recorder != nil {
+				msg := fmt.Sprintf("[%s:%s] Invariant violation persisted across %d consecutive samples (elapsed %s); escalating to strict abort: %s",
+					v.InvariantID, v.InvariantName, count, elapsed.Round(time.Millisecond), v.Message)
+				if s.PrimaryPMJ != nil {
+					e.Recorder.Event(s.PrimaryPMJ, corev1.EventTypeWarning, EventReasonInvariantViolation, msg)
+				}
+			}
+		} else {
+			logger.Info("Invariant violation reached debounce threshold (would escalate to strict mode abort)",
+				"invariant", v.InvariantID,
+				"name", v.InvariantName,
+				"reason", v.Reason,
+				"consecutive", count,
+				"elapsed", elapsed.String(),
+				"thresholdCount", thresholdCount,
+				"minDuration", minDuration.String(),
+				"reconciler", s.Reconciler,
+				"namespace", v.Namespace,
+				"pmj", v.PMJName,
+				"pod", v.PodName,
+			)
+			if e.Recorder != nil {
+				msg := fmt.Sprintf("[%s:%s] Invariant violation persisted across %d consecutive samples (elapsed %s); would escalate to strict abort in strict mode: %s",
+					v.InvariantID, v.InvariantName, count, elapsed.Round(time.Millisecond), v.Message)
+				if s.PrimaryPMJ != nil {
+					e.Recorder.Event(s.PrimaryPMJ, corev1.EventTypeWarning, EventReasonInvariantViolation, msg)
+				}
 			}
 		}
 	}
