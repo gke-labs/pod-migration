@@ -20,7 +20,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
@@ -30,9 +32,10 @@ import (
 // to ensure cluster-scoped PodSnapshotStorageConfig and associated policies are
 // cleaned up when the PodMigration CR is deleted.
 const (
-	StorageCleanupFinalizer = "podmigration.gke.io/storage-cleanup"
-	OwnerUIDLabelKey        = "podmigration.gke.io/owner-uid"
-	maxDeletionDeferral     = 10 * time.Minute
+	StorageCleanupFinalizer                = "podmigration.gke.io/storage-cleanup"
+	OwnerUIDLabelKey                       = "podmigration.gke.io/owner-uid"
+	ReasonDuplicatePodMigrationInNamespace = "DuplicatePodMigrationInNamespace"
+	maxDeletionDeferral                    = 10 * time.Minute
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -89,30 +92,14 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if !config.ObjectMeta.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
 			// Check if any in-flight migrations owned by this PodMigration are running in this namespace before deleting storage config
-			var pmjList pmv1alpha1.PodMigrationJobList
-			if err := r.List(ctx, &pmjList, client.InNamespace(req.Namespace)); err != nil {
+			inFlight, err := r.listInFlightMigrations(ctx, config)
+			if err != nil {
 				logger.Error(err, "Failed to list PodMigrationJobs during finalization")
 				return ctrl.Result{}, err
 			}
 
-			var inFlight []string
-			for _, pmj := range pmjList.Items {
-				if !isPMJOwnedByPodMigration(&pmj, config) {
-					continue
-				}
-				switch pmj.Status.Phase {
-				case pmv1alpha1.PodMigrationJobPhaseSucceeded,
-					pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
-					pmv1alpha1.PodMigrationJobPhaseFailed:
-					// Terminal state: safe to ignore
-					continue
-				default:
-					inFlight = append(inFlight, pmj.Name)
-				}
-			}
-
 			if len(inFlight) > 0 {
-				if !config.DeletionTimestamp.IsZero() && time.Since(config.DeletionTimestamp.Time) > maxDeletionDeferral {
+				if deferralExpired(config) {
 					logger.Error(nil, "Deletion deferral exceeded maximum; forcing storage cleanup",
 						"name", config.Name,
 						"namespace", config.Namespace,
@@ -157,6 +144,80 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				logger.Error(err, "Failed to remove finalizer from PodMigration")
 				return ctrl.Result{}, err
 			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Enforce singleton PodMigration per namespace (#60): every PodMigration CR
+	// reconciles a PodSnapshotPolicy with the same selector (pod-migration.gke.io/enabled=true),
+	// so at most one PodMigration CR may be active in a namespace at a time.
+	var migList pmv1alpha1.PodMigrationList
+	if err := r.List(ctx, &migList, client.InNamespace(req.Namespace)); err != nil {
+		logger.Error(err, "Failed to list PodMigrations in namespace")
+		return ctrl.Result{}, err
+	}
+	if active := selectActivePodMigration(migList.Items); active != nil && active.Name != config.Name {
+		deferCleanup := false
+		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
+			inFlight, err := r.listInFlightMigrations(ctx, config)
+			if err != nil {
+				logger.Error(err, "Failed to list PodMigrationJobs during duplicate demotion")
+				return ctrl.Result{}, err
+			}
+			if len(inFlight) > 0 {
+				if deferralExpired(config) {
+					logger.Error(nil, "Demotion deferral exceeded maximum; forcing storage cleanup",
+						"name", config.Name,
+						"namespace", config.Namespace,
+						"inFlight", inFlight)
+					if r.Recorder != nil {
+						r.Recorder.Eventf(config, corev1.EventTypeWarning, "DeletionDeferralTimeout",
+							"Forcing cleanup after %s with %d migration(s) still in flight",
+							maxDeletionDeferral, len(inFlight))
+					}
+				} else {
+					logger.Info("Postponing storage resource cleanup on duplicate PodMigration: active migrations in flight",
+						"name", config.Name,
+						"namespace", config.Namespace,
+						"active", active.Name,
+						"inFlightCount", len(inFlight),
+						"jobs", inFlight)
+					deferCleanup = true
+				}
+			}
+			if !deferCleanup {
+				if err := r.deleteStorageResources(ctx, req.Namespace, req.Name, config.UID); err != nil {
+					logger.Error(err, "Failed to clean up storage resources on duplicate PodMigration")
+					return ctrl.Result{}, err
+				}
+				controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
+				if err := r.Update(ctx, config); err != nil {
+					logger.Error(err, "Failed to remove finalizer from duplicate PodMigration")
+					return ctrl.Result{}, err
+				}
+			}
+		}
+		msg := fmt.Sprintf("Only one PodMigration resource is allowed per namespace; active configuration is %q", active.Name)
+		logger.Info("Skipping reconciliation for duplicate PodMigration in namespace",
+			"name", config.Name, "namespace", config.Namespace, "active", active.Name)
+		changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonDuplicatePodMigrationInNamespace,
+			Message:            msg,
+			ObservedGeneration: config.Generation,
+		})
+		if changed {
+			if r.Recorder != nil {
+				r.Recorder.Event(config, corev1.EventTypeWarning, ReasonDuplicatePodMigrationInNamespace, msg)
+			}
+			if err := r.Status().Update(ctx, config); err != nil {
+				logger.Error(err, "Failed to update status on duplicate PodMigration")
+				return ctrl.Result{}, err
+			}
+		}
+		if deferCleanup || !active.DeletionTimestamp.IsZero() {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, nil
 	}
@@ -361,6 +422,41 @@ func isPMJOwnedByPodMigration(pmj *pmv1alpha1.PodMigrationJob, config *pmv1alpha
 	return false
 }
 
+func (r *PodMigrationReconciler) listInFlightMigrations(ctx context.Context, config *pmv1alpha1.PodMigration) ([]string, error) {
+	var pmjList pmv1alpha1.PodMigrationJobList
+	if err := r.List(ctx, &pmjList, client.InNamespace(config.Namespace)); err != nil {
+		return nil, err
+	}
+	var inFlight []string
+	for _, pmj := range pmjList.Items {
+		if !isPMJOwnedByPodMigration(&pmj, config) {
+			continue
+		}
+		switch pmj.Status.Phase {
+		case pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			pmv1alpha1.PodMigrationJobPhaseFailed:
+			// Terminal state: safe to ignore
+			continue
+		default:
+			inFlight = append(inFlight, pmj.Name)
+		}
+	}
+	return inFlight, nil
+}
+
+func deferralExpired(config *pmv1alpha1.PodMigration) bool {
+	if !config.DeletionTimestamp.IsZero() && time.Since(config.DeletionTimestamp.Time) > maxDeletionDeferral {
+		return true
+	}
+	if cond := meta.FindStatusCondition(config.Status.Conditions, "Ready"); cond != nil &&
+		cond.Status == metav1.ConditionFalse && !cond.LastTransitionTime.IsZero() &&
+		time.Since(cond.LastTransitionTime.Time) > maxDeletionDeferral {
+		return true
+	}
+	return false
+}
+
 func (r *PodMigrationReconciler) syncResource(ctx context.Context, obj *unstructured.Unstructured) error {
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(obj.GroupVersionKind())
@@ -384,9 +480,67 @@ func (r *PodMigrationReconciler) syncResource(ctx context.Context, obj *unstruct
 	return nil
 }
 
+// selectActivePodMigration deterministically elects the single active PodMigration
+// CR in a namespace:
+//  1. If any deleting PodMigration still holds StorageCleanupFinalizer, its
+//     PodSnapshotPolicy is still present in the namespace, so it remains the
+//     active owner until finalization completes.
+//  2. Otherwise, the non-deleting PodMigration with the oldest CreationTimestamp
+//     (tie-broken by lexicographically smallest metadata.name) wins.
+func selectActivePodMigration(items []pmv1alpha1.PodMigration) *pmv1alpha1.PodMigration {
+	var deletingWithFinalizer *pmv1alpha1.PodMigration
+	var active *pmv1alpha1.PodMigration
+	for i := range items {
+		candidate := &items[i]
+		if !candidate.DeletionTimestamp.IsZero() {
+			if controllerutil.ContainsFinalizer(candidate, StorageCleanupFinalizer) {
+				if deletingWithFinalizer == nil || podMigrationPrecedes(candidate, deletingWithFinalizer) {
+					deletingWithFinalizer = candidate
+				}
+			}
+			continue
+		}
+		if active == nil || podMigrationPrecedes(candidate, active) {
+			active = candidate
+		}
+	}
+	if deletingWithFinalizer != nil {
+		return deletingWithFinalizer
+	}
+	return active
+}
+
+func podMigrationPrecedes(a, b *pmv1alpha1.PodMigration) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	return a.Name < b.Name
+}
+
+func (r *PodMigrationReconciler) enqueueNamespacePeers(ctx context.Context, obj client.Object) []reconcile.Request {
+	var list pmv1alpha1.PodMigrationList
+	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for _, item := range list.Items {
+		if item.Name == obj.GetName() {
+			continue
+		}
+		reqs = append(reqs, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: item.Namespace,
+				Name:      item.Name,
+			},
+		})
+	}
+	return reqs
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigration{}).
+		Watches(&pmv1alpha1.PodMigration{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNamespacePeers)).
 		Complete(r)
 }
