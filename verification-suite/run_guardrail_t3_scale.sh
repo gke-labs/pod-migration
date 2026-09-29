@@ -60,6 +60,7 @@ SLO_GATE_HOLD_P95="${SLO_GATE_HOLD_P95:-60s}"
 SLO_DOWNTIME_P95="${SLO_DOWNTIME_P95:-60s}"
 SLO_E2E_P95="${SLO_E2E_P95:-180s}"
 REQUIRE_CROSS_SHAPE="${REQUIRE_CROSS_SHAPE:-false}"
+ALLOW_SIMULATED_S3="${ALLOW_SIMULATED_S3:-false}"
 SELF_TEST="false"
 
 usage() {
@@ -78,6 +79,8 @@ Options:
   --slo-downtime-p95 <dur>          Max p95 serving blackout duration (default: 60s)
   --slo-e2e-p95 <dur>               Max p95 end-to-end migration duration (default: 180s)
   --require-cross-shape             Assert src_type != dst_type in T3-S1/T3-S3 (requires multi-shape pool)
+  --allow-simulated-s3              Run T3-S3 on a single-shape pool as an explicit simulated exit-128 fallback
+                                    test (otherwise T3-S3 logs SKIPPED when <2 gVisor shapes exist)
   --self-test                       Run offline end-to-end self-test of scalesim, pmprofiler
                                     SLO gates, and T3 report generation (used in CI)
   -h, --help                        Show this help message
@@ -124,6 +127,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --require-cross-shape)
       REQUIRE_CROSS_SHAPE="true"
+      shift
+      ;;
+    --allow-simulated-s3)
+      ALLOW_SIMULATED_S3="true"
       shift
       ;;
     --self-test|--dry-run)
@@ -1004,6 +1011,23 @@ EOF
 scenario_t3_s3() {
   local run_dir="${OUT_DIR}/t3_s3"
   log "=== Scenario T3-S3: Heterogeneous Node-Shape Drain & I9 Fallback Verification ==="
+
+  local shape_lines shape_list distinct_shapes
+  shape_lines="$(kubectl get nodes -l sandbox.gke.io/runtime=gvisor -o jsonpath='{range .items[*]}{.metadata.labels.node\.kubernetes\.io/instance-type}{"\n"}{end}' 2>/dev/null | sort -u || true)"
+  shape_list="$(grep -v '^$' <<<"${shape_lines}" | paste -sd ',' - || true)"
+  distinct_shapes="$(grep -cv '^$' <<<"${shape_lines}" || true)"
+
+  if [[ "${distinct_shapes}" -le 1 ]]; then
+    if [[ "${REQUIRE_CROSS_SHAPE}" == "true" ]]; then
+      die "T3-S3: --require-cross-shape is set, but cluster only has ${distinct_shapes} distinct gVisor machine shape(s) (${shape_list:-unknown})"
+    fi
+    if [[ "${ALLOW_SIMULATED_S3}" != "true" ]]; then
+      log "SKIPPED [T3-S3]: heterogeneous cross-shape drain requires >=2 distinct gVisor machine shapes (found ${distinct_shapes}: ${shape_list:-unknown}); pass --allow-simulated-s3 to run same-shape simulated exit-128 fallback"
+      return 0
+    fi
+    log "SKIPPED [T3-S3 heterogeneous cross-shape claim]: cluster has ${distinct_shapes} gVisor machine shape (${shape_list:-unknown}); running opt-in --allow-simulated-s3 same-shape exit-128 fallback"
+  fi
+
   resolve_gcs_bucket
   clean_t3_workloads
   clean_stale_migration_resources
@@ -1068,33 +1092,33 @@ EOF
   kubectl rollout status deployment/t3-s3-hetero -n "${NAMESPACE}" --timeout=120s
   sleep 3
 
-  start_collector "${run_dir}" "T3-S3 heterogeneous node-shape drain & I9 fallback"
+  if [[ "${distinct_shapes}" -gt 1 ]]; then
+    start_collector "${run_dir}" "T3-S3 heterogeneous node-shape drain (${shape_list}) & I9 fallback"
+  else
+    start_collector "${run_dir}" "T3-S3 (simulated fallback, single-shape ${shape_list:-unknown})"
+  fi
 
   local target_pod src_node src_type
   target_pod="$(kubectl get pods -n "${NAMESPACE}" -l app=t3-s3-hetero --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
   src_node="$(kubectl get pod "${target_pod}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}')"
   src_type="$(kubectl get node "${src_node}" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}')"
 
-  # Check if the gVisor pool has multiple distinct machine shapes; if so, cordon
-  # all nodes sharing src_type to force cross-shape scheduling onto another shape.
-  local distinct_shapes
-  distinct_shapes="$(kubectl get nodes -l sandbox.gke.io/runtime=gvisor -o jsonpath='{range .items[*]}{.metadata.labels.node\.kubernetes\.io/instance-type}{"\n"}{end}' | sort -u | grep -v '^$' | wc -l | tr -d ' ')"
   if [[ "${distinct_shapes}" -gt 1 ]]; then
-    log "T3-S3 detected ${distinct_shapes} distinct gVisor machine shapes; cordoning all '${src_type}' nodes to force cross-shape migration"
+    log "T3-S3 detected ${distinct_shapes} distinct gVisor machine shapes (${shape_list}); cordoning all '${src_type}' nodes to force cross-shape migration"
     local same_shape_nodes
     mapfile -t same_shape_nodes < <(kubectl get nodes -l "sandbox.gke.io/runtime=gvisor,node.kubernetes.io/instance-type=${src_type}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
     for n in "${same_shape_nodes[@]:-}"; do
       cordon_node "${n}"
     done
   else
-    log "T3-S3 single gVisor machine shape (${src_type}); cordoning ${src_node} and injecting I9 cross-shape restore fallback"
+    log "T3-S3 (simulated fallback) single gVisor machine shape (${src_type}); cordoning ${src_node} and injecting exit-128 restore fallback"
     cordon_node "${src_node}"
   fi
 
   evict_pod "${target_pod}"
 
-  # Wait for replacement pod to appear, then inject exit 128 on first restore if on a homogeneous pool
-  # so I9 (SucceededWithoutRestore / RestoreFailedColdStart) fallback is deterministically exercised.
+  # Wait for replacement pod to appear; when running under --allow-simulated-s3 on a single-shape pool,
+  # inject exit 128 on first restore so I9 (SucceededWithoutRestore / RestoreFailedColdStart) fallback is exercised.
   local rpod=""
   for _ in $(seq 1 60); do
     rpod="$(kubectl get podmigrationjobs.podmigration.gke.io -n "${NAMESPACE}" \
@@ -1138,21 +1162,34 @@ EOF
     fi
   fi
 
-  if [[ "${REQUIRE_CROSS_SHAPE}" == "true" && "${src_type}" == "${dst_type}" ]]; then
+  local s3_check_name s3_scenario_title
+  if [[ "${distinct_shapes}" -gt 1 ]]; then
+    s3_check_name="T3-S3 heterogeneous cross-shape (${src_type} -> ${dst_type}) & I9 fallback convergence"
+    s3_scenario_title="T3-S3 heterogeneous cross-shape (${src_type} -> ${dst_type}) & I9 fallback"
+  else
+    s3_check_name="T3-S3 (simulated fallback: ${src_type} -> ${dst_type}) & I9 convergence"
+    s3_scenario_title="T3-S3 (simulated fallback: ${src_type} -> ${dst_type})"
+  fi
+  if [[ -f "${run_dir}/meta.json" ]]; then
+    local tmp_meta="${run_dir}/meta.json.tmp"
+    jq --arg s "${s3_scenario_title}" '.scenario = $s' "${run_dir}/meta.json" > "${tmp_meta}" && mv "${tmp_meta}" "${run_dir}/meta.json"
+  fi
+
+  if [[ ( "${REQUIRE_CROSS_SHAPE}" == "true" || "${distinct_shapes}" -gt 1 ) && "${src_type}" == "${dst_type}" ]]; then
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
-      --name "T3-S3 heterogeneous cross-shape & I9 fallback convergence" --group "t3-s3-hetero" --pass=false \
+      --name "${s3_check_name}" --group "t3-s3-hetero" --pass=false \
       --value 0 --total 1 --detail "expected src_type != dst_type, got ${src_node}(${src_type}) -> ${dst_node}(${dst_type})"
-    die "T3-S3: --require-cross-shape set, but source (${src_type}) and destination (${dst_type}) match"
+    die "T3-S3: expected cross-shape migration, but source (${src_type}) and destination (${dst_type}) match"
   fi
 
   if [[ "${pmj_phase}" == "Succeeded" || "${pmj_phase}" == "SucceededWithoutRestore" ]]; then
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
-      --name "T3-S3 heterogeneous cross-shape & I9 fallback convergence" --group "t3-s3-hetero" --pass \
+      --name "${s3_check_name}" --group "t3-s3-hetero" --pass \
       --value 1 --total 1 --detail "phase=${pmj_phase}, src=${src_node}(${src_type}) -> dst=${dst_node}(${dst_type})"
   else
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
-      --name "T3-S3 heterogeneous cross-shape & I9 fallback convergence" --group "t3-s3-hetero" --pass=false \
-      --value 0 --total 1 --detail "unexpected phase=${pmj_phase}"
+      --name "${s3_check_name}" --group "t3-s3-hetero" --pass=false \
+      --value 0 --total 1 --detail "unexpected phase=${pmj_phase}, src=${src_node}(${src_type}) -> dst=${dst_node}(${dst_type})"
     die "T3-S3 failed with unexpected PMJ phase=${pmj_phase}"
   fi
 
@@ -1295,7 +1332,7 @@ EOF
   id_2="$(awk '{print $1}' <<<"${state_2}")"
   val_2="$(awk '{print $2}' <<<"${state_2}")"
 
-  if [[ "${id_2}" == "${id_0}" && "${val_2}" -ge "${val_1}" && "${val_1}" -ge "${val_0}" ]]; then
+  if [[ "${id_1}" == "${id_0}" && "${id_2}" == "${id_0}" && "${val_2}" -ge "${val_1}" && "${val_1}" -ge "${val_0}" ]]; then
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
       --name "T3-S4 multi-wave sequential warm migration state continuity" --group "t3-s4-soak" --pass \
       --value 2 --total 2 --detail "${node_w1} -> ${node_w2} -> ${node_w3}, id=${id_2}, counter ${val_0}->${val_1}->${val_2}"
@@ -1399,7 +1436,7 @@ EOF
   local s3_dir="${base_dir}/t3_s3"
   mkdir -p "${s3_dir}"
   cat > "${s3_dir}/meta.json" <<EOF
-{"scenario":"T3-S3 heterogeneous node-shape drain & I9 fallback","startedAt":"2026-09-28T12:00:00Z"}
+{"scenario":"T3-S3 heterogeneous cross-shape (e2-standard-4 -> n2-standard-4) & I9 fallback","startedAt":"2026-09-28T12:00:00Z"}
 EOF
   cat > "${s3_dir}/records.ndjson" <<EOF
 {"ts":"2026-09-28T11:59:00Z","type":"list","gvr":"${pod_gvr}","obj":{"metadata":{"name":"t3-s3-hetero-0","uid":"uid-s3-src","creationTimestamp":"2026-09-28T11:59:00Z","labels":{"app":"t3-s3-hetero","pod-migration.gke.io/enabled":"true"}},"spec":{"nodeName":"node-e2-standard-4"},"status":{"conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-28T11:59:05Z"}]}}}
@@ -1410,8 +1447,8 @@ EOF
 {"ts":"2026-09-28T12:00:17Z","type":"update","gvr":"${pmj_gvr}","obj":{"metadata":{"name":"pmj-s3-0","uid":"uid-pmj-s3","creationTimestamp":"2026-09-28T12:00:01Z"},"spec":{"podRef":{"name":"t3-s3-hetero-0"},"targetPodUID":"uid-s3-src"},"status":{"phase":"SucceededWithoutRestore","evictingStartTime":"2026-09-28T12:00:06Z","restoredPodName":"t3-s3-hetero-dst","restoredPodUID":"uid-s3-dst","conditions":[{"type":"Restored","status":"False","reason":"RestoreFailedColdStart"}]}}}
 EOF
   "${PMPROFILER_BIN}" check --run "${s3_dir}" \
-    --name "T3-S3 heterogeneous cross-shape & I9 fallback convergence" --group "t3-s3-hetero" --pass \
-    --value 1 --total 1 --detail "self-test I9 cold-start fallback verified"
+    --name "T3-S3 heterogeneous cross-shape (e2-standard-4 -> n2-standard-4) & I9 fallback convergence" --group "t3-s3-hetero" --pass \
+    --value 1 --total 1 --detail "self-test I9 cold-start fallback verified (e2-standard-4 -> n2-standard-4)"
   "${PMPROFILER_BIN}" analyze --run "${s3_dir}" \
     --assert-zero-invariants --assert-clean-outcomes --allow-cold-start --enforce-slo
 
@@ -1687,6 +1724,43 @@ EOF
     die "Self-test failure: expected 'gs://custom-bucket/snaps', got '${resolved_custom_bucket}'"
   fi
   log "PASS [self-test]: resolve_gcs_bucket extracts custom bucket with stderr noise"
+
+  # 12. Verify scenario_t3_s3 logs SKIPPED on a single-shape pool by default (without --allow-simulated-s3)
+  # and fails closed when --require-cross-shape is set
+  local s3_skip_out
+  s3_skip_out="$(
+    OUT_DIR="${base_dir}/test-s3-skip"
+    REQUIRE_CROSS_SHAPE="false"
+    ALLOW_SIMULATED_S3="false"
+    kubectl() {
+      if [[ "$*" == *"get nodes -l sandbox.gke.io/runtime=gvisor"* ]]; then
+        printf "n2-standard-4\nn2-standard-4\n"
+        return 0
+      fi
+      return 1
+    }
+    scenario_t3_s3 2>&1
+  )" || die "Self-test failure: scenario_t3_s3 failed instead of skipping on a single-shape pool"
+  grep -q 'SKIPPED \[T3-S3\]' <<<"${s3_skip_out}" || die "Self-test failure: expected SKIPPED [T3-S3] log on single-shape pool, got: ${s3_skip_out}"
+  if [[ -d "${base_dir}/test-s3-skip/t3_s3" ]]; then
+    die "Self-test failure: expected scenario_t3_s3 not to emit a t3_s3 run directory when skipped"
+  fi
+  if (
+    OUT_DIR="${base_dir}/test-s3-require-fail"
+    REQUIRE_CROSS_SHAPE="true"
+    ALLOW_SIMULATED_S3="false"
+    kubectl() {
+      if [[ "$*" == *"get nodes -l sandbox.gke.io/runtime=gvisor"* ]]; then
+        printf "n2-standard-4\n"
+        return 0
+      fi
+      return 1
+    }
+    scenario_t3_s3 >/dev/null 2>&1
+  ); then
+    die "Self-test failure: expected scenario_t3_s3 to fail closed on single-shape pool when --require-cross-shape is set"
+  fi
+  log "PASS [self-test]: scenario_t3_s3 single-shape SKIPPED and --require-cross-shape fail-closed verified"
 
   log "PASS [self-test]: PodMigration backup filter & restore transform verified"
   log "Self-test PASSED: HTML report generated at ${report_html}"
