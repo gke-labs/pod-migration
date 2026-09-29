@@ -64,7 +64,7 @@ Options:
   --runtime-class <name|none>       Pod runtimeClassName (default: gvisor; 'none' or '' omits it)
   --node-selector <k=v|none>        Pod nodeSelector key=value (default: sandbox.gke.io/runtime=gvisor; 'none' or '' omits it)
   --cordon-selector <k=v|all|none>  Node label selector for S3 pool cordon (default: uses --node-selector when set;
-                                    requires explicit '<k=v>' or 'all' when --node-selector is 'none')
+                                    requires explicit '<k=v>' or 'all' when --node-selector is 'none'; 'none' skips pool cordon)
   --toleration <k=v:effect|none>    Pod toleration in '<key>[=<value>]:<Effect>' format (default: sandbox.gke.io/runtime=gvisor:NoSchedule; 'none' or '' omits it)
   --service-account <name|none>     Pod serviceAccountName (default: pm-test-ksa; 'none' or '' omits it)
   --skip-podmigration-create        Use a pre-created snapshot policy instead of applying a PodMigration CR
@@ -161,6 +161,13 @@ validate_toleration_format() {
   if [[ -z "${tol_kv}" || -z "${tol_effect}" ]]; then
     die "Invalid --toleration '${TOLERATION}': both key and Effect must be non-empty in '<key>[=<value>]:<Effect>'"
   fi
+  case "${tol_effect}" in
+    NoSchedule|PreferNoSchedule|NoExecute)
+      ;;
+    *)
+      die "Invalid --toleration Effect '${tol_effect}' in '${TOLERATION}': expected NoSchedule, PreferNoSchedule, or NoExecute"
+      ;;
+  esac
 }
 
 validate_toleration_format
@@ -210,11 +217,16 @@ cordon_target_pool_nodes() {
   fi
 
   local nodes=()
+  local line
   if [[ "${effective_selector}" == "all" ]]; then
-    mapfile -t nodes < <("${KUBECTL_CMD}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] && nodes+=("${line}")
+    done < <("${KUBECTL_CMD}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
     log "Cordoning ${#nodes[@]} node(s) across cluster (--cordon-selector=all): ${nodes[*]:-none}"
   else
-    mapfile -t nodes < <("${KUBECTL_CMD}" get nodes -l "${effective_selector}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] && nodes+=("${line}")
+    done < <("${KUBECTL_CMD}" get nodes -l "${effective_selector}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
     log "Cordoning ${#nodes[@]} node(s) matching selector '${effective_selector}': ${nodes[*]:-none}"
   fi
   local n
@@ -991,8 +1003,11 @@ run_scenario_s4() {
 
   start_collector "${run_dir}" "S4: Dual-replica simultaneous eviction under serialized PodGate contention"
 
-  local c_pods
-  mapfile -t c_pods < <(get_active_pods "app=t2-counter")
+  local c_pods=()
+  local c_pod_line
+  while IFS= read -r c_pod_line; do
+    [[ -n "${c_pod_line}" ]] && c_pods+=("${c_pod_line}")
+  done < <(get_active_pods "app=t2-counter")
   for p in "${c_pods[@]}" "${pg_pod}"; do
     evict_pod "${p}"
   done
@@ -1327,7 +1342,7 @@ EOF
   grep -q 'command: \["redis-server"\]' <<<"${runc_redis}" || die "Expected explicit command in runtime-agnostic redis manifest"
   grep -q 'command: \["docker-entrypoint.sh"\]' <<<"${runc_pg}" || die "Expected explicit command in runtime-agnostic postgres manifest"
 
-  # Verify --toleration format validation rejects missing ':Effect' or empty Effect
+  # Verify --toleration format validation rejects missing ':Effect', empty Effect, or unknown Effect
   if (TOLERATION="foo=bar" validate_toleration_format >/dev/null 2>&1); then
     die "Expected validate_toleration_format to reject --toleration without ':Effect'"
   fi
@@ -1336,6 +1351,9 @@ EOF
   fi
   if (TOLERATION=":NoSchedule" validate_toleration_format >/dev/null 2>&1); then
     die "Expected validate_toleration_format to reject --toleration with empty key"
+  fi
+  if (TOLERATION="foo=bar:bogus" validate_toleration_format >/dev/null 2>&1); then
+    die "Expected validate_toleration_format to reject --toleration with invalid Effect"
   fi
 
   # Verify tracked node cordon/uncordon only uncordons nodes cordoned during the run
