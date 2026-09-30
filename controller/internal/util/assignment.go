@@ -26,11 +26,21 @@ const (
 	AnnotationAssignedPMJ        = "pod-migration.gke.io/assigned-pmj"
 	AnnotationMismatchSince      = "pod-migration.gke.io/mismatch-since"
 	AnnotationPDBEvictionTimeout = "pod-migration.gke.io/pdb-eviction-timeout"
+	AnnotationPodSnapshotPolicy  = "pod-migration.gke.io/pod-snapshot-policy"
 
 	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
 	// in their assigned-pmj annotation.  Registered at manager startup via
 	// controller.RegisterFieldIndexes.
 	PodAssignedPMJIndexKey = "pod.podmigration.gke.io/assigned-pmj"
+
+	LabelTriggerSource          = "pod-migration.gke.io/trigger-source"
+	AnnotationTriggerSource     = "pod-migration.gke.io/trigger-source"
+	TriggerSourceSpotPreemption = "spot-preemption"
+	TriggerSourceEviction       = "eviction-webhook"
+
+	// DefaultSpotPreemptionNodeBudget is the baseline memory request budget (15 GiB)
+	// allocated per node during a ~30-second spot preemption window at ~0.5 GB/s checkpoint throughput.
+	DefaultSpotPreemptionNodeBudget = int64(15 * 1024 * 1024 * 1024)
 )
 
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).

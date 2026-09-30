@@ -17,11 +17,18 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - nodes
   - persistentvolumeclaims
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes/status
+  verbs:
+  - get
 - apiGroups:
   - ""
   resources:

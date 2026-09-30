@@ -28,6 +28,18 @@ func PodAssignedPMJIndexValue(obj client.Object) []string {
 	return nil
 }
 
+// PodNodeNameIndex is the cache index key mapping pods to their assigned node name.
+const PodNodeNameIndex = "spec.nodeName"
+
+// PodNodeNameIndexValue extracts the node name for a pod.
+func PodNodeNameIndexValue(obj client.Object) []string {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok || pod == nil || pod.Spec.NodeName == "" {
+		return nil
+	}
+	return []string{pod.Spec.NodeName}
+}
+
 // VolumeAttachmentPVIndex is the cache index key mapping VolumeAttachments to
 // the persistent volume name they attach.
 const VolumeAttachmentPVIndex = "spec.source.persistentVolumeName"
@@ -60,6 +72,9 @@ func PMJSnapshotRefIndexValue(obj client.Object) []string {
 // Must be called before the manager starts.
 func RegisterFieldIndexes(ctx context.Context, indexer client.FieldIndexer) error {
 	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue); err != nil {
+		return err
+	}
+	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue); err != nil {
 		return err
 	}
 	if err := indexer.IndexField(ctx, &storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue); err != nil {

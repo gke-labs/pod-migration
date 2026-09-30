@@ -61,6 +61,19 @@ var (
 		Help: "Total number of detected correctness invariant violations by invariant ID (I1-I9).",
 	}, []string{"invariant"})
 
+	// SpotPreemptionTriggeredTotal counts pods for which spot preemption migration was initiated.
+	SpotPreemptionTriggeredTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "pod_migration_spot_preemption_triggered_total",
+		Help: "Total number of pod migrations initiated due to spot VM preemption.",
+	})
+
+	// SpotPreemptionSkippedTotal counts pods skipped on spot preemption by reason.
+	// Reasons: budget_exceeded | no_policy
+	SpotPreemptionSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_spot_preemption_skipped_total",
+		Help: "Total number of pods skipped for spot preemption migration by reason.",
+	}, []string{"reason"})
+
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
 )
@@ -73,7 +86,21 @@ func init() {
 		PhaseDurationSeconds,
 		ActiveMigrations,
 		InvariantViolationsTotal,
+		SpotPreemptionTriggeredTotal,
+		SpotPreemptionSkippedTotal,
 	)
+}
+
+// RecordSpotPreemptionTriggered increments the spot preemption triggered counter.
+func RecordSpotPreemptionTriggered() {
+	SpotPreemptionTriggeredTotal.Inc()
+}
+
+// RecordSpotPreemptionSkipped increments the spot preemption skipped counter for the given reason.
+func RecordSpotPreemptionSkipped(reason string) {
+	if reason != "" {
+		SpotPreemptionSkippedTotal.WithLabelValues(reason).Inc()
+	}
 }
 
 // RecordInvariantViolation increments the invariant violation counter for the given invariant ID (e.g. "I1").
