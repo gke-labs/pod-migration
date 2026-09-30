@@ -322,5 +322,134 @@ func TestDetectBlindSpot_PrematureSnapshotFailedFromTrace(t *testing.T) {
 	if !proof.CompiledAndTested || !proof.RedPassed || !proof.GreenPassed {
 		t.Fatalf("expected compiled go test RED and GREEN to pass for premature-snapshot-failed trace, got %+v", proof)
 	}
+	if proof.Debounced {
+		t.Fatalf("expected premature-snapshot-failed (non-absence template) not to be debounced by default, got %+v", proof)
+	}
+	ruleSrc, err := os.ReadFile(proof.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ruleSrc), "NewDebouncedRule(") {
+		t.Fatalf("expected non-absence rule not to emit NewDebouncedRule by default, got:\n%s", string(ruleSrc))
+	}
 }
 
+func TestAbsenceTemplatesEmitDebouncedRuleWrappersAndSupportOverrides(t *testing.T) {
+	// 1. Absence template (TemplateWedgedRestoringOrphan) defaults to NewDebouncedRule(..., 3, 30*time.Second).
+	fWedged, err := ParseTriggerCommentOrPR("I10", "/extract-invariant I10 wedged-restoring-orphan PMJ stuck in Restoring after replacement pod deleted", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR failed: %v", err)
+	}
+	if !IsAbsenceTemplate(fWedged.Template) {
+		t.Fatalf("expected %s to be classified as an absence template", fWedged.Template)
+	}
+	pWedged, err := SynthesizeAndVerify(fWedged, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify failed: %v", err)
+	}
+	if !pWedged.Debounced || pWedged.DebounceCount != 3 || pWedged.DebounceDuration != "30s" {
+		t.Fatalf("expected Debounced=true count=3 duration=30s on absence template, got debounced=%v count=%d duration=%q",
+			pWedged.Debounced, pWedged.DebounceCount, pWedged.DebounceDuration)
+	}
+	wedgedRuleBytes, err := os.ReadFile(pWedged.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wedgedRuleSrc := string(wedgedRuleBytes)
+	if !strings.Contains(wedgedRuleSrc, "return NewDebouncedRule(funcRule{") || !strings.Contains(wedgedRuleSrc, "}, 3, 30*time.Second)") {
+		t.Fatalf("expected generated absence rule to wrap funcRule with NewDebouncedRule(..., 3, 30*time.Second), got:\n%s", wedgedRuleSrc)
+	}
+	wedgedTestBytes, err := os.ReadFile(pWedged.TestFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wedgedTestBytes), "rule.(DebouncedRule)") {
+		t.Fatalf("expected generated test to assert DebouncedRule interface on absence rule, got:\n%s", string(wedgedTestBytes))
+	}
+
+	// 2. Absence template (TemplateNoReplacementEvictingStall) with custom debounce count and duration override.
+	fEvict, err := ParseTriggerCommentOrPR("I11", "/extract-invariant I11 no-replacement-evicting-stall PMJ stalled in Evicting with no replacement", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR evicting stall failed: %v", err)
+	}
+	applyFindingOverrides(&fEvict, "", 5, 45*1e9, false)
+	pEvict, err := SynthesizeAndVerify(fEvict, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify custom debounce failed: %v", err)
+	}
+	if !pEvict.CompiledAndTested || !pEvict.RedPassed || !pEvict.GreenPassed {
+		t.Fatalf("expected custom debounced rule to compile and pass RED/GREEN, got %+v", pEvict)
+	}
+	if !pEvict.Debounced || pEvict.DebounceCount != 5 || pEvict.DebounceDuration != "45s" {
+		t.Fatalf("expected Debounced=true count=5 duration=45s, got %+v", pEvict)
+	}
+	evictRuleBytes, err := os.ReadFile(pEvict.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(evictRuleBytes), "}, 5, 45*time.Second)") {
+		t.Fatalf("expected custom debounce signature }, 5, 45*time.Second), got:\n%s", string(evictRuleBytes))
+	}
+
+	// 3. --no-debounce override emits immediate funcRule even for absence template.
+	fNoDebounce := fWedged
+	applyFindingOverrides(&fNoDebounce, "", 0, 0, true)
+	pNoDebounce, err := SynthesizeAndVerify(fNoDebounce, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify no-debounce failed: %v", err)
+	}
+	if pNoDebounce.Debounced {
+		t.Fatalf("expected Debounced=false when --no-debounce is set, got %+v", pNoDebounce)
+	}
+	noDebounceRuleBytes, err := os.ReadFile(pNoDebounce.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(noDebounceRuleBytes), "NewDebouncedRule(") {
+		t.Fatalf("expected --no-debounce to omit NewDebouncedRule wrapper, got:\n%s", string(noDebounceRuleBytes))
+	}
+
+	// 4. Count-only debounce (--debounce-count 3 --debounce-duration 0s) on a non-absence template:
+	// must emit 0*time.Second, import "time", and pass compiled go test / go vet.
+	fCountOnly, err := ParseTriggerCommentOrPR("I21", "/extract-invariant I21 unintended-cold-start-active-pmj test cold start count only", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR count-only failed: %v", err)
+	}
+	applyFindingOverrides(&fCountOnly, "", 3, 0, false)
+	pCountOnly, err := SynthesizeAndVerify(fCountOnly, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify count-only failed: %v", err)
+	}
+	if !pCountOnly.CompiledAndTested || !pCountOnly.RedPassed || !pCountOnly.GreenPassed {
+		t.Fatalf("expected count-only debounced rule to compile and pass RED/GREEN (go vet), got %+v\nRED:\n%s\nGREEN:\n%s",
+			pCountOnly, pCountOnly.RedTestOutput, pCountOnly.GreenTestOutput)
+	}
+	if !pCountOnly.Debounced || pCountOnly.DebounceCount != 3 || pCountOnly.DebounceDuration != "0s" {
+		t.Fatalf("expected Debounced=true count=3 duration=0s, got %+v", pCountOnly)
+	}
+
+	// 5. Duration-only debounce (--debounce-duration 15s without --debounce-count) on a non-absence template:
+	// EffectiveDebounce must normalize count to 1 across proof.json, pr_body.md, and emitted Go code.
+	fDurOnly, err := ParseTriggerCommentOrPR("I22", "/extract-invariant I22 unintended-cold-start-active-pmj test cold start duration only", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR duration-only failed: %v", err)
+	}
+	applyFindingOverrides(&fDurOnly, "", 0, 15*1e9, false)
+	pDurOnly, err := SynthesizeAndVerify(fDurOnly, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify duration-only failed: %v", err)
+	}
+	if !pDurOnly.CompiledAndTested || !pDurOnly.RedPassed || !pDurOnly.GreenPassed {
+		t.Fatalf("expected duration-only debounced rule to compile and pass RED/GREEN, got %+v", pDurOnly)
+	}
+	if !pDurOnly.Debounced || pDurOnly.DebounceCount != 1 || pDurOnly.DebounceDuration != "15s" {
+		t.Fatalf("expected EffectiveDebounce to normalize count=1 with duration=15s, got %+v", pDurOnly)
+	}
+	prBodyBytes, err := os.ReadFile(pDurOnly.PRBodyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prBodyBytes), "(`consecutive=1`, `minDuration=15s`)") {
+		t.Fatalf("expected pr_body.md to report consecutive=1, minDuration=15s, got:\n%s", string(prBodyBytes))
+	}
+}
