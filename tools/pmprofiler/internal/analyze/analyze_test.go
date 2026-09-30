@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -820,4 +821,95 @@ func TestGateHoldReconstructionAndVerifySLO(t *testing.T) {
 		t.Errorf("VerifySLO on empty run succeeded, want error")
 	}
 }
+
+func TestVerifyVerdictMatchesData(t *testing.T) {
+	// 1. Consistent warm restore: Restored=true and state check Pass=true.
+	warmRun := &Run{
+		Scenario:    "warm-ok",
+		Populations: map[string]int{"measured": 1},
+		Outcomes:    map[string]int{OutcomeRestored: 1},
+		Migrations: []Migration{{
+			PMJ: "pmj-redis-0", Pod: "redis-0", Population: "measured",
+			Outcome: OutcomeRestored, Restored: true, RestoreSignal: "pmj:RestoreVerified",
+		}},
+		Checks: []Check{{
+			Name: "state survived (token-verified)", Group: "redis", Pass: true, Detail: "migkey matched",
+		}},
+	}
+	if err := VerifyVerdictMatchesData(warmRun); err != nil {
+		t.Fatalf("expected consistent warm restore to pass VerifyVerdictMatchesData, got: %v", err)
+	}
+
+	// 2. False-positive restore verdict: Restored=true while app is empty (Pass=false).
+	falsePositiveRestore := &Run{
+		Scenario:    "s7-false-positive",
+		Populations: map[string]int{"measured": 1},
+		Outcomes:    map[string]int{OutcomeRestored: 1},
+		Migrations: []Migration{{
+			PMJ: "pmj-redis-0", Pod: "redis-0", Population: "measured",
+			Outcome: OutcomeRestored, Restored: true, RestoreSignal: "pmj:RestoreVerified",
+		}},
+		Checks: []Check{{
+			Name: "write continuity", Group: "redis", Pass: false, Detail: "lost acknowledged writes: 50 missing",
+		}},
+	}
+	if err := VerifyVerdictMatchesData(falsePositiveRestore); err == nil {
+		t.Fatal("expected Restored=true with failed write continuity check to fail VerifyVerdictMatchesData")
+	} else if !strings.Contains(err.Error(), "verdict-data mismatch [S7]") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// 3. Reverse mismatch: controller reports cold-start (Restored=false) while app check says state survived (Pass=true).
+	reverseMismatch := &Run{
+		Scenario:    "s7-reverse-mismatch",
+		Populations: map[string]int{"measured": 1},
+		Outcomes:    map[string]int{OutcomeColdStart: 1},
+		Migrations: []Migration{{
+			PMJ: "pmj-counter-0", Pod: "counter-0", Population: "measured",
+			Outcome: OutcomeColdStart, Restored: false, RestoreSignal: "pmj:FallbackToColdStart",
+		}},
+		Checks: []Check{{
+			Name: "state survived (token-verified)", Group: "counter", Pass: true, Detail: "instanceID preserved",
+		}},
+	}
+	if err := VerifyVerdictMatchesData(reverseMismatch); err == nil {
+		t.Fatal("expected Restored=false with Pass=true state check to fail VerifyVerdictMatchesData")
+	} else if !strings.Contains(err.Error(), "verdict-data mismatch [S7]") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// 4. Consistent cold-start fallback: Restored=false and pre-checkpoint state check Pass=false.
+	coldStartConsistent := &Run{
+		Scenario:    "s3-cold-start-ok",
+		Populations: map[string]int{"measured": 1},
+		Outcomes:    map[string]int{OutcomeColdStart: 1},
+		Migrations: []Migration{{
+			PMJ: "pmj-counter-0", Pod: "counter-0", Population: "measured",
+			Outcome: OutcomeColdStart, Restored: false, RestoreSignal: "pmj:FallbackToColdStart",
+		}},
+		Checks: []Check{
+			{Name: "I9 deterministic cold-start fallback (FallbackToColdStart)", Group: "counter", Pass: true},
+			{Name: "state survived (token-verified)", Group: "counter", Pass: false, Detail: "fresh instanceID after cold start"},
+		},
+	}
+	if err := VerifyVerdictMatchesData(coldStartConsistent); err != nil {
+		t.Fatalf("expected consistent cold-start (Restored=false, state Pass=false) to pass VerifyVerdictMatchesData, got: %v", err)
+	}
+	if err := VerifyOutcomes(coldStartConsistent, true); err != nil {
+		t.Fatalf("expected consistent cold-start with allowColdStart=true to pass VerifyOutcomes, got: %v", err)
+	}
+
+	// 5. Missing state check must fail VerifyVerdictMatchesData.
+	noCheckRun := &Run{
+		Scenario:    "no-checks",
+		Populations: map[string]int{"measured": 1},
+		Migrations: []Migration{{
+			PMJ: "pmj-1", Pod: "pod-1", Population: "measured", Outcome: OutcomeRestored, Restored: true,
+		}},
+	}
+	if err := VerifyVerdictMatchesData(noCheckRun); err == nil {
+		t.Fatal("expected run without state checks to fail VerifyVerdictMatchesData")
+	}
+}
+
 

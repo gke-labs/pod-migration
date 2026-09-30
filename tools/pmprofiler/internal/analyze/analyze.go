@@ -1165,7 +1165,70 @@ func VerifyOutcomes(run *Run, allowColdStart bool) error {
 	}
 	for _, c := range run.Checks {
 		if !c.Pass {
+			if allowColdStart && isStateSurvivalCheck(c.Name) && run.Outcomes[OutcomeColdStart] > 0 && run.Outcomes[OutcomeRestored] == 0 {
+				continue
+			}
 			return fmt.Errorf("driver check %q (group=%s) failed: %s", c.Name, c.Group, c.Detail)
+		}
+	}
+	return nil
+}
+
+func isStateSurvivalCheck(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.Contains(lower, "state survived") || strings.Contains(lower, "write continuity")
+}
+
+// VerifyVerdictMatchesData enforces S7 ("the verdict matches the data"):
+//   - A migration that reports Restored / RestoreVerified while an application
+//     state-survival or write-continuity check failed is a false-positive restore verdict.
+//   - A migration that reports non-restored (e.g. cold-start fallback) while an
+//     application pre-checkpoint state-survival check reports Pass=true is an
+//     inconsistent verdict in the reverse direction.
+func VerifyVerdictMatchesData(run *Run) error {
+	if run == nil {
+		return fmt.Errorf("verdict-data assertion failed [S7]: nil run")
+	}
+	var measured []Migration
+	for _, m := range run.Migrations {
+		if m.Population == "" || m.Population == "measured" {
+			measured = append(measured, m)
+		}
+	}
+	if len(measured) == 0 {
+		return fmt.Errorf("verdict-data assertion failed [S7]: 0 measured migrations in run")
+	}
+	var stateChecks []Check
+	for _, c := range run.Checks {
+		if isStateSurvivalCheck(c.Name) {
+			stateChecks = append(stateChecks, c)
+		}
+	}
+	if len(stateChecks) == 0 {
+		return fmt.Errorf("verdict-data assertion failed [S7]: no state-survival or write-continuity check recorded in run")
+	}
+	for _, c := range stateChecks {
+		var matched []Migration
+		if c.Group != "" {
+			for _, m := range measured {
+				if strings.Contains(m.Pod, c.Group) || strings.Contains(m.PMJ, c.Group) {
+					matched = append(matched, m)
+				}
+			}
+		}
+		if len(matched) == 0 {
+			matched = measured
+		}
+		for _, m := range matched {
+			restored := m.Restored || m.Outcome == OutcomeRestored || strings.HasSuffix(m.RestoreSignal, ":RestoreVerified") || m.RestoreSignal == "psengine-restore:restored"
+			if restored && !c.Pass {
+				return fmt.Errorf("verdict-data mismatch [S7]: migration %s (pod=%s, outcome=%s, restoreSignal=%s) reports Restored=true, but app state check %q (group=%s) failed: %s",
+					m.PMJ, m.Pod, m.Outcome, m.RestoreSignal, c.Name, c.Group, c.Detail)
+			}
+			if !restored && c.Pass {
+				return fmt.Errorf("verdict-data mismatch [S7]: migration %s (pod=%s, outcome=%s, restoreSignal=%s) reports Restored=false, but app state check %q (group=%s) passed: %s",
+					m.PMJ, m.Pod, m.Outcome, m.RestoreSignal, c.Name, c.Group, c.Detail)
+			}
 		}
 	}
 	return nil
