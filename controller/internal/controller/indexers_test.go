@@ -10,6 +10,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestPodAssignedPMJIndex_ListsOnlyAssignedPods(t *testing.T) {
@@ -169,6 +172,106 @@ func TestVolumeAttachmentPVIndex_ListsOnlyMatchingAttachments(t *testing.T) {
 	}
 }
 
+func TestPMJParentKeyIndex_ListsOnlyMatchingPMJs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	deployPMJ1 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-deploy-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "my-deploy",
+				util.LabelParentKind: "Deployment",
+			},
+		},
+	}
+	deployPMJ2 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-deploy-2",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "my-deploy",
+				util.LabelParentKind: "Deployment",
+			},
+		},
+	}
+	otherDeployPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-other-deploy",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "other-deploy",
+				util.LabelParentKind: "Deployment",
+			},
+		},
+	}
+	barePodPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-bare-pod",
+			Namespace: "default",
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: "my-bare-pod"},
+		},
+	}
+	unindexablePMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-unindexable",
+			Namespace: "default",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(deployPMJ1, deployPMJ2, otherDeployPMJ, barePodPMJ, unindexablePMJ).
+		Build()
+
+	// Query for my-deploy
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	err := cl.List(context.Background(), pmjList,
+		client.InNamespace("default"),
+		client.MatchingFields{PMJParentKeyIndex: "my-deploy/Deployment"})
+	if err != nil {
+		t.Fatalf("indexed list for my-deploy/Deployment failed: %v", err)
+	}
+	if len(pmjList.Items) != 2 {
+		t.Fatalf("expected exactly 2 PMJs for my-deploy/Deployment, got %d", len(pmjList.Items))
+	}
+	found := make(map[string]bool)
+	for _, item := range pmjList.Items {
+		found[item.Name] = true
+	}
+	if !found["pmj-deploy-1"] || !found["pmj-deploy-2"] {
+		t.Errorf("expected pmj-deploy-1 and pmj-deploy-2, got %v", pmjList.Items)
+	}
+
+	// Query for bare pod
+	bareList := &pmv1alpha1.PodMigrationJobList{}
+	err = cl.List(context.Background(), bareList,
+		client.InNamespace("default"),
+		client.MatchingFields{PMJParentKeyIndex: "my-bare-pod/Pod"})
+	if err != nil {
+		t.Fatalf("indexed list for my-bare-pod/Pod failed: %v", err)
+	}
+	if len(bareList.Items) != 1 || bareList.Items[0].Name != "pmj-bare-pod" {
+		t.Fatalf("expected exactly pmj-bare-pod, got %v", bareList.Items)
+	}
+
+	// Query for nonexistent parent
+	emptyList := &pmv1alpha1.PodMigrationJobList{}
+	err = cl.List(context.Background(), emptyList,
+		client.InNamespace("default"),
+		client.MatchingFields{PMJParentKeyIndex: "nonexistent/Deployment"})
+	if err != nil {
+		t.Fatalf("indexed list for nonexistent failed: %v", err)
+	}
+	if len(emptyList.Items) != 0 {
+		t.Fatalf("expected 0 PMJs for nonexistent, got %d", len(emptyList.Items))
+	}
+}
+
 func TestIndexValues_NilSafety(t *testing.T) {
 	// Untyped nil interface
 	if got := PodAssignedPMJIndexValue(nil); got != nil {
@@ -176,6 +279,12 @@ func TestIndexValues_NilSafety(t *testing.T) {
 	}
 	if got := VolumeAttachmentPVIndexValue(nil); got != nil {
 		t.Errorf("expected nil for untyped nil VolumeAttachment, got %v", got)
+	}
+	if got := PMJParentKeyIndexValue(nil); got != nil {
+		t.Errorf("expected nil for untyped nil PMJ, got %v", got)
+	}
+	if got := PMJSnapshotRefIndexValue(nil); got != nil {
+		t.Errorf("expected nil for untyped nil PMJ snapshotRef, got %v", got)
 	}
 
 	// Typed nil interface
@@ -186,5 +295,12 @@ func TestIndexValues_NilSafety(t *testing.T) {
 	var nilVA *storagev1.VolumeAttachment
 	if got := VolumeAttachmentPVIndexValue(nilVA); got != nil {
 		t.Errorf("expected nil for typed nil VolumeAttachment, got %v", got)
+	}
+	var nilPMJ *pmv1alpha1.PodMigrationJob
+	if got := PMJParentKeyIndexValue(nilPMJ); got != nil {
+		t.Errorf("expected nil for typed nil PMJ, got %v", got)
+	}
+	if got := PMJSnapshotRefIndexValue(nilPMJ); got != nil {
+		t.Errorf("expected nil for typed nil PMJ snapshotRef, got %v", got)
 	}
 }

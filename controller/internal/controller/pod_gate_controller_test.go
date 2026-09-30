@@ -403,6 +403,7 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+				WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 				WithRuntimeObjects(initObjs...).
 				Build()
@@ -416,6 +417,7 @@ func TestPodGateReconciler_Reconcile(t *testing.T) {
 			apiReader := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+				WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 				WithRuntimeObjects(apiObjs...).
 				Build()
@@ -509,6 +511,7 @@ func TestPodGateReconciler_ActivePMJWaitUsesBackstopRequeue(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithRuntimeObjects(pod, pmj).
 		Build()
@@ -576,6 +579,7 @@ func TestPodGateReconciler_mapPMJToPods(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithObjects(pmj, replacementPod1, replacementPod2, siblingPod).
 		Build()
 
@@ -668,6 +672,7 @@ func TestPodGateReconciler_Reconcile_Collision(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithObjects(winnerPod, loserPod, pmj).
 		Build()
 
@@ -797,6 +802,7 @@ func TestPodGateReconciler_Reconcile_Collision_WinnerAlreadyUngated(t *testing.T
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithObjects(winnerPod, loserPod, pmj).
 		Build()
 
@@ -962,6 +968,7 @@ func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithObjects(rs, winnerPod, loserPod, pmj1, pmj2).
 		Build()
 
@@ -1035,6 +1042,7 @@ func TestPodGateReconciler_Reconcile_AlreadyConsumedPMJ_ReleasesGateWithColdStar
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(loserPod, pmj).
 		Build()
@@ -1120,6 +1128,7 @@ func TestPodGateReconciler_Reconcile_RecordsRestoredPodNameAndUID(t *testing.T) 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(pod, pmj).
 		Build()
@@ -1211,6 +1220,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_RecoversAndAdopts(t *testing.T)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj). // dead consumer pod is NOT in objects
 		Build()
@@ -1334,6 +1344,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_TerminatingConsumerDoesNotRecov
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, terminatingConsumer, pmj).
 		Build()
@@ -1433,6 +1444,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_CacheLagConsumerStillOnAPIServe
 	cacheClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj).
 		Build()
@@ -1531,6 +1543,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_ConfirmedDeletedOnAPIServer(t *
 	cacheClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj).
 		Build()
@@ -1626,6 +1639,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_AdoptsNewCandidateUIDAndRelease
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj).
 		Build()
@@ -1709,6 +1723,7 @@ func TestPodGateReconciler_Reconcile_SucceededPMJ_NeverReRestored(t *testing.T) 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj). // consumer pod does not exist
 		Build()
@@ -1808,6 +1823,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_UIDMismatchRecovers(t *testing.
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, recreatedPod, pmj).
 		Build()
@@ -1898,6 +1914,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_EmptyRestoredPodNameRecovers(t 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj).
 		Build()
@@ -1999,6 +2016,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_EmptyRestoredPodName_ConsumerSt
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, existingConsumerPod, pmj).
 		Build()
@@ -2080,6 +2098,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_GateAlreadyReleasedDoesNotRecov
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj).
 		Build()
@@ -2180,6 +2199,7 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_StaleCacheHitConfirmedDeletedOn
 	cacheClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj, staleConsumerInCache).
 		Build()
@@ -2279,6 +2299,7 @@ func TestPodGate_GateReleased_StatusPatchFailure_PodRemainsGated(t *testing.T) {
 	baseClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj).
 		Build()
@@ -2407,6 +2428,7 @@ func TestPodGate_EmptyRestoredPodName_UsesLiveReader(t *testing.T) {
 	cacheClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 		WithObjects(candidatePod, pmj).
 		Build()
