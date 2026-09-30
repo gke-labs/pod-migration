@@ -322,5 +322,90 @@ func TestDetectBlindSpot_PrematureSnapshotFailedFromTrace(t *testing.T) {
 	if !proof.CompiledAndTested || !proof.RedPassed || !proof.GreenPassed {
 		t.Fatalf("expected compiled go test RED and GREEN to pass for premature-snapshot-failed trace, got %+v", proof)
 	}
+	if proof.Debounced {
+		t.Fatalf("expected premature-snapshot-failed (non-absence template) not to be debounced by default, got %+v", proof)
+	}
+	ruleSrc, err := os.ReadFile(proof.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ruleSrc), "NewDebouncedRule(") {
+		t.Fatalf("expected non-absence rule not to emit NewDebouncedRule by default, got:\n%s", string(ruleSrc))
+	}
 }
 
+func TestAbsenceTemplatesEmitDebouncedRuleWrappersAndSupportOverrides(t *testing.T) {
+	// 1. Absence template (TemplateWedgedRestoringOrphan) defaults to NewDebouncedRule(..., 3, 30*time.Second).
+	fWedged, err := ParseTriggerCommentOrPR("I10", "/extract-invariant I10 wedged-restoring-orphan PMJ stuck in Restoring after replacement pod deleted", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR failed: %v", err)
+	}
+	if !IsAbsenceTemplate(fWedged.Template) {
+		t.Fatalf("expected %s to be classified as an absence template", fWedged.Template)
+	}
+	pWedged, err := SynthesizeAndVerify(fWedged, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify failed: %v", err)
+	}
+	if !pWedged.Debounced || pWedged.DebounceCount != 3 || pWedged.DebounceDuration != "30s" {
+		t.Fatalf("expected Debounced=true count=3 duration=30s on absence template, got debounced=%v count=%d duration=%q",
+			pWedged.Debounced, pWedged.DebounceCount, pWedged.DebounceDuration)
+	}
+	wedgedRuleBytes, err := os.ReadFile(pWedged.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wedgedRuleSrc := string(wedgedRuleBytes)
+	if !strings.Contains(wedgedRuleSrc, "return NewDebouncedRule(funcRule{") || !strings.Contains(wedgedRuleSrc, "}, 3, 30*time.Second)") {
+		t.Fatalf("expected generated absence rule to wrap funcRule with NewDebouncedRule(..., 3, 30*time.Second), got:\n%s", wedgedRuleSrc)
+	}
+	wedgedTestBytes, err := os.ReadFile(pWedged.TestFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wedgedTestBytes), "rule.(DebouncedRule)") {
+		t.Fatalf("expected generated test to assert DebouncedRule interface on absence rule, got:\n%s", string(wedgedTestBytes))
+	}
+
+	// 2. Absence template (TemplateNoReplacementEvictingStall) with custom debounce count and duration override.
+	fEvict, err := ParseTriggerCommentOrPR("I11", "/extract-invariant I11 no-replacement-evicting-stall PMJ stalled in Evicting with no replacement", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR evicting stall failed: %v", err)
+	}
+	applyFindingOverrides(&fEvict, "", 5, 45*1e9, false)
+	pEvict, err := SynthesizeAndVerify(fEvict, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify custom debounce failed: %v", err)
+	}
+	if !pEvict.CompiledAndTested || !pEvict.RedPassed || !pEvict.GreenPassed {
+		t.Fatalf("expected custom debounced rule to compile and pass RED/GREEN, got %+v", pEvict)
+	}
+	if !pEvict.Debounced || pEvict.DebounceCount != 5 || pEvict.DebounceDuration != "45s" {
+		t.Fatalf("expected Debounced=true count=5 duration=45s, got %+v", pEvict)
+	}
+	evictRuleBytes, err := os.ReadFile(pEvict.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(evictRuleBytes), "}, 5, 45*time.Second)") {
+		t.Fatalf("expected custom debounce signature }, 5, 45*time.Second), got:\n%s", string(evictRuleBytes))
+	}
+
+	// 3. --no-debounce override emits immediate funcRule even for absence template.
+	fNoDebounce := fWedged
+	applyFindingOverrides(&fNoDebounce, "", 0, 0, true)
+	pNoDebounce, err := SynthesizeAndVerify(fNoDebounce, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify no-debounce failed: %v", err)
+	}
+	if pNoDebounce.Debounced {
+		t.Fatalf("expected Debounced=false when --no-debounce is set, got %+v", pNoDebounce)
+	}
+	noDebounceRuleBytes, err := os.ReadFile(pNoDebounce.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(noDebounceRuleBytes), "NewDebouncedRule(") {
+		t.Fatalf("expected --no-debounce to omit NewDebouncedRule wrapper, got:\n%s", string(noDebounceRuleBytes))
+	}
+}

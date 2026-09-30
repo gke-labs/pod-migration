@@ -70,7 +70,49 @@ const (
 	// /extract-invariant directive requires a human/agent author to supply the
 	// predicate body.
 	TemplateCustomScaffold TemplateClass = "custom-invariant-scaffold"
+
+	// DefaultAbsenceDebounceCount is the default consecutive reconcile sample
+	// threshold emitted for absence/negative templates so transient pod recreation
+	// or node reschedule cycles do not trigger premature strict-mode failure (#99, #112).
+	DefaultAbsenceDebounceCount = 3
+
+	// DefaultAbsenceDebounceDuration is the default minimum elapsed duration since
+	// first violation observation emitted for absence/negative templates (#99, #112).
+	DefaultAbsenceDebounceDuration = 30 * time.Second
 )
+
+// IsAbsenceTemplate reports whether a template class checks for the absence of a
+// pod or resource in namespace listings and therefore defaults to debounced
+// multi-sample evaluation via NewDebouncedRule (#99, #112).
+func IsAbsenceTemplate(t TemplateClass) bool {
+	switch t {
+	case TemplateWedgedRestoringOrphan, TemplateNoReplacementEvictingStall:
+		return true
+	default:
+		return false
+	}
+}
+
+// EffectiveDebounce returns the consecutive sample count and minimum duration to
+// emit for a BlindSpotFinding. Explicit finding overrides take precedence;
+// otherwise absence templates default to (3, 30s) unless DisableDebounce is set.
+func EffectiveDebounce(f BlindSpotFinding) (int, time.Duration) {
+	if f.DisableDebounce {
+		return 0, 0
+	}
+	count := f.DebounceCount
+	dur := f.DebounceDuration
+	if count <= 0 && dur <= 0 && IsAbsenceTemplate(f.Template) {
+		return DefaultAbsenceDebounceCount, DefaultAbsenceDebounceDuration
+	}
+	if count > 0 && count < 1 {
+		count = 1
+	}
+	if dur < 0 {
+		dur = 0
+	}
+	return count, dur
+}
 
 // K8sObjectMeta matches the JSON serialization of metav1.ObjectMeta fields used
 // by invariants.ReconcileSnapshot.
@@ -183,6 +225,9 @@ type BlindSpotFinding struct {
 	RestoredPod      string                `json:"restoredPod,omitempty"`
 	FailureTimestamp string                `json:"failureTimestamp"`
 	Description      string                `json:"description"`
+	DebounceCount    int                   `json:"debounceCount,omitempty"`
+	DebounceDuration time.Duration         `json:"debounceDuration,omitempty"`
+	DisableDebounce  bool                  `json:"disableDebounce,omitempty"`
 	Snapshot         ReconcileSnapshotJSON `json:"snapshot"`
 }
 
@@ -194,6 +239,9 @@ type RedGreenProof struct {
 	Template               TemplateClass `json:"template"`
 	TriggerSource          string        `json:"triggerSource"`
 	RequiresAuthorBody     bool          `json:"requiresAuthorBody"`
+	Debounced              bool          `json:"debounced"`
+	DebounceCount          int           `json:"debounceCount,omitempty"`
+	DebounceDuration       string        `json:"debounceDuration,omitempty"`
 	CompiledAndTested      bool          `json:"compiledAndTested"`
 	RedPassed              bool          `json:"redPassed"`
 	RedTestOutput          string        `json:"redTestOutput,omitempty"`
@@ -257,11 +305,14 @@ func main() {
 		commentBody      = flag.String("comment", "", "PR review comment body containing /extract-invariant (Trigger C)")
 		prTitle          = flag.String("pr-title", "", "Bugfix PR title for Trigger B extraction")
 		overrideTemplate = flag.String("template", "", "Optional override for candidate template class")
+		debounceCount    = flag.Int("debounce-count", 0, "Optional override for NewDebouncedRule consecutive sample threshold (default 3 for absence templates)")
+		debounceDuration = flag.Duration("debounce-duration", 0, "Optional override for NewDebouncedRule minimum duration (default 30s for absence templates)")
+		noDebounce       = flag.Bool("no-debounce", false, "Emit immediate funcRule without NewDebouncedRule wrapper even for absence templates")
 		requireRedGreen  = flag.Bool("require-red-green", true, "Exit non-zero if compiled go test RED or GREEN proof fails")
 	)
 	flag.Parse()
 
-	if err := execute(*mode, *runDir, *outDir, *controllerDir, *invariantID, *allowColdStart, *greenRecords, *commentBody, *prTitle, TemplateClass(*overrideTemplate), *requireRedGreen); err != nil {
+	if err := execute(*mode, *runDir, *outDir, *controllerDir, *invariantID, *allowColdStart, *greenRecords, *commentBody, *prTitle, TemplateClass(*overrideTemplate), *debounceCount, *debounceDuration, *noDebounce, *requireRedGreen); err != nil {
 		fmt.Fprintf(os.Stderr, "invariant-gen error: %v\n", err)
 		os.Exit(1)
 	}
@@ -301,7 +352,9 @@ func execute(
 	allowColdStart bool,
 	greenRecordsCSV, commentBody, prTitle string,
 	overrideTemplate TemplateClass,
-	requireRedGreen bool,
+	debounceCount int,
+	debounceDuration time.Duration,
+	noDebounce, requireRedGreen bool,
 ) error {
 	if outDir == "" {
 		return errors.New("--out-dir is required")
@@ -327,6 +380,9 @@ func execute(
 		if err != nil {
 			return err
 		}
+		for i := range findings {
+			applyFindingOverrides(&findings[i], overrideTemplate, debounceCount, debounceDuration, noDebounce)
+		}
 		b, err := json.MarshalIndent(findings, "", "  ")
 		if err != nil {
 			return err
@@ -347,9 +403,7 @@ func execute(
 		if err != nil {
 			return err
 		}
-		if overrideTemplate != "" {
-			finding.Template = overrideTemplate
-		}
+		applyFindingOverrides(&finding, overrideTemplate, debounceCount, debounceDuration, noDebounce)
 		proof, err := SynthesizeAndVerify(finding, outDir, ctrlDir, greenPaths)
 		if err != nil {
 			return err
@@ -377,9 +431,7 @@ func execute(
 			return nil
 		}
 		finding := findings[0]
-		if overrideTemplate != "" {
-			finding.Template = overrideTemplate
-		}
+		applyFindingOverrides(&finding, overrideTemplate, debounceCount, debounceDuration, noDebounce)
 		proof, err := SynthesizeAndVerify(finding, outDir, ctrlDir, greenPaths)
 		if err != nil {
 			return err
@@ -395,9 +447,40 @@ func execute(
 	}
 }
 
+func applyFindingOverrides(
+	f *BlindSpotFinding,
+	overrideTemplate TemplateClass,
+	debounceCount int,
+	debounceDuration time.Duration,
+	noDebounce bool,
+) {
+	if overrideTemplate != "" {
+		f.Template = overrideTemplate
+		if IsAbsenceTemplate(overrideTemplate) {
+			f.DebounceCount = DefaultAbsenceDebounceCount
+			f.DebounceDuration = DefaultAbsenceDebounceDuration
+		} else {
+			f.DebounceCount = 0
+			f.DebounceDuration = 0
+		}
+	}
+	if noDebounce {
+		f.DisableDebounce = true
+		f.DebounceCount = 0
+		f.DebounceDuration = 0
+		return
+	}
+	if debounceCount > 0 {
+		f.DebounceCount = debounceCount
+	}
+	if debounceDuration > 0 {
+		f.DebounceDuration = debounceDuration
+	}
+}
+
 func printProofSummary(p RedGreenProof) {
-	fmt.Printf("invariant-gen %s (%s) [template=%s, trigger=%s, compiled=%v]:\n",
-		p.InvariantID, p.InvariantName, p.Template, p.TriggerSource, p.CompiledAndTested)
+	fmt.Printf("invariant-gen %s (%s) [template=%s, trigger=%s, debounced=%v, compiled=%v]:\n",
+		p.InvariantID, p.InvariantName, p.Template, p.TriggerSource, p.Debounced, p.CompiledAndTested)
 	fmt.Printf("  RED proof   : passed=%v (executed via `go test` on emitted rule & fixture)\n", p.RedPassed)
 	fmt.Printf("  GREEN proof : passed=%v (baselineSnapshots=%d, traceSteps=%d via `go test`)\n",
 		p.GreenPassed, p.GreenBaselineChecked, p.GreenTraceStepsChecked)
@@ -477,7 +560,7 @@ func DetectBlindSpots(runDir, nextInvariantID string, allowColdStart bool) ([]Bl
 		}
 		seq++
 
-		findings = append(findings, BlindSpotFinding{
+		finding := BlindSpotFinding{
 			TriggerSource:    "TriggerA:BlindSpot",
 			InvariantID:      id,
 			InvariantName:    invName,
@@ -491,7 +574,12 @@ func DetectBlindSpots(runDir, nextInvariantID string, allowColdStart bool) ([]Bl
 			FailureTimestamp: snap.Now,
 			Description:      desc,
 			Snapshot:         snap,
-		})
+		}
+		if IsAbsenceTemplate(tmpl) {
+			finding.DebounceCount = DefaultAbsenceDebounceCount
+			finding.DebounceDuration = DefaultAbsenceDebounceDuration
+		}
+		findings = append(findings, finding)
 	}
 	return findings, nil
 }
@@ -623,7 +711,7 @@ func ParseTriggerCommentOrPR(defaultID, commentBody, prTitle string) (BlindSpotF
 		desc = fmt.Sprintf("Extracted candidate invariant %s (%s) from %s", id, invName, triggerSource)
 	}
 
-	return BlindSpotFinding{
+	finding := BlindSpotFinding{
 		TriggerSource:    triggerSource,
 		InvariantID:      id,
 		InvariantName:    invName,
@@ -637,7 +725,12 @@ func ParseTriggerCommentOrPR(defaultID, commentBody, prTitle string) (BlindSpotF
 		FailureTimestamp: snap.Now,
 		Description:      desc,
 		Snapshot:         snap,
-	}, nil
+	}
+	if IsAbsenceTemplate(tmpl) {
+		finding.DebounceCount = DefaultAbsenceDebounceCount
+		finding.DebounceDuration = DefaultAbsenceDebounceDuration
+	}
+	return finding, nil
 }
 
 func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, string, string, string, ReconcileSnapshotJSON) {
@@ -973,6 +1066,13 @@ func SynthesizeAndVerify(
 		greenPassed = false
 	}
 
+	debounceCount, debounceDur := EffectiveDebounce(finding)
+	debounced := debounceCount > 1 || debounceDur > 0
+	var debounceDurStr string
+	if debounced && debounceDur > 0 {
+		debounceDurStr = debounceDur.String()
+	}
+
 	proof := RedGreenProof{
 		InvariantID:            finding.InvariantID,
 		InvariantName:          finding.InvariantName,
@@ -980,6 +1080,9 @@ func SynthesizeAndVerify(
 		Template:               finding.Template,
 		TriggerSource:          finding.TriggerSource,
 		RequiresAuthorBody:     finding.Template == TemplateCustomScaffold,
+		Debounced:              debounced,
+		DebounceCount:          debounceCount,
+		DebounceDuration:       debounceDurStr,
 		CompiledAndTested:      compiled,
 		RedPassed:              redPassed,
 		RedTestOutput:          strings.TrimSpace(redOut),
@@ -1008,6 +1111,45 @@ func SynthesizeAndVerify(
 	return proof, nil
 }
 
+const debounceCompatShimGo = `package invariants
+
+import "time"
+
+type DebouncedRule interface {
+	Rule
+	ConsecutiveSamples() int
+	MinimumDuration() time.Duration
+}
+
+type debouncedRule struct {
+	Rule
+	consecutive     int
+	minimumDuration time.Duration
+}
+
+func (r debouncedRule) ConsecutiveSamples() int {
+	return r.consecutive
+}
+
+func (r debouncedRule) MinimumDuration() time.Duration {
+	return r.minimumDuration
+}
+
+func NewDebouncedRule(r Rule, consecutive int, minDuration time.Duration) DebouncedRule {
+	if consecutive < 1 {
+		consecutive = 1
+	}
+	if minDuration < 0 {
+		minDuration = 0
+	}
+	return debouncedRule{
+		Rule:            r,
+		consecutive:     consecutive,
+		minimumDuration: minDuration,
+	}
+}
+`
+
 func runCompiledGoTestProof(
 	controllerDir string,
 	finding BlindSpotFinding,
@@ -1027,6 +1169,7 @@ func runCompiledGoTestProof(
 	if err != nil {
 		return false, "", false, "", false, fmt.Errorf("read %s: %w", srcInvDir, err)
 	}
+	hasDebouncedRuleInSource := false
 	for _, ent := range entries {
 		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".go") {
 			continue
@@ -1035,7 +1178,15 @@ func runCompiledGoTestProof(
 		if readErr != nil {
 			return false, "", false, "", false, readErr
 		}
+		if strings.Contains(string(b), "NewDebouncedRule") {
+			hasDebouncedRuleInSource = true
+		}
 		if writeErr := os.WriteFile(filepath.Join(stageDir, ent.Name()), b, 0o644); writeErr != nil {
+			return false, "", false, "", false, writeErr
+		}
+	}
+	if !hasDebouncedRuleInSource {
+		if writeErr := os.WriteFile(filepath.Join(stageDir, "debounce_compat_shim.go"), []byte(debounceCompatShimGo), 0o644); writeErr != nil {
 			return false, "", false, "", false, writeErr
 		}
 	}
@@ -1341,9 +1492,50 @@ func loadNDJSONRecords(path string) ([]rawNDJSONRecord, error) {
 	return out, sc.Err()
 }
 
+func formatDurationGoLiteral(d time.Duration) string {
+	if d <= 0 {
+		return "0"
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%d*time.Minute", d/time.Minute)
+	}
+	if d%time.Second == 0 {
+		return fmt.Sprintf("%d*time.Second", d/time.Second)
+	}
+	if d%time.Millisecond == 0 {
+		return fmt.Sprintf("%d*time.Millisecond", d/time.Millisecond)
+	}
+	return fmt.Sprintf("time.Duration(%d)", int64(d))
+}
+
 func renderCandidateRuleGo(f BlindSpotFinding) string {
 	funcName := fmt.Sprintf("Evaluate%s_%s", strings.ToUpper(f.InvariantID), f.InvariantName)
 	ruleConstructor := fmt.Sprintf("Rule%s", strings.ToUpper(f.InvariantID))
+
+	debounceCount, debounceDur := EffectiveDebounce(f)
+	var constructorComment string
+	var returnStmt string
+	if debounceCount > 1 || debounceDur > 0 {
+		if debounceCount < 1 {
+			debounceCount = 1
+		}
+		durLiteral := formatDurationGoLiteral(debounceDur)
+		constructorComment = fmt.Sprintf("// %s returns the debounced stateless Rule for %s (%s).\n// Requires %d consecutive samples and %s minimum duration before strict abort (#99, #112).",
+			ruleConstructor, f.InvariantID, f.InvariantName, debounceCount, debounceDur)
+		returnStmt = fmt.Sprintf(`	return NewDebouncedRule(funcRule{
+		id:   %q,
+		name: %q,
+		fn:   %s,
+	}, %d, %s)`, f.InvariantID, f.InvariantName, funcName, debounceCount, durLiteral)
+	} else {
+		constructorComment = fmt.Sprintf("// %s returns the stateless Rule for %s (%s).",
+			ruleConstructor, f.InvariantID, f.InvariantName)
+		returnStmt = fmt.Sprintf(`	return funcRule{
+		id:   %q,
+		name: %q,
+		fn:   %s,
+	}`, f.InvariantID, f.InvariantName, funcName)
+	}
 
 	return fmt.Sprintf(`// Code generated by tools/invariant-gen (%s); review before merging on an invariant/* branch.
 package invariants
@@ -1359,16 +1551,12 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
-// %s returns the stateless Rule for %s (%s).
+%s
 //
 // Trigger: %s
 // Summary: %s
 func %s() Rule {
-	return funcRule{
-		id:   %q,
-		name: %q,
-		fn:   %s,
-	}
+%s
 }
 
 // %s evaluates %s (%s) over a point-in-time ReconcileSnapshot.
@@ -1385,8 +1573,8 @@ func %s(s *ReconcileSnapshot) []Violation {
 	_ = pmv1alpha1.PodMigrationJobPhaseRestoring
 %s
 }
-`, f.TriggerSource, ruleConstructor, f.InvariantID, f.InvariantName, f.TriggerSource, f.Description,
-		ruleConstructor, f.InvariantID, f.InvariantName, funcName,
+`, f.TriggerSource, constructorComment, f.TriggerSource, f.Description,
+		ruleConstructor, returnStmt,
 		funcName, f.InvariantID, f.InvariantName, funcName,
 		renderPredicateBodyGo(f))
 }
@@ -1551,6 +1739,27 @@ func renderCandidateTestGo(f BlindSpotFinding, fixtureFilename, greenFilename st
 	redTestName := fmt.Sprintf("Test%s_%s_RedProof", strings.ToUpper(f.InvariantID), f.InvariantName)
 	greenTestName := fmt.Sprintf("Test%s_%s_GreenProof", strings.ToUpper(f.InvariantID), f.InvariantName)
 
+	debounceCount, debounceDur := EffectiveDebounce(f)
+	var extraImport string
+	var debounceAssert string
+	if debounceCount > 1 || debounceDur > 0 {
+		if debounceCount < 1 {
+			debounceCount = 1
+		}
+		durLiteral := formatDurationGoLiteral(debounceDur)
+		if strings.Contains(durLiteral, "time.") {
+			extraImport = "\n\t\"time\""
+		}
+		debounceAssert = fmt.Sprintf(`
+	dr, ok := rule.(DebouncedRule)
+	if !ok {
+		t.Fatalf("expected %s() to implement DebouncedRule, got %%T", rule)
+	}
+	if dr.ConsecutiveSamples() != %d || dr.MinimumDuration() != %s {
+		t.Fatalf("expected DebouncedRule(consecutive=%d, minDuration=%%s), got consecutive=%%d minDuration=%%s", %s, dr.ConsecutiveSamples(), dr.MinimumDuration())
+	}`, ruleConstructor, debounceCount, durLiteral, debounceCount, durLiteral)
+	}
+
 	return fmt.Sprintf(`// Code generated by tools/invariant-gen (%s); review before merging on an invariant/* branch.
 package invariants
 
@@ -1558,7 +1767,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"testing"
+	"testing"%s
 )
 
 func %s(t *testing.T) {
@@ -1571,7 +1780,7 @@ func %s(t *testing.T) {
 	if err := json.Unmarshal(raw, &snap); err != nil {
 		t.Fatalf("unmarshal RED snapshot fixture %%s into ReconcileSnapshot: %%v", fixturePath, err)
 	}
-	rule := %s()
+	rule := %s()%s
 	vs := rule.Evaluate(&snap)
 	if len(vs) == 0 {
 		t.Fatalf("RED proof failed: expected >= 1 violation from %%s (%%s) on offending fixture %%s, got 0", rule.ID(), rule.Name(), fixturePath)
@@ -1601,8 +1810,8 @@ func %s(t *testing.T) {
 		}
 	}
 }
-`, f.TriggerSource,
-		redTestName, fixtureFilename, ruleConstructor, f.InvariantID, f.InvariantID,
+`, f.TriggerSource, extraImport,
+		redTestName, fixtureFilename, ruleConstructor, debounceAssert, f.InvariantID, f.InvariantID,
 		greenTestName, greenFilename, ruleConstructor)
 }
 
@@ -1614,6 +1823,10 @@ func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
 	greenStatus := "PASS (`go test` verified)"
 	if !p.GreenPassed {
 		greenStatus = "FAIL"
+	}
+	debounceSummary := "Immediate (`funcRule`, single-sample)"
+	if p.Debounced {
+		debounceSummary = fmt.Sprintf("`NewDebouncedRule` (`consecutive=%d`, `minDuration=%s`)", p.DebounceCount, p.DebounceDuration)
 	}
 
 	return fmt.Sprintf(`## [Invariant %s] %s
@@ -1630,6 +1843,7 @@ func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
 - **Observed Outcome:** `+"`%s`"+` (while `+"`invariantViolations == 0`"+`)
 - **Offending PMJ / Pods:** `+"`%s`"+` (source: `+"`%s`"+`, replacement: `+"`%s`"+`)
 - **Failure Timestamp:** `+"`%s`"+`
+- **Debounce Configuration:** %s
 - **Root Cause & Predicate Summary:** %s
 
 ---
@@ -1657,6 +1871,7 @@ func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
 		f.Outcome,
 		f.PMJName, f.SourcePod, f.RestoredPod,
 		f.FailureTimestamp,
+		debounceSummary,
 		f.Description,
 		strings.ToUpper(f.InvariantID), f.InvariantName, filepath.Base(p.SnapshotFixturePath), p.CompiledAndTested, redStatus,
 		strings.ToUpper(f.InvariantID), f.InvariantName, filepath.Base(p.GreenFixturesPath), p.GreenBaselineChecked, p.GreenTraceStepsChecked, p.CompiledAndTested, greenStatus,
