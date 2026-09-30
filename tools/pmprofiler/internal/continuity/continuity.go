@@ -124,10 +124,21 @@ func Analyze(group string, samples []Sample) Result {
 		checkpointCeiling   int64
 		postRestoreAdvanced bool
 		lastGoodSample      *Sample
+		hasPreCheckpoint    bool
+		hasPostRestore      bool
+		migratingSamples    int
 	)
 
 	for i := range samples {
 		s := &samples[i]
+		switch s.Phase {
+		case "pre-checkpoint":
+			hasPreCheckpoint = true
+		case "migrating":
+			migratingSamples++
+		case "post-restore":
+			hasPostRestore = true
+		}
 		if s.Error != "" {
 			continue
 		}
@@ -199,6 +210,11 @@ func Analyze(group string, samples []Sample) Result {
 		res.Violations = append(res.Violations, "0 successful continuity samples recorded")
 		res.Detail = strings.Join(res.Violations, "; ")
 		return res
+	}
+
+	if hasPreCheckpoint && hasPostRestore && migratingSamples == 0 {
+		res.Violations = append(res.Violations,
+			"missing migrating-phase continuity samples: pre-checkpoint and post-restore phases present but 0 migrating samples recorded")
 	}
 
 	res.FinalObservedMaxSeq = lastGoodSample.ObservedMaxSeq
@@ -463,37 +479,54 @@ echo "${RUN_ID}|${PREV}|%d"
 		}
 
 	case "postgres":
-		sql := fmt.Sprintf(`
-SELECT COALESCE(CAST(EXTRACT(EPOCH FROM pg_postmaster_start_time()) AS BIGINT)::TEXT, 'pg')
-       || '|' || COALESCE((SELECT MAX(seq) FROM mig_seq), 0)::TEXT;
-INSERT INTO mig_seq (seq, nonce) VALUES (%d, 'continuity') ON CONFLICT (seq) DO NOTHING;
-SELECT COALESCE((SELECT MAX(seq) FROM mig_seq), 0)::TEXT;
-`, nextSeq)
-		out, err := execKubectl(ctx, o.KubectlBin, "exec", "-n", o.Namespace, pod, "--",
-			"psql", "-U", "postgres", "-d", "postgres", "-t", "-A", "-c", sql)
+		script := fmt.Sprintf(`
+INST=$(psql -U postgres -d postgres -tAc "SELECT COALESCE(CAST(EXTRACT(EPOCH FROM pg_postmaster_start_time()) AS BIGINT)::TEXT, 'pg');" 2>/dev/null | tr -d '[:space:]')
+if [ -z "${INST}" ]; then
+  exit 1
+fi
+HAS_CONT=$(psql -U postgres -d postgres -tAc "SELECT CASE WHEN to_regclass('public.mig_continuity_seq') IS NULL THEN 0 ELSE 1 END;" 2>/dev/null | tr -d '[:space:]')
+if [ "${HAS_CONT:-0}" -eq 0 ]; then
+  HAS_SEED=$(psql -U postgres -d postgres -tAc "SELECT CASE WHEN to_regclass('public.mig_seq') IS NULL THEN 0 ELSE COALESCE((SELECT COUNT(*) FROM mig_seq), 0) END;" 2>/dev/null | tr -d '[:space:]')
+  if [ "%d" -gt 1 ] || [ "${HAS_SEED:-0}" -le 0 ]; then
+    echo "${INST}|0|0"
+    exit 0
+  fi
+  psql -U postgres -d postgres -tAc "CREATE TABLE IF NOT EXISTS mig_continuity_seq (seq BIGINT PRIMARY KEY, instance TEXT NOT NULL, ts TIMESTAMPTZ DEFAULT now());" >/dev/null 2>&1 || exit 1
+fi
+PREV=$(psql -U postgres -d postgres -tAc "SELECT COALESCE((SELECT MAX(seq) FROM mig_continuity_seq), 0);" 2>/dev/null | tr -d '[:space:]')
+PREV=${PREV:-0}
+if [ "%d" -gt 1 ] && [ "${PREV}" -le 0 ]; then
+  echo "${INST}|0|0"
+  exit 0
+fi
+psql -U postgres -d postgres -tAc "INSERT INTO mig_continuity_seq (seq, instance) VALUES (%d, '${INST}') ON CONFLICT (seq) DO NOTHING;" >/dev/null 2>&1 || exit 1
+POST=$(psql -U postgres -d postgres -tAc "SELECT COALESCE((SELECT MAX(seq) FROM mig_continuity_seq), 0);" 2>/dev/null | tr -d '[:space:]')
+echo "${INST}|${PREV}|${POST:-0}"
+`, nextSeq, nextSeq, nextSeq)
+		out, err := execKubectl(ctx, o.KubectlBin, "exec", "-n", o.Namespace, pod, "--", "sh", "-c", script)
 		if err != nil {
 			return Sample{TS: now, Op: "step", Pod: pod, Phase: o.Phase, Error: err.Error()}
 		}
-		lines := strings.Fields(strings.TrimSpace(out))
-		if len(lines) < 2 {
+		parts := strings.Split(strings.TrimSpace(out), "|")
+		if len(parts) != 3 {
 			return Sample{TS: now, Op: "step", Pod: pod, Phase: o.Phase, Error: "malformed postgres probe output"}
 		}
-		firstParts := strings.Split(lines[0], "|")
-		if len(firstParts) != 2 {
-			return Sample{TS: now, Op: "step", Pod: pod, Phase: o.Phase, Error: "malformed postgres header"}
+		prevMax, _ := strconv.ParseInt(parts[1], 10, 64)
+		afterMax, _ := strconv.ParseInt(parts[2], 10, 64)
+		if afterMax == 0 {
+			return Sample{TS: now, Op: "step", Pod: pod, InstanceID: parts[0], ObservedMaxSeq: 0, Phase: o.Phase}
 		}
-		prevMax, _ := strconv.ParseInt(firstParts[1], 10, 64)
-		if prevMax == 0 {
-			return Sample{TS: now, Op: "step", Pod: pod, InstanceID: firstParts[0], ObservedMaxSeq: 0, Phase: o.Phase}
+		obs := afterMax
+		if prevMax > 0 && prevMax+1 < nextSeq {
+			obs = prevMax
 		}
-		afterMax, _ := strconv.ParseInt(lines[len(lines)-1], 10, 64)
 		return Sample{
 			TS:             now,
 			Op:             "step",
 			Pod:            pod,
-			InstanceID:     firstParts[0],
+			InstanceID:     parts[0],
 			AckedSeq:       nextSeq,
-			ObservedMaxSeq: afterMax,
+			ObservedMaxSeq: obs,
 			Phase:          o.Phase,
 		}
 	default:

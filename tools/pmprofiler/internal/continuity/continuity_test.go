@@ -101,7 +101,7 @@ func TestAnalyze_DoubleRestoreRollback(t *testing.T) {
 	samples := []Sample{
 		{TS: "2026-09-29T10:00:01Z", Pod: "counter-0", InstanceID: "inst-1", AckedSeq: 1, ObservedMaxSeq: 1, Phase: "pre-checkpoint"},
 		{TS: "2026-09-29T10:00:02Z", Pod: "counter-0", InstanceID: "inst-1", AckedSeq: 2, ObservedMaxSeq: 2, Phase: "pre-checkpoint"},
-		{TS: "2026-09-29T10:00:03Z", Pod: "counter-0", InstanceID: "inst-1", AckedSeq: 3, ObservedMaxSeq: 3, Phase: "pre-checkpoint"},
+		{TS: "2026-09-29T10:00:03Z", Pod: "counter-0", InstanceID: "inst-1", AckedSeq: 3, ObservedMaxSeq: 3, Phase: "migrating"},
 		// First restore on replacement pod:
 		{TS: "2026-09-29T10:00:06Z", Pod: "counter-1", InstanceID: "inst-1", AckedSeq: 4, ObservedMaxSeq: 4, Phase: "post-restore"},
 		{TS: "2026-09-29T10:00:07Z", Pod: "counter-1", InstanceID: "inst-1", AckedSeq: 5, ObservedMaxSeq: 5, Phase: "post-restore"},
@@ -118,6 +118,25 @@ func TestAnalyze_DoubleRestoreRollback(t *testing.T) {
 	}
 	if !strings.Contains(res.Detail, "double-restore sequence rollback") {
 		t.Fatalf("expected detail to mention double-restore sequence rollback, got %q", res.Detail)
+	}
+}
+
+func TestAnalyze_MissingMigratingPhase(t *testing.T) {
+	// If pre-checkpoint and post-restore samples exist but the background migrating
+	// probe died without recording any migrating samples, Analyze must fail.
+	samples := []Sample{
+		{TS: "2026-09-29T10:00:01Z", Pod: "redis-0", InstanceID: "run-a", AckedSeq: 1, ObservedMaxSeq: 1, Phase: "pre-checkpoint"},
+		{TS: "2026-09-29T10:00:02Z", Pod: "redis-0", InstanceID: "run-a", AckedSeq: 2, ObservedMaxSeq: 2, Phase: "pre-checkpoint"},
+		{TS: "2026-09-29T10:00:05Z", Pod: "redis-0", InstanceID: "run-a", AckedSeq: 3, ObservedMaxSeq: 3, Phase: "post-restore"},
+		{TS: "2026-09-29T10:00:06Z", Pod: "redis-0", InstanceID: "run-a", AckedSeq: 4, ObservedMaxSeq: 4, Phase: "post-restore"},
+	}
+
+	res := Analyze("redis", samples)
+	if res.Pass {
+		t.Fatalf("expected missing migrating phase to fail Analyze, got %+v", res)
+	}
+	if !strings.Contains(res.Detail, "missing migrating-phase continuity samples") {
+		t.Fatalf("expected detail to mention missing migrating-phase continuity samples, got %q", res.Detail)
 	}
 }
 

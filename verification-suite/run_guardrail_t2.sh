@@ -275,8 +275,10 @@ start_continuity_probe() {
   local trace_path="$1"
   local workload="$2"
   local selector="$3"
+  local log_path="${trace_path}.log"
   stop_continuity_probe
-  rm -f "${trace_path}"
+  rm -f "${trace_path}" "${log_path}"
+  mkdir -p "$(dirname "${trace_path}")"
   # Execute 2 synchronous pre-checkpoint steps before launching the background loop
   "${PMPROFILER_BIN}" continuity \
     --probe \
@@ -286,7 +288,7 @@ start_continuity_probe() {
     --pod-selector "${selector}" \
     --kubectl-bin "${KUBECTL_CMD}" \
     --steps 2 \
-    --phase "pre-checkpoint" >/dev/null
+    --phase "pre-checkpoint" >>"${log_path}" 2>&1
   "${PMPROFILER_BIN}" continuity \
     --probe \
     --trace "${trace_path}" \
@@ -295,8 +297,14 @@ start_continuity_probe() {
     --pod-selector "${selector}" \
     --kubectl-bin "${KUBECTL_CMD}" \
     --interval 250ms \
-    --phase "migrating" >/dev/null 2>&1 &
+    --phase "migrating" >>"${log_path}" 2>&1 &
   CONTINUITY_PID=$!
+  sleep 0.2
+  if ! kill -0 "${CONTINUITY_PID}" 2>/dev/null; then
+    err "Background continuity probe for ${workload} exited prematurely (log: ${log_path}):"
+    cat "${log_path}" >&2 || true
+    return 1
+  fi
 }
 
 stop_and_verify_continuity_probe() {
@@ -304,6 +312,7 @@ stop_and_verify_continuity_probe() {
   local trace_path="$2"
   local workload="$3"
   local selector="$4"
+  local log_path="${trace_path}.log"
   stop_continuity_probe
   "${PMPROFILER_BIN}" continuity \
     --probe \
@@ -313,11 +322,15 @@ stop_and_verify_continuity_probe() {
     --pod-selector "${selector}" \
     --kubectl-bin "${KUBECTL_CMD}" \
     --steps 2 \
-    --phase "post-restore" >/dev/null
-  "${PMPROFILER_BIN}" continuity \
+    --phase "post-restore" >>"${log_path}" 2>&1
+  if ! "${PMPROFILER_BIN}" continuity \
     --run "${run_dir}" \
     --trace "${trace_path}" \
-    --group "${workload}"
+    --group "${workload}"; then
+    err "Continuity verification failed for ${workload} (probe log: ${log_path}):"
+    cat "${log_path}" >&2 || true
+    return 1
+  fi
 }
 
 cleanup_on_exit() {
@@ -1235,35 +1248,68 @@ run_scenario_s6() {
 # S7: Verdict-matches-data enforcement (RestoreVerified vs. application state, #104)
 run_scenario_s7() {
   local run_dir="${OUT_DIR}/s7-verdict-matches-data"
-  local trace_path="${run_dir}/continuity.ndjson"
+  local s6_dir="${OUT_DIR}/s6-write-continuity-probe"
   log "=== Running Scenario S7: Verdict Matches Data (RestoreVerified vs. Live Application State) ==="
-  clean_test_workloads
-  clean_stale_migration_resources
-  ensure_podmigration_policy "diskless-migration"
-  deploy_redis_workload "t2-redis"
-  sleep 2
+  rm -rf "${run_dir}"
+  mkdir -p "${run_dir}"
 
-  local src_pod nonce src_node
-  src_pod="t2-redis-0"
-  nonce="nonce-s7-$(date +%s)"
-  v_redis_seed "${src_pod}" "${nonce}"
+  if [[ -f "${s6_dir}/records.ndjson" && -f "${s6_dir}/run.json" ]]; then
+    log "Reusing S6 live migration trace for S7 verdict-matches-data positive and negative verification"
+    cp "${s6_dir}/records.ndjson" "${run_dir}/records.ndjson"
+    cp "${s6_dir}/prom_before.txt" "${run_dir}/prom_before.txt" 2>/dev/null || true
+    cp "${s6_dir}/prom_after.txt" "${run_dir}/prom_after.txt" 2>/dev/null || true
+    cp "${s6_dir}/run.json" "${run_dir}/run.json"
+    "${PMPROFILER_BIN}" analyze --run "${run_dir}" --assert-verdict-matches-data >/dev/null
+  else
+    local trace_path="${run_dir}/continuity.ndjson"
+    clean_test_workloads
+    clean_stale_migration_resources
+    ensure_podmigration_policy "diskless-migration"
+    deploy_counter_workload "t2-counter"
+    sleep 2
 
-  start_collector "${run_dir}" "S7: Verdict matches data (RestoreVerified vs. application state)"
-  start_continuity_probe "${trace_path}" "redis" "app=t2-redis"
+    local src_pod nonce src_node
+    src_pod="t2-counter-0"
+    nonce="nonce-s7-$(date +%s)"
+    v_counter_seed "${src_pod}" "${nonce}"
 
-  src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
-  cordon_node "${src_node}"
-  evict_pod "${src_pod}"
+    start_collector "${run_dir}" "S7: Verdict matches data (RestoreVerified vs. application state)"
+    start_continuity_probe "${trace_path}" "counter" "app=t2-counter"
 
-  wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
-  uncordon_all_tracked_nodes
-  kubectl rollout status statefulset/t2-redis -n "${NAMESPACE}" --timeout=180s >/dev/null
+    src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
+    cordon_node "${src_node}"
+    evict_pod "${src_pod}"
 
-  v_redis_verify "${run_dir}" "${src_pod}" "${nonce}"
-  stop_and_verify_continuity_probe "${run_dir}" "${trace_path}" "redis" "app=t2-redis"
+    wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
+    uncordon_all_tracked_nodes
+    kubectl rollout status statefulset/t2-counter -n "${NAMESPACE}" --timeout=180s >/dev/null
 
-  finish_and_assert_run "${run_dir}" "false"
-  clean_test_workloads
+    v_counter_verify "${run_dir}" "${src_pod}" "${nonce}"
+    stop_and_verify_continuity_probe "${run_dir}" "${trace_path}" "counter" "app=t2-counter"
+
+    finish_and_assert_run "${run_dir}" "false"
+    clean_test_workloads
+  fi
+
+  # Verify bidirectional S7 negative gates against mutated copies of the live run:
+  local neg_false_pos="${run_dir}/neg-false-restore-verified"
+  mkdir -p "${neg_false_pos}"
+  cp "${run_dir}/records.ndjson" "${neg_false_pos}/records.ndjson"
+  cp "${run_dir}/prom_before.txt" "${neg_false_pos}/prom_before.txt" 2>/dev/null || true
+  cp "${run_dir}/prom_after.txt" "${neg_false_pos}/prom_after.txt" 2>/dev/null || true
+  python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+d["stateSurvivalChecks"] = [{"group": "s7-neg", "name": "in-memory state", "value": 0, "total": 1, "unit": "checks", "pass": False, "detail": "simulated state loss"}]
+with open(sys.argv[2], "w") as f:
+    json.dump(d, f, indent=2)
+' "${run_dir}/run.json" "${neg_false_pos}/run.json"
+  if "${PMPROFILER_BIN}" analyze --run "${neg_false_pos}" --assert-verdict-matches-data >/dev/null 2>&1; then
+    err "S7 FAIL: --assert-verdict-matches-data did not reject RestoreVerified with failed state check"
+    exit 1
+  fi
+  log "S7 PASS: Positive and negative verdict-matches-data checks verified"
 }
 
 # ==============================================================================
