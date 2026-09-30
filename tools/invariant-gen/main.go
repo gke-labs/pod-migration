@@ -105,11 +105,14 @@ func EffectiveDebounce(f BlindSpotFinding) (int, time.Duration) {
 	if count <= 0 && dur <= 0 && IsAbsenceTemplate(f.Template) {
 		return DefaultAbsenceDebounceCount, DefaultAbsenceDebounceDuration
 	}
-	if count > 0 && count < 1 {
-		count = 1
-	}
 	if dur < 0 {
 		dur = 0
+	}
+	if dur > 0 && count < 1 {
+		count = 1
+	}
+	if count < 0 {
+		count = 0
 	}
 	return count, dur
 }
@@ -306,7 +309,7 @@ func main() {
 		prTitle          = flag.String("pr-title", "", "Bugfix PR title for Trigger B extraction")
 		overrideTemplate = flag.String("template", "", "Optional override for candidate template class")
 		debounceCount    = flag.Int("debounce-count", 0, "Optional override for NewDebouncedRule consecutive sample threshold (default 3 for absence templates)")
-		debounceDuration = flag.Duration("debounce-duration", 0, "Optional override for NewDebouncedRule minimum duration (default 30s for absence templates)")
+		debounceDuration = flag.Duration("debounce-duration", -1, "Optional override for NewDebouncedRule minimum duration (default 30s for absence templates)")
 		noDebounce       = flag.Bool("no-debounce", false, "Emit immediate funcRule without NewDebouncedRule wrapper even for absence templates")
 		requireRedGreen  = flag.Bool("require-red-green", true, "Exit non-zero if compiled go test RED or GREEN proof fails")
 	)
@@ -473,7 +476,7 @@ func applyFindingOverrides(
 	if debounceCount > 0 {
 		f.DebounceCount = debounceCount
 	}
-	if debounceDuration > 0 {
+	if debounceDuration >= 0 {
 		f.DebounceDuration = debounceDuration
 	}
 }
@@ -1069,7 +1072,7 @@ func SynthesizeAndVerify(
 	debounceCount, debounceDur := EffectiveDebounce(finding)
 	debounced := debounceCount > 1 || debounceDur > 0
 	var debounceDurStr string
-	if debounced && debounceDur > 0 {
+	if debounced {
 		debounceDurStr = debounceDur.String()
 	}
 
@@ -1494,7 +1497,7 @@ func loadNDJSONRecords(path string) ([]rawNDJSONRecord, error) {
 
 func formatDurationGoLiteral(d time.Duration) string {
 	if d <= 0 {
-		return "0"
+		return "0*time.Second"
 	}
 	if d%time.Minute == 0 {
 		return fmt.Sprintf("%d*time.Minute", d/time.Minute)

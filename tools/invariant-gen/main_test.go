@@ -408,4 +408,48 @@ func TestAbsenceTemplatesEmitDebouncedRuleWrappersAndSupportOverrides(t *testing
 	if strings.Contains(string(noDebounceRuleBytes), "NewDebouncedRule(") {
 		t.Fatalf("expected --no-debounce to omit NewDebouncedRule wrapper, got:\n%s", string(noDebounceRuleBytes))
 	}
+
+	// 4. Count-only debounce (--debounce-count 3 --debounce-duration 0s) on a non-absence template:
+	// must emit 0*time.Second, import "time", and pass compiled go test / go vet.
+	fCountOnly, err := ParseTriggerCommentOrPR("I21", "/extract-invariant I21 unintended-cold-start-active-pmj test cold start count only", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR count-only failed: %v", err)
+	}
+	applyFindingOverrides(&fCountOnly, "", 3, 0, false)
+	pCountOnly, err := SynthesizeAndVerify(fCountOnly, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify count-only failed: %v", err)
+	}
+	if !pCountOnly.CompiledAndTested || !pCountOnly.RedPassed || !pCountOnly.GreenPassed {
+		t.Fatalf("expected count-only debounced rule to compile and pass RED/GREEN (go vet), got %+v\nRED:\n%s\nGREEN:\n%s",
+			pCountOnly, pCountOnly.RedTestOutput, pCountOnly.GreenTestOutput)
+	}
+	if !pCountOnly.Debounced || pCountOnly.DebounceCount != 3 || pCountOnly.DebounceDuration != "0s" {
+		t.Fatalf("expected Debounced=true count=3 duration=0s, got %+v", pCountOnly)
+	}
+
+	// 5. Duration-only debounce (--debounce-duration 15s without --debounce-count) on a non-absence template:
+	// EffectiveDebounce must normalize count to 1 across proof.json, pr_body.md, and emitted Go code.
+	fDurOnly, err := ParseTriggerCommentOrPR("I22", "/extract-invariant I22 unintended-cold-start-active-pmj test cold start duration only", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR duration-only failed: %v", err)
+	}
+	applyFindingOverrides(&fDurOnly, "", 0, 15*1e9, false)
+	pDurOnly, err := SynthesizeAndVerify(fDurOnly, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify duration-only failed: %v", err)
+	}
+	if !pDurOnly.CompiledAndTested || !pDurOnly.RedPassed || !pDurOnly.GreenPassed {
+		t.Fatalf("expected duration-only debounced rule to compile and pass RED/GREEN, got %+v", pDurOnly)
+	}
+	if !pDurOnly.Debounced || pDurOnly.DebounceCount != 1 || pDurOnly.DebounceDuration != "15s" {
+		t.Fatalf("expected EffectiveDebounce to normalize count=1 with duration=15s, got %+v", pDurOnly)
+	}
+	prBodyBytes, err := os.ReadFile(pDurOnly.PRBodyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prBodyBytes), "(`consecutive=1`, `minDuration=15s`)") {
+		t.Fatalf("expected pr_body.md to report consecutive=1, minDuration=15s, got:\n%s", string(prBodyBytes))
+	}
 }
