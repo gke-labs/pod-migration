@@ -20,6 +20,7 @@ import (
 
 	"github.com/gke-labs/pod-migration/tools/pmprofiler/internal/analyze"
 	"github.com/gke-labs/pod-migration/tools/pmprofiler/internal/collect"
+	"github.com/gke-labs/pod-migration/tools/pmprofiler/internal/continuity"
 	"github.com/gke-labs/pod-migration/tools/pmprofiler/internal/report"
 )
 
@@ -33,6 +34,8 @@ func main() {
 		err = cmdCollect(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
+	case "continuity":
+		err = cmdContinuity(os.Args[2:])
 	case "analyze":
 		err = cmdAnalyze(os.Args[2:])
 	case "report":
@@ -47,7 +50,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: pmprofiler <collect|check|analyze|report> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: pmprofiler <collect|check|continuity|analyze|report> [flags]")
 	os.Exit(2)
 }
 
@@ -137,6 +140,57 @@ func splitLines(s string) []string {
 	return out
 }
 
+func cmdContinuity(args []string) error {
+	fs := flag.NewFlagSet("continuity", flag.ExitOnError)
+	probeMode := fs.Bool("probe", false, "run live continuous write/read probe against a cluster pod")
+	run := fs.String("run", "", "optional run directory; when set in verify mode, records a check into <run>/checks.ndjson")
+	name := fs.String("name", "write continuity (no lost acks, empty-source, or rollback)", "check name recorded in checks.ndjson")
+	group := fs.String("group", "redis", "workload group recorded in checks.ndjson")
+	tracePath := fs.String("trace", "", "NDJSON continuity trace file path (required; alias --log)")
+	logAlias := fs.String("log", "", "alias for --trace")
+	po := continuity.LiveProbeOptions{}
+	fs.StringVar(&po.KubectlBin, "kubectl-bin", "kubectl", "kubectl binary for --probe mode")
+	fs.StringVar(&po.Namespace, "namespace", "default", "workload namespace for --probe mode")
+	fs.StringVar(&po.Workload, "workload", "redis", "workload type for --probe mode (counter|redis|postgres)")
+	fs.StringVar(&po.PodSelector, "pod-selector", "", "pod label selector for --probe mode")
+	fs.StringVar(&po.PodName, "pod", "", "explicit pod name for --probe mode")
+	fs.DurationVar(&po.Interval, "interval", 250*time.Millisecond, "probe sampling interval for --probe mode")
+	fs.IntVar(&po.Steps, "steps", 0, "number of probe steps to execute in --probe mode (0 = run until SIGINT/SIGTERM)")
+	fs.StringVar(&po.Phase, "phase", "", "phase tag recorded on samples in --probe mode")
+	fs.Int64Var(&po.StartSeq, "start-seq", 0, "optional starting sequence number in --probe mode")
+	_ = fs.Parse(args) // ExitOnError: never returns an error
+
+	path := *tracePath
+	if path == "" {
+		path = *logAlias
+	}
+	if path == "" {
+		return fmt.Errorf("--trace (or --log) is required")
+	}
+	if *probeMode {
+		po.OutPath = path
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return continuity.RunLiveProbe(ctx, po)
+	}
+
+	samples, err := continuity.LoadSamples(path)
+	if err != nil {
+		return err
+	}
+	res := continuity.Analyze(*group, samples)
+	if *run != "" {
+		if err := continuity.AppendCheckToRun(*run, res.ToCheck(*name)); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(os.Stderr, "continuity (%s): pass=%v %s\n", *group, res.Pass, res.Detail)
+	if !res.Pass {
+		return fmt.Errorf("write continuity assertion failed (%s): %s", *group, res.Detail)
+	}
+	return nil
+}
+
 func cmdAnalyze(args []string) error {
 	fs := flag.NewFlagSet("analyze", flag.ExitOnError)
 	o := analyze.Options{}
@@ -153,6 +207,7 @@ func cmdAnalyze(args []string) error {
 	assertZeroInv := fs.Bool("assert-zero-invariants", true, "fail if sum(pod_migration_invariant_violations_total) > 0")
 	assertCleanOutcomes := fs.Bool("assert-clean-outcomes", false, "fail on wedged, failed, no-replacement, or unintended cold-start outcomes")
 	allowColdStart := fs.Bool("allow-cold-start", false, "permit cold-start outcomes when --assert-clean-outcomes is set (e.g. intentional I9 fallback)")
+	assertVerdictMatchesData := fs.Bool("assert-verdict-matches-data", false, "enforce S7: fail if a migration reports RestoreVerified while the app check failed, or the reverse")
 	enforceSLO := fs.Bool("enforce-slo", false, "enforce wall-clock latency SLO thresholds (T) on p95 gateHoldS, downtimeS, and e2eS")
 	slo := analyze.DefaultSLOThresholds()
 	fs.DurationVar(&slo.GateHoldP95, "slo-gate-hold-p95", slo.GateHoldP95, "max p95 scheduling gate hold duration (gateHoldS) when --enforce-slo is set")
@@ -200,6 +255,11 @@ func cmdAnalyze(args []string) error {
 	}
 	if *assertCleanOutcomes {
 		if err := analyze.VerifyOutcomes(run, *allowColdStart); err != nil {
+			return err
+		}
+	}
+	if *assertVerdictMatchesData {
+		if err := analyze.VerifyVerdictMatchesData(run); err != nil {
 			return err
 		}
 	}
