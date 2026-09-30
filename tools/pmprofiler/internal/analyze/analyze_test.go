@@ -911,5 +911,3 @@ func TestVerifyVerdictMatchesData(t *testing.T) {
 		t.Fatal("expected run without state checks to fail VerifyVerdictMatchesData")
 	}
 }
-
-

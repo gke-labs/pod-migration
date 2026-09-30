@@ -45,14 +45,14 @@ import (
 // Sample represents one observation recorded by the continuous write/read probe.
 type Sample struct {
 	TS             string  `json:"ts"`
-	Op             string  `json:"op,omitempty"`             // "step" or "final"
-	Pod            string  `json:"pod,omitempty"`            // serving pod name
-	InstanceID     string  `json:"instanceId,omitempty"`     // e.g. redis run_id, counter UUID, postgres postmaster start time
-	AckedSeq       int64   `json:"ackedSeq,omitempty"`       // >0 when this step acknowledged writing sequence N
-	ObservedMaxSeq int64   `json:"observedMaxSeq"`           // highest sequence number observed on the serving instance prior to/after write
-	MissingSeqs    []int64 `json:"missingSeqs,omitempty"`    // acknowledged sequence numbers missing from the serving instance
-	Phase          string  `json:"phase,omitempty"`          // optional: "pre-checkpoint", "migrating", "post-restore"
-	Error          string  `json:"error,omitempty"`          // transient error during blackout (not an acknowledgment)
+	Op             string  `json:"op,omitempty"`          // "step" or "final"
+	Pod            string  `json:"pod,omitempty"`         // serving pod name
+	InstanceID     string  `json:"instanceId,omitempty"`  // e.g. redis run_id, counter UUID, postgres postmaster start time
+	AckedSeq       int64   `json:"ackedSeq,omitempty"`    // >0 when this step acknowledged writing sequence N
+	ObservedMaxSeq int64   `json:"observedMaxSeq"`        // highest sequence number observed on the serving instance prior to/after write
+	MissingSeqs    []int64 `json:"missingSeqs,omitempty"` // acknowledged sequence numbers missing from the serving instance
+	Phase          string  `json:"phase,omitempty"`       // optional: "pre-checkpoint", "migrating", "post-restore"
+	Error          string  `json:"error,omitempty"`       // transient error during blackout (not an acknowledgment)
 }
 
 // Result summarizes the write-continuity analysis over a sequence of samples.
@@ -121,8 +121,12 @@ func Analyze(group string, samples []Sample) Result {
 	seenInstances := make(map[string]bool)
 	var (
 		highWaterSeq        int64
-		checkpointCeiling   int64
+		preRestoreHighSeq   int64
+		postRestoreBaseline int64
+		postRestoreHighSeq  int64
 		postRestoreAdvanced bool
+		lastInstanceID      string
+		instanceTransitions int
 		lastGoodSample      *Sample
 		hasPreCheckpoint    bool
 		hasPostRestore      bool
@@ -143,9 +147,15 @@ func Analyze(group string, samples []Sample) Result {
 			continue
 		}
 		res.SuccessfulSamples++
-		if s.InstanceID != "" && !seenInstances[s.InstanceID] {
-			seenInstances[s.InstanceID] = true
-			res.DistinctInstances = append(res.DistinctInstances, s.InstanceID)
+		if s.InstanceID != "" {
+			if !seenInstances[s.InstanceID] {
+				seenInstances[s.InstanceID] = true
+				res.DistinctInstances = append(res.DistinctInstances, s.InstanceID)
+			}
+			if lastInstanceID != "" && s.InstanceID != lastInstanceID {
+				instanceTransitions++
+			}
+			lastInstanceID = s.InstanceID
 		}
 
 		// 1. Empty-source serving check:
@@ -159,29 +169,68 @@ func Analyze(group string, samples []Sample) Result {
 				"empty-source serving at %s (pod=%s, instanceId=%s): observedMaxSeq=0 after seq=%d was already acknowledged",
 				s.TS, s.Pod, s.InstanceID, maxInt64(res.MaxAckedSeq, highWaterSeq),
 			))
-		} else if s.ObservedMaxSeq > 0 && s.ObservedMaxSeq < highWaterSeq {
+		} else if s.ObservedMaxSeq > 0 {
 			// 2. Sequence rollback / double restore check:
-			// ObservedMaxSeq regressed below a previously observed or acknowledged sequence.
-			res.SequenceRollbacks++
-			if postRestoreAdvanced || s.Phase == "post-restore" {
-				res.DoubleRestoreCount++
-				res.Violations = append(res.Violations, fmt.Sprintf(
-					"double-restore sequence rollback at %s (pod=%s, instanceId=%s): observedMaxSeq regressed %d -> %d",
-					s.TS, s.Pod, s.InstanceID, highWaterSeq, s.ObservedMaxSeq,
-				))
-			} else {
-				res.Violations = append(res.Violations, fmt.Sprintf(
-					"sequence rollback at %s (pod=%s, instanceId=%s): observedMaxSeq regressed %d -> %d",
-					s.TS, s.Pod, s.InstanceID, highWaterSeq, s.ObservedMaxSeq,
-				))
+			// Distinguish single-restore post-checkpoint data loss (Mode 1, where the first
+			// post-restore sample reflects the earlier checkpoint ceiling while migrating-phase
+			// writes were lost on the source) from a true double restore / sequence rollback
+			// (Mode 3, where state already advanced in post-restore and then regressed, or a
+			// second instance transition rolled state back).
+			if s.Phase == "post-restore" {
+				if postRestoreHighSeq > 0 && s.ObservedMaxSeq < postRestoreHighSeq {
+					res.SequenceRollbacks++
+					if postRestoreAdvanced || instanceTransitions >= 2 {
+						res.DoubleRestoreCount++
+						res.Violations = append(res.Violations, fmt.Sprintf(
+							"double-restore sequence rollback at %s (pod=%s, instanceId=%s): observedMaxSeq regressed %d -> %d",
+							s.TS, s.Pod, s.InstanceID, postRestoreHighSeq, s.ObservedMaxSeq,
+						))
+					} else {
+						res.Violations = append(res.Violations, fmt.Sprintf(
+							"sequence rollback at %s (pod=%s, instanceId=%s): observedMaxSeq regressed %d -> %d",
+							s.TS, s.Pod, s.InstanceID, postRestoreHighSeq, s.ObservedMaxSeq,
+						))
+					}
+				} else if postRestoreHighSeq == 0 && instanceTransitions >= 2 && s.ObservedMaxSeq < highWaterSeq {
+					res.SequenceRollbacks++
+					res.DoubleRestoreCount++
+					res.Violations = append(res.Violations, fmt.Sprintf(
+						"double-restore sequence rollback at %s (pod=%s, instanceId=%s): observedMaxSeq regressed %d -> %d across %d instance transitions",
+						s.TS, s.Pod, s.InstanceID, highWaterSeq, s.ObservedMaxSeq, instanceTransitions,
+					))
+				}
+			} else if s.ObservedMaxSeq < highWaterSeq {
+				res.SequenceRollbacks++
+				if instanceTransitions >= 2 {
+					res.DoubleRestoreCount++
+					res.Violations = append(res.Violations, fmt.Sprintf(
+						"double-restore sequence rollback at %s (pod=%s, instanceId=%s): observedMaxSeq regressed %d -> %d",
+						s.TS, s.Pod, s.InstanceID, highWaterSeq, s.ObservedMaxSeq,
+					))
+				} else {
+					res.Violations = append(res.Violations, fmt.Sprintf(
+						"sequence rollback at %s (pod=%s, instanceId=%s): observedMaxSeq regressed %d -> %d",
+						s.TS, s.Pod, s.InstanceID, highWaterSeq, s.ObservedMaxSeq,
+					))
+				}
 			}
 		}
 
-		if s.Phase != "post-restore" && s.ObservedMaxSeq > checkpointCeiling {
-			checkpointCeiling = s.ObservedMaxSeq
-		}
-		if s.Phase == "post-restore" && checkpointCeiling > 0 && s.ObservedMaxSeq > checkpointCeiling {
-			postRestoreAdvanced = true
+		sampleMax := maxInt64(s.ObservedMaxSeq, s.AckedSeq)
+		if s.Phase == "post-restore" {
+			if postRestoreBaseline == 0 && sampleMax > 0 {
+				postRestoreBaseline = sampleMax
+				if preRestoreHighSeq > 0 && sampleMax > preRestoreHighSeq {
+					postRestoreAdvanced = true
+				}
+			} else if postRestoreBaseline > 0 && sampleMax > postRestoreBaseline {
+				postRestoreAdvanced = true
+			}
+			if sampleMax > postRestoreHighSeq {
+				postRestoreHighSeq = sampleMax
+			}
+		} else if sampleMax > preRestoreHighSeq {
+			preRestoreHighSeq = sampleMax
 		}
 
 		if s.ObservedMaxSeq > highWaterSeq {
@@ -197,9 +246,6 @@ func Analyze(group string, samples []Sample) Result {
 			}
 			if s.AckedSeq > highWaterSeq {
 				highWaterSeq = s.AckedSeq
-			}
-			if s.Phase == "post-restore" && checkpointCeiling > 0 && s.AckedSeq > checkpointCeiling {
-				postRestoreAdvanced = true
 			}
 		}
 		lastGoodSample = s

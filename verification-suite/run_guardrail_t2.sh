@@ -617,13 +617,13 @@ preflight_snapshot_policy() {
       | select(
           .metadata.deletionTimestamp == null
           and (
-            ((.status.conditions // []) | map(select(.type == "Ready" and .status == "False")) | length) == 0
+            ((.status.conditions // []) | map(select(.type == "Ready" and .status == "True")) | length) > 0
           )
         )
     ] | length
   ' <<<"${psp_json}" 2>/dev/null || echo 0)"
   if [[ "${usable_count:-0}" -lt 1 ]]; then
-    die "Preflight failed: no usable PodSnapshotPolicy found in namespace '${NAMESPACE}' (found 0 active policies without Ready=False)"
+    die "Preflight failed: no Ready PodSnapshotPolicy found in namespace '${NAMESPACE}' (require status.conditions Ready=True)"
   fi
 }
 
@@ -1595,8 +1595,13 @@ EOF
 {"ts":"2026-09-27T10:00:06Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":4,"observedMaxSeq":4,"phase":"migrating"}
 {"ts":"2026-09-27T10:00:14Z","op":"final","pod":"redis-0-restored","instanceId":"run-a","observedMaxSeq":2,"missingSeqs":[3,4],"phase":"post-restore"}
 EOF
-  if "${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/lost-acks.ndjson" --group "redis" >/dev/null 2>&1; then
+  local mode1_out=""
+  if mode1_out="$("${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/lost-acks.ndjson" --group "redis" 2>&1)"; then
     die "Expected pmprofiler continuity to fail on lost acknowledged writes (#103 failure mode 1)"
+  fi
+  grep -q 'lost acknowledged writes' <<<"${mode1_out}" || die "Expected mode 1 output to report 'lost acknowledged writes', got: ${mode1_out}"
+  if grep -q 'double-restore' <<<"${mode1_out}"; then
+    die "Expected single-restore mode 1 output NOT to report 'double-restore', got: ${mode1_out}"
   fi
 
   # Failure mode 2: Empty-source serving (source container restarted empty with new instanceId and observedMaxSeq=0 before eviction)
@@ -1606,21 +1611,25 @@ EOF
 {"ts":"2026-09-27T10:00:06Z","op":"step","pod":"redis-0","instanceId":"run-restarted-empty","observedMaxSeq":0,"phase":"migrating"}
 {"ts":"2026-09-27T10:00:14Z","op":"final","pod":"redis-0-restored","instanceId":"run-a","ackedSeq":3,"observedMaxSeq":3,"phase":"post-restore"}
 EOF
-  if "${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/empty-source.ndjson" --group "redis" >/dev/null 2>&1; then
+  local mode2_out=""
+  if mode2_out="$("${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/empty-source.ndjson" --group "redis" 2>&1)"; then
     die "Expected pmprofiler continuity to fail on empty-source serving (#103 failure mode 2)"
   fi
+  grep -q 'empty-source serving' <<<"${mode2_out}" || die "Expected mode 2 output to report 'empty-source serving', got: ${mode2_out}"
 
   # Failure mode 3: Double restore / rollback (replacement restores at seq 2, acks seq 3..4, then is restored a second time back to seq 2)
   cat >"${neg_cont_dir}/double-restore.ndjson" <<'EOF'
 {"ts":"2026-09-27T10:00:01Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":1,"observedMaxSeq":1,"phase":"pre-checkpoint"}
-{"ts":"2026-09-27T10:00:02Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":2,"observedMaxSeq":2,"phase":"pre-checkpoint"}
+{"ts":"2026-09-27T10:00:02Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":2,"observedMaxSeq":2,"phase":"migrating"}
 {"ts":"2026-09-27T10:00:12Z","op":"step","pod":"redis-0-restored-1","instanceId":"run-a","ackedSeq":3,"observedMaxSeq":3,"phase":"post-restore"}
 {"ts":"2026-09-27T10:00:13Z","op":"step","pod":"redis-0-restored-1","instanceId":"run-a","ackedSeq":4,"observedMaxSeq":4,"phase":"post-restore"}
 {"ts":"2026-09-27T10:00:18Z","op":"final","pod":"redis-0-restored-2","instanceId":"run-a","observedMaxSeq":2,"missingSeqs":[3,4],"phase":"post-restore"}
 EOF
-  if "${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/double-restore.ndjson" --group "redis" >/dev/null 2>&1; then
+  local mode3_out=""
+  if mode3_out="$("${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/double-restore.ndjson" --group "redis" 2>&1)"; then
     die "Expected pmprofiler continuity to fail on double restore / sequence rollback (#103 failure mode 3)"
   fi
+  grep -q 'double-restore sequence rollback' <<<"${mode3_out}" || die "Expected mode 3 output to report 'double-restore sequence rollback', got: ${mode3_out}"
   rm -rf "${neg_cont_dir}"
 
   # Negative tests for Issue #104 (S7: the verdict matches the data):
@@ -1813,10 +1822,20 @@ EOF
 
   # Verify preflight_snapshot_policy (#104):
   #   - fails when no PodSnapshotPolicy exists in the namespace
+  #   - fails when PodSnapshotPolicy has empty status.conditions (never reconciled)
   #   - fails when the only PodSnapshotPolicy has Ready=False
-  #   - passes when an active PodSnapshotPolicy without Ready=False exists
+  #   - passes when an active PodSnapshotPolicy with Ready=True exists
   if (KUBECTL_CMD="${fake_empty_kubectl}" preflight_snapshot_policy >/dev/null 2>&1); then
     die "Expected preflight_snapshot_policy to fail when no PodSnapshotPolicy exists in namespace"
+  fi
+  local fake_unreconciled_psp="${OUT_DIR}/fake-unreconciled-psp.sh"
+  cat >"${fake_unreconciled_psp}" <<'EOF'
+#!/usr/bin/env bash
+printf '{"items":[{"metadata":{"name":"psp-unreconciled"},"status":{"conditions":[]}}]}'
+EOF
+  chmod +x "${fake_unreconciled_psp}"
+  if (KUBECTL_CMD="${fake_unreconciled_psp}" preflight_snapshot_policy >/dev/null 2>&1); then
+    die "Expected preflight_snapshot_policy to fail when PodSnapshotPolicy has empty status.conditions (never reconciled)"
   fi
   local fake_unready_psp="${OUT_DIR}/fake-unready-psp.sh"
   cat >"${fake_unready_psp}" <<'EOF'
@@ -1835,7 +1854,7 @@ EOF
   chmod +x "${fake_ready_psp}"
   KUBECTL_CMD="${fake_ready_psp}" preflight_snapshot_policy
 
-  rm -f "${kubectl_log}" "${fake_kubectl}" "${fake_pssc_kubectl}" "${fake_empty_kubectl}" "${fake_unready_psp}" "${fake_ready_psp}"
+  rm -f "${kubectl_log}" "${fake_kubectl}" "${fake_pssc_kubectl}" "${fake_empty_kubectl}" "${fake_unreconciled_psp}" "${fake_unready_psp}" "${fake_ready_psp}"
 
   log "Self-test PASSED: S1-S7 analyzed with 0 invariant violations, continuity failure modes (#103), S7 verdict-matches-data & preflight gates (#104), runtime-agnostic templates, and report generated at ${report_html}"
 }

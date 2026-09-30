@@ -1216,6 +1216,9 @@ func VerifyVerdictMatchesData(run *Run) error {
 				}
 			}
 		}
+		// When a run contains a single workload or synthetic PMJ/pod names that do
+		// not embed the check's group label as a substring, fall back to cross-checking
+		// against all measured migrations in the run.
 		if len(matched) == 0 {
 			matched = measured
 		}
@@ -1293,4 +1296,3 @@ func VerifySLO(run *Run, slo SLOThresholds) error {
 	}
 	return nil
 }
-
