@@ -451,9 +451,20 @@ resolve_gcs_bucket() {
   fi
   if [[ -n "${existing}" ]]; then
     GCS_BUCKET="${existing}"
-  else
-    GCS_BUCKET="gs://yaoluo-gke-dev-podsnapshots/snapshots"
+    return 0
   fi
+  local pssc_bucket pssc_path
+  pssc_bucket="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
+  pssc_path="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
+  if [[ -n "${pssc_bucket}" ]]; then
+    if [[ -n "${pssc_path}" ]]; then
+      GCS_BUCKET="gs://${pssc_bucket}/${pssc_path#/}"
+    else
+      GCS_BUCKET="gs://${pssc_bucket}"
+    fi
+    return 0
+  fi
+  die "No GCS bucket could be resolved: pass --gcs-bucket <gs://bucket/path>, set GCS_BUCKET, or ensure a PodMigration / PodSnapshotStorageConfig (.spec.snapshotStorageConfig.gcs.{bucket,path}) exists on the cluster"
 }
 
 clean_stale_migration_resources() {
@@ -1789,9 +1800,9 @@ EOF
   fi
   log "PASS [self-test]: backup succeeds when kubectl emits stderr noise"
 
-  # 10. Verify resolve_gcs_bucket returns default bucket on empty List, even with stderr noise
-  local resolved_default_bucket
-  resolved_default_bucket="$(
+  # 10. Verify resolve_gcs_bucket resolves from PodSnapshotStorageConfig on empty PodMigrations List (even with stderr noise) and fails closed when neither exists
+  local resolved_pssc_bucket
+  resolved_pssc_bucket="$(
     GCS_BUCKET=""
     PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_dir}/nonexistent.json"
     kubectl() {
@@ -1800,16 +1811,39 @@ EOF
         echo '{"apiVersion":"v1","kind":"List","items":[]}'
         return 0
       fi
-      command kubectl "$@"
+      if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.bucket}"* ]]; then
+        printf "pssc-bucket"
+        return 0
+      fi
+      if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.path}"* ]]; then
+        printf "/pssc-path"
+        return 0
+      fi
+      return 0
     }
     resolve_gcs_bucket >/dev/null 2>&1
     echo "${GCS_BUCKET}"
-  )" || die "Self-test failure: resolve_gcs_bucket failed on empty List with stderr noise"
+  )" || die "Self-test failure: resolve_gcs_bucket failed when resolving from PodSnapshotStorageConfig with stderr noise"
 
-  if [[ "${resolved_default_bucket}" != "gs://yaoluo-gke-dev-podsnapshots/snapshots" ]]; then
-    die "Self-test failure: expected default GCS bucket for empty List, got '${resolved_default_bucket}'"
+  if [[ "${resolved_pssc_bucket}" != "gs://pssc-bucket/pssc-path" ]]; then
+    die "Self-test failure: expected 'gs://pssc-bucket/pssc-path' from PodSnapshotStorageConfig, got '${resolved_pssc_bucket}'"
   fi
-  log "PASS [self-test]: resolve_gcs_bucket defaults correctly on empty List with stderr noise"
+
+  if (
+    GCS_BUCKET=""
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_dir}/nonexistent.json"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        echo '{"apiVersion":"v1","kind":"List","items":[]}'
+        return 0
+      fi
+      return 0
+    }
+    resolve_gcs_bucket >/dev/null 2>&1
+  ); then
+    die "Self-test failure: expected resolve_gcs_bucket to fail closed when no bucket is passed and neither PodMigration nor PodSnapshotStorageConfig exists"
+  fi
+  log "PASS [self-test]: resolve_gcs_bucket resolves PodSnapshotStorageConfig and fails closed when unconfigured"
 
   # 11. Verify resolve_gcs_bucket extracts existing location when PodMigration exists with stderr noise
   local resolved_custom_bucket
