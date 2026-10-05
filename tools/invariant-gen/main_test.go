@@ -240,9 +240,36 @@ func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 			p1.CompiledAndTested, p1.RedPassed, p1.GreenPassed)
 	}
 
-	// 2. Custom novel directive (or premature-snapshot-failed before ReconcileSnapshot carries PodSnapshot):
-	// must set RequiresAuthorBody=true and fail the compiled RED proof (RedPassed=false, GreenPassed=false).
-	f2, err := ParseTriggerCommentOrPR("I12", "/extract-invariant I12 custom-novel-check some brand new cross-resource invariant", "")
+	// 2. Premature-snapshot-failed directive: now supported natively via PrimarySnapshotConditions (#88).
+	fPremature, err := ParseTriggerCommentOrPR("I12", "/extract-invariant I12 premature-snapshot-failed PMJ failed while Checkpoint=False(InProgress)", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR premature-snapshot-failed failed: %v", err)
+	}
+	if fPremature.Template != TemplatePrematureSnapshotFailed {
+		t.Fatalf("expected TemplatePrematureSnapshotFailed, got %s", fPremature.Template)
+	}
+	pPremature, err := SynthesizeAndVerify(fPremature, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify premature-snapshot-failed failed: %v", err)
+	}
+	if pPremature.RequiresAuthorBody || !pPremature.CompiledAndTested || !pPremature.RedPassed || !pPremature.GreenPassed {
+		t.Fatalf("expected premature-snapshot-failed template to pass compiled go test RED and GREEN, got %+v\nRED:\n%s\nGREEN:\n%s",
+			pPremature, pPremature.RedTestOutput, pPremature.GreenTestOutput)
+	}
+
+	// 3. PodListFailed=true on a wedged-restoring-orphan snapshot must suppress false-positive violations.
+	fListFailed := f1
+	fListFailed.Snapshot.PodListFailed = true
+	pListFailed, err := SynthesizeAndVerify(fListFailed, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify with PodListFailed=true failed: %v", err)
+	}
+	if pListFailed.RedPassed {
+		t.Fatalf("expected PodListFailed=true to suppress RestoringReplacementPodMissing violation, but RED still fired")
+	}
+
+	// 4. Custom novel directive: must set RequiresAuthorBody=true and fail the compiled RED proof (RedPassed=false, GreenPassed=false).
+	f2, err := ParseTriggerCommentOrPR("I13", "/extract-invariant I13 custom-novel-check some brand new cross-resource invariant", "")
 	if err != nil {
 		t.Fatalf("ParseTriggerCommentOrPR custom failed: %v", err)
 	}
@@ -255,5 +282,174 @@ func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 	}
 	if !p2.RequiresAuthorBody || !p2.CompiledAndTested || p2.RedPassed || p2.GreenPassed {
 		t.Fatalf("expected custom scaffold to compile and run go test, require author body, and report redPassed=false greenPassed=false, got %+v", p2)
+	}
+}
+
+func TestDetectBlindSpot_PrematureSnapshotFailedFromTrace(t *testing.T) {
+	runDir := t.TempDir()
+	runJSON := `{
+  "scenario": "synthetic-self-test: premature-snapshot-failed",
+  "outcomes": {"failed": 1},
+  "invariantViolations": {},
+  "totalInvariantViolations": 0,
+  "migrations": [{"app": "redis", "pod": "redis-0", "pmj": "pmj-snap-0", "snapshotName": "ps-snap-0", "outcome": "failed", "phase": "Failed"}]
+}`
+	ndjson := strings.Join([]string{
+		`{"ts":"2026-09-28T02:00:00Z","type":"add","gvr":"podsnapshots.v1.podsnapshot.gke.io","obj":{"metadata":{"name":"ps-snap-0","namespace":"default"},"status":{"conditions":[{"type":"Ready","status":"False","reason":"CheckpointFailed"},{"type":"Checkpoint","status":"False","reason":"InProgress"},{"type":"StorageReplicated","status":"False","reason":"Pending"}]}}}`,
+		`{"ts":"2026-09-28T02:00:01Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-snap-0","namespace":"default"},"spec":{"podRef":{"name":"redis-0"}},"status":{"phase":"Failed","snapshotRef":"ps-snap-0","conditions":[{"type":"Completed","status":"True","reason":"SnapshotFailed"}]}}}`,
+	}, "\n") + "\n"
+
+	if err := os.WriteFile(filepath.Join(runDir, "run.json"), []byte(runJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "records.ndjson"), []byte(ndjson), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := DetectBlindSpots(runDir, "I13", false)
+	if err != nil {
+		t.Fatalf("DetectBlindSpots failed: %v", err)
+	}
+	if len(findings) != 1 || findings[0].Template != TemplatePrematureSnapshotFailed {
+		t.Fatalf("expected 1 finding with TemplatePrematureSnapshotFailed, got %+v", findings)
+	}
+	if len(findings[0].Snapshot.PrimarySnapshotConditions) != 3 {
+		t.Fatalf("expected 3 PrimarySnapshotConditions extracted from podsnapshots trace event, got %+v", findings[0].Snapshot.PrimarySnapshotConditions)
+	}
+	proof, err := SynthesizeAndVerify(findings[0], t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify failed: %v", err)
+	}
+	if !proof.CompiledAndTested || !proof.RedPassed || !proof.GreenPassed {
+		t.Fatalf("expected compiled go test RED and GREEN to pass for premature-snapshot-failed trace, got %+v", proof)
+	}
+	if proof.Debounced {
+		t.Fatalf("expected premature-snapshot-failed (non-absence template) not to be debounced by default, got %+v", proof)
+	}
+	ruleSrc, err := os.ReadFile(proof.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ruleSrc), "NewDebouncedRule(") {
+		t.Fatalf("expected non-absence rule not to emit NewDebouncedRule by default, got:\n%s", string(ruleSrc))
+	}
+}
+
+func TestAbsenceTemplatesEmitDebouncedRuleWrappersAndSupportOverrides(t *testing.T) {
+	// 1. Absence template (TemplateWedgedRestoringOrphan) defaults to NewDebouncedRule(..., 3, 30*time.Second).
+	fWedged, err := ParseTriggerCommentOrPR("I10", "/extract-invariant I10 wedged-restoring-orphan PMJ stuck in Restoring after replacement pod deleted", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR failed: %v", err)
+	}
+	if !IsAbsenceTemplate(fWedged.Template) {
+		t.Fatalf("expected %s to be classified as an absence template", fWedged.Template)
+	}
+	pWedged, err := SynthesizeAndVerify(fWedged, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify failed: %v", err)
+	}
+	if !pWedged.Debounced || pWedged.DebounceCount != 3 || pWedged.DebounceDuration != "30s" {
+		t.Fatalf("expected Debounced=true count=3 duration=30s on absence template, got debounced=%v count=%d duration=%q",
+			pWedged.Debounced, pWedged.DebounceCount, pWedged.DebounceDuration)
+	}
+	wedgedRuleBytes, err := os.ReadFile(pWedged.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wedgedRuleSrc := string(wedgedRuleBytes)
+	if !strings.Contains(wedgedRuleSrc, "return NewDebouncedRule(funcRule{") || !strings.Contains(wedgedRuleSrc, "}, 3, 30*time.Second)") {
+		t.Fatalf("expected generated absence rule to wrap funcRule with NewDebouncedRule(..., 3, 30*time.Second), got:\n%s", wedgedRuleSrc)
+	}
+	wedgedTestBytes, err := os.ReadFile(pWedged.TestFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wedgedTestBytes), "rule.(DebouncedRule)") {
+		t.Fatalf("expected generated test to assert DebouncedRule interface on absence rule, got:\n%s", string(wedgedTestBytes))
+	}
+
+	// 2. Absence template (TemplateNoReplacementEvictingStall) with custom debounce count and duration override.
+	fEvict, err := ParseTriggerCommentOrPR("I11", "/extract-invariant I11 no-replacement-evicting-stall PMJ stalled in Evicting with no replacement", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR evicting stall failed: %v", err)
+	}
+	applyFindingOverrides(&fEvict, "", 5, 45*1e9, false)
+	pEvict, err := SynthesizeAndVerify(fEvict, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify custom debounce failed: %v", err)
+	}
+	if !pEvict.CompiledAndTested || !pEvict.RedPassed || !pEvict.GreenPassed {
+		t.Fatalf("expected custom debounced rule to compile and pass RED/GREEN, got %+v", pEvict)
+	}
+	if !pEvict.Debounced || pEvict.DebounceCount != 5 || pEvict.DebounceDuration != "45s" {
+		t.Fatalf("expected Debounced=true count=5 duration=45s, got %+v", pEvict)
+	}
+	evictRuleBytes, err := os.ReadFile(pEvict.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(evictRuleBytes), "}, 5, 45*time.Second)") {
+		t.Fatalf("expected custom debounce signature }, 5, 45*time.Second), got:\n%s", string(evictRuleBytes))
+	}
+
+	// 3. --no-debounce override emits immediate funcRule even for absence template.
+	fNoDebounce := fWedged
+	applyFindingOverrides(&fNoDebounce, "", 0, 0, true)
+	pNoDebounce, err := SynthesizeAndVerify(fNoDebounce, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify no-debounce failed: %v", err)
+	}
+	if pNoDebounce.Debounced {
+		t.Fatalf("expected Debounced=false when --no-debounce is set, got %+v", pNoDebounce)
+	}
+	noDebounceRuleBytes, err := os.ReadFile(pNoDebounce.RuleFilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(noDebounceRuleBytes), "NewDebouncedRule(") {
+		t.Fatalf("expected --no-debounce to omit NewDebouncedRule wrapper, got:\n%s", string(noDebounceRuleBytes))
+	}
+
+	// 4. Count-only debounce (--debounce-count 3 --debounce-duration 0s) on a non-absence template:
+	// must emit 0*time.Second, import "time", and pass compiled go test / go vet.
+	fCountOnly, err := ParseTriggerCommentOrPR("I21", "/extract-invariant I21 unintended-cold-start-active-pmj test cold start count only", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR count-only failed: %v", err)
+	}
+	applyFindingOverrides(&fCountOnly, "", 3, 0, false)
+	pCountOnly, err := SynthesizeAndVerify(fCountOnly, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify count-only failed: %v", err)
+	}
+	if !pCountOnly.CompiledAndTested || !pCountOnly.RedPassed || !pCountOnly.GreenPassed {
+		t.Fatalf("expected count-only debounced rule to compile and pass RED/GREEN (go vet), got %+v\nRED:\n%s\nGREEN:\n%s",
+			pCountOnly, pCountOnly.RedTestOutput, pCountOnly.GreenTestOutput)
+	}
+	if !pCountOnly.Debounced || pCountOnly.DebounceCount != 3 || pCountOnly.DebounceDuration != "0s" {
+		t.Fatalf("expected Debounced=true count=3 duration=0s, got %+v", pCountOnly)
+	}
+
+	// 5. Duration-only debounce (--debounce-duration 15s without --debounce-count) on a non-absence template:
+	// EffectiveDebounce must normalize count to 1 across proof.json, pr_body.md, and emitted Go code.
+	fDurOnly, err := ParseTriggerCommentOrPR("I22", "/extract-invariant I22 unintended-cold-start-active-pmj test cold start duration only", "")
+	if err != nil {
+		t.Fatalf("ParseTriggerCommentOrPR duration-only failed: %v", err)
+	}
+	applyFindingOverrides(&fDurOnly, "", 0, 15*1e9, false)
+	pDurOnly, err := SynthesizeAndVerify(fDurOnly, t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("SynthesizeAndVerify duration-only failed: %v", err)
+	}
+	if !pDurOnly.CompiledAndTested || !pDurOnly.RedPassed || !pDurOnly.GreenPassed {
+		t.Fatalf("expected duration-only debounced rule to compile and pass RED/GREEN, got %+v", pDurOnly)
+	}
+	if !pDurOnly.Debounced || pDurOnly.DebounceCount != 1 || pDurOnly.DebounceDuration != "15s" {
+		t.Fatalf("expected EffectiveDebounce to normalize count=1 with duration=15s, got %+v", pDurOnly)
+	}
+	prBodyBytes, err := os.ReadFile(pDurOnly.PRBodyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(prBodyBytes), "(`consecutive=1`, `minDuration=15s`)") {
+		t.Fatalf("expected pr_body.md to report consecutive=1, minDuration=15s, got:\n%s", string(prBodyBytes))
 	}
 }
