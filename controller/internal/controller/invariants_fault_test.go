@@ -111,6 +111,26 @@ func (c *envtestIndexedClient) List(ctx context.Context, list client.ObjectList,
 					}
 				}
 				return nil
+
+			case PMJParentKeyIndex:
+				var pmjList pmv1alpha1.PodMigrationJobList
+				forwardOpts := stripCustomFieldSelector(listOpts)
+				if err := c.Client.List(ctx, &pmjList, forwardOpts...); err != nil {
+					return err
+				}
+				target := list.(*pmv1alpha1.PodMigrationJobList)
+				target.ListMeta = pmjList.ListMeta
+				target.Items = nil
+				for i := range pmjList.Items {
+					vals := PMJParentKeyIndexValue(&pmjList.Items[i])
+					for _, v := range vals {
+						if v == req.Value {
+							target.Items = append(target.Items, pmjList.Items[i])
+							break
+						}
+					}
+				}
+				return nil
 			}
 		}
 	}
