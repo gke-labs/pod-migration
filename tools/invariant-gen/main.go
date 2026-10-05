@@ -61,12 +61,61 @@ const (
 	// PMJ is still in PhaseRestoring.
 	TemplateUnintendedColdStartActivePMJ TemplateClass = "unintended-cold-start-active-pmj"
 
-	// TemplateCustomScaffold is emitted when a blind spot (such as PodSnapshot
-	// sub-condition races that are not yet fields on invariants.ReconcileSnapshot)
-	// or a novel /extract-invariant directive requires a human/agent author to
-	// supply the predicate body (and any needed ReconcileSnapshot fields).
+	// TemplatePrematureSnapshotFailed catches PMJs that transitioned to PhaseFailed
+	// with Reason=SnapshotFailed while PrimarySnapshotConditions shows Ready=False
+	// alongside an in-progress Checkpoint or StorageReplicated sub-condition.
+	TemplatePrematureSnapshotFailed TemplateClass = "premature-snapshot-failed"
+
+	// TemplateCustomScaffold is emitted when a blind spot or novel
+	// /extract-invariant directive requires a human/agent author to supply the
+	// predicate body.
 	TemplateCustomScaffold TemplateClass = "custom-invariant-scaffold"
+
+	// DefaultAbsenceDebounceCount is the default consecutive reconcile sample
+	// threshold emitted for absence/negative templates so transient pod recreation
+	// or node reschedule cycles do not trigger premature strict-mode failure (#99, #112).
+	DefaultAbsenceDebounceCount = 3
+
+	// DefaultAbsenceDebounceDuration is the default minimum elapsed duration since
+	// first violation observation emitted for absence/negative templates (#99, #112).
+	DefaultAbsenceDebounceDuration = 30 * time.Second
 )
+
+// IsAbsenceTemplate reports whether a template class checks for the absence of a
+// pod or resource in namespace listings and therefore defaults to debounced
+// multi-sample evaluation via NewDebouncedRule (#99, #112).
+func IsAbsenceTemplate(t TemplateClass) bool {
+	switch t {
+	case TemplateWedgedRestoringOrphan, TemplateNoReplacementEvictingStall:
+		return true
+	default:
+		return false
+	}
+}
+
+// EffectiveDebounce returns the consecutive sample count and minimum duration to
+// emit for a BlindSpotFinding. Explicit finding overrides take precedence;
+// otherwise absence templates default to (3, 30s) unless DisableDebounce is set.
+func EffectiveDebounce(f BlindSpotFinding) (int, time.Duration) {
+	if f.DisableDebounce {
+		return 0, 0
+	}
+	count := f.DebounceCount
+	dur := f.DebounceDuration
+	if count <= 0 && dur <= 0 && IsAbsenceTemplate(f.Template) {
+		return DefaultAbsenceDebounceCount, DefaultAbsenceDebounceDuration
+	}
+	if dur < 0 {
+		dur = 0
+	}
+	if dur > 0 && count < 1 {
+		count = 1
+	}
+	if count < 0 {
+		count = 0
+	}
+	return count, dur
+}
 
 // K8sObjectMeta matches the JSON serialization of metav1.ObjectMeta fields used
 // by invariants.ReconcileSnapshot.
@@ -151,14 +200,17 @@ type K8sPod struct {
 // in controller/internal/invariants/snapshot.go so generated fixtures unmarshal
 // directly into invariants.ReconcileSnapshot during `go test`.
 type ReconcileSnapshotJSON struct {
-	Now                          string   `json:"Now"`
-	Reconciler                   string   `json:"Reconciler"`
-	PrimaryPMJ                   *K8sPMJ  `json:"PrimaryPMJ,omitempty"`
-	PrimaryPod                   *K8sPod  `json:"PrimaryPod,omitempty"`
-	NamespacePMJs                []K8sPMJ `json:"NamespacePMJs,omitempty"`
-	NamespacePods                []K8sPod `json:"NamespacePods,omitempty"`
-	HasOrphanedTrigger           bool     `json:"HasOrphanedTrigger,omitempty"`
-	RestoreCrashSignatureMatched bool     `json:"RestoreCrashSignatureMatched,omitempty"`
+	Now                          string         `json:"Now"`
+	Reconciler                   string         `json:"Reconciler"`
+	PrimaryPMJ                   *K8sPMJ        `json:"PrimaryPMJ,omitempty"`
+	PrimaryPod                   *K8sPod        `json:"PrimaryPod,omitempty"`
+	NamespacePMJs                []K8sPMJ       `json:"NamespacePMJs,omitempty"`
+	NamespacePods                []K8sPod       `json:"NamespacePods,omitempty"`
+	PodListFailed                bool           `json:"PodListFailed,omitempty"`
+	PMJListFailed                bool           `json:"PMJListFailed,omitempty"`
+	HasOrphanedTrigger           bool           `json:"HasOrphanedTrigger,omitempty"`
+	RestoreCrashSignatureMatched bool           `json:"RestoreCrashSignatureMatched,omitempty"`
+	PrimarySnapshotConditions    []K8sCondition `json:"PrimarySnapshotConditions,omitempty"`
 }
 
 // BlindSpotFinding describes a single blind spot where pmprofiler observed an
@@ -176,6 +228,9 @@ type BlindSpotFinding struct {
 	RestoredPod      string                `json:"restoredPod,omitempty"`
 	FailureTimestamp string                `json:"failureTimestamp"`
 	Description      string                `json:"description"`
+	DebounceCount    int                   `json:"debounceCount,omitempty"`
+	DebounceDuration time.Duration         `json:"debounceDuration,omitempty"`
+	DisableDebounce  bool                  `json:"disableDebounce,omitempty"`
 	Snapshot         ReconcileSnapshotJSON `json:"snapshot"`
 }
 
@@ -187,6 +242,9 @@ type RedGreenProof struct {
 	Template               TemplateClass `json:"template"`
 	TriggerSource          string        `json:"triggerSource"`
 	RequiresAuthorBody     bool          `json:"requiresAuthorBody"`
+	Debounced              bool          `json:"debounced"`
+	DebounceCount          int           `json:"debounceCount,omitempty"`
+	DebounceDuration       string        `json:"debounceDuration,omitempty"`
 	CompiledAndTested      bool          `json:"compiledAndTested"`
 	RedPassed              bool          `json:"redPassed"`
 	RedTestOutput          string        `json:"redTestOutput,omitempty"`
@@ -250,11 +308,14 @@ func main() {
 		commentBody      = flag.String("comment", "", "PR review comment body containing /extract-invariant (Trigger C)")
 		prTitle          = flag.String("pr-title", "", "Bugfix PR title for Trigger B extraction")
 		overrideTemplate = flag.String("template", "", "Optional override for candidate template class")
+		debounceCount    = flag.Int("debounce-count", 0, "Optional override for NewDebouncedRule consecutive sample threshold (default 3 for absence templates)")
+		debounceDuration = flag.Duration("debounce-duration", -1, "Optional override for NewDebouncedRule minimum duration (default 30s for absence templates)")
+		noDebounce       = flag.Bool("no-debounce", false, "Emit immediate funcRule without NewDebouncedRule wrapper even for absence templates")
 		requireRedGreen  = flag.Bool("require-red-green", true, "Exit non-zero if compiled go test RED or GREEN proof fails")
 	)
 	flag.Parse()
 
-	if err := execute(*mode, *runDir, *outDir, *controllerDir, *invariantID, *allowColdStart, *greenRecords, *commentBody, *prTitle, TemplateClass(*overrideTemplate), *requireRedGreen); err != nil {
+	if err := execute(*mode, *runDir, *outDir, *controllerDir, *invariantID, *allowColdStart, *greenRecords, *commentBody, *prTitle, TemplateClass(*overrideTemplate), *debounceCount, *debounceDuration, *noDebounce, *requireRedGreen); err != nil {
 		fmt.Fprintf(os.Stderr, "invariant-gen error: %v\n", err)
 		os.Exit(1)
 	}
@@ -294,7 +355,9 @@ func execute(
 	allowColdStart bool,
 	greenRecordsCSV, commentBody, prTitle string,
 	overrideTemplate TemplateClass,
-	requireRedGreen bool,
+	debounceCount int,
+	debounceDuration time.Duration,
+	noDebounce, requireRedGreen bool,
 ) error {
 	if outDir == "" {
 		return errors.New("--out-dir is required")
@@ -320,6 +383,9 @@ func execute(
 		if err != nil {
 			return err
 		}
+		for i := range findings {
+			applyFindingOverrides(&findings[i], overrideTemplate, debounceCount, debounceDuration, noDebounce)
+		}
 		b, err := json.MarshalIndent(findings, "", "  ")
 		if err != nil {
 			return err
@@ -340,9 +406,7 @@ func execute(
 		if err != nil {
 			return err
 		}
-		if overrideTemplate != "" {
-			finding.Template = overrideTemplate
-		}
+		applyFindingOverrides(&finding, overrideTemplate, debounceCount, debounceDuration, noDebounce)
 		proof, err := SynthesizeAndVerify(finding, outDir, ctrlDir, greenPaths)
 		if err != nil {
 			return err
@@ -370,9 +434,7 @@ func execute(
 			return nil
 		}
 		finding := findings[0]
-		if overrideTemplate != "" {
-			finding.Template = overrideTemplate
-		}
+		applyFindingOverrides(&finding, overrideTemplate, debounceCount, debounceDuration, noDebounce)
 		proof, err := SynthesizeAndVerify(finding, outDir, ctrlDir, greenPaths)
 		if err != nil {
 			return err
@@ -388,9 +450,40 @@ func execute(
 	}
 }
 
+func applyFindingOverrides(
+	f *BlindSpotFinding,
+	overrideTemplate TemplateClass,
+	debounceCount int,
+	debounceDuration time.Duration,
+	noDebounce bool,
+) {
+	if overrideTemplate != "" {
+		f.Template = overrideTemplate
+		if IsAbsenceTemplate(overrideTemplate) {
+			f.DebounceCount = DefaultAbsenceDebounceCount
+			f.DebounceDuration = DefaultAbsenceDebounceDuration
+		} else {
+			f.DebounceCount = 0
+			f.DebounceDuration = 0
+		}
+	}
+	if noDebounce {
+		f.DisableDebounce = true
+		f.DebounceCount = 0
+		f.DebounceDuration = 0
+		return
+	}
+	if debounceCount > 0 {
+		f.DebounceCount = debounceCount
+	}
+	if debounceDuration >= 0 {
+		f.DebounceDuration = debounceDuration
+	}
+}
+
 func printProofSummary(p RedGreenProof) {
-	fmt.Printf("invariant-gen %s (%s) [template=%s, trigger=%s, compiled=%v]:\n",
-		p.InvariantID, p.InvariantName, p.Template, p.TriggerSource, p.CompiledAndTested)
+	fmt.Printf("invariant-gen %s (%s) [template=%s, trigger=%s, debounced=%v, compiled=%v]:\n",
+		p.InvariantID, p.InvariantName, p.Template, p.TriggerSource, p.Debounced, p.CompiledAndTested)
 	fmt.Printf("  RED proof   : passed=%v (executed via `go test` on emitted rule & fixture)\n", p.RedPassed)
 	fmt.Printf("  GREEN proof : passed=%v (baselineSnapshots=%d, traceSteps=%d via `go test`)\n",
 		p.GreenPassed, p.GreenBaselineChecked, p.GreenTraceStepsChecked)
@@ -470,7 +563,7 @@ func DetectBlindSpots(runDir, nextInvariantID string, allowColdStart bool) ([]Bl
 		}
 		seq++
 
-		findings = append(findings, BlindSpotFinding{
+		finding := BlindSpotFinding{
 			TriggerSource:    "TriggerA:BlindSpot",
 			InvariantID:      id,
 			InvariantName:    invName,
@@ -484,7 +577,12 @@ func DetectBlindSpots(runDir, nextInvariantID string, allowColdStart bool) ([]Bl
 			FailureTimestamp: snap.Now,
 			Description:      desc,
 			Snapshot:         snap,
-		})
+		}
+		if IsAbsenceTemplate(tmpl) {
+			finding.DebounceCount = DefaultAbsenceDebounceCount
+			finding.DebounceDuration = DefaultAbsenceDebounceDuration
+		}
+		findings = append(findings, finding)
 	}
 	return findings, nil
 }
@@ -529,6 +627,14 @@ func classifyBlindSpot(m pmMigrationJSON, snap ReconcileSnapshotJSON) (TemplateC
 				fmt.Sprintf("PMJ %q remained in PhaseEvicting >=30s after source pod %q was deleted with no replacement pod bound",
 					pmj.Metadata.Name, pmj.Spec.PodRef.Name)
 		}
+		// 4. PrematureSnapshotFailed:
+		if pmj.Status.Phase == "Failed" && hasPrematureSnapshotFailure(pmj.Status.Conditions, snap.PrimarySnapshotConditions) {
+			return TemplatePrematureSnapshotFailed,
+				"SnapshotSubconditionConsistency",
+				"premature_snapshot_failed",
+				fmt.Sprintf("PMJ %q transitioned to PhaseFailed (SnapshotFailed) while PodSnapshot %q still had an in-progress sub-condition",
+					pmj.Metadata.Name, pmj.Status.SnapshotRef)
+		}
 	}
 
 	return TemplateCustomScaffold,
@@ -536,6 +642,39 @@ func classifyBlindSpot(m pmMigrationJSON, snap ReconcileSnapshotJSON) (TemplateC
 		"custom_blind_spot",
 		fmt.Sprintf("Unhealthy migration outcome %q observed on PMJ %q with 0 existing I1-I9 violations (requires author predicate over ReconcileSnapshot)",
 			m.Outcome, derefStr(m.PMJ))
+}
+
+func hasPrematureSnapshotFailure(pmjConds []K8sCondition, snapConds []K8sCondition) bool {
+	if len(snapConds) == 0 {
+		return false
+	}
+	pmjSnapshotFailed := false
+	for _, c := range pmjConds {
+		if c.Reason == "SnapshotFailed" {
+			pmjSnapshotFailed = true
+			break
+		}
+	}
+	if !pmjSnapshotFailed {
+		return false
+	}
+	subInProgress := false
+	for _, c := range snapConds {
+		if (c.Type == "Checkpoint" || c.Type == "StorageReplicated") && c.Status == "False" && isSnapshotSubconditionInProgress(c.Reason) {
+			subInProgress = true
+			break
+		}
+	}
+	return subInProgress
+}
+
+func isSnapshotSubconditionInProgress(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "inprogress", "pending", "running", "uploading", "triggering", "replicating":
+		return true
+	default:
+		return false
+	}
 }
 
 var extractCmdRe = regexp.MustCompile(`(?i)/extract-invariant(?:\s+(I\d+))?(?:\s+([a-z0-9_-]+))?(?:\s+(.*))?`)
@@ -575,7 +714,7 @@ func ParseTriggerCommentOrPR(defaultID, commentBody, prTitle string) (BlindSpotF
 		desc = fmt.Sprintf("Extracted candidate invariant %s (%s) from %s", id, invName, triggerSource)
 	}
 
-	return BlindSpotFinding{
+	finding := BlindSpotFinding{
 		TriggerSource:    triggerSource,
 		InvariantID:      id,
 		InvariantName:    invName,
@@ -589,7 +728,12 @@ func ParseTriggerCommentOrPR(defaultID, commentBody, prTitle string) (BlindSpotF
 		FailureTimestamp: snap.Now,
 		Description:      desc,
 		Snapshot:         snap,
-	}, nil
+	}
+	if IsAbsenceTemplate(tmpl) {
+		finding.DebounceCount = DefaultAbsenceDebounceCount
+		finding.DebounceDuration = DefaultAbsenceDebounceDuration
+	}
+	return finding, nil
 }
 
 func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, string, string, string, ReconcileSnapshotJSON) {
@@ -678,6 +822,34 @@ func buildTemplateFixtureFromDirective(token, desc string) (TemplateClass, strin
 				Reconciler:    "PodMigrationJobReconciler",
 				PrimaryPMJ:    &pmj,
 				NamespacePMJs: []K8sPMJ{pmj},
+			}
+
+	case strings.Contains(combined, "premature") || strings.Contains(combined, "subcondition") || (strings.Contains(combined, "snapshot") && strings.Contains(combined, "failed")):
+		pmj := K8sPMJ{
+			Metadata: K8sObjectMeta{Name: "pmj-snap-race-0", Namespace: "default", UID: "uid-pmj-snap-race"},
+			Spec:     K8sPMJSpec{PodRef: K8sLocalObjectRef{Name: "app-0"}, TargetPodUID: "uid-app-0"},
+			Status: K8sPMJStatus{
+				Phase:       "Failed",
+				SnapshotRef: "ps-race-0",
+				Conditions: []K8sCondition{
+					{Type: "Ready", Status: "False", Reason: "SnapshotFailed", Message: "GKE PodSnapshot Ready failed (Failed)"},
+				},
+			},
+		}
+		snapConds := []K8sCondition{
+			{Type: "Ready", Status: "False", Reason: "Failed"},
+			{Type: "Checkpoint", Status: "False", Reason: "InProgress"},
+		}
+		return TemplatePrematureSnapshotFailed,
+			"SnapshotSubconditionConsistency",
+			"premature_snapshot_failed",
+			"failed",
+			ReconcileSnapshotJSON{
+				Now:                       now,
+				Reconciler:                "PodMigrationJobReconciler",
+				PrimaryPMJ:                &pmj,
+				NamespacePMJs:             []K8sPMJ{pmj},
+				PrimarySnapshotConditions: snapConds,
 			}
 
 	default:
@@ -897,6 +1069,13 @@ func SynthesizeAndVerify(
 		greenPassed = false
 	}
 
+	debounceCount, debounceDur := EffectiveDebounce(finding)
+	debounced := debounceCount > 1 || debounceDur > 0
+	var debounceDurStr string
+	if debounced {
+		debounceDurStr = debounceDur.String()
+	}
+
 	proof := RedGreenProof{
 		InvariantID:            finding.InvariantID,
 		InvariantName:          finding.InvariantName,
@@ -904,6 +1083,9 @@ func SynthesizeAndVerify(
 		Template:               finding.Template,
 		TriggerSource:          finding.TriggerSource,
 		RequiresAuthorBody:     finding.Template == TemplateCustomScaffold,
+		Debounced:              debounced,
+		DebounceCount:          debounceCount,
+		DebounceDuration:       debounceDurStr,
 		CompiledAndTested:      compiled,
 		RedPassed:              redPassed,
 		RedTestOutput:          strings.TrimSpace(redOut),
@@ -932,6 +1114,45 @@ func SynthesizeAndVerify(
 	return proof, nil
 }
 
+const debounceCompatShimGo = `package invariants
+
+import "time"
+
+type DebouncedRule interface {
+	Rule
+	ConsecutiveSamples() int
+	MinimumDuration() time.Duration
+}
+
+type debouncedRule struct {
+	Rule
+	consecutive     int
+	minimumDuration time.Duration
+}
+
+func (r debouncedRule) ConsecutiveSamples() int {
+	return r.consecutive
+}
+
+func (r debouncedRule) MinimumDuration() time.Duration {
+	return r.minimumDuration
+}
+
+func NewDebouncedRule(r Rule, consecutive int, minDuration time.Duration) DebouncedRule {
+	if consecutive < 1 {
+		consecutive = 1
+	}
+	if minDuration < 0 {
+		minDuration = 0
+	}
+	return debouncedRule{
+		Rule:            r,
+		consecutive:     consecutive,
+		minimumDuration: minDuration,
+	}
+}
+`
+
 func runCompiledGoTestProof(
 	controllerDir string,
 	finding BlindSpotFinding,
@@ -951,6 +1172,7 @@ func runCompiledGoTestProof(
 	if err != nil {
 		return false, "", false, "", false, fmt.Errorf("read %s: %w", srcInvDir, err)
 	}
+	hasDebouncedRuleInSource := false
 	for _, ent := range entries {
 		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".go") {
 			continue
@@ -959,7 +1181,15 @@ func runCompiledGoTestProof(
 		if readErr != nil {
 			return false, "", false, "", false, readErr
 		}
+		if strings.Contains(string(b), "NewDebouncedRule") {
+			hasDebouncedRuleInSource = true
+		}
 		if writeErr := os.WriteFile(filepath.Join(stageDir, ent.Name()), b, 0o644); writeErr != nil {
+			return false, "", false, "", false, writeErr
+		}
+	}
+	if !hasDebouncedRuleInSource {
+		if writeErr := os.WriteFile(filepath.Join(stageDir, "debounce_compat_shim.go"), []byte(debounceCompatShimGo), 0o644); writeErr != nil {
 			return false, "", false, "", false, writeErr
 		}
 	}
@@ -1035,14 +1265,16 @@ func ReconstructAllTraceSnapshots(recordsPath string) ([]ReconcileSnapshotJSON, 
 }
 
 type traceState struct {
-	pmjs map[string]K8sPMJ
-	pods map[string]K8sPod
+	pmjs      map[string]K8sPMJ
+	pods      map[string]K8sPod
+	snapshots map[string][]K8sCondition
 }
 
 func newTraceState() *traceState {
 	return &traceState{
-		pmjs: make(map[string]K8sPMJ),
-		pods: make(map[string]K8sPod),
+		pmjs:      make(map[string]K8sPMJ),
+		pods:      make(map[string]K8sPod),
+		snapshots: make(map[string][]K8sCondition),
 	}
 }
 
@@ -1117,6 +1349,13 @@ func (s *traceState) apply(rec rawNDJSONRecord) {
 			},
 		}
 		s.pods[name] = p
+
+	case strings.HasPrefix(rec.GVR, "podsnapshots."):
+		if rec.Type == "delete" {
+			delete(s.snapshots, name)
+			return
+		}
+		s.snapshots[name] = extractConditions(rec.Obj)
 	}
 }
 
@@ -1155,16 +1394,24 @@ func (s *traceState) snapshotForPMJ(ts string, pmj K8sPMJ) ReconcileSnapshotJSON
 	}
 	sort.Slice(nsPods, func(i, j int) bool { return nsPods[i].Metadata.Name < nsPods[i].Metadata.Name })
 
+	var snapConds []K8sCondition
+	if pmj.Status.SnapshotRef != "" {
+		if conds, ok := s.snapshots[pmj.Status.SnapshotRef]; ok && len(conds) > 0 {
+			snapConds = append([]K8sCondition(nil), conds...)
+		}
+	}
+
 	if ts == "" {
 		ts = "2026-09-28T12:00:00Z"
 	}
 	return ReconcileSnapshotJSON{
-		Now:           ts,
-		Reconciler:    "PodMigrationJobReconciler",
-		PrimaryPMJ:    &cpPMJ,
-		PrimaryPod:    primaryPod,
-		NamespacePMJs: nsPMJs,
-		NamespacePods: nsPods,
+		Now:                       ts,
+		Reconciler:                "PodMigrationJobReconciler",
+		PrimaryPMJ:                &cpPMJ,
+		PrimaryPod:                primaryPod,
+		NamespacePMJs:             nsPMJs,
+		NamespacePods:             nsPods,
+		PrimarySnapshotConditions: snapConds,
 	}
 }
 
@@ -1248,9 +1495,50 @@ func loadNDJSONRecords(path string) ([]rawNDJSONRecord, error) {
 	return out, sc.Err()
 }
 
+func formatDurationGoLiteral(d time.Duration) string {
+	if d <= 0 {
+		return "0*time.Second"
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%d*time.Minute", d/time.Minute)
+	}
+	if d%time.Second == 0 {
+		return fmt.Sprintf("%d*time.Second", d/time.Second)
+	}
+	if d%time.Millisecond == 0 {
+		return fmt.Sprintf("%d*time.Millisecond", d/time.Millisecond)
+	}
+	return fmt.Sprintf("time.Duration(%d)", int64(d))
+}
+
 func renderCandidateRuleGo(f BlindSpotFinding) string {
 	funcName := fmt.Sprintf("Evaluate%s_%s", strings.ToUpper(f.InvariantID), f.InvariantName)
 	ruleConstructor := fmt.Sprintf("Rule%s", strings.ToUpper(f.InvariantID))
+
+	debounceCount, debounceDur := EffectiveDebounce(f)
+	var constructorComment string
+	var returnStmt string
+	if debounceCount > 1 || debounceDur > 0 {
+		if debounceCount < 1 {
+			debounceCount = 1
+		}
+		durLiteral := formatDurationGoLiteral(debounceDur)
+		constructorComment = fmt.Sprintf("// %s returns the debounced stateless Rule for %s (%s).\n// Requires %d consecutive samples and %s minimum duration before strict abort (#99, #112).",
+			ruleConstructor, f.InvariantID, f.InvariantName, debounceCount, debounceDur)
+		returnStmt = fmt.Sprintf(`	return NewDebouncedRule(funcRule{
+		id:   %q,
+		name: %q,
+		fn:   %s,
+	}, %d, %s)`, f.InvariantID, f.InvariantName, funcName, debounceCount, durLiteral)
+	} else {
+		constructorComment = fmt.Sprintf("// %s returns the stateless Rule for %s (%s).",
+			ruleConstructor, f.InvariantID, f.InvariantName)
+		returnStmt = fmt.Sprintf(`	return funcRule{
+		id:   %q,
+		name: %q,
+		fn:   %s,
+	}`, f.InvariantID, f.InvariantName, funcName)
+	}
 
 	return fmt.Sprintf(`// Code generated by tools/invariant-gen (%s); review before merging on an invariant/* branch.
 package invariants
@@ -1261,20 +1549,17 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
-// %s returns the stateless Rule for %s (%s).
+%s
 //
 // Trigger: %s
 // Summary: %s
 func %s() Rule {
-	return funcRule{
-		id:   %q,
-		name: %q,
-		fn:   %s,
-	}
+%s
 }
 
 // %s evaluates %s (%s) over a point-in-time ReconcileSnapshot.
@@ -1287,11 +1572,12 @@ func %s(s *ReconcileSnapshot) []Violation {
 	_ = strings.TrimSpace
 	_ = time.Second
 	_ = corev1.ConditionTrue
+	_ = metav1.ConditionFalse
 	_ = pmv1alpha1.PodMigrationJobPhaseRestoring
 %s
 }
-`, f.TriggerSource, ruleConstructor, f.InvariantID, f.InvariantName, f.TriggerSource, f.Description,
-		ruleConstructor, f.InvariantID, f.InvariantName, funcName,
+`, f.TriggerSource, constructorComment, f.TriggerSource, f.Description,
+		ruleConstructor, returnStmt,
 		funcName, f.InvariantID, f.InvariantName, funcName,
 		renderPredicateBodyGo(f))
 }
@@ -1300,11 +1586,12 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 	switch f.Template {
 	case TemplateWedgedRestoringOrphan:
 		return `	// RestoringReplacementLiveness: when a PMJ has remained in PhaseRestoring
-	// for >=30s with a bound RestoredPodName, that replacement pod must still
-	// exist and be non-deleting in the namespace (including single-pod namespaces
-	// where NamespacePods is empty after source eviction; see Issue #88 for
-	// adding PodListFailed to ReconcileSnapshot).
-	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
+	// for >=30s with a bound RestoredPodName and !s.PodListFailed, that replacement
+	// pod must still exist and be non-deleting in the namespace (including single-pod
+	// namespaces where NamespacePods is empty after source eviction).
+	if !s.PodListFailed &&
+		(s.Reconciler == "" || s.Reconciler == "PodMigrationJobReconciler") &&
+		pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring &&
 		pmj.Status.RestoredPodName != "" &&
 		pmj.Status.RestoringStartTime != nil &&
 		!s.Now.IsZero() &&
@@ -1339,11 +1626,12 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 
 	case TemplateNoReplacementEvictingStall:
 		return `	// EvictingNoReplacementLiveness: when a PMJ has remained in PhaseEvicting
-	// for >=30s with no RestoredPodName bound and the source pod is already gone
-	// or deleting (including single-pod namespaces where NamespacePods is empty
-	// after source eviction; see Issue #88 for adding PodListFailed to ReconcileSnapshot),
-	// the migration is stalled.
-	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
+	// for >=30s with no RestoredPodName bound, !s.PodListFailed, and the source
+	// pod is already gone or deleting (including single-pod namespaces where
+	// NamespacePods is empty after source eviction), the migration is stalled.
+	if !s.PodListFailed &&
+		(s.Reconciler == "" || s.Reconciler == "PodMigrationJobReconciler") &&
+		pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
 		pmj.Status.RestoredPodName == "" &&
 		pmj.Status.EvictingStartTime != nil &&
 		!s.Now.IsZero() &&
@@ -1409,11 +1697,41 @@ func renderPredicateBodyGo(f BlindSpotFinding) string {
 	}
 	return nil`
 
+	case TemplatePrematureSnapshotFailed:
+		return `	// SnapshotSubconditionConsistency: a PMJ must not transition to PhaseFailed
+	// with Reason=SnapshotFailed while PrimarySnapshotConditions reports an
+	// active in-progress Checkpoint or StorageReplicated sub-condition (#75, #88).
+	if pmj.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed && len(s.PrimarySnapshotConditions) > 0 {
+		snapshotFailed := false
+		for _, c := range pmj.Status.Conditions {
+			if c.Reason == "SnapshotFailed" {
+				snapshotFailed = true
+				break
+			}
+		}
+		if snapshotFailed {
+			for _, sc := range s.PrimarySnapshotConditions {
+				if (sc.Type == "Checkpoint" || sc.Type == "StorageReplicated") && sc.Status == metav1.ConditionFalse {
+					r := strings.ToLower(strings.TrimSpace(sc.Reason))
+					if r == "inprogress" || r == "pending" || r == "running" || r == "uploading" || r == "triggering" || r == "replicating" {
+						return []Violation{{
+							InvariantID:   "` + f.InvariantID + `",
+							InvariantName: "` + f.InvariantName + `",
+							Reason:        "PrematureSnapshotFailedWhileSubconditionInProgress",
+							Message:       fmt.Sprintf("PMJ %s/%s failed with SnapshotFailed while PodSnapshot %q sub-condition %s=%s (Reason=%s) was still in progress", pmj.Namespace, pmj.Name, pmj.Status.SnapshotRef, sc.Type, sc.Status, sc.Reason),
+							Namespace:     pmj.Namespace,
+							PMJName:       pmj.Name,
+							PodName:       pmj.Spec.PodRef.Name,
+						}}
+					}
+				}
+			}
+		}
+	}
+	return nil`
+
 	default:
 		return `	// TODO(invariant-author): implement pure predicate for ` + f.InvariantID + ` (` + f.InvariantName + `).
-	// If this invariant inspects external CRD sub-conditions not yet present on
-	// ReconcileSnapshot (e.g. PodSnapshot Checkpoint/StorageReplicated conditions; see Issue #88),
-	// extend ReconcileSnapshot in snapshot.go within an authorized co-change PR.
 	_ = pmj
 	return nil`
 	}
@@ -1424,6 +1742,27 @@ func renderCandidateTestGo(f BlindSpotFinding, fixtureFilename, greenFilename st
 	redTestName := fmt.Sprintf("Test%s_%s_RedProof", strings.ToUpper(f.InvariantID), f.InvariantName)
 	greenTestName := fmt.Sprintf("Test%s_%s_GreenProof", strings.ToUpper(f.InvariantID), f.InvariantName)
 
+	debounceCount, debounceDur := EffectiveDebounce(f)
+	var extraImport string
+	var debounceAssert string
+	if debounceCount > 1 || debounceDur > 0 {
+		if debounceCount < 1 {
+			debounceCount = 1
+		}
+		durLiteral := formatDurationGoLiteral(debounceDur)
+		if strings.Contains(durLiteral, "time.") {
+			extraImport = "\n\t\"time\""
+		}
+		debounceAssert = fmt.Sprintf(`
+	dr, ok := rule.(DebouncedRule)
+	if !ok {
+		t.Fatalf("expected %s() to implement DebouncedRule, got %%T", rule)
+	}
+	if dr.ConsecutiveSamples() != %d || dr.MinimumDuration() != %s {
+		t.Fatalf("expected DebouncedRule(consecutive=%d, minDuration=%%s), got consecutive=%%d minDuration=%%s", %s, dr.ConsecutiveSamples(), dr.MinimumDuration())
+	}`, ruleConstructor, debounceCount, durLiteral, debounceCount, durLiteral)
+	}
+
 	return fmt.Sprintf(`// Code generated by tools/invariant-gen (%s); review before merging on an invariant/* branch.
 package invariants
 
@@ -1431,7 +1770,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"testing"
+	"testing"%s
 )
 
 func %s(t *testing.T) {
@@ -1444,7 +1783,7 @@ func %s(t *testing.T) {
 	if err := json.Unmarshal(raw, &snap); err != nil {
 		t.Fatalf("unmarshal RED snapshot fixture %%s into ReconcileSnapshot: %%v", fixturePath, err)
 	}
-	rule := %s()
+	rule := %s()%s
 	vs := rule.Evaluate(&snap)
 	if len(vs) == 0 {
 		t.Fatalf("RED proof failed: expected >= 1 violation from %%s (%%s) on offending fixture %%s, got 0", rule.ID(), rule.Name(), fixturePath)
@@ -1474,8 +1813,8 @@ func %s(t *testing.T) {
 		}
 	}
 }
-`, f.TriggerSource,
-		redTestName, fixtureFilename, ruleConstructor, f.InvariantID, f.InvariantID,
+`, f.TriggerSource, extraImport,
+		redTestName, fixtureFilename, ruleConstructor, debounceAssert, f.InvariantID, f.InvariantID,
 		greenTestName, greenFilename, ruleConstructor)
 }
 
@@ -1487,6 +1826,10 @@ func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
 	greenStatus := "PASS (`go test` verified)"
 	if !p.GreenPassed {
 		greenStatus = "FAIL"
+	}
+	debounceSummary := "Immediate (`funcRule`, single-sample)"
+	if p.Debounced {
+		debounceSummary = fmt.Sprintf("`NewDebouncedRule` (`consecutive=%d`, `minDuration=%s`)", p.DebounceCount, p.DebounceDuration)
 	}
 
 	return fmt.Sprintf(`## [Invariant %s] %s
@@ -1503,6 +1846,7 @@ func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
 - **Observed Outcome:** `+"`%s`"+` (while `+"`invariantViolations == 0`"+`)
 - **Offending PMJ / Pods:** `+"`%s`"+` (source: `+"`%s`"+`, replacement: `+"`%s`"+`)
 - **Failure Timestamp:** `+"`%s`"+`
+- **Debounce Configuration:** %s
 - **Root Cause & Predicate Summary:** %s
 
 ---
@@ -1530,6 +1874,7 @@ func renderPRBodyMarkdown(f BlindSpotFinding, p RedGreenProof) string {
 		f.Outcome,
 		f.PMJName, f.SourcePod, f.RestoredPod,
 		f.FailureTimestamp,
+		debounceSummary,
 		f.Description,
 		strings.ToUpper(f.InvariantID), f.InvariantName, filepath.Base(p.SnapshotFixturePath), p.CompiledAndTested, redStatus,
 		strings.ToUpper(f.InvariantID), f.InvariantName, filepath.Base(p.GreenFixturesPath), p.GreenBaselineChecked, p.GreenTraceStepsChecked, p.CompiledAndTested, greenStatus,

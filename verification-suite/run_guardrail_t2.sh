@@ -13,21 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Tier-2 (T2) Per-Merge Cluster Scenario & Stateful Verifier Suite (Issue #52)
+# Tier-2 (T2) Per-Merge Cluster Scenario & Stateful Verifier Suite (Issues #52, #103, #104)
 #
 # Orchestrates:
-#   - 3 Stateful Application Verifiers (I2: No Silent Cold-Start / No Rollback):
-#       * v_counter  : Monotonic counter + instanceID continuity across warm restore
-#       * v_redis    : 50,000 populated keys + per-cycle nonce across warm restore
-#       * v_postgres : Active transactional sequence table without gap/rollback
-#   - 5 Adversarial T2 Scenarios (S1-S5) exercising invariants I1-I9:
+#   - 3 Stateful Application Verifiers + Continuous Write-Continuity Probe (I2 / #103):
+#       * v_counter    : Monotonic counter + instanceID continuity across warm restore
+#       * v_redis      : 50,000 populated keys + per-cycle nonce across warm restore
+#       * v_postgres   : Active transactional sequence table without gap/rollback
+#       * continuity   : Continuous monotonic sequence writer + reader-identity probe
+#                        catching lost acknowledged writes, empty-source serving, and
+#                        double-restore rollbacks across migration.
+#   - 7 Adversarial T2 Scenarios (S1-S7) exercising invariants I1-I9:
 #       * S1 : Deployment rolling upgrade during active node drain (I6, I2)
 #       * S2 : PDB minAvailable: 100% block followed by budget release (I7, I2)
 #       * S3 : Corrupted checkpoint artifact in GCS -> deterministic I9 cold-start fallback
 #       * S4 : Dual-replica simultaneous eviction under serialized PodGate contention (I1, I3, I2)
 #       * S5 : Mid-flight PodMigration deletion -> I4/I5 deferral & zero orphan PSSC/PSMT leaks
-#   - Offline CI validation mode (--self-test) exercising pmprofiler check, analyze,
-#     invariant gates, and report generation end-to-end without requiring a live cluster.
+#       * S6 : Continuous write-continuity probe under live warm migration (#103)
+#       * S7 : Verdict-matches-data gate: RestoreVerified vs. live application state (#104)
+#   - Offline CI validation mode (--self-test) exercising pmprofiler check, continuity,
+#     analyze, invariant gates, S7 verdict-matches-data checks, and report generation.
 
 set -euo pipefail
 
@@ -41,6 +46,12 @@ OUT_DIR="${OUT_DIR:-/tmp/pmprofiler-t2-runs}"
 NAMESPACE="${NAMESPACE:-default}"
 CONTROLLER_NS="${CONTROLLER_NS:-pod-migration-system}"
 GCS_BUCKET="${GCS_BUCKET:-}"
+RUNTIME_CLASS="${RUNTIME_CLASS:-gvisor}"
+NODE_SELECTOR="${NODE_SELECTOR:-sandbox.gke.io/runtime=gvisor}"
+CORDON_SELECTOR="${CORDON_SELECTOR:-}"
+TOLERATION="${TOLERATION:-sandbox.gke.io/runtime=gvisor:NoSchedule}"
+SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-pm-test-ksa}"
+SKIP_PODMIGRATION_CREATE="${SKIP_PODMIGRATION_CREATE:-false}"
 SELF_TEST="false"
 
 usage() {
@@ -48,13 +59,21 @@ usage() {
 Usage: $(basename "$0") [options]
 
 Options:
-  --scenario <S1|S2|S3|S4|S5|all>   Scenario(s) to execute (default: all)
+  --scenario <S1|S2|S3|S4|S5|S6|S7|all>
+                                    Scenario(s) to execute (default: all)
   --verifier-only <counter|redis|postgres>
                                     Run a single stateful app verifier on the cluster
   --out-dir <dir>                   Output directory for pmprofiler runs & HTML report
   --namespace <ns>                  Target workload namespace (default: default)
   --controller-ns <ns>              Controller namespace (default: pod-migration-system)
-  --gcs-bucket <gs://bucket/path>   Optional GCS bucket for snapshot storage & size sampling
+  --gcs-bucket <gs://bucket/path>   GCS bucket for snapshot storage & size sampling
+  --runtime-class <name|none>       Pod runtimeClassName (default: gvisor; 'none' or '' omits it)
+  --node-selector <k=v|none>        Pod nodeSelector key=value (default: sandbox.gke.io/runtime=gvisor; 'none' or '' omits it)
+  --cordon-selector <k=v|all|none>  Node label selector for S3 pool cordon (default: uses --node-selector when set;
+                                    requires explicit '<k=v>' or 'all' when --node-selector is 'none'; 'none' skips pool cordon)
+  --toleration <k=v:effect|none>    Pod toleration in '<key>[=<value>]:<Effect>' format (default: sandbox.gke.io/runtime=gvisor:NoSchedule; 'none' or '' omits it)
+  --service-account <name|none>     Pod serviceAccountName (default: pm-test-ksa; 'none' or '' omits it)
+  --skip-podmigration-create        Use a pre-created snapshot policy instead of applying a PodMigration CR
   --self-test                       Run offline end-to-end self-test of pmprofiler + T2
                                     scenario fixtures and invariant gates (used in CI)
   -h, --help                        Show this help message
@@ -87,6 +106,30 @@ while [[ $# -gt 0 ]]; do
       GCS_BUCKET="$2"
       shift 2
       ;;
+    --runtime-class)
+      RUNTIME_CLASS="$2"
+      shift 2
+      ;;
+    --node-selector)
+      NODE_SELECTOR="$2"
+      shift 2
+      ;;
+    --cordon-selector)
+      CORDON_SELECTOR="$2"
+      shift 2
+      ;;
+    --toleration)
+      TOLERATION="$2"
+      shift 2
+      ;;
+    --service-account)
+      SERVICE_ACCOUNT="$2"
+      shift 2
+      ;;
+    --skip-podmigration-create)
+      SKIP_PODMIGRATION_CREATE="true"
+      shift
+      ;;
     --self-test|--dry-run)
       SELF_TEST="true"
       shift
@@ -112,9 +155,34 @@ die() {
   exit 1
 }
 
+validate_toleration_format() {
+  if [[ -z "${TOLERATION}" || "${TOLERATION}" == "none" ]]; then
+    return 0
+  fi
+  if [[ "${TOLERATION}" != *:* ]]; then
+    die "Invalid --toleration '${TOLERATION}': expected '<key>[=<value>]:<Effect>' (missing ':Effect') or 'none'"
+  fi
+  local tol_kv="${TOLERATION%:*}"
+  local tol_effect="${TOLERATION##*:}"
+  if [[ -z "${tol_kv}" || -z "${tol_effect}" ]]; then
+    die "Invalid --toleration '${TOLERATION}': both key and Effect must be non-empty in '<key>[=<value>]:<Effect>'"
+  fi
+  case "${tol_effect}" in
+    NoSchedule|PreferNoSchedule|NoExecute)
+      ;;
+    *)
+      die "Invalid --toleration Effect '${tol_effect}' in '${TOLERATION}': expected NoSchedule, PreferNoSchedule, or NoExecute"
+      ;;
+  esac
+}
+
+validate_toleration_format
+
 PMPROFILER_BIN=""
 COLLECT_PID=""
+CONTINUITY_PID=""
 CORDONED_NODES=()
+KUBECTL_CMD="${KUBECTL_CMD:-kubectl}"
 
 build_pmprofiler() {
   mkdir -p "${OUT_DIR}/bin"
@@ -123,16 +191,67 @@ build_pmprofiler() {
   (cd "${PMPROFILER_SRC}" && go build -o "${PMPROFILER_BIN}" ./cmd/pmprofiler)
 }
 
-uncordon_all_tracked_nodes() {
-  if [[ "${SELF_TEST}" == "true" ]]; then
-    return 0
-  fi
-  for n in "${CORDONED_NODES[@]:-}"; do
-    if [[ -n "${n}" ]]; then
-      kubectl uncordon "${n}" >/dev/null 2>&1 || true
+cordon_node() {
+  local node="$1"
+  [[ -n "${node}" ]] || return 0
+  local existing
+  for existing in "${CORDONED_NODES[@]:-}"; do
+    if [[ "${existing}" == "${node}" ]]; then
+      return 0
     fi
   done
-  kubectl uncordon -l sandbox.gke.io/runtime=gvisor >/dev/null 2>&1 || true
+  local already_unschedulable
+  already_unschedulable="$("${KUBECTL_CMD}" get node "${node}" -o jsonpath='{.spec.unschedulable}' 2>/dev/null || true)"
+  if [[ "${already_unschedulable}" != "true" ]]; then
+    CORDONED_NODES+=("${node}")
+  else
+    log "Node ${node} was already unschedulable prior to T2; will not uncordon on cleanup"
+  fi
+  "${KUBECTL_CMD}" cordon "${node}" >/dev/null
+}
+
+cordon_target_pool_nodes() {
+  local effective_selector="${CORDON_SELECTOR}"
+  if [[ -z "${effective_selector}" && -n "${NODE_SELECTOR}" && "${NODE_SELECTOR}" != "none" ]]; then
+    effective_selector="${NODE_SELECTOR}"
+  fi
+  if [[ -z "${effective_selector}" ]]; then
+    die "cordon_target_pool_nodes: refusing to cordon all cluster nodes when --node-selector is 'none' without an explicit --cordon-selector <k=v|all>"
+  fi
+  if [[ "${effective_selector}" == "none" ]]; then
+    log "Skipping pool cordon because --cordon-selector is set to 'none'"
+    return 0
+  fi
+
+  local nodes=()
+  local line
+  if [[ "${effective_selector}" == "all" ]]; then
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] && nodes+=("${line}")
+    done < <("${KUBECTL_CMD}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    log "Cordoning ${#nodes[@]} node(s) across cluster (--cordon-selector=all): ${nodes[*]:-none}"
+  else
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] && nodes+=("${line}")
+    done < <("${KUBECTL_CMD}" get nodes -l "${effective_selector}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    log "Cordoning ${#nodes[@]} node(s) matching selector '${effective_selector}': ${nodes[*]:-none}"
+  fi
+  local n
+  for n in "${nodes[@]:-}"; do
+    [[ -n "${n}" ]] && cordon_node "${n}"
+  done
+}
+
+uncordon_all_tracked_nodes() {
+  if [[ "${SELF_TEST}" == "true" && "${T2_TEST_UNCONDITIONAL_UNCORDON:-false}" != "true" ]]; then
+    return 0
+  fi
+  local n
+  for n in "${CORDONED_NODES[@]:-}"; do
+    if [[ -n "${n}" ]]; then
+      "${KUBECTL_CMD}" uncordon "${n}" >/dev/null 2>&1 || true
+    fi
+  done
   CORDONED_NODES=()
 }
 
@@ -144,7 +263,78 @@ stop_collector() {
   COLLECT_PID=""
 }
 
+stop_continuity_probe() {
+  if [[ -n "${CONTINUITY_PID}" ]] && kill -0 "${CONTINUITY_PID}" 2>/dev/null; then
+    kill -INT "${CONTINUITY_PID}" 2>/dev/null || true
+    wait "${CONTINUITY_PID}" 2>/dev/null || true
+  fi
+  CONTINUITY_PID=""
+}
+
+start_continuity_probe() {
+  local trace_path="$1"
+  local workload="$2"
+  local selector="$3"
+  local log_path="${trace_path}.log"
+  stop_continuity_probe
+  rm -f "${trace_path}" "${log_path}"
+  mkdir -p "$(dirname "${trace_path}")"
+  # Execute 2 synchronous pre-checkpoint steps before launching the background loop
+  "${PMPROFILER_BIN}" continuity \
+    --probe \
+    --trace "${trace_path}" \
+    --workload "${workload}" \
+    --namespace "${NAMESPACE}" \
+    --pod-selector "${selector}" \
+    --kubectl-bin "${KUBECTL_CMD}" \
+    --steps 2 \
+    --phase "pre-checkpoint" >>"${log_path}" 2>&1
+  "${PMPROFILER_BIN}" continuity \
+    --probe \
+    --trace "${trace_path}" \
+    --workload "${workload}" \
+    --namespace "${NAMESPACE}" \
+    --pod-selector "${selector}" \
+    --kubectl-bin "${KUBECTL_CMD}" \
+    --interval 250ms \
+    --phase "migrating" >>"${log_path}" 2>&1 &
+  CONTINUITY_PID=$!
+  sleep 0.2
+  if ! kill -0 "${CONTINUITY_PID}" 2>/dev/null; then
+    err "Background continuity probe for ${workload} exited prematurely (log: ${log_path}):"
+    cat "${log_path}" >&2 || true
+    return 1
+  fi
+}
+
+stop_and_verify_continuity_probe() {
+  local run_dir="$1"
+  local trace_path="$2"
+  local workload="$3"
+  local selector="$4"
+  local log_path="${trace_path}.log"
+  stop_continuity_probe
+  "${PMPROFILER_BIN}" continuity \
+    --probe \
+    --trace "${trace_path}" \
+    --workload "${workload}" \
+    --namespace "${NAMESPACE}" \
+    --pod-selector "${selector}" \
+    --kubectl-bin "${KUBECTL_CMD}" \
+    --steps 2 \
+    --phase "post-restore" >>"${log_path}" 2>&1
+  if ! "${PMPROFILER_BIN}" continuity \
+    --run "${run_dir}" \
+    --trace "${trace_path}" \
+    --group "${workload}"; then
+    err "Continuity verification failed for ${workload} (probe log: ${log_path}):"
+    cat "${log_path}" >&2 || true
+    return 1
+  fi
+}
+
 cleanup_on_exit() {
+  stop_continuity_probe
   stop_collector
   uncordon_all_tracked_nodes
 }
@@ -155,12 +345,23 @@ resolve_gcs_bucket() {
     return 0
   fi
   local existing
-  existing="$(kubectl get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+  existing="$("${KUBECTL_CMD}" get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
   if [[ -n "${existing}" ]]; then
     GCS_BUCKET="${existing}"
-  else
-    GCS_BUCKET="gs://yaoluo-gke-dev-podsnapshots/snapshots"
+    return 0
   fi
+  local pssc_bucket pssc_path
+  pssc_bucket="$("${KUBECTL_CMD}" get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
+  pssc_path="$("${KUBECTL_CMD}" get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
+  if [[ -n "${pssc_bucket}" ]]; then
+    if [[ -n "${pssc_path}" ]]; then
+      GCS_BUCKET="gs://${pssc_bucket}/${pssc_path#/}"
+    else
+      GCS_BUCKET="gs://${pssc_bucket}"
+    fi
+    return 0
+  fi
+  die "No GCS bucket could be resolved: pass --gcs-bucket <gs://bucket/path>, set GCS_BUCKET, or ensure a PodMigration / PodSnapshotStorageConfig (.spec.snapshotStorageConfig.gcs.{bucket,path}) exists on the cluster"
 }
 
 clean_stale_migration_resources() {
@@ -218,6 +419,7 @@ finish_and_assert_run() {
   local run_dir="$1"
   local allow_cold_start="${2:-false}"
   sleep 2
+  stop_continuity_probe
   stop_collector
   local analyze_args=(
     analyze
@@ -225,6 +427,7 @@ finish_and_assert_run() {
     --controller-ns "${CONTROLLER_NS}"
     --assert-zero-invariants
     --assert-clean-outcomes
+    --assert-verdict-matches-data
   )
   if [[ "${allow_cold_start}" == "true" ]]; then
     analyze_args+=(--allow-cold-start)
@@ -402,10 +605,38 @@ v_postgres_verify() {
 # Workload & Policy Helpers for Live Cluster Scenarios
 # ==============================================================================
 
+preflight_snapshot_policy() {
+  local psp_json
+  psp_json="$("${KUBECTL_CMD}" get podsnapshotpolicies -n "${NAMESPACE}" -o json 2>/dev/null || true)"
+  if [[ -z "${psp_json}" ]]; then
+    die "Preflight failed: unable to query PodSnapshotPolicies in namespace '${NAMESPACE}'"
+  fi
+  local usable_count
+  usable_count="$(jq -r '
+    [ (.items // [])[]
+      | select(
+          .metadata.deletionTimestamp == null
+          and (
+            ((.status.conditions // []) | map(select(.type == "Ready" and .status == "True")) | length) > 0
+          )
+        )
+    ] | length
+  ' <<<"${psp_json}" 2>/dev/null || echo 0)"
+  if [[ "${usable_count:-0}" -lt 1 ]]; then
+    die "Preflight failed: no Ready PodSnapshotPolicy found in namespace '${NAMESPACE}' (require status.conditions Ready=True)"
+  fi
+}
+
 ensure_podmigration_policy() {
   local name="${1:-diskless-migration}"
+  local force_create="${2:-false}"
   resolve_gcs_bucket
-  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
+  if [[ "${SKIP_PODMIGRATION_CREATE}" == "true" && "${force_create}" != "true" ]]; then
+    log "Skipping PodMigration CR creation (--skip-podmigration-create; using pre-created policy with GCS_BUCKET=${GCS_BUCKET})"
+    preflight_snapshot_policy
+    return 0
+  fi
+  "${KUBECTL_CMD}" apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
 apiVersion: podmigration.gke.io/v1alpha1
 kind: PodMigration
 metadata:
@@ -415,13 +646,51 @@ spec:
   storage:
     location: ${GCS_BUCKET}
 EOF
-  kubectl wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null
+  "${KUBECTL_CMD}" wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null
+  preflight_snapshot_policy
 }
 
-deploy_counter_workload() {
+render_pod_runtime_spec() {
+  if [[ -n "${SERVICE_ACCOUNT}" && "${SERVICE_ACCOUNT}" != "none" ]]; then
+    printf "      serviceAccountName: %s\n" "${SERVICE_ACCOUNT}"
+  fi
+  if [[ -n "${RUNTIME_CLASS}" && "${RUNTIME_CLASS}" != "none" ]]; then
+    printf "      runtimeClassName: %s\n" "${RUNTIME_CLASS}"
+  fi
+  if [[ -n "${NODE_SELECTOR}" && "${NODE_SELECTOR}" != "none" ]]; then
+    local ns_key="${NODE_SELECTOR%%=*}"
+    local ns_val="${NODE_SELECTOR#*=}"
+    printf "      nodeSelector:\n        %s: %s\n" "${ns_key}" "${ns_val}"
+  fi
+  if [[ -n "${TOLERATION}" && "${TOLERATION}" != "none" ]]; then
+    validate_toleration_format
+    local tol_kv="${TOLERATION%:*}"
+    local tol_effect="${TOLERATION##*:}"
+    if [[ "${tol_kv}" == *"="* ]]; then
+      local tol_key="${tol_kv%%=*}"
+      local tol_val="${tol_kv#*=}"
+      cat <<EOF
+      tolerations:
+      - key: ${tol_key}
+        operator: Equal
+        value: ${tol_val}
+        effect: ${tol_effect}
+EOF
+    else
+      cat <<EOF
+      tolerations:
+      - key: ${tol_kv}
+        operator: Exists
+        effect: ${tol_effect}
+EOF
+    fi
+  fi
+}
+
+render_counter_manifest() {
   local name="${1:-t2-counter}"
   local replicas="${2:-1}"
-  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
+  cat <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -438,15 +707,7 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
-      serviceAccountName: pm-test-ksa
-      runtimeClassName: gvisor
-      nodeSelector:
-        sandbox.gke.io/runtime: gvisor
-      tolerations:
-      - key: sandbox.gke.io/runtime
-        operator: Equal
-        value: gvisor
-        effect: NoSchedule
+$(render_pod_runtime_spec)
       containers:
       - name: counter
         image: busybox:1.36
@@ -475,12 +736,18 @@ spec:
           limits:
             memory: 256Mi
 EOF
+}
+
+deploy_counter_workload() {
+  local name="${1:-t2-counter}"
+  local replicas="${2:-1}"
+  render_counter_manifest "${name}" "${replicas}" | kubectl apply -n "${NAMESPACE}" -f - >/dev/null
   kubectl rollout status deployment/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
-deploy_redis_workload() {
+render_redis_manifest() {
   local name="${1:-t2-redis}"
-  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
+  cat <<EOF
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -498,20 +765,13 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
-      serviceAccountName: pm-test-ksa
-      runtimeClassName: gvisor
-      nodeSelector:
-        sandbox.gke.io/runtime: gvisor
-      tolerations:
-      - key: sandbox.gke.io/runtime
-        operator: Equal
-        value: gvisor
-        effect: NoSchedule
+$(render_pod_runtime_spec)
       containers:
       - name: redis
         image: redis:7-alpine
         imagePullPolicy: IfNotPresent
-        args: ["--save", "", "--appendonly", "no", "--enable-debug-command", "yes"]
+        command: ["docker-entrypoint.sh"]
+        args: ["redis-server", "--save", "", "--appendonly", "no", "--enable-debug-command", "yes"]
         ports:
         - containerPort: 6379
         readinessProbe:
@@ -538,12 +798,17 @@ spec:
   - port: 6379
     targetPort: 6379
 EOF
+}
+
+deploy_redis_workload() {
+  local name="${1:-t2-redis}"
+  render_redis_manifest "${name}" | kubectl apply -n "${NAMESPACE}" -f - >/dev/null
   kubectl rollout status statefulset/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
-deploy_postgres_workload() {
+render_postgres_manifest() {
   local name="${1:-t2-postgres}"
-  kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
+  cat <<EOF
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -561,19 +826,13 @@ spec:
         app: ${name}
         pod-migration.gke.io/enabled: "true"
     spec:
-      serviceAccountName: pm-test-ksa
-      runtimeClassName: gvisor
-      nodeSelector:
-        sandbox.gke.io/runtime: gvisor
-      tolerations:
-      - key: sandbox.gke.io/runtime
-        operator: Equal
-        value: gvisor
-        effect: NoSchedule
+$(render_pod_runtime_spec)
       containers:
       - name: postgres
         image: postgres:16-alpine
         imagePullPolicy: IfNotPresent
+        command: ["docker-entrypoint.sh"]
+        args: ["postgres"]
         env:
         - name: POSTGRES_HOST_AUTH_METHOD
           value: trust
@@ -607,6 +866,11 @@ spec:
   - port: 5432
     targetPort: 5432
 EOF
+}
+
+deploy_postgres_workload() {
+  local name="${1:-t2-postgres}"
+  render_postgres_manifest "${name}" | kubectl apply -n "${NAMESPACE}" -f - >/dev/null
   kubectl rollout status statefulset/"${name}" -n "${NAMESPACE}" --timeout=180s >/dev/null
 }
 
@@ -633,12 +897,13 @@ wait_for_pmj_terminal() {
 }
 
 # ==============================================================================
-# 5 Adversarial T2 Scenarios (S1 - S5)
+# 7 Adversarial T2 Scenarios (S1 - S7)
 # ==============================================================================
 
 # S1: Deployment rolling upgrade during active node drain (I6: Zero False Positive Intercepts)
 run_scenario_s1() {
   local run_dir="${OUT_DIR}/s1-rolling-upgrade-during-drain"
+  local trace_path="${run_dir}/continuity.ndjson"
   log "=== Running Scenario S1: Deployment Rolling Upgrade During Active Node Drain ==="
   clean_test_workloads
   clean_stale_migration_resources
@@ -653,11 +918,11 @@ run_scenario_s1() {
   before_state="$(v_counter_capture "${src_pod}")"
 
   start_collector "${run_dir}" "S1: Deployment rolling upgrade during active node drain"
+  start_continuity_probe "${trace_path}" "counter" "app=t2-counter"
 
   # Cordon source node and trigger eviction of t2-counter while simultaneously
   # rolling-upgrading t2-bystander (proving I6: rolling upgrade does not trigger a false PMJ).
-  kubectl cordon "${src_node}" >/dev/null
-  CORDONED_NODES+=("${src_node}")
+  cordon_node "${src_node}"
 
   evict_pod "${src_pod}"
   kubectl patch deployment t2-bystander -n "${NAMESPACE}" --type=merge \
@@ -670,6 +935,7 @@ run_scenario_s1() {
   local dst_pod
   dst_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   v_counter_verify "${run_dir}" "${dst_pod}" "${before_state}"
+  stop_and_verify_continuity_probe "${run_dir}" "${trace_path}" "counter" "app=t2-counter"
 
   # Verify zero PMJs were created for t2-bystander's rolling upgrade
   local bystander_pmjs
@@ -686,6 +952,7 @@ run_scenario_s1() {
 # S2: PDB minAvailable: 100% temporary block followed by budget release (I7: PDB & Quota Fidelity)
 run_scenario_s2() {
   local run_dir="${OUT_DIR}/s2-pdb-temporary-block"
+  local trace_path="${run_dir}/continuity.ndjson"
   log "=== Running Scenario S2: PDB minAvailable: 100% Temporary Block & Release ==="
   clean_test_workloads
   clean_stale_migration_resources
@@ -712,11 +979,11 @@ spec:
 EOF
 
   start_collector "${run_dir}" "S2: PDB minAvailable 100% block followed by budget release"
+  start_continuity_probe "${trace_path}" "redis" "app=t2-redis"
 
   local src_node
   src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
-  kubectl cordon "${src_node}" >/dev/null
-  CORDONED_NODES+=("${src_node}")
+  cordon_node "${src_node}"
 
   # Trigger migration while PDB blocks origin eviction; wait until PMJ reaches Evicting (BlockedByPDB),
   # then relax PDB to minAvailable: 0 so eviction and warm restore complete cleanly.
@@ -740,6 +1007,7 @@ EOF
   kubectl rollout status statefulset/t2-redis -n "${NAMESPACE}" --timeout=180s >/dev/null
 
   v_redis_verify "${run_dir}" "${src_pod}" "${nonce}"
+  stop_and_verify_continuity_probe "${run_dir}" "${trace_path}" "redis" "app=t2-redis"
 
   kubectl delete pdb t2-redis-pdb -n "${NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
   finish_and_assert_run "${run_dir}" "false"
@@ -756,14 +1024,15 @@ run_scenario_s3() {
   deploy_counter_workload "t2-counter" 1
   sleep 2
 
-  local src_pod
+  local src_pod before_state
   src_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
+  before_state="$(v_counter_capture "${src_pod}")"
   start_collector "${run_dir}" "S3: Corrupted checkpoint artifact -> I9 cold-start fallback"
 
-  # Cordon all gVisor nodes before triggering eviction so the replacement pod is held
+  # Cordon target node pool before triggering eviction so the replacement pod is held
   # Unschedulable after snapshot upload + source eviction while we corrupt checkpoint.img in GCS.
-  log "Cordoning gVisor nodes to hold replacement pod Pending during GCS checkpoint corruption"
-  kubectl cordon -l sandbox.gke.io/runtime=gvisor >/dev/null
+  log "Cordoning target pool nodes (CORDON_SELECTOR=${CORDON_SELECTOR:-${NODE_SELECTOR}}) to hold replacement pod Pending during GCS checkpoint corruption"
+  cordon_target_pool_nodes
 
   evict_pod "${src_pod}"
 
@@ -801,7 +1070,7 @@ run_scenario_s3() {
     die "S3: failed to remove GCS checkpoint artifacts at ${GCS_BUCKET}/${snap_name}"
   fi
 
-  log "Uncordoning gVisor nodes so replacement pod attempts restore from missing/corrupted checkpoint"
+  log "Uncordoning tracked nodes so replacement pod attempts restore from missing/corrupted checkpoint"
   uncordon_all_tracked_nodes
 
   # Wait for PMJ to conclude via either SucceededWithoutRestore (FallbackToColdStart)
@@ -813,6 +1082,23 @@ run_scenario_s3() {
   reason="$(kubectl get podmigrationjobs -n "${NAMESPACE}" -o jsonpath="{.items[?(@.spec.podRef.name=='${src_pod}')].status.conditions[?(@.type=='Restored')].reason}" 2>/dev/null || true)"
   if [[ "${reason}" != "FallbackToColdStart" && "${reason}" != "RestoreCrashFallback" ]]; then
     die "S3: expected Restored condition reason FallbackToColdStart or RestoreCrashFallback, got '${reason}'"
+  fi
+
+  local dst_pod after_state id_before id_after
+  dst_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
+  after_state="$(v_counter_capture "${dst_pod}")"
+  id_before="${before_state%%|*}"
+  id_after="${after_state%%|*}"
+  if [[ "${id_after}" == "${id_before}" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "state survived (token-verified)" --group "counter" \
+      --pass --value 1 --total 1 \
+      --detail "unexpectedly preserved pre-checkpoint instanceID=${id_after} despite ${reason}"
+  else
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "state survived (token-verified)" --group "counter" \
+      --pass=false --value 0 --total 1 \
+      --detail "cold-start instanceID=${id_after} replaced pre-checkpoint instanceID=${id_before} (consistent with ${reason})"
   fi
 
   "${PMPROFILER_BIN}" check --run "${run_dir}" \
@@ -827,6 +1113,7 @@ run_scenario_s3() {
 # S4: Dual-replica simultaneous eviction under serialized PodGate contention (I1, I3, I2)
 run_scenario_s4() {
   local run_dir="${OUT_DIR}/s4-dual-replica-podgate-contention"
+  local trace_path="${run_dir}/continuity.ndjson"
   log "=== Running Scenario S4: Dual-Replica Simultaneous Eviction Under Serialized PodGate Contention ==="
   clean_test_workloads
   clean_stale_migration_resources
@@ -841,9 +1128,13 @@ run_scenario_s4() {
   v_postgres_seed "${pg_pod}" "${pg_nonce}" 200
 
   start_collector "${run_dir}" "S4: Dual-replica simultaneous eviction under serialized PodGate contention"
+  start_continuity_probe "${trace_path}" "postgres" "app=t2-postgres"
 
-  local c_pods
-  mapfile -t c_pods < <(get_active_pods "app=t2-counter")
+  local c_pods=()
+  local c_pod_line
+  while IFS= read -r c_pod_line; do
+    [[ -n "${c_pod_line}" ]] && c_pods+=("${c_pod_line}")
+  done < <(get_active_pods "app=t2-counter")
   for p in "${c_pods[@]}" "${pg_pod}"; do
     evict_pod "${p}"
   done
@@ -855,6 +1146,7 @@ run_scenario_s4() {
   kubectl rollout status statefulset/t2-postgres -n "${NAMESPACE}" --timeout=180s >/dev/null
 
   v_postgres_verify "${run_dir}" "${pg_pod}" "${pg_nonce}" 200
+  stop_and_verify_continuity_probe "${run_dir}" "${trace_path}" "postgres" "app=t2-postgres"
 
   finish_and_assert_run "${run_dir}" "false"
   clean_test_workloads
@@ -863,6 +1155,7 @@ run_scenario_s4() {
 # S5: Mid-flight PodMigration deletion verifying I4/I5 deferral and zero orphan PSSC/PSMT leaks
 run_scenario_s5() {
   local run_dir="${OUT_DIR}/s5-midflight-podmigration-deletion"
+  local trace_path="${run_dir}/continuity.ndjson"
   log "=== Running Scenario S5: Mid-Flight PodMigration Deletion (I4/I5 Deferral & Zero Orphans) ==="
   clean_test_workloads
   clean_stale_migration_resources
@@ -873,12 +1166,18 @@ run_scenario_s5() {
   local src_pod before_state pm_uid
   src_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   before_state="$(v_counter_capture "${src_pod}")"
-  pm_uid="$(kubectl get podmigration diskless-migration -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')"
 
   start_collector "${run_dir}" "S5: Mid-flight PodMigration deletion (I4/I5 deferral & zero orphan leaks)"
+  start_continuity_probe "${trace_path}" "counter" "app=t2-counter"
 
   evict_pod "${src_pod}"
   sleep 1
+  # Ensure a PodMigration CR exists to exercise I4/I5 deletion deferral even when
+  # --skip-podmigration-create was used prior to eviction.
+  if ! kubectl get podmigration diskless-migration -n "${NAMESPACE}" >/dev/null 2>&1; then
+    ensure_podmigration_policy "diskless-migration" "true"
+  fi
+  pm_uid="$(kubectl get podmigration diskless-migration -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')"
   # Delete PodMigration while PMJ is in-flight; I4/I5 finalizer defers PSSC/PSP cleanup until PMJ finishes.
   kubectl delete podmigration diskless-migration -n "${NAMESPACE}" --wait=false >/dev/null
 
@@ -889,6 +1188,7 @@ run_scenario_s5() {
   local dst_pod
   dst_pod="$(get_active_pods "app=t2-counter" | head -n 1)"
   v_counter_verify "${run_dir}" "${dst_pod}" "${before_state}"
+  stop_and_verify_continuity_probe "${run_dir}" "${trace_path}" "counter" "app=t2-counter"
 
   local leaked_pssc
   leaked_pssc="$(kubectl get podsnapshotstorageconfigs -l "podmigration.gke.io/owner-uid=${pm_uid}" -o name 2>/dev/null || true)"
@@ -905,10 +1205,111 @@ run_scenario_s5() {
     --pass --value 1 --total 1 \
     --detail "0 orphan PodSnapshotStorageConfigs (owner-uid=${pm_uid}) after PodMigration deletion"
 
-  # Restore baseline PodMigration CR on the cluster
+  # Restore baseline PodMigration CR on the cluster unless --skip-podmigration-create is set
   ensure_podmigration_policy "diskless-migration"
   finish_and_assert_run "${run_dir}" "false"
   clean_test_workloads
+}
+
+# S6: Continuous write-continuity probe under live Redis warm migration (#103)
+run_scenario_s6() {
+  local run_dir="${OUT_DIR}/s6-write-continuity-probe"
+  local trace_path="${run_dir}/continuity.ndjson"
+  log "=== Running Scenario S6: Continuous Write-Continuity Probe Across Warm Migration ==="
+  clean_test_workloads
+  clean_stale_migration_resources
+  ensure_podmigration_policy "diskless-migration"
+  deploy_redis_workload "t2-redis"
+  sleep 2
+
+  local src_pod nonce src_node
+  src_pod="t2-redis-0"
+  nonce="nonce-s6-$(date +%s)"
+  v_redis_seed "${src_pod}" "${nonce}"
+
+  start_collector "${run_dir}" "S6: Continuous write-continuity probe across warm migration"
+  start_continuity_probe "${trace_path}" "redis" "app=t2-redis"
+
+  src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
+  cordon_node "${src_node}"
+  evict_pod "${src_pod}"
+
+  wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
+  uncordon_all_tracked_nodes
+  kubectl rollout status statefulset/t2-redis -n "${NAMESPACE}" --timeout=180s >/dev/null
+
+  v_redis_verify "${run_dir}" "${src_pod}" "${nonce}"
+  stop_and_verify_continuity_probe "${run_dir}" "${trace_path}" "redis" "app=t2-redis"
+
+  finish_and_assert_run "${run_dir}" "false"
+  clean_test_workloads
+}
+
+# S7: Verdict-matches-data enforcement (RestoreVerified vs. application state, #104)
+run_scenario_s7() {
+  local run_dir="${OUT_DIR}/s7-verdict-matches-data"
+  local s6_dir="${OUT_DIR}/s6-write-continuity-probe"
+  log "=== Running Scenario S7: Verdict Matches Data (RestoreVerified vs. Live Application State) ==="
+  rm -rf "${run_dir}"
+  mkdir -p "${run_dir}"
+
+  if [[ -f "${s6_dir}/records.ndjson" && -f "${s6_dir}/run.json" ]]; then
+    log "Reusing S6 live migration trace for S7 verdict-matches-data positive and negative verification"
+    cp "${s6_dir}/records.ndjson" "${run_dir}/records.ndjson"
+    cp "${s6_dir}/prom_before.txt" "${run_dir}/prom_before.txt" 2>/dev/null || true
+    cp "${s6_dir}/prom_after.txt" "${run_dir}/prom_after.txt" 2>/dev/null || true
+    cp "${s6_dir}/run.json" "${run_dir}/run.json"
+    "${PMPROFILER_BIN}" analyze --run "${run_dir}" --assert-verdict-matches-data >/dev/null
+  else
+    local trace_path="${run_dir}/continuity.ndjson"
+    clean_test_workloads
+    clean_stale_migration_resources
+    ensure_podmigration_policy "diskless-migration"
+    deploy_counter_workload "t2-counter"
+    sleep 2
+
+    local src_pod nonce src_node
+    src_pod="t2-counter-0"
+    nonce="nonce-s7-$(date +%s)"
+    v_counter_seed "${src_pod}" "${nonce}"
+
+    start_collector "${run_dir}" "S7: Verdict matches data (RestoreVerified vs. application state)"
+    start_continuity_probe "${trace_path}" "counter" "app=t2-counter"
+
+    src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
+    cordon_node "${src_node}"
+    evict_pod "${src_pod}"
+
+    wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
+    uncordon_all_tracked_nodes
+    kubectl rollout status statefulset/t2-counter -n "${NAMESPACE}" --timeout=180s >/dev/null
+
+    v_counter_verify "${run_dir}" "${src_pod}" "${nonce}"
+    stop_and_verify_continuity_probe "${run_dir}" "${trace_path}" "counter" "app=t2-counter"
+
+    finish_and_assert_run "${run_dir}" "false"
+    clean_test_workloads
+  fi
+
+  # Verify bidirectional S7 negative gates against mutated copies of the live run:
+  local neg_false_pos="${run_dir}/neg-false-restore-verified"
+  mkdir -p "${neg_false_pos}"
+  cp "${run_dir}/records.ndjson" "${neg_false_pos}/records.ndjson"
+  cp "${run_dir}/prom_before.txt" "${neg_false_pos}/prom_before.txt" 2>/dev/null || true
+  cp "${run_dir}/prom_after.txt" "${neg_false_pos}/prom_after.txt" 2>/dev/null || true
+  python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+d["stateSurvivalChecks"] = [{"group": "s7-neg", "name": "in-memory state", "value": 0, "total": 1, "unit": "checks", "pass": False, "detail": "simulated state loss"}]
+with open(sys.argv[2], "w") as f:
+    json.dump(d, f, indent=2)
+' "${run_dir}/run.json" "${neg_false_pos}/run.json"
+  if "${PMPROFILER_BIN}" analyze --run "${neg_false_pos}" --assert-verdict-matches-data >/dev/null 2>&1; then
+    err "S7 FAIL: --assert-verdict-matches-data did not reject RestoreVerified with failed state check"
+    exit 1
+  fi
+  log "S7 PASS: Positive and negative verdict-matches-data checks verified"
 }
 
 # ==============================================================================
@@ -976,7 +1377,7 @@ records = [
         "gvr": "podmigrations.v1alpha1.podmigration.gke.io",
         "obj": {
             "metadata": {"name": "diskless-migration", "creationTimestamp": "2026-09-27T10:00:01Z"},
-            "spec": {"storage": {"location": "gs://yaoluo-gke-dev-podsnapshots/snapshots"}},
+            "spec": {"storage": {"location": "gs://example-podsnapshots/snapshots"}},
             "status": {"conditions": [{"type": "Ready", "status": "True", "reason": "Reconciled"}]},
         },
     },
@@ -1081,6 +1482,20 @@ with open(out_path, "w") as f:
 PY
   }
 
+  emit_clean_continuity_trace() {
+    local trace_file="$1"
+    local src_pod="$2"
+    local dst_pod="$3"
+    local inst_id="$4"
+    cat >"${trace_file}" <<EOF
+{"ts":"2026-09-27T10:00:01Z","op":"step","pod":"${src_pod}","instanceId":"${inst_id}","ackedSeq":1,"observedMaxSeq":1,"phase":"pre-checkpoint"}
+{"ts":"2026-09-27T10:00:05Z","op":"step","pod":"${src_pod}","instanceId":"${inst_id}","ackedSeq":2,"observedMaxSeq":2,"phase":"migrating"}
+{"ts":"2026-09-27T10:00:09Z","op":"step","pod":"${src_pod}","phase":"migrating","error":"connection reset during handoff"}
+{"ts":"2026-09-27T10:00:14Z","op":"step","pod":"${dst_pod}","instanceId":"${inst_id}","ackedSeq":3,"observedMaxSeq":3,"phase":"post-restore"}
+{"ts":"2026-09-27T10:00:15Z","op":"final","pod":"${dst_pod}","instanceId":"${inst_id}","ackedSeq":4,"observedMaxSeq":4,"phase":"post-restore"}
+EOF
+  }
+
   # S1: Counter rolling upgrade during active node drain
   emit_synthetic_scenario "${OUT_DIR}/s1" "S1: Deployment rolling upgrade during active node drain" \
     "counter" "pmj-s1-counter" "counter-0" "counter-0-restored" "Succeeded" "True" "RestoreVerified"
@@ -1088,7 +1503,9 @@ PY
     --name "state survived (token-verified)" --group "counter" \
     --pass --value 1 --total 1 \
     --detail "instanceID=7f9c-s1 preserved, count advanced 42 -> 51"
-  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s1" --assert-zero-invariants --assert-clean-outcomes
+  emit_clean_continuity_trace "${OUT_DIR}/s1/continuity.ndjson" "counter-0" "counter-0-restored" "7f9c-s1"
+  "${PMPROFILER_BIN}" continuity --run "${OUT_DIR}/s1" --trace "${OUT_DIR}/s1/continuity.ndjson" --group "counter"
+  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s1" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
 
   # S2: Redis PDB temporary block followed by release (50,000 keys + nonce)
   emit_synthetic_scenario "${OUT_DIR}/s2" "S2: PDB minAvailable 100% block followed by budget release" \
@@ -1097,12 +1514,18 @@ PY
     --name "state survived (token-verified)" --group "redis" \
     --pass --value 50000 --total 50000 \
     --detail "migkey=nonce-s2 matched and DBSIZE=50001 (>= 50000)"
-  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s2" --assert-zero-invariants --assert-clean-outcomes
+  emit_clean_continuity_trace "${OUT_DIR}/s2/continuity.ndjson" "redis-0" "redis-0-restored" "runid-redis-s2"
+  "${PMPROFILER_BIN}" continuity --run "${OUT_DIR}/s2" --trace "${OUT_DIR}/s2/continuity.ndjson" --group "redis"
+  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s2" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
 
   # S3: Corrupted checkpoint -> deterministic I9 cold-start fallback (FallbackToColdStart)
   emit_synthetic_scenario "${OUT_DIR}/s3" "S3: Corrupted checkpoint artifact -> I9 cold-start fallback" \
     "counter" "pmj-s3-counter" "counter-corrupt-0" "counter-corrupt-0-fallback" \
     "SucceededWithoutRestore" "False" "FallbackToColdStart"
+  "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s3" \
+    --name "state survived (token-verified)" --group "counter" \
+    --pass=false --value 0 --total 1 \
+    --detail "cold-start instanceID=fresh-uuid replaced pre-checkpoint instanceID=old-uuid (consistent with FallbackToColdStart)"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s3" \
     --name "I9 deterministic cold-start fallback (FallbackToColdStart)" --group "counter" \
     --pass --value 1 --total 1 \
@@ -1110,7 +1533,7 @@ PY
   if "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s3" --assert-zero-invariants --assert-clean-outcomes >/dev/null 2>&1; then
     die "Expected S3 cold-start run to fail --assert-clean-outcomes when --allow-cold-start is not set"
   fi
-  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s3" --assert-zero-invariants --assert-clean-outcomes --allow-cold-start
+  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s3" --assert-zero-invariants --assert-clean-outcomes --allow-cold-start --assert-verdict-matches-data
 
   # S4: Postgres + Counter dual-replica contention
   emit_synthetic_scenario "${OUT_DIR}/s4" "S4: Dual-replica simultaneous eviction under serialized PodGate contention" \
@@ -1119,16 +1542,122 @@ PY
     --name "state survived (token-verified)" --group "postgres" \
     --pass --value 200 --total 200 \
     --detail "contiguous sequence 1..200 (200 rows) and nonce=nonce-s4 preserved"
-  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s4" --assert-zero-invariants --assert-clean-outcomes
+  emit_clean_continuity_trace "${OUT_DIR}/s4/continuity.ndjson" "postgres-0" "postgres-0-restored" "pg-start-s4"
+  "${PMPROFILER_BIN}" continuity --run "${OUT_DIR}/s4" --trace "${OUT_DIR}/s4/continuity.ndjson" --group "postgres"
+  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s4" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
 
   # S5: Mid-flight PodMigration deletion (I4/I5 deferral & zero orphan leaks)
   emit_synthetic_scenario "${OUT_DIR}/s5" "S5: Mid-flight PodMigration deletion (I4/I5 deferral & zero orphan leaks)" \
     "counter" "pmj-s5-counter" "counter-s5-0" "counter-s5-0-restored" "Succeeded" "True" "RestoreVerified"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s5" \
+    --name "state survived (token-verified)" --group "counter" \
+    --pass --value 1 --total 1 \
+    --detail "instanceID=7f9c-s5 preserved across mid-flight PodMigration deletion"
+  "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s5" \
     --name "I4 zero orphan PSSC after PodMigration deletion" --group "controller" \
     --pass --value 1 --total 1 \
     --detail "0 orphan PodSnapshotStorageConfigs and clean Undeploying deferral"
-  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s5" --assert-zero-invariants --assert-clean-outcomes
+  emit_clean_continuity_trace "${OUT_DIR}/s5/continuity.ndjson" "counter-s5-0" "counter-s5-0-restored" "7f9c-s5"
+  "${PMPROFILER_BIN}" continuity --run "${OUT_DIR}/s5" --trace "${OUT_DIR}/s5/continuity.ndjson" --group "counter"
+  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s5" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
+
+  # S6: Continuous write-continuity probe under live warm migration (#103)
+  emit_synthetic_scenario "${OUT_DIR}/s6" "S6: Continuous write-continuity probe across warm migration" \
+    "redis" "pmj-s6-redis" "redis-s6-0" "redis-s6-0-restored" "Succeeded" "True" "RestoreVerified"
+  "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s6" \
+    --name "state survived (token-verified)" --group "redis" \
+    --pass --value 50000 --total 50000 \
+    --detail "migkey=nonce-s6 matched and DBSIZE=50004 (>= 50000)"
+  emit_clean_continuity_trace "${OUT_DIR}/s6/continuity.ndjson" "redis-s6-0" "redis-s6-0-restored" "runid-redis-s6"
+  "${PMPROFILER_BIN}" continuity --run "${OUT_DIR}/s6" --trace "${OUT_DIR}/s6/continuity.ndjson" --group "redis"
+  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s6" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
+
+  # S7: Verdict matches data (RestoreVerified vs. application state, #104)
+  emit_synthetic_scenario "${OUT_DIR}/s7" "S7: Verdict matches data (RestoreVerified vs. application state)" \
+    "redis" "pmj-s7-redis" "redis-s7-0" "redis-s7-0-restored" "Succeeded" "True" "RestoreVerified"
+  "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s7" \
+    --name "state survived (token-verified)" --group "redis" \
+    --pass --value 50000 --total 50000 \
+    --detail "migkey=nonce-s7 matched and DBSIZE=50004 (>= 50000)"
+  emit_clean_continuity_trace "${OUT_DIR}/s7/continuity.ndjson" "redis-s7-0" "redis-s7-0-restored" "runid-redis-s7"
+  "${PMPROFILER_BIN}" continuity --run "${OUT_DIR}/s7" --trace "${OUT_DIR}/s7/continuity.ndjson" --group "redis"
+  "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s7" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
+
+  # Negative tests for Issue #103: verify all 3 stateful failure modes fail pmprofiler continuity
+  local neg_cont_dir="${OUT_DIR}/neg-continuity"
+  mkdir -p "${neg_cont_dir}"
+
+  # Failure mode 1: Lost acknowledged writes (source acks seq 3..4 after checkpoint at seq 2; restored pod only has 1..2)
+  cat >"${neg_cont_dir}/lost-acks.ndjson" <<'EOF'
+{"ts":"2026-09-27T10:00:01Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":1,"observedMaxSeq":1,"phase":"pre-checkpoint"}
+{"ts":"2026-09-27T10:00:02Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":2,"observedMaxSeq":2,"phase":"pre-checkpoint"}
+{"ts":"2026-09-27T10:00:05Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":3,"observedMaxSeq":3,"phase":"migrating"}
+{"ts":"2026-09-27T10:00:06Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":4,"observedMaxSeq":4,"phase":"migrating"}
+{"ts":"2026-09-27T10:00:14Z","op":"final","pod":"redis-0-restored","instanceId":"run-a","observedMaxSeq":2,"missingSeqs":[3,4],"phase":"post-restore"}
+EOF
+  local mode1_out=""
+  if mode1_out="$("${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/lost-acks.ndjson" --group "redis" 2>&1)"; then
+    die "Expected pmprofiler continuity to fail on lost acknowledged writes (#103 failure mode 1)"
+  fi
+  grep -q 'lost acknowledged writes' <<<"${mode1_out}" || die "Expected mode 1 output to report 'lost acknowledged writes', got: ${mode1_out}"
+  if grep -q 'double-restore' <<<"${mode1_out}"; then
+    die "Expected single-restore mode 1 output NOT to report 'double-restore', got: ${mode1_out}"
+  fi
+
+  # Failure mode 2: Empty-source serving (source container restarted empty with new instanceId and observedMaxSeq=0 before eviction)
+  cat >"${neg_cont_dir}/empty-source.ndjson" <<'EOF'
+{"ts":"2026-09-27T10:00:01Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":1,"observedMaxSeq":1,"phase":"pre-checkpoint"}
+{"ts":"2026-09-27T10:00:02Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":2,"observedMaxSeq":2,"phase":"pre-checkpoint"}
+{"ts":"2026-09-27T10:00:06Z","op":"step","pod":"redis-0","instanceId":"run-restarted-empty","observedMaxSeq":0,"phase":"migrating"}
+{"ts":"2026-09-27T10:00:14Z","op":"final","pod":"redis-0-restored","instanceId":"run-a","ackedSeq":3,"observedMaxSeq":3,"phase":"post-restore"}
+EOF
+  local mode2_out=""
+  if mode2_out="$("${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/empty-source.ndjson" --group "redis" 2>&1)"; then
+    die "Expected pmprofiler continuity to fail on empty-source serving (#103 failure mode 2)"
+  fi
+  grep -q 'empty-source serving' <<<"${mode2_out}" || die "Expected mode 2 output to report 'empty-source serving', got: ${mode2_out}"
+
+  # Failure mode 3: Double restore / rollback (replacement restores at seq 2, acks seq 3..4, then is restored a second time back to seq 2)
+  cat >"${neg_cont_dir}/double-restore.ndjson" <<'EOF'
+{"ts":"2026-09-27T10:00:01Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":1,"observedMaxSeq":1,"phase":"pre-checkpoint"}
+{"ts":"2026-09-27T10:00:02Z","op":"step","pod":"redis-0","instanceId":"run-a","ackedSeq":2,"observedMaxSeq":2,"phase":"migrating"}
+{"ts":"2026-09-27T10:00:12Z","op":"step","pod":"redis-0-restored-1","instanceId":"run-a","ackedSeq":3,"observedMaxSeq":3,"phase":"post-restore"}
+{"ts":"2026-09-27T10:00:13Z","op":"step","pod":"redis-0-restored-1","instanceId":"run-a","ackedSeq":4,"observedMaxSeq":4,"phase":"post-restore"}
+{"ts":"2026-09-27T10:00:18Z","op":"final","pod":"redis-0-restored-2","instanceId":"run-a","observedMaxSeq":2,"missingSeqs":[3,4],"phase":"post-restore"}
+EOF
+  local mode3_out=""
+  if mode3_out="$("${PMPROFILER_BIN}" continuity --trace "${neg_cont_dir}/double-restore.ndjson" --group "redis" 2>&1)"; then
+    die "Expected pmprofiler continuity to fail on double restore / sequence rollback (#103 failure mode 3)"
+  fi
+  grep -q 'double-restore sequence rollback' <<<"${mode3_out}" || die "Expected mode 3 output to report 'double-restore sequence rollback', got: ${mode3_out}"
+  rm -rf "${neg_cont_dir}"
+
+  # Negative tests for Issue #104 (S7: the verdict matches the data):
+  # 1) Migration reports RestoreVerified (Restored=True) while app is empty (state check Pass=false) -> must fail --assert-verdict-matches-data
+  local neg_s7_fp="${OUT_DIR}/neg-s7-false-positive"
+  emit_synthetic_scenario "${neg_s7_fp}" "Negative Test: S7 RestoreVerified with Empty App" \
+    "redis" "pmj-s7-fp" "redis-fp-0" "redis-fp-0-restored" "Succeeded" "True" "RestoreVerified"
+  "${PMPROFILER_BIN}" check --run "${neg_s7_fp}" \
+    --name "state survived (token-verified)" --group "redis" \
+    --pass=false --value 0 --total 50000 \
+    --detail "migkey='' (expected nonce), DBSIZE=0"
+  if "${PMPROFILER_BIN}" analyze --run "${neg_s7_fp}" --assert-verdict-matches-data >/dev/null 2>&1; then
+    die "Expected pmprofiler analyze --assert-verdict-matches-data to fail when migration reports RestoreVerified while app is empty"
+  fi
+  rm -rf "${neg_s7_fp}"
+
+  # 2) Reverse direction: migration reports FallbackToColdStart (Restored=False) while app check says state survived (Pass=true) -> must fail --assert-verdict-matches-data
+  local neg_s7_rev="${OUT_DIR}/neg-s7-reverse"
+  emit_synthetic_scenario "${neg_s7_rev}" "Negative Test: S7 ColdStart Verdict with Survived State" \
+    "counter" "pmj-s7-rev" "counter-rev-0" "counter-rev-0-fallback" "SucceededWithoutRestore" "False" "FallbackToColdStart"
+  "${PMPROFILER_BIN}" check --run "${neg_s7_rev}" \
+    --name "state survived (token-verified)" --group "counter" \
+    --pass --value 1 --total 1 \
+    --detail "instanceID preserved despite FallbackToColdStart"
+  if "${PMPROFILER_BIN}" analyze --run "${neg_s7_rev}" --allow-cold-start --assert-verdict-matches-data >/dev/null 2>&1; then
+    die "Expected pmprofiler analyze --assert-verdict-matches-data to fail when migration reports FallbackToColdStart while app state check passed"
+  fi
+  rm -rf "${neg_s7_rev}"
 
   # Negative test: verify that a non-zero pod_migration_invariant_violations_total metric fails analyze
   local neg_dir="${OUT_DIR}/neg-invariant-check"
@@ -1145,15 +1674,189 @@ EOF
   local report_html="${OUT_DIR}/guardrail-t2-report.html"
   "${PMPROFILER_BIN}" report \
     --out "${report_html}" \
-    --title "GKE Live Pod Migration — T2 Guardrail Scenarios (S1–S5)" \
+    --title "GKE Live Pod Migration — T2 Guardrail Scenarios (S1–S7)" \
     "${OUT_DIR}/s1/run.json" \
     "${OUT_DIR}/s2/run.json" \
     "${OUT_DIR}/s3/run.json" \
     "${OUT_DIR}/s4/run.json" \
-    "${OUT_DIR}/s5/run.json"
+    "${OUT_DIR}/s5/run.json" \
+    "${OUT_DIR}/s6/run.json" \
+    "${OUT_DIR}/s7/run.json"
 
   [[ -s "${report_html}" ]] || die "Expected non-empty HTML report at ${report_html}"
-  log "Self-test PASSED: S1-S5 analyzed with 0 invariant violations and report generated at ${report_html}"
+
+  # Verify runtime-agnostic manifest rendering & entrypoint command arrays (#82, #104)
+  local gvisor_counter gvisor_redis gvisor_pg
+  gvisor_counter="$(RUNTIME_CLASS=gvisor NODE_SELECTOR="sandbox.gke.io/runtime=gvisor" TOLERATION="sandbox.gke.io/runtime=gvisor:NoSchedule" SERVICE_ACCOUNT="pm-test-ksa" render_counter_manifest)"
+  gvisor_redis="$(RUNTIME_CLASS=gvisor NODE_SELECTOR="sandbox.gke.io/runtime=gvisor" TOLERATION="sandbox.gke.io/runtime=gvisor:NoSchedule" SERVICE_ACCOUNT="pm-test-ksa" render_redis_manifest)"
+  gvisor_pg="$(RUNTIME_CLASS=gvisor NODE_SELECTOR="sandbox.gke.io/runtime=gvisor" TOLERATION="sandbox.gke.io/runtime=gvisor:NoSchedule" SERVICE_ACCOUNT="pm-test-ksa" render_postgres_manifest)"
+  grep -q 'runtimeClassName: gvisor' <<<"${gvisor_counter}" || die "Expected runtimeClassName: gvisor in default counter manifest"
+  grep -q 'command: \["docker-entrypoint.sh"\]' <<<"${gvisor_redis}" || die "Expected command: [\"docker-entrypoint.sh\"] in redis manifest (#104)"
+  grep -q 'command: \["docker-entrypoint.sh"\]' <<<"${gvisor_pg}" || die "Expected explicit command: [\"docker-entrypoint.sh\"] in postgres manifest"
+
+  local runc_counter runc_redis runc_pg
+  runc_counter="$(RUNTIME_CLASS=none NODE_SELECTOR=none TOLERATION=none SERVICE_ACCOUNT=none render_counter_manifest)"
+  runc_redis="$(RUNTIME_CLASS=none NODE_SELECTOR=none TOLERATION=none SERVICE_ACCOUNT=none render_redis_manifest)"
+  runc_pg="$(RUNTIME_CLASS=none NODE_SELECTOR=none TOLERATION=none SERVICE_ACCOUNT=none render_postgres_manifest)"
+  if grep -qE 'runtimeClassName:|nodeSelector:|tolerations:|serviceAccountName:' <<<"${runc_counter}${runc_redis}${runc_pg}"; then
+    die "Expected runtime-agnostic ('none') manifests to omit runtimeClassName, nodeSelector, tolerations, and serviceAccountName"
+  fi
+  grep -q 'command: \["docker-entrypoint.sh"\]' <<<"${runc_redis}" || die "Expected docker-entrypoint.sh in runtime-agnostic redis manifest (#104)"
+  grep -q 'command: \["docker-entrypoint.sh"\]' <<<"${runc_pg}" || die "Expected explicit command in runtime-agnostic postgres manifest"
+
+  # Verify --toleration format validation rejects missing ':Effect', empty Effect, or unknown Effect
+  if (TOLERATION="foo=bar" validate_toleration_format >/dev/null 2>&1); then
+    die "Expected validate_toleration_format to reject --toleration without ':Effect'"
+  fi
+  if (TOLERATION="foo:" validate_toleration_format >/dev/null 2>&1); then
+    die "Expected validate_toleration_format to reject --toleration with empty Effect"
+  fi
+  if (TOLERATION=":NoSchedule" validate_toleration_format >/dev/null 2>&1); then
+    die "Expected validate_toleration_format to reject --toleration with empty key"
+  fi
+  if (TOLERATION="foo=bar:bogus" validate_toleration_format >/dev/null 2>&1); then
+    die "Expected validate_toleration_format to reject --toleration with invalid Effect"
+  fi
+
+  # Verify tracked node cordon/uncordon only uncordons nodes cordoned during the run
+  # and skips nodes that were already unschedulable prior to T2 (#82)
+  local kubectl_log="${OUT_DIR}/kubectl-calls.log"
+  local fake_kubectl="${OUT_DIR}/fake-kubectl.sh"
+  cat >"${fake_kubectl}" <<EOF
+#!/usr/bin/env bash
+if [[ "\$*" == "get node pre-cordoned-node -o jsonpath={.spec.unschedulable}" ]]; then
+  printf "true"
+  exit 0
+fi
+if [[ "\$*" == "get node "* ]]; then
+  exit 0
+fi
+if [[ "\$*" == "get nodes -l pool=runc -o jsonpath="* ]]; then
+  printf "runc-pool-node-1\nrunc-pool-node-2\n"
+  exit 0
+fi
+if [[ "\$*" == "get nodes -o jsonpath="* ]]; then
+  printf "single-pool-node-1\n"
+  exit 0
+fi
+echo "\$*" >> "${kubectl_log}"
+EOF
+  chmod +x "${fake_kubectl}"
+  CORDONED_NODES=()
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-1"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-2"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "runc-pool-node-1"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_node "pre-cordoned-node"
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" uncordon_all_tracked_nodes
+  grep -q '^uncordon runc-pool-node-1$' "${kubectl_log}" || die "Expected tracked node runc-pool-node-1 to be uncordoned"
+  grep -q '^uncordon runc-pool-node-2$' "${kubectl_log}" || die "Expected tracked node runc-pool-node-2 to be uncordoned"
+  if grep -q '^uncordon pre-cordoned-node$' "${kubectl_log}"; then
+    die "Expected pre-existing unschedulable node pre-cordoned-node NOT to be uncordoned"
+  fi
+  if grep -q 'sandbox.gke.io/runtime=gvisor' "${kubectl_log}"; then
+    die "Expected uncordon_all_tracked_nodes not to hardcode sandbox.gke.io/runtime=gvisor"
+  fi
+
+  # Verify cordon_target_pool_nodes refuses NODE_SELECTOR=none without explicit --cordon-selector,
+  # and honors explicit --cordon-selector <k=v> and --cordon-selector all
+  if (KUBECTL_CMD="${fake_kubectl}" NODE_SELECTOR="none" CORDON_SELECTOR="" cordon_target_pool_nodes >/dev/null 2>&1); then
+    die "Expected cordon_target_pool_nodes to fail closed when NODE_SELECTOR=none and CORDON_SELECTOR is unset"
+  fi
+  : >"${kubectl_log}"
+  CORDONED_NODES=()
+  KUBECTL_CMD="${fake_kubectl}" NODE_SELECTOR="none" CORDON_SELECTOR="pool=runc" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_target_pool_nodes >/dev/null
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" uncordon_all_tracked_nodes
+  grep -q '^cordon runc-pool-node-1$' "${kubectl_log}" || die "Expected cordon_target_pool_nodes with CORDON_SELECTOR=pool=runc to cordon runc-pool-node-1"
+  grep -q '^uncordon runc-pool-node-2$' "${kubectl_log}" || die "Expected cordon_target_pool_nodes with CORDON_SELECTOR=pool=runc to track and uncordon runc-pool-node-2"
+
+  : >"${kubectl_log}"
+  CORDONED_NODES=()
+  KUBECTL_CMD="${fake_kubectl}" NODE_SELECTOR="none" CORDON_SELECTOR="all" T2_TEST_UNCONDITIONAL_UNCORDON="true" cordon_target_pool_nodes >/dev/null
+  KUBECTL_CMD="${fake_kubectl}" T2_TEST_UNCONDITIONAL_UNCORDON="true" uncordon_all_tracked_nodes
+  grep -q '^cordon single-pool-node-1$' "${kubectl_log}" || die "Expected cordon_target_pool_nodes with CORDON_SELECTOR=all to cordon single-pool-node-1"
+
+  # Verify resolve_gcs_bucket reads .spec.snapshotStorageConfig.gcs.{bucket,path} on PodSnapshotStorageConfig
+  # and fails closed (no personal bucket fallback) when no bucket is configured (#104)
+  local fake_pssc_kubectl="${OUT_DIR}/fake-pssc-kubectl.sh"
+  cat >"${fake_pssc_kubectl}" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.bucket}"* ]]; then
+  printf "custom-pssc-bucket"
+  exit 0
+fi
+if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.path}"* ]]; then
+  printf "/custom-pssc-path"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${fake_pssc_kubectl}"
+  local resolved_pssc_bucket
+  resolved_pssc_bucket="$(
+    GCS_BUCKET=""
+    SKIP_PODMIGRATION_CREATE="true"
+    KUBECTL_CMD="${fake_pssc_kubectl}"
+    resolve_gcs_bucket
+    echo "${GCS_BUCKET}"
+  )"
+  if [[ "${resolved_pssc_bucket}" != "gs://custom-pssc-bucket/custom-pssc-path" ]]; then
+    die "Expected resolve_gcs_bucket to resolve 'gs://custom-pssc-bucket/custom-pssc-path' from PodSnapshotStorageConfig, got '${resolved_pssc_bucket}'"
+  fi
+
+  local fake_empty_kubectl="${OUT_DIR}/fake-empty-kubectl.sh"
+  cat >"${fake_empty_kubectl}" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"get podsnapshotpolicies"* ]]; then
+  printf '{"items":[]}'
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${fake_empty_kubectl}"
+  if (GCS_BUCKET="" SKIP_PODMIGRATION_CREATE="true" KUBECTL_CMD="${fake_empty_kubectl}" resolve_gcs_bucket >/dev/null 2>&1); then
+    die "Expected resolve_gcs_bucket to fail closed when --skip-podmigration-create is set and no bucket is found"
+  fi
+  if (GCS_BUCKET="" SKIP_PODMIGRATION_CREATE="false" KUBECTL_CMD="${fake_empty_kubectl}" resolve_gcs_bucket >/dev/null 2>&1); then
+    die "Expected resolve_gcs_bucket to fail closed when no bucket is passed or found on the cluster (#104)"
+  fi
+
+  # Verify preflight_snapshot_policy (#104):
+  #   - fails when no PodSnapshotPolicy exists in the namespace
+  #   - fails when PodSnapshotPolicy has empty status.conditions (never reconciled)
+  #   - fails when the only PodSnapshotPolicy has Ready=False
+  #   - passes when an active PodSnapshotPolicy with Ready=True exists
+  if (KUBECTL_CMD="${fake_empty_kubectl}" preflight_snapshot_policy >/dev/null 2>&1); then
+    die "Expected preflight_snapshot_policy to fail when no PodSnapshotPolicy exists in namespace"
+  fi
+  local fake_unreconciled_psp="${OUT_DIR}/fake-unreconciled-psp.sh"
+  cat >"${fake_unreconciled_psp}" <<'EOF'
+#!/usr/bin/env bash
+printf '{"items":[{"metadata":{"name":"psp-unreconciled"},"status":{"conditions":[]}}]}'
+EOF
+  chmod +x "${fake_unreconciled_psp}"
+  if (KUBECTL_CMD="${fake_unreconciled_psp}" preflight_snapshot_policy >/dev/null 2>&1); then
+    die "Expected preflight_snapshot_policy to fail when PodSnapshotPolicy has empty status.conditions (never reconciled)"
+  fi
+  local fake_unready_psp="${OUT_DIR}/fake-unready-psp.sh"
+  cat >"${fake_unready_psp}" <<'EOF'
+#!/usr/bin/env bash
+printf '{"items":[{"metadata":{"name":"psp-unready"},"status":{"conditions":[{"type":"Ready","status":"False","reason":"StorageNotReady"}]}}]}'
+EOF
+  chmod +x "${fake_unready_psp}"
+  if (KUBECTL_CMD="${fake_unready_psp}" preflight_snapshot_policy >/dev/null 2>&1); then
+    die "Expected preflight_snapshot_policy to fail when PodSnapshotPolicy has Ready=False"
+  fi
+  local fake_ready_psp="${OUT_DIR}/fake-ready-psp.sh"
+  cat >"${fake_ready_psp}" <<'EOF'
+#!/usr/bin/env bash
+printf '{"items":[{"metadata":{"name":"psp-ready"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}'
+EOF
+  chmod +x "${fake_ready_psp}"
+  KUBECTL_CMD="${fake_ready_psp}" preflight_snapshot_policy
+
+  rm -f "${kubectl_log}" "${fake_kubectl}" "${fake_pssc_kubectl}" "${fake_empty_kubectl}" "${fake_unreconciled_psp}" "${fake_unready_psp}" "${fake_ready_psp}"
+
+  log "Self-test PASSED: S1-S7 analyzed with 0 invariant violations, continuity failure modes (#103), S7 verdict-matches-data & preflight gates (#104), runtime-agnostic templates, and report generated at ${report_html}"
 }
 
 # ==============================================================================
@@ -1213,19 +1916,28 @@ case "${SCENARIO}" in
   S5|s5)
     run_scenario_s5
     ;;
+  S6|s6)
+    run_scenario_s6
+    ;;
+  S7|s7)
+    run_scenario_s7
+    ;;
   all|ALL)
     run_scenario_s1
     run_scenario_s2
     run_scenario_s3
     run_scenario_s4
     run_scenario_s5
+    run_scenario_s6
+    run_scenario_s7
     "${PMPROFILER_BIN}" report \
       --out "${OUT_DIR}/guardrail-t2-report.html" \
-      --title "GKE Live Pod Migration — T2 Guardrail Scenarios (S1–S5)" \
+      --title "GKE Live Pod Migration — T2 Guardrail Scenarios (S1–S7)" \
       "${OUT_DIR}"/s*/run.json
-    log "All T2 scenarios (S1-S5) PASSED. Report: ${OUT_DIR}/guardrail-t2-report.html"
+    log "All T2 scenarios (S1-S7) PASSED. Report: ${OUT_DIR}/guardrail-t2-report.html"
     ;;
   *)
-    die "Unknown --scenario value: ${SCENARIO} (expected S1, S2, S3, S4, S5, or all)"
+    die "Unknown --scenario value: ${SCENARIO} (expected S1, S2, S3, S4, S5, S6, S7, or all)"
     ;;
 esac
+

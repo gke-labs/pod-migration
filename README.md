@@ -259,6 +259,8 @@ To migrate your workload using this controller:
 ### Step 1: Opt-in your Workload
 Add the label `pod-migration.gke.io/enabled: "true"` to your workload Pod template and ensure the Pod uses the `gvisor` runtime.
 
+The eviction webhook only migrates Pods whose runtime class is listed in the controller flag `--migratable-runtime-classes` (default `gvisor`; the token `@default` matches Pods that set no `runtimeClassName`). Only list a class that your installed snapshot engine supports: GKE Pod Snapshots supports `gvisor`.
+
 Example (Deployment):
 ```yaml
 apiVersion: apps/v1

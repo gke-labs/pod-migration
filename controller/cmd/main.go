@@ -49,6 +49,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/controller"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	// Imported for its side effect: registers the pod-migration collectors on
 	// the controller-runtime metrics registry served at --metrics-bind-address.
@@ -81,6 +82,7 @@ func main() {
 		maxConcurrent        int
 		migrationTimeout     time.Duration
 		invariantModeRaw     string
+		runtimeClassesRaw    string
 		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -91,6 +93,7 @@ func main() {
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", 50, "Maximum number of concurrent reconciles for PodMigrationJobReconciler")
 	flag.DurationVar(&migrationTimeout, "migration-timeout", util.DefaultMigrationTimeout, "Default timeout for active migrations (Pending, Snapshotting, Evicting)")
 	flag.StringVar(&invariantModeRaw, "invariant-mode", string(invariants.ModeDisabled), "Correctness invariant evaluation mode: disabled (default), observe, or strict (CI gate). Enabling observe/strict adds one informer namespace List of Pods and PMJs per PodMigrationJob reconcile.")
+	flag.StringVar(&runtimeClassesRaw, "migratable-runtime-classes", eligibility.DefaultMigratableRuntimeClasses, "Comma-separated RuntimeClass names whose pods are migrated on eviction; "+eligibility.DefaultRuntimeClassToken+" matches pods without a runtimeClassName. List only classes the installed snapshot engine supports.")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -109,6 +112,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	runtimeClassPolicy, err := eligibility.ParseRuntimeClassPolicy(runtimeClassesRaw)
+	if err != nil {
+		setupLog.Error(err, "invalid --migratable-runtime-classes flag")
+		os.Exit(1)
+	}
+
 	ver := version.Get()
 	setupLog.Info("Starting pod-migration-controller",
 		"version", ver.GitVersion,
@@ -116,7 +125,8 @@ func main() {
 		"buildDate", ver.BuildDate,
 		"go", ver.GoVersion,
 		"platform", ver.Platform,
-		"invariantMode", invariantMode)
+		"invariantMode", invariantMode,
+		"migratableRuntimeClasses", runtimeClassPolicy.String())
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -153,8 +163,10 @@ func main() {
 	}
 
 	// Cache indexes must be registered before any controller starts:
-	// 1. Pods by assigned PMJ (used by gate mapper and restore-timeout deferral)
+	// 1. Pods by assigned PMJ (used by gate mapper, collision resolution, and admission assignment)
 	// 2. VolumeAttachments by persistent volume name (used by PMJ detachment wait)
+	// 3. PodMigrationJobs by parent workload key (used by replacement webhook admission)
+	// 4. PodMigrationJobs by snapshot reference (used by cleanup)
 	if err := controller.RegisterFieldIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		setupLog.Error(err, "unable to register field indexes")
 		os.Exit(1)
@@ -202,7 +214,7 @@ func main() {
 	}
 
 	// --- Webhooks ------------------------------------------------------------
-	if err := pmwebhook.SetupEvictionWebhookWithManager(mgr, mgr.GetAPIReader(), migrationTimeout); err != nil {
+	if err := pmwebhook.SetupEvictionWebhookWithManager(mgr, mgr.GetAPIReader(), migrationTimeout, runtimeClassPolicy); err != nil {
 		setupLog.Error(err, "unable to register eviction webhook")
 		os.Exit(1)
 	}

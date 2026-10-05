@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -69,7 +70,10 @@ type EvictionGate struct {
 	APIReader               client.Reader
 	Recorder                record.EventRecorder
 	DefaultMigrationTimeout time.Duration
-	decoder                 admission.Decoder
+	// Eligibility selects the runtime classes whose pods are migrated. Nil
+	// means gVisor only (eligibility.DefaultMigratableRuntimeClasses).
+	Eligibility *eligibility.RuntimeClassPolicy
+	decoder     admission.Decoder
 }
 
 // Handle intercepts eviction requests.
@@ -116,10 +120,13 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed("feature not enabled")
 	}
 
-	// Check if pod uses gvisor runtime
-	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
-		logger.Info("Pod does not use gvisor runtime, allowing eviction immediately", "runtimeClassName", pod.Spec.RuntimeClassName)
-		return admission.Allowed("Pod does not use gvisor runtime, skipping migration")
+	// Only migrate pods whose runtime class the installed snapshot engine supports.
+	if !a.Eligibility.Allows(pod.Spec.RuntimeClassName) {
+		runtimeClass := eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName)
+		logger.Info("Pod runtime class is not migratable, allowing eviction immediately",
+			"runtimeClass", runtimeClass, "migratableRuntimeClasses", a.Eligibility.String())
+		return admission.Allowed(fmt.Sprintf("Pod runtime class %s is not migratable (allowed: %s), skipping migration",
+			runtimeClass, a.Eligibility.String()))
 	}
 
 	// Check if this pod already had a migration that timed out waiting for PDB
@@ -271,7 +278,8 @@ func (a *EvictionGate) InjectDecoder(d admission.Decoder) error {
 }
 
 // SetupEvictionWebhookWithManager registers the webhook on the manager.
-func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, defaultTimeout time.Duration) error {
+// runtimeClasses selects which pods are migrated; nil means gVisor only.
+func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, defaultTimeout time.Duration, runtimeClasses *eligibility.RuntimeClassPolicy) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/validate-v1-pod-eviction",
@@ -280,6 +288,7 @@ func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, 
 			APIReader:               apiReader,
 			Recorder:                mgr.GetEventRecorderFor("pod-migration-controller"),
 			DefaultMigrationTimeout: defaultTimeout,
+			Eligibility:             runtimeClasses,
 			decoder:                 dec,
 		}),
 	)
