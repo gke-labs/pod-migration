@@ -20,13 +20,29 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
+// transientReadyFailureSuppressionWindow bounds how long a Ready=False (Failed)
+// condition is suppressed while a constituent sub-condition (Checkpoint or
+// StorageReplicated) still reports an in-progress reason (#75, #95).
+// The transient race observed in #75 lasted ~337ms; 60s covers that race by two
+// orders of magnitude while ensuring a hung or crashed node snapshot agent still
+// fast-fails instead of waiting out the memory-scaled migration deadline.
+const transientReadyFailureSuppressionWindow = 60 * time.Second
+
 type GKEProvider struct {
 	client client.Client
 	scheme *runtime.Scheme
+	now    func() time.Time
 }
 
 func NewGKEProvider(c client.Client, s *runtime.Scheme) *GKEProvider {
 	return &GKEProvider{client: c, scheme: s}
+}
+
+func (p *GKEProvider) nowFunc() time.Time {
+	if p != nil && p.now != nil {
+		return p.now()
+	}
+	return time.Now()
 }
 
 func (p *GKEProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (ctrl.Result, error) {
@@ -182,31 +198,32 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	}
 
 	conditions, _ := snapStatus["conditions"].([]interface{})
-	var lastProgress time.Time
-	for _, c := range conditions {
-		if cond, ok := c.(map[string]interface{}); ok {
-			if lttStr, ok := cond["lastTransitionTime"].(string); ok {
-				if t, err := time.Parse(time.RFC3339, lttStr); err == nil && t.After(lastProgress) {
-					lastProgress = t
-				}
-			}
-		}
-	}
-	if lastProgress.IsZero() {
-		lastProgress = targetSnapshot.GetCreationTimestamp().Time
-	}
 
-	// Scan conditions for terminal failures, progress, and readiness in a single pass.
-	var terminalSubcond map[string]interface{}
-	var readyTerminalCond map[string]interface{}
-	var subconditionInProgress bool
-	var isReady bool
+	// Scan conditions for terminal failures, progress, transition timestamps, and readiness in a single pass.
+	var (
+		lastProgress            time.Time
+		terminalSubcond         map[string]interface{}
+		readyTerminalCond       map[string]interface{}
+		readyTerminalTransition time.Time
+		subconditionInProgress  bool
+		isReady                 bool
+	)
 
 	for _, c := range conditions {
 		cond, ok := c.(map[string]interface{})
 		if !ok {
 			continue
 		}
+		var condTransitionTime time.Time
+		if lttStr, ok := cond["lastTransitionTime"].(string); ok {
+			if t, err := time.Parse(time.RFC3339Nano, lttStr); err == nil {
+				condTransitionTime = t
+				if t.After(lastProgress) {
+					lastProgress = t
+				}
+			}
+		}
+
 		cType, _ := cond["type"].(string)
 		cStatus, _ := cond["status"].(string)
 		cReason, _ := cond["reason"].(string)
@@ -226,8 +243,12 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 				isReady = true
 			} else if cStatus == "False" && isTerminalSnapshotFailureReason(cReason) {
 				readyTerminalCond = cond
+				readyTerminalTransition = condTransitionTime
 			}
 		}
+	}
+	if lastProgress.IsZero() {
+		lastProgress = targetSnapshot.GetCreationTimestamp().Time
 	}
 
 	// 1. If an underlying constituent sub-condition has terminally failed, fast-fail immediately.
@@ -244,18 +265,43 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		}, nil
 	}
 
-	// 2. Check Ready condition for terminal failure only when no sub-condition is actively in progress (#75).
+	// 2. Check Ready condition for terminal failure (#75, #95).
 	// In high-concurrency waves (Issue #75), GKE PodSnapshot may briefly exhibit a transient
-	// Ready=False (Failed) condition while Checkpoint is still InProgress or StorageReplicated is AwaitingCheckpoint.
-	// In this transient state, sub-conditions are actively running and will finish shortly, so Ready=False (Failed)
-	// must not prematurely abort the PodMigrationJob.
+	// Ready=False (Failed) condition (~337ms) while Checkpoint is still InProgress or
+	// StorageReplicated is AwaitingCheckpoint. To avoid prematurely aborting the PMJ on that
+	// transient race while still fast-failing if the node snapshot agent genuinely hangs or
+	// crashes (#95), we suppress Ready=False only while a sub-condition is in progress AND
+	// Ready's own lastTransitionTime is valid and within transientReadyFailureSuppressionWindow (60s).
+	// Anchoring on Ready's lastTransitionTime (rather than the sub-condition's) ensures a transient
+	// Ready blip midway through a multi-minute large-pod checkpoint still gets a full 60s window.
+	// Note: lastTransitionTime is stamped by the node agent's clock while nowFunc() is ours
+	// (cross-process comparison); 60s dwarfs normal NTP skew, so do not shrink this to a few seconds.
 	if readyTerminalCond != nil {
 		cReason, _ := readyTerminalCond["reason"].(string)
 		cMsg, _ := readyTerminalCond["message"].(string)
-		if subconditionInProgress {
-			logger.Info("PodSnapshot reported Ready=False failure while sub-conditions are still in progress; ignoring transient failure", "snapshot", snapshotName, "reason", cReason, "message", cMsg)
+		now := p.nowFunc()
+		inSuppressionWindow := !readyTerminalTransition.IsZero() &&
+			now.Sub(readyTerminalTransition) <= transientReadyFailureSuppressionWindow
+		if subconditionInProgress && inSuppressionWindow {
+			logger.Info("PodSnapshot reported Ready=False failure while sub-conditions are still in progress within suppression window; ignoring transient failure",
+				"snapshot", snapshotName,
+				"reason", cReason,
+				"message", cMsg,
+				"readyLastTransitionTime", readyTerminalTransition,
+				"window", transientReadyFailureSuppressionWindow,
+			)
 		} else {
-			logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", "Ready", "reason", cReason, "message", cMsg)
+			if subconditionInProgress {
+				logger.Info("PodSnapshot reported Ready=False failure and Ready transition exceeded suppression window; treating as terminal failure",
+					"snapshot", snapshotName,
+					"reason", cReason,
+					"message", cMsg,
+					"readyLastTransitionTime", readyTerminalTransition,
+					"window", transientReadyFailureSuppressionWindow,
+				)
+			} else {
+				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", "Ready", "reason", cReason, "message", cMsg)
+			}
 			return &Status{
 				Phase:       PhaseFailed,
 				SnapshotRef: snapshotName,
