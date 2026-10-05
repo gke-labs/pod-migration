@@ -83,3 +83,4 @@ func TestI10_RestoringReplacementLiveness_GreenProof(t *testing.T) {
 		t.Fatalf("expected GREEN corpus to exercise the PrimaryPod fallback (empty NamespacePods) at least once, got %d", exercisedPrimaryPodFallback)
 	}
 }
+
