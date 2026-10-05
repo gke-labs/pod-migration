@@ -779,4 +779,3 @@ func TestInvariantEngine_ReconcilerStrictAndObserveIntegration(t *testing.T) {
 		t.Errorf("Expected strict mode to transition non-terminal PMJ to PhaseFailed, got %s", updated.Status.Phase)
 	}
 }
-

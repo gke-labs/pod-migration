@@ -7355,4 +7355,3 @@ func TestPodMigrationJobReconciler_EvaluateInvariants_PopulatesListFailedAndPodS
 			capture.captured.PodListFailed, capture.captured.PMJListFailed)
 	}
 }
-
