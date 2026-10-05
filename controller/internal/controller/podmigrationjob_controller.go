@@ -183,7 +183,8 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 
 // isOriginPodTerminatedDueToNodeShutdown checks whether the origin pod was terminated due to node shutdown.
 // It checks pod status indicators (reason, shutdown messages, DisruptionTarget condition), and if absent,
-// falls back to checking the origin node condition for graceful node shutdown.
+// falls back to checking the origin node condition for graceful node shutdown, or whether the origin node
+// has vanished (NotFound) after node termination on Spot/preemptible instances.
 func (r *PodMigrationJobReconciler) isOriginPodTerminatedDueToNodeShutdown(ctx context.Context, pod *corev1.Pod) bool {
 	if pod == nil {
 		return false
@@ -193,8 +194,15 @@ func (r *PodMigrationJobReconciler) isOriginPodTerminatedDueToNodeShutdown(ctx c
 	}
 	if (pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded) && pod.Spec.NodeName != "" {
 		node := &corev1.Node{}
-		if err := r.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, node); err == nil {
+		err := r.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, node)
+		if err == nil {
 			return util.IsNodeShuttingDown(node)
+		}
+		if apierrors.IsNotFound(err) {
+			// On Spot/preemptible nodes, the Node object can be deleted within seconds
+			// of preemption. If the origin pod is terminal and its scheduled node is already gone,
+			// that is evidence of node shutdown.
+			return true
 		}
 	}
 	return false
@@ -941,9 +949,22 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, nil
 			}
 
-			// If origin pod terminated due to node graceful shutdown, fail fast immediately.
-			if r.isOriginPodTerminatedDueToNodeShutdown(ctx, originPod) {
-				logger.Info("Origin pod terminated due to node shutdown in Pending state, failing migration job")
+			// If origin pod entered terminal phase (Failed or Succeeded), fail fast immediately.
+			// It has no running process left to checkpoint.
+			if originPod.Status.Phase == corev1.PodFailed || originPod.Status.Phase == corev1.PodSucceeded {
+				isShutdown := r.isOriginPodTerminatedDueToNodeShutdown(ctx, originPod)
+				reason := "OriginPodTerminated"
+				msg := fmt.Sprintf("Origin pod entered terminal phase %s before snapshotting could start", originPod.Status.Phase)
+				eventMsg := fmt.Sprintf("Origin pod entered terminal phase %s", originPod.Status.Phase)
+				logMsg := "Origin pod entered terminal phase in Pending state, failing migration job"
+				if isShutdown {
+					reason = "NodeShutdown"
+					msg = "Origin pod was terminated due to node shutdown before snapshotting could start"
+					eventMsg = "Origin pod terminated due to node shutdown"
+					logMsg = "Origin pod terminated due to node shutdown in Pending state, failing migration job"
+				}
+
+				logger.Info(logMsg, "phase", originPod.Status.Phase, "reason", reason)
 				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 				now := metav1.Now()
 				job.Status.CompletionTime = &now
@@ -951,18 +972,18 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 					Type:               "Ready",
 					Status:             metav1.ConditionFalse,
-					Reason:             "NodeShutdown",
-					Message:            "Origin pod was terminated due to node shutdown before snapshotting could start",
+					Reason:             reason,
+					Message:            msg,
 					ObservedGeneration: job.Generation,
 				})
 
 				if err := r.patchStatus(ctx, job, origJob); err != nil {
-					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on origin pod node shutdown")
+					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on origin pod termination")
 				}
 				metrics.MarkPMJInactive(req.NamespacedName.String())
 				metrics.RecordPhaseDuration("pending", time.Since(job.CreationTimestamp.Time).Seconds())
 				metrics.RecordOutcome("failed")
-				r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Origin pod terminated due to node shutdown")
+				r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", eventMsg)
 				return ctrl.Result{}, nil
 			}
 
@@ -1106,11 +1127,24 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{Requeue: true}, nil
 
 		case snapshot.PhaseInProgress:
-			// If origin pod terminated due to node graceful shutdown while snapshotting, fail fast.
+			// If origin pod entered terminal phase (Failed or Succeeded) while snapshotting, fail fast.
+			// It has no running process left to checkpoint.
 			originPod := &corev1.Pod{}
 			if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod); err == nil {
-				if r.isOriginPodTerminatedDueToNodeShutdown(ctx, originPod) {
-					logger.Info("Origin pod terminated due to node shutdown during snapshotting, failing migration job")
+				if originPod.Status.Phase == corev1.PodFailed || originPod.Status.Phase == corev1.PodSucceeded {
+					isShutdown := r.isOriginPodTerminatedDueToNodeShutdown(ctx, originPod)
+					reason := "OriginPodTerminated"
+					msg := fmt.Sprintf("Origin pod entered terminal phase %s during snapshotting", originPod.Status.Phase)
+					eventMsg := fmt.Sprintf("Origin pod entered terminal phase %s during snapshotting", originPod.Status.Phase)
+					logMsg := "Origin pod entered terminal phase during snapshotting, failing migration job"
+					if isShutdown {
+						reason = "NodeShutdown"
+						msg = "Origin pod was terminated due to node shutdown during snapshotting"
+						eventMsg = "Origin pod terminated due to node shutdown during snapshotting"
+						logMsg = "Origin pod terminated due to node shutdown during snapshotting, failing migration job"
+					}
+
+					logger.Info(logMsg, "phase", originPod.Status.Phase, "reason", reason)
 					_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 					job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 					now := metav1.Now()
@@ -1118,18 +1152,18 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 						Type:               "Ready",
 						Status:             metav1.ConditionFalse,
-						Reason:             "NodeShutdown",
-						Message:            "Origin pod was terminated due to node shutdown during snapshotting",
+						Reason:             reason,
+						Message:            msg,
 						ObservedGeneration: job.Generation,
 					})
 					err = r.patchStatus(ctx, job, origJob)
 					if err != nil {
-						return r.handleStatusError(ctx, err, "Failed to update job status to Failed on snapshot node shutdown")
+						return r.handleStatusError(ctx, err, "Failed to update job status to Failed on origin pod termination during snapshotting")
 					}
 					metrics.MarkPMJInactive(req.NamespacedName.String())
 					metrics.RecordOutcome("failed")
 					r.recordPreviousPhaseDuration(job, pmv1alpha1.PodMigrationJobPhaseSnapshotting)
-					r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Origin pod terminated due to node shutdown during snapshotting")
+					r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", eventMsg)
 					return ctrl.Result{}, nil
 				}
 			}

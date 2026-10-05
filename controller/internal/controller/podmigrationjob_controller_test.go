@@ -721,6 +721,191 @@ func TestPodMigrationJobReconciler_Pending_NodeShutdown_OriginNodeShuttingDown(t
 	}
 }
 
+func TestPodMigrationJobReconciler_Pending_NodeShutdown_OriginNodeNotFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "shutdown-node-notfound-pod"
+	nodeName := "vanished-node-pending"
+	jobName := "pmj-" + podName
+	uid := "uid-shutdown-node-notfound"
+
+	// Origin pod entered phase Succeeded on a Spot node that has already vanished (NotFound)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(uid),
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: uid,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	// Note: node object is NOT in the client (simulating deleted/vanished node on Spot preemption)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	recorder := record.NewFakeRecorder(10)
+	reconciler := &PodMigrationJobReconciler{
+		Client:                  fakeClient,
+		Scheme:                  scheme,
+		Recorder:                recorder,
+		DefaultMigrationTimeout: 10 * time.Minute,
+	}
+
+	res, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected Requeue=false, got %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseFailed, updatedPMJ.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "NodeShutdown" {
+		t.Errorf("Expected Ready condition Reason=NodeShutdown on vanished node, got: %+v", cond)
+	}
+}
+
+func TestPodMigrationJobReconciler_Pending_OriginPodTerminated_NonShutdown(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "oom-pod"
+	nodeName := "healthy-node-pending"
+	jobName := "pmj-" + podName
+	uid := "uid-oom-pending"
+
+	// Origin pod failed due to OOM kill or container exit without node shutdown markers
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(uid),
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+		},
+		Status: corev1.PodStatus{
+			Phase:   corev1.PodFailed,
+			Reason:  "OOMKilled",
+			Message: "Container exceeded memory limit and was terminated",
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeName,
+		},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{
+					Type:   corev1.NodeReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{
+				Name: podName,
+			},
+			TargetPodUID: uid,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	recorder := record.NewFakeRecorder(10)
+	reconciler := &PodMigrationJobReconciler{
+		Client:                  fakeClient,
+		Scheme:                  scheme,
+		Recorder:                recorder,
+		DefaultMigrationTimeout: 10 * time.Minute,
+	}
+
+	res, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      jobName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("Expected Requeue=false, got %+v", res)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+	if err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseFailed, updatedPMJ.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "OriginPodTerminated" {
+		t.Errorf("Expected Ready condition Reason=OriginPodTerminated, got: %+v", cond)
+	}
+}
+
 func TestPodMigrationJobReconciler_Timeout(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -1865,6 +2050,380 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, cleanedTrigger)
 		if err == nil || !apierrors.IsNotFound(err) {
 			t.Errorf("Expected PSMT trigger to be cleaned up on node shutdown fast-fail, got error: %v", err)
+		}
+	})
+
+	t.Run("Test Case 8: Origin pod entered terminal phase with origin node vanished (NotFound) during snapshotting triggers fast-fail", func(t *testing.T) {
+		namespace := "default"
+		podName := "test-pod-succeeded-node-notfound"
+		nodeName := "vanished-node-snap"
+		podUID := "pod-uid-succeeded-3"
+		jobName := util.FormatPMJName(podName, podUID)
+		triggerName := util.FormatPSMTName(podName, podUID)
+
+		pmj := &pmv1alpha1.PodMigrationJob{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         namespace,
+				Name:              jobName,
+				UID:               types.UID("pmj-uid-succeeded-3"),
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef: corev1.LocalObjectReference{
+					Name: podName,
+				},
+				TargetPodUID: podUID,
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			},
+		}
+
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		trigger.SetName(triggerName)
+		trigger.SetNamespace(namespace)
+		isController := true
+		trigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        pmj.UID,
+				Controller: &isController,
+			},
+		})
+		trigger.Object["status"] = map[string]interface{}{}
+
+		// Origin pod entered phase Succeeded, node object is absent (vanished on Spot preemption)
+		succeededPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      podName,
+				UID:       types.UID(podUID),
+			},
+			Spec: corev1.PodSpec{
+				NodeName: nodeName,
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodSucceeded,
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(pmj, trigger, succeededPod).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			Build()
+
+		recorder := record.NewFakeRecorder(10)
+		reconciler := &PodMigrationJobReconciler{
+			Client:                  fakeClient,
+			Scheme:                  scheme,
+			Recorder:                recorder,
+			DefaultMigrationTimeout: 10 * time.Minute,
+		}
+
+		res, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      jobName,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if res.Requeue || res.RequeueAfter != 0 {
+			t.Errorf("Expected Requeue=false on fast-fail, got %+v", res)
+		}
+
+		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+		if err != nil {
+			t.Fatalf("Failed to get PMJ: %v", err)
+		}
+		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseFailed, updatedPMJ.Status.Phase)
+		}
+		cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+		if cond == nil || cond.Reason != "NodeShutdown" {
+			t.Errorf("Expected Ready condition Reason=NodeShutdown, got %+v", cond)
+		}
+
+		cleanedTrigger := &unstructured.Unstructured{}
+		cleanedTrigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, cleanedTrigger)
+		if err == nil || !apierrors.IsNotFound(err) {
+			t.Errorf("Expected PSMT trigger to be cleaned up on node shutdown fast-fail, got error: %v", err)
+		}
+	})
+
+	t.Run("Test Case 9: Origin pod entered terminal phase without node shutdown indicators during snapshotting triggers fast-fail with OriginPodTerminated", func(t *testing.T) {
+		namespace := "default"
+		podName := "test-pod-oom-snap"
+		nodeName := "healthy-node-snap"
+		podUID := "pod-uid-oom-snap"
+		jobName := util.FormatPMJName(podName, podUID)
+		triggerName := util.FormatPSMTName(podName, podUID)
+
+		pmj := &pmv1alpha1.PodMigrationJob{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         namespace,
+				Name:              jobName,
+				UID:               types.UID("pmj-uid-oom-snap"),
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef: corev1.LocalObjectReference{
+					Name: podName,
+				},
+				TargetPodUID: podUID,
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			},
+		}
+
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		trigger.SetName(triggerName)
+		trigger.SetNamespace(namespace)
+		isController := true
+		trigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        pmj.UID,
+				Controller: &isController,
+			},
+		})
+		trigger.Object["status"] = map[string]interface{}{}
+
+		// Origin pod failed due to OOM kill on a healthy node
+		failedPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      podName,
+				UID:       types.UID(podUID),
+			},
+			Spec: corev1.PodSpec{
+				NodeName: nodeName,
+			},
+			Status: corev1.PodStatus{
+				Phase:   corev1.PodFailed,
+				Reason:  "OOMKilled",
+				Message: "Container killed by OOM",
+			},
+		}
+
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName,
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{
+						Type:   corev1.NodeReady,
+						Status: corev1.ConditionTrue,
+					},
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(node, pmj, trigger, failedPod).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			Build()
+
+		recorder := record.NewFakeRecorder(10)
+		reconciler := &PodMigrationJobReconciler{
+			Client:                  fakeClient,
+			Scheme:                  scheme,
+			Recorder:                recorder,
+			DefaultMigrationTimeout: 10 * time.Minute,
+		}
+
+		res, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      jobName,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if res.Requeue || res.RequeueAfter != 0 {
+			t.Errorf("Expected Requeue=false on fast-fail, got %+v", res)
+		}
+
+		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+		if err != nil {
+			t.Fatalf("Failed to get PMJ: %v", err)
+		}
+		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseFailed, updatedPMJ.Status.Phase)
+		}
+		cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+		if cond == nil || cond.Reason != "OriginPodTerminated" {
+			t.Errorf("Expected Ready condition Reason=OriginPodTerminated, got %+v", cond)
+		}
+
+		cleanedTrigger := &unstructured.Unstructured{}
+		cleanedTrigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: triggerName}, cleanedTrigger)
+		if err == nil || !apierrors.IsNotFound(err) {
+			t.Errorf("Expected PSMT trigger to be cleaned up on origin pod termination fast-fail, got error: %v", err)
+		}
+	})
+
+	t.Run("Test Case 10: Checkpoint already completed (PhaseReady) when origin pod is terminal proceeds to Evicting phase", func(t *testing.T) {
+		namespace := "default"
+		podName := "test-pod-ready-then-exited"
+		snapName := "snap-already-ready"
+		podUID := "pod-uid-ready-exited"
+		jobName := util.FormatPMJName(podName, podUID)
+		triggerName := util.FormatPSMTName(podName, podUID)
+
+		pmj := &pmv1alpha1.PodMigrationJob{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         namespace,
+				Name:              jobName,
+				UID:               types.UID("pmj-uid-ready-exited"),
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef: corev1.LocalObjectReference{
+					Name: podName,
+				},
+				TargetPodUID: podUID,
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			},
+		}
+
+		trigger := &unstructured.Unstructured{}
+		trigger.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotManualTrigger",
+		})
+		trigger.SetName(triggerName)
+		trigger.SetNamespace(namespace)
+		isController := true
+		trigger.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: "podmigration.gke.io/v1alpha1",
+				Kind:       "PodMigrationJob",
+				Name:       jobName,
+				UID:        pmj.UID,
+				Controller: &isController,
+			},
+		})
+		trigger.Object["status"] = map[string]interface{}{
+			"snapshotCreated": map[string]interface{}{
+				"name": snapName,
+			},
+		}
+
+		snapshot := &unstructured.Unstructured{}
+		snapshot.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshot",
+		})
+		snapshot.SetName(snapName)
+		snapshot.SetNamespace(namespace)
+		snapshot.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+
+		// Origin pod exited and entered phase Succeeded after checkpoint completed
+		exitedPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      podName,
+				UID:       types.UID(podUID),
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodSucceeded,
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(pmj, trigger, snapshot, exitedPod).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			Build()
+
+		recorder := record.NewFakeRecorder(10)
+		reconciler := &PodMigrationJobReconciler{
+			Client:                  fakeClient,
+			Scheme:                  scheme,
+			Recorder:                recorder,
+			DefaultMigrationTimeout: 10 * time.Minute,
+		}
+
+		res, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      jobName,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !res.Requeue {
+			t.Errorf("Expected Requeue=true on transition to Evicting, got %+v", res)
+		}
+
+		updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+		err = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ)
+		if err != nil {
+			t.Fatalf("Failed to get PMJ: %v", err)
+		}
+		if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+			t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseEvicting, updatedPMJ.Status.Phase)
+		}
+		cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Ready")
+		if cond == nil || cond.Reason != "Evicting" {
+			t.Errorf("Expected Ready condition Reason=Evicting, got %+v", cond)
 		}
 	})
 }
