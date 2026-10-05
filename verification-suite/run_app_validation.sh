@@ -5,7 +5,7 @@ APP=$1
 CORPUS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ -z "$APP" ]; then
-  echo "Usage: $0 [redis|node|go|memcached|valkey|etcd|nats|postgres|dragonfly|vault|minio|nginx|haproxy|traefik|caddy|python|consul|mysql|mariadb|zookeeper|kafka]"
+  echo "Usage: $0 [redis|node|go|memcached|valkey|etcd|nats|postgres|dragonfly|vault|minio|nginx|haproxy|traefik|caddy|python|consul|mysql|mariadb|zookeeper|kafka|multicontainer]"
   exit 1
 fi
 
@@ -18,6 +18,25 @@ exec_with_retry() {
       exit 1
     fi
     echo "[*] Connection failed, retrying in 3 seconds (Attempt $attempt/$max_attempts)..." >&2
+    sleep 3
+    attempt=$((attempt + 1))
+  done
+}
+
+exec_json_with_retry() {
+  local max_attempts=5
+  local attempt=1
+  local output=""
+  while [ $attempt -le $max_attempts ]; do
+    if output=$("$@") && [ -n "$output" ] && echo "$output" | jq -e . >/dev/null 2>&1; then
+      echo "$output"
+      return 0
+    fi
+    if [ $attempt -eq $max_attempts ]; then
+      echo "[ERROR] Command failed, returned empty output, or invalid JSON after $max_attempts attempts: $*" >&2
+      exit 1
+    fi
+    echo "[*] Command returned empty/invalid response, retrying in 3 seconds (Attempt $attempt/$max_attempts)..." >&2
     sleep 3
     attempt=$((attempt + 1))
   done
@@ -981,6 +1000,142 @@ case "$APP" in
       echo "[ERROR] Go state verification failed! Expected $INITIAL_INST_ID / >=$INITIAL_COUNT, got $RESTORED_INST_ID / $RESTORED_COUNT"
       exit 1
     fi
+    ;;
+
+  multicontainer)
+    MANIFEST="$CORPUS_DIR/manifests/pm-multicontainer-statefulset.yaml"
+    POD_NAME="pm-multicontainer-0"
+
+    echo "[*] Cleaning up potential residue..."
+    kubectl delete statefulset/pm-multicontainer service/pm-multicontainer-service --ignore-not-found || true
+    if kubectl get pod/"$POD_NAME" >/dev/null 2>&1; then
+      echo "[*] Waiting for old multi-container pod to be deleted..."
+      kubectl wait --for=delete pod/"$POD_NAME" --timeout=60s || true
+    fi
+
+    echo "[*] Deploying Multi-Container StatefulSet (initContainer + app + sidecar)..."
+    kubectl apply -f "$MANIFEST"
+
+    echo "[*] Waiting for Multi-Container pod to be Ready (init completed + all containers ready)..."
+    wait_for_pod_ready "$POD_NAME" 120
+
+    echo "[*] Verifying initContainer execution and reading initial state..."
+    INIT_APP_STATUS=$(exec_json_with_retry kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/status').read().decode())")
+    INIT_SIDECAR_STATUS=$(exec_json_with_retry kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:9090/status').read().decode())")
+
+    echo "[+] Initial app status: $INIT_APP_STATUS"
+    echo "[+] Initial sidecar status: $INIT_SIDECAR_STATUS"
+
+    INIT_APP_ID=$(echo "$INIT_APP_STATUS" | jq -r '.instance_id')
+    INIT_APP_TOKEN=$(echo "$INIT_APP_STATUS" | jq -r '.init_token')
+    INIT_SIDECAR_ID=$(echo "$INIT_SIDECAR_STATUS" | jq -r '.instance_id')
+    INIT_SIDECAR_TOKEN=$(echo "$INIT_SIDECAR_STATUS" | jq -r '.init_token')
+
+    if [ -z "$INIT_APP_ID" ] || [ "$INIT_APP_ID" == "null" ] || [ -z "$INIT_SIDECAR_ID" ] || [ "$INIT_SIDECAR_ID" == "null" ]; then
+      echo "[ERROR] Failed to obtain initial instance IDs from containers!"
+      exit 1
+    fi
+
+    if [ "$INIT_APP_TOKEN" != "$INIT_SIDECAR_TOKEN" ] || [ -z "$INIT_APP_TOKEN" ]; then
+      echo "[ERROR] Init token mismatch between app and sidecar: app=$INIT_APP_TOKEN, sidecar=$INIT_SIDECAR_TOKEN"
+      exit 1
+    fi
+
+    echo "[*] Seeding in-memory state and volume data across both containers..."
+    # Increment app counter twice (in-memory + shared emptyDir file app-data.txt)
+    kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8080/incr', data=b'', method='POST'))"
+    kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8080/incr', data=b'', method='POST'))"
+    # Increment sidecar counter three times (in-memory + shared emptyDir file sidecar-data.txt)
+    kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:9090/incr', data=b'', method='POST'))"
+    kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:9090/incr', data=b'', method='POST'))"
+    kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:9090/incr', data=b'', method='POST'))"
+
+    # Verify intra-pod networking (app calling sidecar over loopback localhost:9090)
+    INTRA_POD_CHECK=$(kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:9090/healthz').read().decode())")
+    if [ "$INTRA_POD_CHECK" != "OK" ]; then
+      echo "[ERROR] Intra-pod loopback networking failed between app and sidecar!"
+      exit 1
+    fi
+
+    NODE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.nodeName}')
+    echo "[*] Pod is running on node: $NODE"
+
+    echo "[*] Draining node $NODE..."
+    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+
+    echo "[*] Restoring node $NODE (uncordon)..."
+    kubectl uncordon "$NODE"
+
+    echo "[*] Waiting for restored Multi-Container pod to be Ready..."
+    wait_for_pod_ready "$POD_NAME" 120
+
+    echo "[*] Verifying restored state on both containers..."
+    RESTORED_APP_STATUS=$(exec_json_with_retry kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/status').read().decode())")
+    RESTORED_SIDECAR_STATUS=$(exec_json_with_retry kubectl exec "$POD_NAME" -c sidecar -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:9090/status').read().decode())")
+
+    echo "[+] Restored app status: $RESTORED_APP_STATUS"
+    echo "[+] Restored sidecar status: $RESTORED_SIDECAR_STATUS"
+
+    RESTORED_APP_ID=$(echo "$RESTORED_APP_STATUS" | jq -r '.instance_id')
+    RESTORED_APP_TOKEN=$(echo "$RESTORED_APP_STATUS" | jq -r '.init_token')
+    RESTORED_APP_COUNTER=$(echo "$RESTORED_APP_STATUS" | jq -r '.counter')
+    RESTORED_APP_VOL=$(echo "$RESTORED_APP_STATUS" | jq -r '.volume_data')
+
+    RESTORED_SIDECAR_ID=$(echo "$RESTORED_SIDECAR_STATUS" | jq -r '.instance_id')
+    RESTORED_SIDECAR_TOKEN=$(echo "$RESTORED_SIDECAR_STATUS" | jq -r '.init_token')
+    RESTORED_SIDECAR_COUNTER=$(echo "$RESTORED_SIDECAR_STATUS" | jq -r '.counter')
+    RESTORED_SIDECAR_VOL=$(echo "$RESTORED_SIDECAR_STATUS" | jq -r '.volume_data')
+
+    FAILED=0
+    # 1. Primary app container in-memory state preservation
+    if [ "$RESTORED_APP_ID" != "$INIT_APP_ID" ]; then
+      echo "[ERROR] Primary app container cold-started! Expected $INIT_APP_ID, got $RESTORED_APP_ID"
+      FAILED=1
+    fi
+    if ! [[ "$RESTORED_APP_COUNTER" =~ ^[0-9]+$ ]] || [ "$RESTORED_APP_COUNTER" -ne 2 ]; then
+      echo "[ERROR] Primary app counter lost! Expected 2, got '$RESTORED_APP_COUNTER'"
+      FAILED=1
+    fi
+
+    # 2. Sidecar container in-memory state preservation
+    if [ "$RESTORED_SIDECAR_ID" != "$INIT_SIDECAR_ID" ]; then
+      echo "[ERROR] Sidecar container cold-started! Expected $INIT_SIDECAR_ID, got $RESTORED_SIDECAR_ID"
+      FAILED=1
+    fi
+    if ! [[ "$RESTORED_SIDECAR_COUNTER" =~ ^[0-9]+$ ]] || [ "$RESTORED_SIDECAR_COUNTER" -ne 3 ]; then
+      echo "[ERROR] Sidecar counter lost! Expected 3, got '$RESTORED_SIDECAR_COUNTER'"
+      FAILED=1
+    fi
+
+    # 3. InitContainer non-race / seed token preservation
+    if [ "$RESTORED_APP_TOKEN" != "$INIT_APP_TOKEN" ] || [ "$RESTORED_SIDECAR_TOKEN" != "$INIT_SIDECAR_TOKEN" ]; then
+      echo "[ERROR] Init token corrupted or re-seeded during restore!"
+      FAILED=1
+    fi
+
+    # 4. Shared emptyDir volume file preservation
+    if ! echo "$RESTORED_APP_VOL" | grep -q "app-step-2"; then
+      echo "[ERROR] Shared emptyDir app-data missing expected content! Got: $RESTORED_APP_VOL"
+      FAILED=1
+    fi
+    if ! echo "$RESTORED_SIDECAR_VOL" | grep -q "sidecar-step-3"; then
+      echo "[ERROR] Shared emptyDir sidecar-data missing expected content! Got: $RESTORED_SIDECAR_VOL"
+      FAILED=1
+    fi
+
+    # 5. Restored intra-pod loopback communication
+    RESTORED_INTRA_POD=$(kubectl exec "$POD_NAME" -c app -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:9090/healthz').read().decode())")
+    if [ "$RESTORED_INTRA_POD" != "OK" ]; then
+      echo "[ERROR] Restored intra-pod loopback networking failed between app and sidecar!"
+      FAILED=1
+    fi
+
+    if [ "$FAILED" -ne 0 ]; then
+      echo "[ERROR] Multi-Container & Sidecar Restore verification failed!"
+      exit 1
+    fi
+
+    echo "[SUCCESS] Multi-Container & Sidecar E2E Live Migration Succeeded. All container states, memory, and volumes survived!"
     ;;
 
   *)
