@@ -29,6 +29,7 @@ func TestPodGateInjector(t *testing.T) {
 		expectedAllowed bool
 		expectGate      bool
 		expectBypass    bool
+		expectScrubbed  bool
 	}{
 		{
 			name: "Pod not opted in",
@@ -55,7 +56,7 @@ func TestPodGateInjector(t *testing.T) {
 			},
 			expectedAllowed: true,
 			expectGate:      false,
-			expectBypass:    true,
+			expectBypass:    false,
 		},
 		{
 			name: "Pod opted in with pre-existing podsnapshot.gke.io/ps-name (e.g. Kubeflow UI resume), no active PMJ, preserves ps-name",
@@ -76,6 +77,45 @@ func TestPodGateInjector(t *testing.T) {
 			expectBypass:    false,
 		},
 		{
+			name: "Pod opted in with explicit empty podsnapshot.gke.io/ps-name annotation scrubs empty annotation (Issue #74)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-empty-psname-pod",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					Annotations: map[string]string{
+						"podsnapshot.gke.io/ps-name": "",
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      false,
+			expectBypass:    false,
+			expectScrubbed:  true,
+		},
+		{
+			name: "Pod opted in with empty ps-name and existing annotations preserves others and scrubs empty ps-name (Issue #74)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "test-empty-psname-with-other-ann",
+					Labels: map[string]string{
+						"pod-migration.gke.io/enabled": "true",
+					},
+					Annotations: map[string]string{
+						"custom.io/app":              "test",
+						"podsnapshot.gke.io/ps-name": "",
+					},
+				},
+			},
+			expectedAllowed: true,
+			expectGate:      false,
+			expectBypass:    false,
+			expectScrubbed:  true,
+		},
+		{
 			name: "Pod already has gate, bypassed (no active PMJ)",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -93,7 +133,7 @@ func TestPodGateInjector(t *testing.T) {
 			},
 			expectedAllowed: true,
 			expectGate:      false,
-			expectBypass:    true,
+			expectBypass:    false,
 		},
 		{
 			name: "Pod opted in, active PMJ exists, gate injected",
@@ -164,7 +204,7 @@ func TestPodGateInjector(t *testing.T) {
 			},
 			expectedAllowed: true,
 			expectGate:      false,
-			expectBypass:    true,
+			expectBypass:    false,
 		},
 		{
 			name: "Pod opted in, parent workload exists, active PMJ exists, gate injected",
@@ -272,7 +312,7 @@ func TestPodGateInjector(t *testing.T) {
 			},
 			expectedAllowed: true,
 			expectGate:      false,
-			expectBypass:    true,
+			expectBypass:    false,
 		},
 		{
 			name: "Deployment rolling update: pod for old revision (v1) matches v1 PMJ and injects gate",
@@ -476,7 +516,7 @@ func TestPodGateInjector(t *testing.T) {
 			},
 			expectedAllowed: true,
 			expectGate:      false,
-			expectBypass:    true,
+			expectBypass:    false,
 		},
 	}
 
@@ -521,6 +561,7 @@ func TestPodGateInjector(t *testing.T) {
 
 			gateAdded := false
 			bypassAnnotated := false
+			scrubbed := false
 
 			for _, patch := range resp.Patches {
 				if patch.Operation == "add" && (patch.Path == "/spec/schedulingGates" || patch.Path == "/spec/schedulingGates/-") {
@@ -532,10 +573,16 @@ func TestPodGateInjector(t *testing.T) {
 							bypassAnnotated = true
 						}
 					}
+					if patch.Operation == "remove" {
+						scrubbed = true
+					}
 				}
 				if patch.Path == "/metadata/annotations/podsnapshot.gke.io~1ps-name" {
 					if valStr, ok := patch.Value.(string); ok && valStr == "" {
 						bypassAnnotated = true
+					}
+					if patch.Operation == "remove" {
+						scrubbed = true
 					}
 				}
 			}
@@ -546,6 +593,10 @@ func TestPodGateInjector(t *testing.T) {
 
 			if tt.expectBypass != bypassAnnotated {
 				t.Errorf("Expected bypassAnnotated %t, got %t (patches: %+v)", tt.expectBypass, bypassAnnotated, resp.Patches)
+			}
+
+			if tt.expectScrubbed != scrubbed {
+				t.Errorf("Expected scrubbed %t, got %t (patches: %+v)", tt.expectScrubbed, scrubbed, resp.Patches)
 			}
 		})
 	}
@@ -646,7 +697,7 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("Cache miss with live miss bypasses gate with cold-start bypass", func(t *testing.T) {
+	t.Run("Cache miss with live miss bypasses gate without stamping empty ps-name", func(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
@@ -662,7 +713,7 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 
 		resp := handler.Handle(context.Background(), req)
 		if !resp.Allowed {
-			t.Fatalf("Expected allowed with bypass patches, got denied: %v", resp.Result)
+			t.Fatalf("Expected allowed, got denied: %v", resp.Result)
 		}
 
 		bypassAnnotated := false
@@ -688,8 +739,11 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 		if gateAdded {
 			t.Errorf("Expected gate NOT to be added on scale-up pod, got patches: %+v", resp.Patches)
 		}
-		if !bypassAnnotated {
-			t.Errorf("Expected ps-name: \"\" bypass annotation on scale-up pod, got patches: %+v", resp.Patches)
+		if bypassAnnotated {
+			t.Errorf("Expected ps-name: \"\" NOT to be stamped on scale-up pod, got patches: %+v", resp.Patches)
+		}
+		if len(resp.Patches) != 0 {
+			t.Errorf("Expected 0 patches on scale-up pod without annotations, got patches: %+v", resp.Patches)
 		}
 	})
 
