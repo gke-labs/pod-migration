@@ -921,4 +921,3 @@ func TestEvictionGate_PropagatesControllerRevisionHashLabel(t *testing.T) {
 		t.Fatalf("Expected PMJ label %s=%q, got %q", util.LabelControllerRevisionHash, "sts-web-6b7f8c9d4", got)
 	}
 }
-

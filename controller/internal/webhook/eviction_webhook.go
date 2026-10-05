@@ -261,6 +261,7 @@ func newEvictionWebhook(gate *EvictionGate) *admission.Webhook {
 		WithContextFunc: contextWithAdmissionTimeout,
 	}
 }
+
 // findLatestReadyManualStopPSP finds the latest ready manual PodSnapshotPolicy in the namespace matching the labels,
 // and verifies that its postCheckpoint behavior is set to "stop".
 func findLatestReadyManualStopPSP(ctx context.Context, c client.Client, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {

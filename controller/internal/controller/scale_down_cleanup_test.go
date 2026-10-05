@@ -50,7 +50,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeletesUnassignedSucceededWithoutRe
 			Name:      rsName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 			OwnerReferences: []metav1.OwnerReference{
@@ -66,7 +66,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeletesUnassignedSucceededWithoutRe
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app":                               "web",
+					"app":                                  "web",
 					appsv1.DefaultDeploymentUniqueLabelKey: hash,
 				},
 			},
@@ -78,7 +78,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeletesUnassignedSucceededWithoutRe
 			Name:      "web-1",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 		},
@@ -91,7 +91,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeletesUnassignedSucceededWithoutRe
 			Name:      "web-2",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 		},
@@ -194,7 +194,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Name:      "web-deploy-" + oldHash,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: oldHash,
 			},
 			OwnerReferences: []metav1.OwnerReference{
@@ -210,7 +210,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Replicas: &oldRSReplicas, // desired: 3
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app":                               "web",
+					"app":                                  "web",
 					appsv1.DefaultDeploymentUniqueLabelKey: oldHash,
 				},
 			},
@@ -222,7 +222,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Name:      "web-deploy-" + newHash,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: newHash,
 			},
 			OwnerReferences: []metav1.OwnerReference{
@@ -238,7 +238,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Replicas: &newRSReplicas, // desired: 3
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app":                               "web",
+					"app":                                  "web",
 					appsv1.DefaultDeploymentUniqueLabelKey: newHash,
 				},
 			},
@@ -251,7 +251,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Name:      "web-old-1",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: oldHash,
 			},
 		},
@@ -262,7 +262,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Name:      "web-old-2",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: oldHash,
 			},
 		},
@@ -275,7 +275,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Name:      "web-new-1",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: newHash,
 			},
 		},
@@ -286,7 +286,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Name:      "web-new-2",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: newHash,
 			},
 		},
@@ -297,7 +297,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentRolloutTwoReplicaSets(t *
 			Name:      "web-new-3",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: newHash,
 			},
 		},
@@ -528,7 +528,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenActivePodsBelowTar
 			Name:      "web-deploy-" + hash,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 		},
@@ -536,7 +536,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenActivePodsBelowTar
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app":                               "web",
+					"app":                                  "web",
 					appsv1.DefaultDeploymentUniqueLabelKey: hash,
 				},
 			},
@@ -549,7 +549,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenActivePodsBelowTar
 			Name:      "web-1",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 		},
@@ -560,7 +560,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenActivePodsBelowTar
 			Name:      "web-2",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 		},
@@ -630,7 +630,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenConsumedOrClaimed(
 			Name:      "web-deploy-" + hash,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 		},
@@ -638,7 +638,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenConsumedOrClaimed(
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app":                               "web",
+					"app":                                  "web",
 					appsv1.DefaultDeploymentUniqueLabelKey: hash,
 				},
 			},
@@ -686,7 +686,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenConsumedOrClaimed(
 			Name:      "web-claimant",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 			Annotations: map[string]string{
@@ -700,7 +700,7 @@ func TestPodMigrationJobReconciler_ScaleDown_DoesNotDeleteWhenConsumedOrClaimed(
 			Name:      "web-active",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 		},
@@ -884,9 +884,9 @@ func TestPodMigrationJobReconciler_ScaleDown_DeploymentReplicaSetNotFound_DoesNo
 			Name:      "pmj-missing-rs",
 			Namespace: namespace,
 			Labels: map[string]string{
-				util.LabelParentKind:         "Deployment",
-				util.LabelParentName:         "long-deployment-name-that-is-missing-its-replicaset-object",
-				util.LabelPodTemplateHash:    hash,
+				util.LabelParentKind:      "Deployment",
+				util.LabelParentName:      "long-deployment-name-that-is-missing-its-replicaset-object",
+				util.LabelPodTemplateHash: hash,
 			},
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
@@ -958,7 +958,7 @@ func TestPodMigrationJobReconciler_ScaleDown_OriginPodStillRunning_FailOpenPrese
 			Namespace: namespace,
 			UID:       "uid-origin-alive",
 			Labels: map[string]string{
-				"app":                               "web",
+				"app":                                  "web",
 				appsv1.DefaultDeploymentUniqueLabelKey: hash,
 			},
 		},
