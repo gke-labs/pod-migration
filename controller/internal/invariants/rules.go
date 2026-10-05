@@ -63,7 +63,7 @@ var DefaultRules = []Rule{
 	funcRule{id: "I7", name: "DisruptionBoundingPDBCompliance", fn: EvaluateI7},
 	funcRule{id: "I8", name: "PlatformAndControlPlaneIsolation", fn: EvaluateI8},
 	funcRule{id: "I9", name: "DeterministicFallbackOverCrashloop", fn: EvaluateI9},
-	RuleI10(),
+	NewDebouncedRule(RuleI10(), 3, 30*time.Second),
 }
 
 func allPMJs(s *ReconcileSnapshot) []pmv1alpha1.PodMigrationJob {

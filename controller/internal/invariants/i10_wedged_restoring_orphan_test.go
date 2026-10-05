@@ -2,11 +2,82 @@
 package invariants
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestI10_DefaultRules_DebouncedRuleWiring(t *testing.T) {
+	var found Rule
+	for _, r := range DefaultRules {
+		if r.ID() == "I10" {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("expected I10 in DefaultRules, got nil")
+	}
+	dr, ok := found.(DebouncedRule)
+	if !ok {
+		t.Fatalf("expected I10 in DefaultRules to implement DebouncedRule, got %T", found)
+	}
+	if dr.ConsecutiveSamples() != 3 || dr.MinimumDuration() != 30*time.Second {
+		t.Fatalf("expected I10 DebouncedRule(consecutive=3, minDuration=30s), got consecutive=%d minDuration=%s",
+			dr.ConsecutiveSamples(), dr.MinimumDuration())
+	}
+
+	fixturePath := filepath.Join("testdata", "i10_wedged_restoring_orphan_snapshot.json")
+	raw, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read RED snapshot fixture %s: %v", fixturePath, err)
+	}
+	var baseSnap ReconcileSnapshot
+	if err := json.Unmarshal(raw, &baseSnap); err != nil {
+		t.Fatalf("unmarshal RED snapshot fixture %s into ReconcileSnapshot: %v", fixturePath, err)
+	}
+	// Clear the origin pod (evicted prior to PhaseRestoring) so only I10 violates across DefaultRules.
+	baseSnap.PrimaryPod = nil
+	baseSnap.NamespacePods = nil
+	baseTime := baseSnap.PrimaryPMJ.Status.RestoringStartTime.Add(35 * time.Second)
+
+	eng := NewEngine(ModeStrict, nil)
+
+	// Sample 1 (t=0s): count=1, elapsed=0s -> strict=false
+	snap1 := baseSnap
+	snap1.Now = baseTime
+	vs1, strict1 := eng.Evaluate(context.Background(), &snap1)
+	if len(vs1) != 1 || vs1[0].InvariantID != "I10" || strict1 {
+		t.Fatalf("sample 1 (t=0s): expected 1 I10 violation with strict=false, got violations=%+v strict=%v", vs1, strict1)
+	}
+
+	// Sample 2 (t=10s): count=2, elapsed=10s -> strict=false
+	snap2 := baseSnap
+	snap2.Now = baseTime.Add(10 * time.Second)
+	vs2, strict2 := eng.Evaluate(context.Background(), &snap2)
+	if len(vs2) == 0 || strict2 {
+		t.Fatalf("sample 2 (t=10s): expected violation with strict=false, got violations=%d strict=%v", len(vs2), strict2)
+	}
+
+	// Sample 3 (t=20s): count=3, elapsed=20s (<30s duration threshold) -> strict=false
+	snap3 := baseSnap
+	snap3.Now = baseTime.Add(20 * time.Second)
+	vs3, strict3 := eng.Evaluate(context.Background(), &snap3)
+	if len(vs3) == 0 || strict3 {
+		t.Fatalf("sample 3 (t=20s): expected violation with strict=false before 30s duration gate, got violations=%d strict=%v", len(vs3), strict3)
+	}
+
+	// Sample 4 (t=30s): count=4 (>=3) and elapsed=30s (>=30s) -> strict=true!
+	snap4 := baseSnap
+	snap4.Now = baseTime.Add(30 * time.Second)
+	vs4, strict4 := eng.Evaluate(context.Background(), &snap4)
+	if len(vs4) == 0 || !strict4 {
+		t.Fatalf("sample 4 (t=30s): expected violation with strict=true once count>=3 and elapsed>=30s, got violations=%d strict=%v", len(vs4), strict4)
+	}
+}
 
 func TestI10_RestoringReplacementLiveness_RedProof(t *testing.T) {
 	fixturePath := filepath.Join("testdata", "i10_wedged_restoring_orphan_snapshot.json")
@@ -83,4 +154,3 @@ func TestI10_RestoringReplacementLiveness_GreenProof(t *testing.T) {
 		t.Fatalf("expected GREEN corpus to exercise the PrimaryPod fallback (empty NamespacePods) at least once, got %d", exercisedPrimaryPodFallback)
 	}
 }
-
