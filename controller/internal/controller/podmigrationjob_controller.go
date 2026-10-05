@@ -181,6 +181,25 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 	return false
 }
 
+// isOriginPodTerminatedDueToNodeShutdown checks whether the origin pod was terminated due to node shutdown.
+// It checks pod status indicators (reason, shutdown messages, DisruptionTarget condition), and if absent,
+// falls back to checking the origin node condition for graceful node shutdown.
+func (r *PodMigrationJobReconciler) isOriginPodTerminatedDueToNodeShutdown(ctx context.Context, pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	if util.IsPodTerminatedDueToNodeShutdown(pod) {
+		return true
+	}
+	if (pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded) && pod.Spec.NodeName != "" {
+		node := &corev1.Node{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, node); err == nil {
+			return util.IsNodeShuttingDown(node)
+		}
+	}
+	return false
+}
+
 func (r *PodMigrationJobReconciler) restoreEngines() []restore.Engine {
 	if r.RestoreEngines != nil {
 		return r.RestoreEngines
@@ -922,9 +941,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, nil
 			}
 
-			// If origin pod failed due to node graceful shutdown, fail fast immediately.
-			if util.IsPodFailedDueToNodeShutdown(originPod) {
-				logger.Info("Origin pod failed due to node shutdown in Pending state, failing migration job")
+			// If origin pod terminated due to node graceful shutdown, fail fast immediately.
+			if r.isOriginPodTerminatedDueToNodeShutdown(ctx, originPod) {
+				logger.Info("Origin pod terminated due to node shutdown in Pending state, failing migration job")
 				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 				now := metav1.Now()
 				job.Status.CompletionTime = &now
@@ -1087,11 +1106,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{Requeue: true}, nil
 
 		case snapshot.PhaseInProgress:
-			// If origin pod failed due to node graceful shutdown while snapshotting, fail fast.
+			// If origin pod terminated due to node graceful shutdown while snapshotting, fail fast.
 			originPod := &corev1.Pod{}
 			if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod); err == nil {
-				if util.IsPodFailedDueToNodeShutdown(originPod) {
-					logger.Info("Origin pod failed due to node shutdown during snapshotting, failing migration job")
+				if r.isOriginPodTerminatedDueToNodeShutdown(ctx, originPod) {
+					logger.Info("Origin pod terminated due to node shutdown during snapshotting, failing migration job")
 					_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
 					job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 					now := metav1.Now()

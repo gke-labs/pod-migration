@@ -66,6 +66,15 @@ func IsNodePreempting(node *corev1.Node) bool {
 
 	// 3. Conditions: Kubelet Graceful Node Shutdown sets NodeReady to False with reason
 	// KubeletNotReady and message indicating the node is shutting down.
+	return IsNodeShuttingDown(node)
+}
+
+// IsNodeShuttingDown returns true if the node Ready condition is False with reason KubeletNotReady
+// and a status message indicating graceful node shutdown.
+func IsNodeShuttingDown(node *corev1.Node) bool {
+	if node == nil {
+		return false
+	}
 	for _, cond := range node.Status.Conditions {
 		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionFalse {
 			if cond.Reason == "KubeletNotReady" {
@@ -75,17 +84,24 @@ func IsNodePreempting(node *corev1.Node) bool {
 			}
 		}
 	}
-
 	return false
 }
 
-// IsPodFailedDueToNodeShutdown returns true if the pod phase is Failed and the reason, condition,
-// or status message indicates it was terminated by kubelet during node graceful shutdown.
-func IsPodFailedDueToNodeShutdown(pod *corev1.Pod) bool {
+// IsPodTerminatedDueToNodeShutdown returns true if the pod phase is terminal (Failed or Succeeded)
+// and the reason, condition, or status message indicates it was terminated by kubelet during node graceful shutdown.
+func IsPodTerminatedDueToNodeShutdown(pod *corev1.Pod) bool {
+	return IsPodTerminatedDueToNodeShutdownWithNode(pod, nil)
+}
+
+// IsPodTerminatedDueToNodeShutdownWithNode returns true if the pod phase is terminal (Failed or Succeeded)
+// and either:
+// 1. The pod's reason, condition, or status message indicates it was terminated by kubelet during node graceful shutdown.
+// 2. The origin node condition indicates Kubelet graceful node shutdown (Ready=False, Reason: KubeletNotReady, message containing "node is shutting down").
+func IsPodTerminatedDueToNodeShutdownWithNode(pod *corev1.Pod, node *corev1.Node) bool {
 	if pod == nil {
 		return false
 	}
-	if pod.Status.Phase != corev1.PodFailed {
+	if pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded {
 		return false
 	}
 
@@ -113,7 +129,18 @@ func IsPodFailedDueToNodeShutdown(pod *corev1.Pod) bool {
 		return true
 	}
 
+	if node != nil && IsNodeShuttingDown(node) {
+		return true
+	}
+
 	return false
+}
+
+// IsPodFailedDueToNodeShutdown returns true if the pod phase is terminal (Failed or Succeeded) and the reason, condition,
+// or status message indicates it was terminated by kubelet during node graceful shutdown.
+// It is retained for backwards compatibility and forwards directly to IsPodTerminatedDueToNodeShutdown.
+func IsPodFailedDueToNodeShutdown(pod *corev1.Pod) bool {
+	return IsPodTerminatedDueToNodeShutdown(pod)
 }
 
 // CalculatePodMemoryFootprint returns the memory footprint of a pod in bytes, and true if known.

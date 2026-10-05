@@ -121,6 +121,91 @@ func TestIsNodePreempting(t *testing.T) {
 	}
 }
 
+func TestIsNodeShuttingDown(t *testing.T) {
+	tests := []struct {
+		name     string
+		node     *corev1.Node
+		expected bool
+	}{
+		{
+			name:     "nil node",
+			node:     nil,
+			expected: false,
+		},
+		{
+			name: "node with Ready condition False and Reason KubeletNotReady with shutdown message",
+			node: &corev1.Node{
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:    corev1.NodeReady,
+							Status:  corev1.ConditionFalse,
+							Reason:  "KubeletNotReady",
+							Message: "Kubelet is not ready: node is shutting down",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "node with Ready condition False but different reason",
+			node: &corev1.Node{
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:    corev1.NodeReady,
+							Status:  corev1.ConditionFalse,
+							Reason:  "NetworkUnavailable",
+							Message: "network is not ready",
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "node with Ready condition False and KubeletNotReady but not shutting down",
+			node: &corev1.Node{
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:    corev1.NodeReady,
+							Status:  corev1.ConditionFalse,
+							Reason:  "KubeletNotReady",
+							Message: "container runtime network not ready",
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "node with Ready condition True",
+			node: &corev1.Node{
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:   corev1.NodeReady,
+							Status: corev1.ConditionTrue,
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsNodeShuttingDown(tt.node)
+			if got != tt.expected {
+				t.Errorf("IsNodeShuttingDown() = %v, expected %v", got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsPodFailedDueToNodeShutdown(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -142,10 +227,30 @@ func TestIsPodFailedDueToNodeShutdown(t *testing.T) {
 			expected: false,
 		},
 		{
+			name: "running pod with imminent node shutdown message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:   corev1.PodRunning,
+					Message: "Pod was terminated in response to imminent node shutdown.",
+				},
+			},
+			expected: false,
+		},
+		{
 			name: "failed pod with Reason NodeShutdown",
 			pod: &corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase:  corev1.PodFailed,
+					Reason: "NodeShutdown",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "succeeded pod with Reason NodeShutdown",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:  corev1.PodSucceeded,
 					Reason: "NodeShutdown",
 				},
 			},
@@ -161,6 +266,43 @@ func TestIsPodFailedDueToNodeShutdown(t *testing.T) {
 				},
 			},
 			expected: true,
+		},
+		{
+			name: "succeeded pod with Reason Terminated and imminent node shutdown message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:   corev1.PodSucceeded,
+					Reason:  "Terminated",
+					Message: "Pod was terminated in response to imminent node shutdown.",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "succeeded pod with clean exit 0 on SIGTERM during node shutdown (disruption target)",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+					Conditions: []corev1.PodCondition{
+						{
+							Type:   corev1.DisruptionTarget,
+							Reason: "TerminationByKubelet",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "succeeded pod completed normally with no shutdown indicators",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:   corev1.PodSucceeded,
+					Reason:  "Completed",
+					Message: "Job completed successfully.",
+				},
+			},
+			expected: false,
 		},
 		{
 			name: "failed pod with Reason Terminated but no shutdown message or disruption condition",
@@ -202,9 +344,140 @@ func TestIsPodFailedDueToNodeShutdown(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := IsPodFailedDueToNodeShutdown(tt.pod)
+			gotFailed := IsPodFailedDueToNodeShutdown(tt.pod)
+			if gotFailed != tt.expected {
+				t.Errorf("IsPodFailedDueToNodeShutdown() = %v, expected %v", gotFailed, tt.expected)
+			}
+			gotTerm := IsPodTerminatedDueToNodeShutdown(tt.pod)
+			if gotTerm != tt.expected {
+				t.Errorf("IsPodTerminatedDueToNodeShutdown() = %v, expected %v", gotTerm, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsPodTerminatedDueToNodeShutdownWithNode(t *testing.T) {
+	shuttingDownNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "shutting-down-node"},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{
+					Type:    corev1.NodeReady,
+					Status:  corev1.ConditionFalse,
+					Reason:  "KubeletNotReady",
+					Message: "node is shutting down",
+				},
+			},
+		},
+	}
+
+	healthyNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "healthy-node"},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{
+					Type:   corev1.NodeReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		node     *corev1.Node
+		expected bool
+	}{
+		{
+			name:     "nil pod with shutting down node",
+			pod:      nil,
+			node:     shuttingDownNode,
+			expected: false,
+		},
+		{
+			name: "succeeded pod with no signals on pod, but node is shutting down",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+				},
+			},
+			node:     shuttingDownNode,
+			expected: true,
+		},
+		{
+			name: "failed pod with no signals on pod, but node is shutting down",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodFailed,
+				},
+			},
+			node:     shuttingDownNode,
+			expected: true,
+		},
+		{
+			name: "succeeded pod with healthy node",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+				},
+			},
+			node:     healthyNode,
+			expected: false,
+		},
+		{
+			name: "succeeded pod with nil node",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+				},
+			},
+			node:     nil,
+			expected: false,
+		},
+		{
+			name: "running pod on shutting down node (must not fail fast before terminating)",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+				},
+			},
+			node:     shuttingDownNode,
+			expected: false,
+		},
+		{
+			name: "pending pod on shutting down node",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+				},
+			},
+			node:     shuttingDownNode,
+			expected: false,
+		},
+		{
+			name: "pod with DisruptionTarget condition on healthy node still returns true",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+					Conditions: []corev1.PodCondition{
+						{
+							Type:   corev1.DisruptionTarget,
+							Reason: "TerminationByKubelet",
+						},
+					},
+				},
+			},
+			node:     healthyNode,
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsPodTerminatedDueToNodeShutdownWithNode(tt.pod, tt.node)
 			if got != tt.expected {
-				t.Errorf("IsPodFailedDueToNodeShutdown() = %v, expected %v", got, tt.expected)
+				t.Errorf("IsPodTerminatedDueToNodeShutdownWithNode() = %v, expected %v", got, tt.expected)
 			}
 		})
 	}
