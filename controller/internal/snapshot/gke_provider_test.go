@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -667,6 +668,9 @@ func TestGKEProvider_CheckStatus(t *testing.T) {
 
 		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(trigger, snapshot).Build()
 		provider := NewGKEProvider(client, scheme)
+		provider.now = func() time.Time {
+			return time.Date(2026, 9, 28, 0, 27, 0, 500_000_000, time.UTC)
+		}
 		job := &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
 			Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "pod-uid-456"},
@@ -683,6 +687,168 @@ func TestGKEProvider_CheckStatus(t *testing.T) {
 		}
 		if status.SnapshotRef != snapshotName {
 			t.Errorf("expected SnapshotRef=%s, got %s", snapshotName, status.SnapshotRef)
+		}
+	})
+
+	t.Run("PodSnapshot_ReadyFailed_ExpiredSuppressionWindow_FastFail", func(t *testing.T) {
+		trigger := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshotManualTrigger",
+				"metadata": map[string]interface{}{
+					"name":      triggerName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"snapshotCreated": map[string]interface{}{
+						"name": snapshotName,
+					},
+				},
+			},
+		}
+		// Simulate a multi-minute checkpoint (started at t-150s) where Ready=False(Failed)
+		// transitions at readyTransition (t=0s). Because the suppression window is anchored
+		// on Ready's own lastTransitionTime, a Ready blip at t+150s of a long checkpoint gets
+		// its full 60s suppression window before expiring at readyTransition + 60s + 1ns.
+		readyTransition := time.Date(2026, 9, 28, 0, 29, 30, 0, time.UTC)
+		checkpointStart := readyTransition.Add(-150 * time.Second)
+		snapshot := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshot",
+				"metadata": map[string]interface{}{
+					"name":      snapshotName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{
+							"type":               "Checkpoint",
+							"status":             "False",
+							"reason":             "InProgress",
+							"lastTransitionTime": checkpointStart.Format(time.RFC3339),
+						},
+						map[string]interface{}{
+							"type":               "StorageReplicated",
+							"status":             "False",
+							"reason":             "AwaitingCheckpoint",
+							"lastTransitionTime": checkpointStart.Format(time.RFC3339),
+						},
+						map[string]interface{}{
+							"type":               "Ready",
+							"status":             "False",
+							"reason":             "Failed",
+							"message":            "Failed to take snapshot (1).",
+							"lastTransitionTime": readyTransition.Format(time.RFC3339),
+						},
+					},
+				},
+			},
+		}
+
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(trigger, snapshot).Build()
+		provider := NewGKEProvider(client, scheme)
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
+			Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "pod-uid-456"},
+		}
+
+		// 1. At exact boundary (readyTransition + 60s, even though Checkpoint started 210s ago),
+		// Ready=False(Failed) is still suppressed.
+		provider.now = func() time.Time {
+			return readyTransition.Add(transientReadyFailureSuppressionWindow)
+		}
+		status, err := provider.CheckStatus(context.Background(), job, "test-pod")
+		if err != nil {
+			t.Fatalf("unexpected error at boundary: %v", err)
+		}
+		if status.Phase != PhaseInProgress {
+			t.Fatalf("expected PhaseInProgress at exact 60s Ready window boundary, got %v", status.Phase)
+		}
+
+		// 2. Beyond window (readyTransition + 60s + 1ns), Ready=False(Failed) fast-fails (#95).
+		provider.now = func() time.Time {
+			return readyTransition.Add(transientReadyFailureSuppressionWindow + time.Nanosecond)
+		}
+		status, err = provider.CheckStatus(context.Background(), job, "test-pod")
+		if err != nil {
+			t.Fatalf("unexpected error after window expiry: %v", err)
+		}
+		if status.Phase != PhaseFailed {
+			t.Fatalf("expected PhaseFailed after 60s Ready suppression window expired, got %v", status.Phase)
+		}
+		if status.Reason != "SnapshotFailed" {
+			t.Errorf("expected Reason=SnapshotFailed, got %s", status.Reason)
+		}
+		if !strings.Contains(status.Message, "Ready failed (Failed): Failed to take snapshot (1).") {
+			t.Errorf("unexpected failure message: %s", status.Message)
+		}
+	})
+
+	t.Run("PodSnapshot_ReadyFailed_MissingLastTransitionTime_FastFail", func(t *testing.T) {
+		trigger := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshotManualTrigger",
+				"metadata": map[string]interface{}{
+					"name":      triggerName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"snapshotCreated": map[string]interface{}{
+						"name": snapshotName,
+					},
+				},
+			},
+		}
+		baseTime := time.Date(2026, 9, 28, 0, 27, 0, 0, time.UTC)
+		// Even when Checkpoint has a fresh lastTransitionTime, if Ready=False(Failed) lacks
+		// a valid lastTransitionTime, CheckStatus fails closed rather than suppressing indefinitely.
+		snapshot := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshot",
+				"metadata": map[string]interface{}{
+					"name":      snapshotName,
+					"namespace": "default",
+				},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{
+							"type":               "Checkpoint",
+							"status":             "False",
+							"reason":             "InProgress",
+							"lastTransitionTime": baseTime.Format(time.RFC3339),
+						},
+						map[string]interface{}{
+							"type":    "Ready",
+							"status":  "False",
+							"reason":  "Failed",
+							"message": "agent hung without Ready transition timestamp",
+						},
+					},
+				},
+			},
+		}
+
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(trigger, snapshot).Build()
+		provider := NewGKEProvider(client, scheme)
+		provider.now = func() time.Time {
+			return baseTime.Add(time.Second)
+		}
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
+			Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "pod-uid-456"},
+		}
+		status, err := provider.CheckStatus(context.Background(), job, "test-pod")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status.Phase != PhaseFailed {
+			t.Fatalf("expected PhaseFailed when Ready condition lacks lastTransitionTime, got %v", status.Phase)
+		}
+		if status.Reason != "SnapshotFailed" {
+			t.Errorf("expected Reason=SnapshotFailed, got %s", status.Reason)
 		}
 	})
 
