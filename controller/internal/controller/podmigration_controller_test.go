@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1720,5 +1721,272 @@ func TestPodMigrationReconciler_SingletonPerNamespace_DemotionDeferralTimeoutFor
 		}
 	default:
 		t.Errorf("Expected DeletionDeferralTimeout Warning event to be emitted")
+	}
+}
+
+// The tests below cover syncResource (#102): a reconcile patches only the
+// fields this controller owns on the managed PodSnapshotStorageConfig and
+// PodSnapshotPolicy, and leaves metadata other components add alone.
+
+var (
+	psscGVKForTest = schema.GroupVersionKind{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshotStorageConfig"}
+	pspGVKForTest  = schema.GroupVersionKind{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshotPolicy"}
+)
+
+func syncTestPodMigration(namespace, name string) *pmv1alpha1.PodMigration {
+	return &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  namespace,
+			Name:       name,
+			UID:        types.UID("uid-" + name),
+			Generation: 1,
+			Finalizers: []string{StorageCleanupFinalizer},
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://sync-bucket/snaps"},
+		},
+	}
+}
+
+func newSyncTestClient(scheme *runtime.Scheme, objs ...client.Object) client.WithWatch {
+	psscMock := &unstructured.Unstructured{}
+	psscMock.SetGroupVersionKind(psscGVKForTest)
+	pspMock := &unstructured.Unstructured{}
+	pspMock.SetGroupVersionKind(pspGVKForTest)
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		WithStatusSubresource(psscMock).
+		WithStatusSubresource(pspMock).
+		Build()
+}
+
+// wantPSSCSpec and wantPSPSpec mirror the payloads Reconcile writes for
+// syncTestPodMigration.
+func wantPSSCSpec() map[string]interface{} {
+	return map[string]interface{}{
+		"snapshotStorageConfig": map[string]interface{}{
+			"gcs": map[string]interface{}{"bucket": "sync-bucket", "path": "snaps"},
+		},
+	}
+}
+
+func wantPSPSpec(psscName string) map[string]interface{} {
+	return map[string]interface{}{
+		"storageConfigName": psscName,
+		"selector": map[string]interface{}{
+			"matchExpressions": []interface{}{
+				map[string]interface{}{
+					"key":      "pod-migration.gke.io/enabled",
+					"operator": "In",
+					"values":   []interface{}{"true"},
+				},
+			},
+		},
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+	}
+}
+
+func reconcileSyncTest(t *testing.T, c client.Client, scheme *runtime.Scheme, namespace, name string) {
+	t.Helper()
+	r := &PodMigrationReconciler{Client: c, Scheme: scheme}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: name},
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+}
+
+func getManagedForTest(t *testing.T, c client.Client, gvk schema.GroupVersionKind, key types.NamespacedName) *unstructured.Unstructured {
+	t.Helper()
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	if err := c.Get(context.Background(), key, obj); err != nil {
+		t.Fatalf("Get %s %s: %v", gvk.Kind, key, err)
+	}
+	return obj
+}
+
+// A reconcile that has to rewrite the managed objects must keep labels,
+// annotations and finalizers that other components added, such as a snapshot
+// engine's selector label.
+func TestPodMigrationReconciler_Sync_PreservesForeignMetadata(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	namespace, name := "default", "sync-meta"
+	config := syncTestPodMigration(namespace, name)
+	psscName := getPSSCName(namespace, name)
+	pspName := getPSPManualName(name)
+
+	// Both objects carry foreign metadata and a drifted spec, so the reconcile
+	// has to write both of them.
+	pssc := &unstructured.Unstructured{}
+	pssc.SetGroupVersionKind(psscGVKForTest)
+	pssc.SetName(psscName)
+	pssc.SetLabels(map[string]string{"pod-migrate.io/engine": "criu"})
+	pssc.SetAnnotations(map[string]string{"example.com/note": "keep"})
+	pssc.SetFinalizers([]string{"example.com/keep"})
+	pssc.Object["spec"] = map[string]interface{}{
+		"snapshotStorageConfig": map[string]interface{}{
+			"gcs": map[string]interface{}{"bucket": "stale-bucket"},
+		},
+	}
+
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(pspGVKForTest)
+	psp.SetNamespace(namespace)
+	psp.SetName(pspName)
+	psp.SetLabels(map[string]string{"pod-migrate.io/engine": "criu"})
+	psp.SetAnnotations(map[string]string{"example.com/note": "keep"})
+	psp.SetFinalizers([]string{"example.com/keep"})
+	driftedSpec := wantPSPSpec(psscName)
+	driftedSpec["triggerConfig"] = map[string]interface{}{"type": "manual", "postCheckpoint": "resume"}
+	psp.Object["spec"] = driftedSpec
+
+	c := newSyncTestClient(scheme, config, pssc, psp)
+	reconcileSyncTest(t, c, scheme, namespace, name)
+
+	for _, tc := range []struct {
+		gvk      schema.GroupVersionKind
+		key      types.NamespacedName
+		wantSpec map[string]interface{}
+	}{
+		{psscGVKForTest, types.NamespacedName{Name: psscName}, wantPSSCSpec()},
+		{pspGVKForTest, types.NamespacedName{Namespace: namespace, Name: pspName}, wantPSPSpec(psscName)},
+	} {
+		got := getManagedForTest(t, c, tc.gvk, tc.key)
+		if v := got.GetLabels()["pod-migrate.io/engine"]; v != "criu" {
+			t.Errorf("%s: label pod-migrate.io/engine = %q, want %q", tc.gvk.Kind, v, "criu")
+		}
+		if v := got.GetAnnotations()["example.com/note"]; v != "keep" {
+			t.Errorf("%s: annotation example.com/note = %q, want %q", tc.gvk.Kind, v, "keep")
+		}
+		if !reflect.DeepEqual(got.GetFinalizers(), []string{"example.com/keep"}) {
+			t.Errorf("%s: finalizers = %v, want [example.com/keep]", tc.gvk.Kind, got.GetFinalizers())
+		}
+		if !reflect.DeepEqual(got.Object["spec"], tc.wantSpec) {
+			t.Errorf("%s: spec = %v, want %v", tc.gvk.Kind, got.Object["spec"], tc.wantSpec)
+		}
+	}
+
+	gotPSSC := getManagedForTest(t, c, psscGVKForTest, types.NamespacedName{Name: psscName})
+	if v := gotPSSC.GetLabels()[OwnerUIDLabelKey]; v != string(config.UID) {
+		t.Errorf("PSSC label %s = %q, want %q", OwnerUIDLabelKey, v, config.UID)
+	}
+}
+
+// Spec drift on the managed policy is still reverted: changed values come
+// back, a removed key is restored and a key someone added is removed.
+func TestPodMigrationReconciler_Sync_RevertsSpecDrift(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	namespace, name := "default", "sync-drift"
+	config := syncTestPodMigration(namespace, name)
+	psscName := getPSSCName(namespace, name)
+	pspName := getPSPManualName(name)
+
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(pspGVKForTest)
+	psp.SetNamespace(namespace)
+	psp.SetName(pspName)
+	psp.Object["spec"] = map[string]interface{}{
+		"storageConfigName": "some-other-config",
+		"extra":             "added-elsewhere",
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "resume",
+		},
+		// "selector" is missing.
+	}
+
+	c := newSyncTestClient(scheme, config, psp)
+	reconcileSyncTest(t, c, scheme, namespace, name)
+
+	got := getManagedForTest(t, c, pspGVKForTest, types.NamespacedName{Namespace: namespace, Name: pspName})
+	if want := wantPSPSpec(psscName); !reflect.DeepEqual(got.Object["spec"], want) {
+		t.Errorf("PSP spec = %v, want %v", got.Object["spec"], want)
+	}
+}
+
+// The owner-UID label on the storage config is put back if someone removed
+// it, without touching the labels other components set.
+func TestPodMigrationReconciler_Sync_RestoresOwnerLabel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	namespace, name := "default", "sync-owner"
+	config := syncTestPodMigration(namespace, name)
+	psscName := getPSSCName(namespace, name)
+
+	pssc := &unstructured.Unstructured{}
+	pssc.SetGroupVersionKind(psscGVKForTest)
+	pssc.SetName(psscName)
+	pssc.SetLabels(map[string]string{"example.com/team": "storage"})
+	pssc.Object["spec"] = wantPSSCSpec()
+
+	c := newSyncTestClient(scheme, config, pssc)
+	reconcileSyncTest(t, c, scheme, namespace, name)
+
+	got := getManagedForTest(t, c, psscGVKForTest, types.NamespacedName{Name: psscName})
+	want := map[string]string{
+		"example.com/team": "storage",
+		OwnerUIDLabelKey:   string(config.UID),
+	}
+	if !reflect.DeepEqual(got.GetLabels(), want) {
+		t.Errorf("PSSC labels = %v, want %v", got.GetLabels(), want)
+	}
+}
+
+// A reconcile with nothing to change must not write the managed objects, so
+// engines watching them don't see resourceVersion churn.
+func TestPodMigrationReconciler_Sync_NoOpDoesNotWrite(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	namespace, name := "default", "sync-noop"
+	config := syncTestPodMigration(namespace, name)
+	psscKey := types.NamespacedName{Name: getPSSCName(namespace, name)}
+	pspKey := types.NamespacedName{Namespace: namespace, Name: getPSPManualName(name)}
+
+	base := newSyncTestClient(scheme, config)
+	reconcileSyncTest(t, base, scheme, namespace, name) // creates both objects
+
+	psscRV := getManagedForTest(t, base, psscGVKForTest, psscKey).GetResourceVersion()
+	pspRV := getManagedForTest(t, base, pspGVKForTest, pspKey).GetResourceVersion()
+
+	isManaged := func(obj client.Object) bool {
+		switch obj.GetObjectKind().GroupVersionKind().Kind {
+		case psscGVKForTest.Kind, pspGVKForTest.Kind:
+			return true
+		}
+		return false
+	}
+	var writes []string
+	c := interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if isManaged(obj) {
+				writes = append(writes, "Update "+obj.GetName())
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if isManaged(obj) {
+				writes = append(writes, "Patch "+obj.GetName())
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	reconcileSyncTest(t, c, scheme, namespace, name)
+
+	if len(writes) != 0 {
+		t.Errorf("no-op reconcile wrote managed objects: %v", writes)
+	}
+	if got := getManagedForTest(t, base, psscGVKForTest, psscKey).GetResourceVersion(); got != psscRV {
+		t.Errorf("PSSC resourceVersion changed from %s to %s", psscRV, got)
+	}
+	if got := getManagedForTest(t, base, pspGVKForTest, pspKey).GetResourceVersion(); got != pspRV {
+		t.Errorf("PSP resourceVersion changed from %s to %s", pspRV, got)
 	}
 }
