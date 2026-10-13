@@ -457,27 +457,47 @@ func deferralExpired(config *pmv1alpha1.PodMigration) bool {
 	return false
 }
 
-func (r *PodMigrationReconciler) syncResource(ctx context.Context, obj *unstructured.Unstructured) error {
+// syncResource creates desired if it doesn't exist. Otherwise it patches only
+// the fields this controller owns: spec, which is reverted to desired
+// (including removing keys someone else added), and the labels set on
+// desired. Labels, annotations and finalizers that other components add, such
+// as a snapshot engine's selector label, are left untouched. Nothing is
+// written when the object is already in the desired state.
+func (r *PodMigrationReconciler) syncResource(ctx context.Context, desired *unstructured.Unstructured) error {
 	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(obj.GroupVersionKind())
-	err := r.Get(ctx, client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, existing)
+	existing.SetGroupVersionKind(desired.GroupVersionKind())
+	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			err = r.Create(ctx, obj)
-			if err != nil {
-				return err
-			}
-			return nil
+			return r.Create(ctx, desired)
 		}
 		return err
 	}
 
-	obj.SetResourceVersion(existing.GetResourceVersion())
-	err = r.Update(ctx, obj)
-	if err != nil {
-		return err
+	updated := existing.DeepCopy()
+	updated.Object["spec"] = runtime.DeepCopyJSONValue(desired.Object["spec"])
+	if ownLabels := desired.GetLabels(); len(ownLabels) > 0 {
+		labels := updated.GetLabels()
+		if labels == nil {
+			labels = make(map[string]string, len(ownLabels))
+		}
+		for k, v := range ownLabels {
+			labels[k] = v
+		}
+		updated.SetLabels(labels)
 	}
-	return nil
+
+	// A JSON merge patch computed against the live object carries only what
+	// differs: spec drift (keys added elsewhere become null) and our labels.
+	patch := client.MergeFrom(existing)
+	data, err := patch.Data(updated)
+	if err != nil {
+		return fmt.Errorf("computing patch for %s %s: %w", desired.GetKind(), desired.GetName(), err)
+	}
+	if string(data) == "{}" {
+		return nil
+	}
+	return r.Patch(ctx, updated, patch)
 }
 
 // selectActivePodMigration deterministically elects the single active PodMigration
