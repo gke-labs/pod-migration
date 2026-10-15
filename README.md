@@ -35,7 +35,7 @@ The controller is implemented as a custom Operator consisting of the following c
 
 ### 3. Design Docs
 - [Snapshot engine contract](docs/design/engine-contract.md): what the controller requires from a snapshot engine (GKE Pod Snapshots today; CRIU and upstream pod checkpoint/restore next).
-- [Core safety invariants](docs/invariants.md): the invariants the controller checks after each reconcile.
+- [Core safety invariants](docs/invariants.md): the invariants the controller can check after each reconcile (off by default; see `--invariant-mode`).
 
 ---
 
