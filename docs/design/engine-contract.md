@@ -98,7 +98,7 @@ Non-goals:
   - An engine that kills the source only after the archive upload leaves it serving between C and the kill, and writes acknowledged in that window are lost.
   - Early tests of the CRIU prototype showed both effects.
 - **Fencing has two layers.**
-  1. **Controller, for every engine:** take the source out of serving endpoints before the trigger, with a readiness gate that the controller sets to False (#131). The controller creates the trigger only once the source's EndpointSlice entries show `serving: false`; kube-proxy's own sync can't be observed. A restarted instance then never becomes a serving endpoint.
+  1. **Controller, for every engine:** take the source out of serving endpoints before the trigger, for example with a readiness gate that the controller sets to False (#131). The controller creates the trigger only once the source's EndpointSlice entries show `serving: false`; kube-proxy's own sync can't be observed. A restarted instance then never becomes a serving endpoint.
      - This stops new Service connections. It doesn't cut established connections (keep-alive, gRPC, database sessions) or clients that dial the pod IP, and it doesn't stop writes to volumes or other systems. That's enough for the gVisor restart, which comes back in a new sandbox with a new IP, but not for an engine that leaves the source running or kills it late.
      - The costs: new connections stop reaching the source for the whole checkpoint, not only after it. And a fenced source isn't Ready, so a later eviction under `unhealthyPodEvictionPolicy: IfHealthyBudget` can be denied at the PDB's edge.
   2. **Engine:** fence the processes from C until the pod is deleted. Each engine declares a fencing mode:
@@ -373,11 +373,13 @@ Step 6 keeps a `Stopped` engine's source fenced on every failure path. Putting a
 **Decided** by the project owner after review on #146:
 
 - **Fencing policy (was open question 1).** The controller refuses to migrate with a `None` engine, and evicts the pod cold with an event, unless the pod has `pod-migration.gke.io/allow-unfenced: "true"`. A `Stopped` engine is allowed only with the endpoint fence, and every engine must declare a mode. Tracked in #150.
-- **The endpoint fence (was open question 2).** A readiness gate, injected at creation into opted-in pods. Pods created before the upgrade get no fence, and a Warning event, until their next rollout. No label flip and no NetworkPolicy fallback. Implemented in #131, and verified by the scenario in #149.
 
 **Open:**
 
+2. **The endpoint fence (#131).** A readiness gate, a label flip, or both?
+   - **Readiness gate:** it must be in the pod spec when the pod is created, so pods created before the upgrade don't have it. Today's replacement webhook only mutates pods that have an assigned job, so injecting the gate into first-generation pods needs a new mutating path for opted-in pods. The downside: a gated pod becomes Ready only after a controller sets its condition True, so every new opted-in pod depends on our controller. A pod created while the controller is down stays NotReady until it comes back, and a pod left fenced when the controller is uninstalled stays NotReady for good.
+   - **Label flip:** it works on existing pods, and no pod depends on the controller to become Ready. But it must not touch the workload's selector.
 3. **A positive signal for GKE Pod Snapshots.** Is there a condition or annotation we can read? If not, it stays on the inferred path.
 4. **Engine selection flags.** One flag (`--runtime-class-engines=gvisor=gke-pod-snapshots,@default=criu`), or one flag per engine?
 5. **Recording the engine.** An annotation for good, or a typed `status.engine` field later?
-6. **KEP-5823 restore orders.** The KEP checks that a `spec.restoreFrom` pod's spec equals the checkpointed pod's spec, but our webhooks add a scheduling gate, a readiness gate (#131) and annotations. Are the two compatible?
+6. **KEP-5823 restore orders.** The KEP checks that a `spec.restoreFrom` pod's spec equals the checkpointed pod's spec, but our replacement webhook adds a scheduling gate and annotations. Are the two compatible?
