@@ -64,9 +64,9 @@ Non-goals:
 
 ### C2. Eligibility
 
-- `Eligible(pod)` returns a verdict and a reason. It makes no API calls, so it fits the eviction webhook's deadline. Both the eviction webhook and the preemption trigger call it.
+- `Eligible(pod, node)` returns a verdict and a reason, from the pod and its source node as the caller's informer cache has them. It makes no API server calls, so it fits the eviction webhook's deadline. Both the eviction webhook and the preemption trigger call it.
 - It must be conservative. A wrong "yes" costs a `Refused` round trip at best, and silent state loss at worst.
-- It covers the engine's shape limits (the CRIU engine v1 takes one container, and #114 adds sidecars) and node readiness.
+- It covers the engine's shape limits (the CRIU engine v1 takes one container, and #114 adds sidecars) and the source node's readiness. The target node's readiness is a placement constraint (C8).
 - It covers repeat migrations: a pod the engine restored must stay migratable by that engine, or be refused (#121).
 - The operator allow-list (`--migratable-runtime-classes`) stays as a global gate on top.
 
@@ -78,6 +78,7 @@ Non-goals:
   - `Failed`: terminal.
   - `Refused`: terminal, and the source was never touched, so a cold eviction is safe (#78).
 - The engine classifies its own conditions, so the controller stops parsing engine-specific reasons. It never reports a transient condition as terminal (#75, #95).
+- Today `Refused` is a `Failed` status with the reason `refused` (#78). `snapshot.Phase` gains a `Refused` value, so the controller stops matching reason strings, and the job handles it as it does today. This lands in its own PR, because step 2 must not change test expectations.
 
 ### C4. Source fencing
 
@@ -100,7 +101,7 @@ Non-goals:
 
 ### C5. Restore order and exactly-once restore
 
-- The controller issues one restore order per replacement, through the engine: `ps-name` today, `spec.restoreFrom` for KEP-5823.
+- The controller issues one restore order per replacement, through the engine: `ps-name` today, `spec.restoreFrom` for KEP-5823. The engine also defines the explicit cold-start bypass, which the controller applies when it releases a replacement without a restore: `ps-name: ""` today.
 - **Rule.** A replacement is restored from a checkpoint at most once, and its outcome is recorded once. A retried reconcile, a conflict on the outcome write, a container restart or an engine restart must never re-apply the checkpoint to a pod that has already run restored code. A second restore rolls the application back after it has already served clients.
 - **The controller's half exists.** Invariant I1 (`AtMostOnceRestore`) and the single-use gate stop a second pod from consuming the same checkpoint.
 - **The engine owns the other half.** Neither of those can see a second restore inside the same pod. The engine guards the restore with a durable marker, written before restoring under optimistic concurrency, not with in-memory state.
@@ -108,7 +109,7 @@ Non-goals:
 
 ### C6. Restore outcome signal
 
-- For each replacement, the engine reports one terminal verdict with its evidence: `Restored`, `ColdStart` (with a reason) or `Failed`.
+- For each replacement, the engine reports one terminal verdict with its evidence: `Restored`, `ColdStart` (with a reason) or `Failed`. While the restore is still running, the engine reports `InProgress`, which isn't a verdict, and the controller keeps polling.
 - Only a verdict that the engine confirmed may set `RestoreVerified`. Having no verdict when the restore deadline passes (5 minutes today) is not a success.
 - GKE Pod Snapshots keeps today's inference: the replacement is Ready, and no restore-failure Warning event has been seen since restoring started. The job records that verdict as inferred, with its own reason (#79).
 - The verdict must describe the application, not the engine's wrapper. #121 shows a `restored` signal for a pod whose application wasn't running.
@@ -184,11 +185,11 @@ package engine // controller/internal/engine
 
 // Engine is one checkpoint/restore engine.
 type Engine interface {
-	Name() string                      // C1: registry key, recorded on the job
-	Eligible(pod *corev1.Pod) Verdict  // C2: pure, no API calls
-	Snapshots() snapshot.Provider      // C1, C3, C9: the existing seam
-	RestoreFailures() []restore.Engine // C7: classifiers for its runtime classes
-	Guarantees() Guarantees            // C4, C5: declared, checked by invariants and T2
+	Name() string                                        // C1: registry key, recorded on the job
+	Eligible(pod *corev1.Pod, node *corev1.Node) Verdict // C2: pure; node is the source node, from the cache
+	Snapshots() snapshot.Provider                        // C1, C3, C9: the existing seam
+	RestoreFailures() []restore.Engine                   // C7: classifiers for its runtime classes
+	Guarantees() Guarantees                              // C4, C5: declared, checked by invariants and T2
 }
 
 type Verdict struct {
@@ -203,8 +204,17 @@ type Guarantees struct {
 	RestoreOnce bool // C5
 }
 
+type RestoreOutcome string // C6
+
+const (
+	RestoreInProgress RestoreOutcome = "InProgress" // not a verdict: keep polling
+	Restored          RestoreOutcome = "Restored"
+	ColdStart         RestoreOutcome = "ColdStart"
+	RestoreFailed     RestoreOutcome = "Failed"
+)
+
 type RestoreVerdict struct {
-	Outcome  string // C6: "Restored", "ColdStart" or "Failed"
+	Outcome  RestoreOutcome
 	Reason   string
 	Evidence string // the condition, annotation or event the verdict came from
 }
@@ -212,7 +222,8 @@ type RestoreVerdict struct {
 // Optional capabilities. The controller type-asserts them and keeps today's
 // behavior when one is missing.
 type RestoreOrderer interface { // C5
-	OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob)
+	OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) error
+	OrderColdStartBypass(pod *corev1.Pod) error // release without a restore
 }
 type RestoreVerifier interface { // C6, #79
 	VerifyRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (RestoreVerdict, error)
@@ -247,7 +258,7 @@ flowchart TD
 ```
 
 - **GKE Pod Snapshots is the first implementation, and nothing changes for it.**
-  - `Name()` is `gke-pod-snapshots`. `Snapshots()` is today's provider, `RestoreFailures()` is today's gVisor classifier, `Eligible` is today's runtime-class check, and `OrderRestore` is today's `ps-name` stamping. `Guarantees` is `{Stopped, RestoreOnce: false}`, report-only.
+  - `Name()` is `gke-pod-snapshots`. `Snapshots()` is today's provider, `RestoreFailures()` is today's gVisor classifier, `Eligible` is today's runtime-class check, `OrderRestore` is today's `ps-name` stamping, and `OrderColdStartBypass` is today's `ps-name: ""`. `Guarantees` is `{Stopped, RestoreOnce: false}`, report-only.
   - No existing test expectation changes, and T1 and T2 still pass.
 - **The package composes with the existing seams instead of replacing them.**
   - `snapshot.Provider` and `restore.Engine` stay, and `Engine` hands them out.
@@ -267,6 +278,7 @@ Three new invariants follow the style of the existing ones ([invariants.md](../i
 
 - `--invariant-mode` defaults to `disabled`, so production behavior doesn't change.
 - T1 runs in strict mode, so each new rule must stay silent on today's scenarios. That's why `SourceFencedAfterCheckpoint` lands with the endpoint fence (#131).
+- The existing I1 (`AtMostOnceRestore`) and I2 (`NoSilentColdStart`) read the `podsnapshot.gke.io/ps-name` annotation. For an engine with another API group or `spec.restoreFrom` they would miss restores or report false violations, so they read the job's engine's restore order once engines resolve per pod (step 3).
 - The engine conformance suite (#108) runs every clause for each engine, including the negative security tests from #129.
 
 ## Who owns what
@@ -307,6 +319,7 @@ Three new invariants follow the style of the existing ones ([invariants.md](../i
 - **API:** no change. The engine is recorded in a job annotation, so there's no CRD change and no regenerated deepcopy code.
 - **Upgrade and downgrade:** jobs without the annotation resolve to `gke-pod-snapshots`, and an older controller ignores the annotation.
 - **Flags:** `--migratable-runtime-classes` keeps its meaning. The map from runtime class to engine is new, and defaults to `gvisor=gke-pod-snapshots`.
+- **Metrics:** the `engine` label (C11) changes the label sets of existing metrics. Queries that aggregate across labels keep working; alerts and recording rules that match exact label sets need a review when it lands.
 
 ## Delivery
 
@@ -323,7 +336,7 @@ Three new invariants follow the style of the existing ones ([invariants.md](../i
 | 9 | Placement constraints | #14 |
 | 10 | Security requirements; the conformance suite | #129, #108 |
 
-Each invariant lands as an `invariant/` PR next to the step it checks: `RestoreAppliedOnce` at any time, `SourceFencedAfterCheckpoint` with step 6, and `RestoreOutcomeConfirmed` after step 5.
+Each invariant lands as an `invariant/` PR next to the step it checks: `RestoreAppliedOnce` at any time, `SourceFencedAfterCheckpoint` with step 6, `RestoreOutcomeConfirmed` after step 5, and the I1/I2 change after step 3.
 
 ## Open questions
 
