@@ -143,6 +143,122 @@ func TestInvariants_I2_NoSilentColdStart(t *testing.T) {
 	}
 }
 
+// TestInvariants_I2_ReplacementMigratedAgain covers a chained migration (#151): the
+// replacement of a Succeeded job that is still kept becomes the source of a newer job,
+// which sets the cold-start bypass on it before its checkpoint. The bypass stays if
+// the newer job fails.
+func TestInvariants_I2_ReplacementMigratedAgain(t *testing.T) {
+	created := metav1.NewTime(time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC))
+	first := pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-first", CreationTimestamp: created},
+		Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "uid-source"},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			SnapshotRef:     "snap-first",
+			RestoredPodName: "repl-pod",
+			RestoredPodUID:  "uid-repl",
+		},
+	}
+	replacement := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "repl-pod",
+			UID:       types.UID("uid-repl"),
+			Annotations: map[string]string{
+				AnnotationAssignedPMJ: "pmj-first",
+				AnnotationPSName:      "",
+			},
+		},
+	}
+	job := func(name, target string, phase pmv1alpha1.PodMigrationJobPhase, createdAfterFirst time.Duration) pmv1alpha1.PodMigrationJob {
+		return pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, CreationTimestamp: metav1.NewTime(created.Add(createdAfterFirst))},
+			Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: target},
+			Status:     pmv1alpha1.PodMigrationJobStatus{Phase: phase},
+		}
+	}
+
+	cases := []struct {
+		name          string
+		other         *pmv1alpha1.PodMigrationJob
+		wantViolation bool
+	}{
+		{"newer job migrating the replacement", ptrTo(job("pmj-second", "uid-repl", pmv1alpha1.PodMigrationJobPhaseSnapshotting, time.Minute)), false},
+		{"newer job on the replacement failed", ptrTo(job("pmj-second", "uid-repl", pmv1alpha1.PodMigrationJobPhaseFailed, time.Minute)), false},
+		{"newer job created in the same second", ptrTo(job("pmj-second", "uid-repl", pmv1alpha1.PodMigrationJobPhaseSnapshotting, 0)), false},
+		{"no newer job", nil, true},
+		{"newer job on another pod", ptrTo(job("pmj-other", "uid-unrelated", pmv1alpha1.PodMigrationJobPhaseSnapshotting, time.Minute)), true},
+		{"older job on the replacement", ptrTo(job("pmj-older", "uid-repl", pmv1alpha1.PodMigrationJobPhaseFailed, -time.Minute)), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &ReconcileSnapshot{
+				PrimaryPMJ:    &first,
+				NamespacePMJs: []pmv1alpha1.PodMigrationJob{first},
+				NamespacePods: []corev1.Pod{replacement},
+			}
+			if tc.other != nil {
+				s.PrimaryPMJ = tc.other
+				s.NamespacePMJs = append(s.NamespacePMJs, *tc.other)
+			}
+			vs := EvaluateI2(s)
+			if !tc.wantViolation {
+				if len(vs) != 0 {
+					t.Fatalf("expected no I2 violation, got %+v", vs)
+				}
+				return
+			}
+			if len(vs) != 1 || vs[0].Reason != "SucceededPodMissingRestoreAnnotation" || vs[0].PMJName != "pmj-first" {
+				t.Fatalf("expected one I2 SucceededPodMissingRestoreAnnotation on pmj-first, got %+v", vs)
+			}
+		})
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }
+
+// TestInvariants_I2_ReplacementMigratedAgain_TargetingPMJs covers reconcilers that don't
+// list the namespace, such as the pod gate reconciler: they pass the job migrating the
+// primary pod in TargetingPMJs.
+func TestInvariants_I2_ReplacementMigratedAgain_TargetingPMJs(t *testing.T) {
+	created := metav1.NewTime(time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC))
+	first := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-first", CreationTimestamp: created},
+		Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "uid-source"},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			SnapshotRef:     "snap-first",
+			RestoredPodName: "repl-pod",
+			RestoredPodUID:  "uid-repl",
+		},
+	}
+	replacement := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "repl-pod",
+			UID:         types.UID("uid-repl"),
+			Annotations: map[string]string{AnnotationAssignedPMJ: "pmj-first", AnnotationPSName: ""},
+		},
+	}
+	second := pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-second", CreationTimestamp: metav1.NewTime(created.Add(time.Minute))},
+		Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "uid-repl"},
+		Status:     pmv1alpha1.PodMigrationJobStatus{Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting},
+	}
+
+	if vs := EvaluateI2(&ReconcileSnapshot{
+		PrimaryPod:    replacement,
+		PrimaryPMJ:    first,
+		TargetingPMJs: []pmv1alpha1.PodMigrationJob{second},
+	}); len(vs) != 0 {
+		t.Fatalf("expected no I2 violation when the job migrating the replacement is passed, got %+v", vs)
+	}
+	vs := EvaluateI2(&ReconcileSnapshot{PrimaryPod: replacement, PrimaryPMJ: first})
+	if len(vs) != 1 || vs[0].Reason != "SucceededPodMissingRestoreAnnotation" {
+		t.Fatalf("expected I2 SucceededPodMissingRestoreAnnotation without it, got %+v", vs)
+	}
+}
+
 func TestInvariants_I3_GateLivenessAndGraceWindow(t *testing.T) {
 	now := time.Now()
 	justNow := metav1.NewTime(now.Add(-5 * time.Second))
