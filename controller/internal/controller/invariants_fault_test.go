@@ -1410,8 +1410,8 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 
 		// Also create a StatefulSet-style replacement pod with the same name as a
 		// second fenced PMJ's PodRef.Name ("fenced-sts-0") but a distinct UID from
-		// TargetPodUID ("uid-old-fenced-sts-0"), plus a terminal Failed PMJ whose
-		// source pod is unfenced, to prove neither triggers false-positive I11 violations.
+		// TargetPodUID ("uid-old-fenced-sts-0"), to prove same-name replacement pods
+		// do not trigger false-positive I11 violations.
 		stsReplPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: ns,

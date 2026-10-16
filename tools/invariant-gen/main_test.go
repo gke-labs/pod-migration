@@ -123,7 +123,7 @@ func TestDetectAndVerifyEvictingStallAndColdStartTemplates(t *testing.T) {
 	}{
 		{
 			name:  "no-replacement-evicting-stall",
-			invID: "I11",
+			invID: "I15",
 			runJSON: `{
   "scenario": "synthetic-self-test: evicting-stall",
   "outcomes": {"stalled": 1},
@@ -136,7 +136,7 @@ func TestDetectAndVerifyEvictingStallAndColdStartTemplates(t *testing.T) {
 		},
 		{
 			name:  "unintended-cold-start-active-pmj",
-			invID: "I12",
+			invID: "I16",
 			runJSON: `{
   "scenario": "synthetic-self-test: unintended-cold-start",
   "outcomes": {"cold-start": 1},
@@ -224,11 +224,11 @@ func TestDetectBlindSpotsSkipsAlreadyCaughtAndHealthyRuns(t *testing.T) {
 
 func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 	// 1. Trigger C (/extract-invariant) for wedged restoring orphan: passes compiled go test RED & GREEN.
-	f1, err := ParseTriggerCommentOrPR("I10", "/extract-invariant I11 wedged-restoring-orphan PMJ stuck in Restoring after replacement pod deleted", "")
+	f1, err := ParseTriggerCommentOrPR("I10", "/extract-invariant I15 wedged-restoring-orphan PMJ stuck in Restoring after replacement pod deleted", "")
 	if err != nil {
 		t.Fatalf("ParseTriggerCommentOrPR failed: %v", err)
 	}
-	if f1.InvariantID != "I11" || f1.Template != TemplateWedgedRestoringOrphan {
+	if f1.InvariantID != "I15" || f1.Template != TemplateWedgedRestoringOrphan {
 		t.Fatalf("unexpected finding: id=%s template=%s", f1.InvariantID, f1.Template)
 	}
 	p1, err := SynthesizeAndVerify(f1, t.TempDir(), "", nil)
@@ -241,7 +241,7 @@ func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 	}
 
 	// 2. Premature-snapshot-failed directive: now supported natively via PrimarySnapshotConditions (#88).
-	fPremature, err := ParseTriggerCommentOrPR("I12", "/extract-invariant I12 premature-snapshot-failed PMJ failed while Checkpoint=False(InProgress)", "")
+	fPremature, err := ParseTriggerCommentOrPR("I16", "/extract-invariant I16 premature-snapshot-failed PMJ failed while Checkpoint=False(InProgress)", "")
 	if err != nil {
 		t.Fatalf("ParseTriggerCommentOrPR premature-snapshot-failed failed: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestParseTriggerCommentAndCustomScaffoldHonesty(t *testing.T) {
 	}
 
 	// 4. Custom novel directive: must set RequiresAuthorBody=true and fail the compiled RED proof (RedPassed=false, GreenPassed=false).
-	f2, err := ParseTriggerCommentOrPR("I13", "/extract-invariant I13 custom-novel-check some brand new cross-resource invariant", "")
+	f2, err := ParseTriggerCommentOrPR("I17", "/extract-invariant I17 custom-novel-check some brand new cross-resource invariant", "")
 	if err != nil {
 		t.Fatalf("ParseTriggerCommentOrPR custom failed: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestDetectBlindSpot_PrematureSnapshotFailedFromTrace(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(runDir, "records.ndjson"), []byte(ndjson), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	findings, err := DetectBlindSpots(runDir, "I13", false)
+	findings, err := DetectBlindSpots(runDir, "I17", false)
 	if err != nil {
 		t.Fatalf("DetectBlindSpots failed: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestAbsenceTemplatesEmitDebouncedRuleWrappersAndSupportOverrides(t *testing
 	}
 
 	// 2. Absence template (TemplateNoReplacementEvictingStall) with custom debounce count and duration override.
-	fEvict, err := ParseTriggerCommentOrPR("I11", "/extract-invariant I11 no-replacement-evicting-stall PMJ stalled in Evicting with no replacement", "")
+	fEvict, err := ParseTriggerCommentOrPR("I15", "/extract-invariant I15 no-replacement-evicting-stall PMJ stalled in Evicting with no replacement", "")
 	if err != nil {
 		t.Fatalf("ParseTriggerCommentOrPR evicting stall failed: %v", err)
 	}
