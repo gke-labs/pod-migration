@@ -63,8 +63,9 @@ def main():
         print(f"Error: Expected exactly 1 ClusterRole (name: pod-migration-controller-role) replacement, got {clusterrole_sub_count}", file=sys.stderr)
         sys.exit(1)
 
-    if webhook_sub_count != 3:
-        print(f"Error: Expected 3 webhook namespaceSelector replacements, got {webhook_sub_count}", file=sys.stderr)
+    # One per webhook entry: veviction, mpodgate, mpodstatus and mpodfence.
+    if webhook_sub_count != 4:
+        print(f"Error: Expected 4 webhook namespaceSelector replacements, got {webhook_sub_count}", file=sys.stderr)
         sys.exit(1)
 
     new_deploy_content = '---\n'.join(documents)
