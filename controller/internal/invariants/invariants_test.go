@@ -1384,3 +1384,130 @@ func TestEngine_MultiReconcileDebounce_ObserveModeEscalationEvent(t *testing.T) 
 		t.Fatalf("expected observe mode to emit event containing 'would escalate to strict abort'")
 	}
 }
+
+func TestInvariants_I11_SourceFencedAfterCheckpoint(t *testing.T) {
+	makePMJ := func(sourceFenced metav1.ConditionStatus, reason string) *pmv1alpha1.PodMigrationJob {
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "pmj-fence-1",
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "redis-0"},
+				TargetPodUID: "uid-origin-redis-0",
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+			},
+		}
+		if sourceFenced != "" {
+			pmj.Status.Conditions = []metav1.Condition{
+				{
+					Type:   ConditionSourceFenced,
+					Status: sourceFenced,
+					Reason: reason,
+				},
+			}
+		}
+		return pmj
+	}
+
+	makeSourcePod := func(fencedVal string, readyStatus corev1.ConditionStatus, readyReason string) corev1.Pod {
+		var labels map[string]string
+		if fencedVal != "<nil>" {
+			labels = map[string]string{LabelPodFenced: fencedVal}
+		}
+		var conds []corev1.PodCondition
+		if readyStatus != "" {
+			conds = []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: readyStatus,
+					Reason: readyReason,
+				},
+			}
+		}
+		return corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "redis-0",
+				UID:       types.UID("uid-origin-redis-0"),
+				Labels:    labels,
+			},
+			Status: corev1.PodStatus{
+				Conditions: conds,
+			},
+		}
+	}
+
+	// 1. Clean: SourceFenced=True and source pod carries pod-migration.gke.io/fenced=true + Ready=False(PodMigrationFenced)
+	clean := &ReconcileSnapshot{
+		PrimaryPMJ:    makePMJ(metav1.ConditionTrue, "Fenced"),
+		NamespacePods: []corev1.Pod{makeSourcePod("true", corev1.ConditionFalse, ReasonPodMigrationFenced)},
+	}
+	if vs := EvaluateI11(clean); len(vs) != 0 {
+		t.Fatalf("expected 0 violations on properly fenced source pod, got %+v", vs)
+	}
+
+	// 2. Clean: PMJ without SourceFenced=True (e.g. Unfenced / False or absent before PR 5) -> silent
+	unfenced := &ReconcileSnapshot{
+		PrimaryPMJ:    makePMJ(metav1.ConditionFalse, "Unfenced"),
+		NamespacePods: []corev1.Pod{makeSourcePod("<nil>", corev1.ConditionTrue, "ContainersReady")},
+	}
+	if vs := EvaluateI11(unfenced); len(vs) != 0 {
+		t.Fatalf("expected 0 violations when SourceFenced=False (Unfenced), got %+v", vs)
+	}
+
+	// 3. Clean: StatefulSet replacement pod with same name ("redis-0") but different UID must NOT be flagged
+	replPod := makeSourcePod("<nil>", corev1.ConditionTrue, "ContainersReady")
+	replPod.UID = types.UID("uid-replacement-redis-0")
+	statefulSetReplaced := &ReconcileSnapshot{
+		PrimaryPMJ:    makePMJ(metav1.ConditionTrue, "FenceKept"),
+		NamespacePods: []corev1.Pod{replPod},
+	}
+	if vs := EvaluateI11(statefulSetReplaced); len(vs) != 0 {
+		t.Fatalf("expected 0 violations when same-named pod has replacement UID, got %+v", vs)
+	}
+
+	// 4. Violation: Dropped pod-migration.gke.io/fenced label while SourceFenced=True
+	droppedLabel := &ReconcileSnapshot{
+		PrimaryPMJ:    makePMJ(metav1.ConditionTrue, "Fenced"),
+		NamespacePods: []corev1.Pod{makeSourcePod("<nil>", corev1.ConditionFalse, ReasonPodMigrationFenced)},
+	}
+	vsLabel := EvaluateI11(droppedLabel)
+	if len(vsLabel) != 1 || vsLabel[0].InvariantID != "I11" || vsLabel[0].Reason != "SourcePodMissingFenceLabel" {
+		t.Fatalf("expected I11 SourcePodMissingFenceLabel violation when fence label is dropped, got %+v", vsLabel)
+	}
+
+	// 5. Violation: Ready flipped back to True while SourceFenced=True
+	flippedReady := &ReconcileSnapshot{
+		PrimaryPMJ:    makePMJ(metav1.ConditionTrue, "Fenced"),
+		NamespacePods: []corev1.Pod{makeSourcePod("true", corev1.ConditionTrue, "ContainersReady")},
+	}
+	vsReady := EvaluateI11(flippedReady)
+	if len(vsReady) != 1 || vsReady[0].InvariantID != "I11" || vsReady[0].Reason != "SourcePodReadyNotFenced" {
+		t.Fatalf("expected I11 SourcePodReadyNotFenced violation when Ready flips to True, got %+v", vsReady)
+	}
+
+	// 6. Violation: Ready=False but reason is not PodMigrationFenced
+	wrongReason := &ReconcileSnapshot{
+		PrimaryPMJ:    makePMJ(metav1.ConditionTrue, "FenceKept"),
+		NamespacePods: []corev1.Pod{makeSourcePod("true", corev1.ConditionFalse, "ContainersNotReady")},
+	}
+	vsReason := EvaluateI11(wrongReason)
+	if len(vsReason) != 1 || vsReason[0].InvariantID != "I11" || vsReason[0].Reason != "SourcePodReadyNotFenced" {
+		t.Fatalf("expected I11 SourcePodReadyNotFenced violation when Ready=False reason != PodMigrationFenced, got %+v", vsReason)
+	}
+
+	// 7. Verify DefaultRules registers I11 (SourceFencedAfterCheckpoint)
+	foundI11 := false
+	for _, r := range DefaultRules {
+		if r.ID() == "I11" && r.Name() == "SourceFencedAfterCheckpoint" {
+			foundI11 = true
+			break
+		}
+	}
+	if !foundI11 {
+		t.Fatalf("expected DefaultRules to register I11 (SourceFencedAfterCheckpoint)")
+	}
+}
