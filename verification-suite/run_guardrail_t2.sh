@@ -57,7 +57,7 @@ TOLERATION="${TOLERATION:-sandbox.gke.io/runtime=gvisor:NoSchedule}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-pm-test-ksa}"
 SKIP_PODMIGRATION_CREATE="${SKIP_PODMIGRATION_CREATE:-false}"
 S8_WINDOW_W="${S8_WINDOW_W:-5}"
-S8_ENFORCE_CHECK_A="${S8_ENFORCE_CHECK_A:-false}"
+S8_ENFORCE_CHECK_A="${S8_ENFORCE_CHECK_A:-true}"
 S8_ENFORCE_CHECK_B="${S8_ENFORCE_CHECK_B:-false}"
 SELF_TEST="false"
 
@@ -81,8 +81,9 @@ Options:
   --toleration <k=v:effect|none>    Pod toleration in '<key>[=<value>]:<Effect>' format (default: sandbox.gke.io/runtime=gvisor:NoSchedule; 'none' or '' omits it)
   --service-account <name|none>     Pod serviceAccountName (default: pm-test-ksa; 'none' or '' omits it)
   --skip-podmigration-create        Use a pre-created snapshot policy instead of applying a PodMigration CR
-  --s8-window-w <seconds>           Target kube-proxy sync offset W (in seconds after drain) for S8 phase anchor (default: 5)
-  --enforce-s8-check-a              Fail S8 if Check (a) detects a source pod re-restore event after checkpoint (#151)
+  --s8-window-w <seconds>           Target kube-proxy sync offset W (in seconds after drain, single value or comma-separated list) for S8 phase anchor (default: 5)
+  --enforce-s8-check-a              Fail S8 if Check (a) detects a source pod re-restore event after checkpoint (#151; default: true since PR #156)
+  --no-enforce-s8-check-a           Downgrade S8 Check (a) to report-only warning
   --enforce-s8-check-b              Fail S8 if Check (b) detects a fenced pod serving in EndpointSlice or cold_served/empty_reads > 0 (#131)
   --enforce-s8-gates                Enable both --enforce-s8-check-a and --enforce-s8-check-b
   --self-test                       Run offline end-to-end self-test of pmprofiler + T2
@@ -147,6 +148,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --enforce-s8-check-a)
       S8_ENFORCE_CHECK_A="true"
+      shift
+      ;;
+    --no-enforce-s8-check-a)
+      S8_ENFORCE_CHECK_A="false"
       shift
       ;;
     --enforce-s8-check-b)
@@ -1558,11 +1563,14 @@ finally:
 PY
   S8_WATCH_PIDS+=($!)
 
+  # Watch EndpointSlices cluster-wide (-A) so quiet_period_ep_churn_count catches any EndpointSlice
+  # update across the cluster during the 12s quiet window (kube-proxy syncs on cluster-wide EndpointSlice
+  # churn), while Check (b) filters to the target service/namespace.
   python3 - "${NAMESPACE}" "${svc_name}" "${run_dir}/endpointslices.ndjson" "${KUBECTL_CMD}" <<'PY' 2>"${run_dir}/epwatch.err" &
 import json, signal, subprocess, sys, time
 ns, svc_name, out_path, kubectl_bin = sys.argv[1:5]
 proc = subprocess.Popen(
-    [kubectl_bin, "-n", ns, "get", "endpointslices", "-l", f"kubernetes.io/service-name={svc_name}", "--watch", "-o", "json"],
+    [kubectl_bin, "get", "endpointslices", "-A", "--watch", "-o", "json"],
     stdout=subprocess.PIPE,
     text=True,
 )
@@ -1779,7 +1787,7 @@ if os.path.exists(f"{run_dir}/observer.log"):
                             dbsize = int(parts[3][1:])
                             if dbsize < 50000:
                                 empty_reads += 1
-                                if kp_sync_ms is None:
+                                if not initial_backend_ip and kp_sync_ms is None:
                                     kp_sync_ms = t_ms
                         except Exception:
                             pass
@@ -1788,16 +1796,14 @@ if os.path.exists(f"{run_dir}/observer.log"):
                                 backend_cutover_ms = t_ms
                             if kp_sync_ms is None:
                                 kp_sync_ms = t_ms
-                    elif status in ("refused", "timeout", "reset"):
-                        if kp_sync_ms is None:
-                            kp_sync_ms = t_ms
 
+PHASE_TOLERANCE_S = 2.0
 kp_sync_s = round((kp_sync_ms - drain_ms) / 1000.0, 3) if (kp_sync_ms is not None and drain_ms > 0) else None
 backend_cutover_s = round((backend_cutover_ms - drain_ms) / 1000.0, 3) if (backend_cutover_ms is not None and drain_ms > 0) else None
 phase_applicable = dataplane_mode == "kube-proxy"
-phase_hit = bool(phase_applicable and kp_sync_s is not None and abs(kp_sync_s - window_w) <= 3.5)
+phase_hit = bool(phase_applicable and kp_sync_s is not None and abs(kp_sync_s - window_w) <= PHASE_TOLERANCE_S)
 
-# Validate minimum non-empty inputs (fail closed if pinger/observer/watches/checkpoint failed to record)
+# Validate minimum non-empty inputs (fail closed if pinger/observer/watches/checkpoint/events failed to record)
 acks_before_drain = [a for a in acks if a[0] < drain_ms]
 acks_after_drain = [a for a in acks if a[0] >= drain_ms]
 total_pod_obs = len(pod_records) + sum(1 for r in collector_records if r.get("gvr") == "pods.v1")
@@ -1819,15 +1825,23 @@ if total_pod_obs == 0:
 if total_ep_obs == 0:
     inconclusive_reasons.append("0 EndpointSlice watch/collector records")
 
-inputs_valid = len(inconclusive_reasons) == 0
-
-# Quiet period EndpointSlice churn check (#149)
+# Quiet period EndpointSlice churn check (#149): ep_records watches EndpointSlices cluster-wide (-A)
 quiet_period_ep_churn_count = 0
 if quiet_start_ms is not None and anchor_created_ms is not None:
     for r in ep_records:
         rt = r.get("t_ms")
         if rt is not None and quiet_start_ms <= rt < anchor_created_ms:
             quiet_period_ep_churn_count += 1
+quiet_period_clean = quiet_period_ep_churn_count == 0
+
+phase_inconclusive_reasons = []
+if not phase_applicable:
+    phase_inconclusive_reasons.append(f"dataplane_mode={dataplane_mode} (kube-proxy 10s sync phase anchor not applicable)")
+elif not phase_hit:
+    phase_inconclusive_reasons.append(f"phase_hit=false (kp_sync_s={kp_sync_s}, W={window_w}s, tolerance=+-{PHASE_TOLERANCE_S}s)")
+if not quiet_period_clean:
+    phase_inconclusive_reasons.append(f"quiet_period_clean=false (quiet_period_ep_churn_count={quiet_period_ep_churn_count})")
+phase_inconclusive = len(phase_inconclusive_reasons) > 0
 
 # Check (a) (#151): No source pod emits "Successfully restored the pod from PodSnapshot" after its checkpoint.
 # Match by source pod UID (src_uid) so a StatefulSet replacement pod with the same name (e.g. t2-redis-0)
@@ -1836,15 +1850,20 @@ re_restore_violations = []
 events_list = []
 if os.path.exists(f"{run_dir}/events.json"):
     try:
-        ev_doc = json.load(open(f"{run_dir}/events.json"))
-        events_list.extend(ev_doc.get("items") or [])
+        with open(f"{run_dir}/events.json") as ef:
+            ev_doc = json.load(ef)
+        if not isinstance(ev_doc, dict) or not isinstance(ev_doc.get("items"), list):
+            inconclusive_reasons.append("invalid events.json structure (missing items list)")
+        else:
+            events_list.extend(ev_doc["items"])
     except Exception:
-        pass
+        inconclusive_reasons.append("unreadable or invalid events.json")
 for r in collector_records:
     if r.get("gvr") in ("events.v1", "events.v1beta1", "events"):
         events_list.append(r.get("obj") or {})
 
 seen_ev_uids = set()
+restored_pod_restore_events = 0
 for ev in events_list:
     md = ev.get("metadata") or {}
     uid = md.get("uid") or md.get("name")
@@ -1855,7 +1874,11 @@ for ev in events_list:
     inv = ev.get("involvedObject") or ev.get("regarding") or {}
     inv_uid = inv.get("uid") or ""
     inv_name = inv.get("name") or ""
+    msg = ev.get("message") or ev.get("note") or ""
+    if "Successfully restored the pod from PodSnapshot" not in msg:
+        continue
     if inv_uid and inv_uid in restored_pod_uids:
+        restored_pod_restore_events += 1
         continue
     if src_uid and inv_uid:
         if inv_uid != src_uid:
@@ -1863,9 +1886,6 @@ for ev in events_list:
     else:
         if inv_name != src_pod:
             continue
-    msg = ev.get("message") or ev.get("note") or ""
-    if "Successfully restored the pod from PodSnapshot" not in msg:
-        continue
     ev_ms = (
         parse_iso_ms(ev.get("lastTimestamp"))
         or parse_iso_ms(ev.get("eventTime"))
@@ -1882,6 +1902,10 @@ for ev in events_list:
             "message": msg,
         })
 
+if len(events_list) == 0 or (len(restored_pod_uids) > 0 and restored_pod_restore_events == 0):
+    inconclusive_reasons.append("0 replacement pod restore events observed in events.json/collector")
+
+inputs_valid = len(inconclusive_reasons) == 0
 check_a_pass = inputs_valid and (len(re_restore_violations) == 0)
 
 # Check (b) (#131): A pod labeled as fenced (pod-migration.gke.io/fenced=true) is never serving in any EndpointSlice.
@@ -1994,6 +2018,7 @@ summary = {
     "inconclusive_reasons": inconclusive_reasons,
     "dataplane_mode": dataplane_mode,
     "phase_applicable": phase_applicable,
+    "phase_tolerance_s": PHASE_TOLERANCE_S,
     "window_w_s": window_w,
     "drain_ms": drain_ms,
     "checkpoint_ms": ckpt_ms,
@@ -2001,7 +2026,9 @@ summary = {
     "backend_cutover_s": backend_cutover_s,
     "phase_hit": phase_hit,
     "quiet_period_ep_churn_count": quiet_period_ep_churn_count,
-    "quiet_period_clean": quiet_period_ep_churn_count == 0,
+    "quiet_period_clean": quiet_period_clean,
+    "phase_inconclusive": phase_inconclusive,
+    "phase_inconclusive_reasons": phase_inconclusive_reasons,
     "cold_served": cold_served,
     "empty_reads": empty_reads,
     "lost_after_ckpt": lost_after_ckpt,
@@ -2029,6 +2056,7 @@ with open(f"{run_dir}/s8_phase_continuity.json", "w") as f:
 
 print(
     f"S8 summary: W={window_w}s dataplane={dataplane_mode} kp_sync_s={kp_sync_s} phase_hit={phase_hit} "
+    f"phase_inconclusive={phase_inconclusive} "
     f"cold_served={cold_served} empty_reads={empty_reads} lost_after_ckpt={lost_after_ckpt} "
     f"fenced_pods_seen={fenced_pods_seen} "
     f"check_a_pass={check_a_pass}(enforced={enforce_a}) "
@@ -2044,6 +2072,7 @@ PY
 
   local summary_json="${run_dir}/s8_phase_continuity.json"
   local check_a_pass check_b_pass cold_served empty_reads lost_after_ckpt kp_sync_s fenced_pods_seen
+  local dataplane_mode phase_applicable phase_hit quiet_period_clean phase_inconclusive phase_inconclusive_reasons
   check_a_pass="$(jq -r '.check_a_source_no_rerestore.pass' "${summary_json}")"
   check_b_pass="$(jq -r '.check_b_fenced_never_serving.pass' "${summary_json}")"
   cold_served="$(jq -r '.cold_served' "${summary_json}")"
@@ -2051,6 +2080,12 @@ PY
   lost_after_ckpt="$(jq -r '.lost_after_ckpt' "${summary_json}")"
   kp_sync_s="$(jq -r '.kube_proxy_sync_s // "n/a"' "${summary_json}")"
   fenced_pods_seen="$(jq -r '.fenced_pods_seen' "${summary_json}")"
+  dataplane_mode="$(jq -r '.dataplane_mode' "${summary_json}")"
+  phase_applicable="$(jq -r '.phase_applicable' "${summary_json}")"
+  phase_hit="$(jq -r '.phase_hit' "${summary_json}")"
+  quiet_period_clean="$(jq -r '.quiet_period_clean' "${summary_json}")"
+  phase_inconclusive="$(jq -r '.phase_inconclusive' "${summary_json}")"
+  phase_inconclusive_reasons="$(jq -r '.phase_inconclusive_reasons | join("; ")' "${summary_json}")"
 
   # Record Check (a) (#151) in pmprofiler: never record a fake green --pass when a violation occurred in report-only mode
   if [[ "${check_a_pass}" == "true" ]]; then
@@ -2068,12 +2103,12 @@ PY
     err "S8 Check (a) [REPORT-ONLY WARNING]: source pod emitted 'Successfully restored the pod from PodSnapshot' after checkpoint (#151)"
   fi
 
-  # Record Check (b) (#131) + phase-anchored serving continuity in pmprofiler
+  # Record Check (b) (#131) + phase-anchored serving continuity (#149) in pmprofiler
   local check_b_ok="true"
-  if [[ "${check_b_pass}" != "true" || "${cold_served}" -gt 0 || "${empty_reads}" -gt 0 || "${fenced_pods_seen}" -eq 0 ]]; then
+  if [[ "${check_b_pass}" != "true" || "${cold_served}" -gt 0 || "${empty_reads}" -gt 0 || "${fenced_pods_seen}" -eq 0 || "${phase_inconclusive}" == "true" ]]; then
     check_b_ok="false"
   fi
-  local check_b_detail="fenced_pods_seen=${fenced_pods_seen}, fenced_serving_pass=${check_b_pass}, cold_served=${cold_served}, empty_reads=${empty_reads}, lost_after_ckpt=${lost_after_ckpt}, kp_sync_s=${kp_sync_s}"
+  local check_b_detail="dataplane_mode=${dataplane_mode}, phase_applicable=${phase_applicable}, phase_hit=${phase_hit}, quiet_period_clean=${quiet_period_clean}, fenced_pods_seen=${fenced_pods_seen}, fenced_serving_pass=${check_b_pass}, cold_served=${cold_served}, empty_reads=${empty_reads}, lost_after_ckpt=${lost_after_ckpt}, kp_sync_s=${kp_sync_s}"
   if [[ "${check_b_ok}" == "true" ]]; then
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
       --name "S8 Check (b): fenced pod never serving & zero cold/empty reads (#131)" --group "redis" \
@@ -2083,20 +2118,36 @@ PY
     "${PMPROFILER_BIN}" check --run "${run_dir}" \
       --name "S8 Check (b): fenced pod never serving & zero cold/empty reads (#131)" --group "redis" \
       --pass=false --value 0 --total 1 \
-      --detail "VIOLATION (#131): ${check_b_detail}" >/dev/null || true
-    die "S8 FAIL (Check b / #131): fenced pod serving, no fenced pods seen, or cold/empty reads observed: ${check_b_detail} (${summary_json})"
+      --detail "VIOLATION / INCONCLUSIVE (#131/#149): ${check_b_detail}" >/dev/null || true
+    die "S8 FAIL (Check b / #131 / #149): fenced pod serving, no fenced pods seen, phase window missed/not applicable, or cold/empty reads observed: ${check_b_detail} (${summary_json})"
+  elif [[ "${phase_inconclusive}" == "true" && "${enforce_a}" == "true" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "S8 Check (b): fenced pod never serving & zero cold/empty reads (#131)" --group "redis" \
+      --pass=false --value 0 --total 1 \
+      --detail "INCONCLUSIVE PHASE WINDOW (#149): ${phase_inconclusive_reasons}; ${check_b_detail}" >/dev/null || true
+    die "S8 INCONCLUSIVE / PHASE MISS (#149): ${phase_inconclusive_reasons}: ${check_b_detail} (${summary_json})"
   else
-    err "S8 Check (b) [REPORT-ONLY WARNING]: ${check_b_detail} (#131)"
+    err "S8 Check (b) / Phase [REPORT-ONLY WARNING]: ${check_b_detail} (#131/#149)"
   fi
 }
 
 detect_s8_dataplane_mode() {
-  local kp_pods
-  kp_pods="$("${KUBECTL_CMD}" get pods -n kube-system -l k8s-app=kube-proxy -o name 2>/dev/null || true)"
-  if [[ -z "${kp_pods}" ]]; then
-    kp_pods="$("${KUBECTL_CMD}" get daemonset -n kube-system kube-proxy -o name 2>/dev/null || true)"
+  local dpv2_desired kp_running kp_ds_desired
+  dpv2_desired="$("${KUBECTL_CMD}" get daemonset -n kube-system anetd cilium -o jsonpath='{range .items[*]}{.status.desiredNumberScheduled}{"\n"}{end}' 2>/dev/null | awk '$1 > 0 { found=1 } END { print (found ? "1" : "0") }')"
+  if [[ "${dpv2_desired}" == "1" ]]; then
+    echo "dataplane-v2"
+    return 0
   fi
-  if [[ -n "${kp_pods}" ]]; then
+  kp_running="$("${KUBECTL_CMD}" get pods -n kube-system -l component=kube-proxy --field-selector=status.phase=Running -o name 2>/dev/null || true)"
+  if [[ -z "${kp_running}" ]]; then
+    kp_running="$("${KUBECTL_CMD}" get pods -n kube-system -l k8s-app=kube-proxy --field-selector=status.phase=Running -o name 2>/dev/null || true)"
+  fi
+  if [[ -n "${kp_running}" ]]; then
+    echo "kube-proxy"
+    return 0
+  fi
+  kp_ds_desired="$("${KUBECTL_CMD}" get daemonset -n kube-system kube-proxy -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+  if [[ "${kp_ds_desired}" =~ ^[0-9]+$ ]] && [[ "${kp_ds_desired}" -gt 0 ]]; then
     echo "kube-proxy"
   else
     echo "dataplane-v2"
@@ -2522,21 +2573,26 @@ EOF
   [[ "$(jq -r '.cold_served' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "0" ]] || die "Expected S8 clean fixture cold_served == 0"
   [[ "$(jq -r '.empty_reads' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "0" ]] || die "Expected S8 clean fixture empty_reads == 0"
   [[ "$(jq -r '.lost_after_ckpt' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "0" ]] || die "Expected S8 clean fixture lost_after_ckpt == 0"
-  [[ "$(jq -r '.kube_proxy_sync_s' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "2.12" ]] || die "Expected S8 clean fixture kube_proxy_sync_s == 2.12"
+  [[ "$(jq -r '.kube_proxy_sync_s' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "5.2" ]] || die "Expected S8 clean fixture kube_proxy_sync_s == 5.2"
+  [[ "$(jq -r '.backend_cutover_s' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "5.2" ]] || die "Expected S8 clean fixture backend_cutover_s == 5.2"
   [[ "$(jq -r '.phase_hit' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture phase_hit == true"
+  [[ "$(jq -r '.phase_inconclusive' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "false" ]] || die "Expected S8 clean fixture phase_inconclusive == false"
   [[ "$(jq -r '.quiet_period_clean' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture quiet_period_clean == true"
   [[ "$(jq -r '.fenced_pods_seen' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "1" ]] || die "Expected S8 clean fixture fenced_pods_seen == 1"
   [[ "$(jq -r '.check_a_source_no_rerestore.pass' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture Check (a) pass == true"
   [[ "$(jq -r '.check_b_fenced_never_serving.pass' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture Check (b) pass == true"
   "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s8" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
 
-  # Negative tests for S8 Check (a) (#151), Check (b) (#131), no-fenced-pods vacuous guard, and empty inputs:
+  # Negative tests for S8 Check (a) (#151), Check (b) (#131), no-fenced-pods vacuous guard, phase miss/DPv2, and empty/corrupt inputs:
   # 1) Source pod UID re-restores after checkpoint (#151): warns in report-only mode (without fake green check), fails when enforced
   local neg_s8_a="${OUT_DIR}/neg-s8-check-a"
   cp -r "${OUT_DIR}/s8" "${neg_s8_a}"
   rm -f "${neg_s8_a}/checks.json" "${neg_s8_a}/run.json"
   cat >"${neg_s8_a}/events.json" <<'EOF'
-{"items":[{"metadata":{"uid":"ev-rerestore-src","creationTimestamp":"2026-09-27T10:00:05Z"},"involvedObject":{"name":"t2-redis-0","uid":"uid-t2-redis-0-src"},"lastTimestamp":"2026-09-27T10:00:05Z","message":"Successfully restored the pod from PodSnapshot snap-t2-redis-0","count":1}]}
+{"items":[
+  {"metadata":{"uid":"ev-restored-dst","creationTimestamp":"2026-09-27T10:00:07Z"},"involvedObject":{"name":"t2-redis-0","uid":"uid-t2-redis-0-dst"},"lastTimestamp":"2026-09-27T10:00:07Z","message":"Successfully restored the pod from PodSnapshot snap-t2-redis-0","count":1},
+  {"metadata":{"uid":"ev-rerestore-src","creationTimestamp":"2026-09-27T10:00:05Z"},"involvedObject":{"name":"t2-redis-0","uid":"uid-t2-redis-0-src"},"lastTimestamp":"2026-09-27T10:00:05Z","message":"Successfully restored the pod from PodSnapshot snap-t2-redis-0","count":1}
+]}
 EOF
   s8_phase_analyze "${neg_s8_a}" "false" "false"
   [[ "$(jq -r '.check_a_source_no_rerestore.pass' "${neg_s8_a}/s8_phase_continuity.json")" == "false" ]] || die "Expected Check (a) pass == false on source re-restore fixture"
@@ -2594,7 +2650,56 @@ EOF
   fi
   rm -rf "${neg_s8_nofence}"
 
-  # 4) Empty or missing inputs: must fail closed even in report-only mode (enforce_a=false, enforce_b=false)
+  # 4) Phase window missed (kp_sync_s = 9.0 at W = 5, outside +-2.0s tolerance): marks phase_hit=false, phase_inconclusive=true,
+  # does not record a fake green Check (b) in report-only mode, and fails closed when enforcement is enabled (#149)
+  local neg_s8_miss="${OUT_DIR}/neg-s8-phase-miss"
+  cp -r "${OUT_DIR}/s8" "${neg_s8_miss}"
+  rm -f "${neg_s8_miss}/checks.json" "${neg_s8_miss}/run.json"
+  cat >"${neg_s8_miss}/observer.log" <<'EOF'
+1758967202000 2 ok :50002 10.24.1.10
+1758967205120 1 refused
+1758967212000 2 ok :50004 10.24.2.20
+EOF
+  s8_phase_analyze "${neg_s8_miss}" "false" "false"
+  [[ "$(jq -r '.kube_proxy_sync_s' "${neg_s8_miss}/s8_phase_continuity.json")" == "9.0" ]] || die "Expected kube_proxy_sync_s == 9.0 on phase-miss fixture"
+  [[ "$(jq -r '.phase_hit' "${neg_s8_miss}/s8_phase_continuity.json")" == "false" ]] || die "Expected phase_hit == false when kp_sync_s=9.0 at W=5"
+  [[ "$(jq -r '.phase_inconclusive' "${neg_s8_miss}/s8_phase_continuity.json")" == "true" ]] || die "Expected phase_inconclusive == true when phase_hit=false"
+  if [[ -f "${neg_s8_miss}/checks.json" ]] && grep -q 'S8 Check (b)' "${neg_s8_miss}/checks.json"; then
+    die "Expected report-only phase-miss run NOT to record a misleading green Check (b) PASS in checks.json"
+  fi
+  if (s8_phase_analyze "${neg_s8_miss}" "true" "false" >/dev/null 2>&1); then
+    die "Expected s8_phase_analyze with enforce_a=true to fail closed when phase_hit=false (#149)"
+  fi
+  if (s8_phase_analyze "${neg_s8_miss}" "false" "true" >/dev/null 2>&1); then
+    die "Expected s8_phase_analyze with enforce_b=true to fail closed when phase_hit=false (#149)"
+  fi
+  rm -rf "${neg_s8_miss}"
+
+  # 5) Dataplane V2 (dataplane_mode=dataplane-v2 -> phase_applicable=false): marks phase_inconclusive=true and fails closed when enforced (#149)
+  local neg_s8_dpv2="${OUT_DIR}/neg-s8-dpv2"
+  cp -r "${OUT_DIR}/s8" "${neg_s8_dpv2}"
+  rm -f "${neg_s8_dpv2}/checks.json" "${neg_s8_dpv2}/run.json"
+  printf 'quiet_start_ms=1758967186000 anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b dataplane_mode=dataplane-v2\n' >"${neg_s8_dpv2}/phase.txt"
+  s8_phase_analyze "${neg_s8_dpv2}" "false" "false"
+  [[ "$(jq -r '.phase_applicable' "${neg_s8_dpv2}/s8_phase_continuity.json")" == "false" ]] || die "Expected phase_applicable == false on dataplane-v2 fixture"
+  [[ "$(jq -r '.phase_hit' "${neg_s8_dpv2}/s8_phase_continuity.json")" == "false" ]] || die "Expected phase_hit == false on dataplane-v2 fixture"
+  [[ "$(jq -r '.phase_inconclusive' "${neg_s8_dpv2}/s8_phase_continuity.json")" == "true" ]] || die "Expected phase_inconclusive == true on dataplane-v2 fixture"
+  if (s8_phase_analyze "${neg_s8_dpv2}" "true" "false" >/dev/null 2>&1); then
+    die "Expected s8_phase_analyze with enforce_a=true to fail closed when phase_applicable=false"
+  fi
+  rm -rf "${neg_s8_dpv2}"
+
+  # 6) Corrupt events.json: must fail closed with inputs_valid=false
+  local neg_s8_badev="${OUT_DIR}/neg-s8-bad-events"
+  cp -r "${OUT_DIR}/s8" "${neg_s8_badev}"
+  echo "Error from server (Forbidden): events is forbidden" >"${neg_s8_badev}/events.json"
+  if (s8_phase_analyze "${neg_s8_badev}" "false" "false" >/dev/null 2>&1); then
+    die "Expected s8_phase_analyze to fail closed when events.json is corrupt/unreadable"
+  fi
+  [[ "$(jq -r '.inputs_valid' "${neg_s8_badev}/s8_phase_continuity.json")" == "false" ]] || die "Expected inputs_valid == false on corrupt events.json"
+  rm -rf "${neg_s8_badev}"
+
+  # 7) Empty or missing inputs: must fail closed even in report-only mode (enforce_a=false, enforce_b=false)
   local neg_s8_empty="${OUT_DIR}/neg-s8-empty"
   mkdir -p "${neg_s8_empty}"
   echo "1758967203000" >"${neg_s8_empty}/drain_ms.txt"
@@ -2752,6 +2857,49 @@ EOF
   fi
   (S8_WINDOW_W="5" validate_s8_window_w)
   (S8_WINDOW_W="3,5,7" validate_s8_window_w)
+
+  # Verify detect_s8_dataplane_mode distinguishes GKE Standard static kube-proxy pods (component=kube-proxy)
+  # from GKE Dataplane V2 clusters where anetd runs and daemonset/kube-proxy has desiredNumberScheduled=0
+  local fake_dpv2_kubectl="${OUT_DIR}/fake-dpv2-kubectl.sh"
+  cat >"${fake_dpv2_kubectl}" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"get daemonset -n kube-system anetd cilium"* ]]; then
+  printf "3\n"
+  exit 0
+fi
+if [[ "$*" == *"get daemonset -n kube-system kube-proxy"* ]]; then
+  printf "0"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${fake_dpv2_kubectl}"
+  [[ "$(KUBECTL_CMD="${fake_dpv2_kubectl}" detect_s8_dataplane_mode)" == "dataplane-v2" ]] || die "Expected detect_s8_dataplane_mode == dataplane-v2 when anetd desiredNumberScheduled > 0"
+
+  local fake_kp0_kubectl="${OUT_DIR}/fake-kp0-kubectl.sh"
+  cat >"${fake_kp0_kubectl}" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"get daemonset -n kube-system kube-proxy"* ]]; then
+  printf "0"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${fake_kp0_kubectl}"
+  [[ "$(KUBECTL_CMD="${fake_kp0_kubectl}" detect_s8_dataplane_mode)" == "dataplane-v2" ]] || die "Expected detect_s8_dataplane_mode == dataplane-v2 when daemonset/kube-proxy has desiredNumberScheduled=0 and no running kube-proxy pods"
+
+  local fake_gke_std_kubectl="${OUT_DIR}/fake-gke-std-kubectl.sh"
+  cat >"${fake_gke_std_kubectl}" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"get pods -n kube-system -l component=kube-proxy --field-selector=status.phase=Running -o name"* ]]; then
+  printf "pod/kube-proxy-gke-node-a\n"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${fake_gke_std_kubectl}"
+  [[ "$(KUBECTL_CMD="${fake_gke_std_kubectl}" detect_s8_dataplane_mode)" == "kube-proxy" ]] || die "Expected detect_s8_dataplane_mode == kube-proxy when running component=kube-proxy static pods exist"
+  rm -f "${fake_dpv2_kubectl}" "${fake_kp0_kubectl}" "${fake_gke_std_kubectl}"
 
   # Verify tracked node cordon/uncordon only uncordons nodes cordoned during the run
   # and skips nodes that were already unschedulable prior to T2 (#82)
