@@ -1499,11 +1499,74 @@ func TestInvariants_I11_SourceFencedAfterCheckpoint(t *testing.T) {
 		t.Fatalf("expected I11 SourcePodReadyNotFenced violation when Ready=False reason != PodMigrationFenced, got %+v", vsReason)
 	}
 
-	// 7. Verify DefaultRules registers I11 (SourceFencedAfterCheckpoint)
+	// 7. Violation: Ready=True even when reason is PodMigrationFenced (pins the Status != ConditionFalse check)
+	readyTrueWithFenceReason := &ReconcileSnapshot{
+		PrimaryPMJ:    makePMJ(metav1.ConditionTrue, "Fenced"),
+		NamespacePods: []corev1.Pod{makeSourcePod("true", corev1.ConditionTrue, ReasonPodMigrationFenced)},
+	}
+	vsReadyTrueSameReason := EvaluateI11(readyTrueWithFenceReason)
+	if len(vsReadyTrueSameReason) != 1 || vsReadyTrueSameReason[0].InvariantID != "I11" || vsReadyTrueSameReason[0].Reason != "SourcePodReadyNotFenced" {
+		t.Fatalf("expected I11 SourcePodReadyNotFenced violation when Ready=True with reason=PodMigrationFenced, got %+v", vsReadyTrueSameReason)
+	}
+
+	// 8. Violation: Missing Ready condition (Conditions is empty/nil; pins the readyCond == nil guard)
+	missingReady := &ReconcileSnapshot{
+		PrimaryPMJ:    makePMJ(metav1.ConditionTrue, "Fenced"),
+		NamespacePods: []corev1.Pod{makeSourcePod("true", "", "")},
+	}
+	vsMissingReady := EvaluateI11(missingReady)
+	if len(vsMissingReady) != 1 || vsMissingReady[0].InvariantID != "I11" || vsMissingReady[0].Reason != "SourcePodReadyNotFenced" || !strings.Contains(vsMissingReady[0].Message, "Ready=absent") {
+		t.Fatalf("expected I11 SourcePodReadyNotFenced violation with Ready=absent when Ready condition is missing, got %+v", vsMissingReady)
+	}
+
+	// 9. Clean: Terminal PMJs (Failed, Succeeded, SucceededWithoutRestore) with SourceFenced=True must be skipped
+	for _, termPhase := range []pmv1alpha1.PodMigrationJobPhase{
+		pmv1alpha1.PodMigrationJobPhaseFailed,
+		pmv1alpha1.PodMigrationJobPhaseSucceeded,
+		pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+	} {
+		termPMJ := makePMJ(metav1.ConditionTrue, "FenceKept")
+		termPMJ.Status.Phase = termPhase
+		termSnap := &ReconcileSnapshot{
+			PrimaryPMJ:    termPMJ,
+			NamespacePods: []corev1.Pod{makeSourcePod("<nil>", corev1.ConditionTrue, "ContainersReady")},
+		}
+		if vs := EvaluateI11(termSnap); len(vs) != 0 {
+			t.Fatalf("expected 0 violations on terminal PMJ (phase=%s), got %+v", termPhase, vs)
+		}
+	}
+
+	// 10. Grace window: SourceFenced=True within SourceFencedGraceWindow (10s) of LastTransitionTime is skipped,
+	//     and fires once SourceFencedGraceWindow has elapsed.
+	baseNow := time.Date(2026, 10, 16, 20, 0, 0, 0, time.UTC)
+	gracePMJ := makePMJ(metav1.ConditionTrue, "Fenced")
+	gracePMJ.Status.Conditions[0].LastTransitionTime = metav1.NewTime(baseNow.Add(-2 * time.Second))
+	inGraceSnap := &ReconcileSnapshot{
+		Now:           baseNow,
+		PrimaryPMJ:    gracePMJ,
+		NamespacePods: []corev1.Pod{makeSourcePod("<nil>", corev1.ConditionTrue, "ContainersReady")},
+	}
+	if vs := EvaluateI11(inGraceSnap); len(vs) != 0 {
+		t.Fatalf("expected 0 violations within SourceFencedGraceWindow (elapsed=2s < 10s), got %+v", vs)
+	}
+	pastGraceSnap := &ReconcileSnapshot{
+		Now:           baseNow.Add(12 * time.Second),
+		PrimaryPMJ:    gracePMJ,
+		NamespacePods: []corev1.Pod{makeSourcePod("<nil>", corev1.ConditionTrue, "ContainersReady")},
+	}
+	if vs := EvaluateI11(pastGraceSnap); len(vs) != 2 {
+		t.Fatalf("expected 2 violations (missing label + Ready=True) after SourceFencedGraceWindow elapsed, got %+v", vs)
+	}
+
+	// 11. Verify DefaultRules registers I11 wrapped in NewDebouncedRule(3, 30s)
 	foundI11 := false
 	for _, r := range DefaultRules {
 		if r.ID() == "I11" && r.Name() == "SourceFencedAfterCheckpoint" {
 			foundI11 = true
+			dr, ok := r.(DebouncedRule)
+			if !ok || dr.ConsecutiveSamples() != 3 || dr.MinimumDuration() != 30*time.Second {
+				t.Fatalf("expected DefaultRules I11 to be wrapped in NewDebouncedRule(3, 30s), got %T %+v", r, r)
+			}
 			break
 		}
 	}

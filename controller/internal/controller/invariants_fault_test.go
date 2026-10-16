@@ -1396,16 +1396,75 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		pmjA.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
 		pmjA.Status.SnapshotRef = "snap-fence-a"
 		pmjA.Status.EvictingStartTime = &evictStart
-		meta.SetStatusCondition(&pmjA.Status.Conditions, metav1.Condition{
-			Type:   invariants.ConditionSourceFenced,
-			Status: metav1.ConditionTrue,
-			Reason: "Fenced",
-		})
+		pmjA.Status.Conditions = []metav1.Condition{
+			{
+				Type:               invariants.ConditionSourceFenced,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Fenced",
+				LastTransitionTime: evictStart,
+			},
+		}
 		if err := k8sClient.Status().Update(ctx, pmjA); err != nil {
 			t.Fatalf("update pmjA status: %v", err)
 		}
 
-		// Leg 1: Clean fenced source pod -> 0 I11 violations
+		// Also create a StatefulSet-style replacement pod with the same name as a
+		// second fenced PMJ's PodRef.Name ("fenced-sts-0") but a distinct UID from
+		// TargetPodUID ("uid-old-fenced-sts-0"), plus a terminal Failed PMJ whose
+		// source pod is unfenced, to prove neither triggers false-positive I11 violations.
+		stsReplPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "fenced-sts-0",
+				Labels:    map[string]string{"app": "fence-s7"},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+			},
+		}
+		if err := k8sClient.Create(ctx, stsReplPod); err != nil {
+			t.Fatalf("create stsReplPod: %v", err)
+		}
+		stsReplPod.Status.Phase = corev1.PodRunning
+		stsReplPod.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue, Reason: "ContainersReady"},
+		}
+		if err := k8sClient.Status().Update(ctx, stsReplPod); err != nil {
+			t.Fatalf("update stsReplPod status: %v", err)
+		}
+		pmjStsSameName := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "pmj-sts-samename",
+				Annotations: map[string]string{
+					util.AnnotationEvictingSince: evictStart.Time.Format(time.RFC3339Nano),
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: stsReplPod.Name},
+				TargetPodUID: "uid-old-fenced-sts-0",
+			},
+		}
+		if err := k8sClient.Create(ctx, pmjStsSameName); err != nil {
+			t.Fatalf("create pmjStsSameName: %v", err)
+		}
+		pmjStsSameName.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+		pmjStsSameName.Status.SnapshotRef = "snap-sts-0"
+		pmjStsSameName.Status.RestoredPodName = stsReplPod.Name
+		pmjStsSameName.Status.RestoredPodUID = string(stsReplPod.UID)
+		pmjStsSameName.Status.Conditions = []metav1.Condition{
+			{
+				Type:               invariants.ConditionSourceFenced,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Fenced",
+				LastTransitionTime: evictStart,
+			},
+		}
+		if err := k8sClient.Status().Update(ctx, pmjStsSameName); err != nil {
+			t.Fatalf("update pmjStsSameName status: %v", err)
+		}
+
+		// Leg 1: Clean fenced source pod + same-name StatefulSet replacement pod -> 0 I11 violations
 		beforeLeg1 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I11"))
 		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
 			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjA.Name},
@@ -1413,10 +1472,10 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			t.Fatalf("pmjRec.Reconcile(pmjA clean) failed: %v", err)
 		}
 		if afterLeg1 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I11")); afterLeg1 != beforeLeg1 {
-			t.Fatalf("expected 0 I11 violations on properly fenced source pod, delta=%v", afterLeg1-beforeLeg1)
+			t.Fatalf("expected 0 I11 violations on properly fenced source pod + same-name replacement, delta=%v", afterLeg1-beforeLeg1)
 		}
 
-		// Leg 2: Fault-inject dropped `pod-migration.gke.io/fenced` label -> I11 fires and aborts pmjA in ModeStrict
+		// Leg 2: Fault-inject dropped `pod-migration.gke.io/fenced` label -> I11 fires and aborts pmjA after debounce in ModeStrict
 		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: originA.Name}, originA); err != nil {
 			t.Fatalf("get originA: %v", err)
 		}
@@ -1426,27 +1485,37 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		}
 
 		beforeLeg2 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I11"))
+		// Sample 1: records metric & warning event, holds strict abort pending 3-sample / 30s debounce
 		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
 			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjA.Name},
 		}); err != nil {
-			t.Fatalf("pmjRec.Reconcile(pmjA dropped label) failed: %v", err)
+			t.Fatalf("pmjRec.Reconcile(pmjA dropped label sample 1) failed: %v", err)
 		}
 		if afterLeg2 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I11")); afterLeg2 <= beforeLeg2 {
 			t.Fatalf("expected I11 counter to increment when fence label is dropped; before=%v after=%v", beforeLeg2, afterLeg2)
+		}
+		subjKeyA := "PodMigrationJobReconciler/pmj/" + ns + "/" + pmjA.Name + "/" + string(pmjA.UID)
+		engine.BackdateFirstSeen(subjKeyA, "I11", time.Now().Add(-35*time.Second))
+		for sample := 2; sample <= 3; sample++ {
+			if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjA.Name},
+			}); err != nil {
+				t.Fatalf("pmjRec.Reconcile(pmjA dropped label sample %d) failed: %v", sample, err)
+			}
 		}
 		var gotPMJA pmv1alpha1.PodMigrationJob
 		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: pmjA.Name}, &gotPMJA); err != nil {
 			t.Fatalf("get gotPMJA: %v", err)
 		}
 		if gotPMJA.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
-			t.Fatalf("expected strict mode to fail pmjA on I11 dropped label, got phase=%s", gotPMJA.Status.Phase)
+			t.Fatalf("expected strict mode to fail pmjA on I11 dropped label after debounce, got phase=%s", gotPMJA.Status.Phase)
 		}
 		condA := meta.FindStatusCondition(gotPMJA.Status.Conditions, "Ready")
 		if condA == nil || condA.Status != metav1.ConditionFalse || condA.Reason != invariants.EventReasonInvariantViolation || !strings.Contains(condA.Message, "[I11:SourceFencedAfterCheckpoint]") {
 			t.Fatalf("expected Ready=False condition with [I11:SourceFencedAfterCheckpoint], got %+v", condA)
 		}
 
-		// Leg 3: Fault-inject flipped `Ready=True` while `pod-migration.gke.io/fenced=true` and `SourceFenced=True` -> I11 fires
+		// Leg 3: Fault-inject flipped `Ready=True` (even with reason=PodMigrationFenced) while `pod-migration.gke.io/fenced=true` and `SourceFenced=True` -> I11 fires
 		originB := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:  ns,
@@ -1469,7 +1538,7 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			{
 				Type:   corev1.PodReady,
 				Status: corev1.ConditionTrue,
-				Reason: "ContainersReady",
+				Reason: invariants.ReasonPodMigrationFenced,
 			},
 		}
 		if err := k8sClient.Status().Update(ctx, originB); err != nil {
@@ -1495,11 +1564,14 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		pmjB.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
 		pmjB.Status.SnapshotRef = "snap-fence-b"
 		pmjB.Status.EvictingStartTime = &evictStart
-		meta.SetStatusCondition(&pmjB.Status.Conditions, metav1.Condition{
-			Type:   invariants.ConditionSourceFenced,
-			Status: metav1.ConditionTrue,
-			Reason: "Fenced",
-		})
+		pmjB.Status.Conditions = []metav1.Condition{
+			{
+				Type:               invariants.ConditionSourceFenced,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Fenced",
+				LastTransitionTime: evictStart,
+			},
+		}
 		if err := k8sClient.Status().Update(ctx, pmjB); err != nil {
 			t.Fatalf("update pmjB status: %v", err)
 		}
@@ -1508,10 +1580,19 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
 			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjB.Name},
 		}); err != nil {
-			t.Fatalf("pmjRec.Reconcile(pmjB flipped Ready=True) failed: %v", err)
+			t.Fatalf("pmjRec.Reconcile(pmjB flipped Ready=True sample 1) failed: %v", err)
 		}
 		if afterLeg3 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I11")); afterLeg3 <= beforeLeg3 {
 			t.Fatalf("expected I11 counter to increment when Ready flips to True on fenced source pod; before=%v after=%v", beforeLeg3, afterLeg3)
+		}
+		subjKeyB := "PodMigrationJobReconciler/pmj/" + ns + "/" + pmjB.Name + "/" + string(pmjB.UID)
+		engine.BackdateFirstSeen(subjKeyB, "I11", time.Now().Add(-35*time.Second))
+		for sample := 2; sample <= 3; sample++ {
+			if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjB.Name},
+			}); err != nil {
+				t.Fatalf("pmjRec.Reconcile(pmjB flipped Ready=True sample %d) failed: %v", sample, err)
+			}
 		}
 		var gotPMJB pmv1alpha1.PodMigrationJob
 		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: pmjB.Name}, &gotPMJB); err != nil {

@@ -57,6 +57,10 @@ const (
 	ConditionSourceFenced = "SourceFenced"
 	// ReasonPodMigrationFenced is the Pod Ready condition reason held while a source pod is fenced (#131, #154).
 	ReasonPodMigrationFenced = "PodMigrationFenced"
+	// SourceFencedGraceWindow is the grace window after SourceFenced=True transitions
+	// on a PodMigrationJob during which I11 tolerates informer cache lag before the
+	// source Pod's fence label and Ready=False status appear in cached Pod lists.
+	SourceFencedGraceWindow = 10 * time.Second
 )
 
 // DefaultRules is the canonical ordered registry of the Core & Evolved Invariants (I1-I11).
@@ -71,7 +75,7 @@ var DefaultRules = []Rule{
 	funcRule{id: "I8", name: "PlatformAndControlPlaneIsolation", fn: EvaluateI8},
 	funcRule{id: "I9", name: "DeterministicFallbackOverCrashloop", fn: EvaluateI9},
 	NewDebouncedRule(RuleI10(), 3, 30*time.Second),
-	funcRule{id: "I11", name: "SourceFencedAfterCheckpoint", fn: EvaluateI11},
+	NewDebouncedRule(RuleI11(), 3, 30*time.Second),
 }
 
 func allPMJs(s *ReconcileSnapshot) []pmv1alpha1.PodMigrationJob {
@@ -783,18 +787,35 @@ func isSourcePodForPMJ(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) bool {
 }
 
 // EvaluateI11 enforces I11 (SourceFencedAfterCheckpoint, #154 / #131):
-// Once a PodMigrationJob records condition SourceFenced=True, its source pod,
+// While a non-terminal PodMigrationJob records condition SourceFenced=True (after
+// SourceFencedGraceWindow has elapsed since LastTransitionTime), its source pod,
 // while it exists, must carry the label `pod-migration.gke.io/fenced: "true"`
 // and have pod status condition `Ready=False` with reason `PodMigrationFenced`.
+//
+// Required unfence ordering: when unfencing a source pod on an abort/cancel path,
+// the controller must set `SourceFenced=False` (Reason=Unfenced) on the
+// PodMigrationJob before removing `pod-migration.gke.io/fenced` from the Pod.
+// Terminal PMJs (Succeeded, SucceededWithoutRestore, Failed) are skipped so an
+// unfenced pod from a concluded job never flags active migrations in the namespace.
 func EvaluateI11(s *ReconcileSnapshot) []Violation {
 	if s == nil {
 		return nil
 	}
+	now := time.Now()
+	if !s.Now.IsZero() {
+		now = s.Now
+	}
 	var violations []Violation
 	pods := allPods(s)
 	for _, job := range allPMJs(s) {
+		if isTerminalPhase(job.Status.Phase) {
+			continue
+		}
 		fencedCond := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced)
 		if fencedCond == nil || fencedCond.Status != metav1.ConditionTrue {
+			continue
+		}
+		if !fencedCond.LastTransitionTime.IsZero() && now.Sub(fencedCond.LastTransitionTime.Time) < SourceFencedGraceWindow {
 			continue
 		}
 		for i := range pods {
