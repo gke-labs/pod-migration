@@ -74,6 +74,14 @@ var (
 		Help: "Total number of pods skipped for spot preemption migration by reason.",
 	}, []string{"reason"})
 
+	// BudgetChecksTotal counts the dry-run evictions that check a source's
+	// disruption budget before its checkpoint (#42), by result.
+	// Results: allowed | budget_exhausted | check_error
+	BudgetChecksTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_budget_checks_total",
+		Help: "Total number of disruption budget checks (dry-run evictions) before a checkpoint, by result.",
+	}, []string{"result"})
+
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
 )
@@ -88,7 +96,15 @@ func init() {
 		InvariantViolationsTotal,
 		SpotPreemptionTriggeredTotal,
 		SpotPreemptionSkippedTotal,
+		BudgetChecksTotal,
 	)
+}
+
+// RecordBudgetCheck increments the disruption budget check counter for the given result.
+func RecordBudgetCheck(result string) {
+	if result != "" {
+		BudgetChecksTotal.WithLabelValues(result).Inc()
+	}
 }
 
 // RecordSpotPreemptionTriggered increments the spot preemption triggered counter.
