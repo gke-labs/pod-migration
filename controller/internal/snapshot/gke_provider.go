@@ -2,11 +2,14 @@ package snapshot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -19,6 +22,11 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
+
+// psNameAnnotation is the GKE Pod Snapshots restore annotation. When the agent
+// creates a pod's sandbox, a snapshot name in it means "restore from that
+// snapshot", and an empty value means "start cold".
+const psNameAnnotation = "podsnapshot.gke.io/ps-name"
 
 // transientReadyFailureSuppressionWindow bounds how long a Ready=False (Failed)
 // condition is suppressed while a constituent sub-condition (Checkpoint or
@@ -91,6 +99,16 @@ func (p *GKEProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigr
 		return ctrl.Result{}, err
 	}
 
+	// Never trigger without the cold-start bypass on the source (#151).
+	sourceGone, err := p.ensureSourceColdStartBypass(ctx, job, podName)
+	if err != nil {
+		logger.Error(err, "Failed to set the cold-start bypass on the source pod; not creating the trigger", "pod", podName)
+		return ctrl.Result{}, err
+	}
+	if sourceGone {
+		logger.Info("Source pod not found, so nothing can restart from the snapshot; creating the trigger as before", "pod", podName)
+	}
+
 	logger.Info("Creating PodSnapshotManualTrigger")
 	err = p.client.Create(ctx, trigger)
 	if err != nil {
@@ -104,6 +122,42 @@ func (p *GKEProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigr
 
 	logger.Info("Successfully created PodSnapshotManualTrigger")
 	return ctrl.Result{}, nil
+}
+
+// ensureSourceColdStartBypass sets the cold-start bypass (ps-name: "") on the
+// source pod right before its checkpoint is triggered (#151).
+//
+// After the checkpoint, GKE Pod Snapshots stops the source (postCheckpoint:
+// stop), and the kubelet restarts it in a new sandbox. Without the bypass, the
+// agent can restore that sandbox from the snapshot that was just taken, so two
+// copies run from one checkpoint. With an empty ps-name the restart is cold.
+// The agent reads the annotation when it creates a sandbox, so setting it on a
+// running pod takes effect at the next restart and changes nothing before.
+//
+// The merge patch is idempotent, and it also replaces a stale snapshot name
+// left on a pod that an earlier migration restored. It carries the source's
+// UID as a precondition, so a pod that was replaced under the same name is never
+// patched. sourceGone reports that the source no longer exists, so nothing can
+// restart from the snapshot.
+func (p *GKEProvider) ensureSourceColdStartBypass(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (sourceGone bool, err error) {
+	meta := map[string]interface{}{
+		"annotations": map[string]interface{}{psNameAnnotation: ""},
+	}
+	if job.Spec.TargetPodUID != "" {
+		meta["uid"] = job.Spec.TargetPodUID
+	}
+	data, err := json.Marshal(map[string]interface{}{"metadata": meta})
+	if err != nil {
+		return false, fmt.Errorf("encoding the cold-start bypass patch: %w", err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: job.Namespace}}
+	if err := p.client.Patch(ctx, pod, client.RawPatch(types.MergePatchType, data)); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("patching %s on pod %s/%s: %w", psNameAnnotation, job.Namespace, podName, err)
+	}
+	return false, nil
 }
 
 func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (*Status, error) {

@@ -58,6 +58,11 @@ type ReconcileSnapshot struct {
 	NamespacePMJs []pmv1alpha1.PodMigrationJob
 	NamespacePods []corev1.Pod
 
+	// TargetingPMJs holds the jobs that target the primary pod (Spec.TargetPodUID),
+	// for reconcilers that don't list the namespace. Only I2 reads it, to tell a
+	// replacement that a newer job is migrating again (#151) from one that started cold.
+	TargetingPMJs []pmv1alpha1.PodMigrationJob
+
 	// Explicit state signals captured during the reconcile step.
 	PodListFailed                bool
 	PMJListFailed                bool

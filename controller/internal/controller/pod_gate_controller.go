@@ -63,11 +63,24 @@ func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.
 		}
 	}
 
+	// The job migrating this pod, if any, lets I2 tell a replacement that is
+	// being migrated again from one that started cold (#151). Job creators
+	// name the job after the pod's name and UID.
+	var targeting []pmv1alpha1.PodMigrationJob
+	if pod.UID != "" {
+		migrating := &pmv1alpha1.PodMigrationJob{}
+		key := types.NamespacedName{Namespace: pod.Namespace, Name: util.FormatPMJName(pod.Name, string(pod.UID))}
+		if err := r.Get(ctx, key, migrating); err == nil && migrating.Spec.TargetPodUID == string(pod.UID) {
+			targeting = append(targeting, *migrating)
+		}
+	}
+
 	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
-		Now:        time.Now(),
-		Reconciler: "PodGateReconciler",
-		PrimaryPod: pod,
-		PrimaryPMJ: job,
+		Now:           time.Now(),
+		Reconciler:    "PodGateReconciler",
+		PrimaryPod:    pod,
+		PrimaryPMJ:    job,
+		TargetingPMJs: targeting,
 	})
 }
 
