@@ -183,6 +183,14 @@ die() {
   exit 1
 }
 
+err() {
+  printf "\033[1;33m[WARN]\033[0m %s\n" "$*" >&2
+}
+
+now_ms() {
+  python3 -c 'import time; print(int(time.time() * 1000))'
+}
+
 validate_toleration_format() {
   if [[ -z "${TOLERATION}" || "${TOLERATION}" == "none" ]]; then
     return 0
@@ -204,13 +212,32 @@ validate_toleration_format() {
   esac
 }
 
+validate_s8_window_w() {
+  if [[ -z "${S8_WINDOW_W}" ]]; then
+    die "Invalid --s8-window-w '': expected one or more comma-separated numbers in (0, 10)"
+  fi
+  local item
+  local items=()
+  IFS=',' read -ra items <<<"${S8_WINDOW_W}"
+  for item in "${items[@]}"; do
+    if [[ ! "${item}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      die "Invalid --s8-window-w value '${item}' in '${S8_WINDOW_W}': must be numeric in (0, 10)"
+    fi
+    if ! awk -v w="${item}" 'BEGIN { exit !(w > 0 && w < 10) }'; then
+      die "Invalid --s8-window-w value '${item}' in '${S8_WINDOW_W}': must satisfy 0 < W < 10"
+    fi
+  done
+}
+
 validate_toleration_format
+validate_s8_window_w
 
 PMPROFILER_BIN=""
 COLLECT_PID=""
 CONTINUITY_PID=""
 S8_WATCH_PIDS=()
 CORDONED_NODES=()
+PINGER_NODE=""
 KUBECTL_CMD="${KUBECTL_CMD:-kubectl}"
 
 build_pmprofiler() {
@@ -1413,8 +1440,8 @@ spec:
         memory: 32Mi
 EOF
   kubectl wait -n "${NAMESPACE}" --for=condition=Ready pod/pinger-t2-redis --timeout=180s >/dev/null
-  local pnode
-  pnode="$(kubectl get pod -n "${NAMESPACE}" pinger-t2-redis -o jsonpath='{.spec.nodeName}')"
+  PINGER_NODE="$(kubectl get pod -n "${NAMESPACE}" pinger-t2-redis -o jsonpath='{.spec.nodeName}')"
+  [[ -n "${PINGER_NODE}" ]] || die "S8: failed to resolve nodeName for pinger-t2-redis"
 
   kubectl apply -n "${NAMESPACE}" -f - >/dev/null <<EOF
 apiVersion: v1
@@ -1425,7 +1452,7 @@ metadata:
   labels:
     app: observer
 spec:
-  nodeName: ${pnode}
+  nodeName: ${PINGER_NODE}
   containers:
   - name: observer
     image: python:3.12-alpine
@@ -1441,10 +1468,23 @@ spec:
           try:
               s = socket.create_connection((ip, 6379), timeout=0.5)
               s.settimeout(0.5)
-              s.sendall(b"DBSIZE\r\n")
-              r = s.recv(64)
+              s.sendall(b"DBSIZE\r\nCLIENT INFO\r\n")
+              data = b""
+              while b"\n" not in data or (data.count(b"\n") < 2 and b"laddr=" not in data):
+                  chunk = s.recv(512)
+                  if not chunk:
+                      break
+                  data += chunk
               s.close()
-              out = "ok " + r.decode(errors="replace").strip()
+              lines = [ln.strip() for ln in data.decode(errors="replace").splitlines() if ln.strip()]
+              db_line = lines[0] if lines else ""
+              laddr = ""
+              for ln in lines[1:]:
+                  for tok in ln.split():
+                      if tok.startswith("laddr="):
+                          laddr = tok.split("=", 1)[1].split(":", 1)[0]
+                          break
+              out = ("ok " + db_line + (" " + laddr if laddr else "")).strip()
           except ConnectionRefusedError:
               out = "refused"
           except socket.timeout:
@@ -1464,7 +1504,6 @@ spec:
         memory: 32Mi
 EOF
   kubectl wait -n "${NAMESPACE}" --for=condition=Ready pod/observer-t2-redis --timeout=180s >/dev/null
-  echo "${pnode}"
 }
 
 start_s8_watches() {
@@ -1474,64 +1513,94 @@ start_s8_watches() {
   stop_s8_watches
 
   python3 - "${NAMESPACE}" "${pod_selector}" "${run_dir}/pods.ndjson" "${KUBECTL_CMD}" <<'PY' 2>"${run_dir}/podwatch.err" &
-import json, subprocess, sys, time
+import json, signal, subprocess, sys, time
 ns, selector, out_path, kubectl_bin = sys.argv[1:5]
 proc = subprocess.Popen(
     [kubectl_bin, "-n", ns, "get", "pods", "-l", selector, "--watch", "-o", "json"],
     stdout=subprocess.PIPE,
     text=True,
 )
+def _stop(signum, frame):
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    sys.exit(0)
+signal.signal(signal.SIGTERM, _stop)
+signal.signal(signal.SIGINT, _stop)
 buf = []
 depth = 0
-with open(out_path, "w") as out:
-    for line in proc.stdout:
-        s = line.strip()
-        if not s and depth == 0:
-            continue
-        buf.append(line)
-        depth += line.count("{") - line.count("}")
-        if depth <= 0 and buf:
-            raw = "".join(buf)
-            buf = []
-            depth = 0
-            try:
-                obj = json.loads(raw)
-                rec = {"t_ms": int(time.time() * 1000), "ev": {"type": "WATCH", "object": obj}}
-                out.write(json.dumps(rec) + "\n")
-                out.flush()
-            except Exception:
-                pass
+try:
+    with open(out_path, "w") as out:
+        for line in proc.stdout:
+            s = line.strip()
+            if not s and depth == 0:
+                continue
+            buf.append(line)
+            depth += line.count("{") - line.count("}")
+            if depth <= 0 and buf:
+                raw = "".join(buf)
+                buf = []
+                depth = 0
+                try:
+                    obj = json.loads(raw)
+                    rec = {"t_ms": int(time.time() * 1000), "ev": {"type": "WATCH", "object": obj}}
+                    out.write(json.dumps(rec) + "\n")
+                    out.flush()
+                except Exception:
+                    pass
+finally:
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        pass
 PY
   S8_WATCH_PIDS+=($!)
 
   python3 - "${NAMESPACE}" "${svc_name}" "${run_dir}/endpointslices.ndjson" "${KUBECTL_CMD}" <<'PY' 2>"${run_dir}/epwatch.err" &
-import json, subprocess, sys, time
+import json, signal, subprocess, sys, time
 ns, svc_name, out_path, kubectl_bin = sys.argv[1:5]
 proc = subprocess.Popen(
     [kubectl_bin, "-n", ns, "get", "endpointslices", "-l", f"kubernetes.io/service-name={svc_name}", "--watch", "-o", "json"],
     stdout=subprocess.PIPE,
     text=True,
 )
+def _stop(signum, frame):
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    sys.exit(0)
+signal.signal(signal.SIGTERM, _stop)
+signal.signal(signal.SIGINT, _stop)
 buf = []
 depth = 0
-with open(out_path, "w") as out:
-    for line in proc.stdout:
-        s = line.strip()
-        if not s and depth == 0:
-            continue
-        buf.append(line)
-        depth += line.count("{") - line.count("}")
-        if depth <= 0 and buf:
-            raw = "".join(buf)
-            buf = []
-            depth = 0
-            try:
-                obj = json.loads(raw)
-                rec = {"t_ms": int(time.time() * 1000), "ev": {"type": "WATCH", "object": obj}}
-                out.write(json.dumps(rec) + "\n")
-                out.flush()
-            except Exception:
-                pass
+try:
+    with open(out_path, "w") as out:
+        for line in proc.stdout:
+            s = line.strip()
+            if not s and depth == 0:
+                continue
+            buf.append(line)
+            depth += line.count("{") - line.count("}")
+            if depth <= 0 and buf:
+                raw = "".join(buf)
+                buf = []
+                depth = 0
+                try:
+                    obj = json.loads(raw)
+                    rec = {"t_ms": int(time.time() * 1000), "ev": {"type": "WATCH", "object": obj}}
+                    out.write(json.dumps(rec) + "\n")
+                    out.flush()
+                except Exception:
+                    pass
+finally:
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        pass
 PY
   S8_WATCH_PIDS+=($!)
 }
@@ -1544,7 +1613,7 @@ s8_phase_analyze() {
   local enforce_a="${2:-${S8_ENFORCE_CHECK_A}}"
   local enforce_b="${3:-${S8_ENFORCE_CHECK_B}}"
 
-  python3 - "${run_dir}" "${enforce_a}" "${enforce_b}" <<'PY'
+  if ! python3 - "${run_dir}" "${enforce_a}" "${enforce_b}" <<'PY'; then
 import datetime, json, os, sys
 
 run_dir, enforce_a_str, enforce_b_str = sys.argv[1:4]
@@ -1578,6 +1647,10 @@ src_pod = "t2-redis-0"
 if os.path.exists(f"{run_dir}/source_pod.txt"):
     src_pod = open(f"{run_dir}/source_pod.txt").read().strip() or src_pod
 
+src_uid = ""
+if os.path.exists(f"{run_dir}/source_pod_uid.txt"):
+    src_uid = open(f"{run_dir}/source_pod_uid.txt").read().strip()
+
 drain_ms = 0
 if os.path.exists(f"{run_dir}/drain_ms.txt"):
     try:
@@ -1595,6 +1668,9 @@ if os.path.exists(f"{run_dir}/phase.txt"):
                     phase_kv[k] = v
 
 window_w = float(phase_kv.get("W", "5"))
+dataplane_mode = phase_kv.get("dataplane_mode", "kube-proxy")
+quiet_start_ms = int(phase_kv["quiet_start_ms"]) if "quiet_start_ms" in phase_kv and phase_kv["quiet_start_ms"].isdigit() else None
+anchor_created_ms = int(phase_kv["anchor_created_ms"]) if "anchor_created_ms" in phase_kv and phase_kv["anchor_created_ms"].isdigit() else None
 
 # 1. Parse pinger.log -> cold_served, lost_after_ckpt using M0 segment analysis
 acks = []
@@ -1628,41 +1704,17 @@ if src_seg and restored:
     lost_after_ckpt = max(0, src_seg["last"] - c)
 cold_served = sum(s["n"] for s in segs[1:] if s["kind"] == "cold")
 
-# 2. Parse observer.log -> empty_reads (DBSIZE < 50000 after drain) and kube_proxy_sync_s
-empty_reads = 0
-kp_sync_ms = None
-if os.path.exists(f"{run_dir}/observer.log"):
-    with open(f"{run_dir}/observer.log") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 3:
-                try:
-                    t_ms = int(parts[0])
-                except Exception:
-                    continue
-                status = parts[2]
-                if t_ms >= drain_ms:
-                    if status == "ok" and len(parts) >= 4 and parts[3].startswith(":"):
-                        try:
-                            dbsize = int(parts[3][1:])
-                            if dbsize < 50000:
-                                empty_reads += 1
-                                if kp_sync_ms is None:
-                                    kp_sync_ms = t_ms
-                        except Exception:
-                            pass
-                    elif status in ("refused", "timeout", "reset"):
-                        if kp_sync_ms is None:
-                            kp_sync_ms = t_ms
-
-kp_sync_s = round((kp_sync_ms - drain_ms) / 1000.0, 3) if (kp_sync_ms is not None and drain_ms > 0) else None
-
-# 3. Load pod, snapshot, and event records for Check (a) (#151) and Check (b) (#131)
+# 2. Load pod, EndpointSlice, and collector records
 pod_records = load_ndjson(f"{run_dir}/pods.ndjson")
 ep_records = load_ndjson(f"{run_dir}/endpointslices.ndjson")
 collector_records = load_ndjson(f"{run_dir}/records.ndjson")
 
 ckpt_ms = None
+restored_pod_uids = set()
+earliest_src_pod_uid = ""
+earliest_src_pod_ms = None
+initial_src_ip = ""
+
 for r in collector_records:
     gvr = r.get("gvr", "")
     obj = r.get("obj") or {}
@@ -1678,14 +1730,108 @@ for r in collector_records:
     elif gvr.startswith("podmigrationjobs."):
         spec = obj.get("spec") or {}
         if (spec.get("podRef") or {}).get("name") == src_pod:
+            if not src_uid and spec.get("targetPodUID"):
+                src_uid = spec["targetPodUID"]
+            if st.get("restoredPodUID"):
+                restored_pod_uids.add(st["restoredPodUID"])
             ev_ms = parse_iso_ms(st.get("evictingStartTime"))
             if ev_ms is not None and (ckpt_ms is None or ev_ms < ckpt_ms):
                 ckpt_ms = ev_ms
+    elif gvr == "pods.v1":
+        if md.get("name") == src_pod and md.get("uid"):
+            c_ms = parse_iso_ms(md.get("creationTimestamp")) or t_ms
+            if earliest_src_pod_ms is None or (c_ms is not None and c_ms < earliest_src_pod_ms):
+                earliest_src_pod_ms = c_ms
+                earliest_src_pod_uid = md["uid"]
+                if st.get("podIP"):
+                    initial_src_ip = st["podIP"]
 
-if ckpt_ms is None and drain_ms > 0:
-    ckpt_ms = drain_ms
+if not src_uid and earliest_src_pod_uid and earliest_src_pod_uid not in restored_pod_uids:
+    src_uid = earliest_src_pod_uid
 
-# Check (a) (#151): No source pod emits "Successfully restored the pod from PodSnapshot" after its checkpoint
+# 3. Parse observer.log -> empty_reads (DBSIZE < 50000 after drain), backend cutover, and kube_proxy_sync_s
+empty_reads = 0
+kp_sync_ms = None
+backend_cutover_ms = None
+obs_before_drain = 0
+obs_after_drain = 0
+initial_backend_ip = initial_src_ip
+
+if os.path.exists(f"{run_dir}/observer.log"):
+    with open(f"{run_dir}/observer.log") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 3 and parts[0] != "START":
+                try:
+                    t_ms = int(parts[0])
+                except Exception:
+                    continue
+                status = parts[2]
+                backend_ip = parts[4] if (status == "ok" and len(parts) >= 5) else ""
+                if t_ms < drain_ms:
+                    obs_before_drain += 1
+                    if status == "ok" and backend_ip and not initial_backend_ip:
+                        initial_backend_ip = backend_ip
+                else:
+                    obs_after_drain += 1
+                    if status == "ok" and len(parts) >= 4 and parts[3].startswith(":"):
+                        try:
+                            dbsize = int(parts[3][1:])
+                            if dbsize < 50000:
+                                empty_reads += 1
+                                if kp_sync_ms is None:
+                                    kp_sync_ms = t_ms
+                        except Exception:
+                            pass
+                        if backend_ip and initial_backend_ip and backend_ip != initial_backend_ip:
+                            if backend_cutover_ms is None:
+                                backend_cutover_ms = t_ms
+                            if kp_sync_ms is None:
+                                kp_sync_ms = t_ms
+                    elif status in ("refused", "timeout", "reset"):
+                        if kp_sync_ms is None:
+                            kp_sync_ms = t_ms
+
+kp_sync_s = round((kp_sync_ms - drain_ms) / 1000.0, 3) if (kp_sync_ms is not None and drain_ms > 0) else None
+backend_cutover_s = round((backend_cutover_ms - drain_ms) / 1000.0, 3) if (backend_cutover_ms is not None and drain_ms > 0) else None
+phase_applicable = dataplane_mode == "kube-proxy"
+phase_hit = bool(phase_applicable and kp_sync_s is not None and abs(kp_sync_s - window_w) <= 3.5)
+
+# Validate minimum non-empty inputs (fail closed if pinger/observer/watches/checkpoint failed to record)
+acks_before_drain = [a for a in acks if a[0] < drain_ms]
+acks_after_drain = [a for a in acks if a[0] >= drain_ms]
+total_pod_obs = len(pod_records) + sum(1 for r in collector_records if r.get("gvr") == "pods.v1")
+total_ep_obs = len(ep_records) + sum(1 for r in collector_records if r.get("gvr", "").startswith("endpointslices."))
+
+inconclusive_reasons = []
+if drain_ms <= 0:
+    inconclusive_reasons.append("missing or invalid drain_ms")
+if ckpt_ms is None:
+    inconclusive_reasons.append("missing checkpoint timestamp (no PodSnapshot/PSMT/PMJ evictingStartTime found)")
+if len(acks_before_drain) == 0:
+    inconclusive_reasons.append("0 pinger acks before drain_ms")
+if len(acks_after_drain) == 0:
+    inconclusive_reasons.append("0 pinger acks after drain_ms")
+if obs_after_drain == 0:
+    inconclusive_reasons.append("0 observer samples after drain_ms")
+if total_pod_obs == 0:
+    inconclusive_reasons.append("0 pod watch/collector records")
+if total_ep_obs == 0:
+    inconclusive_reasons.append("0 EndpointSlice watch/collector records")
+
+inputs_valid = len(inconclusive_reasons) == 0
+
+# Quiet period EndpointSlice churn check (#149)
+quiet_period_ep_churn_count = 0
+if quiet_start_ms is not None and anchor_created_ms is not None:
+    for r in ep_records:
+        rt = r.get("t_ms")
+        if rt is not None and quiet_start_ms <= rt < anchor_created_ms:
+            quiet_period_ep_churn_count += 1
+
+# Check (a) (#151): No source pod emits "Successfully restored the pod from PodSnapshot" after its checkpoint.
+# Match by source pod UID (src_uid) so a StatefulSet replacement pod with the same name (e.g. t2-redis-0)
+# and a different UID is never misidentified as the source pod re-restoring.
 re_restore_violations = []
 events_list = []
 if os.path.exists(f"{run_dir}/events.json"):
@@ -1707,8 +1853,16 @@ for ev in events_list:
     if uid:
         seen_ev_uids.add(uid)
     inv = ev.get("involvedObject") or ev.get("regarding") or {}
-    if inv.get("name") != src_pod:
+    inv_uid = inv.get("uid") or ""
+    inv_name = inv.get("name") or ""
+    if inv_uid and inv_uid in restored_pod_uids:
         continue
+    if src_uid and inv_uid:
+        if inv_uid != src_uid:
+            continue
+    else:
+        if inv_name != src_pod:
+            continue
     msg = ev.get("message") or ev.get("note") or ""
     if "Successfully restored the pod from PodSnapshot" not in msg:
         continue
@@ -1718,19 +1872,21 @@ for ev in events_list:
         or parse_iso_ms(md.get("creationTimestamp"))
     )
     count = int(ev.get("count") or 1)
-    if (ckpt_ms is not None and ev_ms is not None and ev_ms >= ckpt_ms) or count > 1:
+    if ckpt_ms is not None and ev_ms is not None and ev_ms >= ckpt_ms:
         re_restore_violations.append({
-            "pod": src_pod,
+            "pod": inv_name or src_pod,
+            "pod_uid": inv_uid or src_uid,
             "event_ms": ev_ms,
             "checkpoint_ms": ckpt_ms,
             "count": count,
             "message": msg,
         })
 
-check_a_pass = len(re_restore_violations) == 0
+check_a_pass = inputs_valid and (len(re_restore_violations) == 0)
 
-# Check (b) (#131): A pod labeled as fenced (pod-migration.gke.io/fenced=true) is never serving in any EndpointSlice
-fenced_pods = {}  # pod_name -> {"fence_ms": int, "ips": set()}
+# Check (b) (#131): A pod labeled as fenced (pod-migration.gke.io/fenced=true) is never serving in any EndpointSlice.
+# Key fenced_pods by Pod UID so a StatefulSet replacement pod with the same name does not collide with the fenced source pod.
+fenced_pods = {}  # pod_uid -> {"uid": str, "name": str, "fence_ms": int, "ready_false_ms": int, "first_non_serving_ep_ms": int, "ips": set()}
 
 def inspect_pod_obj(t_ms, obj):
     md = obj.get("metadata") or {}
@@ -1738,10 +1894,19 @@ def inspect_pod_obj(t_ms, obj):
     name = md.get("name")
     if not name:
         return
+    p_uid = md.get("uid") or ""
+    if not p_uid:
+        if name == src_pod and src_uid:
+            p_uid = src_uid
+        else:
+            p_uid = f"name:{name}"
     labels = md.get("labels") or {}
     ip = st.get("podIP")
     if labels.get("pod-migration.gke.io/fenced") == "true":
-        entry = fenced_pods.setdefault(name, {"fence_ms": t_ms, "ready_false_ms": None, "ips": set()})
+        entry = fenced_pods.setdefault(
+            p_uid,
+            {"uid": p_uid, "name": name, "fence_ms": t_ms, "ready_false_ms": None, "first_non_serving_ep_ms": None, "ips": set()},
+        )
         if t_ms is not None and (entry["fence_ms"] is None or t_ms < entry["fence_ms"]):
             entry["fence_ms"] = t_ms
         if ip:
@@ -1762,46 +1927,86 @@ for r in collector_records:
 
 fenced_serving_violations = []
 
-def inspect_ep_obj(t_ms, obj):
-    for ep in obj.get("endpoints") or []:
-        conds = ep.get("conditions") or {}
-        if not conds.get("serving"):
-            continue
-        tref = ep.get("targetRef") or {}
-        tname = tref.get("name")
-        addrs = set(ep.get("addresses") or [])
-        for fp_name, fp_info in fenced_pods.items():
-            matched = (tname == fp_name) or bool(addrs & fp_info["ips"])
-            if not matched:
-                continue
-            anchor_ms = fp_info["ready_false_ms"] or fp_info["fence_ms"]
-            if anchor_ms is not None and t_ms is not None and t_ms > anchor_ms + 50:
-                fenced_serving_violations.append({
-                    "pod": fp_name,
-                    "addresses": sorted(addrs),
-                    "t_ms": t_ms,
-                    "fence_ms": anchor_ms,
-                    "offset_after_fence_ms": t_ms - anchor_ms,
-                })
-
+all_ep_events = []
 for r in ep_records:
-    inspect_ep_obj(r.get("t_ms"), (r.get("ev") or {}).get("object") or {})
-
+    all_ep_events.append((r.get("t_ms"), (r.get("ev") or {}).get("object") or {}))
 for r in collector_records:
     if r.get("gvr", "").startswith("endpointslices."):
-        inspect_ep_obj(parse_iso_ms(r.get("ts")), r.get("obj") or {})
+        all_ep_events.append((parse_iso_ms(r.get("ts")), r.get("obj") or {}))
+all_ep_events.sort(key=lambda x: x[0] if x[0] is not None else 0)
 
-check_b_pass = len(fenced_serving_violations) == 0
+def endpoint_matches_fenced_pod(ep, fp_uid, fp_info):
+    tref = ep.get("targetRef") or {}
+    t_uid = tref.get("uid") or ""
+    if t_uid and t_uid in restored_pod_uids:
+        return False
+    if t_uid and not fp_uid.startswith("name:"):
+        return t_uid == fp_uid
+    addrs = set(ep.get("addresses") or [])
+    if addrs and fp_info["ips"]:
+        return bool(addrs & fp_info["ips"])
+    return (not t_uid) and (tref.get("name") == fp_info["name"])
+
+for t_ms, obj in all_ep_events:
+    endpoints = obj.get("endpoints") or []
+    for fp_uid, fp_info in fenced_pods.items():
+        anchor_ms = fp_info["ready_false_ms"] or fp_info["fence_ms"]
+        matched_eps = [ep for ep in endpoints if endpoint_matches_fenced_pod(ep, fp_uid, fp_info)]
+        is_serving = any((ep.get("conditions") or {}).get("serving") is True for ep in matched_eps)
+        if not is_serving:
+            if t_ms is not None and anchor_ms is not None and t_ms >= anchor_ms:
+                if fp_info["first_non_serving_ep_ms"] is None or t_ms < fp_info["first_non_serving_ep_ms"]:
+                    fp_info["first_non_serving_ep_ms"] = t_ms
+        else:
+            # Violation if:
+            #  (1) fenced pod UID was already observed non-serving in EndpointSlice and became serving=true again, OR
+            #  (2) fenced pod UID remained serving=true more than 1500ms after fence/Ready=False timestamp.
+            non_serving_ms = fp_info["first_non_serving_ep_ms"]
+            re_served = non_serving_ms is not None and t_ms is not None and t_ms > non_serving_ms
+            stale_serving = anchor_ms is not None and t_ms is not None and t_ms > anchor_ms + 1500
+            if re_served or stale_serving:
+                addrs = sorted({a for ep in matched_eps for a in (ep.get("addresses") or [])})
+                fenced_serving_violations.append({
+                    "pod": fp_info["name"],
+                    "pod_uid": fp_uid,
+                    "addresses": addrs,
+                    "t_ms": t_ms,
+                    "fence_ms": anchor_ms,
+                    "first_non_serving_ep_ms": non_serving_ms,
+                    "offset_after_fence_ms": (t_ms - anchor_ms) if (t_ms is not None and anchor_ms is not None) else None,
+                })
+
+fenced_pods_seen = len(fenced_pods)
+no_fenced_pods_seen = fenced_pods_seen == 0
+if not inputs_valid:
+    check_b_pass = False
+elif no_fenced_pods_seen:
+    # Never pass vacuously when enforcement is requested (#131); in report-only mode record status explicitly.
+    check_b_pass = False if enforce_b else True
+else:
+    check_b_pass = len(fenced_serving_violations) == 0
 
 summary = {
     "source_pod": src_pod,
+    "source_pod_uid": src_uid,
+    "restored_pod_uids": sorted(restored_pod_uids),
+    "inputs_valid": inputs_valid,
+    "inconclusive_reasons": inconclusive_reasons,
+    "dataplane_mode": dataplane_mode,
+    "phase_applicable": phase_applicable,
     "window_w_s": window_w,
     "drain_ms": drain_ms,
     "checkpoint_ms": ckpt_ms,
     "kube_proxy_sync_s": kp_sync_s,
+    "backend_cutover_s": backend_cutover_s,
+    "phase_hit": phase_hit,
+    "quiet_period_ep_churn_count": quiet_period_ep_churn_count,
+    "quiet_period_clean": quiet_period_ep_churn_count == 0,
     "cold_served": cold_served,
     "empty_reads": empty_reads,
     "lost_after_ckpt": lost_after_ckpt,
+    "fenced_pods_seen": fenced_pods_seen,
+    "no_fenced_pods_seen": no_fenced_pods_seen,
     "fenced_pods_observed": sorted(fenced_pods.keys()),
     "check_a_source_no_rerestore": {
         "issue": "#151",
@@ -1813,6 +2018,8 @@ summary = {
         "issue": "#131",
         "pass": check_b_pass,
         "enforced": enforce_b,
+        "fenced_pods_seen": fenced_pods_seen,
+        "status": "no_fenced_pods_seen" if no_fenced_pods_seen else ("pass" if len(fenced_serving_violations) == 0 else "fail"),
         "violations": fenced_serving_violations,
     },
 }
@@ -1821,111 +2028,133 @@ with open(f"{run_dir}/s8_phase_continuity.json", "w") as f:
     json.dump(summary, f, indent=2)
 
 print(
-    f"S8 summary: W={window_w}s kp_sync_s={kp_sync_s} cold_served={cold_served} "
-    f"empty_reads={empty_reads} lost_after_ckpt={lost_after_ckpt} "
+    f"S8 summary: W={window_w}s dataplane={dataplane_mode} kp_sync_s={kp_sync_s} phase_hit={phase_hit} "
+    f"cold_served={cold_served} empty_reads={empty_reads} lost_after_ckpt={lost_after_ckpt} "
+    f"fenced_pods_seen={fenced_pods_seen} "
     f"check_a_pass={check_a_pass}(enforced={enforce_a}) "
     f"check_b_pass={check_b_pass}(enforced={enforce_b})"
 )
+
+if not inputs_valid:
+    print(f"S8 INCONCLUSIVE / INVALID INPUTS: {', '.join(inconclusive_reasons)}", file=sys.stderr)
+    sys.exit(1)
 PY
+    die "S8 FAIL: phase analysis inputs were empty or inconclusive (${run_dir}/s8_phase_continuity.json)"
+  fi
 
   local summary_json="${run_dir}/s8_phase_continuity.json"
-  local check_a_pass check_b_pass cold_served empty_reads lost_after_ckpt kp_sync_s
+  local check_a_pass check_b_pass cold_served empty_reads lost_after_ckpt kp_sync_s fenced_pods_seen
   check_a_pass="$(jq -r '.check_a_source_no_rerestore.pass' "${summary_json}")"
   check_b_pass="$(jq -r '.check_b_fenced_never_serving.pass' "${summary_json}")"
   cold_served="$(jq -r '.cold_served' "${summary_json}")"
   empty_reads="$(jq -r '.empty_reads' "${summary_json}")"
   lost_after_ckpt="$(jq -r '.lost_after_ckpt' "${summary_json}")"
   kp_sync_s="$(jq -r '.kube_proxy_sync_s // "n/a"' "${summary_json}")"
+  fenced_pods_seen="$(jq -r '.fenced_pods_seen' "${summary_json}")"
 
-  # Record Check (a) (#151) in pmprofiler
-  local check_a_flag="--pass"
-  local check_a_detail="0 source re-restore events after checkpoint (#151)"
-  if [[ "${check_a_pass}" != "true" ]]; then
-    if [[ "${enforce_a}" == "true" ]]; then
-      check_a_flag="--pass=false"
-      check_a_detail="VIOLATION (#151): source pod emitted 'Successfully restored the pod from PodSnapshot' after checkpoint"
-    else
-      check_a_detail="[REPORT-ONLY: VIOLATION OBSERVED] source pod emitted 'Successfully restored the pod from PodSnapshot' after checkpoint (#151)"
-    fi
+  # Record Check (a) (#151) in pmprofiler: never record a fake green --pass when a violation occurred in report-only mode
+  if [[ "${check_a_pass}" == "true" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "S8 Check (a): no source re-restore after checkpoint (#151)" --group "redis" \
+      --pass --value 1 --total 1 \
+      --detail "0 source re-restore events after checkpoint (source_uid=$(jq -r '.source_pod_uid' "${summary_json}"))" >/dev/null || true
+  elif [[ "${enforce_a}" == "true" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "S8 Check (a): no source re-restore after checkpoint (#151)" --group "redis" \
+      --pass=false --value 0 --total 1 \
+      --detail "VIOLATION (#151): source pod emitted 'Successfully restored the pod from PodSnapshot' after checkpoint" >/dev/null || true
+    die "S8 FAIL (Check a / #151): source pod re-restored from PodSnapshot after checkpoint (${summary_json})"
+  else
+    err "S8 Check (a) [REPORT-ONLY WARNING]: source pod emitted 'Successfully restored the pod from PodSnapshot' after checkpoint (#151)"
   fi
-  "${PMPROFILER_BIN}" check --run "${run_dir}" \
-    --name "S8 Check (a): no source re-restore after checkpoint (#151)" --group "redis" \
-    "${check_a_flag}" --value "$([[ "${check_a_pass}" == "true" ]] && echo 1 || echo 0)" --total 1 \
-    --detail "${check_a_detail}" >/dev/null || true
 
   # Record Check (b) (#131) + phase-anchored serving continuity in pmprofiler
-  local check_b_flag="--pass"
   local check_b_ok="true"
-  if [[ "${check_b_pass}" != "true" || "${cold_served}" -gt 0 || "${empty_reads}" -gt 0 ]]; then
+  if [[ "${check_b_pass}" != "true" || "${cold_served}" -gt 0 || "${empty_reads}" -gt 0 || "${fenced_pods_seen}" -eq 0 ]]; then
     check_b_ok="false"
   fi
-  local check_b_detail="fenced_serving_pass=${check_b_pass}, cold_served=${cold_served}, empty_reads=${empty_reads}, lost_after_ckpt=${lost_after_ckpt}, kp_sync_s=${kp_sync_s}"
-  if [[ "${check_b_ok}" != "true" ]]; then
-    if [[ "${enforce_b}" == "true" ]]; then
-      check_b_flag="--pass=false"
-      check_b_detail="VIOLATION (#131): ${check_b_detail}"
-    else
-      check_b_detail="[REPORT-ONLY: VIOLATION OBSERVED] ${check_b_detail}"
-    fi
-  fi
-  "${PMPROFILER_BIN}" check --run "${run_dir}" \
-    --name "S8 Check (b): fenced pod never serving & zero cold/empty reads (#131)" --group "redis" \
-    "${check_b_flag}" --value "$([[ "${check_b_ok}" == "true" ]] && echo 1 || echo 0)" --total 1 \
-    --detail "${check_b_detail}" >/dev/null || true
-
-  if [[ "${enforce_a}" == "true" && "${check_a_pass}" != "true" ]]; then
-    die "S8 FAIL (Check a / #151): source pod re-restored from PodSnapshot after checkpoint (${summary_json})"
-  fi
-  if [[ "${enforce_b}" == "true" && "${check_b_ok}" != "true" ]]; then
-    die "S8 FAIL (Check b / #131): fenced pod serving or cold/empty reads observed: ${check_b_detail} (${summary_json})"
+  local check_b_detail="fenced_pods_seen=${fenced_pods_seen}, fenced_serving_pass=${check_b_pass}, cold_served=${cold_served}, empty_reads=${empty_reads}, lost_after_ckpt=${lost_after_ckpt}, kp_sync_s=${kp_sync_s}"
+  if [[ "${check_b_ok}" == "true" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "S8 Check (b): fenced pod never serving & zero cold/empty reads (#131)" --group "redis" \
+      --pass --value 1 --total 1 \
+      --detail "${check_b_detail}" >/dev/null || true
+  elif [[ "${enforce_b}" == "true" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "S8 Check (b): fenced pod never serving & zero cold/empty reads (#131)" --group "redis" \
+      --pass=false --value 0 --total 1 \
+      --detail "VIOLATION (#131): ${check_b_detail}" >/dev/null || true
+    die "S8 FAIL (Check b / #131): fenced pod serving, no fenced pods seen, or cold/empty reads observed: ${check_b_detail} (${summary_json})"
+  else
+    err "S8 Check (b) [REPORT-ONLY WARNING]: ${check_b_detail} (#131)"
   fi
 }
 
-# S8: Phase-controlled write-continuity scenario (#149, #151, #131)
-run_scenario_s8() {
-  local run_dir="${OUT_DIR}/s8-phase-controlled-continuity"
-  log "=== Running Scenario S8: Phase-Controlled Write-Continuity (W=${S8_WINDOW_W}s, enforce_a=${S8_ENFORCE_CHECK_A}, enforce_b=${S8_ENFORCE_CHECK_B}) ==="
+detect_s8_dataplane_mode() {
+  local kp_pods
+  kp_pods="$("${KUBECTL_CMD}" get pods -n kube-system -l k8s-app=kube-proxy -o name 2>/dev/null || true)"
+  if [[ -z "${kp_pods}" ]]; then
+    kp_pods="$("${KUBECTL_CMD}" get daemonset -n kube-system kube-proxy -o name 2>/dev/null || true)"
+  fi
+  if [[ -n "${kp_pods}" ]]; then
+    echo "kube-proxy"
+  else
+    echo "dataplane-v2"
+  fi
+}
+
+run_scenario_s8_single_w() {
+  local w_val="$1"
+  local run_dir="$2"
+  log "=== Running Scenario S8: Phase-Controlled Write-Continuity (W=${w_val}s, enforce_a=${S8_ENFORCE_CHECK_A}, enforce_b=${S8_ENFORCE_CHECK_B}) ==="
   clean_test_workloads
   clean_stale_migration_resources
   ensure_podmigration_policy "diskless-migration"
   deploy_redis_workload "t2-redis"
   sleep 2
 
-  local src_pod nonce src_node pinger_node
+  local src_pod src_uid nonce src_node dataplane_mode
   src_pod="t2-redis-0"
+  src_uid="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.metadata.uid}')"
   nonce="nonce-s8-$(date +%s)"
   v_redis_seed "${src_pod}" "${nonce}"
   src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
-  pinger_node="$(deploy_s8_pinger_and_observer "t2-redis-svc")"
-  log "S8 source pod ${src_pod} on ${src_node}; pinger + 20ms observer co-located on ${pinger_node}"
+  deploy_s8_pinger_and_observer "t2-redis-svc"
+  dataplane_mode="$(detect_s8_dataplane_mode)"
+  if [[ "${dataplane_mode}" != "kube-proxy" ]]; then
+    log "S8 note: no kube-proxy detected in kube-system (dataplane_mode=${dataplane_mode}); kube-proxy 10s sync phase anchor is not applicable on Dataplane V2"
+  fi
+  log "S8 source pod ${src_pod} (uid=${src_uid}) on ${src_node}; pinger + 20ms observer co-located on ${PINGER_NODE} (dataplane=${dataplane_mode})"
 
-  start_collector "${run_dir}" "S8: Phase-controlled write-continuity (W=${S8_WINDOW_W}s)"
+  start_collector "${run_dir}" "S8: Phase-controlled write-continuity (W=${w_val}s)"
   start_s8_watches "${run_dir}" "app=t2-redis" "t2-redis-svc"
 
-  # Phase anchor (G0 / #149): 12s quiet period so kube-proxy sync timer is idle,
-  # create throwaway ClusterIP Service at A, then trigger drain/eviction at A + (10 - W)s.
+  # Cordon source node BEFORE the 12s quiet period so node cordon API writes and round-trip latency
+  # do not disturb the quiet window or shift eviction off the computed target timestamp.
   local anchor_svc="s8-phase-anchor"
   kubectl delete service "${anchor_svc}" -n "${NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
+  cordon_node "${src_node}"
+
+  local quiet_start_ms a_ms d_sec target_ms cur_ms sleep_s drain_ms
+  quiet_start_ms="$(now_ms)"
   log "S8 phase anchor: waiting 12s quiet period before creating throwaway ClusterIP Service ${anchor_svc}"
   sleep 12
   kubectl create service clusterip "${anchor_svc}" -n "${NAMESPACE}" --tcp=1:1 >/dev/null
-  local a_ms d_sec target_ms drain_ms
-  a_ms="$(date +%s%3N)"
-  d_sec="$(awk -v w="${S8_WINDOW_W}" 'BEGIN { x = 10 - w; if (x < 0) x = 0; printf "%.3f", x }')"
+  a_ms="$(now_ms)"
+  d_sec="$(awk -v w="${w_val}" 'BEGIN { x = 10 - w; if (x < 0) x = 0; printf "%.3f", x }')"
   target_ms="$(awk -v a="${a_ms}" -v d="${d_sec}" 'BEGIN { printf "%d", a + d * 1000 }')"
-  local now_ms sleep_s
-  now_ms="$(date +%s%3N)"
-  sleep_s="$(awk -v t="${target_ms}" -v n="${now_ms}" 'BEGIN { x = (t - n) / 1000; if (x < 0) x = 0; printf "%.3f", x }')"
+  cur_ms="$(now_ms)"
+  sleep_s="$(awk -v t="${target_ms}" -v n="${cur_ms}" 'BEGIN { x = (t - n) / 1000; if (x < 0) x = 0; printf "%.3f", x }')"
   sleep "${sleep_s}"
 
-  drain_ms="$(date +%s%3N)"
+  drain_ms="$(now_ms)"
+  evict_pod "${src_pod}"
+
   echo "${drain_ms}" >"${run_dir}/drain_ms.txt"
   printf '%s\n' "${src_pod}" >"${run_dir}/source_pod.txt"
-  printf 'anchor_created_ms=%s W=%s D=%s drain_ms=%s drain_minus_anchor_ms=%s pinger_node=%s\n' \
-    "${a_ms}" "${S8_WINDOW_W}" "${d_sec}" "${drain_ms}" "$((drain_ms - a_ms))" "${pinger_node}" >"${run_dir}/phase.txt"
-
-  cordon_node "${src_node}"
-  evict_pod "${src_pod}"
+  printf '%s\n' "${src_uid}" >"${run_dir}/source_pod_uid.txt"
+  printf 'quiet_start_ms=%s anchor_created_ms=%s W=%s D=%s drain_ms=%s drain_minus_anchor_ms=%s pinger_node=%s dataplane_mode=%s\n' \
+    "${quiet_start_ms}" "${a_ms}" "${w_val}" "${d_sec}" "${drain_ms}" "$((drain_ms - a_ms))" "${PINGER_NODE}" "${dataplane_mode}" >"${run_dir}/phase.txt"
 
   wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
   uncordon_all_tracked_nodes
@@ -1944,6 +2173,21 @@ run_scenario_s8() {
 
   finish_and_assert_run "${run_dir}" "false"
   clean_test_workloads
+}
+
+# S8: Phase-controlled write-continuity scenario (#149, #151, #131)
+run_scenario_s8() {
+  local w_list=()
+  IFS=',' read -ra w_list <<<"${S8_WINDOW_W}"
+  if [[ "${#w_list[@]}" -le 1 ]]; then
+    run_scenario_s8_single_w "${w_list[0]}" "${OUT_DIR}/s8-phase-controlled-continuity"
+  else
+    local w_val
+    for w_val in "${w_list[@]}"; do
+      local w_slug="${w_val//./_}"
+      run_scenario_s8_single_w "${w_val}" "${OUT_DIR}/s8-phase-controlled-continuity-w${w_slug}"
+    done
+  fi
 }
 
 # ==============================================================================
@@ -1977,15 +2221,31 @@ pod_migration_invariant_violations_total{invariant="I9_ColdStartTransparency"} 0
     local phase="$7"
     local restored_status="$8"
     local restored_reason="$9"
+    local src_uid="${10:-}"
+    local dst_uid="${11:-}"
+    if [[ -z "${src_uid}" ]]; then
+      if [[ "${src_pod}" == "${dst_pod}" ]]; then
+        src_uid="uid-${src_pod}-src"
+      else
+        src_uid="uid-${src_pod}"
+      fi
+    fi
+    if [[ -z "${dst_uid}" ]]; then
+      if [[ "${src_pod}" == "${dst_pod}" ]]; then
+        dst_uid="uid-${dst_pod}-dst"
+      else
+        dst_uid="uid-${dst_pod}"
+      fi
+    fi
 
     mkdir -p "${dir}"
     cat >"${dir}/meta.json" <<EOF
 {"scenario":"${scenario_name}","namespace":"default","startedAt":"2026-09-27T10:00:00Z","serverVersion":"v1.32.2-gke.1200"}
 EOF
-    python3 - "${dir}/records.ndjson" "${app}" "${pmj_name}" "${src_pod}" "${dst_pod}" "${phase}" "${restored_status}" "${restored_reason}" "${prom_clean}" <<'PY'
+    python3 - "${dir}/records.ndjson" "${app}" "${pmj_name}" "${src_pod}" "${dst_pod}" "${src_uid}" "${dst_uid}" "${phase}" "${restored_status}" "${restored_reason}" "${prom_clean}" <<'PY'
 import json, sys
 
-out_path, app, pmj_name, src_pod, dst_pod, phase, r_status, r_reason, prom_body = sys.argv[1:]
+out_path, app, pmj_name, src_pod, dst_pod, src_uid, dst_uid, phase, r_status, r_reason, prom_body = sys.argv[1:]
 
 records = [
     {
@@ -1995,13 +2255,14 @@ records = [
         "obj": {
             "metadata": {
                 "name": src_pod,
-                "uid": f"uid-{src_pod}",
+                "uid": src_uid,
                 "creationTimestamp": "2026-09-27T09:59:00Z",
                 "labels": {"app": app, "pod-migration.gke.io/enabled": "true"},
             },
             "spec": {"nodeName": "gke-node-a"},
             "status": {
-                "conditions": [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-09-27T09:59:10Z"}]
+                "podIP": "10.24.1.10",
+                "conditions": [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-09-27T09:59:10Z"}],
             },
         },
     },
@@ -2021,7 +2282,7 @@ records = [
         "gvr": "podmigrationjobs.v1alpha1.podmigration.gke.io",
         "obj": {
             "metadata": {"name": pmj_name, "uid": f"uid-{pmj_name}", "creationTimestamp": "2026-09-27T10:00:02Z"},
-            "spec": {"podRef": {"name": src_pod}, "targetPodUID": f"uid-{src_pod}"},
+            "spec": {"podRef": {"name": src_pod}, "targetPodUID": src_uid},
             "status": {"phase": "Snapshotting"},
         },
     },
@@ -2048,7 +2309,7 @@ records = [
         "obj": {
             "metadata": {
                 "name": src_pod,
-                "uid": f"uid-{src_pod}",
+                "uid": src_uid,
                 "creationTimestamp": "2026-09-27T09:59:00Z",
                 "deletionTimestamp": "2026-09-27T10:00:09Z",
                 "labels": {"app": app, "pod-migration.gke.io/enabled": "true"},
@@ -2064,13 +2325,14 @@ records = [
         "obj": {
             "metadata": {
                 "name": dst_pod,
-                "uid": f"uid-{dst_pod}",
+                "uid": dst_uid,
                 "creationTimestamp": "2026-09-27T10:00:10Z",
                 "labels": {"app": app, "pod-migration.gke.io/enabled": "true"},
             },
             "spec": {"nodeName": "gke-node-b"},
             "status": {
-                "conditions": [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-09-27T10:00:14Z"}]
+                "podIP": "10.24.2.20",
+                "conditions": [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-09-27T10:00:14Z"}],
             },
         },
     },
@@ -2080,12 +2342,12 @@ records = [
         "gvr": "podmigrationjobs.v1alpha1.podmigration.gke.io",
         "obj": {
             "metadata": {"name": pmj_name, "uid": f"uid-{pmj_name}", "creationTimestamp": "2026-09-27T10:00:02Z"},
-            "spec": {"podRef": {"name": src_pod}, "targetPodUID": f"uid-{src_pod}"},
+            "spec": {"podRef": {"name": src_pod}, "targetPodUID": src_uid},
             "status": {
                 "phase": phase,
                 "snapshotRef": f"snap-{src_pod}",
                 "restoredPodName": dst_pod,
-                "restoredPodUID": f"uid-{dst_pod}",
+                "restoredPodUID": dst_uid,
                 "evictingStartTime": "2026-09-27T10:00:08Z",
                 "completionTime": "2026-09-27T10:00:15Z",
                 "conditions": [
@@ -2217,12 +2479,16 @@ EOF
   "${PMPROFILER_BIN}" continuity --run "${OUT_DIR}/s7" --trace "${OUT_DIR}/s7/continuity.ndjson" --group "redis"
   "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s7" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
 
-  # S8: Phase-controlled write-continuity scenario (#149, #151, #131) - Clean fenced run
+  # S8: Phase-controlled write-continuity scenario (#149, #151, #131) - Clean fenced StatefulSet run
+  # Use the SAME pod name ("t2-redis-0") for both source (uid-t2-redis-0-src) and replacement (uid-t2-redis-0-dst)
+  # to verify that Check (a) and Check (b) correlate by Pod UID rather than colliding on StatefulSet pod names.
   emit_synthetic_scenario "${OUT_DIR}/s8" "S8: Phase-controlled write-continuity (W=5s)" \
-    "redis" "pmj-s8-redis" "redis-s8-0" "redis-s8-0-restored" "Succeeded" "True" "RestoreVerified"
+    "redis" "pmj-s8-redis" "t2-redis-0" "t2-redis-0" "Succeeded" "True" "RestoreVerified" \
+    "uid-t2-redis-0-src" "uid-t2-redis-0-dst"
   echo "1758967203000" >"${OUT_DIR}/s8/drain_ms.txt"
-  printf '%s\n' "redis-s8-0" >"${OUT_DIR}/s8/source_pod.txt"
-  printf 'anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b\n' >"${OUT_DIR}/s8/phase.txt"
+  printf '%s\n' "t2-redis-0" >"${OUT_DIR}/s8/source_pod.txt"
+  printf '%s\n' "uid-t2-redis-0-src" >"${OUT_DIR}/s8/source_pod_uid.txt"
+  printf 'quiet_start_ms=1758967186000 anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b dataplane_mode=kube-proxy\n' >"${OUT_DIR}/s8/phase.txt"
   cat >"${OUT_DIR}/s8/pinger.log" <<'EOF'
 START 10:00:00
 A 1758967201000 1
@@ -2232,50 +2498,60 @@ A 1758967207200 3
 A 1758967207300 4
 EOF
   cat >"${OUT_DIR}/s8/observer.log" <<'EOF'
-1758967202000 2 ok :50002
+1758967202000 2 ok :50002 10.24.1.10
 1758967205120 1 refused
-1758967208200 2 ok :50004
+1758967208200 2 ok :50004 10.24.2.20
 EOF
   cat >"${OUT_DIR}/s8/pods.ndjson" <<'EOF'
-{"t_ms":1758967202500,"ev":{"type":"WATCH","object":{"metadata":{"name":"redis-s8-0","labels":{"app":"redis","pod-migration.gke.io/fenced":"true"}},"status":{"podIP":"10.24.1.10","conditions":[{"type":"Ready","status":"False","reason":"PodMigrationFenced"}]}}}}
+{"t_ms":1758967202500,"ev":{"type":"WATCH","object":{"metadata":{"name":"t2-redis-0","uid":"uid-t2-redis-0-src","labels":{"app":"redis","pod-migration.gke.io/fenced":"true"}},"status":{"podIP":"10.24.1.10","conditions":[{"type":"Ready","status":"False","reason":"PodMigrationFenced"}]}}}}
+{"t_ms":1758967207100,"ev":{"type":"WATCH","object":{"metadata":{"name":"t2-redis-0","uid":"uid-t2-redis-0-dst","labels":{"app":"redis"}},"status":{"podIP":"10.24.2.20","conditions":[{"type":"Ready","status":"True"}]}}}}
 EOF
   cat >"${OUT_DIR}/s8/endpointslices.ndjson" <<'EOF'
-{"t_ms":1758967202520,"ev":{"type":"WATCH","object":{"endpoints":[{"addresses":["10.24.1.10"],"conditions":{"ready":false,"serving":false,"terminating":false},"targetRef":{"name":"redis-s8-0"}}]}}}
-{"t_ms":1758967207000,"ev":{"type":"WATCH","object":{"endpoints":[{"addresses":["10.24.2.20"],"conditions":{"ready":true,"serving":true,"terminating":false},"targetRef":{"name":"redis-s8-0-restored"}}]}}}
+{"t_ms":1758967202520,"ev":{"type":"WATCH","object":{"endpoints":[{"addresses":["10.24.1.10"],"conditions":{"ready":false,"serving":false,"terminating":false},"targetRef":{"name":"t2-redis-0","uid":"uid-t2-redis-0-src"}}]}}}
+{"t_ms":1758967207000,"ev":{"type":"WATCH","object":{"endpoints":[{"addresses":["10.24.2.20"],"conditions":{"ready":true,"serving":true,"terminating":false},"targetRef":{"name":"t2-redis-0","uid":"uid-t2-redis-0-dst"}}]}}}
 EOF
   cat >"${OUT_DIR}/s8/events.json" <<'EOF'
-{"items":[{"metadata":{"uid":"ev-restored-dst","creationTimestamp":"2026-09-27T10:00:07Z"},"involvedObject":{"name":"redis-s8-0-restored"},"message":"Successfully restored the pod from PodSnapshot snap-redis-s8-0","count":1}]}
+{"items":[{"metadata":{"uid":"ev-restored-dst","creationTimestamp":"2026-09-27T10:00:07Z"},"involvedObject":{"name":"t2-redis-0","uid":"uid-t2-redis-0-dst"},"lastTimestamp":"2026-09-27T10:00:07Z","message":"Successfully restored the pod from PodSnapshot snap-t2-redis-0","count":1}]}
 EOF
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s8" \
     --name "state survived (token-verified)" --group "redis" \
     --pass --value 50000 --total 50000 \
     --detail "migkey=nonce-s8 matched and DBSIZE=50004 (>= 50000)"
   s8_phase_analyze "${OUT_DIR}/s8" "true" "true"
+  [[ "$(jq -r '.inputs_valid' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture inputs_valid == true"
   [[ "$(jq -r '.cold_served' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "0" ]] || die "Expected S8 clean fixture cold_served == 0"
   [[ "$(jq -r '.empty_reads' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "0" ]] || die "Expected S8 clean fixture empty_reads == 0"
   [[ "$(jq -r '.lost_after_ckpt' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "0" ]] || die "Expected S8 clean fixture lost_after_ckpt == 0"
   [[ "$(jq -r '.kube_proxy_sync_s' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "2.12" ]] || die "Expected S8 clean fixture kube_proxy_sync_s == 2.12"
+  [[ "$(jq -r '.phase_hit' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture phase_hit == true"
+  [[ "$(jq -r '.quiet_period_clean' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture quiet_period_clean == true"
+  [[ "$(jq -r '.fenced_pods_seen' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "1" ]] || die "Expected S8 clean fixture fenced_pods_seen == 1"
   [[ "$(jq -r '.check_a_source_no_rerestore.pass' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture Check (a) pass == true"
   [[ "$(jq -r '.check_b_fenced_never_serving.pass' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture Check (b) pass == true"
   "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s8" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
 
-  # Negative tests for S8 Check (a) (#151) and Check (b) (#131):
-  # 1) Source pod re-restores after checkpoint (#151): passes in report-only mode, fails when enforced
+  # Negative tests for S8 Check (a) (#151), Check (b) (#131), no-fenced-pods vacuous guard, and empty inputs:
+  # 1) Source pod UID re-restores after checkpoint (#151): warns in report-only mode (without fake green check), fails when enforced
   local neg_s8_a="${OUT_DIR}/neg-s8-check-a"
   cp -r "${OUT_DIR}/s8" "${neg_s8_a}"
+  rm -f "${neg_s8_a}/checks.json" "${neg_s8_a}/run.json"
   cat >"${neg_s8_a}/events.json" <<'EOF'
-{"items":[{"metadata":{"uid":"ev-rerestore-src","creationTimestamp":"2026-09-27T10:00:05Z"},"involvedObject":{"name":"redis-s8-0"},"lastTimestamp":"2026-09-27T10:00:05Z","message":"Successfully restored the pod from PodSnapshot snap-redis-s8-0","count":1}]}
+{"items":[{"metadata":{"uid":"ev-rerestore-src","creationTimestamp":"2026-09-27T10:00:05Z"},"involvedObject":{"name":"t2-redis-0","uid":"uid-t2-redis-0-src"},"lastTimestamp":"2026-09-27T10:00:05Z","message":"Successfully restored the pod from PodSnapshot snap-t2-redis-0","count":1}]}
 EOF
   s8_phase_analyze "${neg_s8_a}" "false" "false"
   [[ "$(jq -r '.check_a_source_no_rerestore.pass' "${neg_s8_a}/s8_phase_continuity.json")" == "false" ]] || die "Expected Check (a) pass == false on source re-restore fixture"
+  if [[ -f "${neg_s8_a}/checks.json" ]] && grep -q 'S8 Check (a)' "${neg_s8_a}/checks.json"; then
+    die "Expected report-only Check (a) violation NOT to record a misleading green PASS check in checks.json"
+  fi
   if (s8_phase_analyze "${neg_s8_a}" "true" "false" >/dev/null 2>&1); then
     die "Expected s8_phase_analyze with enforce_a=true to fail on source re-restore after checkpoint (#151)"
   fi
   rm -rf "${neg_s8_a}"
 
-  # 2) Fenced pod serving in EndpointSlice + cold_served + empty_reads (#131): passes in report-only mode, fails when enforced
+  # 2) Fenced pod UID serving in EndpointSlice + cold_served + empty_reads (#131): warns in report-only mode, fails when enforced
   local neg_s8_b="${OUT_DIR}/neg-s8-check-b"
   cp -r "${OUT_DIR}/s8" "${neg_s8_b}"
+  rm -f "${neg_s8_b}/checks.json" "${neg_s8_b}/run.json"
   cat >"${neg_s8_b}/pinger.log" <<'EOF'
 START 10:00:00
 A 1758967201000 10
@@ -2286,12 +2562,12 @@ A 1758967205100 2
 A 1758967208000 10
 EOF
   cat >"${neg_s8_b}/observer.log" <<'EOF'
-1758967202000 2 ok :50011
-1758967205050 2 ok :2
-1758967208200 2 ok :50010
+1758967202000 2 ok :50011 10.24.1.10
+1758967205050 2 ok :2 10.24.1.10
+1758967208200 2 ok :50010 10.24.2.20
 EOF
   cat >"${neg_s8_b}/endpointslices.ndjson" <<'EOF'
-{"t_ms":1758967205000,"ev":{"type":"WATCH","object":{"endpoints":[{"addresses":["10.24.1.10"],"conditions":{"ready":true,"serving":true,"terminating":false},"targetRef":{"name":"redis-s8-0"}}]}}}
+{"t_ms":1758967205000,"ev":{"type":"WATCH","object":{"endpoints":[{"addresses":["10.24.1.10"],"conditions":{"ready":true,"serving":true,"terminating":false},"targetRef":{"name":"t2-redis-0","uid":"uid-t2-redis-0-src"}}]}}}
 EOF
   s8_phase_analyze "${neg_s8_b}" "false" "false"
   [[ "$(jq -r '.check_b_fenced_never_serving.pass' "${neg_s8_b}/s8_phase_continuity.json")" == "false" ]] || die "Expected Check (b) pass == false when fenced pod is serving in EndpointSlice"
@@ -2301,6 +2577,32 @@ EOF
     die "Expected s8_phase_analyze with enforce_b=true to fail when fenced pod is serving in EndpointSlice (#131)"
   fi
   rm -rf "${neg_s8_b}"
+
+  # 3) Zero fenced pods observed: records no_fenced_pods_seen=true and fails closed when enforce_b=true
+  local neg_s8_nofence="${OUT_DIR}/neg-s8-no-fenced"
+  cp -r "${OUT_DIR}/s8" "${neg_s8_nofence}"
+  rm -f "${neg_s8_nofence}/checks.json" "${neg_s8_nofence}/run.json"
+  cat >"${neg_s8_nofence}/pods.ndjson" <<'EOF'
+{"t_ms":1758967202500,"ev":{"type":"WATCH","object":{"metadata":{"name":"t2-redis-0","uid":"uid-t2-redis-0-src","labels":{"app":"redis"}},"status":{"podIP":"10.24.1.10","conditions":[{"type":"Ready","status":"True"}]}}}}
+EOF
+  s8_phase_analyze "${neg_s8_nofence}" "false" "false"
+  [[ "$(jq -r '.fenced_pods_seen' "${neg_s8_nofence}/s8_phase_continuity.json")" == "0" ]] || die "Expected fenced_pods_seen == 0 when no pod has fenced label"
+  [[ "$(jq -r '.no_fenced_pods_seen' "${neg_s8_nofence}/s8_phase_continuity.json")" == "true" ]] || die "Expected no_fenced_pods_seen == true when no pod has fenced label"
+  [[ "$(jq -r '.check_b_fenced_never_serving.status' "${neg_s8_nofence}/s8_phase_continuity.json")" == "no_fenced_pods_seen" ]] || die "Expected check_b status == no_fenced_pods_seen"
+  if (s8_phase_analyze "${neg_s8_nofence}" "false" "true" >/dev/null 2>&1); then
+    die "Expected s8_phase_analyze with enforce_b=true to fail closed when 0 fenced pods are observed"
+  fi
+  rm -rf "${neg_s8_nofence}"
+
+  # 4) Empty or missing inputs: must fail closed even in report-only mode (enforce_a=false, enforce_b=false)
+  local neg_s8_empty="${OUT_DIR}/neg-s8-empty"
+  mkdir -p "${neg_s8_empty}"
+  echo "1758967203000" >"${neg_s8_empty}/drain_ms.txt"
+  if (s8_phase_analyze "${neg_s8_empty}" "false" "false" >/dev/null 2>&1); then
+    die "Expected s8_phase_analyze to fail closed when pinger/observer/watch/checkpoint inputs are missing"
+  fi
+  [[ "$(jq -r '.inputs_valid' "${neg_s8_empty}/s8_phase_continuity.json")" == "false" ]] || die "Expected inputs_valid == false on empty S8 directory"
+  rm -rf "${neg_s8_empty}"
 
   # Negative tests for Issue #103: verify all 3 stateful failure modes fail pmprofiler continuity
   local neg_cont_dir="${OUT_DIR}/neg-continuity"
@@ -2437,6 +2739,19 @@ EOF
   if (TOLERATION="foo=bar:bogus" validate_toleration_format >/dev/null 2>&1); then
     die "Expected validate_toleration_format to reject --toleration with invalid Effect"
   fi
+
+  # Verify --s8-window-w validation rejects non-numeric or out-of-range values and accepts single or comma-separated W
+  if (S8_WINDOW_W="bogus" validate_s8_window_w >/dev/null 2>&1); then
+    die "Expected validate_s8_window_w to reject non-numeric --s8-window-w"
+  fi
+  if (S8_WINDOW_W="0" validate_s8_window_w >/dev/null 2>&1); then
+    die "Expected validate_s8_window_w to reject --s8-window-w <= 0"
+  fi
+  if (S8_WINDOW_W="10" validate_s8_window_w >/dev/null 2>&1); then
+    die "Expected validate_s8_window_w to reject --s8-window-w >= 10"
+  fi
+  (S8_WINDOW_W="5" validate_s8_window_w)
+  (S8_WINDOW_W="3,5,7" validate_s8_window_w)
 
   # Verify tracked node cordon/uncordon only uncordons nodes cordoned during the run
   # and skips nodes that were already unschedulable prior to T2 (#82)
