@@ -74,6 +74,13 @@ var (
 		Help: "Total number of pods skipped for spot preemption migration by reason.",
 	}, []string{"reason"})
 
+	// FenceWebhookRequestsTotal counts fence webhook requests by action.
+	// Actions: fenced | unchanged | not_fenced | skipped | decode_error
+	FenceWebhookRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_fence_webhook_requests_total",
+		Help: "Total number of pod status updates seen by the fence webhook, by action.",
+	}, []string{"action"})
+
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
 )
@@ -88,7 +95,15 @@ func init() {
 		InvariantViolationsTotal,
 		SpotPreemptionTriggeredTotal,
 		SpotPreemptionSkippedTotal,
+		FenceWebhookRequestsTotal,
 	)
+}
+
+// RecordFenceWebhookRequest increments the fence webhook request counter for the given action.
+func RecordFenceWebhookRequest(action string) {
+	if action != "" {
+		FenceWebhookRequestsTotal.WithLabelValues(action).Inc()
+	}
 }
 
 // RecordSpotPreemptionTriggered increments the spot preemption triggered counter.
