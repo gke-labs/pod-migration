@@ -139,19 +139,34 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		// Cache miss: query the live API server to prevent duplicate PMJ creation across HA replicas
 		err = a.APIReader.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: jobName}, job)
 	}
+	restartedAfterBudgetWait := false
 	if err == nil {
 		logger.Info("Migration job already exists for current pod instance", "job", jobName, "phase", job.Status.Phase)
-		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
-			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded {
+		switch {
+		case job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
+			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded:
 			logger.Info("Migration checkpoint complete, allowing eviction", "job", jobName, "phase", job.Status.Phase)
 			return admission.Allowed("migration checkpoint complete")
-		}
-		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed ||
-			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		case util.FailedOnDisruptionBudget(job):
+			// The job waited in Pending for the PodDisruptionBudget until its
+			// deadline and checkpointed nothing (#42). The evictor is still asking,
+			// so replace the expired job instead of falling back to a cold eviction.
+			uid := job.UID
+			if delErr := a.Client.Delete(ctx, job, client.Preconditions{UID: &uid}); delErr != nil && !apierrors.IsNotFound(delErr) {
+				logger.Error(delErr, "Failed to delete a job that timed out waiting for the disruption budget", "job", jobName)
+				return denied429("replacing a migration job that timed out waiting for the PodDisruptionBudget, retrying")
+			}
+			logger.Info("Replacing a job that timed out waiting for the disruption budget", "job", jobName)
+			restartedAfterBudgetWait = true
+		case job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed ||
+			job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore:
 			logger.Info("Migration job concluded without restore, allowing eviction (fail-open)", "job", jobName, "phase", job.Status.Phase)
 			return admission.Allowed("migration concluded without restore, falling back to cold eviction")
+		case util.WaitingForDisruptionBudget(job):
+			return denied429("migration job waiting for the PodDisruptionBudget to allow a disruption; nothing has been checkpointed")
+		default:
+			return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
 		}
-		return denied429(fmt.Sprintf("migration job in progress: status %s", job.Status.Phase))
 	}
 
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -214,6 +229,10 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return denied429("failed to create migration job, retrying")
 	}
 
+	if restartedAfterBudgetWait && a.Recorder != nil {
+		a.Recorder.Event(pod, corev1.EventTypeNormal, "MigrationRestartedAfterBudgetWait",
+			"The previous migration job timed out waiting for the PodDisruptionBudget without a checkpoint; started a new one")
+	}
 	return denied429("migration job spawned")
 }
 
