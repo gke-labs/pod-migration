@@ -451,7 +451,7 @@ clean_stale_migration_resources() {
 
 clean_test_workloads() {
   kubectl delete deployment/t2-counter deployment/t2-bystander statefulset/t2-redis statefulset/t2-postgres \
-    service/t2-redis-svc service/t2-postgres-svc service/s8-phase-anchor pdb/t2-redis-pdb \
+    service/t2-redis-svc service/t2-postgres-svc service/s8-phase-anchor service/s8-sync-probe pdb/t2-redis-pdb \
     pod/pinger-t2-redis pod/observer-t2-redis \
     -n "${NAMESPACE}" --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
   kubectl delete pods -n "${NAMESPACE}" -l "app in (t2-counter,t2-bystander,t2-redis,t2-postgres,pinger,observer)" \
@@ -1746,7 +1746,7 @@ if os.path.exists(f"{run_dir}/phase.txt"):
 window_w = float(phase_kv.get("W", "5"))
 dataplane_mode = phase_kv.get("dataplane_mode", "kube-proxy")
 target_ns = phase_kv.get("namespace", "")
-target_service = phase_kv.get("target_service", "t2-redis-svc")
+target_service = phase_kv.get("target_service") or phase_kv.get("service_name") or "t2-redis-svc"
 if not target_ns and os.path.exists(f"{run_dir}/meta.json"):
     try:
         target_ns = (json.load(open(f"{run_dir}/meta.json")) or {}).get("namespace") or ""
@@ -1756,6 +1756,7 @@ if not target_ns:
     target_ns = "default"
 quiet_start_ms = int(phase_kv["quiet_start_ms"]) if "quiet_start_ms" in phase_kv and phase_kv["quiet_start_ms"].isdigit() else None
 anchor_created_ms = int(phase_kv["anchor_created_ms"]) if "anchor_created_ms" in phase_kv and phase_kv["anchor_created_ms"].isdigit() else None
+quiet_end_ms = int(phase_kv["quiet_end_ms"]) if "quiet_end_ms" in phase_kv and phase_kv["quiet_end_ms"].isdigit() else anchor_created_ms
 
 # 1. Parse pinger.log -> cold_served, lost_after_ckpt using M0 segment analysis
 acks = []
@@ -1876,7 +1877,18 @@ if os.path.exists(f"{run_dir}/observer.log"):
                             if backend_cutover_ms is None:
                                 backend_cutover_ms = t_ms
 
-kp_sync_ms = sync_probe_ms if sync_probe_ms is not None else (backend_cutover_ms if backend_cutover_ms is not None else fallback_empty_ms)
+if sync_probe_ms is not None:
+    kp_sync_ms = sync_probe_ms
+    kp_sync_source = "sync_probe"
+elif backend_cutover_ms is not None:
+    kp_sync_ms = backend_cutover_ms
+    kp_sync_source = "backend_cutover"
+elif fallback_empty_ms is not None:
+    kp_sync_ms = fallback_empty_ms
+    kp_sync_source = "empty_read_fallback"
+else:
+    kp_sync_ms = None
+    kp_sync_source = "none"
 
 PHASE_TOLERANCE_S = 2.0
 kp_sync_s = round((kp_sync_ms - drain_ms) / 1000.0, 3) if (kp_sync_ms is not None and drain_ms > 0) else None
@@ -1931,13 +1943,13 @@ if total_ep_obs == 0:
 
 # Quiet period EndpointSlice churn check (#149): ep_records watches EndpointSlices cluster-wide (-A)
 quiet_period_ep_churn_count = 0
-if quiet_start_ms is not None and anchor_created_ms is not None:
+if quiet_start_ms is not None and quiet_end_ms is not None:
     for r in ep_records:
         ev = r.get("ev") or {}
         if ev.get("type") == "SEED":
             continue
         rt = r.get("t_ms")
-        if rt is not None and quiet_start_ms <= rt < anchor_created_ms:
+        if rt is not None and quiet_start_ms <= rt < quiet_end_ms:
             quiet_period_ep_churn_count += 1
 quiet_period_clean = quiet_period_ep_churn_count == 0
 
@@ -2131,6 +2143,7 @@ summary = {
     "drain_ms": drain_ms,
     "checkpoint_ms": ckpt_ms,
     "kube_proxy_sync_s": kp_sync_s,
+    "kp_sync_source": kp_sync_source,
     "backend_cutover_s": backend_cutover_s,
     "phase_hit": phase_hit,
     "quiet_period_ep_churn_count": quiet_period_ep_churn_count,
@@ -2237,16 +2250,8 @@ PY
       --detail "VIOLATION / INCONCLUSIVE (#131/#149): ${check_b_detail}" >/dev/null || true
     die "S8 FAIL (Check b / #131 / #149): fenced pod serving, no fenced pods seen, phase window missed, or cold/empty reads observed: ${check_b_detail} (${summary_json})"
   elif [[ "${check_b_violation}" == "false" && "${phase_inconclusive}" == "true" ]]; then
-    "${PMPROFILER_BIN}" check --run "${run_dir}" \
-      --name "S8 Check (b) [INCONCLUSIVE]: phase window missed or noisy (#149)" --group "redis" \
-      --pass --value 0 --total 0 \
-      --detail "INCONCLUSIVE (#149): ${phase_inconclusive_reasons}; ${check_b_detail}" >/dev/null || true
     err "S8 Check (b) / Phase [INCONCLUSIVE]: ${phase_inconclusive_reasons}; ${check_b_detail} (#149)"
   else
-    "${PMPROFILER_BIN}" check --run "${run_dir}" \
-      --name "S8 Check (b) [REPORT-ONLY WARNING]: fenced pod serving or cold/empty reads (#131)" --group "redis" \
-      --pass --value 0 --total 0 \
-      --detail "WARNING (#131): ${check_b_detail}" >/dev/null || true
     err "S8 Check (b) [REPORT-ONLY WARNING]: ${check_b_detail} (#131)"
   fi
 }
@@ -2339,8 +2344,8 @@ run_scenario_s8_single_w() {
   echo "${drain_ms}" >"${run_dir}/drain_ms.txt"
   printf '%s\n' "${src_pod}" >"${run_dir}/source_pod.txt"
   printf '%s\n' "${src_uid}" >"${run_dir}/source_pod_uid.txt"
-  printf 'quiet_start_ms=%s anchor_created_ms=%s W=%s D=%s drain_ms=%s drain_minus_anchor_ms=%s pinger_node=%s dataplane_mode=%s namespace=%s target_service=t2-redis-svc\n' \
-    "${quiet_start_ms}" "${quiet_end_ms}" "${w_val}" "${d_sec}" "${drain_ms}" "$((drain_ms - a_ms))" "${PINGER_NODE}" "${dataplane_mode}" "${NAMESPACE}" >"${run_dir}/phase.txt"
+  printf 'quiet_start_ms=%s quiet_end_ms=%s anchor_created_ms=%s W=%s D=%s drain_ms=%s drain_minus_anchor_ms=%s pinger_node=%s dataplane_mode=%s namespace=%s target_service=t2-redis-svc\n' \
+    "${quiet_start_ms}" "${quiet_end_ms}" "${a_ms}" "${w_val}" "${d_sec}" "${drain_ms}" "$((drain_ms - a_ms))" "${PINGER_NODE}" "${dataplane_mode}" "${NAMESPACE}" >"${run_dir}/phase.txt"
 
   wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
   uncordon_all_tracked_nodes
@@ -2674,7 +2679,7 @@ EOF
   echo "1758967203000" >"${OUT_DIR}/s8/drain_ms.txt"
   printf '%s\n' "t2-redis-0" >"${OUT_DIR}/s8/source_pod.txt"
   printf '%s\n' "uid-t2-redis-0-src" >"${OUT_DIR}/s8/source_pod_uid.txt"
-  printf 'quiet_start_ms=1758967186000 quiet_end_ms=1758967198000 anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b dataplane_mode=kube-proxy service_name=t2-redis-svc namespace=default\n' >"${OUT_DIR}/s8/phase.txt"
+  printf 'quiet_start_ms=1758967186000 quiet_end_ms=1758967198000 anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b dataplane_mode=kube-proxy namespace=default target_service=t2-redis-svc\n' >"${OUT_DIR}/s8/phase.txt"
   cat >"${OUT_DIR}/s8/pinger.log" <<'EOF'
 START 10:00:00
 A 1758967201000 1
@@ -2717,6 +2722,7 @@ EOF
   [[ "$(jq -r '.empty_reads' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "0" ]] || die "Expected S8 clean fixture empty_reads == 0"
   [[ "$(jq -r '.lost_after_ckpt' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "0" ]] || die "Expected S8 clean fixture lost_after_ckpt == 0"
   [[ "$(jq -r '.kube_proxy_sync_s' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "5.02" ]] || die "Expected S8 clean fixture kube_proxy_sync_s == 5.02 (from sync_probe_ok)"
+  [[ "$(jq -r '.kp_sync_source' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "sync_probe" ]] || die "Expected S8 clean fixture kp_sync_source == sync_probe"
   [[ "$(jq -r '.backend_cutover_s' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "14.2" ]] || die "Expected S8 clean fixture backend_cutover_s == 14.2 (from replacement pod Ready)"
   [[ "$(jq -r '.phase_status' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "pass" ]] || die "Expected S8 clean fixture phase_status == pass"
   [[ "$(jq -r '.phase_hit' "${OUT_DIR}/s8/s8_phase_continuity.json")" == "true" ]] || die "Expected S8 clean fixture phase_hit == true"
@@ -2774,6 +2780,9 @@ EOF
   [[ "$(jq -r '.check_b_fenced_never_serving.pass' "${neg_s8_b}/s8_phase_continuity.json")" == "false" ]] || die "Expected Check (b) pass == false when fenced pod is serving in EndpointSlice"
   [[ "$(jq -r '.cold_served' "${neg_s8_b}/s8_phase_continuity.json")" == "2" ]] || die "Expected cold_served == 2 on cold-serving fixture"
   [[ "$(jq -r '.empty_reads' "${neg_s8_b}/s8_phase_continuity.json")" == "1" ]] || die "Expected empty_reads == 1 on cold-serving fixture"
+  if [[ -f "${neg_s8_b}/checks.ndjson" ]] && grep -q 'S8 Check (b)' "${neg_s8_b}/checks.ndjson"; then
+    die "Expected report-only Check (b) violation NOT to record a misleading green PASS check in checks.ndjson"
+  fi
   if (s8_phase_analyze "${neg_s8_b}" "false" "true" >/dev/null 2>&1); then
     die "Expected s8_phase_analyze with enforce_b=true to fail when fenced pod is serving in EndpointSlice (#131)"
   fi
@@ -2796,7 +2805,7 @@ EOF
   rm -rf "${neg_s8_nofence}"
 
   # 4) Phase window missed (kp_sync_s = 9.0 at W = 5, outside +-2.0s tolerance): marks phase_hit=false, phase_inconclusive=true,
-  # records an explicit [INCONCLUSIVE] Check (b) entry in checks.ndjson in report-only mode, allows Check (a) enforcement
+  # does not record a misleading green Check (b) PASS in checks.ndjson in report-only mode, allows Check (a) enforcement
   # (enforce_a=true, enforce_b=false) to pass independently (#151), and fails closed when enforce_b=true (#149)
   local neg_s8_miss="${OUT_DIR}/neg-s8-phase-miss"
   cp -r "${OUT_DIR}/s8" "${neg_s8_miss}"
@@ -2812,7 +2821,9 @@ EOF
   [[ "$(jq -r '.phase_status' "${neg_s8_miss}/s8_phase_continuity.json")" == "inconclusive" ]] || die "Expected phase_status == inconclusive when kp_sync_s=9.0 at W=5"
   [[ "$(jq -r '.phase_hit' "${neg_s8_miss}/s8_phase_continuity.json")" == "false" ]] || die "Expected phase_hit == false when kp_sync_s=9.0 at W=5"
   [[ "$(jq -r '.phase_inconclusive' "${neg_s8_miss}/s8_phase_continuity.json")" == "true" ]] || die "Expected phase_inconclusive == true when phase_hit=false"
-  grep -q 'S8 Check (b) \[INCONCLUSIVE\]' "${neg_s8_miss}/checks.ndjson" || die "Expected report-only phase-miss run to record an explicit [INCONCLUSIVE] Check (b) entry in checks.ndjson"
+  if [[ -f "${neg_s8_miss}/checks.ndjson" ]] && grep -q 'S8 Check (b)' "${neg_s8_miss}/checks.ndjson"; then
+    die "Expected report-only phase-miss run NOT to record a misleading green Check (b) PASS in checks.ndjson"
+  fi
   if (s8_phase_analyze "${neg_s8_miss}" "false" "true" >/dev/null 2>&1); then
     die "Expected s8_phase_analyze with enforce_b=true to fail closed when phase_hit=false (#149)"
   fi
@@ -2823,7 +2834,7 @@ EOF
   local neg_s8_dpv2="${OUT_DIR}/neg-s8-dpv2"
   cp -r "${OUT_DIR}/s8" "${neg_s8_dpv2}"
   rm -f "${neg_s8_dpv2}/checks.json" "${neg_s8_dpv2}/checks.ndjson" "${neg_s8_dpv2}/run.json"
-  printf 'quiet_start_ms=1758967186000 quiet_end_ms=1758967198000 anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b dataplane_mode=dataplane-v2 service_name=t2-redis-svc namespace=default\n' >"${neg_s8_dpv2}/phase.txt"
+  printf 'quiet_start_ms=1758967186000 quiet_end_ms=1758967198000 anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b dataplane_mode=dataplane-v2 namespace=default target_service=t2-redis-svc\n' >"${neg_s8_dpv2}/phase.txt"
   s8_phase_analyze "${neg_s8_dpv2}" "true" "true"
   [[ "$(jq -r '.phase_applicable' "${neg_s8_dpv2}/s8_phase_continuity.json")" == "false" ]] || die "Expected phase_applicable == false on dataplane-v2 fixture"
   [[ "$(jq -r '.phase_status' "${neg_s8_dpv2}/s8_phase_continuity.json")" == "skipped" ]] || die "Expected phase_status == skipped on dataplane-v2 fixture"
@@ -2835,7 +2846,7 @@ EOF
   local neg_s8_unknown_dp="${OUT_DIR}/neg-s8-unknown-dp"
   cp -r "${OUT_DIR}/s8" "${neg_s8_unknown_dp}"
   rm -f "${neg_s8_unknown_dp}/checks.json" "${neg_s8_unknown_dp}/checks.ndjson" "${neg_s8_unknown_dp}/run.json"
-  printf 'quiet_start_ms=1758967186000 quiet_end_ms=1758967198000 anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b dataplane_mode=unknown service_name=t2-redis-svc namespace=default\n' >"${neg_s8_unknown_dp}/phase.txt"
+  printf 'quiet_start_ms=1758967186000 quiet_end_ms=1758967198000 anchor_created_ms=1758967198000 W=5 D=5.000 drain_ms=1758967203000 drain_minus_anchor_ms=5000 pinger_node=gke-node-b dataplane_mode=unknown namespace=default target_service=t2-redis-svc\n' >"${neg_s8_unknown_dp}/phase.txt"
   if (s8_phase_analyze "${neg_s8_unknown_dp}" "false" "true" >/dev/null 2>&1); then
     die "Expected s8_phase_analyze with enforce_b=true to fail closed when dataplane_mode=unknown"
   fi
