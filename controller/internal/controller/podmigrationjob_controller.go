@@ -918,8 +918,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
 		var annotationUpdated bool
-		// Capture PV Names, origin node name, and migration timeout before starting checkpoint (pod is guaranteed to exist)
-		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" || (job.Annotations == nil || job.Annotations[util.AnnotationMigrationTimeout] == "") {
+		// Capture PV Names, origin node name, and migration timeout before starting checkpoint (pod is guaranteed to exist).
+		// A job waiting for the disruption budget checks the source again on every pass,
+		// since the source can be deleted, replaced, or finish during the wait (#42).
+		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" || (job.Annotations == nil || job.Annotations[util.AnnotationMigrationTimeout] == "") ||
+			waitingForDisruptionBudget(job) {
 			originPod := &corev1.Pod{}
 			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
 			if err != nil {
@@ -1073,13 +1076,12 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// Check the disruption budget before the checkpoint (#42).
 		if r.BudgetChecker != nil && !skipsDisruptionBudgetCheck(job) {
-			waiting, err := r.checkDisruptionBudget(ctx, job, origJob, podName)
+			res, proceed, err := r.checkDisruptionBudget(ctx, job, origJob, podName)
 			if err != nil {
 				return r.handleStatusError(ctx, err, "Failed to record the disruption budget check")
 			}
-			if waiting {
-				logger.Info("Disruption budget doesn't allow the source's eviction yet; waiting in Pending")
-				return ctrl.Result{RequeueAfter: budgetRecheckInterval}, nil
+			if !proceed {
+				return res, nil
 			}
 		}
 

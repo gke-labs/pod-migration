@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -107,10 +108,21 @@ func TestEvictionBudgetChecker_Envtest(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: "source"}, got); err != nil || got.DeletionTimestamp != nil {
 		t.Fatalf("the dry-run eviction touched the pod: err=%v deletionTimestamp=%v", err, got.DeletionTimestamp)
 	}
-	// A pod replaced under the same name is refused by the UID precondition.
+	// A pod replaced under the same name is refused by the UID precondition (409).
 	other := job.DeepCopy()
 	other.Spec.TargetPodUID = "00000000-0000-0000-0000-000000000000"
-	if reason, _ := checker.Check(ctx, other, "source"); reason != reasonBudgetCheckError {
-		t.Errorf("UID mismatch: reason = %q, want %q", reason, reasonBudgetCheckError)
+	if reason, err := checker.Check(ctx, other, "source"); reason != reasonBudgetCheckError || !apierrors.IsConflict(err) {
+		t.Errorf("UID mismatch: Check = (%q, %v), want %q with a 409", reason, err, reasonBudgetCheckError)
+	}
+	// But the API server checks the budget before the precondition, so while the
+	// budget is exhausted a replaced pod gets the budget's 429. That's why a
+	// waiting job checks its source from the cache on every pass.
+	setAllowed(0)
+	if reason, err := checker.Check(ctx, other, "source"); reason != reasonBudgetExhausted {
+		t.Errorf("UID mismatch, exhausted budget: Check = (%q, %v), want %q", reason, err, reasonBudgetExhausted)
+	}
+	// A source that's gone gets a 404.
+	if reason, err := checker.Check(ctx, job, "gone"); reason != reasonBudgetCheckError || !apierrors.IsNotFound(err) {
+		t.Errorf("missing pod: Check = (%q, %v), want %q with a 404", reason, err, reasonBudgetCheckError)
 	}
 }
