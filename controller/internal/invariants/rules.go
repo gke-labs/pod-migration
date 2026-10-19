@@ -149,6 +149,20 @@ func podHasColdStartBypass(pod *corev1.Pod) bool {
 	return hasKey && val == ""
 }
 
+// migratedAgain reports whether targeting, the jobs that target one pod, holds a
+// job other than job that was created at or after it, so that the pod was
+// migrated again. Creation timestamps have one-second resolution, so a job
+// created in the same second counts.
+func migratedAgain(job *pmv1alpha1.PodMigrationJob, targeting []pmv1alpha1.PodMigrationJob) bool {
+	for i := range targeting {
+		other := &targeting[i]
+		if other.Name != job.Name && !other.CreationTimestamp.Before(&job.CreationTimestamp) {
+			return true
+		}
+	}
+	return false
+}
+
 // EvaluateI1 enforces I1 (At-Most-Once Restore):
 // A PodSnapshot may be bound to and consumed by at most one replacement Pod UID
 // across the cluster's lifetime, and a consumed PMJ with GateReleased=true must
@@ -210,7 +224,10 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 // A PMJ may transition to Succeeded (warm restore) iff Status.SnapshotRef is non-empty,
 // Status.RestoredPodName is recorded, and (when the replacement Pod is present in the
 // snapshot) the replacement Pod carries the matching `podsnapshot.gke.io/ps-name` annotation
-// and did not bypass restore via `podsnapshot.gke.io/ps-name: ""`.
+// and did not bypass restore via `podsnapshot.gke.io/ps-name: ""`. The annotation check
+// is skipped once another PMJ, created at or after this one and in any phase, targets
+// the replacement's UID: that pod was migrated again and carries the newer job's
+// cold-start bypass (#151), which stays if the newer job fails.
 func EvaluateI2(s *ReconcileSnapshot) []Violation {
 	var violations []Violation
 	jobs := allPMJs(s)
@@ -219,6 +236,19 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 	podByKey := make(map[string]corev1.Pod, len(pods))
 	for _, p := range pods {
 		podByKey[p.Namespace+"/"+p.Name] = p
+	}
+	jobsByTargetUID := make(map[string][]pmv1alpha1.PodMigrationJob, len(jobs))
+	for _, j := range jobs {
+		if j.Spec.TargetPodUID != "" {
+			jobsByTargetUID[j.Spec.TargetPodUID] = append(jobsByTargetUID[j.Spec.TargetPodUID], j)
+		}
+	}
+	if s != nil {
+		for _, j := range s.TargetingPMJs {
+			if j.Spec.TargetPodUID != "" {
+				jobsByTargetUID[j.Spec.TargetPodUID] = append(jobsByTargetUID[j.Spec.TargetPodUID], j)
+			}
+		}
 	}
 
 	for _, job := range jobs {
@@ -238,6 +268,9 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 		}
 		if job.Status.RestoredPodName != "" {
 			if pod, ok := podByKey[job.Namespace+"/"+job.Status.RestoredPodName]; ok {
+				if pod.UID != "" && migratedAgain(&job, jobsByTargetUID[string(pod.UID)]) {
+					continue
+				}
 				snapAnn := podSnapshotAnnotation(&pod)
 				coldStartBypass := podHasColdStartBypass(&pod)
 				if snapAnn != job.Status.SnapshotRef || coldStartBypass {
