@@ -102,33 +102,31 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	}
 
 	// If there is no active unassigned migration job, this is a scale-up or unrelated pod.
-	// We do NOT inject the scheduling gate.
-	//
-	// If a non-empty ps-name is already present on the pod, it is either a user/template explicitly
-	// requesting a native GKE restore or an upstream mutating webhook (such as Kubeflow's
-	// gke-workspace-snapshot-mutating-webhook / mutate-pod.podsnapshot.gke.kubeflow.org, which sorts
-	// alphabetically before our mutating-webhook-configuration / mpodgate.podmigration.gke.io)
-	// restoring a paused Workspace. That restore request is not ours to override, so we preserve it (#56).
-	//
-	// For unmigrated scale-up pods without a pre-existing restore target, we omit the snapshot
-	// annotation entirely and scrub any literal empty string. This prevents the node-level
-	// gke-pod-snapshots agent from inspecting an empty resource name and emitting spurious
-	// Warning events ("falling back to a cold start ... resource name may not be empty") on normal
-	// pod creation/scale-up (#74).
+	// The cold-start bypass stamps podsnapshot.gke.io/ps-name="" to scrub any stale
+	// snapshot reference that our own controller may have written for an earlier assignment
+	// that did not complete. However, if a non-empty ps-name is already present on the pod,
+	// it is either a user/template explicitly requesting a native GKE restore or an upstream
+	// mutating webhook (such as Kubeflow's gke-workspace-snapshot-mutating-webhook /
+	// mutate-pod.podsnapshot.gke.kubeflow.org, which sorts alphabetically before our
+	// mutating-webhook-configuration / mpodgate.podmigration.gke.io) restoring a paused
+	// Workspace. That restore request is not ours to override, so we preserve it.
 	if assignedPMJ == "" {
 		if existingPS := pod.Annotations["podsnapshot.gke.io/ps-name"]; existingPS != "" {
 			logger.Info("Preserving pre-existing snapshot annotation (no active PMJ)", "snapshotName", existingPS)
 			return admission.Allowed("preserving pre-existing podsnapshot.gke.io/ps-name annotation")
 		}
 		logger.Info("Bypassing scheduling gate injection (scale-up pod)")
-		if pod.Annotations != nil {
-			if _, hasEmpty := pod.Annotations["podsnapshot.gke.io/ps-name"]; hasEmpty {
-				delete(pod.Annotations, "podsnapshot.gke.io/ps-name")
-				marshaledPod, _ := json.Marshal(pod)
-				return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
-			}
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string)
 		}
-		return admission.Allowed("bypassing scheduling gate injection (scale-up pod)")
+		// Why this matters: GKE Pod Snapshots restores a pod that has no ps-name from a
+		// matching snapshot when its sandbox is created. Without "", a new replica, a pod
+		// recreated after a delete, or a restarted migration source can come back from a
+		// leftover snapshot as a copy or with stale state (#151, #157). Don't remove it
+		// without a replacement; the empty value costs one Warning event per pod (#74).
+		pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
+		marshaledPod, _ := json.Marshal(pod)
+		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 	}
 
 	// Check if the gate is already present
