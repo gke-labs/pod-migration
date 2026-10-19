@@ -20,7 +20,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -211,14 +214,19 @@ func TestPodMigrationJobReconciler_BudgetCheckInPending(t *testing.T) {
 
 func TestPodMigrationJobReconciler_BudgetWaitTimesOut(t *testing.T) {
 	blocked := metav1.Condition{Type: ConditionDisruptionBudgetChecked, Status: metav1.ConditionFalse, Reason: reasonBudgetExhausted, LastTransitionTime: metav1.Now()}
+	failing := metav1.Condition{Type: ConditionDisruptionBudgetChecked, Status: metav1.ConditionUnknown, Reason: reasonBudgetCheckError, LastTransitionTime: metav1.Now()}
 	for name, tc := range map[string]struct {
-		conds      []metav1.Condition
-		wantReason string
+		conds       []metav1.Condition
+		wantReason  string
+		wantOutcome string
 	}{
-		"waiting for the budget": {[]metav1.Condition{blocked}, util.ReasonDisruptionBudgetTimeout},
-		"not waiting":            {nil, "Timeout"},
+		"waiting for the budget": {[]metav1.Condition{blocked}, util.ReasonDisruptionBudgetTimeout, "budget_timeout"},
+		// A check that kept failing for another reason falls back like any timeout.
+		"budget check failing": {[]metav1.Condition{failing}, "Timeout", "timeout"},
+		"not waiting":          {nil, "Timeout", "timeout"},
 	} {
 		t.Run(name, func(t *testing.T) {
+			before := testutil.ToFloat64(metrics.OutcomesTotal.WithLabelValues(tc.wantOutcome))
 			// Created past the default 10 minute migration timeout.
 			c := fake.NewClientBuilder().WithScheme(budgetScheme()).
 				WithObjects(budgetSourcePod(), budgetJob(time.Now().Add(-11*time.Minute), nil, tc.conds...)).
@@ -230,6 +238,9 @@ func TestPodMigrationJobReconciler_BudgetWaitTimesOut(t *testing.T) {
 			}
 			if util.FailedOnDisruptionBudget(job) != (tc.wantReason == util.ReasonDisruptionBudgetTimeout) {
 				t.Errorf("FailedOnDisruptionBudget = %t", util.FailedOnDisruptionBudget(job))
+			}
+			if got := testutil.ToFloat64(metrics.OutcomesTotal.WithLabelValues(tc.wantOutcome)) - before; got != 1 {
+				t.Errorf("outcome %q counted %v times, want 1", tc.wantOutcome, got)
 			}
 		})
 	}

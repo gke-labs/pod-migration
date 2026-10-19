@@ -208,3 +208,17 @@ func (r *PodMigrationJobReconciler) failSourceGone(ctx context.Context, job, ori
 func waitingForDisruptionBudget(job *pmv1alpha1.PodMigrationJob) bool {
 	return util.WaitingForDisruptionBudget(job)
 }
+
+// refusedByDisruptionBudget reports whether a Pending job's last budget check
+// was refused by the budget itself. Only such a job times out as
+// DisruptionBudgetTimeout, which the eviction webhook answers with a fresh
+// job. A check that keeps failing for another reason, such as an eviction
+// webhook that doesn't support dry runs, times out as a plain Timeout, which
+// falls back to a cold eviction instead of waiting forever.
+func refusedByDisruptionBudget(job *pmv1alpha1.PodMigrationJob) bool {
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
+		return false
+	}
+	cond := meta.FindStatusCondition(job.Status.Conditions, ConditionDisruptionBudgetChecked)
+	return cond != nil && cond.Status == metav1.ConditionFalse && cond.Reason == reasonBudgetExhausted
+}

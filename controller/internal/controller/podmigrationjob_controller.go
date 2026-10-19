@@ -800,11 +800,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 				prevPhase := origJob.Status.Phase
 				reason := "Timeout"
+				outcome := "timeout"
 				message := fmt.Sprintf("Migration job timed out (exceeded %v limit)", migrationTimeout)
-				if waitingForDisruptionBudget(job) {
+				if refusedByDisruptionBudget(job) {
 					// Nothing was checkpointed. The eviction webhook replaces this job
 					// with a fresh one on the next eviction (#42).
 					reason = util.ReasonDisruptionBudgetTimeout
+					outcome = "budget_timeout"
 					message = fmt.Sprintf("Migration job timed out (exceeded %v limit) waiting for the PodDisruptionBudget; nothing was checkpointed, and the next eviction starts a new job", migrationTimeout)
 				}
 				logger.Info("Migration job timed out, transitioning to Failed", "job", job.Name, "timeout", migrationTimeout, "reason", reason)
@@ -827,7 +829,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on timeout")
 				}
 				metrics.MarkPMJInactive(req.NamespacedName.String())
-				metrics.RecordOutcome("timeout")
+				metrics.RecordOutcome(outcome)
 				r.recordPreviousPhaseDuration(job, prevPhase)
 				r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", message)
 				return ctrl.Result{}, nil

@@ -13,9 +13,10 @@ const (
 	ConditionDisruptionBudgetChecked = "DisruptionBudgetChecked"
 
 	// ReasonDisruptionBudgetTimeout is the Ready reason of a job that waited in
-	// Pending for the source's PodDisruptionBudget until its deadline. Such a job
-	// checkpointed nothing, so the eviction webhook replaces it with a fresh job
-	// on the next eviction instead of allowing a cold eviction (#42).
+	// Pending for the source's PodDisruptionBudget until its deadline, with the
+	// budget refusing its last check. Such a job checkpointed nothing, so the
+	// eviction webhook replaces it with a fresh job on the next eviction instead
+	// of allowing a cold eviction (#42).
 	ReasonDisruptionBudgetTimeout = "DisruptionBudgetTimeout"
 )
 

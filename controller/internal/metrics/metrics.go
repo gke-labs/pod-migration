@@ -35,7 +35,8 @@ var (
 	})
 
 	// OutcomesTotal counts completed pod migration jobs by outcome label.
-	// Outcomes: succeeded | failed | timeout | fallback | succeeded_without_restore
+	// Outcomes: succeeded | failed | timeout | budget_timeout | fallback | succeeded_without_restore
+	// (budget_timeout: timed out waiting in Pending for the PodDisruptionBudget, with nothing checkpointed)
 	OutcomesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_outcomes_total",
 		Help: "Total number of completed pod migration jobs by outcome.",
