@@ -390,6 +390,37 @@ webhooks:
         operations: ["UPDATE"]
         resources: ["pods/status"]
         scope: Namespaced
+
+  # Holds Ready=False on a fenced migration source (#131). failurePolicy Fail:
+  # with Ignore, the kubelet's next status write would end the fence silently.
+  - name: mpodfence.podmigration.gke.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        namespace: pod-migration-system
+        name: webhook-service
+        path: /mutate-v1-pod-fence
+        port: 443
+    objectSelector:
+      matchLabels:
+        pod-migration.gke.io/fenced: "true"
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - pod-migration-system
+            - kube-system
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods/status"]
+        scope: Namespaced
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

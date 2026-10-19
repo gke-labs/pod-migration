@@ -20,7 +20,7 @@ one Manager, and many controllers/webhooks living inside it. The Manager
 owns the shared cache, the typed client, leader election, the metrics server,
 and the webhook HTTPS server.
 
-The structure is: 3 reconcilers + 3 webhooks + 1 Manager. Read this top-to-bottom
+The structure is: 3 reconcilers + 4 webhooks + 1 Manager. Read this top-to-bottom
 and the entire control plane shape will click.
 */
 package main
@@ -255,6 +255,10 @@ func main() {
 	}
 	if err := pmwebhook.SetupStatusWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
 		setupLog.Error(err, "unable to register pod status mutating webhook")
+		os.Exit(1)
+	}
+	if err := pmwebhook.SetupFenceWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to register pod fence mutating webhook")
 		os.Exit(1)
 	}
 
