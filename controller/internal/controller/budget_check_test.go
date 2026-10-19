@@ -86,15 +86,27 @@ func reconcileBudget(t *testing.T, c client.Client, checker DisruptionBudgetChec
 	return res, job
 }
 
+// budgetRefusal is the 429 the eviction API returns when a budget refuses an
+// eviction: it carries the DisruptionBudget cause, which names the budget.
+func budgetRefusal() error {
+	err := apierrors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
+	err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{
+		Type:    policyv1.DisruptionBudgetCause,
+		Message: "The disruption budget db needs 1 healthy pods and has 1 currently",
+	})
+	return err
+}
+
 func TestEvictionBudgetChecker_DryRunEviction(t *testing.T) {
-	tooMany := apierrors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
 	for name, tc := range map[string]struct {
 		err        error
 		wantReason string
 	}{
 		"allowed":          {nil, reasonBudgetAllowed},
-		"budget exhausted": {tooMany, reasonBudgetExhausted},
-		"other error":      {apierrors.NewInternalError(errors.New("This pod has more than one PodDisruptionBudget")), reasonBudgetCheckError},
+		"budget exhausted": {budgetRefusal(), reasonBudgetExhausted},
+		// API Priority and Fairness throttling answers 429 too, without the cause.
+		"throttled":   {apierrors.NewTooManyRequests("Too many requests, please try again later.", 1), reasonBudgetCheckError},
+		"other error": {apierrors.NewInternalError(errors.New("This pod has more than one PodDisruptionBudget")), reasonBudgetCheckError},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var gotDryRun []string
@@ -129,7 +141,7 @@ func TestEvictionBudgetChecker_DryRunEviction(t *testing.T) {
 }
 
 func TestPodMigrationJobReconciler_BudgetCheckInPending(t *testing.T) {
-	tooMany := apierrors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
+	tooMany := budgetRefusal()
 	for name, tc := range map[string]struct {
 		checker    *stubBudgetChecker
 		labels     map[string]string
@@ -176,8 +188,12 @@ func TestPodMigrationJobReconciler_BudgetCheckInPending(t *testing.T) {
 			if tc.checker.calls != tc.wantCalls {
 				t.Errorf("checker calls = %d, want %d", tc.checker.calls, tc.wantCalls)
 			}
-			if tc.wantPhase == pmv1alpha1.PodMigrationJobPhasePending && res.RequeueAfter != budgetRecheckInterval {
-				t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, budgetRecheckInterval)
+			if tc.wantPhase == pmv1alpha1.PodMigrationJobPhasePending &&
+				(res.RequeueAfter < budgetRecheckInterval || res.RequeueAfter > budgetRecheckInterval*6/5) {
+				t.Errorf("RequeueAfter = %v, want %v plus up to 20%% jitter", res.RequeueAfter, budgetRecheckInterval)
+			}
+			if tc.wantReason == reasonBudgetExhausted && !strings.Contains(cond.Message, "The disruption budget db needs") {
+				t.Errorf("condition message %q doesn't name the budget", cond.Message)
 			}
 			if got := countEvents(recorder, "MigrationDeferredByPDB"); (got == 1) != tc.wantEvent || got > 1 {
 				t.Errorf("MigrationDeferredByPDB events = %d, want %t", got, tc.wantEvent)

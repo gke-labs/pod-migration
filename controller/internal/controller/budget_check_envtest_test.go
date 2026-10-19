@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -96,8 +97,13 @@ func TestEvictionBudgetChecker_Envtest(t *testing.T) {
 	checker := EvictionBudgetChecker{Client: c}
 
 	setAllowed(0)
-	if reason, err := checker.Check(ctx, job, "source"); reason != reasonBudgetExhausted {
+	reason, err := checker.Check(ctx, job, "source")
+	if reason != reasonBudgetExhausted {
 		t.Fatalf("exhausted budget: Check = (%q, %v), want %q", reason, err, reasonBudgetExhausted)
+	}
+	// The refusal carries the DisruptionBudget cause, which names the budget.
+	if cause, ok := apierrors.StatusCause(err, policyv1.DisruptionBudgetCause); !ok || !strings.Contains(cause.Message, `budget db`) {
+		t.Errorf("exhausted budget: refusal %v doesn't carry a DisruptionBudget cause naming the budget", err)
 	}
 	setAllowed(1)
 	if reason, err := checker.Check(ctx, job, "source"); reason != reasonBudgetAllowed || err != nil {

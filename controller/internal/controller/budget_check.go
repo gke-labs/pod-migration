@@ -7,10 +7,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -35,8 +37,13 @@ const (
 	reasonBudgetExhausted  = "BudgetExhausted"
 	reasonBudgetCheckError = "CheckError"
 
-	// budgetRecheckInterval is how often a waiting job checks the budget again.
-	budgetRecheckInterval = 5 * time.Second
+	// A waiting job checks the budget again after half the time the budget has
+	// blocked it so far, between budgetRecheckInterval and
+	// budgetRecheckMaxInterval, plus up to budgetRecheckJitter of that, so the
+	// jobs of a large drain neither keep the API server busy nor check in step.
+	budgetRecheckInterval    = 5 * time.Second
+	budgetRecheckMaxInterval = 30 * time.Second
+	budgetRecheckJitter      = 0.2
 )
 
 // DisruptionBudgetChecker checks whether the source's disruption budget allows
@@ -70,7 +77,10 @@ func (c EvictionBudgetChecker) Check(ctx context.Context, job *pmv1alpha1.PodMig
 	switch {
 	case err == nil:
 		return reasonBudgetAllowed, nil
-	case apierrors.IsTooManyRequests(err):
+	case apierrors.IsTooManyRequests(err) && apierrors.HasStatusCause(err, policyv1.DisruptionBudgetCause):
+		// The eviction API marks a budget's refusal with this cause. Any other
+		// 429, such as API Priority and Fairness throttling the request, isn't
+		// the budget's answer.
 		return reasonBudgetExhausted, err
 	default:
 		return reasonBudgetCheckError, err
@@ -89,8 +99,9 @@ func skipsDisruptionBudgetCheck(job *pmv1alpha1.PodMigrationJob) bool {
 // Allowed it records the condition on job (the caller persists it) and returns
 // proceed=true. A dry run that finds no source pod fails the job, since there's
 // nothing left to migrate. On any other result it records the condition,
-// persists the status, emits MigrationDeferredByPDB the first time the budget
-// blocks the job, and returns the result that requeues the next check.
+// persists the status if it changed, emits MigrationDeferredByPDB the first
+// time the budget blocks the job, and returns the result that requeues the
+// next check.
 func (r *PodMigrationJobReconciler) checkDisruptionBudget(ctx context.Context, job, origJob *pmv1alpha1.PodMigrationJob, podName string) (res ctrl.Result, proceed bool, err error) {
 	reason, checkErr := r.BudgetChecker.Check(ctx, job, podName)
 	switch reason {
@@ -117,7 +128,11 @@ func (r *PodMigrationJobReconciler) checkDisruptionBudget(ctx context.Context, j
 	prev := meta.FindStatusCondition(job.Status.Conditions, ConditionDisruptionBudgetChecked)
 	firstBlock := prev == nil || prev.Reason != reason
 	status := metav1.ConditionFalse
-	message := fmt.Sprintf("A dry-run eviction of the source was refused, so nothing is checkpointed yet: %v", checkErr)
+	refusal := fmt.Sprint(checkErr)
+	if cause, ok := apierrors.StatusCause(checkErr, policyv1.DisruptionBudgetCause); ok {
+		refusal = cause.Message // names the budget and its healthy pod counts
+	}
+	message := fmt.Sprintf("A dry-run eviction of the source was refused, so nothing is checkpointed yet: %s", refusal)
 	if reason == reasonBudgetCheckError {
 		status = metav1.ConditionUnknown
 		message = fmt.Sprintf("The dry-run eviction of the source failed, so nothing is checkpointed yet: %v", checkErr)
@@ -129,15 +144,37 @@ func (r *PodMigrationJobReconciler) checkDisruptionBudget(ctx context.Context, j
 		Message:            message,
 		ObservedGeneration: job.Generation,
 	})
-	if err := r.patchStatus(ctx, job, origJob); err != nil {
-		return ctrl.Result{}, false, err
+	// Rechecks that change nothing don't patch the status.
+	if !equality.Semantic.DeepEqual(job.Status, origJob.Status) {
+		if err := r.patchStatus(ctx, job, origJob); err != nil {
+			return ctrl.Result{}, false, err
+		}
 	}
 	if firstBlock && reason == reasonBudgetExhausted {
 		r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "MigrationDeferredByPDB",
-			"Migration is waiting for the PodDisruptionBudget to allow a disruption; nothing has been checkpointed")
+			"Migration is waiting for the PodDisruptionBudget to allow a disruption (%s); nothing has been checkpointed", refusal)
 	}
-	log.FromContext(ctx).Info("Disruption budget doesn't allow the source's eviction yet; waiting in Pending", "reason", reason)
-	return ctrl.Result{RequeueAfter: budgetRecheckInterval}, false, nil
+	after := budgetRecheckAfter(meta.FindStatusCondition(job.Status.Conditions, ConditionDisruptionBudgetChecked),
+		migrationDeadlineAnchor(job).Add(r.getMigrationTimeout(job)), time.Now())
+	log.FromContext(ctx).Info("Disruption budget doesn't allow the source's eviction yet; waiting in Pending", "reason", reason, "recheckAfter", after)
+	return ctrl.Result{RequeueAfter: after}, false, nil
+}
+
+// budgetRecheckAfter returns how long a waiting job waits for its next budget
+// check: half the time since cond's last transition, between
+// budgetRecheckInterval and budgetRecheckMaxInterval, plus jitter. It never
+// waits more than a second past the job's deadline, so the job times out on
+// time; I4 allows only 30 s.
+func budgetRecheckAfter(cond *metav1.Condition, deadline, now time.Time) time.Duration {
+	interval := budgetRecheckInterval
+	if cond != nil {
+		interval = min(max(now.Sub(cond.LastTransitionTime.Time)/2, budgetRecheckInterval), budgetRecheckMaxInterval)
+	}
+	after := wait.Jitter(interval, budgetRecheckJitter)
+	if untilDeadline := deadline.Sub(now) + time.Second; untilDeadline < after {
+		after = max(untilDeadline, time.Second)
+	}
+	return after
 }
 
 // failSourceGone fails a Pending job whose dry-run eviction found no source
