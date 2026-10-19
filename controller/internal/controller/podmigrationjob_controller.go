@@ -136,11 +136,23 @@ func (r *PodMigrationJobReconciler) getMigrationTimeout(job *pmv1alpha1.PodMigra
 	return util.CalculateMigrationTimeout(annotated, 0, base)
 }
 
+// migrationDeadlineAnchor returns the time the job's migration deadline, and
+// its MaxMigrationTimeout hard cap, run from: the job's creation while it is
+// Pending, and the start of Snapshotting once it has left Pending. A job can
+// wait in Pending for the disruption budget for most of its timeout (#42), and
+// that wait mustn't use up the time of the migration that follows.
+func migrationDeadlineAnchor(job *pmv1alpha1.PodMigrationJob) time.Time {
+	if job.Status.SnapshottingStartTime != nil && !job.Status.SnapshottingStartTime.IsZero() {
+		return job.Status.SnapshottingStartTime.Time
+	}
+	return job.CreationTimestamp.Time
+}
+
 func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, job *pmv1alpha1.PodMigrationJob, timeout time.Duration) bool {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || job.Status.SnapshotRef == "" {
 		return false
 	}
-	if time.Since(job.CreationTimestamp.Time) > util.MaxMigrationTimeout {
+	if time.Since(migrationDeadlineAnchor(job)) > util.MaxMigrationTimeout {
 		return false
 	}
 	podName := job.Spec.PodRef.Name
@@ -164,7 +176,7 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		return false
 	}
-	if time.Since(job.CreationTimestamp.Time) > util.MaxMigrationTimeout {
+	if time.Since(migrationDeadlineAnchor(job)) > util.MaxMigrationTimeout {
 		return false
 	}
 	evictionBudget := r.getMigrationTimeout(job)
@@ -732,17 +744,18 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Enforce configurable timeout for active migrations (Pending, Snapshotting, and Evicting)
+	// Enforce configurable timeout for active migrations (Pending, Snapshotting, and Evicting).
+	// Pending's deadline runs from creation, and the migration's from the start of Snapshotting.
 	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhasePending ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 		migrationTimeout := r.getMigrationTimeout(job)
-		if time.Since(job.CreationTimestamp.Time) > migrationTimeout {
+		if time.Since(migrationDeadlineAnchor(job)) > migrationTimeout {
 			if r.isSnapshotProgressing(ctx, job, migrationTimeout) {
 				logger.Info("Migration exceeded baseline timeout but snapshot is actively progressing; extending deadline",
 					"job", job.Name, "snapshot", job.Status.SnapshotRef, "timeout", migrationTimeout)
 			} else if r.isEvictionWithinBudget(job) {
-				logger.Info("Migration exceeded baseline timeout from creation but Evicting phase is within budget; extending deadline",
+				logger.Info("Migration exceeded baseline timeout but Evicting phase is within budget; extending deadline",
 					"job", job.Name, "timeout", migrationTimeout)
 			} else {
 				// If the job was observed to be blocked by PDB or eviction misconfiguration during Evicting phase,
