@@ -50,9 +50,20 @@ const (
 	// GateReleaseGraceWindow is the grace window allowed between patching Status.GateReleased=true on the PMJ
 	// and updating the replacement Pod to remove gke.io/pod-migration-gate.
 	GateReleaseGraceWindow = 30 * time.Second
+
+	// LabelPodFenced is the pod label stamped on fenced source pods (#131, #154).
+	LabelPodFenced = "pod-migration.gke.io/fenced"
+	// ConditionSourceFenced is the PodMigrationJob condition recording source-pod fencing state (#131, #154).
+	ConditionSourceFenced = "SourceFenced"
+	// ReasonPodMigrationFenced is the Pod Ready condition reason held while a source pod is fenced (#131, #154).
+	ReasonPodMigrationFenced = "PodMigrationFenced"
+	// SourceFencedGraceWindow is the grace window after SourceFenced=True transitions
+	// on a PodMigrationJob during which I11 tolerates informer cache lag before the
+	// source Pod's fence label and Ready=False status appear in cached Pod lists.
+	SourceFencedGraceWindow = 10 * time.Second
 )
 
-// DefaultRules is the canonical ordered registry of the Core & Evolved Invariants (I1-I10).
+// DefaultRules is the canonical ordered registry of the Core & Evolved Invariants (I1-I11).
 var DefaultRules = []Rule{
 	funcRule{id: "I1", name: "AtMostOnceRestore", fn: EvaluateI1},
 	funcRule{id: "I2", name: "NoSilentColdStart", fn: EvaluateI2},
@@ -64,6 +75,7 @@ var DefaultRules = []Rule{
 	funcRule{id: "I8", name: "PlatformAndControlPlaneIsolation", fn: EvaluateI8},
 	funcRule{id: "I9", name: "DeterministicFallbackOverCrashloop", fn: EvaluateI9},
 	NewDebouncedRule(RuleI10(), 3, 30*time.Second),
+	NewDebouncedRule(RuleI11(), 3, 30*time.Second),
 }
 
 func allPMJs(s *ReconcileSnapshot) []pmv1alpha1.PodMigrationJob {
@@ -748,6 +760,121 @@ func EvaluateI9(s *ReconcileSnapshot) []Violation {
 				PMJName:   job.Name,
 				PodName:   job.Status.RestoredPodName,
 			})
+		}
+	}
+	return violations
+}
+
+// RuleI11 returns the stateless Rule for I11 (SourceFencedAfterCheckpoint).
+func RuleI11() Rule {
+	return funcRule{
+		id:   "I11",
+		name: "SourceFencedAfterCheckpoint",
+		fn:   EvaluateI11,
+	}
+}
+
+func isSourcePodForPMJ(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) bool {
+	if pod == nil || job == nil {
+		return false
+	}
+	if pod.Namespace != "" && job.Namespace != "" && pod.Namespace != job.Namespace {
+		return false
+	}
+	if job.Status.RestoredPodUID != "" && string(pod.UID) != "" && string(pod.UID) == job.Status.RestoredPodUID {
+		return false
+	}
+	if job.Spec.TargetPodUID != "" && string(pod.UID) != "" {
+		if string(pod.UID) != job.Spec.TargetPodUID {
+			return false
+		}
+		if job.Spec.PodRef.Name != "" && pod.Name != "" && pod.Name != job.Spec.PodRef.Name {
+			return false
+		}
+		return true
+	}
+	return job.Spec.PodRef.Name != "" && pod.Name == job.Spec.PodRef.Name
+}
+
+// EvaluateI11 enforces I11 (SourceFencedAfterCheckpoint, #154 / #131):
+// While a non-terminal PodMigrationJob records condition SourceFenced=True (after
+// SourceFencedGraceWindow has elapsed since LastTransitionTime), its source pod,
+// while it exists, must carry the label `pod-migration.gke.io/fenced: "true"`
+// and have pod status condition `Ready=False` with reason `PodMigrationFenced`.
+//
+// Required unfence ordering: when unfencing a source pod on an abort/cancel path,
+// the controller must set `SourceFenced=False` (Reason=Unfenced) on the
+// PodMigrationJob before removing `pod-migration.gke.io/fenced` from the Pod.
+// Terminal PMJs (Succeeded, SucceededWithoutRestore, Failed) are skipped so an
+// unfenced pod from a concluded job never flags active migrations in the namespace.
+func EvaluateI11(s *ReconcileSnapshot) []Violation {
+	if s == nil {
+		return nil
+	}
+	now := time.Now()
+	if !s.Now.IsZero() {
+		now = s.Now
+	}
+	var violations []Violation
+	pods := allPods(s)
+	for _, job := range allPMJs(s) {
+		if isTerminalPhase(job.Status.Phase) {
+			continue
+		}
+		fencedCond := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced)
+		if fencedCond == nil || fencedCond.Status != metav1.ConditionTrue {
+			continue
+		}
+		if !fencedCond.LastTransitionTime.IsZero() && now.Sub(fencedCond.LastTransitionTime.Time) < SourceFencedGraceWindow {
+			continue
+		}
+		for i := range pods {
+			pod := &pods[i]
+			if !isSourcePodForPMJ(pod, &job) {
+				continue
+			}
+			fencedLabel := ""
+			if pod.Labels != nil {
+				fencedLabel = pod.Labels[LabelPodFenced]
+			}
+			if fencedLabel != "true" {
+				violations = append(violations, Violation{
+					InvariantID:   "I11",
+					InvariantName: "SourceFencedAfterCheckpoint",
+					Reason:        "SourcePodMissingFenceLabel",
+					Message: fmt.Sprintf("PMJ %s/%s has %s=True, but source pod %s has label %s=%q (want \"true\")",
+						job.Namespace, job.Name, ConditionSourceFenced, pod.Name, LabelPodFenced, fencedLabel),
+					Namespace: job.Namespace,
+					PMJName:   job.Name,
+					PodName:   pod.Name,
+				})
+			}
+
+			var readyCond *corev1.PodCondition
+			for j := range pod.Status.Conditions {
+				if pod.Status.Conditions[j].Type == corev1.PodReady {
+					readyCond = &pod.Status.Conditions[j]
+					break
+				}
+			}
+			if readyCond == nil || readyCond.Status != corev1.ConditionFalse || readyCond.Reason != ReasonPodMigrationFenced {
+				actualStatus := "absent"
+				actualReason := ""
+				if readyCond != nil {
+					actualStatus = string(readyCond.Status)
+					actualReason = readyCond.Reason
+				}
+				violations = append(violations, Violation{
+					InvariantID:   "I11",
+					InvariantName: "SourceFencedAfterCheckpoint",
+					Reason:        "SourcePodReadyNotFenced",
+					Message: fmt.Sprintf("PMJ %s/%s has %s=True, but source pod %s has Ready=%s (reason=%q, want False/%s)",
+						job.Namespace, job.Name, ConditionSourceFenced, pod.Name, actualStatus, actualReason, ReasonPodMigrationFenced),
+					Namespace: job.Namespace,
+					PMJName:   job.Name,
+					PodName:   pod.Name,
+				})
+			}
 		}
 	}
 	return violations

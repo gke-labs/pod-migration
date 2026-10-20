@@ -184,33 +184,33 @@ EOF
   log "Verified Trigger A (wedged-restoring-orphan blind spot) -> I10 compiled go test RED/GREEN proof PASSED"
 
   # 4. Trigger C (/extract-invariant slash command) for unintended-cold-start-active-pmj and premature-snapshot-failed + Negative Honesty Gate
-  local i11_out="${base_dir}/out_i11"
+  local i12_out="${base_dir}/out_i12"
   "${INVARIANT_GEN_BIN}" \
     --mode extract-comment \
-    --comment "/extract-invariant I11 unintended-cold-start-active-pmj Replacement pod cold-started while PMJ remained in PhaseRestoring" \
+    --comment "/extract-invariant I12 unintended-cold-start-active-pmj Replacement pod cold-started while PMJ remained in PhaseRestoring" \
     --green-records "${clean_dir}/records.ndjson" \
-    --out-dir "${i11_out}"
-  [[ "$(jq -r '.compiledAndTested' "${i11_out}/proof.json")" == "true" ]] || die "I11 was not compiled and tested via go test"
-  [[ "$(jq -r '.redPassed' "${i11_out}/proof.json")" == "true" ]] || die "I11 RED proof did not pass"
-  [[ "$(jq -r '.greenPassed' "${i11_out}/proof.json")" == "true" ]] || die "I11 GREEN proof did not pass"
+    --out-dir "${i12_out}"
+  [[ "$(jq -r '.compiledAndTested' "${i12_out}/proof.json")" == "true" ]] || die "I12 was not compiled and tested via go test"
+  [[ "$(jq -r '.redPassed' "${i12_out}/proof.json")" == "true" ]] || die "I12 RED proof did not pass"
+  [[ "$(jq -r '.greenPassed' "${i12_out}/proof.json")" == "true" ]] || die "I12 GREEN proof did not pass"
 
-  local i12_snap_out="${base_dir}/out_i12_snap"
+  local i13_snap_out="${base_dir}/out_i13_snap"
   "${INVARIANT_GEN_BIN}" \
     --mode extract-comment \
-    --comment "/extract-invariant I12 premature-snapshot-failed PMJ failed with SnapshotFailed while PodSnapshot Checkpoint=False(InProgress)" \
+    --comment "/extract-invariant I13 premature-snapshot-failed PMJ failed with SnapshotFailed while PodSnapshot Checkpoint=False(InProgress)" \
     --green-records "${clean_dir}/records.ndjson" \
-    --out-dir "${i12_snap_out}"
-  [[ "$(jq -r '.compiledAndTested' "${i12_snap_out}/proof.json")" == "true" ]] || die "I12 was not compiled and tested via go test"
-  [[ "$(jq -r '.redPassed' "${i12_snap_out}/proof.json")" == "true" ]] || die "I12 RED proof did not pass"
-  [[ "$(jq -r '.greenPassed' "${i12_snap_out}/proof.json")" == "true" ]] || die "I12 GREEN proof did not pass"
-  log "Verified Trigger C (premature-snapshot-failed via PrimarySnapshotConditions) -> I12 compiled go test RED/GREEN proof PASSED"
+    --out-dir "${i13_snap_out}"
+  [[ "$(jq -r '.compiledAndTested' "${i13_snap_out}/proof.json")" == "true" ]] || die "I13 was not compiled and tested via go test"
+  [[ "$(jq -r '.redPassed' "${i13_snap_out}/proof.json")" == "true" ]] || die "I13 RED proof did not pass"
+  [[ "$(jq -r '.greenPassed' "${i13_snap_out}/proof.json")" == "true" ]] || die "I13 GREEN proof did not pass"
+  log "Verified Trigger C (premature-snapshot-failed via PrimarySnapshotConditions) -> I13 compiled go test RED/GREEN proof PASSED"
 
-  local i13_custom_out="${base_dir}/out_i13_custom"
+  local i14_custom_out="${base_dir}/out_i14_custom"
   if "${INVARIANT_GEN_BIN}" \
     --mode extract-comment \
-    --comment "/extract-invariant I13 custom-unauthored-check requires manual predicate" \
+    --comment "/extract-invariant I14 custom-unauthored-check requires manual predicate" \
     --require-red-green=true \
-    --out-dir "${i13_custom_out}" >/dev/null 2>&1; then
+    --out-dir "${i14_custom_out}" >/dev/null 2>&1; then
     die "Negative gate failed: custom scaffold without predicate should fail --require-red-green=true"
   fi
   log "Verified negative gate: unauthored custom scaffold fails compiled go test RED proof under --require-red-green=true"

@@ -132,6 +132,23 @@ func (e *Engine) FirstSeen(subjectKey, invariantID string) time.Time {
 	return e.consecutiveFirstSeen[subjectKey][invariantID]
 }
 
+// BackdateFirstSeen sets the first-seen timestamp for a subject key and invariant ID.
+// Used in envtest fault-injection suites to advance debounced rules without wall-clock sleeps.
+func (e *Engine) BackdateFirstSeen(subjectKey, invariantID string, t time.Time) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.consecutiveFirstSeen == nil {
+		e.consecutiveFirstSeen = make(map[string]map[string]time.Time)
+	}
+	if e.consecutiveFirstSeen[subjectKey] == nil {
+		e.consecutiveFirstSeen[subjectKey] = make(map[string]time.Time)
+	}
+	e.consecutiveFirstSeen[subjectKey][invariantID] = t
+}
+
 func snapshotScopeKey(s *ReconcileSnapshot) string {
 	if s == nil {
 		return ""

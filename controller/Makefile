@@ -143,7 +143,7 @@ verify-invariant-governance: ## Run T0 Two-Lane CODEOWNERS governance gate.
 
 test-invariant-gen: ## Run unit tests for tools/invariant-gen blind-spot detector & replay verifier.
 	@test "$$(awk '/^go / {print $$2}' go.mod)" = "$$(awk '/^go / {print $$2}' ../tools/invariant-gen/go.mod)" || { echo "Error: go version mismatch between controller/go.mod and tools/invariant-gen/go.mod" >&2; exit 1; }
-	cd ../tools/invariant-gen && go test -v -race ./...
+	cd ../tools/invariant-gen && go test -count=1 -v -race ./...
 
 test-t5-guardrail: verify-invariant-governance test-pmprofiler test-invariant-gen ## Run T5 invariant evolution pipeline self-test.
 	../verification-suite/run_guardrail_t5_evolution.sh --self-test
