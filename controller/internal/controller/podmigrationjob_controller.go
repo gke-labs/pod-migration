@@ -109,6 +109,11 @@ type PodMigrationJobReconciler struct {
 	// default engine set.  Overridden in tests.
 	RestoreEngines []restore.Engine
 
+	// BudgetChecker checks the source's disruption budget before the
+	// checkpoint (#42). Optional: nil skips the check (unit tests whose fake
+	// client would treat the dry-run eviction as a real one).
+	BudgetChecker DisruptionBudgetChecker
+
 	// DefaultMigrationTimeout specifies the baseline timeout for active migrations.
 	// Defaults to util.DefaultMigrationTimeout (10 minutes) if unset or <= 0.
 	DefaultMigrationTimeout time.Duration
@@ -131,11 +136,23 @@ func (r *PodMigrationJobReconciler) getMigrationTimeout(job *pmv1alpha1.PodMigra
 	return util.CalculateMigrationTimeout(annotated, 0, base)
 }
 
+// migrationDeadlineAnchor returns the time the job's migration deadline, and
+// its MaxMigrationTimeout hard cap, run from: the job's creation while it is
+// Pending, and the start of Snapshotting once it has left Pending. A job can
+// wait in Pending for the disruption budget for most of its timeout (#42), and
+// that wait mustn't use up the time of the migration that follows.
+func migrationDeadlineAnchor(job *pmv1alpha1.PodMigrationJob) time.Time {
+	if job.Status.SnapshottingStartTime != nil && !job.Status.SnapshottingStartTime.IsZero() {
+		return job.Status.SnapshottingStartTime.Time
+	}
+	return job.CreationTimestamp.Time
+}
+
 func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, job *pmv1alpha1.PodMigrationJob, timeout time.Duration) bool {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || job.Status.SnapshotRef == "" {
 		return false
 	}
-	if time.Since(job.CreationTimestamp.Time) > util.MaxMigrationTimeout {
+	if time.Since(migrationDeadlineAnchor(job)) > util.MaxMigrationTimeout {
 		return false
 	}
 	podName := job.Spec.PodRef.Name
@@ -159,7 +176,7 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		return false
 	}
-	if time.Since(job.CreationTimestamp.Time) > util.MaxMigrationTimeout {
+	if time.Since(migrationDeadlineAnchor(job)) > util.MaxMigrationTimeout {
 		return false
 	}
 	evictionBudget := r.getMigrationTimeout(job)
@@ -727,17 +744,18 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Enforce configurable timeout for active migrations (Pending, Snapshotting, and Evicting)
+	// Enforce configurable timeout for active migrations (Pending, Snapshotting, and Evicting).
+	// Pending's deadline runs from creation, and the migration's from the start of Snapshotting.
 	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhasePending ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 		migrationTimeout := r.getMigrationTimeout(job)
-		if time.Since(job.CreationTimestamp.Time) > migrationTimeout {
+		if time.Since(migrationDeadlineAnchor(job)) > migrationTimeout {
 			if r.isSnapshotProgressing(ctx, job, migrationTimeout) {
 				logger.Info("Migration exceeded baseline timeout but snapshot is actively progressing; extending deadline",
 					"job", job.Name, "snapshot", job.Status.SnapshotRef, "timeout", migrationTimeout)
 			} else if r.isEvictionWithinBudget(job) {
-				logger.Info("Migration exceeded baseline timeout from creation but Evicting phase is within budget; extending deadline",
+				logger.Info("Migration exceeded baseline timeout but Evicting phase is within budget; extending deadline",
 					"job", job.Name, "timeout", migrationTimeout)
 			} else {
 				// If the job was observed to be blocked by PDB or eviction misconfiguration during Evicting phase,
@@ -781,7 +799,17 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 
 				prevPhase := origJob.Status.Phase
-				logger.Info("Migration job timed out, transitioning to Failed", "job", job.Name, "timeout", migrationTimeout)
+				reason := "Timeout"
+				outcome := "timeout"
+				message := fmt.Sprintf("Migration job timed out (exceeded %v limit)", migrationTimeout)
+				if refusedByDisruptionBudget(job) {
+					// Nothing was checkpointed. The eviction webhook replaces this job
+					// with a fresh one on the next eviction (#42).
+					reason = util.ReasonDisruptionBudgetTimeout
+					outcome = "budget_timeout"
+					message = fmt.Sprintf("Migration job timed out (exceeded %v limit) waiting for the PodDisruptionBudget; nothing was checkpointed, and the next eviction starts a new job", migrationTimeout)
+				}
+				logger.Info("Migration job timed out, transitioning to Failed", "job", job.Name, "timeout", migrationTimeout, "reason", reason)
 				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 				now := metav1.Now()
 				job.Status.CompletionTime = &now
@@ -789,8 +817,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 					Type:               "Ready",
 					Status:             metav1.ConditionFalse,
-					Reason:             "Timeout",
-					Message:            fmt.Sprintf("Migration job timed out (exceeded %v limit)", migrationTimeout),
+					Reason:             reason,
+					Message:            message,
 					ObservedGeneration: job.Generation,
 				})
 
@@ -801,9 +829,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on timeout")
 				}
 				metrics.MarkPMJInactive(req.NamespacedName.String())
-				metrics.RecordOutcome("timeout")
+				metrics.RecordOutcome(outcome)
 				r.recordPreviousPhaseDuration(job, prevPhase)
-				r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", fmt.Sprintf("Migration job timed out (exceeded %v limit)", migrationTimeout))
+				r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", message)
 				return ctrl.Result{}, nil
 			}
 		}
@@ -892,8 +920,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
 		var annotationUpdated bool
-		// Capture PV Names, origin node name, and migration timeout before starting checkpoint (pod is guaranteed to exist)
-		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" || (job.Annotations == nil || job.Annotations[util.AnnotationMigrationTimeout] == "") {
+		// Capture PV Names, origin node name, and migration timeout before starting checkpoint (pod is guaranteed to exist).
+		// A job waiting for the disruption budget checks the source again on every pass,
+		// since the source can be deleted, replaced, or finish during the wait (#42).
+		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" || (job.Annotations == nil || job.Annotations[util.AnnotationMigrationTimeout] == "") ||
+			waitingForDisruptionBudget(job) {
 			originPod := &corev1.Pod{}
 			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: podName}, originPod)
 			if err != nil {
@@ -1043,6 +1074,17 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			job.ObjectMeta = *jobToUpdate.ObjectMeta.DeepCopy()
 			job.Status = *savedStatus
 			origJob.ObjectMeta = *jobToUpdate.ObjectMeta.DeepCopy()
+		}
+
+		// Check the disruption budget before the checkpoint (#42).
+		if r.BudgetChecker != nil && !skipsDisruptionBudgetCheck(job) {
+			res, proceed, err := r.checkDisruptionBudget(ctx, job, origJob, podName)
+			if err != nil {
+				return r.handleStatusError(ctx, err, "Failed to record the disruption budget check")
+			}
+			if !proceed {
+				return res, nil
+			}
 		}
 
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting

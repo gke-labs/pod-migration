@@ -411,6 +411,7 @@ func EffectiveMigrationTimeout(job *pmv1alpha1.PodMigrationJob) time.Duration {
 // timeout (`pod-migration.gke.io/timeout` annotation on the PMJ, or 10m default)
 // without transitioning to a terminal phase, and a deleting PodMigration CR with
 // StorageCleanupFinalizer must not remain un-finalized past MaxMigrationDuration (10m).
+// The PMJ deadline runs from creation while Pending and from Status.SnapshottingStartTime after.
 func EvaluateI4(s *ReconcileSnapshot) []Violation {
 	var violations []Violation
 	now := time.Now()
@@ -429,11 +430,20 @@ func EvaluateI4(s *ReconcileSnapshot) []Violation {
 			effectiveTimeout := EffectiveMigrationTimeout(&job)
 			budget := effectiveTimeout + progressGraceSlack
 
+			// The deadline and its MaxMigrationTimeout (2h) hard cap run from the PMJ's
+			// creation while it is Pending, and from Status.SnapshottingStartTime once it
+			// has left Pending, as in the reconciler: a wait in Pending for the
+			// disruption budget (#42) doesn't use up the migration's own time.
+			anchor, anchorLabel := job.CreationTimestamp.Time, "created"
+			if job.Status.SnapshottingStartTime != nil && !job.Status.SnapshottingStartTime.IsZero() {
+				anchor, anchorLabel = job.Status.SnapshottingStartTime.Time, "snapshotting started"
+			}
+
 			// During Evicting, PR #57 anchors the eviction phase budget on Status.EvictingStartTime
 			// (with fallback to the `pod-migration.gke.io/evicting-since` annotation for in-flight jobs),
 			// bounded by the hard MaxMigrationTimeout (2h) wall-clock cap.
 			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting &&
-				(job.CreationTimestamp.IsZero() || now.Sub(job.CreationTimestamp.Time) <= util.MaxMigrationTimeout+progressGraceSlack) {
+				(anchor.IsZero() || now.Sub(anchor) <= util.MaxMigrationTimeout+progressGraceSlack) {
 				if job.Status.EvictingStartTime != nil && !job.Status.EvictingStartTime.IsZero() {
 					if now.Sub(job.Status.EvictingStartTime.Time) <= budget {
 						continue
@@ -451,15 +461,15 @@ func EvaluateI4(s *ReconcileSnapshot) []Violation {
 				}
 			}
 
-			if !job.CreationTimestamp.IsZero() && now.Sub(job.CreationTimestamp.Time) > budget {
+			if !anchor.IsZero() && now.Sub(anchor) > budget {
 				// Static message string (without dynamic now.Sub elapsed duration) so
 				// client-go EventRecorder and Engine deduplication aggregate cleanly.
 				violations = append(violations, Violation{
 					InvariantID:   "I4",
 					InvariantName: "TerminalProgress",
 					Reason:        "ActivePMJExceededDeadline",
-					Message: fmt.Sprintf("PMJ %s/%s remained in non-terminal phase %q beyond its %s deadline (created at %s)",
-						job.Namespace, job.Name, job.Status.Phase, effectiveTimeout, job.CreationTimestamp.Time.UTC().Format(time.RFC3339)),
+					Message: fmt.Sprintf("PMJ %s/%s remained in non-terminal phase %q beyond its %s deadline (%s at %s)",
+						job.Namespace, job.Name, job.Status.Phase, effectiveTimeout, anchorLabel, anchor.UTC().Format(time.RFC3339)),
 					Namespace: job.Namespace,
 					PMJName:   job.Name,
 				})

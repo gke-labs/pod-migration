@@ -61,7 +61,7 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -82,7 +82,7 @@ func TestFindUnassignedActivePMJ_BarePod(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 				&corev1.Pod{
@@ -165,7 +165,7 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -194,7 +194,7 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -223,7 +223,7 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 				&pmv1alpha1.PodMigrationJob{
@@ -242,7 +242,7 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -271,7 +271,7 @@ func TestFindUnassignedActivePMJ_DeploymentRevisionIsolation(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 				&corev1.Pod{
@@ -1119,7 +1119,7 @@ func TestFindUnassignedActivePMJ_IndexedMultiWorkload(t *testing.T) {
 			PodRef: corev1.LocalObjectReference{Name: "standalone"},
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 		},
 	}
 

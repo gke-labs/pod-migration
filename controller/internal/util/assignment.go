@@ -174,15 +174,38 @@ func filterCandidates(jobs []pmv1alpha1.PodMigrationJob, parentName, parentKind,
 			}
 		}
 
+		// A replacement exists because its source was evicted, which happens only
+		// after the job's checkpoint. So a Pending job never owns a new pod: it can
+		// wait there for the disruption budget for minutes (#42), and handing it a
+		// sibling's replacement would leave that pod gated under a job that may
+		// never checkpoint, while the evicted job never gets its replacement. A pod
+		// created while only Pending jobs exist takes the scale-up path.
 		phase := job.Status.Phase
-		if phase == pmv1alpha1.PodMigrationJobPhasePending ||
-			phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
+		if phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting ||
 			phase == pmv1alpha1.PodMigrationJobPhaseEvicting ||
 			phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
 			candidates = append(candidates, job)
 		}
 	}
+	// Prefer the jobs whose source is being evicted; Snapshotting stays a
+	// candidate only for a cache that lags the job's move to Evicting.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidatePhaseRank(candidates[i].Status.Phase) < candidatePhaseRank(candidates[j].Status.Phase)
+	})
 	return candidates
+}
+
+// candidatePhaseRank orders replacement candidates, closest to the source's
+// eviction first.
+func candidatePhaseRank(phase pmv1alpha1.PodMigrationJobPhase) int {
+	switch phase {
+	case pmv1alpha1.PodMigrationJobPhaseEvicting:
+		return 0
+	case pmv1alpha1.PodMigrationJobPhaseRestoring:
+		return 1
+	default:
+		return 2
+	}
 }
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.

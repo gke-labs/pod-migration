@@ -118,7 +118,7 @@ func TestPodGateInjector(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -211,7 +211,7 @@ func TestPodGateInjector(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -266,7 +266,7 @@ func TestPodGateInjector(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -321,7 +321,7 @@ func TestPodGateInjector(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -376,7 +376,7 @@ func TestPodGateInjector(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 				&pmv1alpha1.PodMigrationJob{
@@ -390,7 +390,7 @@ func TestPodGateInjector(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -430,7 +430,7 @@ func TestPodGateInjector(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},
@@ -470,7 +470,7 @@ func TestPodGateInjector(t *testing.T) {
 						},
 					},
 					Status: pmv1alpha1.PodMigrationJobStatus{
-						Phase: pmv1alpha1.PodMigrationJobPhasePending,
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 					},
 				},
 			},

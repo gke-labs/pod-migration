@@ -35,7 +35,8 @@ var (
 	})
 
 	// OutcomesTotal counts completed pod migration jobs by outcome label.
-	// Outcomes: succeeded | failed | timeout | fallback | succeeded_without_restore
+	// Outcomes: succeeded | failed | timeout | budget_timeout | fallback | succeeded_without_restore
+	// (budget_timeout: timed out waiting in Pending for the PodDisruptionBudget, with nothing checkpointed)
 	OutcomesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_outcomes_total",
 		Help: "Total number of completed pod migration jobs by outcome.",
@@ -74,6 +75,14 @@ var (
 		Help: "Total number of pods skipped for spot preemption migration by reason.",
 	}, []string{"reason"})
 
+	// BudgetChecksTotal counts the dry-run evictions that check a source's
+	// disruption budget before its checkpoint (#42), by result.
+	// Results: allowed | budget_exhausted | check_error
+	BudgetChecksTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_budget_checks_total",
+		Help: "Total number of disruption budget checks (dry-run evictions) before a checkpoint, by result.",
+	}, []string{"result"})
+
 	// FenceWebhookRequestsTotal counts fence webhook requests by action.
 	// Actions: fenced | unchanged | not_fenced | skipped | decode_error
 	FenceWebhookRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -95,8 +104,16 @@ func init() {
 		InvariantViolationsTotal,
 		SpotPreemptionTriggeredTotal,
 		SpotPreemptionSkippedTotal,
+		BudgetChecksTotal,
 		FenceWebhookRequestsTotal,
 	)
+}
+
+// RecordBudgetCheck increments the disruption budget check counter for the given result.
+func RecordBudgetCheck(result string) {
+	if result != "" {
+		BudgetChecksTotal.WithLabelValues(result).Inc()
+	}
 }
 
 // RecordFenceWebhookRequest increments the fence webhook request counter for the given action.
