@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -417,6 +418,127 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 	}
 	logger.Info("Successfully deleted trigger")
 	return nil
+}
+
+// snapshotTriggeredByLabel is the label GKE Pod Snapshots puts on every
+// PodSnapshot it creates for a manual trigger. Its value is the trigger's name.
+const snapshotTriggeredByLabel = "gke-pod-snapshot-triggered-by"
+
+// CheckpointState reports whether the job's checkpoint of the source has
+// settled and whether it completed (#131). It finds the job's PodSnapshots by
+// the trigger's status, the snapshot recorded on the job, and the label the
+// agent puts on every snapshot it creates for the trigger, so it still finds
+// them after Cleanup deleted the trigger.
+//
+// A trigger that still exists can start a checkpoint, and a snapshot that's
+// neither finished nor gone can still complete, so either one means not
+// Settled. A snapshot whose Checkpoint condition is True, or that is Ready,
+// is a completed checkpoint: GKE stops the source after it.
+func (p *GKEProvider) CheckpointState(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (CheckpointState, error) {
+	triggerName := util.FormatPSMTName(podName, job.Spec.TargetPodUID)
+	state := CheckpointState{Settled: true}
+	names := map[string]bool{}
+	if job.Status.SnapshotRef != "" {
+		names[job.Status.SnapshotRef] = true
+	}
+
+	trigger := &unstructured.Unstructured{}
+	trigger.SetGroupVersionKind(schema.GroupVersionKind{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshotManualTrigger"})
+	err := p.client.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger)
+	switch {
+	case err == nil:
+		state.Settled = false
+		if name, found, _ := unstructured.NestedString(trigger.Object, "status", "snapshotCreated", "name"); found && name != "" {
+			names[name] = true
+		}
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	default:
+		return CheckpointState{}, fmt.Errorf("reading trigger %s: %w", triggerName, err)
+	}
+
+	snapshotGVK := schema.GroupVersionKind{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshot"}
+	snapshots := map[string]*unstructured.Unstructured{}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(snapshotGVK.GroupVersion().WithKind("PodSnapshotList"))
+	if err := p.client.List(ctx, list, client.InNamespace(job.Namespace), client.MatchingLabels{snapshotTriggeredByLabel: triggerName}); err != nil {
+		if !meta.IsNoMatchError(err) {
+			return CheckpointState{}, fmt.Errorf("listing the snapshots of trigger %s: %w", triggerName, err)
+		}
+	}
+	for i := range list.Items {
+		snapshots[list.Items[i].GetName()] = &list.Items[i]
+	}
+	for name := range names {
+		if _, ok := snapshots[name]; ok {
+			continue
+		}
+		snap := &unstructured.Unstructured{}
+		snap.SetGroupVersionKind(snapshotGVK)
+		if err := p.client.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: name}, snap); err != nil {
+			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+				continue
+			}
+			return CheckpointState{}, fmt.Errorf("reading snapshot %s: %w", name, err)
+		}
+		snapshots[name] = snap
+	}
+
+	for _, snap := range snapshots {
+		completed, finished := podSnapshotCheckpointProgress(snap)
+		if completed {
+			state.Completed = true
+		}
+		if !finished {
+			state.Settled = false
+		}
+	}
+	return state, nil
+}
+
+// podSnapshotCheckpointProgress reports whether a PodSnapshot's checkpoint
+// completed, and whether the snapshot finished: Ready, or failed terminally.
+// A snapshot being deleted hasn't finished until it's gone.
+func podSnapshotCheckpointProgress(snap *unstructured.Unstructured) (completed, finished bool) {
+	conditions, _, _ := unstructured.NestedSlice(snap.Object, "status", "conditions")
+	var readyFailed, subconditionInProgress bool
+	for _, c := range conditions {
+		cond, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cType, _ := cond["type"].(string)
+		cStatus, _ := cond["status"].(string)
+		cReason, _ := cond["reason"].(string)
+		switch cType {
+		case "Checkpoint", "StorageReplicated":
+			if cType == "Checkpoint" && cStatus == "True" {
+				completed = true
+			}
+			if cStatus == "False" && isTerminalSnapshotFailureReason(cReason) {
+				finished = true
+			} else if cStatus == "False" && isSnapshotSubconditionInProgressReason(cReason) {
+				subconditionInProgress = true
+			}
+		case "Ready":
+			if cStatus == "True" {
+				completed, finished = true, true
+			} else if cStatus == "False" && isTerminalSnapshotFailureReason(cReason) {
+				readyFailed = true
+			}
+		}
+	}
+	// A Ready=False failure while a sub-condition is still in progress can be
+	// the transient race of #75, so it alone doesn't finish the snapshot.
+	if readyFailed && !subconditionInProgress {
+		finished = true
+	}
+	if phase, _, _ := unstructured.NestedString(snap.Object, "status", "phase"); isTerminalSnapshotFailureReason(phase) {
+		finished = true
+	}
+	if snap.GetDeletionTimestamp() != nil {
+		finished = false
+	}
+	return completed, finished
 }
 
 // isTerminalSnapshotFailureReason checks if a condition reason indicates that the snapshot operation

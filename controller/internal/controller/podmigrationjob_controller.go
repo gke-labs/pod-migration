@@ -67,11 +67,14 @@ const (
 // requests when it evicts the origin pod after its snapshot is durable, or
 // shortens the termination of an origin pod that an external evictor already
 // started deleting. By then the authoritative workload state lives in the
-// snapshot and the checkpointed sandbox has stopped: anything kubelet restarted
-// in the origin pod (restartPolicy: Always) is an empty cold instance. Honouring
-// the pod's full terminationGracePeriodSeconds for it only delays Restoring,
-// which waits for the origin pod to be gone. 1s keeps the deletion graceful;
-// 0 would force-delete the API object before kubelet confirms the sandbox is gone.
+// snapshot and the checkpointed sandbox has stopped. What the kubelet restarted
+// in the origin pod (restartPolicy: Always) isn't inert: it runs the workload
+// from scratch, without that state. The fence keeps it out of its Services'
+// endpoints (#131), but not its outbound work or its writes to volumes, so the
+// sooner it's gone the better. Its full terminationGracePeriodSeconds would
+// also delay Restoring, which waits for the origin pod to be gone. 1s keeps the
+// deletion graceful; 0 would force-delete the API object before kubelet
+// confirms the sandbox is gone.
 const postCheckpointEvictionGracePeriodSeconds int64 = 1
 
 // newPostCheckpointEviction builds the PDB-safe eviction for a checkpointed origin pod.
@@ -117,6 +120,17 @@ type PodMigrationJobReconciler struct {
 	// DefaultMigrationTimeout specifies the baseline timeout for active migrations.
 	// Defaults to util.DefaultMigrationTimeout (10 minutes) if unset or <= 0.
 	DefaultMigrationTimeout time.Duration
+
+	// FencePreCheckpointCap bounds how long a fenced source waits for its
+	// checkpoint trigger while creating it fails with retryable errors (#131).
+	// Defaults to DefaultFencePreCheckpointCap if unset or <= 0.
+	FencePreCheckpointCap time.Duration
+
+	// FenceLateStopWatch is how long the controller watches a source that a
+	// failed migration returned to service, to fence and evict it again if it
+	// stops anyway (#131). Defaults to DefaultFenceLateStopWatch if unset or
+	// <= 0.
+	FenceLateStopWatch time.Duration
 
 	// fallbackEventChecks records the last fallback-event probe per PMJ
 	// (namespace/name -> time.Time).  In-memory only; a restart just means
@@ -532,6 +546,8 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
+// The source fence (#131) holds the source's Ready condition at False.
+// +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;patch
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // The recorder publishes restore-crash Warning events, which needs write access.
@@ -854,6 +870,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
+	// A job that fenced its source and then concluded without a restore still
+	// owns the fence: it returns the source to service, or keeps it fenced and
+	// evicts it (#131). That has to finish before the job is deleted.
+	if res, handled, err := r.resolveSourceFence(ctx, job, origJob); handled || err != nil {
+		return res, err
+	}
+
 	// Garbage collect completed PMJs after 30 minutes to allow ample time for large queue drainage.
 	// Note: Once Issue #19 (field indexers & transactional status.claimedBy) lands, gate lookups
 	// will be O(1) and this TTL can be safely reduced to a shorter interval (e.g. 5-10 minutes).
@@ -1107,8 +1130,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
+		// Fence the source before its checkpoint is triggered (#131).
+		if err := r.fenceSource(ctx, job, origJob); err != nil {
+			return r.handleStatusError(ctx, err, "Failed to fence the source before its checkpoint")
+		}
 		res, err := r.getSnapshotProvider().EnsureTrigger(ctx, job, podName)
 		if err != nil {
+			if reason, message, failed := r.triggerFailure(job, err); failed {
+				return r.failSnapshotting(ctx, req, job, origJob, reason, message)
+			}
 			return ctrl.Result{}, err
 		}
 		if res.Requeue || res.RequeueAfter != 0 {
@@ -1466,6 +1496,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		metrics.MarkPMJActive(req.NamespacedName.String())
 		r.recordPreviousPhaseDuration(job, pmv1alpha1.PodMigrationJobPhaseEvicting)
+		if fenced := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced); fenced != nil && fenced.Status == metav1.ConditionTrue {
+			metrics.RecordSourceFencedDuration("migrated", time.Since(fenced.LastTransitionTime.Time).Seconds())
+		}
 		logger.Info("PodMigrationJob transitioned to Restoring phase", "pod", podName)
 		return ctrl.Result{}, nil
 

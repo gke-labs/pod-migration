@@ -57,6 +57,13 @@ rules:
   verbs:
   - create
 - apiGroups:
+  - ""
+  resources:
+  - pods/status
+  verbs:
+  - get
+  - patch
+- apiGroups:
   - apps
   resources:
   - deployments
@@ -396,6 +403,12 @@ webhooks:
   - name: mpodfence.podmigration.gke.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
+    # Fail: if this webhook let a status write through, the kubelet's next
+    # write would set a fenced source Ready again (#131). The cost: while the
+    # controller is down, a fenced pod can't finish deleting, because the
+    # kubelet writes a pod's final status before the pod is removed, so an
+    # evicted source stays Terminating and a drain waits on it. It heals when
+    # the webhook is back, and only pods with the label below are affected.
     failurePolicy: Fail
     reinvocationPolicy: IfNeeded
     timeoutSeconds: 5
