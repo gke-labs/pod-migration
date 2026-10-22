@@ -9,7 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -21,6 +20,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -43,15 +43,30 @@ type NodePreemptionReconciler struct {
 	SpotPreemptionBudget    int64
 	RuntimeClassPolicy      *eligibility.RuntimeClassPolicy
 
+	// Engines provides the snapshot engine for each pod: whether it can
+	// migrate the pod, and its policy for the pod. Optional: nil selects GKE
+	// Pod Snapshots, built from Client and Scheme with RuntimeClassPolicy as
+	// its allow-list.
+	Engines *engine.Registry
+
 	// processedPods tracks pods that have already had a preemption migration triggered or skipped
 	// to avoid spamming duplicate events across subsequent node heartbeat updates.
 	processedPods sync.Map // map[types.UID]time.Time
 }
 
 type preemptionCandidate struct {
-	pod  *corev1.Pod
-	psp  *unstructured.Unstructured
-	size int64
+	pod    *corev1.Pod
+	policy *engine.PolicyRef
+	size   int64
+}
+
+// engineFor returns the snapshot engine for pod, and false if no engine
+// serves it.
+func (r *NodePreemptionReconciler) engineFor(pod *corev1.Pod) (engine.Engine, bool) {
+	if r.Engines != nil {
+		return r.Engines.ForPod(pod, nil)
+	}
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, r.RuntimeClassPolicy), true
 }
 
 // Reconcile reacts to Node events, scanning for preemption signals and initiating migrations.
@@ -120,8 +135,10 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 
-		// Check migratable runtime class
-		if !r.RuntimeClassPolicy.Allows(pod.Spec.RuntimeClassName) {
+		// Check that a snapshot engine serves the pod and can migrate it (for
+		// GKE Pod Snapshots, the migratable runtime classes)
+		eng, ok := r.engineFor(pod)
+		if !ok || !eng.Eligible(pod, node).OK {
 			continue
 		}
 
@@ -153,13 +170,14 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 
-		// Verify matching PodSnapshotPolicy
-		matchingPSP, err := util.FindLatestReadyManualStopPSP(ctx, r.Client, pod.Namespace, pod.Labels)
+		// Verify the engine's policy for the pod (GKE Pod Snapshots: a Ready,
+		// manual, stop PodSnapshotPolicy)
+		policy, err := eng.ResolvePolicy(ctx, pod)
 		if err != nil {
 			logger.Error(err, "Failed to resolve matching PodSnapshotPolicy for pod", "pod", pod.Name, "namespace", pod.Namespace)
 			continue
 		}
-		if matchingPSP == nil {
+		if policy == nil {
 			logger.Info("No matching ready manual+stop policy found for pod on preempting node", "pod", pod.Name, "namespace", pod.Namespace)
 			if r.Recorder != nil {
 				r.Recorder.Event(pod, corev1.EventTypeWarning, "MigrationSkippedNoPolicy",
@@ -186,9 +204,9 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 
 		candidates = append(candidates, preemptionCandidate{
-			pod:  pod,
-			psp:  matchingPSP,
-			size: footprintBytes,
+			pod:    pod,
+			policy: policy,
+			size:   footprintBytes,
 		})
 	}
 
@@ -247,8 +265,8 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		// For spot preemption, enforce a short 2-minute deadline so doomed migrations
 		// fail fast rather than waiting up to 2 hours on a node that will vanish in seconds.
 		preemptionTimeout := util.PreemptionDefaultTimeout
-		jobLabels, jobAnnotations := util.BuildPMJLabelsAndAnnotations(
-			pod, parentName, parentKind, parentUID, cand.psp, preemptionTimeout, util.TriggerSourceSpotPreemption,
+		jobLabels, jobAnnotations := util.BuildPMJLabelsAndAnnotationsForPolicy(
+			pod, parentName, parentKind, parentUID, cand.policy.Name, preemptionTimeout, util.TriggerSourceSpotPreemption,
 		)
 		if jobAnnotations == nil {
 			jobAnnotations = make(map[string]string)
