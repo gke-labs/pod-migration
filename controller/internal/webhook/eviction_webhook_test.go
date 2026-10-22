@@ -23,6 +23,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -657,6 +658,10 @@ func TestEvictionGate(t *testing.T) {
 				}
 				if pmj.Annotations[util.AnnotationPodSnapshotPolicy] != "psp-test-manual" {
 					t.Errorf("Expected annotation %s=psp-test-manual, got %s", util.AnnotationPodSnapshotPolicy, pmj.Annotations[util.AnnotationPodSnapshotPolicy])
+				}
+				// Without a registry, GKE Pod Snapshots serves the job.
+				if pmj.Annotations[engine.AnnotationEngine] != engine.GKEPodSnapshotsName {
+					t.Errorf("Expected annotation %s=%s, got %s", engine.AnnotationEngine, engine.GKEPodSnapshotsName, pmj.Annotations[engine.AnnotationEngine])
 				}
 				for k, v := range tt.expectedLabels {
 					if pmj.Labels[k] != v {

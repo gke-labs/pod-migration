@@ -17,7 +17,9 @@
 // An Engine bundles what the controller needs from one engine: the pods it
 // can serve, the policy and storage objects it needs in a namespace, its
 // snapshot provider, its restore-failure classifiers and the guarantees it
-// declares. A Registry holds the engines and picks one for a pod or a job.
+// declares. A Registry holds the engines and picks one for a pod, by routing
+// the pod's runtime class to an engine, or for a job, by the engine recorded
+// on the job.
 // The contract is docs/design/engine-contract.md (#81); the clause numbers
 // in the comments (C1, C2, ...) refer to it.
 //
@@ -42,6 +44,19 @@ import (
 // object only when the label is absent or matches, so a PodMigration that was
 // recreated under the same name keeps its objects.
 const OwnerUIDLabel = "podmigration.gke.io/owner-uid"
+
+const (
+	// AnnotationEngine names, on a PodMigrationJob, the engine that serves
+	// the job (C1). The eviction webhook and the preemption trigger record
+	// the engine they picked for the pod when they create the job.
+	AnnotationEngine = "pod-migration.gke.io/engine"
+
+	// AnnotationRuntimeClassEngines, on a PodMigration, routes runtime
+	// classes to engines for the pods of its namespace, in ParseRoutes
+	// syntax: "gvisor=gke-pod-snapshots,@default=other-engine". Each class
+	// it routes overrides the controller's route for that class.
+	AnnotationRuntimeClassEngines = "pod-migration.gke.io/runtime-class-engines"
+)
 
 // Engine is one checkpoint/restore engine.
 type Engine interface {

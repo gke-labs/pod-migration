@@ -1,6 +1,7 @@
 package eligibility
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -81,6 +82,21 @@ func TestNilPolicyStringIsDefault(t *testing.T) {
 	var p *RuntimeClassPolicy
 	if got := p.String(); got != DefaultMigratableRuntimeClasses {
 		t.Errorf("nil policy String() = %q, want %q", got, DefaultMigratableRuntimeClasses)
+	}
+}
+
+func TestRuntimeClassPolicyClasses(t *testing.T) {
+	for _, tc := range []struct {
+		policy *RuntimeClassPolicy
+		want   []string
+	}{
+		{policy: nil, want: []string{"gvisor"}},
+		{policy: mustParseRuntimeClassPolicy("@default"), want: []string{"@default"}},
+		{policy: mustParseRuntimeClassPolicy("runsc-debug,@default,gvisor"), want: []string{"gvisor", "runsc-debug", "@default"}},
+	} {
+		if got := tc.policy.Classes(); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("Classes() of %q = %q, want %q", tc.policy.String(), got, tc.want)
+		}
 	}
 }
 

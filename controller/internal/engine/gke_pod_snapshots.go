@@ -59,9 +59,8 @@ const (
 // method hands out what the controller used before the engine package
 // existed.
 type GKEPodSnapshots struct {
-	reader         client.Reader
-	provider       *snapshot.GKEProvider
-	runtimeClasses *eligibility.RuntimeClassPolicy
+	reader   client.Reader
+	provider *snapshot.GKEProvider
 }
 
 var (
@@ -71,21 +70,24 @@ var (
 
 // NewGKEPodSnapshots returns the GKE Pod Snapshots engine. c serves the
 // policy lookup and the snapshot provider, and scheme sets the owner
-// reference on checkpoint triggers. runtimeClasses is the operator
-// allow-list (--migratable-runtime-classes); nil means gVisor only.
-func NewGKEPodSnapshots(c client.Client, scheme *runtime.Scheme, runtimeClasses *eligibility.RuntimeClassPolicy) *GKEPodSnapshots {
+// reference on checkpoint triggers.
+func NewGKEPodSnapshots(c client.Client, scheme *runtime.Scheme) *GKEPodSnapshots {
 	return &GKEPodSnapshots{
-		reader:         c,
-		provider:       snapshot.NewGKEProvider(c, scheme),
-		runtimeClasses: runtimeClasses,
+		reader:   c,
+		provider: snapshot.NewGKEProvider(c, scheme),
 	}
 }
 
 // NewDefaultRegistry returns the registry of a stock deployment: GKE Pod
-// Snapshots, registered as the default engine.
+// Snapshots, registered as the default engine, serving every runtime class
+// that runtimeClasses allows (RoutesFromAllowList). runtimeClasses is the
+// operator allow-list (--migratable-runtime-classes); nil means gVisor only.
 func NewDefaultRegistry(c client.Client, scheme *runtime.Scheme, runtimeClasses *eligibility.RuntimeClassPolicy) (*Registry, error) {
 	r := NewRegistry(GKEPodSnapshotsName)
-	if err := r.Register(NewGKEPodSnapshots(c, scheme, runtimeClasses)); err != nil {
+	if err := r.Register(NewGKEPodSnapshots(c, scheme)); err != nil {
+		return nil, err
+	}
+	if err := r.SetRoutes(RoutesFromAllowList(runtimeClasses, GKEPodSnapshotsName)); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -97,18 +99,13 @@ func (*GKEPodSnapshots) Name() string { return GKEPodSnapshotsName }
 // RuntimeClasses implements Engine: gVisor.
 func (*GKEPodSnapshots) RuntimeClasses() []string { return []string{gkeRuntimeClass} }
 
-// Eligible implements Engine with the operator allow-list, the check the
-// eviction webhook and the preemption trigger made before the registry.
-// Until per-pod resolution (#80), this engine serves every allow-listed
-// runtime class, so the allow-list is its eligibility. The node isn't used
-// yet.
-func (e *GKEPodSnapshots) Eligible(pod *corev1.Pod, _ *corev1.Node) Verdict {
+// Eligible implements Engine. GKE Pod Snapshots refuses no pod: the
+// operator allow-list (--migratable-runtime-classes), which callers check
+// first, and the routes decide which pods reach it, as the allow-list alone
+// did before the registry. The node isn't used yet.
+func (*GKEPodSnapshots) Eligible(pod *corev1.Pod, _ *corev1.Node) Verdict {
 	if pod == nil {
 		return Verdict{Reason: "no pod to migrate"}
-	}
-	if !e.runtimeClasses.Allows(pod.Spec.RuntimeClassName) {
-		return Verdict{Reason: fmt.Sprintf("Pod runtime class %s is not migratable (allowed: %s), skipping migration",
-			eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName), e.runtimeClasses.String())}
 	}
 	return Verdict{OK: true}
 }

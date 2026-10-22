@@ -43,10 +43,10 @@ type NodePreemptionReconciler struct {
 	SpotPreemptionBudget    int64
 	RuntimeClassPolicy      *eligibility.RuntimeClassPolicy
 
-	// Engines provides the snapshot engine for each pod: whether it can
-	// migrate the pod, and its policy for the pod. Optional: nil selects GKE
-	// Pod Snapshots, built from Client and Scheme with RuntimeClassPolicy as
-	// its allow-list.
+	// Engines provides the snapshot engine for each pod: the one its
+	// runtime class routes to, whether that engine can migrate the pod, and
+	// its policy for the pod. Optional: nil selects GKE Pod Snapshots, built
+	// from Client and Scheme, for every pod RuntimeClassPolicy allows.
 	Engines *engine.Registry
 
 	// processedPods tracks pods that have already had a preemption migration triggered or skipped
@@ -56,17 +56,33 @@ type NodePreemptionReconciler struct {
 
 type preemptionCandidate struct {
 	pod    *corev1.Pod
+	engine engine.Engine
 	policy *engine.PolicyRef
 	size   int64
 }
 
-// engineFor returns the snapshot engine for pod, and false if no engine
-// serves it.
-func (r *NodePreemptionReconciler) engineFor(pod *corev1.Pod) (engine.Engine, bool) {
+// engineFor returns the snapshot engine for pod, given pm, the active
+// PodMigration of its namespace (nil if there's none), and false if no
+// engine serves the pod.
+func (r *NodePreemptionReconciler) engineFor(pod *corev1.Pod, pm *pmv1alpha1.PodMigration) (engine.Engine, bool) {
 	if r.Engines != nil {
-		return r.Engines.ForPod(pod, nil)
+		return r.Engines.ForPod(pod, pm)
 	}
-	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, r.RuntimeClassPolicy), true
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme), true
+}
+
+// activePodMigration returns the active PodMigration of namespace, through
+// seen, which remembers the namespaces looked up during one reconcile.
+func (r *NodePreemptionReconciler) activePodMigration(ctx context.Context, seen map[string]*pmv1alpha1.PodMigration, namespace string) (*pmv1alpha1.PodMigration, error) {
+	if pm, ok := seen[namespace]; ok {
+		return pm, nil
+	}
+	pm, err := util.ActivePodMigration(ctx, r.Client, namespace)
+	if err != nil {
+		return nil, err
+	}
+	seen[namespace] = pm
+	return pm, nil
 }
 
 // Reconcile reacts to Node events, scanning for preemption signals and initiating migrations.
@@ -108,6 +124,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	var candidates []preemptionCandidate
+	activePodMigrations := map[string]*pmv1alpha1.PodMigration{}
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
@@ -135,10 +152,8 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 
-		// Check that a snapshot engine serves the pod and can migrate it (for
-		// GKE Pod Snapshots, the migratable runtime classes)
-		eng, ok := r.engineFor(pod)
-		if !ok || !eng.Eligible(pod, node).OK {
+		// Check migratable runtime class
+		if !r.RuntimeClassPolicy.Allows(pod.Spec.RuntimeClassName) {
 			continue
 		}
 
@@ -167,6 +182,18 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 		// Check if already processed in memory recently
 		if _, ok := r.processedPods.Load(pod.UID); ok {
+			continue
+		}
+
+		// Pick the snapshot engine for the pod (the one its runtime class
+		// routes to) and check that it can migrate the pod
+		pm, err := r.activePodMigration(ctx, activePodMigrations, pod.Namespace)
+		if err != nil {
+			logger.Error(err, "Failed to look up the PodMigration of the pod's namespace", "pod", pod.Name, "namespace", pod.Namespace)
+			continue
+		}
+		eng, ok := r.engineFor(pod, pm)
+		if !ok || !eng.Eligible(pod, node).OK {
 			continue
 		}
 
@@ -205,6 +232,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 		candidates = append(candidates, preemptionCandidate{
 			pod:    pod,
+			engine: eng,
 			policy: policy,
 			size:   footprintBytes,
 		})
@@ -275,6 +303,8 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if pod.Annotations == nil || pod.Annotations[util.AnnotationMigrationTimeout] == "" {
 			jobAnnotations[util.AnnotationMigrationTimeout] = preemptionTimeout.String()
 		}
+		// The engine picked for the pod serves the job to the end (#80).
+		jobAnnotations[engine.AnnotationEngine] = cand.engine.Name()
 
 		newJob := &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{

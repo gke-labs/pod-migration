@@ -67,20 +67,22 @@ type EvictionGate struct {
 	// Eligibility selects the runtime classes whose pods are migrated. Nil
 	// means gVisor only (eligibility.DefaultMigratableRuntimeClasses).
 	Eligibility *eligibility.RuntimeClassPolicy
-	// Engines provides the snapshot engine for each pod: whether it can
-	// migrate the pod, and its policy for the pod. Optional: nil selects GKE
-	// Pod Snapshots, built from Client with Eligibility as its allow-list.
+	// Engines provides the snapshot engine for each pod: the one its
+	// runtime class routes to, whether that engine can migrate the pod, and
+	// its policy for the pod. Optional: nil selects GKE Pod Snapshots, built
+	// from Client, for every pod Eligibility allows.
 	Engines *engine.Registry
 	decoder admission.Decoder
 }
 
-// engineFor returns the snapshot engine for pod, and false if no engine
-// serves it.
-func (a *EvictionGate) engineFor(pod *corev1.Pod) (engine.Engine, bool) {
+// engineFor returns the snapshot engine for pod, given pm, the active
+// PodMigration of its namespace (nil if there's none), and false if no
+// engine serves the pod.
+func (a *EvictionGate) engineFor(pod *corev1.Pod, pm *pmv1alpha1.PodMigration) (engine.Engine, bool) {
 	if a.Engines != nil {
-		return a.Engines.ForPod(pod, nil)
+		return a.Engines.ForPod(pod, pm)
 	}
-	return engine.NewGKEPodSnapshots(a.Client, nil, a.Eligibility), true
+	return engine.NewGKEPodSnapshots(a.Client, nil), true
 }
 
 // Handle intercepts eviction requests.
@@ -127,18 +129,13 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed("feature not enabled")
 	}
 
-	// Only migrate pods that a snapshot engine serves and can migrate. For GKE
-	// Pod Snapshots, that's the runtime-class allow-list.
-	eng, ok := a.engineFor(pod)
-	if !ok {
+	// Only migrate pods whose runtime class the installed snapshot engine supports.
+	if !a.Eligibility.Allows(pod.Spec.RuntimeClassName) {
 		runtimeClass := eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName)
-		logger.Info("No snapshot engine serves the pod, allowing eviction immediately", "runtimeClass", runtimeClass)
-		return admission.Allowed(fmt.Sprintf("No snapshot engine serves runtime class %s, skipping migration", runtimeClass))
-	}
-	if verdict := eng.Eligible(pod, nil); !verdict.OK {
-		logger.Info("Snapshot engine can't migrate the pod, allowing eviction immediately",
-			"engine", eng.Name(), "runtimeClass", eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName), "reason", verdict.Reason)
-		return admission.Allowed(verdict.Reason)
+		logger.Info("Pod runtime class is not migratable, allowing eviction immediately",
+			"runtimeClass", runtimeClass, "migratableRuntimeClasses", a.Eligibility.String())
+		return admission.Allowed(fmt.Sprintf("Pod runtime class %s is not migratable (allowed: %s), skipping migration",
+			runtimeClass, a.Eligibility.String()))
 	}
 
 	// Check if this pod already had a migration that timed out waiting for PDB
@@ -192,6 +189,27 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return denied429("transient error reading migration job status, retrying")
 	}
 
+	// Pick the snapshot engine for the pod: the one its runtime class routes
+	// to, through the namespace's PodMigration or the controller's routes.
+	// This comes after the job checks above, which answer for a job in
+	// flight whatever the routes say now.
+	pm, err := util.ActivePodMigration(ctx, a.Client, pod.Namespace)
+	if err != nil {
+		logger.Error(err, "Failed to look up the namespace's PodMigration")
+		return denied429("transient error reading the namespace's PodMigration, retrying")
+	}
+	eng, ok := a.engineFor(pod, pm)
+	if !ok {
+		runtimeClass := eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName)
+		logger.Info("No snapshot engine serves the pod's runtime class, allowing eviction immediately", "runtimeClass", runtimeClass)
+		return admission.Allowed(fmt.Sprintf("No snapshot engine serves runtime class %s, skipping migration", runtimeClass))
+	}
+	if verdict := eng.Eligible(pod, nil); !verdict.OK {
+		logger.Info("Snapshot engine can't migrate the pod, allowing eviction immediately",
+			"engine", eng.Name(), "runtimeClass", eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName), "reason", verdict.Reason)
+		return admission.Allowed(verdict.Reason)
+	}
+
 	// Resolve parent owner details
 	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -222,6 +240,11 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	jobLabels, jobAnnotations := util.BuildPMJLabelsAndAnnotationsForPolicy(
 		pod, parentName, parentKind, parentUID, policy.Name, a.DefaultMigrationTimeout, util.TriggerSourceEviction,
 	)
+	if jobAnnotations == nil {
+		jobAnnotations = make(map[string]string)
+	}
+	// The engine picked for the pod serves the job to the end (#80).
+	jobAnnotations[engine.AnnotationEngine] = eng.Name()
 
 	newJob := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
@@ -277,7 +300,7 @@ func (a *EvictionGate) InjectDecoder(d admission.Decoder) error {
 // SetupEvictionWebhookWithManager registers the webhook on the manager.
 // runtimeClasses selects which pods are migrated; nil means gVisor only.
 // engines provides the snapshot engine for each pod; nil means GKE Pod
-// Snapshots with runtimeClasses as its allow-list.
+// Snapshots for every pod runtimeClasses allows.
 func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, defaultTimeout time.Duration, runtimeClasses *eligibility.RuntimeClassPolicy, engines *engine.Registry) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
