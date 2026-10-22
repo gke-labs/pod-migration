@@ -844,6 +844,86 @@ func TestFindUnassignedActivePMJ_EvictingScaleUpIsolation(t *testing.T) {
 			},
 			expected: "pmj-deploy-pod-1",
 		},
+		{
+			name:       "Snapshotting PMJ with Job-owned source pod Failed matches replacement pod",
+			podName:    "job-pod-replacement-1",
+			parentName: "my-job",
+			parentKind: "Job",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-job-pod-1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName: "my-job",
+							LabelParentKind: "Job",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef:       corev1.LocalObjectReference{Name: "job-pod-1"},
+						TargetPodUID: "origin-job-uid",
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+					},
+				},
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "job-pod-1",
+						Namespace: "default",
+						UID:       "origin-job-uid",
+						Labels: map[string]string{
+							"pod-migration.gke.io/enabled": "true",
+						},
+					},
+					Status: corev1.PodStatus{
+						Phase:  corev1.PodFailed,
+						Reason: "EvictedByMigration",
+					},
+				},
+			},
+			expected: "pmj-job-pod-1",
+		},
+		{
+			name:       "Evicting PMJ with Job-owned source pod Failed matches replacement pod",
+			podName:    "job-pod-replacement-1",
+			parentName: "my-job",
+			parentKind: "Job",
+			existing: []runtime.Object{
+				&pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pmj-job-pod-1",
+						Namespace: "default",
+						Labels: map[string]string{
+							LabelParentName: "my-job",
+							LabelParentKind: "Job",
+						},
+					},
+					Spec: pmv1alpha1.PodMigrationJobSpec{
+						PodRef:       corev1.LocalObjectReference{Name: "job-pod-1"},
+						TargetPodUID: "origin-job-uid",
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{
+						Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+					},
+				},
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "job-pod-1",
+						Namespace: "default",
+						UID:       "origin-job-uid",
+						Labels: map[string]string{
+							"pod-migration.gke.io/enabled": "true",
+						},
+					},
+					Status: corev1.PodStatus{
+						Phase:  corev1.PodFailed,
+						Reason: "EvictedByMigration",
+					},
+				},
+			},
+			expected: "pmj-job-pod-1",
+		},
 	}
 
 	for _, tc := range tests {

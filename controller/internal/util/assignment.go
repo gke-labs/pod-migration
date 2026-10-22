@@ -188,7 +188,8 @@ func filterCandidates(jobs []pmv1alpha1.PodMigrationJob, parentName, parentKind,
 		}
 	}
 	// Prefer the jobs whose source is being evicted; Snapshotting stays a
-	// candidate only for a cache that lags the job's move to Evicting.
+	// candidate only for a cache that lags the job's move to Evicting, and
+	// FindUnassignedActivePMJ skips it while its source is alive.
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidatePhaseRank(candidates[i].Status.Phase) < candidatePhaseRank(candidates[j].Status.Phase)
 	})
@@ -206,6 +207,27 @@ func candidatePhaseRank(phase pmv1alpha1.PodMigrationJobPhase) int {
 	default:
 		return 2
 	}
+}
+
+// requiresSourceGone reports whether a job in this phase can own a new pod only
+// once its source is terminating, in a terminal phase (Failed or Succeeded), or gone.
+// While the source is alive and running, a new pod under the same parent is a
+// scale-up or another replica's replacement: an Evicting job waits there while
+// its eviction is refused, and a Snapshotting job while its checkpoint runs (#168).
+// A Restoring job's source is gone.
+func requiresSourceGone(phase pmv1alpha1.PodMigrationJobPhase) bool {
+	return phase == pmv1alpha1.PodMigrationJobPhaseEvicting || phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting
+}
+
+// isSourcePodAlive reports whether pod is an active source workload pod. A pod
+// that is terminating (has DeletionTimestamp) or in a terminal phase (Failed or
+// Succeeded, such as a batch/v1 Job pod terminated by checkpoint) is treated as
+// gone.
+func isSourcePodAlive(pod *corev1.Pod) bool {
+	if pod == nil || pod.DeletionTimestamp != nil {
+		return false
+	}
+	return pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded
 }
 
 // FindUnassignedActivePMJ searches for an active PMJ under the parent that hasn't been assigned to a pod yet.
@@ -230,14 +252,17 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 		}
 
 		for _, job := range candidates {
-			// Narrowing for scale-up race: don't match Evicting-phase PMJs whose origin pod still exists.
-			// If the origin pod is still alive, any newly arriving candidate pod is a concurrent scale-up.
-			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+			// Narrowing for scale-up race: don't match Evicting- or Snapshotting-phase PMJs whose origin
+			// pod still exists and is running. If the origin pod is still alive, any newly arriving candidate
+			// pod is a concurrent scale-up (see requiresSourceGone).
+			// A pod in a terminal phase (Failed or Succeeded) is no longer running (e.g. a batch/v1 Job pod
+			// whose container stopped on checkpoint and was marked Failed by PodStatusMutator).
+			if requiresSourceGone(job.Status.Phase) {
 				targetName := job.Spec.PodRef.Name
 				if targetName != "" {
 					originPod := &corev1.Pod{}
 					err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: targetName}, originPod)
-					if err == nil && originPod.DeletionTimestamp == nil {
+					if err == nil && isSourcePodAlive(originPod) {
 						if job.Spec.TargetPodUID == "" || string(originPod.UID) == job.Spec.TargetPodUID {
 							continue
 						}
@@ -280,7 +305,7 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 	}
 
 	for _, p := range podList.Items {
-		if p.DeletionTimestamp == nil {
+		if isSourcePodAlive(&p) {
 			existingPodUIDs[string(p.UID)] = true
 			existingPodNames[p.Name] = true
 		}
@@ -292,7 +317,7 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 	}
 
 	for _, job := range candidates {
-		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
+		if requiresSourceGone(job.Status.Phase) {
 			originExists := false
 			if job.Spec.TargetPodUID != "" {
 				originExists = existingPodUIDs[job.Spec.TargetPodUID]
