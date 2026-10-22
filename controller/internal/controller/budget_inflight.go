@@ -54,23 +54,28 @@ type InFlightBudgetChecker struct {
 	reserved map[string]map[types.UID]time.Time // PDB key -> job UID -> reserved at
 }
 
-// Check runs the dry run, then the in-flight count.
+// Check reads the source and the PodDisruptionBudgets that cover it from the
+// cache, skips the dry run when the cached budget already settles it, and
+// otherwise runs the dry run and then the in-flight count.
 func (c *InFlightBudgetChecker) Check(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (string, error) {
-	if reason, err := c.DryRun.Check(ctx, job, podName); reason != reasonBudgetAllowed {
-		return reason, err
-	}
 	source := &corev1.Pod{}
 	if err := c.Client.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: podName}, source); err != nil {
-		if apierrors.IsNotFound(err) {
-			// The Pending phase handles a source that's gone.
-			return reasonBudgetAllowed, nil
+		if !apierrors.IsNotFound(err) {
+			return reasonBudgetCheckError, fmt.Errorf("reading the source pod: %w", err)
 		}
-		return reasonBudgetCheckError, fmt.Errorf("reading the source pod: %w", err)
+		// Not in the cache: the dry run tells whether the source is gone, and
+		// the Pending phase handles that.
+		return c.DryRun.Check(ctx, job, podName)
 	}
 	pdbs := &policyv1.PodDisruptionBudgetList{}
 	if err := c.Client.List(ctx, pdbs, client.InNamespace(job.Namespace)); err != nil {
 		return reasonBudgetCheckError, fmt.Errorf("listing PodDisruptionBudgets: %w", err)
 	}
+	type coveringPDB struct {
+		pdb      *policyv1.PodDisruptionBudget
+		selector labels.Selector
+	}
+	var covering []coveringPDB
 	for i := range pdbs.Items {
 		pdb := &pdbs.Items[i]
 		selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
@@ -78,11 +83,50 @@ func (c *InFlightBudgetChecker) Check(ctx context.Context, job *pmv1alpha1.PodMi
 		if err != nil || selector.Empty() || !selector.Matches(labels.Set(source.Labels)) {
 			continue
 		}
-		if reason, err := c.checkPDB(ctx, job, source, pdb, selector); reason != reasonBudgetAllowed {
+		covering = append(covering, coveringPDB{pdb, selector})
+	}
+	// With more than one PDB, the dry run gets the eviction API's own error.
+	if len(covering) == 1 {
+		if refusal := cachedBudgetRefusal(source, covering[0].pdb); refusal != nil {
+			return reasonBudgetExhausted, refusal
+		}
+	}
+	if reason, err := c.DryRun.Check(ctx, job, podName); reason != reasonBudgetAllowed {
+		return reason, err
+	}
+	for _, cov := range covering {
+		if reason, err := c.checkPDB(ctx, job, source, cov.pdb, cov.selector); reason != reasonBudgetAllowed {
 			return reason, err
 		}
 	}
 	return reasonBudgetAllowed, nil
+}
+
+// cachedBudgetRefusal returns the refusal that the eviction API would give a
+// healthy source under pdb, judging by the cached PDB status, or nil when the
+// cache doesn't settle it. A PDB whose status lags its spec, or that allows
+// no disruption, refuses a healthy pod's eviction, so a waiting job needn't
+// send a dry run until the cache shows the budget freed. The refusal carries
+// the DisruptionBudget cause, worded like the eviction API's. An unhealthy
+// source depends on unhealthyPodEvictionPolicy, so it's left to the dry run.
+func cachedBudgetRefusal(source *corev1.Pod, pdb *policyv1.PodDisruptionBudget) error {
+	if !podCountsHealthy(source) {
+		return nil
+	}
+	var cause string
+	switch {
+	case pdb.Status.ObservedGeneration < pdb.Generation:
+		cause = fmt.Sprintf("The disruption budget %s is still being processed by the server.", pdb.Name)
+	case pdb.Status.DisruptionsAllowed == 0:
+		cause = fmt.Sprintf("The disruption budget %s needs %d healthy pods and has %d currently",
+			pdb.Name, pdb.Status.DesiredHealthy, pdb.Status.CurrentHealthy)
+	default:
+		return nil
+	}
+	err := apierrors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
+	err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes,
+		metav1.StatusCause{Type: policyv1.DisruptionBudgetCause, Message: cause})
+	return err
 }
 
 // checkPDB counts one PDB under its lock, and reserves the budget for job
