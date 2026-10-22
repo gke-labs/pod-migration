@@ -51,6 +51,7 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/controller"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	// Imported for its side effect: registers the pod-migration collectors on
 	// the controller-runtime metrics registry served at --metrics-bind-address.
@@ -197,11 +198,21 @@ func main() {
 	eventRecorder := mgr.GetEventRecorderFor("pod-migration-controller")
 	invariantEngine := invariants.NewEngine(invariantMode, eventRecorder)
 
+	// Snapshot engines, shared by every reconciler and the eviction webhook.
+	// GKE Pod Snapshots is the only engine and the default, with the
+	// --migratable-runtime-classes allow-list as its eligibility.
+	engines, err := engine.NewDefaultRegistry(mgr.GetClient(), mgr.GetScheme(), runtimeClassPolicy)
+	if err != nil {
+		setupLog.Error(err, "unable to build the snapshot engine registry")
+		os.Exit(1)
+	}
+
 	if err := (&controller.PodMigrationReconciler{
 		Client:          mgr.GetClient(),
 		Scheme:          mgr.GetScheme(),
 		Recorder:        eventRecorder,
 		InvariantEngine: invariantEngine,
+		Engines:         engines,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")
 		os.Exit(1)
@@ -214,6 +225,7 @@ func main() {
 		DefaultMigrationTimeout: migrationTimeout,
 		InvariantEngine:         invariantEngine,
 		BudgetChecker:           controller.EvictionBudgetChecker{Client: mgr.GetClient()},
+		Engines:                 engines,
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)
@@ -227,6 +239,7 @@ func main() {
 		Scheme:          mgr.GetScheme(),
 		Recorder:        eventRecorder,
 		InvariantEngine: invariantEngine,
+		Engines:         engines,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
 		os.Exit(1)
@@ -240,13 +253,14 @@ func main() {
 		DefaultMigrationTimeout: migrationTimeout,
 		SpotPreemptionBudget:    spotPreemptionBudget,
 		RuntimeClassPolicy:      runtimeClassPolicy,
+		Engines:                 engines,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create NodePreemptionReconciler")
 		os.Exit(1)
 	}
 
 	// --- Webhooks ------------------------------------------------------------
-	if err := pmwebhook.SetupEvictionWebhookWithManager(mgr, mgr.GetAPIReader(), migrationTimeout, runtimeClassPolicy); err != nil {
+	if err := pmwebhook.SetupEvictionWebhookWithManager(mgr, mgr.GetAPIReader(), migrationTimeout, runtimeClassPolicy, engines); err != nil {
 		setupLog.Error(err, "unable to register eviction webhook")
 		os.Exit(1)
 	}
