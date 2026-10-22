@@ -388,16 +388,24 @@ func TestGKEPodSnapshots_RestoreFailuresIsTheGVisorClassifier(t *testing.T) {
 		t.Fatalf("RestoreFailures() = %v, want restore.DefaultEngines() = %v", failures, restore.DefaultEngines())
 	}
 
-	restoreCrash := &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+	crashStatus := corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
 		Name: "app",
 		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 			Reason:   "StartError",
 			ExitCode: 128,
 			Message:  "failed to start containerd task: OCI runtime restore failed",
 		}},
-	}}}}
+	}}}
+	restoreCrash := podWithRuntimeClass("gvisor")
+	restoreCrash.Status = crashStatus
 	if got := restore.Classify(restoreCrash, failures...); got.Class != restore.FailureFatal || got.Engine != "gvisor" {
-		t.Errorf("Classify(restore crash) = %+v, want FailureFatal from gvisor", got)
+		t.Errorf("Classify(gVisor restore crash) = %+v, want FailureFatal from gvisor", got)
+	}
+	// The same message on a runc pod isn't gVisor's: reported, never acted on.
+	runcCrash := podWithRuntimeClass("runc")
+	runcCrash.Status = crashStatus
+	if got := restore.Classify(runcCrash, failures...); got.Class != restore.FailureUnrecognized {
+		t.Errorf("Classify(runc start failure) = %+v, want FailureUnrecognized", got)
 	}
 
 	appCrash := &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{

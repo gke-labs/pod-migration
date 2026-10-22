@@ -12,6 +12,13 @@ var (
 	restoreCrashUnknownMessage = "failed to create containerd task: UNKNOWN ERROR"
 )
 
+// gvisorPodSpec is the spec of a gVisor pod, the only runtime class whose
+// start failures the gVisor engine classifies.
+func gvisorPodSpec() corev1.PodSpec {
+	runtimeClass := GVisorRuntimeClass
+	return corev1.PodSpec{RuntimeClassName: &runtimeClass}
+}
+
 // restoreCrashPodStatus reproduces the kubelet shape where the container is
 // parked in Waiting(RunContainerError) with the StartError in
 // LastTerminationState.
@@ -154,6 +161,7 @@ func TestClassify(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p"},
+				Spec:       gvisorPodSpec(),
 				Status:     tc.status,
 			}
 			got := Classify(pod, DefaultEngines()...)
@@ -287,6 +295,7 @@ func TestClassify_IgnoresStaleTerminationHistory(t *testing.T) {
 					}
 					pod := &corev1.Pod{
 						ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p"},
+						Spec:       gvisorPodSpec(),
 						Status:     status,
 					}
 					if got := Classify(pod, DefaultEngines()...); got.Class != FailureNone {
@@ -308,6 +317,7 @@ func TestClassify_IgnoresRestartCount(t *testing.T) {
 		status.ContainerStatuses[0].RestartCount = restartCount
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p"},
+			Spec:       gvisorPodSpec(),
 			Status:     status,
 		}
 		if got := Classify(pod, DefaultEngines()...); got.Class != FailureFatal {
@@ -543,6 +553,7 @@ func TestClassify_MultiContainerAndSidecar(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pm-multicontainer-0"},
+				Spec:       gvisorPodSpec(),
 				Status: corev1.PodStatus{
 					Phase:                 corev1.PodRunning,
 					InitContainerStatuses: []corev1.ContainerStatus{tc.initStatus},

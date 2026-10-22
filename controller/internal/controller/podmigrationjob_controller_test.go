@@ -6086,14 +6086,17 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 
 // newRestoreCrashFixture builds a PMJ parked in Restoring that has already been
 // consumed by the given replacement pod, i.e. the exact state in which a
-// restore crash becomes observable.
+// restore crash becomes observable. The replacement is a gVisor pod, the only
+// runtime class whose restore failures the gVisor engine classifies.
 func newRestoreCrashFixture(namespace, jobName, podName, podUID string, podStatus corev1.PodStatus) (*corev1.Pod, *pmv1alpha1.PodMigrationJob) {
+	gvisor := "gvisor"
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      podName,
 			UID:       types.UID(podUID),
 		},
+		Spec:   corev1.PodSpec{RuntimeClassName: &gvisor},
 		Status: podStatus,
 	}
 

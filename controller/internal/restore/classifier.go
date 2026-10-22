@@ -4,6 +4,8 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 )
 
 // startFailureExitCode is the exit code the kubelet reports when the container
@@ -50,6 +52,34 @@ type Failure struct {
 type Engine interface {
 	Name() string
 	MatchesRestoreFailure(msg string) (signature string, ok bool)
+}
+
+// RuntimeClassScoped is an optional Engine capability, for an engine whose
+// restore failures can only happen in pods of certain runtime classes.
+// Classify offers a pod's start failure only to the engines that cover the
+// pod's runtime class: its spec.runtimeClassName, or
+// eligibility.DefaultRuntimeClassToken for a pod without one. An engine
+// without this method is offered every pod.
+//
+// A signature that matches deletes the pod, so an engine must not classify
+// pods that it never restores: a gVisor signature applied to a runc pod is a
+// destructive false match (#132).
+type RuntimeClassScoped interface {
+	CoversRuntimeClass(runtimeClass string) bool
+}
+
+// enginesFor returns the engines that may classify pod's start failures: the
+// ones that cover its runtime class, or that aren't scoped to any.
+func enginesFor(pod *corev1.Pod, engines []Engine) []Engine {
+	runtimeClass := eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName)
+	scoped := make([]Engine, 0, len(engines))
+	for _, engine := range engines {
+		if s, ok := engine.(RuntimeClassScoped); ok && !s.CoversRuntimeClass(runtimeClass) {
+			continue
+		}
+		scoped = append(scoped, engine)
+	}
+	return scoped
 }
 
 // DefaultEngines returns the engine set for a stock deployment.
@@ -163,12 +193,15 @@ func startFailures(pod *corev1.Pod) []startFailure {
 
 // Classify runs the shared kubelet start-failure walk once, then offers each
 // message to each engine IN ORDER (so more specific engines should be listed
-// before more generic ones).
+// before more generic ones). Only engines that cover the pod's runtime class
+// are offered its messages (see RuntimeClassScoped); a start failure that no
+// covering engine claims is FailureUnrecognized.
 func Classify(pod *corev1.Pod, engines ...Engine) Failure {
 	failures := startFailures(pod)
 	if len(failures) == 0 {
 		return Failure{Class: FailureNone}
 	}
+	engines = enginesFor(pod, engines)
 
 	var unmatched *Failure
 	for _, fail := range failures {
