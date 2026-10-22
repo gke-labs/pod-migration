@@ -98,9 +98,12 @@ Non-goals:
   - An engine that kills the source only after the archive upload leaves it serving between C and the kill, and writes acknowledged in that window are lost.
   - Early tests of the CRIU prototype showed both effects.
 - **Fencing has two layers.**
-  1. **Controller, for every engine:** take the source out of serving endpoints before the trigger, for example with a readiness gate that the controller sets to False (#131). The controller creates the trigger only once the source's EndpointSlice entries show `serving: false`; kube-proxy's own sync can't be observed. A restarted instance then never becomes a serving endpoint.
-     - This stops new Service connections. It doesn't cut established connections (keep-alive, gRPC, database sessions) or clients that dial the pod IP, and it doesn't stop writes to volumes or other systems. That's enough for the gVisor restart, which comes back in a new sandbox with a new IP, but not for an engine that leaves the source running or kills it late.
-     - The costs: new connections stop reaching the source for the whole checkpoint, not only after it. And a fenced source isn't Ready, so a later eviction under `unhealthyPodEvictionPolicy: IfHealthyBudget` can be denied at the PDB's edge.
+  1. **Controller, for every engine:** take the source out of serving endpoints before the trigger (#131). The controller labels the source `pod-migration.gke.io/fenced=true` and sets Ready=False through `pods/status`, with the label first or in the same write. A mutating webhook on `pods/status` that selects the label (`mpodfence`, failure policy `Fail`, #161) then holds Ready=False, with reason `PodMigrationFenced`, until the pod is deleted. A restarted instance never becomes a serving endpoint.
+     - **Not a readiness gate:** a gate has to be in the pod spec at creation, and every opted-in pod's readiness would then depend on the controller.
+     - **When to trigger:** an engine that restarts the source on the same IP must wait until the source's EndpointSlice entries show `serving: false`. GKE Pod Snapshots restarts it in a new sandbox, with a new IP that's never published as serving.
+     - **Limits:** this stops new Service connections, for the whole checkpoint. It doesn't cut established connections (keep-alive, gRPC, database sessions), it doesn't cover clients that dial the pod IP or Services with `publishNotReadyAddresses`, and it doesn't stop writes to volumes or other systems. That's enough for the gVisor restart, but not for an engine that leaves the source running or kills it late.
+     - **Webhook down:** a fenced pod's status can't change, so its deletion waits until the webhook is back. `Ignore` would let the fence leak, and nothing would restore it.
+     - **Budget first:** the fence makes the source unhealthy, so the controller checks the PodDisruptionBudget with a dry-run eviction before the fence and the checkpoint (#164, #165), counting the other migrations in flight (#42).
   2. **Engine:** fence the processes from C until the pod is deleted. Each engine declares a fencing mode:
      - `Frozen`: sufficient.
      - `Stopped`: not sufficient on its own, because the kubelet may restart a stopped container. Pod Migration uses GKE Pod Snapshots in this mode today; the controller-side fence (#131) keeps new Service connections away from the restarted instance.
@@ -108,13 +111,13 @@ Non-goals:
 - **Failure rule.** What happens to a fenced source after a failure depends on whether its state can still be trusted:
   - `Refused` never touches the source, so the controller puts it back into its endpoints. So does a `None` engine's failure, because the source kept running.
   - With a `Frozen` engine, the state is intact. The engine thaws the source before it reports `Failed`, on every failure path and after its own restart, and the controller then puts it back. This needs care: a cancelled or timed-out containerd checkpoint can leave the task frozen, because containerd resumes it with the caller's context, which has already ended (#106).
-  - With a `Stopped` engine, the controller can't tell whether C has passed once the trigger is accepted, and after C the sandbox is gone: a kubelet restart brings back an empty instance. So the controller keeps the fence and cold-evicts the source. Putting it back would serve exactly the empty instance of #131.
-  - The controller puts a source back only after the engine confirms the cancel (C9), or when nothing can stop the source any more. Today the failure and timeout paths delete the trigger and mark the job `Failed` at once, and #106 shows the engine can still stop the source after that.
+  - With a `Stopped` engine, a stop leaves only an empty instance to come back. On a failure, the controller deletes the trigger and waits, bounded, for the snapshot to settle. It unfences the source only if the containers still match the baseline taken before the trigger and the checkpoint never completed, and never after a stop. Otherwise it keeps the fence and cold-evicts the source, since putting it back would serve exactly the empty instance of #131. An engine can still stop the source after its trigger is deleted (#106), so a watch re-fences and cold-evicts a source that stops late. The source keeps the start-empty mark (`ps-name: ""`, C5) after a failure.
+  - Other engines get their source back only after the engine confirms the cancel (C9), or when nothing can stop the source any more.
 - Once the outcome is `Ready`, the controller evicts the source with a 1 s grace period. The deletion ends the engine's fencing duty.
 
 ### C5. Restore order and exactly-once restore
 
-- The controller issues one restore order per replacement, through the engine: `ps-name` today, `spec.restoreFrom` for KEP-5823. The engine also defines the explicit cold-start bypass, which the controller applies when it releases a replacement without a restore: `ps-name: ""` today.
+- The controller issues one restore order per replacement, through the engine: `ps-name` today, `spec.restoreFrom` for KEP-5823. The engine also defines the explicit cold-start bypass, `ps-name: ""` today. The controller sets it on a replacement it releases without a restore, on the source right before the trigger (#156), and on every pod created without an active migration (#158): GKE Pod Snapshots restores a pod that has no `ps-name` from a matching snapshot when its sandbox is created.
 - **Rule.** A replacement is restored from a checkpoint at most once, and its outcome is recorded once. A retried reconcile, a conflict on the outcome write, a container restart or an engine restart must never re-apply the checkpoint to a pod that has already run restored code. A second restore rolls the application back after it has already served clients.
 - **The controller's half exists.** Invariant I1 (`AtMostOnceRestore`) and the single-use gate stop a second pod from consuming the same checkpoint.
 - **The engine owns the other half.** Neither of those can see a second restore inside the same pod. The engine guards the restore with a durable marker, written before restoring under optimistic concurrency, not with in-memory state.
@@ -186,7 +189,7 @@ The KEP-5823 column follows the KEP text; its implementation hasn't merged.
 | C2 Eligibility | Runtime class `gvisor` | One container and a criu-ready node. No runtime-class check | The kubelet checks at checkpoint time |
 | C3 Outcomes | Best effort: the provider suppresses a terminal `Ready` for a bounded window while sub-conditions progress (#75, #95), which may not cover every flap (see #122). `Refused` is terminal | `Ready` only after the archive is uploaded and verified; policy refusals are `Refused` | One `Ready` condition; `SourcePodReplaced` maps to `Refused` |
 | C4 Fencing | `Stopped`, the mode Pod Migration uses today; needs the controller-side fence (#131) | `Stopped`, after the upload | `None`: the source keeps running |
-| C5 Exactly-once | Unverified. The replacement keeps `ps-name` for life, and #131 saw sandboxes recreated, so a recreated sandbox might restore again: a conformance case for #108 | Not idempotent: after a conflict on its outcome write, the retry restored the replacement again | Once by design: `spec.restoreFrom` is ignored once containers run |
+| C5 Exactly-once | Fixed: a restarted source (#151) and new pods (#157) restoring from a leftover snapshot. Open: a restored replacement keeps `ps-name`, so a recreated sandbox might restore again (#152) | Not idempotent: after a conflict on its outcome write, the retry restored the replacement again | Once by design: `spec.restoreFrom` is ignored once containers run |
 | C6 Restore signal | Inferred from the absence of Warning events | A pod annotation. A skipped restore leaves none | The pod's `Restoring` condition and a restore event |
 | C7 Classification | gVisor signatures | None yet. gVisor's signatures are applied to its pods today (#132) | The reason on the pod's `Restoring` condition |
 | C8 Placement | None declared. A different machine shape can fail the restore (#14) | Checks the CPU family at restore time, too late to reschedule | Same node only |
@@ -275,7 +278,7 @@ flowchart TD
     EV["Eviction webhook or preemption trigger"] -->|"1. ForPod, Eligible, ResolvePolicy"| REG["engine.Registry"]
     EV -->|"2. create the job, record the engine"| PMJ["PodMigrationJob reconciler"]
     PMJ -->|"3. ForJob"| REG
-    PMJ -->|"4. take the source out of endpoints"| SRC["Source pod"]
+    PMJ -->|"4. check the budget, fence the source"| SRC["Source pod"]
     PMJ -->|"5. trigger, poll the outcome"| ENG["Engine"]
     ENG -->|"6. fence at C, report Ready"| PMJ
     PMJ -->|"7. evict the source, 1 s grace"| SRC
@@ -294,17 +297,17 @@ flowchart TD
 
 ## Guardrails
 
-Three new checks follow the style of the existing invariants ([invariants.md](../invariants.md)). Two are controller-side rules, and each gets its number when its `invariant/` PR merges (#85). `RestoreAppliedOnce` is checked only by T2 and the conformance suite.
+Three new checks follow the style of the existing invariants ([invariants.md](../invariants.md)). Two are controller-side rules: `SourceFencedAfterCheckpoint` is I11 (#159), and `RestoreOutcomeConfirmed` gets its number when its `invariant/` PR merges (#85). `RestoreAppliedOnce` is checked only by T2 and the conformance suite.
 
 | Check | T1, controller side | T2, application side |
 |---|---|---|
-| `SourceFencedAfterCheckpoint` | From the trigger until the source is deleted, the source's fence condition stays False: the readiness-gate condition in pod status (#131), which needs no EndpointSlice informer. For an engine that declares `Frozen`, no source container starts after the trigger either | The write-continuity probe (#103): every write acknowledged after C is in the restored copy, and no read is served by an empty instance |
+| `SourceFencedAfterCheckpoint` | I11: once the job records `SourceFenced=True`, and until the source is deleted, the source carries the fence label and is Ready=False with reason `PodMigrationFenced` (C4). It needs no EndpointSlice informer. For an engine that declares `Frozen`, no source container starts after the trigger either | The write-continuity probe (#103): every write acknowledged after C is in the restored copy, and no read is served by an empty instance |
 | `RestoreAppliedOnce` | None: I1 and I2 already cover the controller's side | No rollback after a restored instance has acknowledged writes. Conformance cases (#108): a conflict on the outcome write, and a recreated sandbox, must not restore again |
 | `RestoreOutcomeConfirmed` | `RestoreVerified` requires the job to record engine-confirmed evidence. An inferred verdict carries its own reason (C6), so the check reads only the job | A workload whose restore is skipped must not end `RestoreVerified` |
 
 - `--invariant-mode` defaults to `disabled`, so production behavior doesn't change.
-- T1 runs in strict mode, so each new rule must stay silent on today's scenarios. That's why `SourceFencedAfterCheckpoint` lands with the endpoint fence (#131).
-- `ReconcileSnapshot` doesn't carry what these rules read yet: the engine's identity, the fence condition, the recorded evidence. It's built outside `invariants/**`, so each rule needs a plumbing PR on a normal branch first (or the `allow-invariant-cochange` label), then its `invariant/` PR.
+- T1 runs in strict mode, so each new rule must stay silent on today's scenarios. I11 is: no job records `SourceFenced=True` until the fence lands.
+- I11 reads only what `ReconcileSnapshot` already carries, the namespace's jobs and pods. `RestoreOutcomeConfirmed` needs the engine's identity and the recorded evidence, and the snapshot is built outside `invariants/**`, so it needs a plumbing PR on a normal branch first (or the `allow-invariant-cochange` label), then its `invariant/` PR.
 - The existing I1 (`AtMostOnceRestore`) and I2 (`NoSilentColdStart`) read the `podsnapshot.gke.io/ps-name` annotation. For an engine with another API group or `spec.restoreFrom` they would miss restores or report false violations, so they read the job's engine's restore order once engines resolve per pod (step 3).
 - The engine conformance suite (#108) runs every clause for each engine, including the negative security tests from #129.
 
@@ -354,31 +357,30 @@ Three new checks follow the style of the existing invariants ([invariants.md](..
 | Step | Scope | Issue |
 |---|---|---|
 | 1 | This document | #81 |
-| 2 | The `engine` package, the registry and the GKE Pod Snapshots engine, with no behavior change | #145 |
+| 2 | The `engine` package, the registry and the GKE Pod Snapshots engine, with no behavior change | #166, #145 |
 | 3 | Per-pod engine resolution and targeting; the engine annotation | #80 |
 | 4 | Restore failure classification by runtime class | #132 |
 | 5 | Positive restore verification | #79 |
-| 6 | Take the source out of endpoints before the trigger | #131 |
+| 6 | Take the source out of endpoints before the trigger: the status fence webhook (#161), the budget check before the checkpoint (#164, #165) and the in-flight count (#42), then the fence itself; guardrails I11 (#159) and the T2 write-continuity scenario (#160) | #131 |
 | 7 | The CRIU engine in the repo, with its own API group | #134, #135 |
 | 8 | Cancellation; archive garbage collection | #106, #107 |
 | 9 | Placement constraints | #14 |
 | 10 | Security requirements; the conformance suite | #129, #108 |
 
-The two controller-side rules land as `invariant/` PRs, each after its plumbing PR: `SourceFencedAfterCheckpoint` with step 6, and `RestoreOutcomeConfirmed` after step 5. The I1/I2 change follows step 3.
+`SourceFencedAfterCheckpoint` comes ahead of the fence as I11 (#159), silent until the fence records `SourceFenced=True`. `RestoreOutcomeConfirmed` lands as an `invariant/` PR after its plumbing PR and step 5. The I1/I2 change follows step 3.
 
-Step 6 keeps a `Stopped` engine's source fenced on every failure path. Putting a source back into its endpoints waits for confirmed cancellation (step 8).
+Step 6 keeps a `Stopped` engine's source fenced after a failure unless the checkpoint never completed and the containers match the baseline (C4). For other engines, putting a source back waits for confirmed cancellation (step 8).
 
 ## Decisions and open questions
 
 **Decided** by the project owner after review on #146:
 
 - **Fencing policy (was open question 1).** The controller refuses to migrate with a `None` engine, and evicts the pod cold with an event, unless the pod has `pod-migration.gke.io/allow-unfenced: "true"`. A `Stopped` engine is allowed only with the endpoint fence, and every engine must declare a mode. Tracked in #150.
+- **The endpoint fence (was open question 2).** A label plus a `pods/status` webhook (C4). A readiness gate was rejected, for the reasons in C4.
+- **Deferred:** an optional init-container gate that keeps a restarted source's app from starting (#153). It would also stop the writes to volumes that the fence can't, at the cost of a few seconds more downtime per migration and a changed pod spec.
 
 **Open:**
 
-2. **The endpoint fence (#131).** A readiness gate, a label flip, or both?
-   - **Readiness gate:** it must be in the pod spec when the pod is created, so pods created before the upgrade don't have it. Today's replacement webhook only mutates pods that have an assigned job, so injecting the gate into first-generation pods needs a new mutating path for opted-in pods. The downside: a gated pod becomes Ready only after a controller sets its condition True, so every new opted-in pod depends on our controller. A pod created while the controller is down stays NotReady until it comes back, and a pod left fenced when the controller is uninstalled stays NotReady for good.
-   - **Label flip:** it works on existing pods, and no pod depends on the controller to become Ready. But it must not touch the workload's selector.
 3. **A positive signal for GKE Pod Snapshots.** Is there a condition or annotation we can read? If not, it stays on the inferred path.
 4. **Engine selection flags.** One flag (`--runtime-class-engines=gvisor=gke-pod-snapshots,@default=criu`), or one flag per engine?
 5. **Recording the engine.** An annotation for good, or a typed `status.engine` field later?
