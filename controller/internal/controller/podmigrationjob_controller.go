@@ -1763,6 +1763,16 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		// 8. Verified restore: the pod is Ready with no fallback event.
+		// Later restarts of the replacement must start cold instead of
+		// restoring the migration snapshot again (#152), so the engine
+		// completes the restore before Succeeded is recorded. A failure
+		// requeues and tries again.
+		if completer, ok := r.getSnapshotProvider(job).(snapshot.RestoreCompleter); ok {
+			if err := completer.CompleteRestore(ctx, job, replacementPod.Name, replacementPod.UID); err != nil {
+				logger.Error(err, "Failed to complete the restore on the replacement pod; retrying", "pod", replacementPod.Name)
+				return ctrl.Result{}, err
+			}
+		}
 		logger.Info("Pod state restored from snapshot and replacement pod is Ready", "pod", replacementPod.Name)
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
 		now := metav1.Now()

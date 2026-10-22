@@ -409,6 +409,10 @@ When migrating single-replica workloads (such as a `StatefulSet` with `replicas:
   kubectl annotate pod <pod-name> pod-migration.gke.io/pdb-eviction-timeout-
   ```
 
+### Restarts After a Migration
+
+The pod gate sets `podsnapshot.gke.io/ps-name` on the replacement to the migration snapshot, so that GKE Pod Snapshots restores the replacement from it. The agent reads that annotation whenever it creates the pod's sandbox, so a later sandbox restart (a sandbox crash, a containerd restart) would restore the migration snapshot again and roll the app back to its state at migration time (#152). So once the restore is verified, the controller sets the annotation to `""`, the cold-start bypass: later restarts start cold, like any other pod's, and GKE Pod Snapshots emits a `falling back to a cold start` Warning event for each of them.
+
 ## 8. Monitoring & Prometheus Metrics
 
 The controller registers Prometheus metrics on the standard controller-runtime metrics endpoint (`:8080/metrics` by default):

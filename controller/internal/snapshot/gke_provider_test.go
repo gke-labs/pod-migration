@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1031,5 +1032,51 @@ func TestIsTerminalSnapshotFailureReason(t *testing.T) {
 				t.Errorf("isTerminalSnapshotFailureReason(%q) = %v, want %v", tc.reason, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGKEProvider_CompleteRestore_StampsRestoreCompleted pins that CompleteRestore
+// sets both the cold-start bypass and the durable restore-completed marker (#152).
+func TestGKEProvider_CompleteRestore_StampsRestoreCompleted(t *testing.T) {
+	scheme := setupTestScheme()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-0",
+			Namespace: "default",
+			UID:       types.UID("pod-uid-456"),
+			Annotations: map[string]string{
+				"podsnapshot.gke.io/ps-name": "snap-test-123",
+			},
+		},
+	}
+	job := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-job",
+			Namespace: "default",
+			UID:       types.UID("job-uid-123"),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-0"},
+			TargetPodUID: "pod-uid-456",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			SnapshotRef: "snap-test-123",
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+	p := NewGKEProvider(c, scheme)
+
+	if err := p.CompleteRestore(context.Background(), job, "web-0", "pod-uid-456"); err != nil {
+		t.Fatalf("CompleteRestore failed: %v", err)
+	}
+	gotPod := &corev1.Pod{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-0"}, gotPod); err != nil {
+		t.Fatalf("getting pod: %v", err)
+	}
+	if got := gotPod.Annotations["podsnapshot.gke.io/ps-name"]; got != "" {
+		t.Errorf("expected ps-name to be empty string, got %q", got)
+	}
+	if got := gotPod.Annotations[util.AnnotationRestoreCompleted]; got != "snap-test-123" {
+		t.Errorf("expected restore-completed to be %q, got %q", "snap-test-123", got)
 	}
 }

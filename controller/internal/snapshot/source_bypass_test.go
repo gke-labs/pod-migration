@@ -38,6 +38,9 @@ func bypassTestJob() *pmv1alpha1.PodMigrationJob {
 			PodRef:       corev1.LocalObjectReference{Name: bypassTestPodName},
 			TargetPodUID: bypassTestPodUID,
 		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			SnapshotRef: "migration-snapshot",
+		},
 	}
 }
 

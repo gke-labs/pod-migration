@@ -3422,6 +3422,9 @@ func TestPodMigrationJobReconciler_Restoring_Success(t *testing.T) {
 			Namespace: namespace,
 			Name:      podName,
 			UID:       types.UID(podUID),
+			Annotations: map[string]string{
+				"podsnapshot.gke.io/ps-name": "snapshot-ref",
+			},
 		},
 		Status: corev1.PodStatus{
 			Conditions: []corev1.PodCondition{
@@ -3448,6 +3451,7 @@ func TestPodMigrationJobReconciler_Restoring_Success(t *testing.T) {
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-ref",
 			Consumed:        true,
 			RestoredPodUID:  podUID,
 			RestoredPodName: podName,
@@ -3511,6 +3515,9 @@ func TestPodMigrationJobReconciler_Restoring_Success_DifferentReplacementPodName
 			Namespace: namespace,
 			Name:      restoredPodName,
 			UID:       types.UID(restoredPodUID),
+			Annotations: map[string]string{
+				"podsnapshot.gke.io/ps-name": "snapshot-ref",
+			},
 		},
 		Status: corev1.PodStatus{
 			Conditions: []corev1.PodCondition{
@@ -3538,6 +3545,7 @@ func TestPodMigrationJobReconciler_Restoring_Success_DifferentReplacementPodName
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-ref",
 			Consumed:        true,
 			RestoredPodUID:  restoredPodUID,
 			RestoredPodName: restoredPodName,
@@ -3600,6 +3608,9 @@ func TestPodMigrationJobReconciler_Restoring_ColdStartFallback(t *testing.T) {
 			Namespace: namespace,
 			Name:      podName,
 			UID:       types.UID(podUID),
+			Annotations: map[string]string{
+				"podsnapshot.gke.io/ps-name": "snapshot-ref",
+			},
 		},
 		Status: corev1.PodStatus{
 			Conditions: []corev1.PodCondition{
@@ -3642,6 +3653,7 @@ func TestPodMigrationJobReconciler_Restoring_ColdStartFallback(t *testing.T) {
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-ref",
 			Consumed:        true,
 			RestoredPodUID:  podUID,
 			RestoredPodName: podName,
@@ -3704,6 +3716,9 @@ func TestPodMigrationJobReconciler_Restoring_IgnoresNormalEventsWithFallbackKeyw
 			Namespace: namespace,
 			Name:      podName,
 			UID:       types.UID(podUID),
+			Annotations: map[string]string{
+				"podsnapshot.gke.io/ps-name": "snapshot-ref",
+			},
 		},
 		Status: corev1.PodStatus{
 			Conditions: []corev1.PodCondition{
@@ -3746,6 +3761,7 @@ func TestPodMigrationJobReconciler_Restoring_IgnoresNormalEventsWithFallbackKeyw
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-ref",
 			Consumed:        true,
 			RestoredPodUID:  podUID,
 			RestoredPodName: podName,
@@ -3805,6 +3821,9 @@ func TestPodMigrationJobReconciler_Restoring_IgnoresStaleWarningEventsBeforeRest
 			Namespace: namespace,
 			Name:      podName,
 			UID:       types.UID(podUID),
+			Annotations: map[string]string{
+				"podsnapshot.gke.io/ps-name": "snapshot-ref",
+			},
 		},
 		Status: corev1.PodStatus{
 			Conditions: []corev1.PodCondition{
@@ -4064,6 +4083,7 @@ func TestPodMigrationJobReconciler_Restoring_NotReadyPodWithFallbackEventConclud
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-ref",
 			Consumed:        true,
 			RestoredPodUID:  podUID,
 			RestoredPodName: podName,
@@ -4125,6 +4145,7 @@ func TestPodMigrationJobReconciler_Restoring_NoEventQueriesBeforePodReady(t *tes
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
 			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef:     "snapshot-ref",
 			Consumed:        true,
 			RestoredPodUID:  podUID,
 			RestoredPodName: podName,
@@ -6095,6 +6116,9 @@ func newRestoreCrashFixture(namespace, jobName, podName, podUID string, podStatu
 			Namespace: namespace,
 			Name:      podName,
 			UID:       types.UID(podUID),
+			Annotations: map[string]string{
+				"podsnapshot.gke.io/ps-name": "snapshot-ref",
+			},
 		},
 		Spec:   corev1.PodSpec{RuntimeClassName: &gvisor},
 		Status: podStatus,
