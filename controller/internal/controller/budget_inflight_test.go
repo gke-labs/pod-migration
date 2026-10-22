@@ -2,12 +2,14 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,14 +29,16 @@ func ifPod(name string, ready bool) *corev1.Pod {
 	}
 }
 
+// ifPDB's cached status allows a disruption, so checks reach the dry run and
+// the in-flight count.
 func ifPDB(desiredHealthy int32, app string, policy *policyv1.UnhealthyPodEvictionPolicyType) *policyv1.PodDisruptionBudget {
 	return &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "db"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "db", Generation: 1},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			Selector:                   &metav1.LabelSelector{MatchLabels: map[string]string{"app": app}},
 			UnhealthyPodEvictionPolicy: policy,
 		},
-		Status: policyv1.PodDisruptionBudgetStatus{DesiredHealthy: desiredHealthy},
+		Status: policyv1.PodDisruptionBudgetStatus{ObservedGeneration: 1, DesiredHealthy: desiredHealthy, DisruptionsAllowed: 1},
 	}
 }
 
@@ -200,5 +204,74 @@ func TestInFlightBudgetChecker_ConcurrentChecks(t *testing.T) {
 		if allowed != 1 {
 			t.Fatalf("round %d: %d jobs passed, want exactly 1 (one disruption allowed)", round, allowed)
 		}
+	}
+}
+
+// TestInFlightBudgetChecker_CachedBudgetSkipsTheDryRun: a healthy source
+// under one PDB whose cached status allows no disruption waits without a dry
+// run (Brian's #165 review, item 4). Anything the cache doesn't settle goes to
+// the dry run.
+func TestInFlightBudgetChecker_CachedBudgetSkipsTheDryRun(t *testing.T) {
+	exhausted := ifPDB(2, "db", nil)
+	exhausted.Status.DisruptionsAllowed = 0
+	exhausted.Status.CurrentHealthy = 2
+	lagging := ifPDB(2, "db", nil)
+	lagging.Generation = 2 // the disruption controller hasn't seen the new spec yet
+	second := exhausted.DeepCopy()
+	second.Name = "db-2"
+	emptySelector := ifPDB(2, "db", nil)
+	emptySelector.Spec.Selector = &metav1.LabelSelector{}
+	emptySelector.Status.DisruptionsAllowed = 0
+	self := ifJob("self", "a", pmv1alpha1.PodMigrationJobPhasePending)
+
+	for name, tc := range map[string]struct {
+		objs        []client.Object
+		wantReason  string
+		wantDryRuns int
+		wantCause   string // in the DisruptionBudget cause, when the cache refused
+	}{
+		"healthy source, budget at zero": {
+			[]client.Object{ifPod("a", true), ifPod("b", true), exhausted, self},
+			reasonBudgetExhausted, 0, "The disruption budget db needs 2 healthy pods and has 2 currently",
+		},
+		"healthy source, status behind the spec": {
+			[]client.Object{ifPod("a", true), ifPod("b", true), lagging, self},
+			reasonBudgetExhausted, 0, "The disruption budget db is still being processed by the server.",
+		},
+		"NotReady source: the dry run decides": {
+			[]client.Object{ifPod("a", false), ifPod("b", true), ifPod("c", true), exhausted, self},
+			reasonBudgetAllowed, 1, "",
+		},
+		"two PDBs: the dry run gets the eviction API's error": {
+			[]client.Object{ifPod("a", true), ifPod("b", true), ifPod("c", true), exhausted, second, self},
+			reasonBudgetAllowed, 1, "",
+		},
+		"source not in the cache: the dry run decides": {
+			[]client.Object{ifPod("b", true), exhausted, self},
+			reasonBudgetAllowed, 1, "",
+		},
+		"an empty selector covers nothing": {
+			[]client.Object{ifPod("a", true), ifPod("b", true), emptySelector, self},
+			reasonBudgetAllowed, 1, "",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			checker, _ := ifChecker(tc.objs...)
+			dryRun := &stubBudgetChecker{reason: reasonBudgetAllowed}
+			checker.DryRun = dryRun
+			reason, err := checker.Check(context.Background(), self, "a")
+			if reason != tc.wantReason {
+				t.Fatalf("Check = (%q, %v), want %q", reason, err, tc.wantReason)
+			}
+			if dryRun.calls != tc.wantDryRuns {
+				t.Errorf("dry runs = %d, want %d", dryRun.calls, tc.wantDryRuns)
+			}
+			if tc.wantCause != "" {
+				cause, ok := apierrors.StatusCause(err, policyv1.DisruptionBudgetCause)
+				if !apierrors.IsTooManyRequests(err) || !ok || !strings.Contains(cause.Message, tc.wantCause) {
+					t.Errorf("refusal %v: want a 429 whose DisruptionBudget cause says %q", err, tc.wantCause)
+				}
+			}
+		})
 	}
 }
