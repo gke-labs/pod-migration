@@ -223,3 +223,26 @@ func TestGanttDomainCap(t *testing.T) {
 		t.Errorf("uniform rows must not be capped, got %v", capS)
 	}
 }
+
+// TestMigrationsTableShowsRestoreEvidence: the migrations table shows where
+// each restore signal came from, so an inferred restore can't pass for a
+// confirmed one (#79).
+func TestMigrationsTableShowsRestoreEvidence(t *testing.T) {
+	html := string(migrationsTable([]analyze.Migration{
+		{Pod: "a-0", RestoreSignal: "pmj:RestoreInferred", RestoreEvidence: analyze.EvidenceInferred},
+		{Pod: "b-0", RestoreSignal: "pmj:RestoreVerified", RestoreEvidence: analyze.EvidenceConfirmed},
+		{Pod: "c-0", RestoreSignal: "psengine-restore:restored", RestoreEvidence: analyze.EvidenceEngine},
+		{Pod: "d-0", RestoreSignal: "absent"},
+	}))
+	for _, want := range []string{
+		"<th>evidence</th>",
+		"<td>pmj:RestoreInferred</td><td>inferred</td>",
+		"<td>pmj:RestoreVerified</td><td>confirmed</td>",
+		"<td>psengine-restore:restored</td><td>engine</td>",
+		"<td>absent</td><td>–</td>",
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("migrations table missing %q", want)
+		}
+	}
+}

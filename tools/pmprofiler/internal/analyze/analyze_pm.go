@@ -95,6 +95,7 @@ func reconstructPM(name string, s *pmState, lastTS time.Time, wedge time.Duratio
 	if wv, ok, _ := unstructured.NestedBool(u.Object, "status", "agent", "warmStateVerified"); ok {
 		m.Restored = wv
 		m.RestoreSignal = fmt.Sprintf("agent.warmStateVerified:%t", wv)
+		m.RestoreEvidence = EvidenceEngine
 	} else {
 		m.RestoreSignal = "absent"
 	}

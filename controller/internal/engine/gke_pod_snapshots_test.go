@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +75,9 @@ func TestGKEPodSnapshots_Identity(t *testing.T) {
 	var asEngine Engine = e
 	if _, ok := asEngine.(RestoreOrderer); !ok {
 		t.Errorf("GKE Pod Snapshots doesn't implement RestoreOrderer")
+	}
+	if _, ok := asEngine.(RestoreVerifier); !ok {
+		t.Errorf("GKE Pod Snapshots doesn't implement RestoreVerifier")
 	}
 }
 
@@ -622,5 +626,152 @@ func TestGKEPodSnapshots_OrderColdStartBypass(t *testing.T) {
 
 	if err := NewGKEPodSnapshots(nil, nil).OrderColdStartBypass(nil); err == nil {
 		t.Errorf("OrderColdStartBypass(nil) returned no error")
+	}
+}
+
+// eventClient returns a fake client that serves objs and lists events by
+// involvedObject.uid, as the API server does.
+func eventClient(objs ...client.Object) client.Client {
+	return fake.NewClientBuilder().WithScheme(testScheme()).
+		WithIndex(&corev1.Event{}, "involvedObject.uid", func(o client.Object) []string {
+			return []string{string(o.(*corev1.Event).InvolvedObject.UID)}
+		}).
+		WithObjects(objs...).
+		Build()
+}
+
+func podEvent(name string, podUID types.UID, eventType, reason, message string, at time.Time) *corev1.Event {
+	return &corev1.Event{
+		ObjectMeta:     metav1.ObjectMeta{Name: name, Namespace: "default"},
+		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Namespace: "default", Name: "replacement", UID: podUID},
+		Type:           eventType,
+		Reason:         reason,
+		Message:        message,
+		LastTimestamp:  metav1.NewTime(at),
+	}
+}
+
+func TestGKEPodSnapshots_VerifyRestore(t *testing.T) {
+	restoringStart := time.Now().Add(-time.Minute)
+	job := &pmv1alpha1.PodMigrationJob{ObjectMeta: metav1.ObjectMeta{Name: "pmj", Namespace: "default"}}
+	start := metav1.NewTime(restoringStart)
+	job.Status.RestoringStartTime = &start
+	newPod := func(ready bool) *corev1.Pod {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: "default", UID: "replacement-uid"}}
+		if ready {
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		}
+		return pod
+	}
+	after := restoringStart.Add(10 * time.Second)
+	inferred := RestoreVerdict{Outcome: Restored, Evidence: "pod Ready, with no restore-failure Warning event since restoring started"}
+	coldStart := func(reason, message string) RestoreVerdict {
+		return RestoreVerdict{
+			Outcome:  ColdStart,
+			Reason:   "GKE runtime skipped snapshot restore and fell back to cold start",
+			Evidence: "Warning event " + reason + ": " + message,
+		}
+	}
+
+	tests := []struct {
+		name   string
+		ready  bool
+		events []*corev1.Event
+		want   RestoreVerdict
+	}{
+		{name: "Ready, no events: an inferred restore", ready: true, want: inferred},
+		{name: "not Ready, no events: in progress", want: RestoreVerdict{Outcome: RestoreInProgress}},
+		{
+			name:   "a fallback event on a Ready pod: a cold start",
+			ready:  true,
+			events: []*corev1.Event{podEvent("e1", "replacement-uid", corev1.EventTypeWarning, "FallbackToColdStart", "fell back", after)},
+			want:   coldStart("FallbackToColdStart", "fell back"),
+		},
+		{
+			name:   "a fallback event on a pod that isn't Ready: a cold start",
+			events: []*corev1.Event{podEvent("e1", "replacement-uid", corev1.EventTypeWarning, "SkipRestore", "skipped", after)},
+			want:   coldStart("SkipRestore", "skipped"),
+		},
+		{
+			name:   "a Warning message about a failed restore: a cold start",
+			ready:  true,
+			events: []*corev1.Event{podEvent("e1", "replacement-uid", corev1.EventTypeWarning, "Other", "Failed to restore the sandbox", after)},
+			want:   coldStart("Other", "Failed to restore the sandbox"),
+		},
+		{
+			name:   "a Normal event is ignored",
+			ready:  true,
+			events: []*corev1.Event{podEvent("e1", "replacement-uid", corev1.EventTypeNormal, "FallbackToColdStart", "fell back", after)},
+			want:   inferred,
+		},
+		{
+			name:   "an event from before restoring started is ignored",
+			ready:  true,
+			events: []*corev1.Event{podEvent("e1", "replacement-uid", corev1.EventTypeWarning, "FallbackToColdStart", "old", restoringStart.Add(-time.Minute))},
+			want:   inferred,
+		},
+		{
+			name:   "another pod's event is ignored",
+			ready:  true,
+			events: []*corev1.Event{podEvent("e1", "other-uid", corev1.EventTypeWarning, "FallbackToColdStart", "fell back", after)},
+			want:   inferred,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var objs []client.Object
+			for _, e := range tt.events {
+				objs = append(objs, e)
+			}
+			c := eventClient(objs...)
+			got, err := NewGKEPodSnapshots(c, testScheme()).VerifyRestore(context.Background(), job, newPod(tt.ready))
+			if err != nil {
+				t.Fatalf("VerifyRestore: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("VerifyRestore() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("a nil pod", func(t *testing.T) {
+		if _, err := NewGKEPodSnapshots(eventClient(), testScheme()).VerifyRestore(context.Background(), job, nil); err == nil {
+			t.Errorf("VerifyRestore(nil pod): want an error")
+		}
+	})
+	t.Run("no reader for events", func(t *testing.T) {
+		if _, err := NewGKEPodSnapshots(nil, nil).VerifyRestore(context.Background(), job, newPod(true)); err == nil {
+			t.Errorf("VerifyRestore without a reader: want an error")
+		}
+	})
+	t.Run("a list error", func(t *testing.T) {
+		failing := fake.NewClientBuilder().WithScheme(testScheme()).WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return errors.New("throttled")
+			},
+		}).Build()
+		if _, err := NewGKEPodSnapshots(failing, testScheme()).VerifyRestore(context.Background(), job, newPod(true)); err == nil ||
+			!strings.Contains(err.Error(), "throttled") {
+			t.Errorf("VerifyRestore error = %v, want the list error", err)
+		}
+	})
+}
+
+// Events aren't cached, so VerifyRestore reads them through the API reader
+// when it has one.
+func TestGKEPodSnapshots_VerifyRestoreReadsEventsThroughTheAPIReader(t *testing.T) {
+	job := &pmv1alpha1.PodMigrationJob{ObjectMeta: metav1.ObjectMeta{Name: "pmj", Namespace: "default"}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: "default", UID: "replacement-uid"}}
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	cache := eventClient()
+	apiServer := eventClient(podEvent("e1", "replacement-uid", corev1.EventTypeWarning, "FallbackToColdStart", "fell back", time.Now()))
+
+	got, err := NewGKEPodSnapshots(cache, testScheme(), WithAPIReader(apiServer)).VerifyRestore(context.Background(), job, pod)
+	if err != nil || got.Outcome != ColdStart {
+		t.Errorf("with the API reader: VerifyRestore() = %+v, %v; want the cold start it reports", got, err)
+	}
+	got, err = NewGKEPodSnapshots(cache, testScheme(), WithAPIReader(nil)).VerifyRestore(context.Background(), job, pod)
+	if err != nil || got.Outcome != Restored {
+		t.Errorf("WithAPIReader(nil) keeps the client: VerifyRestore() = %+v, %v; want an inferred restore", got, err)
 	}
 }
