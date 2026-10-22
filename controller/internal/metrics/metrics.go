@@ -77,7 +77,7 @@ var (
 
 	// BudgetChecksTotal counts the dry-run evictions that check a source's
 	// disruption budget before its checkpoint (#42), by result.
-	// Results: allowed | budget_exhausted | check_error
+	// Results: allowed | budget_exhausted | in_flight | check_error
 	BudgetChecksTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_budget_checks_total",
 		Help: "Total number of disruption budget checks (dry-run evictions) before a checkpoint, by result.",

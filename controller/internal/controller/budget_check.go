@@ -117,6 +117,8 @@ func (r *PodMigrationJobReconciler) checkDisruptionBudget(ctx context.Context, j
 		return ctrl.Result{}, true, nil
 	case reasonBudgetExhausted:
 		metrics.RecordBudgetCheck("budget_exhausted")
+	case reasonMigrationsInFlight:
+		metrics.RecordBudgetCheck("in_flight")
 	default:
 		reason = reasonBudgetCheckError
 		metrics.RecordBudgetCheck("check_error")
@@ -126,16 +128,22 @@ func (r *PodMigrationJobReconciler) checkDisruptionBudget(ctx context.Context, j
 	}
 
 	prev := meta.FindStatusCondition(job.Status.Conditions, ConditionDisruptionBudgetChecked)
-	firstBlock := prev == nil || prev.Reason != reason
+	// MigrationDeferredByPDB marks the first refusal by the budget or by the
+	// migrations in flight under it. During a drain, a job goes back and forth
+	// between the two as its siblings migrate, which doesn't repeat it.
+	firstBlock := prev == nil || (prev.Reason != reasonBudgetExhausted && prev.Reason != reasonMigrationsInFlight)
 	status := metav1.ConditionFalse
 	refusal := fmt.Sprint(checkErr)
 	if cause, ok := apierrors.StatusCause(checkErr, policyv1.DisruptionBudgetCause); ok {
 		refusal = cause.Message // names the budget and its healthy pod counts
 	}
 	message := fmt.Sprintf("A dry-run eviction of the source was refused, so nothing is checkpointed yet: %s", refusal)
-	if reason == reasonBudgetCheckError {
+	switch reason {
+	case reasonBudgetCheckError:
 		status = metav1.ConditionUnknown
 		message = fmt.Sprintf("The dry-run eviction of the source failed, so nothing is checkpointed yet: %v", checkErr)
+	case reasonMigrationsInFlight:
+		message = fmt.Sprintf("Other migrations under the PodDisruptionBudget are in flight, so nothing is checkpointed yet: %v", checkErr)
 	}
 	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 		Type:               ConditionDisruptionBudgetChecked,
@@ -153,6 +161,10 @@ func (r *PodMigrationJobReconciler) checkDisruptionBudget(ctx context.Context, j
 	if firstBlock && reason == reasonBudgetExhausted {
 		r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "MigrationDeferredByPDB",
 			"Migration is waiting for the PodDisruptionBudget to allow a disruption (%s); nothing has been checkpointed", refusal)
+	}
+	if firstBlock && reason == reasonMigrationsInFlight {
+		r.recordPodEvent(ctx, job, corev1.EventTypeNormal, "MigrationDeferredByPDB",
+			"Migration is waiting for other migrations under the PodDisruptionBudget to finish (%v); nothing has been checkpointed", checkErr)
 	}
 	after := budgetRecheckAfter(meta.FindStatusCondition(job.Status.Conditions, ConditionDisruptionBudgetChecked),
 		migrationDeadlineAnchor(job).Add(r.getMigrationTimeout(job)), time.Now())
@@ -210,15 +222,17 @@ func waitingForDisruptionBudget(job *pmv1alpha1.PodMigrationJob) bool {
 }
 
 // refusedByDisruptionBudget reports whether a Pending job's last budget check
-// was refused by the budget itself. Only such a job times out as
-// DisruptionBudgetTimeout, which the eviction webhook answers with a fresh
-// job. A check that keeps failing for another reason, such as an eviction
-// webhook that doesn't support dry runs, times out as a plain Timeout, which
-// falls back to a cold eviction instead of waiting forever.
+// was refused by the budget itself, or by the other migrations in flight under
+// it. Only such a job times out as DisruptionBudgetTimeout, which the eviction
+// webhook answers with a fresh job. A check that keeps failing for another
+// reason, such as an eviction webhook that doesn't support dry runs, times out
+// as a plain Timeout, which falls back to a cold eviction instead of waiting
+// forever.
 func refusedByDisruptionBudget(job *pmv1alpha1.PodMigrationJob) bool {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
 		return false
 	}
 	cond := meta.FindStatusCondition(job.Status.Conditions, ConditionDisruptionBudgetChecked)
-	return cond != nil && cond.Status == metav1.ConditionFalse && cond.Reason == reasonBudgetExhausted
+	return cond != nil && cond.Status == metav1.ConditionFalse &&
+		(cond.Reason == reasonBudgetExhausted || cond.Reason == reasonMigrationsInFlight)
 }

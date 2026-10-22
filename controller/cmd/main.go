@@ -228,7 +228,10 @@ func main() {
 		Recorder:                eventRecorder,
 		DefaultMigrationTimeout: migrationTimeout,
 		InvariantEngine:         invariantEngine,
-		BudgetChecker:           controller.EvictionBudgetChecker{Client: mgr.GetClient()},
+		BudgetChecker: &controller.InFlightBudgetChecker{
+			Client: mgr.GetClient(),
+			DryRun: controller.EvictionBudgetChecker{Client: mgr.GetClient()},
+		},
 		Engines:                 engines,
 		FencePreCheckpointCap:   fenceCap,
 		FenceLateStopWatch:      fenceLateStopWatch,
