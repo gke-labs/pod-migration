@@ -61,7 +61,7 @@ func mustParsePolicy(t *testing.T, raw string) *eligibility.RuntimeClassPolicy {
 }
 
 func TestGKEPodSnapshots_Identity(t *testing.T) {
-	e := NewGKEPodSnapshots(nil, nil, nil)
+	e := NewGKEPodSnapshots(nil, nil)
 	if got := e.Name(); got != "gke-pod-snapshots" {
 		t.Errorf("Name() = %q, want gke-pod-snapshots", got)
 	}
@@ -78,64 +78,75 @@ func TestGKEPodSnapshots_Identity(t *testing.T) {
 }
 
 func TestNewDefaultRegistry(t *testing.T) {
-	r, err := NewDefaultRegistry(fake.NewClientBuilder().WithScheme(testScheme()).Build(), testScheme(), nil)
-	if err != nil {
-		t.Fatalf("NewDefaultRegistry: %v", err)
-	}
-	def, err := r.Default()
-	if err != nil || def.Name() != GKEPodSnapshotsName {
-		t.Fatalf("Default() = %v, %v; want gke-pod-snapshots", def, err)
-	}
-	if got, err := r.ForJob(nil); err != nil || got != def {
-		t.Errorf("ForJob() = %v, %v; want gke-pod-snapshots", got, err)
-	}
-	// GKE Pod Snapshots serves every pod, as the only engine did before the
-	// registry; its Eligible applies the operator allow-list.
-	for _, class := range []string{"gvisor", "", "runc"} {
-		if got, ok := r.ForPod(podWithRuntimeClass(class), nil); !ok || got != def {
-			t.Errorf("ForPod(%q) = %v, %t; want gke-pod-snapshots", class, got, ok)
-		}
-	}
-}
-
-// The expected messages are the ones eviction_webhook_test.go asserts for
-// the same pods and allow-lists.
-func TestGKEPodSnapshots_EligibleIsTheRuntimeClassAllowList(t *testing.T) {
 	tests := []struct {
 		name       string
 		allowList  string // "" leaves the policy nil: gVisor only
-		class      string // "" leaves runtimeClassName unset
-		wantOK     bool
-		wantReason string
+		wantRoutes string
+		served     []string // runtime classes routed to GKE Pod Snapshots; "" is no runtime class
+		notServed  []string
 	}{
-		{name: "gvisor pod, default list", class: "gvisor", wantOK: true},
-		{name: "pod without a runtime class, default list", class: "",
-			wantReason: "Pod runtime class @default is not migratable (allowed: gvisor), skipping migration"},
-		{name: "other runtime class, default list", class: "other",
-			wantReason: "Pod runtime class other is not migratable (allowed: gvisor), skipping migration"},
-		{name: "gvisor pod, @default only", allowList: "@default", class: "gvisor",
-			wantReason: "Pod runtime class gvisor is not migratable (allowed: @default), skipping migration"},
-		{name: "pod without a runtime class, @default only", allowList: "@default", class: "", wantOK: true},
-		{name: "other runtime class, gvisor and @default", allowList: "gvisor,@default", class: "other",
-			wantReason: "Pod runtime class other is not migratable (allowed: gvisor,@default), skipping migration"},
-		{name: "pod without a runtime class, gvisor and @default", allowList: "gvisor,@default", class: "", wantOK: true},
-		{name: "gvisor pod, gvisor and @default", allowList: "gvisor,@default", class: "gvisor", wantOK: true},
+		{
+			name:       "nil allow-list",
+			wantRoutes: "gvisor=gke-pod-snapshots",
+			served:     []string{"gvisor"},
+			notServed:  []string{"", "runc"},
+		},
+		{
+			// As the only engine before the registry, GKE Pod Snapshots
+			// serves every class that the operator allow-lists.
+			name:       "allow-list with other classes",
+			allowList:  "gvisor,runc,@default",
+			wantRoutes: "@default=gke-pod-snapshots,gvisor=gke-pod-snapshots,runc=gke-pod-snapshots",
+			served:     []string{"gvisor", "runc", ""},
+			notServed:  []string{"kata"},
+		},
 	}
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			e := NewGKEPodSnapshots(nil, nil, mustParsePolicy(t, tt.allowList))
-			want := Verdict{OK: tt.wantOK, Reason: tt.wantReason}
-			// The node isn't used yet: with or without it, the verdict is the same.
-			for _, n := range []*corev1.Node{nil, node} {
-				if got := e.Eligible(podWithRuntimeClass(tt.class), n); got != want {
-					t.Errorf("Eligible(node=%v) = %+v, want %+v", n != nil, got, want)
+			r, err := NewDefaultRegistry(fake.NewClientBuilder().WithScheme(testScheme()).Build(), testScheme(), mustParsePolicy(t, tt.allowList))
+			if err != nil {
+				t.Fatalf("NewDefaultRegistry: %v", err)
+			}
+			def, err := r.Default()
+			if err != nil || def.Name() != GKEPodSnapshotsName {
+				t.Fatalf("Default() = %v, %v; want gke-pod-snapshots", def, err)
+			}
+			if got, err := r.ForJob(nil); err != nil || got != def {
+				t.Errorf("ForJob() = %v, %v; want gke-pod-snapshots", got, err)
+			}
+			if got := r.Routes().String(); got != tt.wantRoutes {
+				t.Errorf("Routes() = %q, want %q", got, tt.wantRoutes)
+			}
+			for _, class := range tt.served {
+				if got, ok := r.ForPod(podWithRuntimeClass(class), nil); !ok || got != def {
+					t.Errorf("ForPod(%q) = %v, %t; want gke-pod-snapshots", class, got, ok)
+				}
+			}
+			for _, class := range tt.notServed {
+				if got, ok := r.ForPod(podWithRuntimeClass(class), nil); ok {
+					t.Errorf("ForPod(%q) = %v; want no engine", class, got)
 				}
 			}
 		})
 	}
+}
 
-	if got := NewGKEPodSnapshots(nil, nil, nil).Eligible(nil, nil); got.OK {
+// GKE Pod Snapshots refuses no pod: the operator allow-list, which the
+// eviction webhook and the preemption trigger check first, and the routes
+// decide which pods reach it.
+func TestGKEPodSnapshots_EligibleRefusesNoPod(t *testing.T) {
+	e := NewGKEPodSnapshots(nil, nil)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	for _, class := range []string{"gvisor", "", "other"} {
+		// The node isn't used yet: with or without it, the verdict is the same.
+		for _, n := range []*corev1.Node{nil, node} {
+			if got := e.Eligible(podWithRuntimeClass(class), n); got != (Verdict{OK: true}) {
+				t.Errorf("Eligible(%q, node=%t) = %+v, want OK", class, n != nil, got)
+			}
+		}
+	}
+
+	if got := e.Eligible(nil, nil); got.OK {
 		t.Errorf("Eligible(nil pod) = %+v, want a refusal", got)
 	}
 }
@@ -239,7 +250,7 @@ func TestGKEPodSnapshots_ResolvePolicyIsTheExistingLookup(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(tt.policies...).Build()
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", Labels: tt.labels}}
 
-			got, err := NewGKEPodSnapshots(c, testScheme(), nil).ResolvePolicy(context.Background(), pod)
+			got, err := NewGKEPodSnapshots(c, testScheme()).ResolvePolicy(context.Background(), pod)
 			if err != nil {
 				t.Fatalf("ResolvePolicy: %v", err)
 			}
@@ -275,7 +286,7 @@ func TestGKEPodSnapshots_ResolvePolicyListFailures(t *testing.T) {
 
 	t.Run("missing PodSnapshotPolicy CRD means no policy", func(t *testing.T) {
 		c := listErr(&meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "podsnapshot.gke.io", Kind: "PodSnapshotPolicy"}})
-		got, err := NewGKEPodSnapshots(c, testScheme(), nil).ResolvePolicy(context.Background(), pod)
+		got, err := NewGKEPodSnapshots(c, testScheme()).ResolvePolicy(context.Background(), pod)
 		if err != nil || got != nil {
 			t.Fatalf("ResolvePolicy = %+v, %v; want no policy and no error", got, err)
 		}
@@ -283,7 +294,7 @@ func TestGKEPodSnapshots_ResolvePolicyListFailures(t *testing.T) {
 
 	t.Run("list error is returned", func(t *testing.T) {
 		c := listErr(apierrors.NewServiceUnavailable("etcd is down"))
-		got, err := NewGKEPodSnapshots(c, testScheme(), nil).ResolvePolicy(context.Background(), pod)
+		got, err := NewGKEPodSnapshots(c, testScheme()).ResolvePolicy(context.Background(), pod)
 		if err == nil || got != nil {
 			t.Fatalf("ResolvePolicy = %+v, %v; want an error", got, err)
 		}
@@ -293,7 +304,7 @@ func TestGKEPodSnapshots_ResolvePolicyListFailures(t *testing.T) {
 	})
 
 	t.Run("nil pod", func(t *testing.T) {
-		if _, err := NewGKEPodSnapshots(listErr(nil), testScheme(), nil).ResolvePolicy(context.Background(), nil); err == nil {
+		if _, err := NewGKEPodSnapshots(listErr(nil), testScheme()).ResolvePolicy(context.Background(), nil); err == nil {
 			t.Fatalf("ResolvePolicy(nil) returned no error")
 		}
 	})
@@ -332,7 +343,7 @@ func TestGKEPodSnapshots_SnapshotsIsTheGKEProvider(t *testing.T) {
 		},
 	}).Build()
 
-	e := NewGKEPodSnapshots(c, scheme, nil)
+	e := NewGKEPodSnapshots(c, scheme)
 	provider := e.Snapshots()
 	if _, ok := provider.(*snapshot.GKEProvider); !ok {
 		t.Fatalf("Snapshots() = %T, want *snapshot.GKEProvider", provider)
@@ -383,7 +394,7 @@ func TestGKEPodSnapshots_SnapshotsIsTheGKEProvider(t *testing.T) {
 }
 
 func TestGKEPodSnapshots_RestoreFailuresIsTheGVisorClassifier(t *testing.T) {
-	failures := NewGKEPodSnapshots(nil, nil, nil).RestoreFailures()
+	failures := NewGKEPodSnapshots(nil, nil).RestoreFailures()
 	if !reflect.DeepEqual(failures, restore.DefaultEngines()) {
 		t.Fatalf("RestoreFailures() = %v, want restore.DefaultEngines() = %v", failures, restore.DefaultEngines())
 	}
@@ -479,7 +490,7 @@ func TestGKEPodSnapshots_NamespaceResources(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := NewGKEPodSnapshots(nil, nil, nil).NamespaceResources(testPodMigration(tt.location))
+			got, err := NewGKEPodSnapshots(nil, nil).NamespaceResources(testPodMigration(tt.location))
 			if err != nil {
 				t.Fatalf("NamespaceResources: %v", err)
 			}
@@ -498,7 +509,7 @@ func TestGKEPodSnapshots_NamespaceResources(t *testing.T) {
 
 func TestGKEPodSnapshots_NamespaceResourcesRejectsNonGCSLocations(t *testing.T) {
 	for _, location := range []string{"http://my-test-bucket", "my-test-bucket", ""} {
-		got, err := NewGKEPodSnapshots(nil, nil, nil).NamespaceResources(testPodMigration(location))
+		got, err := NewGKEPodSnapshots(nil, nil).NamespaceResources(testPodMigration(location))
 		var locationErr *StorageLocationError
 		if !errors.As(err, &locationErr) {
 			t.Fatalf("NamespaceResources(%q) error = %v, want a *StorageLocationError", location, err)
@@ -514,7 +525,7 @@ func TestGKEPodSnapshots_NamespaceResourcesRejectsNonGCSLocations(t *testing.T) 
 		}
 	}
 
-	if _, err := NewGKEPodSnapshots(nil, nil, nil).NamespaceResources(nil); err == nil {
+	if _, err := NewGKEPodSnapshots(nil, nil).NamespaceResources(nil); err == nil {
 		t.Errorf("NamespaceResources(nil) returned no error")
 	}
 }
@@ -554,7 +565,7 @@ func TestGKEPodSnapshots_OrderRestore(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Annotations: tt.annotations}}
-			if err := NewGKEPodSnapshots(nil, nil, nil).OrderRestore(pod, job); err != nil {
+			if err := NewGKEPodSnapshots(nil, nil).OrderRestore(pod, job); err != nil {
 				t.Fatalf("OrderRestore: %v", err)
 			}
 			if !reflect.DeepEqual(pod.Annotations, tt.want) {
@@ -567,7 +578,7 @@ func TestGKEPodSnapshots_OrderRestore(t *testing.T) {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement"}}
 		noSnapshot := job.DeepCopy()
 		noSnapshot.Status.SnapshotRef = ""
-		if err := NewGKEPodSnapshots(nil, nil, nil).OrderRestore(pod, noSnapshot); err == nil {
+		if err := NewGKEPodSnapshots(nil, nil).OrderRestore(pod, noSnapshot); err == nil {
 			t.Fatalf("OrderRestore without a snapshot returned no error")
 		}
 		if pod.Annotations != nil {
@@ -576,7 +587,7 @@ func TestGKEPodSnapshots_OrderRestore(t *testing.T) {
 	})
 
 	t.Run("nil pod or job", func(t *testing.T) {
-		e := NewGKEPodSnapshots(nil, nil, nil)
+		e := NewGKEPodSnapshots(nil, nil)
 		if err := e.OrderRestore(nil, job); err == nil {
 			t.Errorf("OrderRestore(nil pod) returned no error")
 		}
@@ -600,7 +611,7 @@ func TestGKEPodSnapshots_OrderColdStartBypass(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Annotations: tt.annotations}}
-			if err := NewGKEPodSnapshots(nil, nil, nil).OrderColdStartBypass(pod); err != nil {
+			if err := NewGKEPodSnapshots(nil, nil).OrderColdStartBypass(pod); err != nil {
 				t.Fatalf("OrderColdStartBypass: %v", err)
 			}
 			if !reflect.DeepEqual(pod.Annotations, tt.want) {
@@ -609,7 +620,7 @@ func TestGKEPodSnapshots_OrderColdStartBypass(t *testing.T) {
 		})
 	}
 
-	if err := NewGKEPodSnapshots(nil, nil, nil).OrderColdStartBypass(nil); err == nil {
+	if err := NewGKEPodSnapshots(nil, nil).OrderColdStartBypass(nil); err == nil {
 		t.Errorf("OrderColdStartBypass(nil) returned no error")
 	}
 }

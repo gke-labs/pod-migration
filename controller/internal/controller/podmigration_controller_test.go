@@ -23,7 +23,71 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 )
+
+func TestPodMigrationReconciler_RouteRejectUncoveringEngine(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	config := &pmv1alpha1.PodMigration{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "podmigration.gke.io/v1alpha1",
+			Kind:       "PodMigration",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "default",
+			Name:       "test-migration",
+			Generation: 1,
+			Annotations: map[string]string{
+				engine.AnnotationRuntimeClassEngines: "gvisor=criu",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://my-test-bucket",
+			},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).Build()
+
+	gke := &renderingEngine{name: "gke", classes: []string{"gvisor"}}
+	criu := &renderingEngine{name: "criu", classes: []string{eligibility.DefaultRuntimeClassToken, "runc"}}
+	rRegistry := engine.NewRegistry("gke")
+	if err := rRegistry.Register(gke); err != nil {
+		t.Fatalf("Register gke: %v", err)
+	}
+	if err := rRegistry.Register(criu); err != nil {
+		t.Fatalf("Register criu: %v", err)
+	}
+	if err := rRegistry.SetRoutes(engine.Routes{"gvisor": "gke"}); err != nil {
+		t.Fatalf("SetRoutes: %v", err)
+	}
+
+	r := &PodMigrationReconciler{Client: c, Scheme: scheme, Engines: rRegistry}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-migration"}})
+	if err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+
+	got := &pmv1alpha1.PodMigration{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-migration"}, got); err != nil {
+		t.Fatalf("Get PodMigration: %v", err)
+	}
+
+	cond := meta.FindStatusCondition(got.Status.Conditions, ConditionEngineRoutesValid)
+	if cond == nil {
+		t.Fatalf("Condition %s not found on PodMigration", ConditionEngineRoutesValid)
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("Condition %s status = %v, want %v", ConditionEngineRoutesValid, cond.Status, metav1.ConditionFalse)
+	}
+	if cond.Reason != ReasonInvalidEngineRoutes {
+		t.Errorf("Condition %s reason = %v, want %v", ConditionEngineRoutesValid, cond.Reason, ReasonInvalidEngineRoutes)
+	}
+}
 
 func TestPodMigrationReconciler_Reconcile_Success(t *testing.T) {
 	scheme := runtime.NewScheme()

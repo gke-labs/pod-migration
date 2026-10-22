@@ -21,18 +21,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
+	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
@@ -94,7 +99,8 @@ type namedClassifier string
 func (n namedClassifier) Name() string                                { return string(n) }
 func (n namedClassifier) MatchesRestoreFailure(string) (string, bool) { return "", false }
 
-// registryOf registers engines, the first one as the default.
+// registryOf registers engines, the first one as the default. It sets no
+// routes, so the engines' declared runtime classes decide.
 func registryOf(t *testing.T, engines ...engine.Engine) *engine.Registry {
 	t.Helper()
 	r := engine.NewRegistry(engines[0].Name())
@@ -104,6 +110,16 @@ func registryOf(t *testing.T, engines ...engine.Engine) *engine.Registry {
 		}
 	}
 	return r
+}
+
+// podMigrationWithRoutes returns a PodMigration in namespace whose
+// runtime-class routes annotation is routes.
+func podMigrationWithRoutes(namespace, routes string) *pmv1alpha1.PodMigration {
+	return &pmv1alpha1.PodMigration{ObjectMeta: metav1.ObjectMeta{
+		Namespace:   namespace,
+		Name:        "migration",
+		Annotations: map[string]string{engine.AnnotationRuntimeClassEngines: routes},
+	}}
 }
 
 func TestPodMigrationJobReconciler_SnapshotProviderComesFromTheJobEngine(t *testing.T) {
@@ -202,36 +218,228 @@ func TestPodMigrationJobReconciler_SnapshottingUsesTheJobEngine(t *testing.T) {
 	}
 }
 
+// A job that names an engine reads its checkpoint status from that engine's
+// provider, not the default engine's.
+func TestPodMigrationJobReconciler_SnapshottingUsesTheEngineTheJobNames(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-pod", UID: "origin-uid-123"}}
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default", Name: "pmj-test-pod", CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{engine.AnnotationEngine: "named"},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "test-pod"},
+			TargetPodUID: "origin-uid-123",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	reporting := func(ref string) *fakeSnapshotProvider {
+		return &fakeSnapshotProvider{checkStatusResult: &snapshot.Status{Phase: snapshot.PhaseInProgress, SnapshotRef: ref, Reason: "Snapshotting"}}
+	}
+	r := &PodMigrationJobReconciler{
+		Client: c,
+		Scheme: scheme,
+		Engines: registryOf(t,
+			&routedEngine{name: "default", provider: reporting("snapshot-from-the-default-engine")},
+			&routedEngine{name: "named", provider: reporting("snapshot-from-the-named-engine")}),
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-test-pod"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pmj-test-pod"}, got); err != nil {
+		t.Fatalf("getting the job: %v", err)
+	}
+	if got.Status.SnapshotRef != "snapshot-from-the-named-engine" {
+		t.Errorf("SnapshotRef = %q, want the one the named engine's provider reported", got.Status.SnapshotRef)
+	}
+}
+
+// countingProvider is a snapshot provider that counts its calls.
+type countingProvider struct{ calls int }
+
+func (p *countingProvider) EnsureTrigger(context.Context, *pmv1alpha1.PodMigrationJob, string) (ctrl.Result, error) {
+	p.calls++
+	return ctrl.Result{}, nil
+}
+func (p *countingProvider) CheckStatus(context.Context, *pmv1alpha1.PodMigrationJob, string) (*snapshot.Status, error) {
+	p.calls++
+	return nil, nil
+}
+func (p *countingProvider) Cleanup(context.Context, *pmv1alpha1.PodMigrationJob, string) error {
+	p.calls++
+	return nil
+}
+
+func TestPodMigrationJobReconciler_FailsAJobWhoseEngineIsNotRegistered(t *testing.T) {
+	newJob := func(phase pmv1alpha1.PodMigrationJobPhase) *pmv1alpha1.PodMigrationJob {
+		return &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default", Name: "pmj-test-pod", CreationTimestamp: metav1.Now(),
+				Annotations: map[string]string{engine.AnnotationEngine: "missing"},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "test-pod"},
+				TargetPodUID: "origin-uid-123",
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{Phase: phase},
+		}
+	}
+	reconcileJob := func(t *testing.T, job *pmv1alpha1.PodMigrationJob) (*pmv1alpha1.PodMigrationJob, ctrl.Result, *countingProvider, []string) {
+		t.Helper()
+		scheme := runtime.NewScheme()
+		_ = corev1.AddToScheme(scheme)
+		_ = pmv1alpha1.AddToScheme(scheme)
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-pod", UID: "origin-uid-123"}}
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			WithObjects(pod, job).
+			Build()
+		provider := &countingProvider{}
+		recorder := record.NewFakeRecorder(10)
+		r := &PodMigrationJobReconciler{
+			Client:   c,
+			Scheme:   scheme,
+			Recorder: recorder,
+			Engines:  registryOf(t, &routedEngine{name: "routed", provider: provider}),
+		}
+		res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job.Name}})
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		got := &pmv1alpha1.PodMigrationJob{}
+		if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: job.Name}, got); err != nil {
+			t.Fatalf("getting the job: %v", err)
+		}
+		var events []string
+		for len(recorder.Events) > 0 {
+			events = append(events, <-recorder.Events)
+		}
+		return got, res, provider, events
+	}
+
+	const wantMessage = `Snapshot engine "missing" is not registered in this controller (registered: routed); failing the migration`
+	// Pending: before the checkpoint. Snapshotting: the controller restarted
+	// without the engine that took the checkpoint.
+	for _, phase := range []pmv1alpha1.PodMigrationJobPhase{pmv1alpha1.PodMigrationJobPhasePending, pmv1alpha1.PodMigrationJobPhaseSnapshotting} {
+		t.Run(string(phase), func(t *testing.T) {
+			before := testutil.ToFloat64(metrics.OutcomesTotal.WithLabelValues("engine_not_registered"))
+			got, res, provider, events := reconcileJob(t, newJob(phase))
+
+			if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+				t.Errorf("phase = %s, want Failed", got.Status.Phase)
+			}
+			if got.Status.CompletionTime == nil {
+				t.Errorf("CompletionTime isn't set")
+			}
+			cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonEngineNotRegistered || cond.Message != wantMessage {
+				t.Errorf("Ready condition = %+v, want False/%s with message %q", cond, ReasonEngineNotRegistered, wantMessage)
+			}
+			if !res.IsZero() {
+				t.Errorf("Reconcile result = %+v, want no requeue", res)
+			}
+			if provider.calls != 0 {
+				t.Errorf("the default engine's provider was called %d time(s), want none", provider.calls)
+			}
+			if want := []string{"Warning MigrationFailed " + wantMessage}; !reflect.DeepEqual(events, want) {
+				t.Errorf("events = %q, want %q", events, want)
+			}
+			if got := testutil.ToFloat64(metrics.OutcomesTotal.WithLabelValues("engine_not_registered")) - before; got != 1 {
+				t.Errorf("engine_not_registered outcomes recorded = %v, want 1", got)
+			}
+		})
+	}
+
+	t.Run("a concluded job is left alone", func(t *testing.T) {
+		job := newJob(pmv1alpha1.PodMigrationJobPhaseSucceeded)
+		now := metav1.Now()
+		job.Status.CompletionTime = &now
+		got, _, _, _ := reconcileJob(t, job)
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
+			t.Errorf("phase = %s, want Succeeded", got.Status.Phase)
+		}
+		if cond := meta.FindStatusCondition(got.Status.Conditions, "Ready"); cond != nil && cond.Reason == ReasonEngineNotRegistered {
+			t.Errorf("Ready condition = %+v, want no %s", cond, ReasonEngineNotRegistered)
+		}
+	})
+}
+
 func TestNodePreemptionReconciler_UsesThePodEngine(t *testing.T) {
 	runc := "runc"
+	gvisorEngine := func(e routedEngine) *routedEngine {
+		e.name, e.classes = "routed", []string{"gvisor"}
+		return &e
+	}
+	other := &routedEngine{name: "other", classes: []string{"gvisor"}, verdict: engine.Verdict{OK: true}, policy: &engine.PolicyRef{Name: "other-policy"}}
 	tests := []struct {
-		name         string
-		engine       *routedEngine
-		runtimeClass *string // nil keeps the test pod's gvisor
-		wantPolicy   string  // "" means no job
-		wantNoPolicy bool
-		wantNoEvents bool
+		name               string
+		engines            []engine.Engine // the first is the default; no routes
+		allowList          string          // "" leaves RuntimeClassPolicy nil: gVisor only
+		podMigrationRoutes string          // set: the namespace has a PodMigration with these routes
+		runtimeClass       *string         // nil keeps the test pod's gvisor
+		wantPolicy         string          // "" means no job
+		wantEngine         string
+		wantNoPolicy       bool
+		wantNoEvents       bool
 	}{
 		{
 			name:         "the engine refuses the pod",
-			engine:       &routedEngine{name: "routed", verdict: engine.Verdict{Reason: "not for this engine"}},
+			engines:      []engine.Engine{gvisorEngine(routedEngine{verdict: engine.Verdict{Reason: "not for this engine"}})},
 			wantNoEvents: true,
 		},
 		{
-			name:       "the engine's policy is recorded on the job",
-			engine:     &routedEngine{name: "routed", verdict: engine.Verdict{OK: true}, policy: &engine.PolicyRef{Group: "engine.example.com", Kind: "Policy", Name: "engine-policy"}},
+			name:       "the engine's policy and name are recorded on the job",
+			engines:    []engine.Engine{gvisorEngine(routedEngine{verdict: engine.Verdict{OK: true}, policy: &engine.PolicyRef{Group: "engine.example.com", Kind: "Policy", Name: "engine-policy"}})},
 			wantPolicy: "engine-policy",
+			wantEngine: "routed",
 		},
 		{
 			name:         "the engine has no policy for the pod",
-			engine:       &routedEngine{name: "routed", verdict: engine.Verdict{OK: true}},
+			engines:      []engine.Engine{gvisorEngine(routedEngine{verdict: engine.Verdict{OK: true}})},
 			wantNoPolicy: true,
 		},
 		{
-			name:         "the engine's eligibility replaces the default runtime-class allow-list",
-			engine:       &routedEngine{name: "routed", verdict: engine.Verdict{OK: true}, policy: &engine.PolicyRef{Name: "engine-policy"}},
+			name:         "the allow-list applies before the engine",
+			engines:      []engine.Engine{&routedEngine{name: "routed", classes: []string{"gvisor", "runc"}, verdict: engine.Verdict{OK: true}, policy: &engine.PolicyRef{Name: "engine-policy"}}},
+			runtimeClass: &runc,
+			wantNoEvents: true,
+		},
+		{
+			name:         "an allow-listed class the engine serves",
+			engines:      []engine.Engine{&routedEngine{name: "routed", classes: []string{"gvisor", "runc"}, verdict: engine.Verdict{OK: true}, policy: &engine.PolicyRef{Name: "engine-policy"}}},
+			allowList:    "gvisor,runc",
 			runtimeClass: &runc,
 			wantPolicy:   "engine-policy",
+			wantEngine:   "routed",
+		},
+		{
+			name:         "no engine serves the pod's runtime class",
+			engines:      []engine.Engine{gvisorEngine(routedEngine{verdict: engine.Verdict{OK: true}, policy: &engine.PolicyRef{Name: "engine-policy"}})},
+			allowList:    "gvisor,runc",
+			runtimeClass: &runc,
+			wantNoEvents: true,
+		},
+		{
+			name:               "the namespace's PodMigration routes the class to another engine",
+			engines:            []engine.Engine{gvisorEngine(routedEngine{verdict: engine.Verdict{OK: true}, policy: &engine.PolicyRef{Name: "engine-policy"}}), other},
+			podMigrationRoutes: "gvisor=other",
+			wantPolicy:         "other-policy",
+			wantEngine:         "other",
 		},
 	}
 	for _, tt := range tests {
@@ -245,11 +453,22 @@ func TestNodePreemptionReconciler_UsesThePodEngine(t *testing.T) {
 			if tt.runtimeClass != nil {
 				pod.Spec.RuntimeClassName = tt.runtimeClass
 			}
+			objects := []client.Object{node, pod} // no PodSnapshotPolicy: only the engine can supply a policy
+			if tt.podMigrationRoutes != "" {
+				objects = append(objects, podMigrationWithRoutes("default", tt.podMigrationRoutes))
+			}
 			c := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
-				WithObjects(node, pod). // no PodSnapshotPolicy: only the engine can supply a policy
+				WithObjects(objects...).
 				Build()
+			var allowList *eligibility.RuntimeClassPolicy
+			if tt.allowList != "" {
+				var err error
+				if allowList, err = eligibility.ParseRuntimeClassPolicy(tt.allowList); err != nil {
+					t.Fatalf("ParseRuntimeClassPolicy(%q): %v", tt.allowList, err)
+				}
+			}
 			recorder := record.NewFakeRecorder(10)
 			r := &NodePreemptionReconciler{
 				Client:                  c,
@@ -257,7 +476,8 @@ func TestNodePreemptionReconciler_UsesThePodEngine(t *testing.T) {
 				Recorder:                recorder,
 				DefaultMigrationTimeout: 10 * time.Minute,
 				SpotPreemptionBudget:    15 * 1024 * 1024 * 1024,
-				Engines:                 registryOf(t, tt.engine),
+				RuntimeClassPolicy:      allowList,
+				Engines:                 registryOf(t, tt.engines...),
 			}
 			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "spot-node-engine"}}); err != nil {
 				t.Fatalf("Reconcile: %v", err)
@@ -277,6 +497,9 @@ func TestNodePreemptionReconciler_UsesThePodEngine(t *testing.T) {
 				}
 				if got := jobs.Items[0].Annotations[util.AnnotationPodSnapshotPolicy]; got != tt.wantPolicy {
 					t.Errorf("job policy annotation = %q, want %q", got, tt.wantPolicy)
+				}
+				if got := jobs.Items[0].Annotations[engine.AnnotationEngine]; got != tt.wantEngine {
+					t.Errorf("job engine annotation = %q, want %q", got, tt.wantEngine)
 				}
 			}
 
@@ -324,38 +547,113 @@ func TestPodGateReconciler_RestoreOrdersComeFromTheEngine(t *testing.T) {
 			SnapshotRef: "snapshot-123",
 		},
 	}
-	orderer := &orderingEngine{routedEngine{name: "ordering"}}
-	plain := &routedEngine{name: "plain"}
+	// Both declare @default, the class of the test pod, so without routes
+	// the default engine serves it.
+	orderer := &orderingEngine{routedEngine{name: "ordering", classes: []string{"@default"}}}
+	plain := &routedEngine{name: "plain", classes: []string{"@default"}}
+	jobNaming := func(engineName string) *pmv1alpha1.PodMigrationJob {
+		job := restoringJob.DeepCopy()
+		job.Annotations = map[string]string{engine.AnnotationEngine: engineName}
+		return job
+	}
 
 	tests := []struct {
-		name            string
-		engine          engine.Engine
-		pod             *corev1.Pod
-		wantAnnotations map[string]string
+		name               string
+		engines            []engine.Engine // the first is the default
+		job                *pmv1alpha1.PodMigrationJob
+		podMigrationRoutes string // set: the namespace has a PodMigration with these routes
+		pod                *corev1.Pod
+		wantAnnotations    map[string]string
+		wantErr            bool // and the pod keeps its gate
 	}{
 		{
 			name:            "restore order from the job's engine",
-			engine:          orderer,
+			engines:         []engine.Engine{orderer},
 			pod:             newPod("pmj-test"),
 			wantAnnotations: map[string]string{routedRestoreAnnotation: "snapshot-123", util.AnnotationAssignedPMJ: "pmj-test"},
 		},
 		{
+			name:            "restore order from the engine the job names",
+			engines:         []engine.Engine{plain, orderer},
+			job:             jobNaming("ordering"),
+			pod:             newPod("pmj-test"),
+			wantAnnotations: map[string]string{routedRestoreAnnotation: "snapshot-123", util.AnnotationAssignedPMJ: "pmj-test"},
+		},
+		{
+			// Another engine's restore order would restore the wrong
+			// snapshot; the job reconciler fails the job.
+			name:            "no restore order for a job that names an unregistered engine",
+			engines:         []engine.Engine{orderer},
+			job:             jobNaming("missing"),
+			pod:             newPod("pmj-test"),
+			wantAnnotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-test"},
+			wantErr:         true,
+		},
+		{
 			name:            "cold-start bypass from the pod's engine",
-			engine:          orderer,
+			engines:         []engine.Engine{orderer},
 			pod:             newPod(""),
 			wantAnnotations: map[string]string{routedRestoreAnnotation: "none"},
 		},
 		{
+			name:               "cold-start bypass from the engine the namespace's PodMigration routes the pod to",
+			engines:            []engine.Engine{plain, orderer},
+			podMigrationRoutes: "@default=ordering",
+			pod:                newPod(""),
+			wantAnnotations:    map[string]string{routedRestoreAnnotation: "none"},
+		},
+		{
 			name:            "an engine without restore orders gets GKE Pod Snapshots' restore order",
-			engine:          plain,
+			engines:         []engine.Engine{plain},
 			pod:             newPod("pmj-test"),
 			wantAnnotations: map[string]string{"podsnapshot.gke.io/ps-name": "snapshot-123", util.AnnotationAssignedPMJ: "pmj-test"},
 		},
 		{
 			name:            "an engine without restore orders gets GKE Pod Snapshots' cold-start bypass",
-			engine:          plain,
+			engines:         []engine.Engine{plain},
 			pod:             newPod(""),
 			wantAnnotations: map[string]string{"podsnapshot.gke.io/ps-name": ""},
+		},
+		{
+			name:    "cold-start bypass preserves job engine bypass on route change (Failed job)",
+			engines: []engine.Engine{plain, orderer},
+			job: func() *pmv1alpha1.PodMigrationJob {
+				j := jobNaming("plain")
+				j.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+				j.Status.SnapshotRef = "snapshot-123"
+				return j
+			}(),
+			podMigrationRoutes: "@default=ordering",
+			pod:                newPod("pmj-test"),
+			wantAnnotations:    map[string]string{routedRestoreAnnotation: "none", "podsnapshot.gke.io/ps-name": ""},
+		},
+		{
+			name:    "cold-start bypass preserves job engine bypass on route change (SucceededWithoutRestore job)",
+			engines: []engine.Engine{plain, orderer},
+			job: func() *pmv1alpha1.PodMigrationJob {
+				j := jobNaming("plain")
+				j.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+				return j
+			}(),
+			podMigrationRoutes: "@default=ordering",
+			pod:                newPod("pmj-test"),
+			wantAnnotations:    map[string]string{routedRestoreAnnotation: "none", "podsnapshot.gke.io/ps-name": ""},
+		},
+		{
+			name:    "cold-start bypass preserves job engine bypass on route change (already-consumed job)",
+			engines: []engine.Engine{plain, orderer},
+			job: func() *pmv1alpha1.PodMigrationJob {
+				j := jobNaming("plain")
+				j.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+				j.Status.SnapshotRef = "snapshot-123"
+				j.Status.Consumed = true
+				j.Status.GateReleased = true
+				j.Status.RestoredPodUID = "other-pod-uid"
+				return j
+			}(),
+			podMigrationRoutes: "@default=ordering",
+			pod:                newPod("pmj-test"),
+			wantAnnotations:    map[string]string{routedRestoreAnnotation: "none", "podsnapshot.gke.io/ps-name": ""},
 		},
 	}
 	for _, tt := range tests {
@@ -363,17 +661,26 @@ func TestPodGateReconciler_RestoreOrdersComeFromTheEngine(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = corev1.AddToScheme(scheme)
 			_ = pmv1alpha1.AddToScheme(scheme)
+			job := tt.job
+			if job == nil {
+				job = restoringJob.DeepCopy()
+			}
+			objects := []client.Object{tt.pod, job}
+			if tt.podMigrationRoutes != "" {
+				objects = append(objects, podMigrationWithRoutes("default", tt.podMigrationRoutes))
+			}
 			c := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 				WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-				WithObjects(tt.pod, restoringJob.DeepCopy()).
+				WithObjects(objects...).
 				Build()
 
-			r := &PodGateReconciler{Client: c, Scheme: scheme, Engines: registryOf(t, tt.engine)}
-			if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "replacement"}}); err != nil {
-				t.Fatalf("Reconcile: %v", err)
+			r := &PodGateReconciler{Client: c, Scheme: scheme, Engines: registryOf(t, tt.engines...)}
+			_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "replacement"}})
+			if gotErr := err != nil; gotErr != tt.wantErr {
+				t.Fatalf("Reconcile error = %v, want error: %t", err, tt.wantErr)
 			}
 
 			got := &corev1.Pod{}
@@ -383,8 +690,8 @@ func TestPodGateReconciler_RestoreOrdersComeFromTheEngine(t *testing.T) {
 			if !reflect.DeepEqual(got.Annotations, tt.wantAnnotations) {
 				t.Errorf("annotations = %v, want %v", got.Annotations, tt.wantAnnotations)
 			}
-			if podHasMigrationGate(got) {
-				t.Errorf("the migration gate is still on the pod")
+			if gated := podHasMigrationGate(got); gated != tt.wantErr {
+				t.Errorf("the pod's migration gate is there: %t, want %t", gated, tt.wantErr)
 			}
 		})
 	}
