@@ -2,10 +2,8 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 )
 
@@ -33,7 +32,7 @@ import (
 // cleaned up when the PodMigration CR is deleted.
 const (
 	StorageCleanupFinalizer                = "podmigration.gke.io/storage-cleanup"
-	OwnerUIDLabelKey                       = "podmigration.gke.io/owner-uid"
+	OwnerUIDLabelKey                       = engine.OwnerUIDLabel
 	ReasonDuplicatePodMigrationInNamespace = "DuplicatePodMigrationInNamespace"
 	maxDeletionDeferral                    = 10 * time.Minute
 )
@@ -44,6 +43,21 @@ type PodMigrationReconciler struct {
 	Scheme          *runtime.Scheme
 	Recorder        record.EventRecorder
 	InvariantEngine *invariants.Engine
+
+	// Engines provides the snapshot engine whose policy and storage objects
+	// a PodMigration's namespace gets. Optional: nil selects GKE Pod
+	// Snapshots, built from Client and Scheme. Overridden in tests.
+	Engines *engine.Registry
+}
+
+// namespaceEngine returns the engine that renders a PodMigration's policy
+// and storage objects: the default engine, until a PodMigration can choose
+// engines (#80).
+func (r *PodMigrationReconciler) namespaceEngine() (engine.Engine, error) {
+	if r.Engines != nil {
+		return r.Engines.Default()
+	}
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, nil), nil
 }
 
 func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config *pmv1alpha1.PodMigration, reconcileErr *error) {
@@ -231,102 +245,38 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	// Parse bucket and path from GCS URL (gs://bucket/path)
-	location := config.Spec.Storage.Location
-	if !strings.HasPrefix(location, "gs://") {
-		err := fmt.Errorf("invalid GCS location: %s (must start with gs://)", location)
-		meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			Reason:             "InvalidStorageLocation",
-			Message:            err.Error(),
-			ObservedGeneration: config.Generation,
-		})
-		if updateErr := r.Status().Update(ctx, config); updateErr != nil {
-			logger.Error(updateErr, "Failed to update status on invalid storage location")
+	// Render the engine's policy and storage objects and sync them in order.
+	// For GKE Pod Snapshots that's the cluster-scoped PodSnapshotStorageConfig,
+	// then the manual PodSnapshotPolicy that uses it.
+	eng, err := r.namespaceEngine()
+	if err != nil {
+		logger.Error(err, "No snapshot engine to render the namespace resources")
+		return ctrl.Result{}, err
+	}
+	resources, err := eng.NamespaceResources(config)
+	if err != nil {
+		var locationErr *engine.StorageLocationError
+		if errors.As(err, &locationErr) {
+			meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "InvalidStorageLocation",
+				Message:            err.Error(),
+				ObservedGeneration: config.Generation,
+			})
+			if updateErr := r.Status().Update(ctx, config); updateErr != nil {
+				logger.Error(updateErr, "Failed to update status on invalid storage location")
+			}
 		}
 		return ctrl.Result{}, err
 	}
-	urlStr := strings.TrimPrefix(location, "gs://")
-	parts := strings.SplitN(urlStr, "/", 2)
-	bucketName := parts[0]
-	pathPrefix := ""
-	if len(parts) > 1 {
-		pathPrefix = parts[1]
-	}
 
-	// Hash-based unique name for cluster-scoped PSSC to prevent namespace conflicts
-	psscName := getPSSCName(req.Namespace, req.Name)
-
-	// 1. Reconcile PodSnapshotStorageConfig (Cluster-scoped)
-	pssc := &unstructured.Unstructured{}
-	pssc.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotStorageConfig",
-	})
-	pssc.SetName(psscName)
-	labels := pssc.GetLabels()
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	labels[OwnerUIDLabelKey] = string(config.UID)
-	pssc.SetLabels(labels)
-
-	gcsConfig := map[string]interface{}{
-		"bucket": bucketName,
-	}
-	if pathPrefix != "" {
-		gcsConfig["path"] = pathPrefix
-	}
-
-	pssc.Object["spec"] = map[string]interface{}{
-		"snapshotStorageConfig": map[string]interface{}{
-			"gcs": gcsConfig,
-		},
-	}
-
-	logger.Info("Syncing PodSnapshotStorageConfig", "name", psscName)
-	err = r.syncResource(ctx, pssc)
-	if err != nil {
-		logger.Error(err, "Failed to sync PodSnapshotStorageConfig")
-		return ctrl.Result{}, err
-	}
-
-	// 2. Reconcile PodSnapshotPolicy for manual (Namespaced)
-	pspManualName := getPSPManualName(req.Name)
-	pspManual := &unstructured.Unstructured{}
-	pspManual.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotPolicy",
-	})
-	pspManual.SetName(pspManualName)
-	pspManual.SetNamespace(req.Namespace)
-
-	specPayloadManual := map[string]interface{}{
-		"storageConfigName": psscName,
-		"selector": map[string]interface{}{
-			"matchExpressions": []interface{}{
-				map[string]interface{}{
-					"key":      "pod-migration.gke.io/enabled",
-					"operator": "In",
-					"values":   []interface{}{"true"},
-				},
-			},
-		},
-		"triggerConfig": map[string]interface{}{
-			"type":           "manual",
-			"postCheckpoint": "stop",
-		},
-	}
-	pspManual.Object["spec"] = specPayloadManual
-
-	logger.Info("Syncing PodSnapshotPolicy (manual)", "name", pspManualName, "namespace", req.Namespace)
-	err = r.syncResource(ctx, pspManual)
-	if err != nil {
-		logger.Error(err, "Failed to sync PodSnapshotPolicy (manual)")
-		return ctrl.Result{}, err
+	for _, desired := range resources {
+		logger.Info("Syncing "+desired.GetKind(), "engine", eng.Name(), "name", desired.GetName(), "namespace", desired.GetNamespace())
+		if err := r.syncResource(ctx, desired); err != nil {
+			logger.Error(err, "Failed to sync "+desired.GetKind(), "engine", eng.Name(), "name", desired.GetName())
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Set status condition to Ready
@@ -346,14 +296,14 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
+// getPSSCName names a PodMigration's cluster-scoped PodSnapshotStorageConfig.
 func getPSSCName(namespace, name string) string {
-	h := sha256.New()
-	h.Write([]byte(fmt.Sprintf("%s/%s", namespace, name)))
-	return fmt.Sprintf("pssc-%s", hex.EncodeToString(h.Sum(nil))[:16])
+	return engine.PodSnapshotStorageConfigName(namespace, name)
 }
 
+// getPSPManualName names a PodMigration's PodSnapshotPolicy.
 func getPSPManualName(name string) string {
-	return fmt.Sprintf("psp-%s-manual", name)
+	return engine.PodSnapshotPolicyName(name)
 }
 
 func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, namespace, name string, expectedOwnerUID types.UID) error {
