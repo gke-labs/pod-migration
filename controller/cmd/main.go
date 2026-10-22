@@ -85,6 +85,8 @@ func main() {
 		invariantModeRaw     string
 		spotPreemptionBudget int64
 		runtimeClassesRaw    string
+		fenceCap             time.Duration
+		fenceLateStopWatch   time.Duration
 		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -97,6 +99,8 @@ func main() {
 	flag.StringVar(&invariantModeRaw, "invariant-mode", string(invariants.ModeDisabled), "Correctness invariant evaluation mode: disabled (default), observe, or strict (CI gate). Enabling observe/strict adds one informer namespace List of Pods and PMJs per PodMigrationJob reconcile.")
 	flag.Int64Var(&spotPreemptionBudget, "spot-preemption-node-budget", util.DefaultSpotPreemptionNodeBudget, "Total memory request budget in bytes per node for spot preemption migrations (default 15GiB)")
 	flag.StringVar(&runtimeClassesRaw, "migratable-runtime-classes", eligibility.DefaultMigratableRuntimeClasses, "Comma-separated RuntimeClass names whose pods are migrated on eviction; "+eligibility.DefaultRuntimeClassToken+" matches pods without a runtimeClassName. List only classes the installed snapshot engine supports.")
+	flag.DurationVar(&fenceCap, "fence-pre-checkpoint-cap", controller.DefaultFencePreCheckpointCap, "How long a fenced migration source waits for its checkpoint trigger while creating it fails with retryable errors; then the migration fails")
+	flag.DurationVar(&fenceLateStopWatch, "fence-late-stop-watch", controller.DefaultFenceLateStopWatch, "How long the controller watches a source that a failed migration returned to service, to fence and evict it again if the snapshot engine stops it anyway")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -214,6 +218,8 @@ func main() {
 		DefaultMigrationTimeout: migrationTimeout,
 		InvariantEngine:         invariantEngine,
 		BudgetChecker:           controller.EvictionBudgetChecker{Client: mgr.GetClient()},
+		FencePreCheckpointCap:   fenceCap,
+		FenceLateStopWatch:      fenceLateStopWatch,
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)

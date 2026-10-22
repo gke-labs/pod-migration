@@ -22,17 +22,43 @@ The controller is implemented as a custom Operator consisting of the following c
 - **Eviction Interception Webhook (`/validate-v1-pod-eviction`)**: Handled by `EvictionGate`. Intercepts Pod eviction API calls. If the Pod is opted-in (`pod-migration.gke.io/enabled: "true"`), it denies the eviction request with `429 (Too Many Requests)` to block immediate destruction, and spawns a `PodMigrationJob` (PMJ) CR to orchestrate the migration flow.
 - **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods, it injects the `gke.io/pod-migration-gate` scheduling gate to hold the pod in a pending state until volume detachment is complete, preventing replica collisions.
 - **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Handled by `PodStatusMutator`. Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
-- **Fence Webhook (`/mutate-v1-pod-fence`)**: Handled by `PodFenceMutator`. Intercepts status updates of Pods labeled `pod-migration.gke.io/fenced: "true"` and holds their `Ready` condition at `False` (reason `PodMigrationFenced`), so a fenced migration source stays out of its Services' endpoints (#131). The other conditions, including `ContainersReady`, keep the kubelet's view. It uses `failurePolicy: Fail`: while the webhook is down, a fenced Pod's status writes are rejected, so it stays NotReady. Pods without the label never reach it.
+- **Fence Webhook (`/mutate-v1-pod-fence`)**: Handled by `PodFenceMutator`. Intercepts status updates of Pods labeled `pod-migration.gke.io/fenced: "true"` and holds their `Ready` condition at `False` (reason `PodMigrationFenced`), so a fenced migration source stays out of its Services' endpoints (#131). The other conditions, including `ContainersReady`, keep the kubelet's view. It uses `failurePolicy: Fail`: while the webhook is down, a fenced Pod's status writes are rejected, so it stays NotReady, and it can't finish deleting either, because the kubelet writes a Pod's final status before the Pod is removed. That heals when the webhook is back. Pods without the label never reach it. See [Source fence](#3-source-fence).
 
 ### 2. Reconcilers
 - **`PodMigration` (Config) Reconciler**: Watches `PodMigration` resources. It automatically provisions the required GKE `PodSnapshotStorageConfig` (PSSC) and manual `PodSnapshotPolicy` (PSP) resources with `postCheckpoint: stop` in the target namespace.
 - **`PodMigrationJob` (Execution) Reconciler**: Coordinates the active migration loop:
-  1. Creates a `PodSnapshotManualTrigger` (PSMT) targeting the source Pod to initiate snapshotting and container termination.
+  1. Fences the source Pod (see [Source fence](#3-source-fence)), then creates a `PodSnapshotManualTrigger` (PSMT) targeting it to initiate snapshotting and container termination.
   2. Monitors the resulting `PodSnapshot` until it becomes `Ready` (uploaded to GCS).
   3. Transitions the job to `Evicting` phase, which signals the Eviction Webhook that it is safe to allow the source Pod deletion.
   4. Waits for the source Pod to be deleted and its volumes to fully detach from the GCE node.
   5. Transitions the job to `Succeeded`, signaling the Pod Gate Reconciler that it is safe to release the replacement Pod.
 - **Pod Gate Reconciler**: Monitors replacement Pods injected with the `gke.io/pod-migration-gate` scheduling gate. It holds them in a pending state and releases the gate only after the matched `PodMigrationJob` reaches `Succeeded` (confirming snapshot readiness and volume detachment), then injects the GKE snapshot name annotation to force restore, and removes the scheduling gate to allow startup. It bypasses gate injection for normal scale-up pods.
+
+### 3. Source Fence
+
+After GKE Pod Snapshots checkpoints the source Pod, it stops it, and the kubelet restarts it in a new sandbox. That instance starts cold, so if its Services still sent it traffic, it would serve without the checkpointed state, and the writes it acknowledged would be lost (#131). So right before the checkpoint trigger, after the [budget check](#poddisruptionbudgets-and-single-replica-minavailable1-workloads), the controller fences the source:
+
+1. It records condition `SourceFenced=True` (reason `Fenced`) on the job.
+2. It labels the Pod `pod-migration.gke.io/fenced: "true"`, then sets its `Ready` condition to `False` (reason `PodMigrationFenced`) through `pods/status`. From then on the fence webhook holds `Ready` at `False`, so the Pod leaves its Services' endpoints and doesn't come back, even after the restart.
+3. It records the Pod's container IDs and restart counts on the job (annotation `pod-migration.gke.io/fence-baseline`), and emits a `SourceFenced` event. Only then does it create the trigger.
+
+A successful migration deletes the source, and the label goes with it. When a migration fails, the controller decides what happens to the fenced source:
+
+| Situation | What the controller does |
+|---|---|
+| The budget check refused the disruption | Nothing: the source was never fenced. |
+| The trigger was rejected (forbidden, invalid, denied by admission) | The job fails with reason `TriggerCreateFailed`. Nothing was checkpointed, so the source is unfenced (next row). |
+| Creating the trigger fails with retryable errors | Retried for up to `--fence-pre-checkpoint-cap` (default 30 s); then the job fails with reason `FenceCapExceeded`, and the next row applies. |
+| Any other failure (snapshot failure, timeout, strict-mode invariant failure) | The trigger is deleted, and the controller waits up to 30 s for the snapshot to finish or go away. If the snapshot never completed its checkpoint, and the source still runs the containers it was fenced with, the source can't have stopped: the controller sets `SourceFenced=False` (reason `Unfenced`), removes the label, and emits `SourceUnfenced`. The kubelet's next status write, within about 10 s, sets `Ready` again. |
+| Otherwise (the checkpoint completed, a container changed or restarted, or the snapshot didn't finish in time) | The source stays fenced (`SourceFenced=True`, reason `FenceKept`, Warning event `SourceKeptFenced`), and the controller evicts it, honouring its PodDisruptionBudgets and its grace period, so that its workload controller replaces it. A Pod without a controller isn't evicted, because nothing would replace it: delete it to release it. |
+| A source returned to service stops anyway | For `--fence-late-stop-watch` (default 5 min) after an unfence, the controller checks the source's containers. If they change, it fences the source again (Warning event `SourceRefencedLateStop`) and evicts it. |
+
+Notes:
+- The webhook must be installed: the controller only sets `Ready` to `False` once, and without the webhook the kubelet's next status write sets it back.
+- A fenced source counts as unhealthy for its PodDisruptionBudgets, so the budget checks of its siblings see the smaller budget.
+- The fence covers Service endpoints only. Services with `publishNotReadyAddresses: true`, clients that connect to the Pod IP directly, and the restarted instance's own outbound work and volume writes aren't fenced.
+- A job that's deleted while it's active leaves its source fenced. Delete the Pod, or remove the label if you know its checkpoint never ran.
+- The fence needs RBAC on `pods/status` (`get`, `patch`), which `deploy.yaml` grants.
 
 ---
 
@@ -416,6 +442,8 @@ The controller registers Prometheus metrics on the standard controller-runtime m
 | `pod_migration_phase_duration_seconds` | Histogram | `phase` (`pending`, `snapshotting`, `evicting`, `restoring`) | Latency distribution of individual migration phases. |
 | `pod_migration_restore_crash_fallback_total` | Counter | None | Total cold-start fallbacks triggered by matched gVisor/OCI restore crashes. |
 | `pod_migration_restore_crash_unmatched_total` | Counter | None | Total unrecognised StartError restore-pod crashes with no known signature. |
+| `pod_migration_source_fence_total` | Counter | `action` (`fenced`, `unfenced`, `kept`, `refenced`) | Fence actions on migration sources (see [Source fence](#3-source-fence)). |
+| `pod_migration_source_fenced_seconds` | Histogram | `outcome` (`migrated`, `unfenced`) | Time a source spent fenced: until the migration moved on to restoring, or until a failed migration returned it to service. |
 
 ### High Availability (HA) Scraping Considerations
 

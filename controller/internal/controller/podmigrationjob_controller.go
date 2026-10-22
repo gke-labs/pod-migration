@@ -67,11 +67,14 @@ const (
 // requests when it evicts the origin pod after its snapshot is durable, or
 // shortens the termination of an origin pod that an external evictor already
 // started deleting. By then the authoritative workload state lives in the
-// snapshot and the checkpointed sandbox has stopped: anything kubelet restarted
-// in the origin pod (restartPolicy: Always) is an empty cold instance. Honouring
-// the pod's full terminationGracePeriodSeconds for it only delays Restoring,
-// which waits for the origin pod to be gone. 1s keeps the deletion graceful;
-// 0 would force-delete the API object before kubelet confirms the sandbox is gone.
+// snapshot and the checkpointed sandbox has stopped. What the kubelet restarted
+// in the origin pod (restartPolicy: Always) isn't inert: it runs the workload
+// from scratch, without that state. The fence keeps it out of its Services'
+// endpoints (#131), but not its outbound work or its writes to volumes, so the
+// sooner it's gone the better. Its full terminationGracePeriodSeconds would
+// also delay Restoring, which waits for the origin pod to be gone. 1s keeps the
+// deletion graceful; 0 would force-delete the API object before kubelet
+// confirms the sandbox is gone.
 const postCheckpointEvictionGracePeriodSeconds int64 = 1
 
 // newPostCheckpointEviction builds the PDB-safe eviction for a checkpointed origin pod.
