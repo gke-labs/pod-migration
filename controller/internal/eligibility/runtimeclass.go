@@ -77,6 +77,13 @@ func (p *RuntimeClassPolicy) Allows(runtimeClassName *string) bool {
 // String returns the policy in flag syntax: sorted class names, then @default
 // if it is allowed.
 func (p *RuntimeClassPolicy) String() string {
+	return strings.Join(p.Classes(), ",")
+}
+
+// Classes returns the runtime classes the policy allows, in String's order:
+// sorted class names, then DefaultRuntimeClassToken if pods without a runtime
+// class are allowed.
+func (p *RuntimeClassPolicy) Classes() []string {
 	if p == nil {
 		p = defaultPolicy
 	}
@@ -88,7 +95,7 @@ func (p *RuntimeClassPolicy) String() string {
 	if p.allowDefault {
 		out = append(out, DefaultRuntimeClassToken)
 	}
-	return strings.Join(out, ",")
+	return out
 }
 
 // RuntimeClassLabel renders a pod's spec.runtimeClassName for logs and

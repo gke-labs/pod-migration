@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,16 +26,33 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 // StorageCleanupFinalizer is the finalizer added to PodMigration resources
 // to ensure cluster-scoped PodSnapshotStorageConfig and associated policies are
 // cleaned up when the PodMigration CR is deleted.
 const (
-	StorageCleanupFinalizer                = "podmigration.gke.io/storage-cleanup"
+	StorageCleanupFinalizer                = util.StorageCleanupFinalizer
 	OwnerUIDLabelKey                       = engine.OwnerUIDLabel
 	ReasonDuplicatePodMigrationInNamespace = "DuplicatePodMigrationInNamespace"
 	maxDeletionDeferral                    = 10 * time.Minute
+)
+
+const (
+	// ConditionEngineRoutesValid reports whether the runtime-class routes
+	// of a PodMigration (engine.AnnotationRuntimeClassEngines) are valid.
+	// It's set only while the PodMigration has the annotation.
+	ConditionEngineRoutesValid = "EngineRoutesValid"
+
+	// ReasonEngineRoutesValid: every route parses and names a registered
+	// engine.
+	ReasonEngineRoutesValid = "RoutesValid"
+	// ReasonInvalidEngineRoutes: the routes don't parse, and are ignored.
+	ReasonInvalidEngineRoutes = "InvalidRoutes"
+	// ReasonEngineNotRegistered: a route, or a PodMigrationJob, names an
+	// engine that the controller doesn't register.
+	ReasonEngineNotRegistered = "EngineNotRegistered"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object.
@@ -44,20 +62,48 @@ type PodMigrationReconciler struct {
 	Recorder        record.EventRecorder
 	InvariantEngine *invariants.Engine
 
-	// Engines provides the snapshot engine whose policy and storage objects
-	// a PodMigration's namespace gets. Optional: nil selects GKE Pod
-	// Snapshots, built from Client and Scheme. Overridden in tests.
+	// Engines provides the snapshot engines whose policy and storage
+	// objects a PodMigration's namespace gets: those that serve a runtime
+	// class there. Optional: nil selects GKE Pod Snapshots for gVisor pods,
+	// built from Client and Scheme. Overridden in tests.
 	Engines *engine.Registry
 }
 
-// namespaceEngine returns the engine that renders a PodMigration's policy
-// and storage objects: the default engine, until a PodMigration can choose
-// engines (#80).
-func (r *PodMigrationReconciler) namespaceEngine() (engine.Engine, error) {
+// engines returns the registry that serves the reconciler: Engines, or the
+// registry of a stock deployment.
+func (r *PodMigrationReconciler) engines() (*engine.Registry, error) {
 	if r.Engines != nil {
-		return r.Engines.Default()
+		return r.Engines, nil
 	}
-	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, nil), nil
+	return engine.NewDefaultRegistry(r.Client, r.Scheme, nil)
+}
+
+// setEngineRoutesCondition reports on config whether its
+// engine.AnnotationRuntimeClassEngines routes are valid. Without the
+// annotation, the condition is removed.
+func setEngineRoutesCondition(config *pmv1alpha1.PodMigration, registry *engine.Registry) {
+	if strings.TrimSpace(config.Annotations[engine.AnnotationRuntimeClassEngines]) == "" {
+		meta.RemoveStatusCondition(&config.Status.Conditions, ConditionEngineRoutesValid)
+		return
+	}
+	cond := metav1.Condition{
+		Type:               ConditionEngineRoutesValid,
+		Status:             metav1.ConditionTrue,
+		Reason:             ReasonEngineRoutesValid,
+		ObservedGeneration: config.Generation,
+	}
+	routes, err := registry.PodMigrationRoutes(config)
+	switch {
+	case errors.Is(err, engine.ErrEngineNotRegistered):
+		cond.Status, cond.Reason = metav1.ConditionFalse, ReasonEngineNotRegistered
+		cond.Message = err.Error() + "; that route is ignored"
+	case err != nil:
+		cond.Status, cond.Reason = metav1.ConditionFalse, ReasonInvalidEngineRoutes
+		cond.Message = err.Error() + "; the annotation is ignored"
+	default:
+		cond.Message = "Runtime class routes: " + routes.String()
+	}
+	meta.SetStatusCondition(&config.Status.Conditions, cond)
 }
 
 func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config *pmv1alpha1.PodMigration, reconcileErr *error) {
@@ -148,7 +194,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			}
 
 			logger.Info("Cleaning up storage config and policy before deletion", "name", config.Name, "namespace", config.Namespace)
-			if err := r.deleteStorageResources(ctx, req.Namespace, req.Name, config.UID); err != nil {
+			if err := r.deleteNamespaceResources(ctx, config); err != nil {
 				logger.Error(err, "Failed to clean up storage resources during finalization")
 				return ctrl.Result{}, err
 			}
@@ -200,7 +246,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				}
 			}
 			if !deferCleanup {
-				if err := r.deleteStorageResources(ctx, req.Namespace, req.Name, config.UID); err != nil {
+				if err := r.deleteNamespaceResources(ctx, config); err != nil {
 					logger.Error(err, "Failed to clean up storage resources on duplicate PodMigration")
 					return ctrl.Result{}, err
 				}
@@ -245,37 +291,53 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	// Render the engine's policy and storage objects and sync them in order.
-	// For GKE Pod Snapshots that's the cluster-scoped PodSnapshotStorageConfig,
-	// then the manual PodSnapshotPolicy that uses it.
-	eng, err := r.namespaceEngine()
+	// Render the policy and storage objects of every engine that serves a
+	// runtime class in the namespace, and sync each engine's objects in
+	// order. For GKE Pod Snapshots that's the cluster-scoped
+	// PodSnapshotStorageConfig, then the manual PodSnapshotPolicy that uses
+	// it.
+	registry, err := r.engines()
 	if err != nil {
+		logger.Error(err, "No snapshot engine registry to render the namespace resources")
+		return ctrl.Result{}, err
+	}
+	setEngineRoutesCondition(config, registry)
+	engines := registry.EnginesFor(config)
+	if len(engines) == 0 {
+		// EnginesFor falls back to the default engine, so that isn't
+		// registered.
+		err := errors.New("no snapshot engine serves the namespace")
+		if _, defaultErr := registry.Default(); defaultErr != nil {
+			err = defaultErr
+		}
 		logger.Error(err, "No snapshot engine to render the namespace resources")
 		return ctrl.Result{}, err
 	}
-	resources, err := eng.NamespaceResources(config)
-	if err != nil {
-		var locationErr *engine.StorageLocationError
-		if errors.As(err, &locationErr) {
-			meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				Reason:             "InvalidStorageLocation",
-				Message:            err.Error(),
-				ObservedGeneration: config.Generation,
-			})
-			if updateErr := r.Status().Update(ctx, config); updateErr != nil {
-				logger.Error(updateErr, "Failed to update status on invalid storage location")
+	for _, eng := range engines {
+		resources, err := eng.NamespaceResources(config)
+		if err != nil {
+			var locationErr *engine.StorageLocationError
+			if errors.As(err, &locationErr) {
+				meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "InvalidStorageLocation",
+					Message:            err.Error(),
+					ObservedGeneration: config.Generation,
+				})
+				if updateErr := r.Status().Update(ctx, config); updateErr != nil {
+					logger.Error(updateErr, "Failed to update status on invalid storage location")
+				}
 			}
-		}
-		return ctrl.Result{}, err
-	}
-
-	for _, desired := range resources {
-		logger.Info("Syncing "+desired.GetKind(), "engine", eng.Name(), "name", desired.GetName(), "namespace", desired.GetNamespace())
-		if err := r.syncResource(ctx, desired); err != nil {
-			logger.Error(err, "Failed to sync "+desired.GetKind(), "engine", eng.Name(), "name", desired.GetName())
 			return ctrl.Result{}, err
+		}
+
+		for _, desired := range resources {
+			logger.Info("Syncing "+desired.GetKind(), "engine", eng.Name(), "name", desired.GetName(), "namespace", desired.GetNamespace())
+			if err := r.syncResource(ctx, desired); err != nil {
+				logger.Error(err, "Failed to sync "+desired.GetKind(), "engine", eng.Name(), "name", desired.GetName())
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
@@ -304,6 +366,72 @@ func getPSSCName(namespace, name string) string {
 // getPSPManualName names a PodMigration's PodSnapshotPolicy.
 func getPSPManualName(name string) string {
 	return engine.PodSnapshotPolicyName(name)
+}
+
+// deleteNamespaceResources deletes the policy and storage objects that the
+// engines rendered for config.
+func (r *PodMigrationReconciler) deleteNamespaceResources(ctx context.Context, config *pmv1alpha1.PodMigration) error {
+	if err := r.deleteStorageResources(ctx, config.Namespace, config.Name, config.UID); err != nil {
+		return err
+	}
+	return r.deleteEngineResources(ctx, config)
+}
+
+// deleteEngineResources deletes the objects that engines other than GKE Pod
+// Snapshots rendered for config; deleteStorageResources deletes GKE Pod
+// Snapshots' objects. Routes can change after objects were synced, so it
+// renders the objects of every registered engine, skipping an engine that
+// can't render them, and deletes those that exist, in reverse sync order.
+// An object labeled as rendered for another PodMigration (OwnerUIDLabel) is
+// kept.
+func (r *PodMigrationReconciler) deleteEngineResources(ctx context.Context, config *pmv1alpha1.PodMigration) error {
+	if r.Engines == nil {
+		return nil
+	}
+	for _, name := range r.Engines.Names() {
+		eng, ok := r.Engines.Get(name)
+		if !ok {
+			continue
+		}
+		if _, isGKE := eng.(*engine.GKEPodSnapshots); isGKE {
+			continue
+		}
+		resources, err := eng.NamespaceResources(config)
+		if err != nil {
+			log.FromContext(ctx).Info("Not cleaning up an engine's objects: it can't render them",
+				"engine", name, "error", err.Error())
+			continue
+		}
+		for i := len(resources) - 1; i >= 0; i-- {
+			if err := r.deleteOwnedResource(ctx, resources[i], config.UID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// deleteOwnedResource deletes the live object that rendered names, unless
+// its OwnerUIDLabel names a PodMigration other than ownerUID. A missing
+// object or kind is already deleted.
+func (r *PodMigrationReconciler) deleteOwnedResource(ctx context.Context, rendered *unstructured.Unstructured, ownerUID types.UID) error {
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(rendered.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(rendered), live); err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get %s %s: %w", rendered.GetKind(), rendered.GetName(), err)
+	}
+	if owner := live.GetLabels()[OwnerUIDLabelKey]; owner != "" && ownerUID != "" && owner != string(ownerUID) {
+		log.FromContext(ctx).Info("Skipping deletion: owner-uid does not match (recreated by another PodMigration)",
+			"kind", rendered.GetKind(), "name", rendered.GetName(), "expectedUID", ownerUID, "actualUID", owner)
+		return nil
+	}
+	if err := r.Delete(ctx, live); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete %s %s: %w", rendered.GetKind(), rendered.GetName(), err)
+	}
+	return nil
 }
 
 func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, namespace, name string, expectedOwnerUID types.UID) error {
@@ -451,40 +579,9 @@ func (r *PodMigrationReconciler) syncResource(ctx context.Context, desired *unst
 }
 
 // selectActivePodMigration deterministically elects the single active PodMigration
-// CR in a namespace:
-//  1. If any deleting PodMigration still holds StorageCleanupFinalizer, its
-//     PodSnapshotPolicy is still present in the namespace, so it remains the
-//     active owner until finalization completes.
-//  2. Otherwise, the non-deleting PodMigration with the oldest CreationTimestamp
-//     (tie-broken by lexicographically smallest metadata.name) wins.
+// CR in a namespace; see util.SelectActivePodMigration.
 func selectActivePodMigration(items []pmv1alpha1.PodMigration) *pmv1alpha1.PodMigration {
-	var deletingWithFinalizer *pmv1alpha1.PodMigration
-	var active *pmv1alpha1.PodMigration
-	for i := range items {
-		candidate := &items[i]
-		if !candidate.DeletionTimestamp.IsZero() {
-			if controllerutil.ContainsFinalizer(candidate, StorageCleanupFinalizer) {
-				if deletingWithFinalizer == nil || podMigrationPrecedes(candidate, deletingWithFinalizer) {
-					deletingWithFinalizer = candidate
-				}
-			}
-			continue
-		}
-		if active == nil || podMigrationPrecedes(candidate, active) {
-			active = candidate
-		}
-	}
-	if deletingWithFinalizer != nil {
-		return deletingWithFinalizer
-	}
-	return active
-}
-
-func podMigrationPrecedes(a, b *pmv1alpha1.PodMigration) bool {
-	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
-		return a.CreationTimestamp.Before(&b.CreationTimestamp)
-	}
-	return a.Name < b.Name
+	return util.SelectActivePodMigration(items)
 }
 
 func (r *PodMigrationReconciler) enqueueNamespacePeers(ctx context.Context, obj client.Object) []reconcile.Request {

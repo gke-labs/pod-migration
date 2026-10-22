@@ -35,8 +35,9 @@ var (
 	})
 
 	// OutcomesTotal counts completed pod migration jobs by outcome label.
-	// Outcomes: succeeded | failed | timeout | budget_timeout | fallback | succeeded_without_restore
-	// (budget_timeout: timed out waiting in Pending for the PodDisruptionBudget, with nothing checkpointed)
+	// Outcomes: succeeded | failed | timeout | budget_timeout | fallback | succeeded_without_restore | engine_not_registered
+	// (budget_timeout: timed out waiting in Pending for the PodDisruptionBudget, with nothing checkpointed;
+	// engine_not_registered: the job names a snapshot engine that the controller doesn't register)
 	OutcomesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_outcomes_total",
 		Help: "Total number of completed pod migration jobs by outcome.",
