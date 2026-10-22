@@ -507,6 +507,7 @@ func TestInvariants_I8_PlatformAndControlPlaneIsolation(t *testing.T) {
 }
 
 func TestInvariants_I9_DeterministicFallbackOverCrashloop_LiveClassifier(t *testing.T) {
+	gvisor := "gvisor"
 	vs := EvaluateI9(&ReconcileSnapshot{
 		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-crash"},
@@ -523,6 +524,7 @@ func TestInvariants_I9_DeterministicFallbackOverCrashloop_LiveClassifier(t *test
 					Name:      "crash-pod",
 					UID:       types.UID("crash-uid-1"),
 				},
+				Spec: corev1.PodSpec{RuntimeClassName: &gvisor},
 				Status: corev1.PodStatus{
 					ContainerStatuses: []corev1.ContainerStatus{
 						{
@@ -542,6 +544,50 @@ func TestInvariants_I9_DeterministicFallbackOverCrashloop_LiveClassifier(t *test
 	})
 	if len(vs) != 1 || vs[0].InvariantID != "I9" {
 		t.Fatalf("expected live I9 violation when restore.Classify detects StartError/128 restore crash, got %+v", vs)
+	}
+}
+
+// A runc replacement's start failure with the same wording isn't a gVisor
+// restore crash: restore.Classify leaves it unrecognized, so I9 doesn't count
+// it as a matched crash (#132).
+func TestInvariants_I9_LiveClassifierIgnoresOtherRuntimeClasses(t *testing.T) {
+	runc := "runc"
+	vs := EvaluateI9(&ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-crash"},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+				RestoredPodName: "crash-pod",
+				RestoredPodUID:  "crash-uid-1",
+			},
+		},
+		NamespacePods: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "crash-pod",
+					UID:       types.UID("crash-uid-1"),
+				},
+				Spec: corev1.PodSpec{RuntimeClassName: &runc},
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "app",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									ExitCode: 128,
+									Reason:   "StartError",
+									Message:  "failed to start containerd task: OCI runtime restore failed: bad image",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if len(vs) != 0 {
+		t.Fatalf("expected no I9 violation for a runc replacement, got %+v", vs)
 	}
 }
 

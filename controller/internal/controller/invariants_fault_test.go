@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -865,7 +866,13 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			InvariantEngine: engine,
 		}
 
-		// Subcase A: Fatal StartError (exit 128) restore crash
+		// Subcase A: Fatal StartError (exit 128) restore crash. The replacement
+		// is a gVisor pod: gVisor restore-crash signatures classify only gVisor
+		// pods (#132).
+		gvisorRuntimeClass := &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "gvisor"}, Handler: "runsc"}
+		if err := k8sClient.Create(ctx, gvisorRuntimeClass); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("create RuntimeClass gvisor: %v", err)
+		}
 		crashedPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: ns,
@@ -876,7 +883,8 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 				},
 			},
 			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+				RuntimeClassName: &gvisorRuntimeClass.Name,
+				Containers:       []corev1.Container{{Name: "app", Image: "busybox"}},
 			},
 		}
 		if err := k8sClient.Create(ctx, crashedPod); err != nil {
