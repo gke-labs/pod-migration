@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -795,5 +796,33 @@ func TestFenceBaselineUnchanged(t *testing.T) {
 	b, recorded := jobFenceBaseline(job)
 	if ok, _ := b.unchanged(fenceTestSource(fenceTestCID, 0)); !recorded || ok {
 		t.Errorf("unparseable baseline: recorded %t, matches %t; want recorded, no match", recorded, ok)
+	}
+}
+
+// TestFenceSource_SatisfiesI11: I11 (SourceFencedAfterCheckpoint) holds for a
+// source the controller fenced, and fires once the label is gone, so the rule
+// and the fence agree on the names they share.
+func TestFenceSource_SatisfiesI11(t *testing.T) {
+	f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSource(fenceTestCID, 0), fenceTestSnapshottingJob())
+	if _, err := f.reconcile(t); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	job, pod := f.job(t), f.pod(t)
+	// Evaluate past I11's grace window.
+	snapshotAt := func(p *corev1.Pod) *invariants.ReconcileSnapshot {
+		return &invariants.ReconcileSnapshot{
+			Now:           time.Now().Add(invariants.SourceFencedGraceWindow + time.Second),
+			PrimaryPMJ:    job,
+			NamespacePMJs: []pmv1alpha1.PodMigrationJob{*job},
+			NamespacePods: []corev1.Pod{*p},
+		}
+	}
+	if vs := invariants.EvaluateI11(snapshotAt(pod)); len(vs) != 0 {
+		t.Fatalf("I11 violations on a fenced source: %+v", vs)
+	}
+	unlabeled := pod.DeepCopy()
+	delete(unlabeled.Labels, util.LabelFenced)
+	if vs := invariants.EvaluateI11(snapshotAt(unlabeled)); len(vs) == 0 {
+		t.Fatal("I11 didn't fire for a fenced job whose source lost the label")
 	}
 }
