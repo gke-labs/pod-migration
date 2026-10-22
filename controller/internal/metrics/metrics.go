@@ -90,6 +90,28 @@ var (
 		Help: "Total number of pod status updates seen by the fence webhook, by action.",
 	}, []string{"action"})
 
+	// SourceFenceTotal counts the controller's fence actions on migration
+	// sources (#131), by action.
+	// Actions: fenced | unfenced | kept | refenced
+	// (fenced: before the checkpoint; unfenced: a failed migration returned
+	// the source to service; kept: a failed migration kept it fenced and
+	// evicts it; refenced: the source stopped after it was unfenced)
+	SourceFenceTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_source_fence_total",
+		Help: "Total number of fence actions on migration sources, by action.",
+	}, []string{"action"})
+
+	// SourceFencedSeconds tracks how long a migration source was fenced, by
+	// outcome.
+	// Outcomes: migrated | unfenced
+	// (migrated: until the migration moved on to restoring, with the source
+	// gone; unfenced: until a failed migration returned it to service)
+	SourceFencedSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "pod_migration_source_fenced_seconds",
+		Help:    "Time a migration source spent fenced, by outcome.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 12),
+	}, []string{"outcome"})
+
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
 )
@@ -106,7 +128,23 @@ func init() {
 		SpotPreemptionSkippedTotal,
 		BudgetChecksTotal,
 		FenceWebhookRequestsTotal,
+		SourceFenceTotal,
+		SourceFencedSeconds,
 	)
+}
+
+// RecordSourceFence increments the source fence counter for the given action.
+func RecordSourceFence(action string) {
+	if action != "" {
+		SourceFenceTotal.WithLabelValues(action).Inc()
+	}
+}
+
+// RecordSourceFencedDuration records how long a source was fenced.
+func RecordSourceFencedDuration(outcome string, durationSeconds float64) {
+	if outcome != "" && durationSeconds >= 0 {
+		SourceFencedSeconds.WithLabelValues(outcome).Observe(durationSeconds)
+	}
 }
 
 // RecordBudgetCheck increments the disruption budget check counter for the given result.

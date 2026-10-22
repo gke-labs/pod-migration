@@ -125,6 +125,12 @@ type PodMigrationJobReconciler struct {
 	// Defaults to util.DefaultMigrationTimeout (10 minutes) if unset or <= 0.
 	DefaultMigrationTimeout time.Duration
 
+	// FenceLateStopWatch is how long the controller watches a source that a
+	// failed migration returned to service, to fence and evict it again if it
+	// stops anyway (#131). Defaults to DefaultFenceLateStopWatch if unset or
+	// <= 0.
+	FenceLateStopWatch time.Duration
+
 	// fallbackEventChecks records the last fallback-event probe per PMJ
 	// (namespace/name -> time.Time).  In-memory only; a restart just means
 	// one extra probe per in-flight migration.
@@ -556,6 +562,8 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
+// The source fence (#131) holds the source's Ready condition at False.
+// +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;patch
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // The recorder publishes restore-crash Warning events, which needs write access.
@@ -878,6 +886,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
+	// A job that fenced its source and then concluded without a restore still
+	// owns the fence: it returns the source to service, or keeps it fenced and
+	// evicts it (#131). That has to finish before the job is deleted.
+	if res, handled, err := r.resolveSourceFence(ctx, job, origJob); handled || err != nil {
+		return res, err
+	}
+
 	// Garbage collect completed PMJs after 30 minutes to allow ample time for large queue drainage.
 	// Note: Once Issue #19 (field indexers & transactional status.claimedBy) lands, gate lookups
 	// will be O(1) and this TTL can be safely reduced to a shorter interval (e.g. 5-10 minutes).
@@ -1131,6 +1146,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
+		// Fence the source before its checkpoint is triggered (#131).
+		if err := r.fenceSource(ctx, job, origJob); err != nil {
+			return r.handleStatusError(ctx, err, "Failed to fence the source before its checkpoint")
+		}
 		res, err := r.getSnapshotProvider(job).EnsureTrigger(ctx, job, podName)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -1490,6 +1509,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		metrics.MarkPMJActive(req.NamespacedName.String())
 		r.recordPreviousPhaseDuration(job, pmv1alpha1.PodMigrationJobPhaseEvicting)
+		if fenced := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced); fenced != nil && fenced.Status == metav1.ConditionTrue {
+			metrics.RecordSourceFencedDuration("migrated", time.Since(fenced.LastTransitionTime.Time).Seconds())
+		}
 		logger.Info("PodMigrationJob transitioned to Restoring phase", "pod", podName)
 		return ctrl.Result{}, nil
 
