@@ -213,7 +213,10 @@ func main() {
 		Recorder:                eventRecorder,
 		DefaultMigrationTimeout: migrationTimeout,
 		InvariantEngine:         invariantEngine,
-		BudgetChecker:           controller.EvictionBudgetChecker{Client: mgr.GetClient()},
+		BudgetChecker: &controller.InFlightBudgetChecker{
+			Client: mgr.GetClient(),
+			DryRun: controller.EvictionBudgetChecker{Client: mgr.GetClient()},
+		},
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)

@@ -533,6 +533,8 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
+// The budget check counts in-flight migrations per PodDisruptionBudget (#42).
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // The recorder publishes restore-crash Warning events, which needs write access.
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
