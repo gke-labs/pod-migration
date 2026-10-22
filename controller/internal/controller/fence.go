@@ -45,6 +45,17 @@ const (
 	// ConditionSourceFenced records the source's fence on the job.
 	ConditionSourceFenced = util.ConditionSourceFenced
 
+	// ReasonTriggerCreateFailed fails a job whose checkpoint trigger the API
+	// server rejected (forbidden, invalid, or denied by admission). Retrying
+	// won't create it, and nothing was checkpointed.
+	ReasonTriggerCreateFailed = "TriggerCreateFailed"
+	// ReasonFenceCapExceeded fails a job whose source stayed fenced for the
+	// pre-checkpoint cap while its trigger couldn't be created.
+	ReasonFenceCapExceeded = "FenceCapExceeded"
+
+	// DefaultFencePreCheckpointCap bounds how long a fenced source waits for
+	// its checkpoint trigger while creating it fails with retryable errors.
+	DefaultFencePreCheckpointCap = 30 * time.Second
 	// DefaultFenceLateStopWatch is how long the controller watches a source it
 	// returned to service after a failed migration.
 	DefaultFenceLateStopWatch = 5 * time.Minute
@@ -61,6 +72,13 @@ const (
 	// that stays fenced is retried while the budget refuses it.
 	keptSourceEvictionRetryInterval = 10 * time.Second
 )
+
+func (r *PodMigrationJobReconciler) fencePreCheckpointCap() time.Duration {
+	if r.FencePreCheckpointCap > 0 {
+		return r.FencePreCheckpointCap
+	}
+	return DefaultFencePreCheckpointCap
+}
 
 func (r *PodMigrationJobReconciler) fenceLateStopWatch() time.Duration {
 	if r.FenceLateStopWatch > 0 {
@@ -283,6 +301,51 @@ func (r *PodMigrationJobReconciler) fenceSource(ctx context.Context, job, origJo
 		"Fenced the source before its checkpoint: it's out of its Services' endpoints until it's deleted")
 	metrics.RecordSourceFence("fenced")
 	return nil
+}
+
+// triggerFailure decides whether a failure to create the checkpoint trigger
+// fails the job. The API server's rejection (forbidden, invalid, or denied by
+// admission) won't change on a retry, and nothing was checkpointed. Other
+// errors are retried, but a fenced source isn't kept out of service for longer
+// than the pre-checkpoint cap waiting for its trigger.
+func (r *PodMigrationJobReconciler) triggerFailure(job *pmv1alpha1.PodMigrationJob, err error) (reason, message string, failed bool) {
+	if apierrors.IsForbidden(err) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) {
+		return ReasonTriggerCreateFailed, fmt.Sprintf("The checkpoint trigger was rejected, so nothing was checkpointed: %v", err), true
+	}
+	cond := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced)
+	if cond == nil || cond.Status != metav1.ConditionTrue || job.Status.SnapshotRef != "" {
+		return "", "", false
+	}
+	limit := r.fencePreCheckpointCap()
+	if time.Since(cond.LastTransitionTime.Time) < limit {
+		return "", "", false
+	}
+	return ReasonFenceCapExceeded, fmt.Sprintf("The source stayed fenced for %v while its checkpoint trigger couldn't be created: %v", limit, err), true
+}
+
+// failSnapshotting fails a Snapshotting job: it deletes the trigger and
+// records Failed. resolveSourceFence then settles the source's fence.
+func (r *PodMigrationJobReconciler) failSnapshotting(ctx context.Context, req ctrl.Request, job, origJob *pmv1alpha1.PodMigrationJob, reason, message string) (ctrl.Result, error) {
+	log.FromContext(ctx).Info("Failing migration job before its checkpoint completed", "reason", reason, "message", message)
+	_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
+	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+	now := metav1.Now()
+	job.Status.CompletionTime = &now
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: job.Generation,
+	})
+	if err := r.patchStatus(ctx, job, origJob); err != nil {
+		return r.handleStatusError(ctx, err, "Failed to update job status to Failed")
+	}
+	metrics.MarkPMJInactive(req.NamespacedName.String())
+	metrics.RecordOutcome("failed")
+	r.recordPreviousPhaseDuration(job, pmv1alpha1.PodMigrationJobPhaseSnapshotting)
+	r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "%s", message)
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // resolveSourceFence settles the fence of a job that fenced its source and

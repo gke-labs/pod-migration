@@ -125,6 +125,11 @@ type PodMigrationJobReconciler struct {
 	// Defaults to util.DefaultMigrationTimeout (10 minutes) if unset or <= 0.
 	DefaultMigrationTimeout time.Duration
 
+	// FencePreCheckpointCap bounds how long a fenced source waits for its
+	// checkpoint trigger while creating it fails with retryable errors (#131).
+	// Defaults to DefaultFencePreCheckpointCap if unset or <= 0.
+	FencePreCheckpointCap time.Duration
+
 	// FenceLateStopWatch is how long the controller watches a source that a
 	// failed migration returned to service, to fence and evict it again if it
 	// stops anyway (#131). Defaults to DefaultFenceLateStopWatch if unset or
@@ -1152,6 +1157,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		res, err := r.getSnapshotProvider(job).EnsureTrigger(ctx, job, podName)
 		if err != nil {
+			if reason, message, failed := r.triggerFailure(job, err); failed {
+				return r.failSnapshotting(ctx, req, job, origJob, reason, message)
+			}
 			return ctrl.Result{}, err
 		}
 		if res.Requeue || res.RequeueAfter != 0 {

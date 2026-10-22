@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -411,6 +412,80 @@ func TestFenceSource_NothingToFence(t *testing.T) {
 				t.Error("SourceFenced recorded without a source to fence")
 			}
 		})
+	}
+}
+
+// TestTriggerRejected_FailsAndUnfences: a trigger the API server rejects fails
+// the job at once, and the source, never checkpointed, goes back into service.
+func TestTriggerRejected_FailsAndUnfences(t *testing.T) {
+	for name, rejection := range map[string]error{
+		"forbidden": apierrors.NewForbidden(schema.GroupResource{Group: "podsnapshot.gke.io", Resource: "podsnapshotmanualtriggers"}, "t", errors.New("denied by policy")),
+		"invalid":   apierrors.NewInvalid(schema.GroupKind{Group: "podsnapshot.gke.io", Kind: "PodSnapshotManualTrigger"}, "t", nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSource(fenceTestCID, 0), fenceTestSnapshottingJob())
+			f.provider.ensureErr = rejection
+			f.provider.state = snapshot.CheckpointState{Settled: true}
+			if _, err := f.reconcile(t); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			job := f.job(t)
+			if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+				t.Fatalf("phase = %s, want Failed", job.Status.Phase)
+			}
+			if ready := meta.FindStatusCondition(job.Status.Conditions, "Ready"); ready == nil || ready.Reason != ReasonTriggerCreateFailed {
+				t.Errorf("Ready = %+v, want reason %s", ready, ReasonTriggerCreateFailed)
+			}
+
+			// The Failed job resolves the fence.
+			if _, err := f.reconcile(t); err != nil {
+				t.Fatalf("resolving Reconcile: %v", err)
+			}
+			if pod := f.pod(t); pod == nil || pod.Labels[util.LabelFenced] != "" {
+				t.Fatalf("source = %+v, want it unfenced", pod)
+			}
+			if cond := fenceCondition(t, f.job(t)); cond.Status != metav1.ConditionFalse || cond.Reason != util.ReasonUnfenced {
+				t.Errorf("SourceFenced = %s/%s, want False/%s", cond.Status, cond.Reason, util.ReasonUnfenced)
+			}
+			if !hasEvent(f.events(), "SourceUnfenced") {
+				t.Error("no SourceUnfenced event")
+			}
+		})
+	}
+}
+
+// TestTriggerTransientError_CappedWhileFenced: transient trigger errors are
+// retried while the source is fenced, until the pre-checkpoint cap.
+func TestTriggerTransientError_CappedWhileFenced(t *testing.T) {
+	f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSource(fenceTestCID, 0), fenceTestSnapshottingJob())
+	f.provider.ensureErr = apierrors.NewServiceUnavailable("apiserver busy")
+	if _, err := f.reconcile(t); err == nil {
+		t.Fatal("Reconcile returned no error for a transient trigger error")
+	}
+	if phase := f.job(t).Status.Phase; phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Fatalf("phase = %s after one transient error, want Snapshotting", phase)
+	}
+
+	// Backdate the fence past the cap.
+	job := f.job(t)
+	orig := job.DeepCopy()
+	cond := fenceCondition(t, job)
+	cond.LastTransitionTime = metav1.NewTime(time.Now().Add(-DefaultFencePreCheckpointCap - time.Second))
+	if err := f.client.Status().Patch(context.Background(), job, client.MergeFrom(orig)); err != nil {
+		t.Fatalf("backdating SourceFenced: %v", err)
+	}
+	if _, err := f.reconcile(t); err != nil {
+		t.Fatalf("Reconcile past the cap: %v", err)
+	}
+	job = f.job(t)
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Fatalf("phase = %s past the cap, want Failed", job.Status.Phase)
+	}
+	if ready := meta.FindStatusCondition(job.Status.Conditions, "Ready"); ready == nil || ready.Reason != ReasonFenceCapExceeded {
+		t.Errorf("Ready = %+v, want reason %s", ready, ReasonFenceCapExceeded)
+	}
+	if f.provider.cleanupCalls == 0 {
+		t.Error("the trigger wasn't deleted when the cap failed the job")
 	}
 }
 
