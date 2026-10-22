@@ -19,9 +19,9 @@ import (
 // FencePath is the path of the fence webhook on the webhook server.
 const FencePath = "/mutate-v1-pod-fence"
 
-// fenceMessage is the message on a Ready condition that the fence holds at False.
-const fenceMessage = "Readiness is held False while this pod is a migration source (label " +
-	util.LabelFenced + "); the ContainersReady condition shows the kubelet's view."
+// fenceMessage is the message on a Ready condition that the fence holds at
+// False. The controller writes the same message when it fences a source.
+const fenceMessage = util.FenceReadyMessage
 
 // fencePod is the part of a Pod that the fence webhook reads. The raw object is
 // decoded only this far, so fields that this controller's API version doesn't
