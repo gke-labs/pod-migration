@@ -30,7 +30,7 @@
 #       * S4 : Dual-replica simultaneous eviction under serialized PodGate contention (I1, I3, I2)
 #       * S5 : Mid-flight PodMigration deletion -> I4/I5 deferral & zero orphan PSSC/PSMT leaks
 #       * S6 : Continuous write-continuity probe under live warm migration (#103)
-#       * S7 : Verdict-matches-data gate: RestoreVerified vs. live application state (#104)
+#       * S7 : Verdict-matches-data gate: restore verdict (RestoreVerified or RestoreInferred) vs. live application state (#104)
 #       * S8 : Phase-controlled write-continuity scenario (#149) with kube-proxy sync
 #              phase anchor, Check (a) no source re-restore after checkpoint (#151),
 #              and Check (b) fenced pod never serving in EndpointSlice (#131)
@@ -1319,11 +1319,11 @@ run_scenario_s6() {
   clean_test_workloads
 }
 
-# S7: Verdict-matches-data enforcement (RestoreVerified vs. application state, #104)
+# S7: Verdict-matches-data enforcement (restore verdict vs. application state, #104)
 run_scenario_s7() {
   local run_dir="${OUT_DIR}/s7-verdict-matches-data"
   local s6_dir="${OUT_DIR}/s6-write-continuity-probe"
-  log "=== Running Scenario S7: Verdict Matches Data (RestoreVerified vs. Live Application State) ==="
+  log "=== Running Scenario S7: Verdict Matches Data (Restore Verdict vs. Live Application State) ==="
   rm -rf "${run_dir}"
   mkdir -p "${run_dir}"
 
@@ -1347,7 +1347,7 @@ run_scenario_s7() {
     nonce="nonce-s7-$(date +%s)"
     v_counter_seed "${src_pod}" "${nonce}"
 
-    start_collector "${run_dir}" "S7: Verdict matches data (RestoreVerified vs. application state)"
+    start_collector "${run_dir}" "S7: Verdict matches data (restore verdict vs. application state)"
     start_continuity_probe "${trace_path}" "counter" "app=t2-counter"
 
     src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
@@ -1380,7 +1380,7 @@ with open(sys.argv[2], "w") as f:
     json.dump(d, f, indent=2)
 ' "${run_dir}/run.json" "${neg_false_pos}/run.json"
   if "${PMPROFILER_BIN}" analyze --run "${neg_false_pos}" --assert-verdict-matches-data >/dev/null 2>&1; then
-    err "S7 FAIL: --assert-verdict-matches-data did not reject RestoreVerified with failed state check"
+    err "S7 FAIL: --assert-verdict-matches-data did not reject a restore verdict with a failed state check"
     exit 1
   fi
   log "S7 PASS: Positive and negative verdict-matches-data checks verified"
@@ -2585,7 +2585,7 @@ EOF
 
   # S1: Counter rolling upgrade during active node drain
   emit_synthetic_scenario "${OUT_DIR}/s1" "S1: Deployment rolling upgrade during active node drain" \
-    "counter" "pmj-s1-counter" "counter-0" "counter-0-restored" "Succeeded" "True" "RestoreVerified"
+    "counter" "pmj-s1-counter" "counter-0" "counter-0-restored" "Succeeded" "True" "RestoreInferred"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s1" \
     --name "state survived (token-verified)" --group "counter" \
     --pass --value 1 --total 1 \
@@ -2596,7 +2596,7 @@ EOF
 
   # S2: Redis PDB temporary block followed by release (50,000 keys + nonce)
   emit_synthetic_scenario "${OUT_DIR}/s2" "S2: PDB minAvailable 100% block followed by budget release" \
-    "redis" "pmj-s2-redis" "redis-0" "redis-0-restored" "Succeeded" "True" "RestoreVerified"
+    "redis" "pmj-s2-redis" "redis-0" "redis-0-restored" "Succeeded" "True" "RestoreInferred"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s2" \
     --name "state survived (token-verified)" --group "redis" \
     --pass --value 50000 --total 50000 \
@@ -2624,7 +2624,7 @@ EOF
 
   # S4: Postgres + Counter dual-replica contention
   emit_synthetic_scenario "${OUT_DIR}/s4" "S4: Dual-replica simultaneous eviction under serialized PodGate contention" \
-    "postgres" "pmj-s4-postgres" "postgres-0" "postgres-0-restored" "Succeeded" "True" "RestoreVerified"
+    "postgres" "pmj-s4-postgres" "postgres-0" "postgres-0-restored" "Succeeded" "True" "RestoreInferred"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s4" \
     --name "state survived (token-verified)" --group "postgres" \
     --pass --value 200 --total 200 \
@@ -2635,7 +2635,7 @@ EOF
 
   # S5: Mid-flight PodMigration deletion (I4/I5 deferral & zero orphan leaks)
   emit_synthetic_scenario "${OUT_DIR}/s5" "S5: Mid-flight PodMigration deletion (I4/I5 deferral & zero orphan leaks)" \
-    "counter" "pmj-s5-counter" "counter-s5-0" "counter-s5-0-restored" "Succeeded" "True" "RestoreVerified"
+    "counter" "pmj-s5-counter" "counter-s5-0" "counter-s5-0-restored" "Succeeded" "True" "RestoreInferred"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s5" \
     --name "state survived (token-verified)" --group "counter" \
     --pass --value 1 --total 1 \
@@ -2650,7 +2650,7 @@ EOF
 
   # S6: Continuous write-continuity probe under live warm migration (#103)
   emit_synthetic_scenario "${OUT_DIR}/s6" "S6: Continuous write-continuity probe across warm migration" \
-    "redis" "pmj-s6-redis" "redis-s6-0" "redis-s6-0-restored" "Succeeded" "True" "RestoreVerified"
+    "redis" "pmj-s6-redis" "redis-s6-0" "redis-s6-0-restored" "Succeeded" "True" "RestoreInferred"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s6" \
     --name "state survived (token-verified)" --group "redis" \
     --pass --value 50000 --total 50000 \
@@ -2659,9 +2659,9 @@ EOF
   "${PMPROFILER_BIN}" continuity --run "${OUT_DIR}/s6" --trace "${OUT_DIR}/s6/continuity.ndjson" --group "redis"
   "${PMPROFILER_BIN}" analyze --run "${OUT_DIR}/s6" --assert-zero-invariants --assert-clean-outcomes --assert-verdict-matches-data
 
-  # S7: Verdict matches data (RestoreVerified vs. application state, #104)
-  emit_synthetic_scenario "${OUT_DIR}/s7" "S7: Verdict matches data (RestoreVerified vs. application state)" \
-    "redis" "pmj-s7-redis" "redis-s7-0" "redis-s7-0-restored" "Succeeded" "True" "RestoreVerified"
+  # S7: Verdict matches data (restore verdict vs. application state, #104)
+  emit_synthetic_scenario "${OUT_DIR}/s7" "S7: Verdict matches data (restore verdict vs. application state)" \
+    "redis" "pmj-s7-redis" "redis-s7-0" "redis-s7-0-restored" "Succeeded" "True" "RestoreInferred"
   "${PMPROFILER_BIN}" check --run "${OUT_DIR}/s7" \
     --name "state survived (token-verified)" --group "redis" \
     --pass --value 50000 --total 50000 \
@@ -2674,7 +2674,7 @@ EOF
   # Use the SAME pod name ("t2-redis-0") for both source (uid-t2-redis-0-src) and replacement (uid-t2-redis-0-dst)
   # to verify that Check (a) and Check (b) correlate by Pod UID rather than colliding on StatefulSet pod names.
   emit_synthetic_scenario "${OUT_DIR}/s8" "S8: Phase-controlled write-continuity (W=5s)" \
-    "redis" "pmj-s8-redis" "t2-redis-0" "t2-redis-0" "Succeeded" "True" "RestoreVerified" \
+    "redis" "pmj-s8-redis" "t2-redis-0" "t2-redis-0" "Succeeded" "True" "RestoreInferred" \
     "uid-t2-redis-0-src" "uid-t2-redis-0-dst"
   echo "1758967203000" >"${OUT_DIR}/s8/drain_ms.txt"
   printf '%s\n' "t2-redis-0" >"${OUT_DIR}/s8/source_pod.txt"
@@ -2936,6 +2936,20 @@ EOF
   fi
   rm -rf "${neg_s7_fp}"
 
+  # 1b) The same with a restore the engine only inferred (RestoreInferred, #79): an
+  # inferred verdict is still a restore claim, so a lost state must fail it too.
+  local neg_s7_inferred="${OUT_DIR}/neg-s7-false-inferred"
+  emit_synthetic_scenario "${neg_s7_inferred}" "Negative Test: S7 RestoreInferred with Empty App" \
+    "redis" "pmj-s7-inferred" "redis-inf-0" "redis-inf-0-restored" "Succeeded" "True" "RestoreInferred"
+  "${PMPROFILER_BIN}" check --run "${neg_s7_inferred}" \
+    --name "state survived (token-verified)" --group "redis" \
+    --pass=false --value 0 --total 50000 \
+    --detail "migkey='' (expected nonce), DBSIZE=0"
+  if "${PMPROFILER_BIN}" analyze --run "${neg_s7_inferred}" --assert-verdict-matches-data >/dev/null 2>&1; then
+    die "Expected pmprofiler analyze --assert-verdict-matches-data to fail when migration reports RestoreInferred while app is empty"
+  fi
+  rm -rf "${neg_s7_inferred}"
+
   # 2) Reverse direction: migration reports FallbackToColdStart (Restored=False) while app check says state survived (Pass=true) -> must fail --assert-verdict-matches-data
   local neg_s7_rev="${OUT_DIR}/neg-s7-reverse"
   emit_synthetic_scenario "${neg_s7_rev}" "Negative Test: S7 ColdStart Verdict with Survived State" \
@@ -2952,7 +2966,7 @@ EOF
   # Negative test: verify that a non-zero pod_migration_invariant_violations_total metric fails analyze
   local neg_dir="${OUT_DIR}/neg-invariant-check"
   emit_synthetic_scenario "${neg_dir}" "Negative Test: Invariant Violation Gate" \
-    "counter" "pmj-neg" "neg-0" "neg-0-restored" "Succeeded" "True" "RestoreVerified"
+    "counter" "pmj-neg" "neg-0" "neg-0-restored" "Succeeded" "True" "RestoreInferred"
   cat >"${neg_dir}/dirty.prom" <<'EOF'
 pod_migration_invariant_violations_total{invariant="I3_VolumeSafeUngate"} 1
 EOF
