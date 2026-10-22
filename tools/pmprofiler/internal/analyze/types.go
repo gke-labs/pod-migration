@@ -69,11 +69,16 @@ type Migration struct {
 	// RestoreSignal names the explicit signal Restored was derived from,
 	// or "absent" when a replacement was observed but no engine stated an
 	// outcome (the report must not claim restoration for those).
-	RestoreSignal string   `json:"restoreSignal,omitempty"`
-	Population    string   `json:"population,omitempty"` // "", pre-collection, stale-cr
-	SnapshotName  string   `json:"snapshotName,omitempty"`
-	SnapshotBytes int64    `json:"snapshotBytes,omitempty"`
-	Warnings      []string `json:"warnings,omitempty"` // warning events joined to this migration
+	RestoreSignal string `json:"restoreSignal,omitempty"`
+	// RestoreEvidence says where RestoreSignal came from (the Evidence*
+	// values): an engine signal on the replacement, or the job's Restored
+	// condition, whose reason tells a restore the engine confirmed from one
+	// it inferred (C6, #79).
+	RestoreEvidence string   `json:"restoreEvidence,omitempty"`
+	Population      string   `json:"population,omitempty"` // "", pre-collection, stale-cr
+	SnapshotName    string   `json:"snapshotName,omitempty"`
+	SnapshotBytes   int64    `json:"snapshotBytes,omitempty"`
+	Warnings        []string `json:"warnings,omitempty"` // warning events joined to this migration
 
 	// psengine-native fields (criu-snapshot-engine runs; HR-2 coverage).
 	// Engine is the PodSnapshot's pod-migrate.io/engine label; absent for
@@ -98,6 +103,21 @@ const (
 	OutcomeWedged   = "wedged"         // no phase progress within threshold
 	OutcomeNoDst    = "no-replacement" // terminal but no replacement pod observed
 	OutcomeInFlight = "in-flight"      // run ended before threshold elapsed
+)
+
+// RestoreEvidence values.
+const (
+	// EvidenceEngine: an explicit engine signal on the replacement, such as
+	// the psengine-restore annotation.
+	EvidenceEngine = "engine"
+	// EvidenceConfirmed: the job's Restored condition, with the reason of a
+	// restore the engine confirmed (RestoreVerified).
+	EvidenceConfirmed = "confirmed"
+	// EvidenceInferred: the job's Restored condition, with the reason of a
+	// restore the engine only inferred (RestoreInferred).
+	EvidenceInferred = "inferred"
+	// EvidenceJob: the job's Restored condition, with another reason.
+	EvidenceJob = "job"
 )
 
 // Stats is a summary distribution for one duration metric.

@@ -552,7 +552,7 @@ func statsTable(stats map[string]analyze.Stats) template.HTML {
 
 func migrationsTable(ms []analyze.Migration) template.HTML {
 	var b strings.Builder
-	b.WriteString("<table><thead><tr><th>pod</th><th>app</th><th>outcome</th><th>restore signal</th>" +
+	b.WriteString("<table><thead><tr><th>pod</th><th>app</th><th>outcome</th><th>restore signal</th><th>evidence</th>" +
 		"<th>population</th><th>snapshot s</th><th>evicted s</th><th>gap s</th><th>e2e s</th>" +
 		"<th>engine</th><th>snapshot</th><th>replacement</th><th>src → dst</th></tr></thead><tbody>")
 	for _, m := range ms {
@@ -560,12 +560,18 @@ func migrationsTable(ms []analyze.Migration) template.HTML {
 		if sig == "" {
 			sig = "–"
 		}
+		// The evidence tells an engine's own signal from the job's verdict,
+		// and a restore the engine confirmed from one it inferred.
+		evidence := m.RestoreEvidence
+		if evidence == "" {
+			evidence = "–"
+		}
 		pop := m.Population
 		if pop == "" {
 			pop = "measured"
 		}
-		fmt.Fprintf(&b, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s → %s</td></tr>",
-			esc(m.Pod), esc(m.App), esc(m.Outcome), esc(sig), esc(pop),
+		fmt.Fprintf(&b, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s → %s</td></tr>",
+			esc(m.Pod), esc(m.App), esc(m.Outcome), esc(sig), esc(evidence), esc(pop),
 			dur(m.SnapReadyS), dur(m.EvictedS), dur(m.DowntimeS), dur(m.E2ES),
 			esc(m.Engine), fmtBytes(float64(m.SnapshotBytes)), esc(m.DstPod),
 			esc(m.SrcNode), esc(m.DstNode))
