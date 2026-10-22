@@ -332,12 +332,15 @@ func TestMetrics_ActiveGaugeAndOutcomes(t *testing.T) {
 		expected string
 	}{
 		{pmv1alpha1.PodMigrationJobPhaseSucceeded, "RestoreVerified", "succeeded"},
+		{pmv1alpha1.PodMigrationJobPhaseSucceeded, ReasonRestoreInferred, "succeeded"},
 		{pmv1alpha1.PodMigrationJobPhaseFailed, "Timeout", "timeout"},
 		{pmv1alpha1.PodMigrationJobPhaseFailed, "PodNotFound", "failed"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, "FallbackToColdStart", "fallback"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, "RestoreTimeout", "timeout"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, "PDBEvictionTimeout", "timeout"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, "ReplacementPodMismatch", "succeeded_without_restore"},
+		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, ReasonRestoreLost, "restore_lost"},
+		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, ReasonRestoreFailed, "succeeded_without_restore"},
 	}
 
 	for _, c := range cases {
