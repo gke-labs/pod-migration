@@ -29,6 +29,10 @@ const (
 	AnnotationMigrationTimeout = "pod-migration.gke.io/timeout"
 	// AnnotationEvictingSince records when the Evicting phase started waiting for deletion.
 	AnnotationEvictingSince = "pod-migration.gke.io/evicting-since"
+	// ConditionRestored is the PMJ condition that records the restore's outcome.
+	ConditionRestored = "Restored"
+	// ReasonRestoreVerified is the Restored reason of a verified warm restore.
+	ReasonRestoreVerified = "RestoreVerified"
 
 	// LabelPodTemplateHash is the upstream Deployment revision label key on Pods.
 	LabelPodTemplateHash = appsv1.DefaultDeploymentUniqueLabelKey
@@ -175,6 +179,13 @@ func migratedAgain(job *pmv1alpha1.PodMigrationJob, targeting []pmv1alpha1.PodMi
 	return false
 }
 
+// restoreVerified reports whether job recorded a verified warm restore: the
+// Restored condition is True with reason RestoreVerified.
+func restoreVerified(job *pmv1alpha1.PodMigrationJob) bool {
+	cond := meta.FindStatusCondition(job.Status.Conditions, ConditionRestored)
+	return cond != nil && cond.Status == metav1.ConditionTrue && cond.Reason == ReasonRestoreVerified
+}
+
 // EvaluateI1 enforces I1 (At-Most-Once Restore):
 // A PodSnapshot may be bound to and consumed by at most one replacement Pod UID
 // across the cluster's lifetime, and a consumed PMJ with GateReleased=true must
@@ -239,7 +250,10 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 // and did not bypass restore via `podsnapshot.gke.io/ps-name: ""`. The annotation check
 // is skipped once another PMJ, created at or after this one and in any phase, targets
 // the replacement's UID: that pod was migrated again and carries the newer job's
-// cold-start bypass (#151), which stays if the newer job fails.
+// cold-start bypass (#151), which stays if the newer job fails. The cold-start bypass
+// is also accepted once the PMJ recorded Restored=True (RestoreVerified): the controller
+// sets it after the verified restore, so that later restarts of the replacement don't
+// restore the migration snapshot again (#152).
 func EvaluateI2(s *ReconcileSnapshot) []Violation {
 	var violations []Violation
 	jobs := allPMJs(s)
@@ -285,6 +299,9 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 				}
 				snapAnn := podSnapshotAnnotation(&pod)
 				coldStartBypass := podHasColdStartBypass(&pod)
+				if coldStartBypass && restoreVerified(&job) {
+					continue
+				}
 				if snapAnn != job.Status.SnapshotRef || coldStartBypass {
 					violations = append(violations, Violation{
 						InvariantID:   "I2",
