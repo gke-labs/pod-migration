@@ -34,6 +34,10 @@ The controller is implemented as a custom Operator consisting of the following c
   5. Transitions the job to `Succeeded`, signaling the Pod Gate Reconciler that it is safe to release the replacement Pod.
 - **Pod Gate Reconciler**: Monitors replacement Pods injected with the `gke.io/pod-migration-gate` scheduling gate. It holds them in a pending state and releases the gate only after the matched `PodMigrationJob` reaches `Succeeded` (confirming snapshot readiness and volume detachment), then injects the GKE snapshot name annotation to force restore, and removes the scheduling gate to allow startup. It bypasses gate injection for normal scale-up pods.
 
+### 3. Design Docs
+- [Snapshot engine contract](docs/design/engine-contract.md): what the controller requires from a snapshot engine (GKE Pod Snapshots today; CRIU and upstream pod checkpoint/restore next).
+- [Core safety invariants](docs/invariants.md): the invariants the controller can check after each reconcile (off by default; see `--invariant-mode`).
+
 ---
 
 ## Prerequisites
