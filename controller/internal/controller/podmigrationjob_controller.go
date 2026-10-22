@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
@@ -109,6 +110,12 @@ type PodMigrationJobReconciler struct {
 	// default engine set.  Overridden in tests.
 	RestoreEngines []restore.Engine
 
+	// Engines provides the snapshot engine that serves each job: its
+	// snapshot provider and its restore-failure classifiers. Optional: nil
+	// selects GKE Pod Snapshots, built from Client and Scheme. The
+	// SnapshotProvider and RestoreEngines overrides take priority.
+	Engines *engine.Registry
+
 	// BudgetChecker checks the source's disruption budget before the
 	// checkpoint (#42). Optional: nil skips the check (unit tests whose fake
 	// client would treat the dry-run eviction as a real one).
@@ -156,7 +163,7 @@ func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, j
 		return false
 	}
 	podName := job.Spec.PodRef.Name
-	snapStatus, err := r.getSnapshotProvider().CheckStatus(ctx, job, podName)
+	snapStatus, err := r.getSnapshotProvider(job).CheckStatus(ctx, job, podName)
 	if err != nil || snapStatus == nil {
 		return false
 	}
@@ -225,11 +232,26 @@ func (r *PodMigrationJobReconciler) isOriginPodTerminatedDueToNodeShutdown(ctx c
 	return false
 }
 
-func (r *PodMigrationJobReconciler) restoreEngines() []restore.Engine {
+func (r *PodMigrationJobReconciler) restoreEngines(job *pmv1alpha1.PodMigrationJob) []restore.Engine {
 	if r.RestoreEngines != nil {
 		return r.RestoreEngines
 	}
-	return restore.DefaultEngines()
+	return r.jobEngine(job).RestoreFailures()
+}
+
+// jobEngine returns the snapshot engine that serves job. Without a registry,
+// that's GKE Pod Snapshots. ForJob fails only when the registry has no default
+// engine, which main.go rules out at startup; the GKE Pod Snapshots fallback
+// keeps the behavior from before the registry.
+func (r *PodMigrationJobReconciler) jobEngine(job *pmv1alpha1.PodMigrationJob) engine.Engine {
+	if r.Engines != nil {
+		eng, err := r.Engines.ForJob(job)
+		if err == nil {
+			return eng
+		}
+		log.Log.Error(err, "No snapshot engine for the job; using GKE Pod Snapshots", "job", client.ObjectKeyFromObject(job))
+	}
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, nil)
 }
 
 // liveReader returns a reader that bypasses the informer cache.
@@ -393,7 +415,7 @@ func (r *PodMigrationJobReconciler) classifyRecordedPodLive(ctx context.Context,
 	if job.Status.RestoredPodUID != "" && string(pod.UID) != job.Status.RestoredPodUID {
 		return nil, none, nil
 	}
-	return pod, restore.Classify(pod, r.restoreEngines()...), nil
+	return pod, restore.Classify(pod, r.restoreEngines(job)...), nil
 }
 
 // concludeRestoreCrash performs the entire fatal-path transition: metric,
@@ -517,11 +539,13 @@ func (r *PodMigrationJobReconciler) shouldProbeFallbackEvents(key string) bool {
 	return true
 }
 
-func (r *PodMigrationJobReconciler) getSnapshotProvider() snapshot.Provider {
+// getSnapshotProvider returns the snapshot provider of the engine that serves
+// job, unwrapped, so callers can type-assert optional provider capabilities.
+func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigrationJob) snapshot.Provider {
 	if r.SnapshotProvider != nil {
 		return r.SnapshotProvider
 	}
-	return snapshot.NewGKEProvider(r.Client, r.Scheme)
+	return r.jobEngine(job).Snapshots()
 }
 
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get
@@ -617,7 +641,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 	restoreCrashMatched := false
 	if primaryPod != nil && job.Status.RestoredPodName != "" && primaryPod.Name == job.Status.RestoredPodName {
 		if job.Status.RestoredPodUID == "" || string(primaryPod.UID) == job.Status.RestoredPodUID {
-			if verdict := restore.Classify(primaryPod, r.restoreEngines()...); verdict.Class == restore.FailureFatal {
+			if verdict := restore.Classify(primaryPod, r.restoreEngines(job)...); verdict.Class == restore.FailureFatal {
 				restoreCrashMatched = true
 			}
 		}
@@ -658,7 +682,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 			}
 			return
 		}
-		_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
+		_ = r.getSnapshotProvider(job).Cleanup(ctx, job, job.Spec.PodRef.Name)
 		metrics.MarkPMJInactive(job.Namespace + "/" + job.Name)
 		metrics.RecordOutcome("failed")
 		r.recordPreviousPhaseDuration(job, prevPhase)
@@ -823,7 +847,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				})
 
 				// Clean up snapshot trigger if it exists (best effort)
-				_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
+				_ = r.getSnapshotProvider(job).Cleanup(ctx, job, podName)
 
 				if err := r.patchStatus(ctx, job, origJob); err != nil {
 					return r.handleStatusError(ctx, err, "Failed to update job status to Failed on timeout")
@@ -1107,7 +1131,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
-		res, err := r.getSnapshotProvider().EnsureTrigger(ctx, job, podName)
+		res, err := r.getSnapshotProvider(job).EnsureTrigger(ctx, job, podName)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1116,7 +1140,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		// Monitor snapshot readiness via the pluggable SnapshotProvider
-		snapStatus, err := r.getSnapshotProvider().CheckStatus(ctx, job, podName)
+		snapStatus, err := r.getSnapshotProvider(job).CheckStatus(ctx, job, podName)
 		if err != nil {
 			logger.Error(err, "Failed to check snapshot status")
 			return ctrl.Result{}, err
@@ -1125,7 +1149,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		switch snapStatus.Phase {
 		case snapshot.PhaseFailed:
 			logger.Info("Snapshot provider reported terminal failure, transitioning to Failed", "reason", snapStatus.Reason, "message", snapStatus.Message)
-			_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
+			_ = r.getSnapshotProvider(job).Cleanup(ctx, job, podName)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 			now := metav1.Now()
 			job.Status.CompletionTime = &now
@@ -1187,7 +1211,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					}
 
 					logger.Info(logMsg, "phase", originPod.Status.Phase, "reason", reason)
-					_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
+					_ = r.getSnapshotProvider(job).Cleanup(ctx, job, podName)
 					job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 					now := metav1.Now()
 					job.Status.CompletionTime = &now
@@ -1253,7 +1277,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// Proactively clean up the manual trigger once the PMJ is durably Evicting.
 		// This frees the target pod lock in the snapshot agent for sequential 2-hop migrations,
 		// and runs idempotently without risk of trigger re-creation on Status().Update retry.
-		_ = r.getSnapshotProvider().Cleanup(ctx, job, podName)
+		_ = r.getSnapshotProvider(job).Cleanup(ctx, job, podName)
 
 		// 4.2. Wait for external drain to evict origin Pod, or invoke PDB-safe eviction fallback
 		pod := &corev1.Pod{}
@@ -1396,7 +1420,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		// Once the origin Pod is gone after eviction, clean up trigger
-		if err := r.getSnapshotProvider().Cleanup(ctx, job, podName); err != nil {
+		if err := r.getSnapshotProvider(job).Cleanup(ctx, job, podName); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -1658,7 +1682,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// status and annotations, never pod identity — but nothing that
 		// reassigns replacementPod may be added between the assertion and here.
 		if !isPodReady(replacementPod) {
-			switch verdict := restore.Classify(replacementPod, r.restoreEngines()...); verdict.Class {
+			switch verdict := restore.Classify(replacementPod, r.restoreEngines(job)...); verdict.Class {
 			case restore.FailureFatal:
 				// The cached verdict only nominates a candidate.  Confirm it
 				// against the API server before acting: the informer cache can
