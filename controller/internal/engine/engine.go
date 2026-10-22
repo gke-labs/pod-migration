@@ -145,6 +145,48 @@ type RestoreOrderer interface {
 	OrderColdStartBypass(pod *corev1.Pod) error
 }
 
+// RestoreOutcome is an engine's verdict on a replacement pod's restore (C6).
+type RestoreOutcome string
+
+const (
+	// RestoreInProgress isn't a verdict: the restore is still running, and
+	// the controller keeps polling.
+	RestoreInProgress RestoreOutcome = "InProgress"
+	// Restored: the replacement runs the restored application.
+	Restored RestoreOutcome = "Restored"
+	// ColdStart: the replacement started without the checkpoint.
+	ColdStart RestoreOutcome = "ColdStart"
+	// RestoreFailed: the restore failed.
+	RestoreFailed RestoreOutcome = "Failed"
+)
+
+// RestoreVerdict is an engine's verdict on a replacement pod's restore, with
+// the evidence it came from (C6).
+type RestoreVerdict struct {
+	Outcome RestoreOutcome
+	// Reason says why, for a ColdStart or Failed verdict.
+	Reason string
+	// Evidence names the condition, annotation or event the verdict came
+	// from.
+	Evidence string
+	// Confirmed marks a Restored verdict that positive evidence of the
+	// restore backs. A Restored verdict without it is inferred, for example
+	// from the absence of failure signals, and never makes the job's restore
+	// RestoreVerified (C6).
+	Confirmed bool
+}
+
+// RestoreVerifier is an optional capability (C6): the engine reports the
+// outcome of a replacement pod's restore. The controller asks it while the
+// job is Restoring, and an engine without it gets an inferred verdict from
+// the pod's readiness alone.
+type RestoreVerifier interface {
+	// VerifyRestore reports the verdict on pod, the replacement that job
+	// restores into. It must not change anything, and may be called again
+	// until it returns a verdict other than RestoreInProgress.
+	VerifyRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (RestoreVerdict, error)
+}
+
 // StorageLocationError reports a PodMigration storage location that an
 // engine can't use. The PodMigration reconciler reports it as the
 // InvalidStorageLocation condition, with Message as the condition message.

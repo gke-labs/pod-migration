@@ -333,6 +333,21 @@ The controller automatically intercepts standard Kubernetes evictions and orches
    kubectl uncordon <node-name>
    ```
 
+### Step 3: Check the Restore Verdict
+The `PodMigrationJob`'s `Restored` condition records how the replacement Pod came up, and its message names the snapshot engine and the evidence:
+
+```bash
+kubectl get podmigrationjob <job-name> -o jsonpath='{.status.conditions[?(@.type=="Restored")]}'
+```
+
+| Phase | `Restored` reason | Meaning |
+|---|---|---|
+| `Succeeded` | `RestoreVerified` | The snapshot engine confirmed the restore with positive evidence. |
+| `Succeeded` | `RestoreInferred` | The engine has no positive restore signal and saw no sign of a failed restore, and the replacement stayed Ready without a container restart for the stabilization window (controller flag `--restore-stabilization-window`, default `30s`). GKE Pod Snapshots reports this verdict. |
+| `SucceededWithoutRestore` | `RestoreLost` | A container of the replacement restarted before the verdict, so it runs without its restored state. A `RestoreLost` Warning event is recorded on the job and on the Pod. |
+| `SucceededWithoutRestore` | `FallbackToColdStart`, `RestoreFailed` | The engine reported a cold start, or a failed restore. |
+| `SucceededWithoutRestore` | `RestoreTimeout` | No verdict within 5 minutes plus the stabilization window. |
+
 ---
 
 ## 5. Automated Verification (E2E Suite)
@@ -451,7 +466,8 @@ The controller registers Prometheus metrics on the standard controller-runtime m
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `pod_migration_active` | Gauge | None | Number of currently active pod migrations in flight. |
-| `pod_migration_outcomes_total` | Counter | `outcome` (`succeeded`, `failed`, `timeout`, `fallback`, `succeeded_without_restore`) | Total completed migrations by outcome. |
+| `pod_migration_outcomes_total` | Counter | `outcome` (`succeeded`, `failed`, `timeout`, `fallback`, `succeeded_without_restore`, `restore_lost`) | Total completed migrations by outcome. |
+| `pod_migration_restore_verdicts_total` | Counter | `engine`, `verdict` (`confirmed`, `inferred`, `cold_start`, `failed`, `lost`, `timeout`) | Restore verdicts on replacement Pods, so a restore the engine confirmed can be told apart from one it inferred. |
 | `pod_migration_phase_duration_seconds` | Histogram | `phase` (`pending`, `snapshotting`, `evicting`, `restoring`) | Latency distribution of individual migration phases. |
 | `pod_migration_restore_crash_fallback_total` | Counter | None | Total cold-start fallbacks triggered by matched gVisor/OCI restore crashes. |
 | `pod_migration_restore_crash_unmatched_total` | Counter | None | Total unrecognised StartError restore-pod crashes with no known signature. |
