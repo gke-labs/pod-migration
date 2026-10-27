@@ -481,7 +481,7 @@ func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, nam
 	return nil
 }
 
-func isPMJOwnedByPodMigration(pmj *pmv1alpha1.PodMigrationJob, config *pmv1alpha1.PodMigration) bool {
+func isPMJOwnedByPodMigration(pmj *pmv1alpha1.PodMigrationJob, config *pmv1alpha1.PodMigration, renderedPolicyNames ...string) bool {
 	for _, ref := range pmj.OwnerReferences {
 		if ref.Kind == "PodMigration" {
 			if (ref.UID != "" && ref.UID == config.UID) || ref.Name == config.Name {
@@ -497,7 +497,42 @@ func isPMJOwnedByPodMigration(pmj *pmv1alpha1.PodMigrationJob, config *pmv1alpha
 			return true
 		}
 	}
+	if pmj.Annotations != nil && config.Name != "" {
+		if policyName := pmj.Annotations[util.AnnotationPodSnapshotPolicy]; policyName != "" {
+			if policyName == getPSPManualName(config.Name) || policyName == config.Name {
+				return true
+			}
+			for _, rendered := range renderedPolicyNames {
+				if rendered != "" && policyName == rendered {
+					return true
+				}
+			}
+		}
+	}
 	return false
+}
+
+func (r *PodMigrationReconciler) renderedPolicyNames(config *pmv1alpha1.PodMigration) []string {
+	if r.Engines == nil || config == nil {
+		return nil
+	}
+	var names []string
+	for _, engName := range r.Engines.Names() {
+		eng, ok := r.Engines.Get(engName)
+		if !ok {
+			continue
+		}
+		resources, err := eng.NamespaceResources(config)
+		if err != nil {
+			continue
+		}
+		for _, res := range resources {
+			if res != nil && res.GetNamespace() == config.Namespace && res.GetName() != "" {
+				names = append(names, res.GetName())
+			}
+		}
+	}
+	return names
 }
 
 func (r *PodMigrationReconciler) listInFlightMigrations(ctx context.Context, config *pmv1alpha1.PodMigration) ([]string, error) {
@@ -505,9 +540,10 @@ func (r *PodMigrationReconciler) listInFlightMigrations(ctx context.Context, con
 	if err := r.List(ctx, &pmjList, client.InNamespace(config.Namespace)); err != nil {
 		return nil, err
 	}
+	extraPolicies := r.renderedPolicyNames(config)
 	var inFlight []string
 	for _, pmj := range pmjList.Items {
-		if !isPMJOwnedByPodMigration(&pmj, config) {
+		if !isPMJOwnedByPodMigration(&pmj, config, extraPolicies...) {
 			continue
 		}
 		switch pmj.Status.Phase {

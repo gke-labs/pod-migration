@@ -25,6 +25,7 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestPodMigrationReconciler_RouteRejectUncoveringEngine(t *testing.T) {
@@ -2054,3 +2055,124 @@ func TestPodMigrationReconciler_Sync_NoOpDoesNotWrite(t *testing.T) {
 		t.Errorf("PSP resourceVersion changed from %s to %s", pspRV, got)
 	}
 }
+
+func TestPodMigrationReconciler_Finalizer_PostponesDeleteForPolicyAnnotatedJob(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	configName := "t2-s5-policy"
+
+	now := metav1.Now()
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              configName,
+			UID:               "uid-t2-s5",
+			Generation:        1,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{StorageCleanupFinalizer},
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://my-test-bucket/snapshots",
+			},
+		},
+	}
+
+	psscName := getPSSCName(namespace, configName)
+	pssc := &unstructured.Unstructured{}
+	pssc.SetGroupVersionKind(psscGVKForTest)
+	pssc.SetName(psscName)
+
+	pspName := getPSPManualName(configName)
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(pspGVKForTest)
+	psp.SetName(pspName)
+	psp.SetNamespace(namespace)
+
+	// EvictionGate and NodePreemptionReconciler record the resolved policy in
+	// pod-migration.gke.io/pod-snapshot-policy without setting OwnerReferences (#185).
+	activeJob := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "migrate-t2-s5-counter-0-abcd1234",
+			Annotations: map[string]string{
+				util.AnnotationPodSnapshotPolicy: pspName,
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	otherPolicyJob := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "migrate-other-0-ef567890",
+			Annotations: map[string]string{
+				util.AnnotationPodSnapshotPolicy: getPSPManualName("other-policy"),
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config, pssc, psp, activeJob, otherPolicyJob).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}, &pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// 1. Reconcile while activeJob is in Snapshotting: deletion must be deferred
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: configName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 5*time.Second {
+		t.Errorf("Expected RequeueAfter 5s while policy-annotated job is in flight, got %v", res.RequeueAfter)
+	}
+
+	checkPSP := &unstructured.Unstructured{}
+	checkPSP.SetGroupVersionKind(pspGVKForTest)
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pspName}, checkPSP); err != nil {
+		t.Errorf("Expected PSP %s to remain while job is in flight, got err: %v", pspName, err)
+	}
+
+	updatedConfig := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: configName}, updatedConfig); err != nil {
+		t.Fatalf("Failed to get config: %v", err)
+	}
+	readyCond := meta.FindStatusCondition(updatedConfig.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Reason != "DeletionBlockedByInFlightMigrations" || readyCond.Message != "Deletion deferred: 1 migration(s) in flight" {
+		t.Errorf("Unexpected Ready condition during deferral: %+v", readyCond)
+	}
+
+	// 2. Complete activeJob (while otherPolicyJob remains in Snapshotting) -> deletion proceeds
+	activeJob.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+	if err := fakeClient.Status().Update(context.Background(), activeJob); err != nil {
+		t.Fatalf("Failed to update activeJob status: %v", err)
+	}
+
+	res, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: configName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed after job completed: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Errorf("Expected RequeueAfter 0 once owned job completed, got %v", res.RequeueAfter)
+	}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pspName}, checkPSP); !apierrors.IsNotFound(err) {
+		t.Errorf("Expected PSP %s to be deleted after job completed, got err: %v", pspName, err)
+	}
+}
+
