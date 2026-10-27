@@ -174,6 +174,22 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return denied429("transient error reading migration job status, retrying")
 	}
 
+	// A replacement that its own migration is still restoring isn't migrated
+	// again until that migration concludes (#162). A second checkpoint would
+	// stop and restart it mid-restore, and the first job would then read the
+	// restart's cold-start event as its own and report a warm restore as a
+	// cold start. The wait is bounded: the first job concludes when the pod is
+	// Ready, on a restore crash, or at its 5-minute restore ceiling.
+	restoringJob, err := a.restoringJob(ctx, pod)
+	if err != nil {
+		logger.Error(err, "Failed to read the migration job that restored this pod")
+		return denied429("transient error reading the migration job that restored this pod, retrying")
+	}
+	if restoringJob != "" {
+		logger.Info("Pod is still being restored by its own migration job; not migrating it again yet", "job", restoringJob)
+		return denied429(fmt.Sprintf("pod is still being restored by migration job %s; retrying after that job concludes", restoringJob))
+	}
+
 	// Resolve parent owner details
 	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -234,6 +250,39 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			"The previous migration job timed out waiting for the PodDisruptionBudget without a checkpoint; started a new one")
 	}
 	return denied429("migration job spawned")
+}
+
+// restoringJob returns the name of the migration job that is still restoring
+// pod, or "" when there's none. The replacement webhook names that job in the
+// pod's assigned-pmj annotation. A job that hasn't concluded owns its
+// replacement until it does, unless it recorded another pod as the one it
+// restored (the name now belongs to a successor).
+func (a *EvictionGate) restoringJob(ctx context.Context, pod *corev1.Pod) (string, error) {
+	name := pod.Annotations[util.AnnotationAssignedPMJ]
+	if name == "" {
+		return "", nil
+	}
+	key := types.NamespacedName{Namespace: pod.Namespace, Name: name}
+	job := &pmv1alpha1.PodMigrationJob{}
+	err := a.Client.Get(ctx, key, job)
+	if apierrors.IsNotFound(err) && a.APIReader != nil {
+		err = a.APIReader.Get(ctx, key, job)
+	}
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	switch job.Status.Phase {
+	case pmv1alpha1.PodMigrationJobPhaseSnapshotting, pmv1alpha1.PodMigrationJobPhaseEvicting, pmv1alpha1.PodMigrationJobPhaseRestoring:
+	default:
+		return "", nil
+	}
+	if job.Status.RestoredPodUID != "" && job.Status.RestoredPodUID != string(pod.UID) {
+		return "", nil
+	}
+	return job.Name, nil
 }
 
 func denied429(msg string) admission.Response {
