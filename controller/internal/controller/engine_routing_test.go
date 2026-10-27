@@ -92,6 +92,21 @@ func (e *orderingEngine) OrderColdStartBypass(pod *corev1.Pod) error {
 	return nil
 }
 
+func (e *orderingEngine) InspectRestoreOrder(pod *corev1.Pod) (string, bool, bool) {
+	if pod == nil || pod.Annotations == nil {
+		return "", false, false
+	}
+	val, exists := pod.Annotations[routedRestoreAnnotation]
+	if !exists {
+		return "", false, false
+	}
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" || trimmed == "none" {
+		return "", true, true
+	}
+	return trimmed, false, true
+}
+
 // namedClassifier is a restore-failure classifier that only has a name, to
 // tell classifier sets apart.
 type namedClassifier string

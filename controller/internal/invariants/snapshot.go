@@ -73,7 +73,18 @@ type ReconcileSnapshot struct {
 	// (when present in the informer cache) so cross-CRD invariants can inspect
 	// Checkpoint / StorageReplicated / Ready sub-conditions without extra API calls.
 	PrimarySnapshotConditions []metav1.Condition
+
+	// RestoreOrders optionally inspects a pod's engine-specific restore order or
+	// cold-start bypass without mutating the pod (C5). When nil, invariants fall
+	// back to the GKE Pod Snapshots podsnapshot.gke.io/ps-name annotation.
+	RestoreOrders RestoreOrderFunc `json:"-"`
 }
+
+// RestoreOrderFunc inspects a replacement pod for the restore order of
+// engineName (or the default/registered engines when engineName is empty).
+// When present is true, either snapshotRef is the non-empty checkpoint
+// identifier ordered for restore or coldStartBypass is true.
+type RestoreOrderFunc func(engineName string, pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool)
 
 // Violation represents a single detected violation of an invariant (I1-I9).
 type Violation struct {

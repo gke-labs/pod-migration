@@ -775,3 +775,58 @@ func TestGKEPodSnapshots_VerifyRestoreReadsEventsThroughTheAPIReader(t *testing.
 		t.Errorf("WithAPIReader(nil) keeps the client: VerifyRestore() = %+v, %v; want an inferred restore", got, err)
 	}
 }
+
+func TestGKEPodSnapshots_InspectRestoreOrder(t *testing.T) {
+	e := NewGKEPodSnapshots(nil, nil)
+	cases := []struct {
+		name        string
+		pod         *corev1.Pod
+		wantSnap    string
+		wantBypass  bool
+		wantPresent bool
+	}{
+		{
+			name:        "nil pod",
+			pod:         nil,
+			wantSnap:    "",
+			wantBypass:  false,
+			wantPresent: false,
+		},
+		{
+			name:        "missing annotation",
+			pod:         &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p"}},
+			wantSnap:    "",
+			wantBypass:  false,
+			wantPresent: false,
+		},
+		{
+			name: "ordered restore snapshot",
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name:        "p",
+				Annotations: map[string]string{"podsnapshot.gke.io/ps-name": "snap-42"},
+			}},
+			wantSnap:    "snap-42",
+			wantBypass:  false,
+			wantPresent: true,
+		},
+		{
+			name: "cold-start bypass",
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name:        "p",
+				Annotations: map[string]string{"podsnapshot.gke.io/ps-name": ""},
+			}},
+			wantSnap:    "",
+			wantBypass:  true,
+			wantPresent: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap, bypass, present := e.InspectRestoreOrder(tc.pod)
+			if snap != tc.wantSnap || bypass != tc.wantBypass || present != tc.wantPresent {
+				t.Fatalf("InspectRestoreOrder() = (%q, %t, %t), want (%q, %t, %t)",
+					snap, bypass, present, tc.wantSnap, tc.wantBypass, tc.wantPresent)
+			}
+		})
+	}
+}

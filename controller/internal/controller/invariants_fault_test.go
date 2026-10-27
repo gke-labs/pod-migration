@@ -31,6 +31,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
@@ -194,12 +195,12 @@ func buildDynamicPodSnapshotCRDs() []*apiextensionsv1.CustomResourceDefinition {
 	}
 }
 
-// totalInvariantViolations sums the process-global Prometheus counter across I1-I11.
+// totalInvariantViolations sums the process-global Prometheus counter across I1-I12.
 // NOTE: Subtests in TestT1_EnvtestFaultInjectionMatrix must remain sequential (do not call
 // t.Parallel()) because each subtest asserts before/after deltas against this shared counter.
 func totalInvariantViolations() float64 {
 	var sum float64
-	for _, id := range []string{"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "I10", "I11"} {
+	for _, id := range []string{"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "I10", "I11", "I12"} {
 		sum += testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues(id))
 	}
 	return sum
@@ -1625,6 +1626,325 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 				cur.Finalizers = nil
 				_ = k8sClient.Update(ctx, &cur)
 			}
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// Scenario 8: RestoreOutcomeConfirmed Fault Injection (I12: #179 / #79)
+	//   Leg 1: Clean Succeeded PMJ on GKE Pod Snapshots with Restored=True
+	//          (Reason=RestoreInferred) passes with 0 I12 violations.
+	//   Leg 2: Fault-inject Restored=True (Reason=RestoreVerified) on a GKE Pod
+	//          Snapshots Succeeded PMJ -> I12 UnconfirmedRestoreMarkedVerified fires.
+	//   Leg 3: Fault-inject Restored=True on an active PhaseRestoring PMJ -> I12
+	//          NonSucceededJobMarkedRestored fires and aborts the PMJ in ModeStrict.
+	// -------------------------------------------------------------------------
+	t.Run("S8_RestoreOutcomeConfirmed_I12", func(t *testing.T) {
+		ns := createTestNamespace(t, ctx, k8sClient, "t1-s8-i12")
+		recorder := record.NewFakeRecorder(32)
+		invEngine := invariants.NewEngine(invariants.ModeStrict, recorder)
+		pmjRec := &PodMigrationJobReconciler{
+			Client:          k8sClient,
+			APIReader:       k8sClient,
+			Scheme:          scheme,
+			Recorder:        recorder,
+			InvariantEngine: invEngine,
+		}
+
+		replClean := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "repl-clean-s8",
+				Annotations: map[string]string{
+					util.AnnotationAssignedPMJ:   "pmj-clean-s8",
+					"podsnapshot.gke.io/ps-name": "snap-clean-s8",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+			},
+		}
+		if err := k8sClient.Create(ctx, replClean); err != nil {
+			t.Fatalf("create replClean: %v", err)
+		}
+
+		now := metav1.Now()
+		pmjClean := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "pmj-clean-s8",
+				Annotations: map[string]string{
+					engine.AnnotationEngine: "gke-pod-snapshots",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "origin-clean-s8"},
+				TargetPodUID: "uid-origin-clean-s8",
+			},
+		}
+		if err := k8sClient.Create(ctx, pmjClean); err != nil {
+			t.Fatalf("create pmjClean: %v", err)
+		}
+		pmjClean.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+		pmjClean.Status.SnapshotRef = "snap-clean-s8"
+		pmjClean.Status.RestoredPodName = replClean.Name
+		pmjClean.Status.RestoredPodUID = string(replClean.UID)
+		pmjClean.Status.CompletionTime = &now
+		pmjClean.Status.Conditions = []metav1.Condition{
+			{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonRestoreInferred,
+				Message:            "Pod state restored from snapshot; engine gke-pod-snapshots reported an unconfirmed restore: pod Ready",
+				LastTransitionTime: now,
+			},
+			{
+				Type:               invariants.ConditionRestored,
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonRestoreInferred,
+				Message:            "Pod state restored from snapshot; engine gke-pod-snapshots reported an unconfirmed restore: pod Ready",
+				LastTransitionTime: now,
+			},
+		}
+		if err := k8sClient.Status().Update(ctx, pmjClean); err != nil {
+			t.Fatalf("update pmjClean status: %v", err)
+		}
+
+		beforeLeg1 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I12"))
+		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjClean.Name},
+		}); err != nil {
+			t.Fatalf("pmjRec.Reconcile(pmjClean) failed: %v", err)
+		}
+		if afterLeg1 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I12")); afterLeg1 != beforeLeg1 {
+			t.Fatalf("expected 0 I12 violations on clean RestoreInferred PMJ, delta=%v", afterLeg1-beforeLeg1)
+		}
+
+		// Leg 2: Fault-inject Reason=RestoreVerified on GKE Pod Snapshots PMJ -> I12 fires
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: pmjClean.Name}, pmjClean); err != nil {
+			t.Fatalf("get pmjClean: %v", err)
+		}
+		pmjClean.Status.Conditions = []metav1.Condition{
+			{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonRestoreVerified,
+				Message:            "Pod state restored from snapshot",
+				LastTransitionTime: now,
+			},
+			{
+				Type:               invariants.ConditionRestored,
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonRestoreVerified,
+				Message:            "Pod state restored from snapshot",
+				LastTransitionTime: now,
+			},
+		}
+		if err := k8sClient.Status().Update(ctx, pmjClean); err != nil {
+			t.Fatalf("update pmjClean bogus RestoreVerified status: %v", err)
+		}
+
+		beforeLeg2 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I12"))
+		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjClean.Name},
+		}); err != nil {
+			t.Fatalf("pmjRec.Reconcile(pmjClean bogus RestoreVerified) failed: %v", err)
+		}
+		if afterLeg2 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I12")); afterLeg2 <= beforeLeg2 {
+			t.Fatalf("expected I12 counter to increment on unconfirmed RestoreVerified; before=%v after=%v", beforeLeg2, afterLeg2)
+		}
+
+		// Clean up pmjClean from Leg 2 so its leftover violation doesn't mask Leg 3
+		if err := k8sClient.Delete(ctx, pmjClean); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatalf("delete pmjClean before Leg 3: %v", err)
+		}
+
+		// Leg 3: Fault-inject Restored=True on an active PhaseRestoring PMJ -> I12 aborts PMJ to Failed in ModeStrict
+		replActive := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "repl-active-s8",
+				Annotations: map[string]string{
+					util.AnnotationAssignedPMJ:   "pmj-active-s8",
+					"podsnapshot.gke.io/ps-name": "snap-active-s8",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+			},
+		}
+		if err := k8sClient.Create(ctx, replActive); err != nil {
+			t.Fatalf("create replActive: %v", err)
+		}
+
+		pmjActive := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "pmj-active-s8",
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "origin-active-s8"},
+				TargetPodUID: "uid-origin-active-s8",
+			},
+		}
+		if err := k8sClient.Create(ctx, pmjActive); err != nil {
+			t.Fatalf("create pmjActive: %v", err)
+		}
+		pmjActive.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+		pmjActive.Status.SnapshotRef = "snap-active-s8"
+		pmjActive.Status.Consumed = true
+		pmjActive.Status.GateReleased = true
+		pmjActive.Status.RestoredPodName = replActive.Name
+		pmjActive.Status.RestoredPodUID = string(replActive.UID)
+		pmjActive.Status.RestoringStartTime = &now
+		pmjActive.Status.Conditions = []metav1.Condition{
+			{
+				Type:               invariants.ConditionRestored,
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonRestoreInferred,
+				Message:            "premature Restored=True while still Restoring",
+				LastTransitionTime: now,
+			},
+		}
+		if err := k8sClient.Status().Update(ctx, pmjActive); err != nil {
+			t.Fatalf("update pmjActive status: %v", err)
+		}
+
+		beforeLeg3 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I12"))
+		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmjActive.Name},
+		}); err != nil {
+			t.Fatalf("pmjRec.Reconcile(pmjActive) failed: %v", err)
+		}
+		if afterLeg3 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I12")); afterLeg3 <= beforeLeg3 {
+			t.Fatalf("expected I12 counter to increment on non-Succeeded Restored=True; before=%v after=%v", beforeLeg3, afterLeg3)
+		}
+		var gotActive pmv1alpha1.PodMigrationJob
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: pmjActive.Name}, &gotActive); err != nil {
+			t.Fatalf("get gotActive: %v", err)
+		}
+		if gotActive.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+			t.Fatalf("expected strict mode to fail pmjActive on I12 violation, got phase=%s", gotActive.Status.Phase)
+		}
+		condActive := meta.FindStatusCondition(gotActive.Status.Conditions, "Ready")
+		if condActive == nil || condActive.Status != metav1.ConditionFalse || condActive.Reason != invariants.EventReasonInvariantViolation || !strings.Contains(condActive.Message, "[I12:RestoreOutcomeConfirmed]") || !strings.Contains(condActive.Message, "NonSucceededJobMarkedRestored") {
+			t.Fatalf("expected Ready=False condition with [I12:RestoreOutcomeConfirmed] NonSucceededJobMarkedRestored, got %+v", condActive)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// RestoreOrders Controller Wiring (I2):
+	// Verifies that Reconciler wiring of RestoreOrders from Engine.Registry
+	// properly supplies order inspection to InvariantEngine:
+	// - Leg 1: Replacement pod carries orderingEngine restore order -> I2 passes (0 violations).
+	// - Leg 2: Order annotation is removed/missing -> I2 fires SucceededPodMissingRestoreAnnotation.
+	// -------------------------------------------------------------------------
+	t.Run("RestoreOrders_ControllerWiring_I2", func(t *testing.T) {
+		ns := createTestNamespace(t, ctx, k8sClient, "t1-restore-orders")
+		recorder := record.NewFakeRecorder(32)
+		invEngine := invariants.NewEngine(invariants.ModeStrict, recorder)
+
+		orderer := &orderingEngine{routedEngine{name: "ordering", classes: []string{"@default"}}}
+		registry := engine.NewRegistry("ordering")
+		if err := registry.Register(orderer); err != nil {
+			t.Fatalf("Register ordering: %v", err)
+		}
+
+		pmjRec := &PodMigrationJobReconciler{
+			Client:          k8sClient,
+			APIReader:       k8sClient,
+			Scheme:          scheme,
+			Recorder:        recorder,
+			InvariantEngine: invEngine,
+			Engines:         registry,
+		}
+
+		replPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "repl-ordering",
+				Annotations: map[string]string{
+					util.AnnotationAssignedPMJ: "pmj-ordering",
+					routedRestoreAnnotation:    "snap-ordering-1",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+			},
+		}
+		if err := k8sClient.Create(ctx, replPod); err != nil {
+			t.Fatalf("create replPod: %v", err)
+		}
+
+		now := metav1.Now()
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "pmj-ordering",
+				Annotations: map[string]string{
+					engine.AnnotationEngine: "ordering",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "origin-ordering"},
+				TargetPodUID: "uid-origin-ordering",
+			},
+		}
+		if err := k8sClient.Create(ctx, pmj); err != nil {
+			t.Fatalf("create pmj: %v", err)
+		}
+		pmj.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+		pmj.Status.SnapshotRef = "snap-ordering-1"
+		pmj.Status.RestoredPodName = replPod.Name
+		pmj.Status.RestoredPodUID = string(replPod.UID)
+		pmj.Status.CompletionTime = &now
+		pmj.Status.Conditions = []metav1.Condition{
+			{
+				Type:               invariants.ConditionRestored,
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonRestoreVerified,
+				Message:            "engine ordering confirmed the restore: snapshot restored",
+				LastTransitionTime: now,
+			},
+			{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonRestoreVerified,
+				Message:            "engine ordering confirmed the restore: snapshot restored",
+				LastTransitionTime: now,
+			},
+		}
+		if err := k8sClient.Status().Update(ctx, pmj); err != nil {
+			t.Fatalf("update pmj status: %v", err)
+		}
+
+		// Leg 1: Order annotation is present -> I2 passes (0 violations)
+		beforeLeg1 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2"))
+		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmj.Name},
+		}); err != nil {
+			t.Fatalf("pmjRec.Reconcile(pmj with order) failed: %v", err)
+		}
+		if afterLeg1 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2")); afterLeg1 != beforeLeg1 {
+			t.Fatalf("expected 0 I2 violations when routed restore order annotation is present, delta=%v", afterLeg1-beforeLeg1)
+		}
+
+		// Leg 2: Missing order annotation -> I2 fires SucceededPodMissingRestoreAnnotation
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: replPod.Name}, replPod); err != nil {
+			t.Fatalf("get replPod: %v", err)
+		}
+		delete(replPod.Annotations, routedRestoreAnnotation)
+		if err := k8sClient.Update(ctx, replPod); err != nil {
+			t.Fatalf("update replPod removing order annotation: %v", err)
+		}
+
+		beforeLeg2 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2"))
+		if _, err := pmjRec.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: pmj.Name},
+		}); err != nil {
+			t.Fatalf("pmjRec.Reconcile(pmj missing order) failed: %v", err)
+		}
+		if afterLeg2 := testutil.ToFloat64(metrics.InvariantViolationsTotal.WithLabelValues("I2")); afterLeg2 <= beforeLeg2 {
+			t.Fatalf("expected I2 counter to increment when routed restore order is missing; before=%v after=%v", beforeLeg2, afterLeg2)
 		}
 	})
 }
