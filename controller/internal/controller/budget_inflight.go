@@ -79,8 +79,9 @@ func (c *InFlightBudgetChecker) Check(ctx context.Context, job *pmv1alpha1.PodMi
 	for i := range pdbs.Items {
 		pdb := &pdbs.Items[i]
 		selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
-		// Like the eviction API, a PDB with an empty selector covers nothing.
-		if err != nil || selector.Empty() || !selector.Matches(labels.Set(source.Labels)) {
+		// An empty selector (&metav1.LabelSelector{}) selects all pods in the
+		// namespace, matching the eviction API; a nil selector selects nothing.
+		if err != nil || !selector.Matches(labels.Set(source.Labels)) {
 			continue
 		}
 		covering = append(covering, coveringPDB{pdb, selector})
@@ -91,11 +92,19 @@ func (c *InFlightBudgetChecker) Check(ctx context.Context, job *pmv1alpha1.PodMi
 			return reasonBudgetExhausted, refusal
 		}
 	}
+	// Pre-check the local in-flight count before the dry run. If in-flight
+	// siblings already exhaust the budget, return without sending an
+	// unnecessary dry-run eviction POST.
+	for _, cov := range covering {
+		if reason, err := c.checkPDB(ctx, job, source, cov.pdb, cov.selector, false); reason != reasonBudgetAllowed {
+			return reason, err
+		}
+	}
 	if reason, err := c.DryRun.Check(ctx, job, podName); reason != reasonBudgetAllowed {
 		return reason, err
 	}
 	for _, cov := range covering {
-		if reason, err := c.checkPDB(ctx, job, source, cov.pdb, cov.selector); reason != reasonBudgetAllowed {
+		if reason, err := c.checkPDB(ctx, job, source, cov.pdb, cov.selector, true); reason != reasonBudgetAllowed {
 			return reason, err
 		}
 	}
@@ -129,13 +138,17 @@ func cachedBudgetRefusal(source *corev1.Pod, pdb *policyv1.PodDisruptionBudget) 
 	return err
 }
 
-// checkPDB counts one PDB under its lock, and reserves the budget for job
-// when it passes.
-func (c *InFlightBudgetChecker) checkPDB(ctx context.Context, job *pmv1alpha1.PodMigrationJob, source *corev1.Pod, pdb *policyv1.PodDisruptionBudget, selector labels.Selector) (string, error) {
+// checkPDB counts one PDB, and reserves the budget for job when reserve is true
+// and the check passes. When reserve is false, it runs as a read-only pre-check
+// without acquiring the per-PDB lock, skipping dry-run eviction POSTs when
+// in-flight siblings already exhaust the budget.
+func (c *InFlightBudgetChecker) checkPDB(ctx context.Context, job *pmv1alpha1.PodMigrationJob, source *corev1.Pod, pdb *policyv1.PodDisruptionBudget, selector labels.Selector, reserve bool) (string, error) {
 	key := pdb.Namespace + "/" + pdb.Name
-	lock := c.pdbLock(key)
-	lock.Lock()
-	defer lock.Unlock()
+	if reserve {
+		lock := c.pdbLock(key)
+		lock.Lock()
+		defer lock.Unlock()
+	}
 
 	sourceHealthy := podCountsHealthy(source)
 	if !sourceHealthy && pdb.Spec.UnhealthyPodEvictionPolicy != nil &&
@@ -193,7 +206,9 @@ func (c *InFlightBudgetChecker) checkPDB(ctx context.Context, job *pmv1alpha1.Po
 		return reasonMigrationsInFlight, fmt.Errorf("PodDisruptionBudget %s needs %d healthy pods, and %d would remain while %d other migrations are in flight (%s)",
 			pdb.Name, pdb.Status.DesiredHealthy, healthy, len(inFlight), strings.Join(names, ", "))
 	}
-	c.reserve(key, job.UID)
+	if reserve {
+		c.reserve(key, job.UID)
+	}
 	return reasonBudgetAllowed, nil
 }
 

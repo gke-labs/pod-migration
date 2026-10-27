@@ -3,7 +3,11 @@ package controller
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -36,8 +40,18 @@ var pdbMayHaveFreedBudget = predicate.Funcs{
 }
 
 // budgetWaitersForPDB returns the jobs waiting in Pending for the disruption
-// budget in the PodDisruptionBudget's namespace.
+// budget in the PodDisruptionBudget's namespace whose source pod matches
+// the PDB's selector.
 func (r *PodMigrationJobReconciler) budgetWaitersForPDB(ctx context.Context, pdb client.Object) []reconcile.Request {
+	pdbObj, ok := pdb.(*policyv1.PodDisruptionBudget)
+	if !ok {
+		return nil
+	}
+	selector, err := metav1.LabelSelectorAsSelector(pdbObj.Spec.Selector)
+	if err != nil {
+		return nil
+	}
+
 	jobs := &pmv1alpha1.PodMigrationJobList{}
 	if err := r.List(ctx, jobs, client.InNamespace(pdb.GetNamespace())); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to list migration jobs to wake after a PodDisruptionBudget change", "pdb", client.ObjectKeyFromObject(pdb))
@@ -45,9 +59,18 @@ func (r *PodMigrationJobReconciler) budgetWaitersForPDB(ctx context.Context, pdb
 	}
 	var reqs []reconcile.Request
 	for i := range jobs.Items {
-		if waitingForDisruptionBudget(&jobs.Items[i]) {
-			reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&jobs.Items[i])})
+		job := &jobs.Items[i]
+		if !waitingForDisruptionBudget(job) {
+			continue
 		}
+		source := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: job.Spec.PodRef.Name}, source); err != nil {
+			continue
+		}
+		if !selector.Matches(labels.Set(source.Labels)) {
+			continue
+		}
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(job)})
 	}
 	return reqs
 }

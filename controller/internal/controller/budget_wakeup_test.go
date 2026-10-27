@@ -37,7 +37,8 @@ func TestPDBMayHaveFreedBudget(t *testing.T) {
 }
 
 // TestPodMigrationJobReconciler_BudgetWaitersForPDB: a PodDisruptionBudget
-// change wakes the jobs in its namespace that wait for the budget, and no others.
+// change wakes the jobs in its namespace that wait for the budget whose source
+// pod matches the PDB's selector, and no others.
 func TestPodMigrationJobReconciler_BudgetWaitersForPDB(t *testing.T) {
 	waiting := func(name, reason string, status metav1.ConditionStatus) *pmv1alpha1.PodMigrationJob {
 		job := ifJob(name, name, pmv1alpha1.PodMigrationJobPhasePending)
@@ -46,16 +47,24 @@ func TestPodMigrationJobReconciler_BudgetWaitersForPDB(t *testing.T) {
 	}
 	elsewhere := waiting("elsewhere", reasonBudgetExhausted, metav1.ConditionFalse)
 	elsewhere.Namespace = "other"
+	otherAppPod := ifPod("other-app", true)
+	otherAppPod.Labels = map[string]string{"app": "other"}
 	c := fake.NewClientBuilder().WithScheme(budgetScheme()).WithObjects(
+		ifPod("exhausted", true),
+		ifPod("in-flight", true),
+		ifPod("check-error", true),
+		otherAppPod,
 		waiting("exhausted", reasonBudgetExhausted, metav1.ConditionFalse),
 		waiting("in-flight", reasonMigrationsInFlight, metav1.ConditionFalse),
 		waiting("check-error", reasonBudgetCheckError, metav1.ConditionUnknown),
+		waiting("other-app", reasonBudgetExhausted, metav1.ConditionFalse),
 		ifJob("unchecked", "unchecked", pmv1alpha1.PodMigrationJobPhasePending),
 		ifJob("snapshotting", "snapshotting", pmv1alpha1.PodMigrationJobPhaseSnapshotting),
 		elsewhere,
 	).Build()
 	r := &PodMigrationJobReconciler{Client: c, Scheme: c.Scheme()}
 
+	// 1. Selector matches "app=db": only the db waiters are woken.
 	reqs := r.budgetWaitersForPDB(context.Background(), ifPDB(2, "db", nil))
 	got := map[types.NamespacedName]bool{}
 	for _, req := range reqs {
@@ -69,5 +78,24 @@ func TestPodMigrationJobReconciler_BudgetWaitersForPDB(t *testing.T) {
 		if !got[types.NamespacedName{Namespace: "default", Name: name}] {
 			t.Errorf("didn't wake %s; woke %v", name, reqs)
 		}
+	}
+	if got[types.NamespacedName{Namespace: "default", Name: "other-app"}] {
+		t.Errorf("woke other-app whose pod does not match PDB selector")
+	}
+
+	// 2. Empty selector ({}) covers all pods in the namespace: wakes other-app too.
+	emptyPDB := ifPDB(2, "db", nil)
+	emptyPDB.Spec.Selector = &metav1.LabelSelector{}
+	emptyReqs := r.budgetWaitersForPDB(context.Background(), emptyPDB)
+	if len(emptyReqs) != 4 {
+		t.Errorf("empty selector woke %d jobs, want 4", len(emptyReqs))
+	}
+
+	// 3. Nil selector covers nothing: wakes none.
+	nilPDB := ifPDB(2, "db", nil)
+	nilPDB.Spec.Selector = nil
+	nilReqs := r.budgetWaitersForPDB(context.Background(), nilPDB)
+	if len(nilReqs) != 0 {
+		t.Errorf("nil selector woke %d jobs, want 0", len(nilReqs))
 	}
 }

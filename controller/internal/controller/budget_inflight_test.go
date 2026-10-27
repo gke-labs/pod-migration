@@ -71,6 +71,8 @@ func TestInFlightBudgetChecker_CountsOtherMigrations(t *testing.T) {
 	gone.Finalizers = []string{"test/keep"}
 	emptySelectorPDB := ifPDB(3, "db", nil)
 	emptySelectorPDB.Spec.Selector = &metav1.LabelSelector{}
+	nilSelectorPDB := ifPDB(3, "db", nil)
+	nilSelectorPDB.Spec.Selector = nil
 	for name, tc := range map[string]struct {
 		objs       []client.Object
 		wantReason string
@@ -99,8 +101,13 @@ func TestInFlightBudgetChecker_CountsOtherMigrations(t *testing.T) {
 				ifJob("other", "b", pmv1alpha1.PodMigrationJobPhaseSnapshotting)},
 			reasonBudgetAllowed,
 		},
-		"a PDB with an empty selector covers nothing, as in the eviction API": {
+		"a PDB with an empty selector covers all pods in the namespace": {
 			[]client.Object{ifPod("a", true), ifPod("b", true), ifPod("c", true), emptySelectorPDB, self,
+				ifJob("other", "b", pmv1alpha1.PodMigrationJobPhaseSnapshotting)},
+			reasonMigrationsInFlight,
+		},
+		"a PDB with a nil selector covers nothing": {
+			[]client.Object{ifPod("a", true), ifPod("b", true), ifPod("c", true), nilSelectorPDB, self,
 				ifJob("other", "b", pmv1alpha1.PodMigrationJobPhaseSnapshotting)},
 			reasonBudgetAllowed,
 		},
@@ -222,6 +229,10 @@ func TestInFlightBudgetChecker_CachedBudgetSkipsTheDryRun(t *testing.T) {
 	emptySelector := ifPDB(2, "db", nil)
 	emptySelector.Spec.Selector = &metav1.LabelSelector{}
 	emptySelector.Status.DisruptionsAllowed = 0
+	emptySelector.Status.CurrentHealthy = 2
+	nilSelector := ifPDB(2, "db", nil)
+	nilSelector.Spec.Selector = nil
+	nilSelector.Status.DisruptionsAllowed = 0
 	self := ifJob("self", "a", pmv1alpha1.PodMigrationJobPhasePending)
 
 	for name, tc := range map[string]struct {
@@ -250,9 +261,18 @@ func TestInFlightBudgetChecker_CachedBudgetSkipsTheDryRun(t *testing.T) {
 			[]client.Object{ifPod("b", true), exhausted, self},
 			reasonBudgetAllowed, 1, "",
 		},
-		"an empty selector covers nothing": {
+		"an empty selector covers all pods in the namespace": {
 			[]client.Object{ifPod("a", true), ifPod("b", true), emptySelector, self},
+			reasonBudgetExhausted, 0, "The disruption budget db needs 2 healthy pods and has 2 currently",
+		},
+		"a nil selector covers nothing": {
+			[]client.Object{ifPod("a", true), ifPod("b", true), nilSelector, self},
 			reasonBudgetAllowed, 1, "",
+		},
+		"in-flight siblings exhaust budget: dry run is skipped": {
+			[]client.Object{ifPod("a", true), ifPod("b", true), ifPod("c", true), ifPDB(2, "db", nil), self,
+				ifJob("other", "b", pmv1alpha1.PodMigrationJobPhaseSnapshotting)},
+			reasonMigrationsInFlight, 0, "",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
