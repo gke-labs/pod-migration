@@ -16,7 +16,8 @@ import "strings"
 //     against containerd wrapping the runtime error differently across
 //     versions. Strictly wider than the observed string, so it cannot miss what
 //     S2 matches. It is also runc+CRIU wording, and is expected to migrate to a
-//     CRIU engine when one lands.
+//     CRIU engine when one lands. Because GVisor classifies only gVisor pods
+//     (see CoversRuntimeClass), this wording never fires on a runc pod (#132).
 //
 // Anything outside this set classifies as FailureUnrecognized: reported via
 // metric, Warning event and condition, but never acted on. That is how a
@@ -29,12 +30,22 @@ var gvisorSignatures = []string{
 	"restore failed",
 }
 
+// GVisorRuntimeClass is the runtime class of gVisor (GKE Sandbox) pods.
+const GVisorRuntimeClass = "gvisor"
+
 // GVisor classifies restore failures from gVisor sentry save/restore, as
 // surfaced through containerd and the kubelet.
 type GVisor struct{}
 
 // Name implements Engine.
 func (GVisor) Name() string { return "gvisor" }
+
+// CoversRuntimeClass implements RuntimeClassScoped: gVisor restore failures
+// only happen in gVisor pods, so pods of any other runtime class, including
+// pods without one, are never matched against gvisorSignatures.
+func (GVisor) CoversRuntimeClass(runtimeClass string) bool {
+	return runtimeClass == GVisorRuntimeClass
+}
 
 // MatchesRestoreFailure implements Engine.
 func (GVisor) MatchesRestoreFailure(msg string) (string, bool) {
