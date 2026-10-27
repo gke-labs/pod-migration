@@ -707,6 +707,10 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		}
 	}
 
+	var restoreOrders invariants.RestoreOrderFunc
+	if r.Engines != nil {
+		restoreOrders = r.Engines.InspectRestoreOrder
+	}
 	violations, shouldFailStrict := r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
 		Now:                          time.Now(),
 		Reconciler:                   "PodMigrationJobReconciler",
@@ -719,6 +723,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		HasOrphanedTrigger:           hasOrphanedTrigger,
 		RestoreCrashSignatureMatched: restoreCrashMatched,
 		PrimarySnapshotConditions:    primarySnapshotConditions,
+		RestoreOrders:                restoreOrders,
 	})
 	if shouldFailStrict && len(violations) > 0 && !invariants.IsTerminalPhase(job.Status.Phase) {
 		orig := job.DeepCopy()

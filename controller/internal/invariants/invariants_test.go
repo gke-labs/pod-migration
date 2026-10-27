@@ -1728,3 +1728,339 @@ func TestInvariants_I2_ColdStartBypassAfterVerifiedRestore(t *testing.T) {
 		})
 	}
 }
+
+func TestInvariants_I1_I2_EngineAwareRestoreOrders(t *testing.T) {
+	const criuAnn = "criu.pod-migration.gke.io/restore-snapshot"
+	restoreOrders := func(engineName string, pod *corev1.Pod) (string, bool, bool) {
+		if pod == nil || pod.Annotations == nil {
+			return "", false, false
+		}
+		if engineName == "criu" || engineName == "" {
+			if val, exists := pod.Annotations[criuAnn]; exists {
+				trimmed := strings.TrimSpace(val)
+				if trimmed == "" {
+					return "", true, true
+				}
+				return trimmed, false, true
+			}
+			if engineName == "criu" {
+				return "", false, false
+			}
+		}
+		val, exists := pod.Annotations[AnnotationPSName]
+		if !exists {
+			return "", false, false
+		}
+		trimmed := strings.TrimSpace(val)
+		if trimmed == "" {
+			return "", true, true
+		}
+		return trimmed, false, true
+	}
+
+	criuPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "pmj-criu-1",
+			Annotations: map[string]string{AnnotationEngine: "criu"},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			SnapshotRef:     "ckpt-criu-1",
+			Consumed:        true,
+			GateReleased:    true,
+			RestoredPodName: "pod-criu-a",
+			RestoredPodUID:  "uid-criu-a",
+		},
+	}
+	podA := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod-criu-a",
+			UID:       types.UID("uid-criu-a"),
+			Annotations: map[string]string{
+				AnnotationAssignedPMJ: "pmj-criu-1",
+				criuAnn:               "ckpt-criu-1",
+			},
+		},
+	}
+
+	cleanSnap := &ReconcileSnapshot{
+		PrimaryPMJ:    criuPMJ,
+		NamespacePods: []corev1.Pod{podA},
+		RestoreOrders: restoreOrders,
+	}
+	if vs := EvaluateI1(cleanSnap); len(vs) != 0 {
+		t.Fatalf("expected 0 I1 violations on clean CRIU restore order, got %+v", vs)
+	}
+	if vs := EvaluateI2(cleanSnap); len(vs) != 0 {
+		t.Fatalf("expected 0 I2 violations on clean CRIU restore order, got %+v", vs)
+	}
+
+	// Duplicate CRIU checkpoint consumption -> I1 violation
+	podB := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod-criu-b",
+			UID:       types.UID("uid-criu-b"),
+			Annotations: map[string]string{
+				AnnotationAssignedPMJ: "pmj-criu-1",
+				criuAnn:               "ckpt-criu-1",
+			},
+		},
+	}
+	dupSnap := &ReconcileSnapshot{
+		PrimaryPMJ:    criuPMJ,
+		NamespacePods: []corev1.Pod{podA, podB},
+		RestoreOrders: restoreOrders,
+	}
+	if vs := EvaluateI1(dupSnap); len(vs) == 0 || vs[0].InvariantID != "I1" {
+		t.Fatalf("expected I1 violation on duplicate CRIU checkpoint consumption, got %+v", vs)
+	}
+
+	// CRIU cold-start bypass on Succeeded PMJ -> I2 violation
+	bypassPod := podA
+	bypassPod.Annotations = map[string]string{
+		AnnotationAssignedPMJ: "pmj-criu-1",
+		criuAnn:               "",
+	}
+	bypassSnap := &ReconcileSnapshot{
+		PrimaryPMJ:    criuPMJ,
+		NamespacePods: []corev1.Pod{bypassPod},
+		RestoreOrders: restoreOrders,
+	}
+	if vs := EvaluateI2(bypassSnap); len(vs) != 1 || vs[0].Reason != "SucceededPodMissingRestoreAnnotation" {
+		t.Fatalf("expected I2 SucceededPodMissingRestoreAnnotation on CRIU cold-start bypass, got %+v", vs)
+	}
+}
+
+func TestInvariants_I12_RestoreOutcomeConfirmed(t *testing.T) {
+	// 1. Clean: GKE Pod Snapshots Succeeded with Restored=True (Reason=RestoreInferred)
+	gkeInferred := &ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-gke-inferred"},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+				RestoredPodName: "pod-gke-1",
+				Conditions: []metav1.Condition{
+					{
+						Type:    "Ready",
+						Status:  metav1.ConditionTrue,
+						Reason:  ReasonRestoreInferred,
+						Message: "Pod state restored from snapshot; engine gke-pod-snapshots reported an unconfirmed restore: pod Ready, with no restore-failure Warning event since restoring started",
+					},
+					{
+						Type:    ConditionRestored,
+						Status:  metav1.ConditionTrue,
+						Reason:  ReasonRestoreInferred,
+						Message: "Pod state restored from snapshot; engine gke-pod-snapshots reported an unconfirmed restore: pod Ready, with no restore-failure Warning event since restoring started",
+					},
+				},
+			},
+		},
+	}
+	if vs := EvaluateI12(gkeInferred); len(vs) != 0 {
+		t.Fatalf("expected 0 I12 violations on GKE RestoreInferred, got %+v", vs)
+	}
+
+	// 2. Clean: CRIU Succeeded with Restored=True (Reason=RestoreVerified) and positive confirmation evidence
+	criuVerified := &ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "default",
+				Name:        "pmj-criu-verified",
+				Annotations: map[string]string{AnnotationEngine: "criu"},
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+				RestoredPodName: "pod-criu-1",
+				Conditions: []metav1.Condition{
+					{
+						Type:    "Ready",
+						Status:  metav1.ConditionTrue,
+						Reason:  ReasonRestoreVerified,
+						Message: "Pod state restored from snapshot; engine criu confirmed the restore: CRIURestore.status.phase=Succeeded (pid=42)",
+					},
+					{
+						Type:    ConditionRestored,
+						Status:  metav1.ConditionTrue,
+						Reason:  ReasonRestoreVerified,
+						Message: "Pod state restored from snapshot; engine criu confirmed the restore: CRIURestore.status.phase=Succeeded (pid=42)",
+					},
+				},
+			},
+		},
+	}
+	if vs := EvaluateI12(criuVerified); len(vs) != 0 {
+		t.Fatalf("expected 0 I12 violations on confirmed CRIU RestoreVerified, got %+v", vs)
+	}
+
+	// 3. Violation: GKE Pod Snapshots claiming Reason=RestoreVerified (GKE has no positive restore signal)
+	gkeBogusVerified := &ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "default",
+				Name:        "pmj-gke-bogus",
+				Annotations: map[string]string{AnnotationEngine: DefaultEngineName},
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+				RestoredPodName: "pod-gke-bogus",
+				Conditions: []metav1.Condition{
+					{
+						Type:    ConditionRestored,
+						Status:  metav1.ConditionTrue,
+						Reason:  ReasonRestoreVerified,
+						Message: "Pod state restored from snapshot",
+					},
+				},
+			},
+		},
+	}
+	if vs := EvaluateI12(gkeBogusVerified); len(vs) != 1 || vs[0].InvariantID != "I12" || vs[0].Reason != "UnconfirmedRestoreMarkedVerified" {
+		t.Fatalf("expected I12 UnconfirmedRestoreMarkedVerified when gke-pod-snapshots claims RestoreVerified, got %+v", vs)
+	}
+
+	// 4. Violation: Non-GKE engine claiming Reason=RestoreVerified without positive confirmation evidence
+	criuUnconfirmed := &ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "default",
+				Name:        "pmj-criu-unconfirmed",
+				Annotations: map[string]string{AnnotationEngine: "criu"},
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+				RestoredPodName: "pod-criu-unconfirmed",
+				Conditions: []metav1.Condition{
+					{
+						Type:    ConditionRestored,
+						Status:  metav1.ConditionTrue,
+						Reason:  ReasonRestoreVerified,
+						Message: "Pod state restored from snapshot; engine criu reported an unconfirmed restore: pod Ready",
+					},
+				},
+			},
+		},
+	}
+	if vs := EvaluateI12(criuUnconfirmed); len(vs) != 1 || vs[0].Reason != "UnconfirmedRestoreMarkedVerified" {
+		t.Fatalf("expected I12 UnconfirmedRestoreMarkedVerified when CRIU message lacks positive confirmation, got %+v", vs)
+	}
+
+	// 5. Violation: Non-Succeeded PMJ carrying Restored=True
+	activeRestored := &ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-restoring-marked"},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+				RestoredPodName: "pod-restoring-1",
+				Conditions: []metav1.Condition{
+					{
+						Type:    ConditionRestored,
+						Status:  metav1.ConditionTrue,
+						Reason:  ReasonRestoreInferred,
+						Message: "premature Restored=True while still Restoring",
+					},
+				},
+			},
+		},
+	}
+	if vs := EvaluateI12(activeRestored); len(vs) != 1 || vs[0].Reason != "NonSucceededJobMarkedRestored" {
+		t.Fatalf("expected I12 NonSucceededJobMarkedRestored when Phase=Restoring has Restored=True, got %+v", vs)
+	}
+
+	// 6. Violation: Succeeded PMJ with mismatched Ready vs Restored condition reason
+	mismatchedReady := &ReconcileSnapshot{
+		PrimaryPMJ: &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-mismatch"},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+				RestoredPodName: "pod-mismatch",
+				Conditions: []metav1.Condition{
+					{
+						Type:   "Ready",
+						Status: metav1.ConditionTrue,
+						Reason: ReasonRestoreVerified,
+					},
+					{
+						Type:   ConditionRestored,
+						Status: metav1.ConditionTrue,
+						Reason: ReasonRestoreInferred,
+					},
+				},
+			},
+		},
+	}
+	if vs := EvaluateI12(mismatchedReady); len(vs) != 1 || vs[0].Reason != "UnconfirmedRestoreMarkedVerified" {
+		t.Fatalf("expected I12 UnconfirmedRestoreMarkedVerified when Ready claims RestoreVerified on inferred restore, got %+v", vs)
+	}
+
+	// 7. Verify DefaultRules registers I12 as an immediate (non-debounced) rule
+	foundI12 := false
+	for _, r := range DefaultRules {
+		if r.ID() == "I12" && r.Name() == "RestoreOutcomeConfirmed" {
+			foundI12 = true
+			if _, ok := r.(DebouncedRule); ok {
+				t.Fatalf("expected DefaultRules I12 to be immediate (non-debounced), got DebouncedRule %T", r)
+			}
+			break
+		}
+	}
+	if !foundI12 {
+		t.Fatalf("expected DefaultRules to register I12 (RestoreOutcomeConfirmed)")
+	}
+}
+
+func TestInvariants_I12_GrandfatherLegacySucceededJob(t *testing.T) {
+	legacyJob := pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-legacy-succeeded",
+			// No AnnotationEngine annotation!
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			RestoredPodName: "pod-1",
+			SnapshotRef:     "snap-1",
+			Conditions: []metav1.Condition{
+				{
+					Type:    "Ready",
+					Status:  metav1.ConditionTrue,
+					Reason:  ReasonRestoreVerified,
+					Message: "Pod state restored from snapshot",
+				},
+				{
+					Type:    ConditionRestored,
+					Status:  metav1.ConditionTrue,
+					Reason:  ReasonRestoreVerified,
+					Message: "Pod state restored from snapshot",
+				},
+			},
+		},
+	}
+	activeJob := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-active-pending",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
+	}
+
+	snap := &ReconcileSnapshot{
+		PrimaryPMJ:    activeJob,
+		NamespacePMJs: []pmv1alpha1.PodMigrationJob{legacyJob, *activeJob},
+	}
+
+	eng := NewEngine(ModeStrict, nil)
+	violations, shouldFailStrict := eng.Evaluate(context.Background(), snap)
+	for _, v := range violations {
+		if v.InvariantID == "I12" {
+			t.Fatalf("unexpected I12 violation on grandfathered legacy job: %+v", v)
+		}
+	}
+	if shouldFailStrict {
+		t.Fatalf("expected shouldFailStrict=false with grandfathered legacy job, got true with violations: %+v", violations)
+	}
+}
