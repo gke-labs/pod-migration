@@ -52,11 +52,11 @@ const (
 	GateReleaseGraceWindow = 30 * time.Second
 
 	// LabelPodFenced is the pod label stamped on fenced source pods (#131, #154).
-	LabelPodFenced = "pod-migration.gke.io/fenced"
+	LabelPodFenced = util.LabelFenced
 	// ConditionSourceFenced is the PodMigrationJob condition recording source-pod fencing state (#131, #154).
-	ConditionSourceFenced = "SourceFenced"
+	ConditionSourceFenced = util.ConditionSourceFenced
 	// ReasonPodMigrationFenced is the Pod Ready condition reason held while a source pod is fenced (#131, #154).
-	ReasonPodMigrationFenced = "PodMigrationFenced"
+	ReasonPodMigrationFenced = util.ReasonPodMigrationFenced
 	// SourceFencedGraceWindow is the grace window after SourceFenced=True transitions
 	// on a PodMigrationJob during which I11 tolerates informer cache lag before the
 	// source Pod's fence label and Ready=False status appear in cached Pod lists.
