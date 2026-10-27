@@ -10,7 +10,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -20,6 +19,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -67,7 +67,20 @@ type EvictionGate struct {
 	// Eligibility selects the runtime classes whose pods are migrated. Nil
 	// means gVisor only (eligibility.DefaultMigratableRuntimeClasses).
 	Eligibility *eligibility.RuntimeClassPolicy
-	decoder     admission.Decoder
+	// Engines provides the snapshot engine for each pod: whether it can
+	// migrate the pod, and its policy for the pod. Optional: nil selects GKE
+	// Pod Snapshots, built from Client with Eligibility as its allow-list.
+	Engines *engine.Registry
+	decoder admission.Decoder
+}
+
+// engineFor returns the snapshot engine for pod, and false if no engine
+// serves it.
+func (a *EvictionGate) engineFor(pod *corev1.Pod) (engine.Engine, bool) {
+	if a.Engines != nil {
+		return a.Engines.ForPod(pod, nil)
+	}
+	return engine.NewGKEPodSnapshots(a.Client, nil, a.Eligibility), true
 }
 
 // Handle intercepts eviction requests.
@@ -114,13 +127,18 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed("feature not enabled")
 	}
 
-	// Only migrate pods whose runtime class the installed snapshot engine supports.
-	if !a.Eligibility.Allows(pod.Spec.RuntimeClassName) {
+	// Only migrate pods that a snapshot engine serves and can migrate. For GKE
+	// Pod Snapshots, that's the runtime-class allow-list.
+	eng, ok := a.engineFor(pod)
+	if !ok {
 		runtimeClass := eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName)
-		logger.Info("Pod runtime class is not migratable, allowing eviction immediately",
-			"runtimeClass", runtimeClass, "migratableRuntimeClasses", a.Eligibility.String())
-		return admission.Allowed(fmt.Sprintf("Pod runtime class %s is not migratable (allowed: %s), skipping migration",
-			runtimeClass, a.Eligibility.String()))
+		logger.Info("No snapshot engine serves the pod, allowing eviction immediately", "runtimeClass", runtimeClass)
+		return admission.Allowed(fmt.Sprintf("No snapshot engine serves runtime class %s, skipping migration", runtimeClass))
+	}
+	if verdict := eng.Eligible(pod, nil); !verdict.OK {
+		logger.Info("Snapshot engine can't migrate the pod, allowing eviction immediately",
+			"engine", eng.Name(), "runtimeClass", eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName), "reason", verdict.Reason)
+		return admission.Allowed(verdict.Reason)
 	}
 
 	// Check if this pod already had a migration that timed out waiting for PDB
@@ -197,14 +215,16 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return denied429("transient error resolving parent workload, retrying")
 	}
 
-	// 1. Find matching PodSnapshotPolicy (manual + stop)
-	matchingPSP, err := findLatestReadyManualStopPSP(ctx, a.Client, req.Namespace, pod.Labels)
+	// 1. Find the engine's policy for the pod. For GKE Pod Snapshots, that's
+	// the newest Ready, manual PodSnapshotPolicy that selects the pod, if its
+	// postCheckpoint is stop.
+	policy, err := eng.ResolvePolicy(ctx, pod)
 	if err != nil {
 		logger.Error(err, "Failed to resolve matching PodSnapshotPolicy")
 		return denied429("transient error resolving snapshot policy, retrying")
 	}
 
-	if matchingPSP == nil {
+	if policy == nil {
 		logger.Info("No matching ready manual+stop policy found, skipping migration and allowing eviction", "pod", req.Name)
 		if a.Recorder != nil {
 			a.Recorder.Event(pod, corev1.EventTypeWarning, "MigrationSkippedNoPolicy",
@@ -215,8 +235,8 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 
 	// Create new PodMigrationJob
 	logger.Info("Creating PodMigrationJob", "job", jobName)
-	jobLabels, jobAnnotations := util.BuildPMJLabelsAndAnnotations(
-		pod, parentName, parentKind, parentUID, matchingPSP, a.DefaultMigrationTimeout, util.TriggerSourceEviction,
+	jobLabels, jobAnnotations := util.BuildPMJLabelsAndAnnotationsForPolicy(
+		pod, parentName, parentKind, parentUID, policy.Name, a.DefaultMigrationTimeout, util.TriggerSourceEviction,
 	)
 
 	newJob := &pmv1alpha1.PodMigrationJob{
@@ -305,7 +325,9 @@ func (a *EvictionGate) InjectDecoder(d admission.Decoder) error {
 
 // SetupEvictionWebhookWithManager registers the webhook on the manager.
 // runtimeClasses selects which pods are migrated; nil means gVisor only.
-func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, defaultTimeout time.Duration, runtimeClasses *eligibility.RuntimeClassPolicy) error {
+// engines provides the snapshot engine for each pod; nil means GKE Pod
+// Snapshots with runtimeClasses as its allow-list.
+func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, defaultTimeout time.Duration, runtimeClasses *eligibility.RuntimeClassPolicy, engines *engine.Registry) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/validate-v1-pod-eviction",
@@ -315,6 +337,7 @@ func SetupEvictionWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, 
 			Recorder:                mgr.GetEventRecorderFor("pod-migration-controller"),
 			DefaultMigrationTimeout: defaultTimeout,
 			Eligibility:             runtimeClasses,
+			Engines:                 engines,
 			decoder:                 dec,
 		}),
 	)
@@ -328,10 +351,4 @@ func newEvictionWebhook(gate *EvictionGate) *admission.Webhook {
 		Handler:         gate,
 		WithContextFunc: contextWithAdmissionTimeout,
 	}
-}
-
-// findLatestReadyManualStopPSP finds the latest ready manual PodSnapshotPolicy in the namespace matching the labels,
-// and verifies that its postCheckpoint behavior is set to "stop".
-func findLatestReadyManualStopPSP(ctx context.Context, c client.Client, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {
-	return util.FindLatestReadyManualStopPSP(ctx, c, namespace, podLabels)
 }

@@ -290,6 +290,24 @@ func BuildPMJLabelsAndAnnotations(
 	defaultTimeout time.Duration,
 	triggerSource string,
 ) (map[string]string, map[string]string) {
+	policyName := ""
+	if matchingPSP != nil {
+		policyName = matchingPSP.GetName()
+	}
+	return BuildPMJLabelsAndAnnotationsForPolicy(pod, parentName, parentKind, parentUID, policyName, defaultTimeout, triggerSource)
+}
+
+// BuildPMJLabelsAndAnnotationsForPolicy is BuildPMJLabelsAndAnnotations for
+// callers that hold only the name of the snapshot policy serving the pod,
+// such as a snapshot engine's resolved policy. An empty name records no
+// policy.
+func BuildPMJLabelsAndAnnotationsForPolicy(
+	pod *corev1.Pod,
+	parentName, parentKind, parentUID string,
+	policyName string,
+	defaultTimeout time.Duration,
+	triggerSource string,
+) (map[string]string, map[string]string) {
 	jobLabels := make(map[string]string)
 	if parentName != "" {
 		jobLabels[LabelParentName] = parentName
@@ -335,11 +353,11 @@ func BuildPMJLabelsAndAnnotations(
 		}
 	}
 
-	if matchingPSP != nil && matchingPSP.GetName() != "" {
+	if policyName != "" {
 		if jobAnnotations == nil {
 			jobAnnotations = make(map[string]string)
 		}
-		jobAnnotations[AnnotationPodSnapshotPolicy] = matchingPSP.GetName()
+		jobAnnotations[AnnotationPodSnapshotPolicy] = policyName
 	}
 
 	if triggerSource != "" {

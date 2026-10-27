@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -44,6 +45,30 @@ type PodGateReconciler struct {
 	Scheme          *runtime.Scheme
 	Recorder        record.EventRecorder
 	InvariantEngine *invariants.Engine
+
+	// Engines provides the snapshot engine whose restore orders a released
+	// pod gets: the job's engine, or the pod's when it has no job. Optional:
+	// nil selects GKE Pod Snapshots.
+	Engines *engine.Registry
+}
+
+// restoreOrderer returns how to order a restore, or a cold start, for pod:
+// through the engine that serves job, or pod when job is nil. An engine
+// without the RestoreOrderer capability, or no engine, gets GKE Pod
+// Snapshots' restore orders, the ones used before the registry.
+func (r *PodGateReconciler) restoreOrderer(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) engine.RestoreOrderer {
+	var eng engine.Engine
+	if r.Engines != nil {
+		if job != nil {
+			eng, _ = r.Engines.ForJob(job)
+		} else {
+			eng, _ = r.Engines.ForPod(pod, nil)
+		}
+	}
+	if orderer, ok := eng.(engine.RestoreOrderer); ok {
+		return orderer
+	}
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, nil)
 }
 
 func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, reconcileErr *error) {
@@ -276,12 +301,14 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			}
 		}
 
-		// Inject GKE's native snapshot name annotation (SnapshotRef is non-empty
-		// here; the empty case released with the cold-start bypass above)
-		if pod.Annotations == nil {
-			pod.Annotations = make(map[string]string)
+		// Order the restore of the job's snapshot through its engine (GKE Pod
+		// Snapshots: the snapshot name in podsnapshot.gke.io/ps-name).
+		// SnapshotRef is non-empty here; the empty case released with the
+		// cold-start bypass above.
+		if err := r.restoreOrderer(pod, job).OrderRestore(pod, job); err != nil {
+			logger.Error(err, "Failed to order the restore", "pmj", correctedPMJ)
+			return ctrl.Result{}, err
 		}
-		pod.Annotations["podsnapshot.gke.io/ps-name"] = job.Status.SnapshotRef
 		logger.Info("Injected target snapshot ref to pod annotations", "snapshot", job.Status.SnapshotRef)
 
 		// Mark PMJ as consumed by this replacement pod to prevent stale resurrection
@@ -404,17 +431,20 @@ func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespac
 }
 
 // releaseWithColdStartBypass removes the gate and scrubs the migration
-// assignment: the assigned-pmj annotation is deleted and the ps-name
-// annotation is set to the explicit empty-string bypass, which tells the GKE
-// runtime NOT to attempt a native snapshot restore.  Every release that is
-// not backed by a durable snapshot must go through here — a bare gate removal
-// leaves the pod exposed to native restore of a stale snapshot.
+// assignment: the assigned-pmj annotation is deleted and the engine's
+// cold-start bypass is ordered (GKE Pod Snapshots: ps-name set to the
+// explicit empty string, which tells the GKE runtime NOT to attempt a native
+// snapshot restore).  Every release that is not backed by a durable snapshot
+// must go through here — a bare gate removal leaves the pod exposed to native
+// restore of a stale snapshot.
 func (r *PodGateReconciler) releaseWithColdStartBypass(pod *corev1.Pod) {
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
 	delete(pod.Annotations, "pod-migration.gke.io/assigned-pmj")
-	pod.Annotations["podsnapshot.gke.io/ps-name"] = ""
+	// The bypass is ordered through the engine that serves the pod. It can
+	// only fail for a nil pod.
+	_ = r.restoreOrderer(pod, nil).OrderColdStartBypass(pod)
 	r.removeGate(pod)
 }
 
