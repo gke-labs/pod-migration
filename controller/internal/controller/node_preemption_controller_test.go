@@ -649,3 +649,57 @@ func TestNodePreemptionReconciler_SortOrderMaximizesSurvivorCount(t *testing.T) 
 		t.Fatalf("expected ascending sort to maximize survivors at 3 pods, got %d", len(pmjList.Items))
 	}
 }
+
+func TestNodePreemptionReconciler_SkipsPodWithUnsatisfiedReadinessGate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	node := createTestNode("spot-readiness-gate-test", true, "taint-gke")
+	gateType := corev1.PodConditionType("snapshot.workspaces.gke.io/active")
+
+	podUnsatisfied := createTestPod("pod-pausing", "default", "spot-readiness-gate-test", "1Gi", "uid-pausing")
+	podUnsatisfied.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: gateType}}
+	podUnsatisfied.Status.Conditions = []corev1.PodCondition{
+		{Type: gateType, Status: corev1.ConditionFalse, Reason: "CheckpointingInProgress"},
+	}
+
+	podSatisfied := createTestPod("pod-active", "default", "spot-readiness-gate-test", "1Gi", "uid-active")
+	podSatisfied.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: gateType}}
+	podSatisfied.Status.Conditions = []corev1.PodCondition{
+		{Type: gateType, Status: corev1.ConditionTrue, Reason: "WorkspaceActive"},
+	}
+
+	psp := createTestPSP("psp-default", "default")
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(node, podUnsatisfied, podSatisfied, psp).
+		Build()
+
+	r := &NodePreemptionReconciler{
+		Client:                  cl,
+		Scheme:                  scheme,
+		Recorder:                record.NewFakeRecorder(10),
+		DefaultMigrationTimeout: 10 * time.Minute,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "spot-readiness-gate-test"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := cl.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 1 {
+		t.Fatalf("expected 1 PMJ (only for satisfied pod), got %d", len(pmjList.Items))
+	}
+	if pmjList.Items[0].Spec.PodRef.Name != "pod-active" {
+		t.Fatalf("expected PMJ for pod-active, got %s", pmjList.Items[0].Spec.PodRef.Name)
+	}
+}

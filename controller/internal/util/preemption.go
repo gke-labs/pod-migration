@@ -396,6 +396,28 @@ func IsPodMigrationEnabled(pod *corev1.Pod) bool {
 	return pod != nil && pod.Labels != nil && pod.Labels["pod-migration.gke.io/enabled"] == "true"
 }
 
+// AreReadinessGatesSatisfied reports whether every readiness gate declared in
+// pod.Spec.ReadinessGates has a matching PodCondition with Status=True.
+// Pods with no readinessGates always return true.
+func AreReadinessGatesSatisfied(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, gate := range pod.Spec.ReadinessGates {
+		satisfied := false
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == gate.ConditionType && cond.Status == corev1.ConditionTrue {
+				satisfied = true
+				break
+			}
+		}
+		if !satisfied {
+			return false
+		}
+	}
+	return true
+}
+
 // HasPDBEvictionTimedOut reports whether a prior migration attempt for this pod
 // timed out waiting on PDB budget.
 func HasPDBEvictionTimedOut(pod *corev1.Pod) bool {
