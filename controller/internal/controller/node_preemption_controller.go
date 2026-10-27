@@ -196,6 +196,17 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if !ok || !eng.Eligible(pod, node).OK {
 			continue
 		}
+		if ok, reason := engine.AllowsFencing(pod, eng); !ok {
+			logger.Info("Skipping pod on preempting node: engine does not fence the source pod and pod has not opted in",
+				"pod", pod.Name, "namespace", pod.Namespace, "engine", eng.Name(), "reason", reason)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedUnfencedEngine",
+					"%s; skipping spot preemption migration", reason)
+			}
+			metrics.RecordSpotPreemptionSkipped("unfenced_engine")
+			r.processedPods.Store(pod.UID, time.Now())
+			continue
+		}
 
 		// Verify the engine's policy for the pod (GKE Pod Snapshots: a Ready,
 		// manual, stop PodSnapshotPolicy)
