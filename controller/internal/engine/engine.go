@@ -30,6 +30,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -56,6 +57,11 @@ const (
 	// syntax: "gvisor=gke-pod-snapshots,@default=other-engine". Each class
 	// it routes overrides the controller's route for that class.
 	AnnotationRuntimeClassEngines = "pod-migration.gke.io/runtime-class-engines"
+
+	// AnnotationAllowUnfenced opts a pod into migration with an engine that
+	// declares FencingNone (C4, #150). Without "true", the controller
+	// refuses to migrate the pod on an unfenced engine.
+	AnnotationAllowUnfenced = "pod-migration.gke.io/allow-unfenced"
 )
 
 // Engine is one checkpoint/restore engine.
@@ -93,7 +99,7 @@ type Engine interface {
 	RestoreFailures() []restore.Engine
 
 	// Guarantees are the fencing mode and restore semantics the engine
-	// declares (C4, C5). Nothing enforces them yet.
+	// declares (C4, C5).
 	Guarantees() Guarantees
 }
 
@@ -132,6 +138,32 @@ type Guarantees struct {
 	// RestoreOnce: the engine restores a replacement at most once, even
 	// across retries and its own restarts (C5).
 	RestoreOnce bool
+}
+
+// AllowsFencing reports whether pod may be migrated by eng under its declared
+// fencing mode (C4, #150). Engines that declare FencingFrozen or
+// FencingStopped fence the source after the checkpoint. Any other mode
+// (FencingNone or unset) leaves the source running alongside the replacement
+// until the source is evicted, so the pod must opt in with
+// pod-migration.gke.io/allow-unfenced="true".
+func AllowsFencing(pod *corev1.Pod, eng Engine) (bool, string) {
+	if eng == nil {
+		return false, "no snapshot engine selected"
+	}
+	fencing := eng.Guarantees().Fencing
+	if fencing == FencingFrozen || fencing == FencingStopped {
+		return true, ""
+	}
+	if pod != nil && pod.Annotations[AnnotationAllowUnfenced] == "true" {
+		return true, ""
+	}
+	if fencing == "" {
+		fencing = FencingNone
+	}
+	return false, fmt.Sprintf(
+		"Snapshot engine %q does not fence the source pod after checkpoint (fencing=%s) and pod does not carry %s=true",
+		eng.Name(), fencing, AnnotationAllowUnfenced,
+	)
 }
 
 // RestoreOrderer is an optional capability (C5): the engine defines how the

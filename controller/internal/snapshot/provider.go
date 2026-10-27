@@ -16,6 +16,7 @@ const (
 	PhaseInProgress Phase = "InProgress"
 	PhaseReady      Phase = "Ready"
 	PhaseFailed     Phase = "Failed"
+	PhaseRefused    Phase = "Refused"
 )
 
 // Status represents the observed result of a snapshot check.

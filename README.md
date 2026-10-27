@@ -294,6 +294,8 @@ The eviction webhook only migrates Pods whose runtime class is listed in the con
 
 A snapshot engine serves each migratable runtime class. By default, the default engine, GKE Pod Snapshots (`gke-pod-snapshots`), serves every class in `--migratable-runtime-classes`. The controller flag `--runtime-class-engines` routes classes to engines instead (for example `--runtime-class-engines=gvisor=gke-pod-snapshots`), and a `PodMigration` overrides those routes for its namespace with the `pod-migration.gke.io/runtime-class-engines` annotation, in the same syntax; its `EngineRoutesValid` condition reports whether the annotation is valid. A Pod whose class no engine serves is evicted without a migration. The engine picked for a Pod is recorded on its `PodMigrationJob` (annotation `pod-migration.gke.io/engine`) and serves the job to the end; a job that names an engine the controller doesn't have fails with reason `EngineNotRegistered`.
 
+An engine that does not fence the source Pod after checkpointing (`FencingNone` or unset) leaves the source running alongside the replacement until evicted. To migrate a Pod using an unfenced engine, the Pod must explicitly opt in with the annotation `pod-migration.gke.io/allow-unfenced: "true"`. Without this annotation, the eviction webhook and preemption controller refuse live migration, record a `Warning MigrationSkippedUnfencedEngine` event on the Pod, and fall back to cold eviction.
+
 Example (Deployment):
 ```yaml
 apiVersion: apps/v1

@@ -604,8 +604,8 @@ func TestGKEProvider_CheckStatus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if status.Phase != PhaseFailed {
-			t.Fatalf("expected PhaseFailed for Refused, got %v", status.Phase)
+		if status.Phase != PhaseRefused {
+			t.Fatalf("expected PhaseRefused for Refused, got %v", status.Phase)
 		}
 		if status.Reason != "SnapshotFailed" {
 			t.Errorf("expected Reason=SnapshotFailed, got %s", status.Reason)

@@ -204,7 +204,7 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 					errMsg, _ := cond["message"].(string)
 					logger.Info("PSMT reported terminal failure", "trigger", triggerName, "reason", cReason, "message", errMsg)
 					return &Status{
-						Phase:   PhaseFailed,
+						Phase:   phaseForTerminalReason(cReason),
 						Reason:  "SnapshotTriggerFailed",
 						Message: fmt.Sprintf("GKE PodSnapshotManualTrigger failed (%s): %s", cReason, errMsg),
 					}, nil
@@ -320,7 +320,7 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		cMsg, _ := terminalSubcond["message"].(string)
 		logger.Info("PodSnapshot reported terminal failure in sub-condition", "snapshot", snapshotName, "type", cType, "reason", cReason, "message", cMsg)
 		return &Status{
-			Phase:       PhaseFailed,
+			Phase:       phaseForTerminalReason(cReason),
 			SnapshotRef: snapshotName,
 			Reason:      "SnapshotFailed",
 			Message:     fmt.Sprintf("GKE PodSnapshot %s failed (%s): %s", cType, cReason, cMsg),
@@ -365,7 +365,7 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", "Ready", "reason", cReason, "message", cMsg)
 			}
 			return &Status{
-				Phase:       PhaseFailed,
+				Phase:       phaseForTerminalReason(cReason),
 				SnapshotRef: snapshotName,
 				Reason:      "SnapshotFailed",
 				Message:     fmt.Sprintf("GKE PodSnapshot %s failed (%s): %s", "Ready", cReason, cMsg),
@@ -378,7 +378,7 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		if isTerminalSnapshotFailureReason(topPhase) {
 			logger.Info("PodSnapshot reported terminal failure via phase", "snapshot", snapshotName, "phase", topPhase)
 			return &Status{
-				Phase:       PhaseFailed,
+				Phase:       phaseForTerminalReason(topPhase),
 				SnapshotRef: snapshotName,
 				Reason:      "SnapshotFailed",
 				Message:     fmt.Sprintf("GKE PodSnapshot failed with phase=%s", topPhase),
@@ -566,6 +566,17 @@ func isTerminalSnapshotFailureReason(reason string) bool {
 		return true
 	}
 	return false
+}
+
+func isSnapshotRefusedReason(reason string) bool {
+	return strings.EqualFold(strings.TrimSpace(reason), "refused")
+}
+
+func phaseForTerminalReason(reason string) Phase {
+	if isSnapshotRefusedReason(reason) {
+		return PhaseRefused
+	}
+	return PhaseFailed
 }
 
 // isSnapshotSubconditionInProgressReason checks if a sub-condition reason indicates that the

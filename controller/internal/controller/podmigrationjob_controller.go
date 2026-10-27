@@ -193,7 +193,7 @@ func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, j
 	if snapStatus.Phase == snapshot.PhaseReady {
 		return true
 	}
-	if snapStatus.Phase == snapshot.PhaseFailed {
+	if snapStatus.Phase == snapshot.PhaseFailed || snapStatus.Phase == snapshot.PhaseRefused {
 		return false
 	}
 	if !snapStatus.LastProgressTime.IsZero() && time.Since(snapStatus.LastProgressTime) < timeout {
@@ -1240,8 +1240,19 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		switch snapStatus.Phase {
-		case snapshot.PhaseFailed:
-			logger.Info("Snapshot provider reported terminal failure, transitioning to Failed", "reason", snapStatus.Reason, "message", snapStatus.Message)
+		case snapshot.PhaseFailed, snapshot.PhaseRefused:
+			// If the snapshot provider does not supply a specific failure reason, fall back
+			// to SnapshotRefused (for providers/engines returning PhaseRefused with an empty reason)
+			// or SnapshotFailed. Note that GKEProvider sets SnapshotTriggerFailed or SnapshotFailed directly.
+			reason := snapStatus.Reason
+			if reason == "" {
+				if snapStatus.Phase == snapshot.PhaseRefused {
+					reason = "SnapshotRefused"
+				} else {
+					reason = "SnapshotFailed"
+				}
+			}
+			logger.Info("Snapshot provider reported terminal failure, transitioning to Failed", "phase", snapStatus.Phase, "reason", reason, "message", snapStatus.Message)
 			_ = r.getSnapshotProvider(job).Cleanup(ctx, job, podName)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 			now := metav1.Now()
@@ -1249,7 +1260,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 				Type:               "Ready",
 				Status:             metav1.ConditionFalse,
-				Reason:             snapStatus.Reason,
+				Reason:             reason,
 				Message:            snapStatus.Message,
 				ObservedGeneration: job.Generation,
 			})
@@ -1260,7 +1271,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			metrics.MarkPMJInactive(req.NamespacedName.String())
 			metrics.RecordOutcome("failed")
 			r.recordPreviousPhaseDuration(job, pmv1alpha1.PodMigrationJobPhaseSnapshotting)
-			r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Snapshot failed: %s - %s", snapStatus.Reason, snapStatus.Message)
+			r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Snapshot failed: %s - %s", reason, snapStatus.Message)
 			return ctrl.Result{}, nil
 
 		case snapshot.PhaseReady:
