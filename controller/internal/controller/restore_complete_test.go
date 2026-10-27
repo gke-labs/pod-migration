@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -254,3 +255,59 @@ func TestRestoreVerified_MissingOrEmptyPSName_CompleteRestoreLeavesPodUntouchedA
 		})
 	}
 }
+
+// TestRestoreVerified_CeilingPathCompletesTheRestoreFirst verifies that when
+// a replacement pod concludes as restored via the restore-ceiling branch
+// (RestoringStartTime past restoreCeiling, pod Ready past the stabilization
+// window), concludeRestored still calls CompleteRestore before marking the
+// job Succeeded (#152, #79).
+func TestRestoreVerified_CeilingPathCompletesTheRestoreFirst(t *testing.T) {
+	c, scheme := completeTestFixture(t)
+
+	job := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: completeTestNS, Name: completeTestJob}, job); err != nil {
+		t.Fatalf("getting job: %v", err)
+	}
+	sixMinAgo := metav1.NewTime(time.Now().Add(-6 * time.Minute))
+	job.Status.RestoringStartTime = &sixMinAgo
+	if err := c.Status().Update(context.Background(), job); err != nil {
+		t.Fatalf("updating job RestoringStartTime: %v", err)
+	}
+
+	pod := &corev1.Pod{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: completeTestNS, Name: completeTestPod}, pod); err != nil {
+		t.Fatalf("getting pod: %v", err)
+	}
+	fiveMinAgo := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type:               corev1.PodReady,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: fiveMinAgo,
+	}}
+	if err := c.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("updating pod status: %v", err)
+	}
+
+	provider := &completingProvider{}
+	provider.onComplete = func() {
+		if phase := completeTestPhase(t, c); phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+			t.Errorf("phase when the restore was completed at ceiling = %s, want Restoring", phase)
+		}
+	}
+	r := &PodMigrationJobReconciler{
+		Client:                     c,
+		Scheme:                     scheme,
+		SnapshotProvider:           provider,
+		RestoreStabilizationWindow: 30 * time.Second,
+	}
+	if err := completeTestReconcile(t, r); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(provider.calls) != 1 || provider.calls[0] != completeTestPod+"/"+completeTestUID {
+		t.Errorf("CompleteRestore calls at ceiling = %v, want [%s/%s]", provider.calls, completeTestPod, completeTestUID)
+	}
+	if phase := completeTestPhase(t, c); phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
+		t.Errorf("phase = %s, want Succeeded", phase)
+	}
+}
+

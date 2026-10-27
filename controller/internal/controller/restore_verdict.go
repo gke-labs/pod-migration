@@ -28,6 +28,7 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 )
 
 // Reasons of the Restored and Ready conditions that conclude a restore (C6,
@@ -198,6 +199,18 @@ func (r *PodMigrationJobReconciler) concludeRestored(
 	engineName string,
 	verdict engine.RestoreVerdict,
 ) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	// Later restarts of the replacement must start cold instead of
+	// restoring the migration snapshot again (#152), so the engine
+	// completes the restore before Succeeded is recorded. A failure
+	// requeues and tries again.
+	if completer, ok := r.getSnapshotProvider(job).(snapshot.RestoreCompleter); ok {
+		if err := completer.CompleteRestore(ctx, job, pod.Name, pod.UID); err != nil {
+			logger.Error(err, "Failed to complete the restore on the replacement pod; retrying", "pod", pod.Name)
+			return ctrl.Result{}, err
+		}
+	}
+
 	reason, label := ReasonRestoreInferred, "inferred"
 	message := fmt.Sprintf("Replacement pod %s is Ready, and engine %s inferred the restore without positive evidence: %s",
 		pod.Name, engineName, verdict.Evidence)
@@ -210,7 +223,7 @@ func (r *PodMigrationJobReconciler) concludeRestored(
 		message = fmt.Sprintf("Pod state restored from snapshot and replacement pod %s is Ready; engine %s confirmed the restore: %s",
 			pod.Name, engineName, verdict.Evidence)
 	}
-	log.FromContext(ctx).Info("Restore concluded", "pod", pod.Name, "engine", engineName, "reason", reason, "evidence", verdict.Evidence)
+	logger.Info("Restore concluded", "pod", pod.Name, "engine", engineName, "reason", reason, "evidence", verdict.Evidence)
 
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
 	now := metav1.Now()

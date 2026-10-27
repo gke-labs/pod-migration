@@ -1919,16 +1919,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// 8. The restore concluded: RestoreVerified if the engine confirmed
 		// it, RestoreInferred otherwise.
-		// Later restarts of the replacement must start cold instead of
-		// restoring the migration snapshot again (#152), so the engine
-		// completes the restore before Succeeded is recorded. A failure
-		// requeues and tries again.
-		if completer, ok := r.getSnapshotProvider(job).(snapshot.RestoreCompleter); ok {
-			if err := completer.CompleteRestore(ctx, job, replacementPod.Name, replacementPod.UID); err != nil {
-				logger.Error(err, "Failed to complete the restore on the replacement pod; retrying", "pod", replacementPod.Name)
-				return ctrl.Result{}, err
-			}
-		}
 		r.fallbackEventChecks.Delete(req.NamespacedName.String())
 		return r.concludeRestored(ctx, req, job, origJob, replacementPod, eng.Name(), verdict)
 	}
