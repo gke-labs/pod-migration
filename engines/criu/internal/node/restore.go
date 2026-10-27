@@ -397,6 +397,11 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		if sig == "" {
 			sig = truncate(lastOut, 800)
 		}
+		// Failure teardown: clean up the bundle and unmount the prepared rootfs
+		// overlay so abandoned restores don't leak mounts on the host node.
+		if notes := r.cleanup(ctx, in.MigrationName, "", "", false); len(notes) > 0 {
+			out.Notes = append(out.Notes, notes...)
+		}
 		return out, fmt.Errorf("runc restore failed: %w: %s", lastErr, truncate(sig, 1200))
 	}
 

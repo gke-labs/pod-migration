@@ -64,12 +64,15 @@ func decideAction(annotationsFile string, assignWait, restoreWait, poll time.Dur
 	psName := ""
 	for {
 		anns := readAnnotationsFile(annotationsFile)
-		if v, ok := anns[annPSName]; ok && v != "" {
-			psName = v
-			break
+		if v, ok := anns[annPSName]; ok {
+			if v != "" {
+				psName = v
+				break
+			}
+			return outcomeColdStart, "explicit cold-start bypass (empty ps-name)"
 		}
 		if time.Now().After(assignDeadline) {
-			return outcomeHold, "no ps-name within assign window; holding to avoid zombie dual-start due to downward API lag"
+			return outcomeColdStart, "no ps-name within assign window; falling through to cold start"
 		}
 		time.Sleep(poll)
 	}

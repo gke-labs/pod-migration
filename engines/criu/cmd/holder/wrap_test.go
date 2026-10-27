@@ -40,14 +40,24 @@ func TestReadAnnotationsFile(t *testing.T) {
 	}
 }
 
-func TestDecideActionNoPSNameHolds(t *testing.T) {
-	// Bypass / non-snapshot path: ps-name is empty -> hold after the short
-	// assign window (avoids zombie dual-start when downward API lags).
+func TestDecideActionEmptyPSNameBypasses(t *testing.T) {
+	// Bypass path: ps-name is explicitly empty -> cold-start immediately.
 	f := filepath.Join(t.TempDir(), "annotations")
 	writeAnns(t, f, `podsnapshot.gke.io/ps-name=""`+"\n")
 
 	got, reason := decideAction(f, 30*time.Millisecond, time.Second, 5*time.Millisecond)
-	if got != outcomeHold || !strings.Contains(reason, "no ps-name") {
+	if got != outcomeColdStart || !strings.Contains(reason, "explicit cold-start bypass") {
+		t.Fatalf("got %v (%s)", got, reason)
+	}
+}
+
+func TestDecideActionNoPSNameFallsThrough(t *testing.T) {
+	// Missing ps-name entirely: falls through to cold start after assign window.
+	f := filepath.Join(t.TempDir(), "annotations")
+	writeAnns(t, f, `other="foo"`+"\n")
+
+	got, reason := decideAction(f, 30*time.Millisecond, time.Second, 5*time.Millisecond)
+	if got != outcomeColdStart || !strings.Contains(reason, "no ps-name within assign window") {
 		t.Fatalf("got %v (%s)", got, reason)
 	}
 }
