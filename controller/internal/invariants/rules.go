@@ -69,9 +69,14 @@ const (
 	// on a PodMigrationJob during which I11 tolerates informer cache lag before the
 	// source Pod's fence label and Ready=False status appear in cached Pod lists.
 	SourceFencedGraceWindow = 10 * time.Second
+
+	// AnnotationEngine records the snapshot engine serving a PodMigrationJob (C1).
+	AnnotationEngine = "pod-migration.gke.io/engine"
+	// DefaultEngineName is the default GKE Pod Snapshots engine name when AnnotationEngine is unset.
+	DefaultEngineName = "gke-pod-snapshots"
 )
 
-// DefaultRules is the canonical ordered registry of the Core & Evolved Invariants (I1-I11).
+// DefaultRules is the canonical ordered registry of the Core & Evolved Invariants (I1-I12).
 var DefaultRules = []Rule{
 	funcRule{id: "I1", name: "AtMostOnceRestore", fn: EvaluateI1},
 	funcRule{id: "I2", name: "NoSilentColdStart", fn: EvaluateI2},
@@ -84,6 +89,7 @@ var DefaultRules = []Rule{
 	funcRule{id: "I9", name: "DeterministicFallbackOverCrashloop", fn: EvaluateI9},
 	NewDebouncedRule(RuleI10(), 3, 30*time.Second),
 	NewDebouncedRule(RuleI11(), 3, 30*time.Second),
+	RuleI12(),
 }
 
 func allPMJs(s *ReconcileSnapshot) []pmv1alpha1.PodMigrationJob {
@@ -169,6 +175,38 @@ func podHasColdStartBypass(pod *corev1.Pod) bool {
 	return hasKey && val == ""
 }
 
+func jobEngineAnnotation(job *pmv1alpha1.PodMigrationJob) string {
+	if job == nil || job.Annotations == nil {
+		return ""
+	}
+	return strings.TrimSpace(job.Annotations[AnnotationEngine])
+}
+
+func effectiveJobEngineName(job *pmv1alpha1.PodMigrationJob) string {
+	if name := jobEngineAnnotation(job); name != "" {
+		return name
+	}
+	return DefaultEngineName
+}
+
+func inspectPodRestoreOrder(s *ReconcileSnapshot, engineName string, pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool) {
+	if s != nil && s.RestoreOrders != nil {
+		return s.RestoreOrders(engineName, pod)
+	}
+	if pod == nil || pod.Annotations == nil {
+		return "", false, false
+	}
+	val, exists := pod.Annotations[AnnotationPSName]
+	if !exists {
+		return "", false, false
+	}
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return "", true, true
+	}
+	return trimmed, false, true
+}
+
 // migratedAgain reports whether targeting, the jobs that target one pod, holds a
 // job other than job that was created at or after it, so that the pod was
 // migrated again. Creation timestamps have one-second resolution, so a job
@@ -202,10 +240,26 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 	jobs := allPMJs(s)
 	pods := allPods(s)
 
+	jobByKey := make(map[string]pmv1alpha1.PodMigrationJob, len(jobs))
+	for _, j := range jobs {
+		jobByKey[j.Namespace+"/"+j.Name] = j
+	}
+
 	snapshotConsumers := make(map[string]string) // snapshotRef -> podUID (or pod key)
 	for _, pod := range pods {
-		snap := podSnapshotAnnotation(&pod)
-		if snap == "" {
+		engName := ""
+		if pod.Annotations != nil {
+			if assigned := pod.Annotations[AnnotationAssignedPMJ]; assigned != "" {
+				if assignedJob, ok := jobByKey[pod.Namespace+"/"+assigned]; ok {
+					engName = jobEngineAnnotation(&assignedJob)
+				}
+			}
+		}
+		snap, bypass, ok := inspectPodRestoreOrder(s, engName, &pod)
+		if (!ok || bypass || snap == "") && engName != "" {
+			snap, bypass, ok = inspectPodRestoreOrder(s, "", &pod)
+		}
+		if !ok || bypass || snap == "" {
 			continue
 		}
 		podID := string(pod.UID)
@@ -228,8 +282,10 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 
 	for _, job := range jobs {
 		if job.Status.Consumed && job.Status.GateReleased && job.Status.SnapshotRef != "" {
+			engName := jobEngineAnnotation(&job)
 			for _, pod := range pods {
-				if podSnapshotAnnotation(&pod) == job.Status.SnapshotRef &&
+				snap, bypass, ok := inspectPodRestoreOrder(s, engName, &pod)
+				if ok && !bypass && snap == job.Status.SnapshotRef &&
 					job.Status.RestoredPodUID != "" &&
 					string(pod.UID) != "" &&
 					string(pod.UID) != job.Status.RestoredPodUID {
@@ -253,8 +309,8 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 // EvaluateI2 enforces I2 (No Silent Cold-Start / No State Rollback):
 // A PMJ may transition to Succeeded (warm restore) iff Status.SnapshotRef is non-empty,
 // Status.RestoredPodName is recorded, and (when the replacement Pod is present in the
-// snapshot) the replacement Pod carries the matching `podsnapshot.gke.io/ps-name` annotation
-// and did not bypass restore via `podsnapshot.gke.io/ps-name: ""`. The annotation check
+// snapshot) the replacement Pod carries the matching restore order for the job's engine
+// and did not bypass restore via a cold-start bypass order. The annotation check
 // is skipped once another PMJ, created at or after this one and in any phase, targets
 // the replacement's UID: that pod was migrated again and carries the newer job's
 // cold-start bypass (#151), which stays if the newer job fails. The cold-start bypass
@@ -271,8 +327,10 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 	for _, p := range pods {
 		podByKey[p.Namespace+"/"+p.Name] = p
 	}
+	jobByKey := make(map[string]pmv1alpha1.PodMigrationJob, len(jobs))
 	jobsByTargetUID := make(map[string][]pmv1alpha1.PodMigrationJob, len(jobs))
 	for _, j := range jobs {
+		jobByKey[j.Namespace+"/"+j.Name] = j
 		if j.Spec.TargetPodUID != "" {
 			jobsByTargetUID[j.Spec.TargetPodUID] = append(jobsByTargetUID[j.Spec.TargetPodUID], j)
 		}
@@ -305,13 +363,12 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 				if pod.UID != "" && migratedAgain(&job, jobsByTargetUID[string(pod.UID)]) {
 					continue
 				}
-				snapAnn := podSnapshotAnnotation(&pod)
-				coldStartBypass := podHasColdStartBypass(&pod)
+				snapAnn, coldStartBypass, present := inspectPodRestoreOrder(s, jobEngineAnnotation(&job), &pod)
 				restoreCompleted := pod.Annotations[AnnotationRestoreCompleted]
 				if coldStartBypass && restoreVerified(&job) && restoreCompleted != "" && restoreCompleted == job.Status.SnapshotRef {
 					continue
 				}
-				if snapAnn != job.Status.SnapshotRef || coldStartBypass {
+				if !present || snapAnn != job.Status.SnapshotRef || coldStartBypass {
 					violations = append(violations, Violation{
 						InvariantID:   "I2",
 						InvariantName: "NoSilentColdStart",
@@ -328,7 +385,7 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 	}
 
 	// Also verify that any replacement pod still carrying assigned-pmj whose gate was removed
-	// has either a non-empty snapshot name or the explicit empty-string cold-start bypass.
+	// has either a non-empty snapshot name or the explicit cold-start bypass order.
 	for _, pod := range pods {
 		if pod.DeletionTimestamp != nil || podHasGate(&pod) || pod.Annotations == nil {
 			continue
@@ -337,7 +394,14 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 		if assigned == "" {
 			continue
 		}
-		_, hasPSKey := pod.Annotations[AnnotationPSName]
+		engName := ""
+		if assignedJob, ok := jobByKey[pod.Namespace+"/"+assigned]; ok {
+			engName = jobEngineAnnotation(&assignedJob)
+		}
+		_, _, hasPSKey := inspectPodRestoreOrder(s, engName, &pod)
+		if !hasPSKey && engName != "" {
+			_, _, hasPSKey = inspectPodRestoreOrder(s, "", &pod)
+		}
 		if !hasPSKey {
 			violations = append(violations, Violation{
 				InvariantID:   "I2",
@@ -899,6 +963,114 @@ func EvaluateI11(s *ReconcileSnapshot) []Violation {
 					Namespace: job.Namespace,
 					PMJName:   job.Name,
 					PodName:   pod.Name,
+				})
+			}
+		}
+	}
+	return violations
+}
+
+// RuleI12 returns the stateless Rule for I12 (RestoreOutcomeConfirmed).
+func RuleI12() Rule {
+	return funcRule{
+		id:   "I12",
+		name: "RestoreOutcomeConfirmed",
+		fn:   EvaluateI12,
+	}
+}
+
+func hasConfirmedRestoreEvidence(engName, msg string) bool {
+	if engName == "" || engName == DefaultEngineName {
+		return false
+	}
+	marker := fmt.Sprintf("engine %s confirmed the restore: ", engName)
+	idx := strings.Index(msg, marker)
+	if idx < 0 {
+		return false
+	}
+	return strings.TrimSpace(msg[idx+len(marker):]) != ""
+}
+
+// EvaluateI12 enforces I12 (RestoreOutcomeConfirmed, C6 / #79 / #179):
+//  1. A non-Succeeded PodMigrationJob must never carry Restored=True.
+//  2. Reason=RestoreVerified on Restored or Ready requires positive engine
+//     restore confirmation (which GKE Pod Snapshots never provides in GKE today)
+//     and non-empty evidence recorded in the Restored condition message.
+//  3. When a Succeeded PodMigrationJob carries the Restored condition, it must
+//     be True with Reason=RestoreVerified or Reason=RestoreInferred, and any
+//     Ready condition on that job must match Restored's status and reason.
+func EvaluateI12(s *ReconcileSnapshot) []Violation {
+	if s == nil {
+		return nil
+	}
+	var violations []Violation
+	for _, job := range allPMJs(s) {
+		engName := effectiveJobEngineName(&job)
+		restoredCond := meta.FindStatusCondition(job.Status.Conditions, ConditionRestored)
+		readyCond := meta.FindStatusCondition(job.Status.Conditions, "Ready")
+
+		// Grandfather pre-#178 legacy Succeeded jobs:
+		// The pre-#178 controller marked warm restores Succeeded with
+		// Restored=True, Reason=RestoreVerified, but without an engine annotation.
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded &&
+			restoredCond != nil && restoredCond.Status == metav1.ConditionTrue &&
+			restoredCond.Reason == ReasonRestoreVerified &&
+			(job.Annotations == nil || strings.TrimSpace(job.Annotations[AnnotationEngine]) == "") &&
+			!hasConfirmedRestoreEvidence(engName, restoredCond.Message) {
+			continue
+		}
+
+		if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded &&
+			restoredCond != nil && restoredCond.Status == metav1.ConditionTrue {
+			violations = append(violations, Violation{
+				InvariantID:   "I12",
+				InvariantName: "RestoreOutcomeConfirmed",
+				Reason:        "NonSucceededJobMarkedRestored",
+				Message: fmt.Sprintf("NonSucceededJobMarkedRestored: PMJ %s/%s has phase %q (not Succeeded) but condition %s=True (reason=%q)",
+					job.Namespace, job.Name, job.Status.Phase, ConditionRestored, restoredCond.Reason),
+				Namespace: job.Namespace,
+				PMJName:   job.Name,
+				PodName:   job.Status.RestoredPodName,
+			})
+		}
+
+		claimsVerified := (restoredCond != nil && restoredCond.Reason == ReasonRestoreVerified) ||
+			(readyCond != nil && readyCond.Reason == ReasonRestoreVerified)
+		if claimsVerified {
+			confirmedValid := restoredCond != nil &&
+				restoredCond.Status == metav1.ConditionTrue &&
+				restoredCond.Reason == ReasonRestoreVerified &&
+				hasConfirmedRestoreEvidence(engName, restoredCond.Message) &&
+				(readyCond == nil || (readyCond.Status == metav1.ConditionTrue && readyCond.Reason == ReasonRestoreVerified))
+			if !confirmedValid {
+				violations = append(violations, Violation{
+					InvariantID:   "I12",
+					InvariantName: "RestoreOutcomeConfirmed",
+					Reason:        "UnconfirmedRestoreMarkedVerified",
+					Message: fmt.Sprintf("PMJ %s/%s (engine %q) claims reason=%s without positive engine restore confirmation",
+						job.Namespace, job.Name, engName, ReasonRestoreVerified),
+					Namespace: job.Namespace,
+					PMJName:   job.Name,
+					PodName:   job.Status.RestoredPodName,
+				})
+			}
+			continue
+		}
+
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded && restoredCond != nil {
+			validVerdict := restoredCond.Status == metav1.ConditionTrue &&
+				(restoredCond.Reason == ReasonRestoreVerified || restoredCond.Reason == ReasonRestoreInferred) &&
+				(readyCond == nil || (readyCond.Status == metav1.ConditionTrue && readyCond.Reason == restoredCond.Reason))
+			if !validVerdict {
+				violations = append(violations, Violation{
+					InvariantID:   "I12",
+					InvariantName: "RestoreOutcomeConfirmed",
+					Reason:        "SucceededWithInvalidRestoreVerdict",
+					Message: fmt.Sprintf("PMJ %s/%s is Succeeded with invalid %s condition (status=%q, reason=%q)",
+						job.Namespace, job.Name, ConditionRestored, restoredCond.Status, restoredCond.Reason),
+					Namespace: job.Namespace,
+					PMJName:   job.Name,
+					PodName:   job.Status.RestoredPodName,
 				})
 			}
 		}
