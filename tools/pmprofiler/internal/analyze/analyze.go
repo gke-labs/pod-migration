@@ -600,11 +600,15 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 	// Restore signal: explicit psengine-restore annotation or PodMigrationJob's
 	// Restored status condition (gke-labs/pod-migration). A replacement without
 	// either gets RestoreSignal "absent" and is never reported as restored.
+	// RestoreEvidence records which of the two the signal came from, and for
+	// the job's condition whether its engine confirmed the restore or only
+	// inferred it.
 	if dst != nil {
 		if dst.psRestore != "" {
 			m.RestoreOutcome = dst.psRestore
 			m.Restored = dst.psRestore == "restored"
 			m.RestoreSignal = "psengine-restore:" + dst.psRestore
+			m.RestoreEvidence = EvidenceEngine
 		} else if j.restoredCondStatus == "True" {
 			m.RestoreOutcome = "restored"
 			m.Restored = true
@@ -613,6 +617,7 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 				reason = "RestoreVerified"
 			}
 			m.RestoreSignal = "pmj:" + reason
+			m.RestoreEvidence = jobRestoreEvidence(reason)
 		} else if j.lastPhase == "SucceededWithoutRestore" || j.restoredCondStatus == "False" {
 			m.RestoreOutcome = "failed"
 			m.Restored = false
@@ -621,6 +626,7 @@ func reconstruct(name string, j *pmjState, pods map[string]map[string]*podInc,
 				reason = "FallbackToColdStart"
 			}
 			m.RestoreSignal = "pmj:" + reason
+			m.RestoreEvidence = EvidenceJob
 		} else {
 			m.RestoreSignal = "absent"
 		}
@@ -1179,6 +1185,20 @@ func isStateSurvivalCheck(name string) bool {
 	return strings.Contains(lower, "state survived") || strings.Contains(lower, "write continuity")
 }
 
+// jobRestoreEvidence classifies the reason of a job's Restored=True
+// condition: RestoreVerified is a restore the engine confirmed, and
+// RestoreInferred one it only inferred (C6).
+func jobRestoreEvidence(reason string) string {
+	switch reason {
+	case "RestoreVerified":
+		return EvidenceConfirmed
+	case "RestoreInferred":
+		return EvidenceInferred
+	default:
+		return EvidenceJob
+	}
+}
+
 // VerifyVerdictMatchesData enforces S7 ("the verdict matches the data"):
 //   - A migration that reports Restored / RestoreVerified while an application
 //     state-survival or write-continuity check failed is a false-positive restore verdict.
@@ -1223,14 +1243,15 @@ func VerifyVerdictMatchesData(run *Run) error {
 			matched = measured
 		}
 		for _, m := range matched {
-			restored := m.Restored || m.Outcome == OutcomeRestored || strings.HasSuffix(m.RestoreSignal, ":RestoreVerified") || m.RestoreSignal == "psengine-restore:restored"
+			restored := m.Restored || m.Outcome == OutcomeRestored || strings.HasSuffix(m.RestoreSignal, ":RestoreVerified") ||
+				strings.HasSuffix(m.RestoreSignal, ":RestoreInferred") || m.RestoreSignal == "psengine-restore:restored"
 			if restored && !c.Pass {
-				return fmt.Errorf("verdict-data mismatch [S7]: migration %s (pod=%s, outcome=%s, restoreSignal=%s) reports Restored=true, but app state check %q (group=%s) failed: %s",
-					m.PMJ, m.Pod, m.Outcome, m.RestoreSignal, c.Name, c.Group, c.Detail)
+				return fmt.Errorf("verdict-data mismatch [S7]: migration %s (pod=%s, outcome=%s, restoreSignal=%s, evidence=%s) reports Restored=true, but app state check %q (group=%s) failed: %s",
+					m.PMJ, m.Pod, m.Outcome, m.RestoreSignal, m.RestoreEvidence, c.Name, c.Group, c.Detail)
 			}
 			if !restored && c.Pass {
-				return fmt.Errorf("verdict-data mismatch [S7]: migration %s (pod=%s, outcome=%s, restoreSignal=%s) reports Restored=false, but app state check %q (group=%s) passed: %s",
-					m.PMJ, m.Pod, m.Outcome, m.RestoreSignal, c.Name, c.Group, c.Detail)
+				return fmt.Errorf("verdict-data mismatch [S7]: migration %s (pod=%s, outcome=%s, restoreSignal=%s, evidence=%s) reports Restored=false, but app state check %q (group=%s) passed: %s",
+					m.PMJ, m.Pod, m.Outcome, m.RestoreSignal, m.RestoreEvidence, c.Name, c.Group, c.Detail)
 			}
 		}
 	}

@@ -3494,8 +3494,8 @@ func TestPodMigrationJobReconciler_Restoring_Success(t *testing.T) {
 	if restoredCond == nil {
 		t.Fatalf("Expected Restored condition to be set")
 	}
-	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != "RestoreVerified" {
-		t.Errorf("Expected Restored condition True/RestoreVerified, got %+v", restoredCond)
+	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != ReasonRestoreInferred {
+		t.Errorf("Expected Restored condition True/RestoreInferred, got %+v", restoredCond)
 	}
 }
 
@@ -3588,8 +3588,8 @@ func TestPodMigrationJobReconciler_Restoring_Success_DifferentReplacementPodName
 	if restoredCond == nil {
 		t.Fatalf("Expected Restored condition to be set")
 	}
-	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != "RestoreVerified" {
-		t.Errorf("Expected Restored condition True/RestoreVerified, got %+v", restoredCond)
+	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != ReasonRestoreInferred {
+		t.Errorf("Expected Restored condition True/RestoreInferred, got %+v", restoredCond)
 	}
 }
 
@@ -3801,8 +3801,8 @@ func TestPodMigrationJobReconciler_Restoring_IgnoresNormalEventsWithFallbackKeyw
 	if restoredCond == nil {
 		t.Fatalf("Expected Restored condition to be set")
 	}
-	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != "RestoreVerified" {
-		t.Errorf("Expected Restored condition True/RestoreVerified, got %+v", restoredCond)
+	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != ReasonRestoreInferred {
+		t.Errorf("Expected Restored condition True/RestoreInferred, got %+v", restoredCond)
 	}
 }
 
@@ -3908,8 +3908,8 @@ func TestPodMigrationJobReconciler_Restoring_IgnoresStaleWarningEventsBeforeRest
 	if restoredCond == nil {
 		t.Fatalf("Expected Restored condition to be set")
 	}
-	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != "RestoreVerified" {
-		t.Errorf("Expected Restored condition True/RestoreVerified, got %+v", restoredCond)
+	if restoredCond.Status != metav1.ConditionTrue || restoredCond.Reason != ReasonRestoreInferred {
+		t.Errorf("Expected Restored condition True/RestoreInferred, got %+v", restoredCond)
 	}
 }
 
@@ -6834,8 +6834,13 @@ func TestPodMigrationJobReconciler_Restoring_RecoveredReadyPodIsNotDeleted(t *te
 	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
 		t.Fatalf("Failed to get PMJ: %v", err)
 	}
-	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
-		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceeded, updatedPMJ.Status.Phase)
+	// The container restarted after its failed start, so it runs without its
+	// restored state: the restore is lost, not verified (#79).
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Errorf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, updatedPMJ.Status.Phase)
+	}
+	if cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "Restored"); cond == nil || cond.Reason != ReasonRestoreLost {
+		t.Errorf("Expected Restored reason %s, got %+v", ReasonRestoreLost, cond)
 	}
 	if cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, ConditionRestoreCrashed); cond != nil {
 		t.Errorf("Expected no %s condition on a recovered pod, got %+v", ConditionRestoreCrashed, cond)
@@ -7013,8 +7018,10 @@ func TestPodMigrationJobReconciler_Restoring_UnrecognizedConditionClearedOnSucce
 	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
 		t.Fatalf("Failed to get PMJ: %v", err)
 	}
-	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded {
-		t.Fatalf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceeded, updatedPMJ.Status.Phase)
+	// Coming up Ready took a container restart, so the job concludes with the
+	// restore lost (#79); concluding retracts the condition all the same.
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Fatalf("Expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, updatedPMJ.Status.Phase)
 	}
 	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, ConditionUnrecognizedRestoreCrash)
 	if cond == nil {
