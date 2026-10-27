@@ -601,3 +601,72 @@ func TestRegistry_ConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+type fakeOrderingEngine struct {
+	fakeEngine
+	ann string
+}
+
+func (e *fakeOrderingEngine) OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) error {
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[e.ann] = job.Status.SnapshotRef
+	return nil
+}
+
+func (e *fakeOrderingEngine) OrderColdStartBypass(pod *corev1.Pod) error {
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[e.ann] = ""
+	return nil
+}
+
+func (e *fakeOrderingEngine) InspectRestoreOrder(pod *corev1.Pod) (string, bool, bool) {
+	if pod == nil || pod.Annotations == nil {
+		return "", false, false
+	}
+	v, ok := pod.Annotations[e.ann]
+	if !ok {
+		return "", false, false
+	}
+	if strings.TrimSpace(v) == "" {
+		return "", true, true
+	}
+	return strings.TrimSpace(v), false, true
+}
+
+func TestRegistry_InspectRestoreOrder(t *testing.T) {
+	gke := NewGKEPodSnapshots(nil, nil)
+	criu := &fakeOrderingEngine{
+		fakeEngine: fakeEngine{name: "criu", classes: []string{"@default", "runc"}},
+		ann:        "criu.pod-migration.gke.io/restore-snapshot",
+	}
+	plain := &fakeEngine{name: "plain", classes: []string{"kata"}}
+
+	r := NewRegistry(GKEPodSnapshotsName)
+	mustRegister(t, r, gke, criu, plain)
+
+	criuPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:        "criu-pod",
+		Annotations: map[string]string{"criu.pod-migration.gke.io/restore-snapshot": "ckpt-99"},
+	}}
+	if snap, bypass, ok := r.InspectRestoreOrder("criu", criuPod); !ok || bypass || snap != "ckpt-99" {
+		t.Fatalf("InspectRestoreOrder(criu) = (%q, %t, %t), want (ckpt-99, false, true)", snap, bypass, ok)
+	}
+	if snap, bypass, ok := r.InspectRestoreOrder("", criuPod); !ok || bypass || snap != "ckpt-99" {
+		t.Fatalf("InspectRestoreOrder(\"\") on criu pod = (%q, %t, %t), want (ckpt-99, false, true)", snap, bypass, ok)
+	}
+	if snap, bypass, ok := r.InspectRestoreOrder("missing", criuPod); ok || bypass || snap != "" {
+		t.Fatalf("InspectRestoreOrder(missing) = (%q, %t, %t), want (\"\", false, false)", snap, bypass, ok)
+	}
+
+	gkeBypassPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:        "gke-pod",
+		Annotations: map[string]string{"podsnapshot.gke.io/ps-name": ""},
+	}}
+	if snap, bypass, ok := r.InspectRestoreOrder("plain", gkeBypassPod); !ok || !bypass || snap != "" {
+		t.Fatalf("InspectRestoreOrder(plain fallback to GKE) = (%q, %t, %t), want (\"\", true, true)", snap, bypass, ok)
+	}
+}

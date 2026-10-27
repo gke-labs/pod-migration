@@ -135,14 +135,19 @@ type Guarantees struct {
 }
 
 // RestoreOrderer is an optional capability (C5): the engine defines how the
-// controller orders a restore into a replacement pod, and how it releases a
-// replacement without one. Both methods edit pod in memory; the caller
+// controller orders a restore into a replacement pod, how it releases a
+// replacement without one, and how invariant checks read that order back from a
+// pod. OrderRestore and OrderColdStartBypass edit pod in memory; the caller
 // writes it.
 type RestoreOrderer interface {
 	// OrderRestore orders job's checkpoint restored into pod.
 	OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) error
 	// OrderColdStartBypass orders pod started without a restore.
 	OrderColdStartBypass(pod *corev1.Pod) error
+	// InspectRestoreOrder reads the engine's restore order on pod without
+	// mutating it. When present is true, either snapshotRef is the non-empty
+	// checkpoint identifier ordered for restore or coldStartBypass is true.
+	InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool)
 }
 
 // RestoreOutcome is an engine's verdict on a replacement pod's restore (C6).

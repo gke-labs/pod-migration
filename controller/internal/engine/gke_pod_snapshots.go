@@ -257,6 +257,24 @@ func (*GKEPodSnapshots) OrderColdStartBypass(pod *corev1.Pod) error {
 	return nil
 }
 
+// InspectRestoreOrder implements RestoreOrderer: a non-empty
+// podsnapshot.gke.io/ps-name annotation orders a restore of that snapshot, and
+// an explicit empty value orders a cold-start bypass.
+func (*GKEPodSnapshots) InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool) {
+	if pod == nil || pod.Annotations == nil {
+		return "", false, false
+	}
+	val, exists := pod.Annotations[gkeRestoreAnnotation]
+	if !exists {
+		return "", false, false
+	}
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return "", true, true
+	}
+	return trimmed, false, true
+}
+
 // gkeColdStartReason is the Reason of the ColdStart verdict.
 const gkeColdStartReason = "GKE runtime skipped snapshot restore and fell back to cold start"
 
