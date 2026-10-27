@@ -135,6 +135,14 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - storage.k8s.io
   resources:
   - volumeattachments

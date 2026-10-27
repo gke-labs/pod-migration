@@ -166,6 +166,10 @@ func TestPodMigrationJobReconciler_BudgetCheckInPending(t *testing.T) {
 			checker: &stubBudgetChecker{reason: reasonBudgetCheckError, err: errors.New("boom")}, wantPhase: pmv1alpha1.PodMigrationJobPhasePending,
 			wantStatus: metav1.ConditionUnknown, wantReason: reasonBudgetCheckError, wantCalls: 1,
 		},
+		"migrations in flight": {
+			checker: &stubBudgetChecker{reason: reasonMigrationsInFlight, err: errors.New("1 other migration in flight")}, wantPhase: pmv1alpha1.PodMigrationJobPhasePending,
+			wantStatus: metav1.ConditionFalse, wantReason: reasonMigrationsInFlight, wantCalls: 1, wantEvent: true,
+		},
 		"spot preemption skips the check": {
 			checker:   &stubBudgetChecker{reason: reasonBudgetExhausted, err: tooMany},
 			labels:    map[string]string{util.LabelTriggerSource: util.TriggerSourceSpotPreemption},
@@ -215,12 +219,14 @@ func TestPodMigrationJobReconciler_BudgetCheckInPending(t *testing.T) {
 func TestPodMigrationJobReconciler_BudgetWaitTimesOut(t *testing.T) {
 	blocked := metav1.Condition{Type: ConditionDisruptionBudgetChecked, Status: metav1.ConditionFalse, Reason: reasonBudgetExhausted, LastTransitionTime: metav1.Now()}
 	failing := metav1.Condition{Type: ConditionDisruptionBudgetChecked, Status: metav1.ConditionUnknown, Reason: reasonBudgetCheckError, LastTransitionTime: metav1.Now()}
+	inFlight := metav1.Condition{Type: ConditionDisruptionBudgetChecked, Status: metav1.ConditionFalse, Reason: reasonMigrationsInFlight, LastTransitionTime: metav1.Now()}
 	for name, tc := range map[string]struct {
 		conds       []metav1.Condition
 		wantReason  string
 		wantOutcome string
 	}{
-		"waiting for the budget": {[]metav1.Condition{blocked}, util.ReasonDisruptionBudgetTimeout, "budget_timeout"},
+		"waiting for the budget":           {[]metav1.Condition{blocked}, util.ReasonDisruptionBudgetTimeout, "budget_timeout"},
+		"waiting for in-flight migrations": {[]metav1.Condition{inFlight}, util.ReasonDisruptionBudgetTimeout, "budget_timeout"},
 		// A check that kept failing for another reason falls back like any timeout.
 		"budget check failing": {[]metav1.Condition{failing}, "Timeout", "timeout"},
 		"not waiting":          {nil, "Timeout", "timeout"},
@@ -257,5 +263,21 @@ func countEvents(recorder *record.FakeRecorder, reason string) int {
 		default:
 			return n
 		}
+	}
+}
+
+// TestPodMigrationJobReconciler_DeferredEventOncePerJob: a job that goes back
+// and forth between BudgetExhausted and MigrationsInFlight while its siblings
+// migrate emits MigrationDeferredByPDB once.
+func TestPodMigrationJobReconciler_DeferredEventOncePerJob(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(budgetScheme()).
+		WithObjects(budgetSourcePod(), budgetJob(time.Now(), nil)).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).Build()
+	recorder := record.NewFakeRecorder(20)
+	for _, reason := range []string{reasonBudgetExhausted, reasonMigrationsInFlight, reasonBudgetExhausted, reasonMigrationsInFlight} {
+		reconcileBudget(t, c, &stubBudgetChecker{reason: reason, err: errors.New(reason)}, recorder)
+	}
+	if got := countEvents(recorder, "MigrationDeferredByPDB"); got != 1 {
+		t.Errorf("MigrationDeferredByPDB events = %d, want 1", got)
 	}
 }

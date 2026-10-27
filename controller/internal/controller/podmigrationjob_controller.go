@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -573,6 +574,8 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // The source fence (#131) holds the source's Ready condition at False.
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;patch
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
+// The budget check counts in-flight migrations per PodDisruptionBudget (#42).
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // The recorder publishes restore-crash Warning events, which needs write access.
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -2271,6 +2274,14 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 		snap := &unstructured.Unstructured{}
 		snap.SetGroupVersionKind(snapGVK)
 		bldr = bldr.Watches(snap, handler.EnqueueRequestsFromMapFunc(r.mapSnapshotToPMJ))
+	}
+
+	// Wake the jobs waiting for the disruption budget when a PodDisruptionBudget
+	// may have freed some, so they don't wait out their backed-off recheck (#42).
+	if r.BudgetChecker != nil {
+		bldr = bldr.Watches(&policyv1.PodDisruptionBudget{},
+			handler.EnqueueRequestsFromMapFunc(r.budgetWaitersForPDB),
+			builder.WithPredicates(pdbMayHaveFreedBudget))
 	}
 
 	return bldr.Complete(r)
