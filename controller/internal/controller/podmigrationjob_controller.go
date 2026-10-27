@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -255,9 +256,11 @@ func (r *PodMigrationJobReconciler) restoreEngines(job *pmv1alpha1.PodMigrationJ
 }
 
 // jobEngine returns the snapshot engine that serves job. Without a registry,
-// that's GKE Pod Snapshots. ForJob fails only when the registry has no default
-// engine, which main.go rules out at startup; the GKE Pod Snapshots fallback
-// keeps the behavior from before the registry.
+// that's GKE Pod Snapshots. ForJob fails when the registry has no default
+// engine, which main.go rules out at startup, or when job names an engine
+// that isn't registered, which Reconcile fails the job for before it uses
+// the engine; the GKE Pod Snapshots fallback keeps the behavior from before
+// the registry.
 func (r *PodMigrationJobReconciler) jobEngine(job *pmv1alpha1.PodMigrationJob) engine.Engine {
 	if r.Engines != nil {
 		eng, err := r.Engines.ForJob(job)
@@ -266,7 +269,38 @@ func (r *PodMigrationJobReconciler) jobEngine(job *pmv1alpha1.PodMigrationJob) e
 		}
 		log.Log.Error(err, "No snapshot engine for the job; using GKE Pod Snapshots", "job", client.ObjectKeyFromObject(job))
 	}
-	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, nil)
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme)
+}
+
+// failEngineNotRegistered fails job, which names a snapshot engine that
+// isn't registered (cause). Without its engine, nothing can checkpoint the
+// job, read its checkpoint or clean up after it, so there's no cleanup.
+func (r *PodMigrationJobReconciler) failEngineNotRegistered(ctx context.Context, job, origJob *pmv1alpha1.PodMigrationJob, cause error) (ctrl.Result, error) {
+	prevPhase := origJob.Status.Phase
+	message := fmt.Sprintf("Snapshot engine %q is not registered in this controller (registered: %s); failing the migration",
+		strings.TrimSpace(job.Annotations[engine.AnnotationEngine]), strings.Join(r.Engines.Names(), ","))
+	log.FromContext(ctx).Info("Job names an unregistered snapshot engine, transitioning to Failed",
+		"job", job.Name, "phase", prevPhase, "error", cause.Error())
+
+	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+	now := metav1.Now()
+	job.Status.CompletionTime = &now
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             ReasonEngineNotRegistered,
+		Message:            message,
+		ObservedGeneration: job.Generation,
+	})
+	if err := r.patchStatus(ctx, job, origJob); err != nil {
+		return r.handleStatusError(ctx, err, "Failed to update job status to Failed for an unregistered engine")
+	}
+	metrics.MarkPMJInactive(types.NamespacedName{Namespace: job.Namespace, Name: job.Name}.String())
+	metrics.RecordOutcome("engine_not_registered")
+	r.recordPreviousPhaseDuration(job, prevPhase)
+	// The message quotes the job's annotation: not a format string.
+	r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "%s", message)
+	return ctrl.Result{}, nil
 }
 
 // liveReader returns a reader that bypasses the informer cache.
@@ -785,6 +819,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		metrics.MarkPMJActive(req.NamespacedName.String())
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// The job names the snapshot engine that serves it (#80). If no
+	// registered engine has that name, nothing can drive the job: fail it.
+	// For a new job, that's before anything is checkpointed.
+	if r.Engines != nil && !invariants.IsTerminalPhase(job.Status.Phase) {
+		if _, err := r.Engines.ForJob(job); errors.Is(err, engine.ErrEngineNotRegistered) {
+			return r.failEngineNotRegistered(ctx, job, origJob, err)
+		}
 	}
 
 	// Enforce configurable timeout for active migrations (Pending, Snapshotting, and Evicting).

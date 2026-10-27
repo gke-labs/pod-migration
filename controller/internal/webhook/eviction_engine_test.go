@@ -25,10 +25,13 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
@@ -38,13 +41,19 @@ import (
 // evictionTestEngine is a snapshot engine whose eligibility verdict and
 // policy are whatever the test configured.
 type evictionTestEngine struct {
+	name      string // "" is eviction-test-engine
 	classes   []string
 	verdict   engine.Verdict
 	policy    *engine.PolicyRef
 	policyErr error
 }
 
-func (e *evictionTestEngine) Name() string             { return "eviction-test-engine" }
+func (e *evictionTestEngine) Name() string {
+	if e.name == "" {
+		return "eviction-test-engine"
+	}
+	return e.name
+}
 func (e *evictionTestEngine) RuntimeClasses() []string { return e.classes }
 func (e *evictionTestEngine) NamespaceResources(*pmv1alpha1.PodMigration) ([]*unstructured.Unstructured, error) {
 	return nil, nil
@@ -58,49 +67,111 @@ func (e *evictionTestEngine) RestoreFailures() []restore.Engine { return nil }
 func (e *evictionTestEngine) Guarantees() engine.Guarantees     { return engine.Guarantees{} }
 
 func TestEvictionGate_UsesThePodEngine(t *testing.T) {
-	gvisor, runc := "gvisor", "runc"
+	const gvisor, runc = "gvisor", "runc"
+	migrating := func() *evictionTestEngine {
+		return &evictionTestEngine{
+			verdict: engine.Verdict{OK: true},
+			policy:  &engine.PolicyRef{Group: "engine.example.com", Kind: "Policy", Name: "engine-policy"},
+		}
+	}
+	other := &evictionTestEngine{
+		name:    "other-engine",
+		classes: []string{"gvisor"},
+		verdict: engine.Verdict{OK: true},
+		policy:  &engine.PolicyRef{Name: "other-policy"},
+	}
 	tests := []struct {
-		name              string
-		registry          func(t *testing.T) *engine.Registry
+		name     string
+		registry func(t *testing.T) *engine.Registry
+		// allowList is the operator allow-list; "" leaves it nil: gVisor only.
+		allowList string
+		// podMigrationRoutes, when set, adds a PodMigration with these
+		// routes to the namespace.
+		podMigrationRoutes string
+		// jobPhase, when set, adds the pod's job in that phase.
+		jobPhase          pmv1alpha1.PodMigrationJobPhase
 		runtimeClass      string
 		wantAllowed       bool
 		wantCode          int32
 		wantMessage       string
-		wantPolicy        string // "" means no job
+		wantPolicy        string // "" means no new job
+		wantEngine        string
 		wantNoPolicyEvent bool
 	}{
 		{
 			name:         "the engine refuses the pod",
-			registry:     registryWithEvictionTestEngine(&evictionTestEngine{verdict: engine.Verdict{Reason: "the engine can't migrate this pod"}}),
+			registry:     evictionTestRegistry("gvisor=eviction-test-engine", &evictionTestEngine{verdict: engine.Verdict{Reason: "the engine can't migrate this pod"}}),
 			runtimeClass: gvisor,
 			wantAllowed:  true,
 			wantMessage:  "the engine can't migrate this pod",
 		},
 		{
-			name: "the engine's policy is recorded on the job",
-			registry: registryWithEvictionTestEngine(&evictionTestEngine{
-				verdict: engine.Verdict{OK: true},
-				policy:  &engine.PolicyRef{Group: "engine.example.com", Kind: "Policy", Name: "engine-policy"},
-			}),
+			name:         "the engine's policy and name are recorded on the job",
+			registry:     evictionTestRegistry("gvisor=eviction-test-engine", migrating()),
 			runtimeClass: gvisor,
 			wantCode:     http.StatusTooManyRequests,
 			wantMessage:  "migration job spawned",
 			wantPolicy:   "engine-policy",
+			wantEngine:   "eviction-test-engine",
 		},
 		{
-			name: "the engine's eligibility replaces the default runtime-class allow-list",
-			registry: registryWithEvictionTestEngine(&evictionTestEngine{
-				verdict: engine.Verdict{OK: true},
-				policy:  &engine.PolicyRef{Name: "engine-policy"},
-			}),
+			name:         "the allow-list applies before the engine",
+			registry:     evictionTestRegistry("gvisor=eviction-test-engine,runc=eviction-test-engine", migrating()),
+			runtimeClass: runc,
+			wantAllowed:  true,
+			wantMessage:  "Pod runtime class runc is not migratable (allowed: gvisor), skipping migration",
+		},
+		{
+			name:         "an allow-listed class routed to the engine",
+			registry:     evictionTestRegistry("gvisor=eviction-test-engine,runc=eviction-test-engine", migrating()),
+			allowList:    "gvisor,runc",
 			runtimeClass: runc,
 			wantCode:     http.StatusTooManyRequests,
 			wantMessage:  "migration job spawned",
 			wantPolicy:   "engine-policy",
+			wantEngine:   "eviction-test-engine",
+		},
+		{
+			name:         "no engine serves the pod's runtime class",
+			registry:     evictionTestRegistry("gvisor=eviction-test-engine", migrating()),
+			allowList:    "gvisor,runc",
+			runtimeClass: runc,
+			wantAllowed:  true,
+			wantMessage:  "No snapshot engine serves runtime class runc, skipping migration",
+		},
+		{
+			name:               "the namespace's PodMigration routes the class to another engine",
+			registry:           evictionTestRegistry("gvisor=eviction-test-engine", migrating(), other),
+			podMigrationRoutes: "gvisor=other-engine",
+			runtimeClass:       gvisor,
+			wantCode:           http.StatusTooManyRequests,
+			wantMessage:        "migration job spawned",
+			wantPolicy:         "other-policy",
+			wantEngine:         "other-engine",
+		},
+		{
+			name:               "a PodMigration route to an unregistered engine is ignored",
+			registry:           evictionTestRegistry("gvisor=eviction-test-engine", migrating(), other),
+			podMigrationRoutes: "gvisor=missing",
+			runtimeClass:       gvisor,
+			wantCode:           http.StatusTooManyRequests,
+			wantMessage:        "migration job spawned",
+			wantPolicy:         "engine-policy",
+			wantEngine:         "eviction-test-engine",
+		},
+		{
+			// The engine is picked after the job checks: a job in flight is
+			// answered for whatever the routes say now.
+			name:         "a job in flight, and an engine that refuses the pod now",
+			registry:     evictionTestRegistry("gvisor=eviction-test-engine", &evictionTestEngine{verdict: engine.Verdict{Reason: "the engine can't migrate this pod"}}),
+			jobPhase:     pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			runtimeClass: gvisor,
+			wantCode:     http.StatusTooManyRequests,
+			wantMessage:  "migration job in progress: status Snapshotting",
 		},
 		{
 			name:              "the engine has no policy for the pod",
-			registry:          registryWithEvictionTestEngine(&evictionTestEngine{verdict: engine.Verdict{OK: true}}),
+			registry:          evictionTestRegistry("gvisor=eviction-test-engine", &evictionTestEngine{verdict: engine.Verdict{OK: true}}),
 			runtimeClass:      gvisor,
 			wantAllowed:       true,
 			wantMessage:       "skipping migration: no valid manual+stop policy found",
@@ -108,27 +179,13 @@ func TestEvictionGate_UsesThePodEngine(t *testing.T) {
 		},
 		{
 			name: "the engine's policy lookup fails",
-			registry: registryWithEvictionTestEngine(&evictionTestEngine{
+			registry: evictionTestRegistry("gvisor=eviction-test-engine", &evictionTestEngine{
 				verdict:   engine.Verdict{OK: true},
 				policyErr: errors.New("cache not synced"),
 			}),
 			runtimeClass: gvisor,
 			wantCode:     http.StatusTooManyRequests,
 			wantMessage:  "transient error resolving snapshot policy, retrying",
-		},
-		{
-			name: "no engine serves the pod",
-			registry: func(t *testing.T) *engine.Registry {
-				// The default engine isn't registered, and no engine declares runc.
-				r := engine.NewRegistry("missing")
-				if err := r.Register(&evictionTestEngine{classes: []string{"gvisor"}}); err != nil {
-					t.Fatalf("Register: %v", err)
-				}
-				return r
-			},
-			runtimeClass: runc,
-			wantAllowed:  true,
-			wantMessage:  "No snapshot engine serves runtime class runc, skipping migration",
 		},
 	}
 	for _, tt := range tests {
@@ -148,9 +205,30 @@ func TestEvictionGate_UsesThePodEngine(t *testing.T) {
 				Spec: corev1.PodSpec{RuntimeClassName: &class},
 			}
 			// No PodSnapshotPolicy: only the engine can supply a policy.
-			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+			objects := []client.Object{pod}
+			if tt.podMigrationRoutes != "" {
+				objects = append(objects, &pmv1alpha1.PodMigration{ObjectMeta: metav1.ObjectMeta{
+					Namespace:   "default",
+					Name:        "migration",
+					Annotations: map[string]string{engine.AnnotationRuntimeClassEngines: tt.podMigrationRoutes},
+				}})
+			}
+			if tt.jobPhase != "" {
+				objects = append(objects, &pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: util.FormatPMJName(pod.Name, string(pod.UID))},
+					Status:     pmv1alpha1.PodMigrationJobStatus{Phase: tt.jobPhase},
+				})
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+			var allowList *eligibility.RuntimeClassPolicy
+			if tt.allowList != "" {
+				var err error
+				if allowList, err = eligibility.ParseRuntimeClassPolicy(tt.allowList); err != nil {
+					t.Fatalf("ParseRuntimeClassPolicy(%q): %v", tt.allowList, err)
+				}
+			}
 			recorder := record.NewFakeRecorder(10)
-			gate := &EvictionGate{Client: c, APIReader: c, Recorder: recorder, Engines: tt.registry(t)}
+			gate := &EvictionGate{Client: c, APIReader: c, Recorder: recorder, Eligibility: allowList, Engines: tt.registry(t)}
 
 			req := admission.Request{}
 			req.Namespace, req.Name, req.SubResource = "default", "test-pod", "eviction"
@@ -174,14 +252,19 @@ func TestEvictionGate_UsesThePodEngine(t *testing.T) {
 			if err := c.List(context.Background(), jobs); err != nil {
 				t.Fatalf("listing jobs: %v", err)
 			}
+			wantJobs := 0
+			if tt.jobPhase != "" || tt.wantPolicy != "" {
+				wantJobs = 1
+			}
 			switch {
-			case tt.wantPolicy == "" && len(jobs.Items) != 0:
-				t.Errorf("created %d job(s), want none", len(jobs.Items))
-			case tt.wantPolicy != "" && len(jobs.Items) != 1:
-				t.Errorf("created %d job(s), want 1", len(jobs.Items))
+			case len(jobs.Items) != wantJobs:
+				t.Errorf("found %d job(s), want %d", len(jobs.Items), wantJobs)
 			case tt.wantPolicy != "":
 				if got := jobs.Items[0].Annotations[util.AnnotationPodSnapshotPolicy]; got != tt.wantPolicy {
 					t.Errorf("job policy annotation = %q, want %q", got, tt.wantPolicy)
+				}
+				if got := jobs.Items[0].Annotations[engine.AnnotationEngine]; got != tt.wantEngine {
+					t.Errorf("job engine annotation = %q, want %q", got, tt.wantEngine)
 				}
 			}
 
@@ -198,12 +281,71 @@ func TestEvictionGate_UsesThePodEngine(t *testing.T) {
 	}
 }
 
-func registryWithEvictionTestEngine(e *evictionTestEngine) func(t *testing.T) *engine.Registry {
+// A PodMigration that can't be read could route the pod to another engine:
+// the evictor retries.
+func TestEvictionGate_PodMigrationLookupFails(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+	class := "gvisor"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-pod",
+			UID:       "test-uid-12345",
+			Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{RuntimeClassName: &class},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*pmv1alpha1.PodMigrationList); ok {
+					return errors.New("cache not synced")
+				}
+				return cl.List(ctx, list, opts...)
+			},
+		}).Build()
+	registry := evictionTestRegistry("gvisor=eviction-test-engine", &evictionTestEngine{
+		verdict: engine.Verdict{OK: true},
+		policy:  &engine.PolicyRef{Name: "engine-policy"},
+	})(t)
+	gate := &EvictionGate{Client: c, APIReader: c, Engines: registry}
+
+	req := admission.Request{}
+	req.Namespace, req.Name, req.SubResource = "default", "test-pod", "eviction"
+	resp := gate.Handle(context.Background(), req)
+
+	if resp.Allowed || resp.Result == nil || resp.Result.Code != http.StatusTooManyRequests ||
+		resp.Result.Message != "transient error reading the namespace's PodMigration, retrying" {
+		t.Errorf("response = allowed %t, %+v; want a 429 for the PodMigration lookup", resp.Allowed, resp.Result)
+	}
+	jobs := &pmv1alpha1.PodMigrationJobList{}
+	if err := c.List(context.Background(), jobs); err != nil {
+		t.Fatalf("listing jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Errorf("created %d job(s), want none", len(jobs.Items))
+	}
+}
+
+// evictionTestRegistry registers engines, the first one as the default, and
+// sets routes, in --runtime-class-engines syntax, as the cluster routes.
+func evictionTestRegistry(routes string, engines ...*evictionTestEngine) func(t *testing.T) *engine.Registry {
 	return func(t *testing.T) *engine.Registry {
 		t.Helper()
-		r := engine.NewRegistry(e.Name())
-		if err := r.Register(e); err != nil {
-			t.Fatalf("Register: %v", err)
+		r := engine.NewRegistry(engines[0].Name())
+		for _, e := range engines {
+			if err := r.Register(e); err != nil {
+				t.Fatalf("Register(%s): %v", e.Name(), err)
+			}
+		}
+		parsed, err := engine.ParseRoutes(routes)
+		if err != nil {
+			t.Fatalf("ParseRoutes(%q): %v", routes, err)
+		}
+		if err := r.SetRoutes(parsed); err != nil {
+			t.Fatalf("SetRoutes(%q): %v", routes, err)
 		}
 		return r
 	}

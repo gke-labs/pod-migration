@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -47,28 +48,48 @@ type PodGateReconciler struct {
 	InvariantEngine *invariants.Engine
 
 	// Engines provides the snapshot engine whose restore orders a released
-	// pod gets: the job's engine, or the pod's when it has no job. Optional:
-	// nil selects GKE Pod Snapshots.
+	// pod gets: the job's engine for a restore, the pod's for a cold start.
+	// Optional: nil selects GKE Pod Snapshots.
 	Engines *engine.Registry
 }
 
-// restoreOrderer returns how to order a restore, or a cold start, for pod:
-// through the engine that serves job, or pod when job is nil. An engine
-// without the RestoreOrderer capability, or no engine, gets GKE Pod
-// Snapshots' restore orders, the ones used before the registry.
-func (r *PodGateReconciler) restoreOrderer(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) engine.RestoreOrderer {
+// jobRestoreOrderer returns how to order job's restore: through the engine
+// that serves job. An engine without the RestoreOrderer capability, or no
+// engine, gets GKE Pod Snapshots' restore orders, the ones used before the
+// registry. It fails when job names an engine that isn't registered:
+// another engine's restore order would restore the wrong snapshot, and the
+// job reconciler fails such a job (#80).
+func (r *PodGateReconciler) jobRestoreOrderer(job *pmv1alpha1.PodMigrationJob) (engine.RestoreOrderer, error) {
 	var eng engine.Engine
 	if r.Engines != nil {
-		if job != nil {
-			eng, _ = r.Engines.ForJob(job)
-		} else {
-			eng, _ = r.Engines.ForPod(pod, nil)
+		var err error
+		if eng, err = r.Engines.ForJob(job); errors.Is(err, engine.ErrEngineNotRegistered) {
+			return nil, err
 		}
+	}
+	if orderer, ok := eng.(engine.RestoreOrderer); ok {
+		return orderer, nil
+	}
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme), nil
+}
+
+// podRestoreOrderer returns how to order a cold start for pod: through the
+// engine that serves pod, which its runtime class routes to through the
+// namespace's PodMigration or the controller's routes. Like
+// jobRestoreOrderer, it falls back to GKE Pod Snapshots' restore orders.
+func (r *PodGateReconciler) podRestoreOrderer(ctx context.Context, pod *corev1.Pod) engine.RestoreOrderer {
+	var eng engine.Engine
+	if r.Engines != nil {
+		pm, err := util.ActivePodMigration(ctx, r.Client, pod.Namespace)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "Failed to look up the namespace's PodMigration; ordering the cold start through the controller's routes")
+		}
+		eng, _ = r.Engines.ForPod(pod, pm)
 	}
 	if orderer, ok := eng.(engine.RestoreOrderer); ok {
 		return orderer
 	}
-	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, nil)
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme)
 }
 
 func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, reconcileErr *error) {
@@ -161,7 +182,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 	if assignedPMJ == "" {
 		logger.Info("Gated pod has no PMJ assignment, releasing gate with cold-start bypass")
-		r.releaseWithColdStartBypass(pod)
+		r.releaseWithColdStartBypass(ctx, pod)
 		return ctrl.Result{}, r.Update(ctx, pod)
 	}
 
@@ -188,7 +209,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			logger.Info("Re-assigned pod to alternative PMJ", "alternativePMJ", correctedPMJ)
 		} else {
 			logger.Info("Releasing scheduling gate for scale-up pod (race loser)")
-			r.releaseWithColdStartBypass(pod)
+			r.releaseWithColdStartBypass(ctx, pod)
 		}
 		return ctrl.Result{}, r.Update(ctx, pod)
 	}
@@ -211,7 +232,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 				return ctrl.Result{}, apiErr
 			}
 			logger.Info("Assigned PMJ deleted, releasing scheduling gate with cold-start bypass", "pmj", correctedPMJ)
-			r.releaseWithColdStartBypass(pod)
+			r.releaseWithColdStartBypass(ctx, pod)
 			return ctrl.Result{}, r.Update(ctx, pod)
 		}
 		logger.Error(err, "Failed to get assigned PMJ")
@@ -248,7 +269,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 					return ctrl.Result{}, updateErr
 				}
 			}
-			r.releaseWithColdStartBypass(pod)
+			r.releaseWithColdStartBypass(ctx, pod, job)
 			return ctrl.Result{}, r.Update(ctx, pod)
 		}
 
@@ -263,7 +284,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring || job.Status.GateReleased {
 				logger.Info("Assigned PMJ was already consumed (phase is not Restoring or gate was already released), releasing gate with cold-start bypass",
 					"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "phase", job.Status.Phase, "gateReleased", job.Status.GateReleased)
-				r.releaseWithColdStartBypass(pod)
+				r.releaseWithColdStartBypass(ctx, pod, job)
 				return ctrl.Result{}, r.Update(ctx, pod)
 			}
 
@@ -305,7 +326,12 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		// Snapshots: the snapshot name in podsnapshot.gke.io/ps-name).
 		// SnapshotRef is non-empty here; the empty case released with the
 		// cold-start bypass above.
-		if err := r.restoreOrderer(pod, job).OrderRestore(pod, job); err != nil {
+		orderer, err := r.jobRestoreOrderer(job)
+		if err != nil {
+			logger.Error(err, "No engine to order the restore; waiting for the job to fail", "pmj", correctedPMJ)
+			return ctrl.Result{}, err
+		}
+		if err := orderer.OrderRestore(pod, job); err != nil {
 			logger.Error(err, "Failed to order the restore", "pmj", correctedPMJ)
 			return ctrl.Result{}, err
 		}
@@ -437,14 +463,23 @@ func (r *PodGateReconciler) checkConsumerPodExists(ctx context.Context, namespac
 // snapshot restore).  Every release that is not backed by a durable snapshot
 // must go through here — a bare gate removal leaves the pod exposed to native
 // restore of a stale snapshot.
-func (r *PodGateReconciler) releaseWithColdStartBypass(pod *corev1.Pod) {
+func (r *PodGateReconciler) releaseWithColdStartBypass(ctx context.Context, pod *corev1.Pod, job ...*pmv1alpha1.PodMigrationJob) {
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
 	delete(pod.Annotations, "pod-migration.gke.io/assigned-pmj")
+	var j *pmv1alpha1.PodMigrationJob
+	if len(job) > 0 {
+		j = job[0]
+	}
+	if j != nil {
+		if orderer, err := r.jobRestoreOrderer(j); err == nil && orderer != nil {
+			_ = orderer.OrderColdStartBypass(pod)
+		}
+	}
 	// The bypass is ordered through the engine that serves the pod. It can
 	// only fail for a nil pod.
-	_ = r.restoreOrderer(pod, nil).OrderColdStartBypass(pod)
+	_ = r.podRestoreOrderer(ctx, pod).OrderColdStartBypass(pod)
 	r.removeGate(pod)
 }
 

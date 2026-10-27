@@ -29,8 +29,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -88,6 +90,7 @@ func main() {
 		runtimeClassesRaw    string
 		fenceCap             time.Duration
 		fenceLateStopWatch   time.Duration
+		runtimeClassEngines  string
 		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -102,6 +105,7 @@ func main() {
 	flag.StringVar(&runtimeClassesRaw, "migratable-runtime-classes", eligibility.DefaultMigratableRuntimeClasses, "Comma-separated RuntimeClass names whose pods are migrated on eviction; "+eligibility.DefaultRuntimeClassToken+" matches pods without a runtimeClassName. List only classes the installed snapshot engine supports.")
 	flag.DurationVar(&fenceCap, "fence-pre-checkpoint-cap", controller.DefaultFencePreCheckpointCap, "How long a fenced migration source waits for its checkpoint trigger while creating it fails with retryable errors; then the migration fails")
 	flag.DurationVar(&fenceLateStopWatch, "fence-late-stop-watch", controller.DefaultFenceLateStopWatch, "How long the controller watches a source that a failed migration returned to service, to fence and evict it again if the snapshot engine stops it anyway")
+	flag.StringVar(&runtimeClassEngines, "runtime-class-engines", "", "Comma-separated class=engine routes that pick the snapshot engine for the pods of each migratable runtime class, e.g. gvisor="+engine.GKEPodSnapshotsName+" ("+eligibility.DefaultRuntimeClassToken+" matches pods without a runtimeClassName). Unset routes every --migratable-runtime-classes class to the default engine, "+engine.GKEPodSnapshotsName+". A PodMigration overrides routes for its namespace with the "+engine.AnnotationRuntimeClassEngines+" annotation.")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -123,6 +127,13 @@ func main() {
 	runtimeClassPolicy, err := eligibility.ParseRuntimeClassPolicy(runtimeClassesRaw)
 	if err != nil {
 		setupLog.Error(err, "invalid --migratable-runtime-classes flag")
+		os.Exit(1)
+	}
+
+	// Checked against the registered engines once the registry is built.
+	runtimeClassRoutes, err := engine.ParseRoutes(runtimeClassEngines)
+	if err != nil {
+		setupLog.Error(err, "invalid --runtime-class-engines flag")
 		os.Exit(1)
 	}
 
@@ -203,13 +214,21 @@ func main() {
 	invariantEngine := invariants.NewEngine(invariantMode, eventRecorder)
 
 	// Snapshot engines, shared by every reconciler and the eviction webhook.
-	// GKE Pod Snapshots is the only engine and the default, with the
-	// --migratable-runtime-classes allow-list as its eligibility.
+	// GKE Pod Snapshots is the only engine and the default. Unless
+	// --runtime-class-engines routes runtime classes to engines, it serves
+	// every class of the --migratable-runtime-classes allow-list.
 	engines, err := engine.NewDefaultRegistry(mgr.GetClient(), mgr.GetScheme(), runtimeClassPolicy)
 	if err != nil {
 		setupLog.Error(err, "unable to build the snapshot engine registry")
 		os.Exit(1)
 	}
+	if len(runtimeClassRoutes) > 0 {
+		if err := engines.SetRoutes(runtimeClassRoutes); err != nil {
+			setupLog.Error(err, "invalid --runtime-class-engines flag")
+			os.Exit(1)
+		}
+	}
+	logEngineRoutes(engines, runtimeClassPolicy, len(runtimeClassRoutes) == 0)
 
 	if err := (&controller.PodMigrationReconciler{
 		Client:          mgr.GetClient(),
@@ -317,6 +336,36 @@ func main() {
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "manager exited")
 		os.Exit(1)
+	}
+}
+
+// logEngineRoutes logs the snapshot engines and the routes from runtime
+// classes to engines, which come from the allow-list when fromAllowList is
+// set. When --runtime-class-engines sets them, it also reports the
+// allow-listed classes that no route serves, and the routes for classes the
+// allow-list doesn't migrate.
+func logEngineRoutes(engines *engine.Registry, policy *eligibility.RuntimeClassPolicy, fromAllowList bool) {
+	routes := engines.Routes()
+	setupLog.Info("Snapshot engines",
+		"engines", engines.Names(),
+		"runtimeClassRoutes", routes.String(),
+		"routesFromMigratableRuntimeClasses", fromAllowList)
+	if fromAllowList {
+		return
+	}
+	allowed := map[string]bool{}
+	for _, class := range policy.Classes() {
+		allowed[class] = true
+		if _, ok := routes[class]; !ok {
+			setupLog.Info("No --runtime-class-engines route serves a migratable runtime class: its pods are migrated only in namespaces whose PodMigration routes it",
+				"runtimeClass", class)
+		}
+	}
+	for _, class := range slices.Sorted(maps.Keys(routes)) {
+		if !allowed[class] {
+			setupLog.Info("A --runtime-class-engines route has no effect: --migratable-runtime-classes doesn't migrate its runtime class",
+				"runtimeClass", class, "engine", routes[class])
+		}
 	}
 }
 

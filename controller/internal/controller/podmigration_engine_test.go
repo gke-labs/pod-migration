@@ -42,12 +42,24 @@ import (
 // renderingEngine is an engine whose NamespaceResources returns fixed
 // objects, or a fixed error.
 type renderingEngine struct {
+	name      string   // "" is rendering-engine
+	classes   []string // nil is @default
 	resources []*unstructured.Unstructured
 	err       error
 }
 
-func (e *renderingEngine) Name() string             { return "rendering-engine" }
-func (e *renderingEngine) RuntimeClasses() []string { return []string{"@default"} }
+func (e *renderingEngine) Name() string {
+	if e.name == "" {
+		return "rendering-engine"
+	}
+	return e.name
+}
+func (e *renderingEngine) RuntimeClasses() []string {
+	if e.classes == nil {
+		return []string{"@default"}
+	}
+	return e.classes
+}
 func (e *renderingEngine) NamespaceResources(*pmv1alpha1.PodMigration) ([]*unstructured.Unstructured, error) {
 	if e.err != nil {
 		return nil, e.err
@@ -123,7 +135,7 @@ func TestPodMigrationReconciler_WithoutEnginesSyncsGKEPodSnapshotsResources(t *t
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	want, err := engine.NewGKEPodSnapshots(nil, nil, nil).NamespaceResources(config)
+	want, err := engine.NewGKEPodSnapshots(nil, nil).NamespaceResources(config)
 	if err != nil {
 		t.Fatalf("NamespaceResources: %v", err)
 	}
@@ -269,5 +281,274 @@ func TestPodMigrationReconciler_EngineRenderErrors(t *testing.T) {
 				t.Errorf("objects were synced despite the render error")
 			}
 		})
+	}
+}
+
+// engineObject returns an engine.example.com/v1 object of kind; namespace ""
+// makes it cluster-scoped.
+func engineObject(kind, namespace, name string, labels map[string]string) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(schema.GroupVersionKind{Group: "engine.example.com", Version: "v1", Kind: kind})
+	u.SetNamespace(namespace)
+	u.SetName(name)
+	u.SetLabels(labels)
+	u.Object["spec"] = map[string]interface{}{"owner": name}
+	return u
+}
+
+func objectExists(t *testing.T, c client.Client, obj *unstructured.Unstructured) bool {
+	t.Helper()
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(obj.GroupVersionKind())
+	err := c.Get(context.Background(), client.ObjectKeyFromObject(obj), u)
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("getting %s %s: %v", obj.GetKind(), obj.GetName(), err)
+	}
+	return err == nil
+}
+
+func mustRoutedRegistry(t *testing.T, routes string, engines ...engine.Engine) *engine.Registry {
+	t.Helper()
+	r := engine.NewRegistry(engines[0].Name())
+	for _, e := range engines {
+		if err := r.Register(e); err != nil {
+			t.Fatalf("Register(%s): %v", e.Name(), err)
+		}
+	}
+	parsed, err := engine.ParseRoutes(routes)
+	if err != nil {
+		t.Fatalf("ParseRoutes(%q): %v", routes, err)
+	}
+	if err := r.SetRoutes(parsed); err != nil {
+		t.Fatalf("SetRoutes(%q): %v", routes, err)
+	}
+	return r
+}
+
+// The reconciler syncs the objects of every engine that serves a runtime
+// class in the namespace: the cluster routes' engines and those of the
+// PodMigration's routes, but not an engine that nothing routes to.
+func TestPodMigrationReconciler_SyncsTheResourcesOfEveryRoutedEngine(t *testing.T) {
+	objA := engineObject("Policy", "default", "policy-a", nil)
+	objB := engineObject("Policy", "default", "policy-b", nil)
+	objUnused := engineObject("Policy", "default", "policy-unused", nil)
+	tests := []struct {
+		name               string
+		podMigrationRoutes string
+		wantSynced         []*unstructured.Unstructured
+		wantNotSynced      []*unstructured.Unstructured
+		wantCondition      *metav1.Condition // nil: no EngineRoutesValid condition
+	}{
+		{
+			name:          "cluster routes",
+			wantSynced:    []*unstructured.Unstructured{objA},
+			wantNotSynced: []*unstructured.Unstructured{objB, objUnused},
+		},
+		{
+			name:               "the PodMigration routes another class",
+			podMigrationRoutes: "runc=b",
+			wantSynced:         []*unstructured.Unstructured{objA, objB},
+			wantNotSynced:      []*unstructured.Unstructured{objUnused},
+			wantCondition: &metav1.Condition{
+				Type: ConditionEngineRoutesValid, Status: metav1.ConditionTrue,
+				Reason: ReasonEngineRoutesValid, Message: "Runtime class routes: runc=b",
+			},
+		},
+		{
+			name:               "the PodMigration routes the class elsewhere",
+			podMigrationRoutes: "gvisor=b",
+			wantSynced:         []*unstructured.Unstructured{objB},
+			wantNotSynced:      []*unstructured.Unstructured{objA, objUnused},
+			wantCondition: &metav1.Condition{
+				Type: ConditionEngineRoutesValid, Status: metav1.ConditionTrue,
+				Reason: ReasonEngineRoutesValid, Message: "Runtime class routes: gvisor=b",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = pmv1alpha1.AddToScheme(scheme)
+			config := engineTestPodMigration("gs://my-test-bucket")
+			if tt.podMigrationRoutes != "" {
+				config.Annotations = map[string]string{engine.AnnotationRuntimeClassEngines: tt.podMigrationRoutes}
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config).
+				WithStatusSubresource(&pmv1alpha1.PodMigration{}).Build()
+			registry := mustRoutedRegistry(t, "gvisor=a",
+				&renderingEngine{name: "a", classes: []string{"gvisor"}, resources: []*unstructured.Unstructured{objA}},
+				&renderingEngine{name: "b", classes: []string{"runc", "gvisor"}, resources: []*unstructured.Unstructured{objB}},
+				&renderingEngine{name: "unused", classes: []string{"kata"}, resources: []*unstructured.Unstructured{objUnused}})
+
+			r := &PodMigrationReconciler{Client: c, Scheme: scheme, Engines: registry}
+			if err := reconcileEngineTestPodMigration(t, r, config); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			for _, obj := range tt.wantSynced {
+				if !objectExists(t, c, obj) {
+					t.Errorf("%s wasn't synced", obj.GetName())
+				}
+			}
+			for _, obj := range tt.wantNotSynced {
+				if objectExists(t, c, obj) {
+					t.Errorf("%s was synced, for an engine that serves no class in the namespace", obj.GetName())
+				}
+			}
+			got := &pmv1alpha1.PodMigration{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(config), got); err != nil {
+				t.Fatalf("getting the PodMigration: %v", err)
+			}
+			if cond := meta.FindStatusCondition(got.Status.Conditions, "Ready"); cond == nil || cond.Status != metav1.ConditionTrue {
+				t.Errorf("Ready condition = %+v, want True", cond)
+			}
+			assertEngineRoutesCondition(t, got, tt.wantCondition)
+		})
+	}
+}
+
+func assertEngineRoutesCondition(t *testing.T, pm *pmv1alpha1.PodMigration, want *metav1.Condition) {
+	t.Helper()
+	got := meta.FindStatusCondition(pm.Status.Conditions, ConditionEngineRoutesValid)
+	switch {
+	case want == nil && got != nil:
+		t.Errorf("%s condition = %+v, want none", ConditionEngineRoutesValid, got)
+	case want != nil && got == nil:
+		t.Errorf("no %s condition, want %+v", ConditionEngineRoutesValid, want)
+	case want != nil && (got.Status != want.Status || got.Reason != want.Reason || got.Message != want.Message):
+		t.Errorf("%s condition = %s/%s %q, want %s/%s %q", ConditionEngineRoutesValid,
+			got.Status, got.Reason, got.Message, want.Status, want.Reason, want.Message)
+	}
+}
+
+func TestPodMigrationReconciler_ReportsInvalidEngineRoutes(t *testing.T) {
+	tests := []struct {
+		name               string
+		podMigrationRoutes string
+		previous           bool // the PodMigration already has the condition
+		want               *metav1.Condition
+	}{
+		{
+			name:               "routes that don't parse",
+			podMigrationRoutes: "runc",
+			want: &metav1.Condition{
+				Status: metav1.ConditionFalse, Reason: ReasonInvalidEngineRoutes,
+				Message: `invalid route "runc": want class=engine; the annotation is ignored`,
+			},
+		},
+		{
+			name:               "a route to an engine that isn't registered",
+			podMigrationRoutes: "runc=missing",
+			want: &metav1.Condition{
+				Status: metav1.ConditionFalse, Reason: ReasonEngineNotRegistered,
+				Message: `runtime class "runc" routes to engine "missing": engine not registered (registered: a); that route is ignored`,
+			},
+		},
+		{
+			name:     "the annotation was removed",
+			previous: true,
+			want:     nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = pmv1alpha1.AddToScheme(scheme)
+			config := engineTestPodMigration("gs://my-test-bucket")
+			if tt.podMigrationRoutes != "" {
+				config.Annotations = map[string]string{engine.AnnotationRuntimeClassEngines: tt.podMigrationRoutes}
+			}
+			if tt.previous {
+				config.Status.Conditions = []metav1.Condition{{
+					Type: ConditionEngineRoutesValid, Status: metav1.ConditionTrue, Reason: ReasonEngineRoutesValid,
+					Message: "Runtime class routes: gvisor=a", LastTransitionTime: metav1.Now(),
+				}}
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config).
+				WithStatusSubresource(&pmv1alpha1.PodMigration{}).Build()
+			objA := engineObject("Policy", "default", "policy-a", nil)
+			registry := mustRoutedRegistry(t, "gvisor=a",
+				&renderingEngine{name: "a", classes: []string{"gvisor"}, resources: []*unstructured.Unstructured{objA}})
+
+			r := &PodMigrationReconciler{Client: c, Scheme: scheme, Engines: registry}
+			if err := reconcileEngineTestPodMigration(t, r, config); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			got := &pmv1alpha1.PodMigration{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(config), got); err != nil {
+				t.Fatalf("getting the PodMigration: %v", err)
+			}
+			// The cluster routes still serve the namespace.
+			if !objectExists(t, c, objA) {
+				t.Errorf("the cluster route's engine objects weren't synced")
+			}
+			if cond := meta.FindStatusCondition(got.Status.Conditions, "Ready"); cond == nil || cond.Status != metav1.ConditionTrue {
+				t.Errorf("Ready condition = %+v, want True", cond)
+			}
+			if tt.want != nil {
+				tt.want.Type = ConditionEngineRoutesValid
+			}
+			assertEngineRoutesCondition(t, got, tt.want)
+		})
+	}
+}
+
+// Deleting a PodMigration deletes every engine's objects: GKE Pod
+// Snapshots' as before, and the other engines' that exist, whatever the
+// routes are now.
+func TestPodMigrationReconciler_DeletesEveryEngineResources(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	config := engineTestPodMigration("gs://my-test-bucket")
+	config.Finalizers = []string{StorageCleanupFinalizer}
+	now := metav1.Now()
+	config.DeletionTimestamp = &now
+
+	gkeObjects, err := engine.NewGKEPodSnapshots(nil, nil).NamespaceResources(config)
+	if err != nil {
+		t.Fatalf("NamespaceResources: %v", err)
+	}
+	owned := map[string]string{engine.OwnerUIDLabel: string(config.UID)}
+	ownedStorage := engineObject("StorageConfig", "", "storage-b", owned)
+	policy := engineObject("Policy", "default", "policy-b", nil)
+	othersStorage := engineObject("StorageConfig", "", "storage-c", map[string]string{engine.OwnerUIDLabel: "another-podmigration"})
+	unlabeledStorage := engineObject("StorageConfig", "", "storage-d", nil)
+
+	objects := []client.Object{config, ownedStorage.DeepCopy(), policy.DeepCopy(), othersStorage.DeepCopy(), unlabeledStorage.DeepCopy()}
+	for _, o := range gkeObjects {
+		objects = append(objects, o.DeepCopy())
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).Build()
+
+	// Nothing routes to b, c or d now; e can't render its objects.
+	registry := mustRoutedRegistry(t, "gvisor="+engine.GKEPodSnapshotsName,
+		engine.NewGKEPodSnapshots(c, scheme),
+		&renderingEngine{name: "b", resources: []*unstructured.Unstructured{ownedStorage, policy}},
+		&renderingEngine{name: "c", resources: []*unstructured.Unstructured{othersStorage}},
+		&renderingEngine{name: "d", resources: []*unstructured.Unstructured{unlabeledStorage}},
+		&renderingEngine{name: "e", err: errors.New("render failed")})
+	r := &PodMigrationReconciler{Client: c, Scheme: scheme, Engines: registry}
+	if err := reconcileEngineTestPodMigration(t, r, config); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	for _, o := range gkeObjects {
+		if objectExists(t, c, o) {
+			t.Errorf("GKE Pod Snapshots' %s %s wasn't deleted", o.GetKind(), o.GetName())
+		}
+	}
+	for _, o := range []*unstructured.Unstructured{ownedStorage, policy, unlabeledStorage} {
+		if objectExists(t, c, o) {
+			t.Errorf("%s %s wasn't deleted", o.GetKind(), o.GetName())
+		}
+	}
+	if !objectExists(t, c, othersStorage) {
+		t.Errorf("storage-c, labeled for another PodMigration, was deleted")
+	}
+	got := &pmv1alpha1.PodMigration{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(config), got); !apierrors.IsNotFound(err) {
+		t.Errorf("the PodMigration is still there (finalizers %v, error %v), want it gone", got.Finalizers, err)
 	}
 }

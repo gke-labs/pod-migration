@@ -883,3 +883,59 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestReplacementWebhook_ColdStartBypassPreservesGKEBypassOnRouteChange(t *testing.T) {
+	// Verifies that scale-up or unassigned replacement pod cold-start bypass stamps
+	// podsnapshot.gke.io/ps-name: "" to prevent stale GKE snapshot restoration even
+	// when a route change is in effect.
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "scale-up-pod",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ: "",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+		Build()
+
+	handler := &PodGateInjector{
+		Client: fakeClient,
+	}
+	_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+	rawPod, _ := json.Marshal(pod)
+	req := admission.Request{}
+	req.Namespace = pod.Namespace
+	req.Name = pod.Name
+	req.Object = runtime.RawExtension{Raw: rawPod}
+
+	resp := handler.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("Expected allowed, got denied: %+v", resp.Result)
+	}
+
+	hasBypass := false
+	for _, patch := range resp.Patches {
+		if patch.Path == "/metadata/annotations/podsnapshot.gke.io~1ps-name" && patch.Value == "" {
+			hasBypass = true
+			break
+		}
+	}
+	if !hasBypass {
+		t.Errorf("Expected cold start bypass patch for podsnapshot.gke.io/ps-name, got patches: %+v", resp.Patches)
+	}
+}
