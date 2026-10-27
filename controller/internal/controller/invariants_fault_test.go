@@ -512,6 +512,10 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		// the Status.Consumed guard and binds "snap-s1-unique" while an active Restoring PMJ tracks
 		// an in-progress (non-Ready) winnerPod, a strict-mode PMJ reconcile detects the duplicate
 		// consumption via EvaluateI1 and aborts the PMJ to Failed (Reason: InvariantViolation).
+		// Re-read the winner first: completing its restore set the cold-start bypass on it (#152).
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: winnerPod.Name}, winnerPod); err != nil {
+			t.Fatalf("re-fetch winnerPod for Leg 3: %v", err)
+		}
 		winnerPod.Status.Conditions = []corev1.PodCondition{
 			{Type: corev1.PodReady, Status: corev1.ConditionFalse},
 		}

@@ -141,22 +141,29 @@ func (p *GKEProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigr
 // patched. sourceGone reports that the source no longer exists, so nothing can
 // restart from the snapshot.
 func (p *GKEProvider) ensureSourceColdStartBypass(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (sourceGone bool, err error) {
+	return p.setColdStartBypass(ctx, job.Namespace, podName, job.Spec.TargetPodUID)
+}
+
+// setColdStartBypass merge-patches ps-name: "" onto a pod. A non-empty uid is
+// sent as a precondition, so a pod replaced under the same name is never
+// patched. gone reports that the pod no longer exists.
+func (p *GKEProvider) setColdStartBypass(ctx context.Context, namespace, podName, uid string) (gone bool, err error) {
 	meta := map[string]interface{}{
 		"annotations": map[string]interface{}{psNameAnnotation: ""},
 	}
-	if job.Spec.TargetPodUID != "" {
-		meta["uid"] = job.Spec.TargetPodUID
+	if uid != "" {
+		meta["uid"] = uid
 	}
 	data, err := json.Marshal(map[string]interface{}{"metadata": meta})
 	if err != nil {
 		return false, fmt.Errorf("encoding the cold-start bypass patch: %w", err)
 	}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: job.Namespace}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace}}
 	if err := p.client.Patch(ctx, pod, client.RawPatch(types.MergePatchType, data)); err != nil {
 		if apierrors.IsNotFound(err) {
 			return true, nil
 		}
-		return false, fmt.Errorf("patching %s on pod %s/%s: %w", psNameAnnotation, job.Namespace, podName, err)
+		return false, fmt.Errorf("patching %s on pod %s/%s: %w", psNameAnnotation, namespace, podName, err)
 	}
 	return false, nil
 }

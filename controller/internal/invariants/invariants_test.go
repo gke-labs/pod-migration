@@ -1620,3 +1620,111 @@ func TestInvariants_I11_SourceFencedAfterCheckpoint(t *testing.T) {
 		t.Fatalf("expected DefaultRules to register I11 (SourceFencedAfterCheckpoint)")
 	}
 }
+
+// TestInvariants_I2_ColdStartBypassAfterVerifiedRestore covers #152: once a job
+// recorded Restored=True (RestoreVerified or RestoreInferred), the controller sets the
+// cold-start bypass on its replacement alongside the durable restore-completed marker,
+// so that later restarts don't restore the migration snapshot again. I2 accepts that bypass
+// iff the pod carries the restore-completed marker matching the snapshot.
+func TestInvariants_I2_ColdStartBypassAfterVerifiedRestore(t *testing.T) {
+	verified := metav1.Condition{Type: ConditionRestored, Status: metav1.ConditionTrue, Reason: ReasonRestoreVerified}
+	inferred := metav1.Condition{Type: ConditionRestored, Status: metav1.ConditionTrue, Reason: ReasonRestoreInferred}
+	job := func(conds ...metav1.Condition) *pmv1alpha1.PodMigrationJob {
+		return &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-verified"},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+				SnapshotRef:     "snap-1",
+				RestoredPodName: "repl-pod",
+				RestoredPodUID:  "uid-repl",
+				Conditions:      conds,
+			},
+		}
+	}
+	pod := func(annotations map[string]string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default", Name: "repl-pod", UID: types.UID("uid-repl"), Annotations: annotations,
+		}}
+	}
+	cases := []struct {
+		name          string
+		job           *pmv1alpha1.PodMigrationJob
+		pod           *corev1.Pod
+		wantViolation bool
+	}{
+		{
+			"bypass and restore-completed marker after verified restore",
+			job(verified),
+			pod(map[string]string{AnnotationPSName: "", AnnotationRestoreCompleted: "snap-1"}),
+			false,
+		},
+		{
+			"bypass and restore-completed marker after inferred restore",
+			job(inferred),
+			pod(map[string]string{AnnotationPSName: "", AnnotationRestoreCompleted: "snap-1"}),
+			false,
+		},
+		{
+			"snapshot name without bypass after verified restore",
+			job(verified),
+			pod(map[string]string{AnnotationPSName: "snap-1"}),
+			false,
+		},
+		{
+			"bypass after verified restore lacking restore-completed marker",
+			job(verified),
+			pod(map[string]string{AnnotationPSName: ""}),
+			true,
+		},
+		{
+			"bypass after inferred restore lacking restore-completed marker",
+			job(inferred),
+			pod(map[string]string{AnnotationPSName: ""}),
+			true,
+		},
+		{
+			"bypass with mismatched restore-completed marker",
+			job(verified),
+			pod(map[string]string{AnnotationPSName: "", AnnotationRestoreCompleted: "snap-other"}),
+			true,
+		},
+		{
+			"bypass without a verified or inferred restore",
+			job(),
+			pod(map[string]string{AnnotationPSName: "", AnnotationRestoreCompleted: "snap-1"}),
+			true,
+		},
+		{
+			"bypass after a restore that isn't verified",
+			job(metav1.Condition{Type: ConditionRestored, Status: metav1.ConditionFalse, Reason: "FallbackToColdStart"}),
+			pod(map[string]string{AnnotationPSName: "", AnnotationRestoreCompleted: "snap-1"}),
+			true,
+		},
+		{
+			"another snapshot after a verified restore",
+			job(verified),
+			pod(map[string]string{AnnotationPSName: "snap-other"}),
+			true,
+		},
+		{
+			"no annotation after a verified restore",
+			job(verified),
+			pod(nil),
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vs := EvaluateI2(&ReconcileSnapshot{PrimaryPMJ: tc.job, PrimaryPod: tc.pod})
+			if !tc.wantViolation {
+				if len(vs) != 0 {
+					t.Fatalf("expected no I2 violation, got %+v", vs)
+				}
+				return
+			}
+			if len(vs) != 1 || vs[0].Reason != "SucceededPodMissingRestoreAnnotation" {
+				t.Fatalf("expected one I2 SucceededPodMissingRestoreAnnotation, got %+v", vs)
+			}
+		})
+	}
+}
