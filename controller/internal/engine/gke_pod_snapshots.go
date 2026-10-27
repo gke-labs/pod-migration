@@ -61,30 +61,54 @@ const (
 type GKEPodSnapshots struct {
 	reader   client.Reader
 	provider *snapshot.GKEProvider
+	// events reads the events that VerifyRestore inspects, from the API
+	// server rather than the cache.
+	events client.Reader
 }
 
 var (
-	_ Engine         = (*GKEPodSnapshots)(nil)
-	_ RestoreOrderer = (*GKEPodSnapshots)(nil)
+	_ Engine          = (*GKEPodSnapshots)(nil)
+	_ RestoreOrderer  = (*GKEPodSnapshots)(nil)
+	_ RestoreVerifier = (*GKEPodSnapshots)(nil)
 )
+
+// GKEOption configures the GKE Pod Snapshots engine.
+type GKEOption func(*GKEPodSnapshots)
+
+// WithAPIReader sets the reader of the events that VerifyRestore inspects.
+// Events aren't cached, so pass a reader that reads the API server, such as
+// a manager's API reader. Without it, the engine's client reads them.
+func WithAPIReader(r client.Reader) GKEOption {
+	return func(e *GKEPodSnapshots) {
+		if r != nil {
+			e.events = r
+		}
+	}
+}
 
 // NewGKEPodSnapshots returns the GKE Pod Snapshots engine. c serves the
 // policy lookup and the snapshot provider, and scheme sets the owner
 // reference on checkpoint triggers.
-func NewGKEPodSnapshots(c client.Client, scheme *runtime.Scheme) *GKEPodSnapshots {
-	return &GKEPodSnapshots{
+func NewGKEPodSnapshots(c client.Client, scheme *runtime.Scheme, opts ...GKEOption) *GKEPodSnapshots {
+	e := &GKEPodSnapshots{
 		reader:   c,
 		provider: snapshot.NewGKEProvider(c, scheme),
+		events:   c,
 	}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // NewDefaultRegistry returns the registry of a stock deployment: GKE Pod
 // Snapshots, registered as the default engine, serving every runtime class
 // that runtimeClasses allows (RoutesFromAllowList). runtimeClasses is the
 // operator allow-list (--migratable-runtime-classes); nil means gVisor only.
-func NewDefaultRegistry(c client.Client, scheme *runtime.Scheme, runtimeClasses *eligibility.RuntimeClassPolicy) (*Registry, error) {
+// opts configure the engine.
+func NewDefaultRegistry(c client.Client, scheme *runtime.Scheme, runtimeClasses *eligibility.RuntimeClassPolicy, opts ...GKEOption) (*Registry, error) {
 	r := NewRegistry(GKEPodSnapshotsName)
-	if err := r.Register(NewGKEPodSnapshots(c, scheme)); err != nil {
+	if err := r.Register(NewGKEPodSnapshots(c, scheme, opts...)); err != nil {
 		return nil, err
 	}
 	if err := r.SetRoutes(RoutesFromAllowList(runtimeClasses, GKEPodSnapshotsName)); err != nil {
@@ -231,6 +255,117 @@ func (*GKEPodSnapshots) OrderColdStartBypass(pod *corev1.Pod) error {
 	}
 	pod.Annotations[gkeRestoreAnnotation] = ""
 	return nil
+}
+
+// InspectRestoreOrder implements RestoreOrderer: a non-empty
+// podsnapshot.gke.io/ps-name annotation orders a restore of that snapshot, and
+// an explicit empty value orders a cold-start bypass.
+func (*GKEPodSnapshots) InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool) {
+	if pod == nil || pod.Annotations == nil {
+		return "", false, false
+	}
+	val, exists := pod.Annotations[gkeRestoreAnnotation]
+	if !exists {
+		return "", false, false
+	}
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return "", true, true
+	}
+	return trimmed, false, true
+}
+
+// gkeColdStartReason is the Reason of the ColdStart verdict.
+const gkeColdStartReason = "GKE runtime skipped snapshot restore and fell back to cold start"
+
+// VerifyRestore implements RestoreVerifier with the check the controller made
+// before engines reported their verdicts. GKE Pod Snapshots exposes no
+// positive restore signal (C6), so:
+//
+//   - a restore-failure Warning event on pod, since job started restoring, is
+//     a ColdStart verdict, whether or not the pod is Ready;
+//   - otherwise, a Ready pod is a Restored verdict that isn't confirmed: it's
+//     inferred from the absence of that event;
+//   - otherwise, the restore is still in progress.
+//
+// The events are listed from the API server, through the reader that
+// WithAPIReader sets.
+func (e *GKEPodSnapshots) VerifyRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (RestoreVerdict, error) {
+	if pod == nil {
+		return RestoreVerdict{}, errors.New("verifying the restore of a nil pod")
+	}
+	event, err := e.restoreFailureEvent(ctx, job, pod)
+	if err != nil {
+		return RestoreVerdict{}, err
+	}
+	if event != nil {
+		return RestoreVerdict{
+			Outcome:  ColdStart,
+			Reason:   gkeColdStartReason,
+			Evidence: fmt.Sprintf("Warning event %s: %s", event.Reason, event.Message),
+		}, nil
+	}
+	if !podReady(pod) {
+		return RestoreVerdict{Outcome: RestoreInProgress}, nil
+	}
+	return RestoreVerdict{
+		Outcome:  Restored,
+		Evidence: "pod Ready, with no restore-failure Warning event since restoring started",
+	}, nil
+}
+
+// restoreFailureEvent returns the first Warning event on pod that reports a
+// skipped or failed restore, ignoring events from before job started
+// restoring. It returns nil when there's none.
+func (e *GKEPodSnapshots) restoreFailureEvent(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (*corev1.Event, error) {
+	if e.events == nil {
+		return nil, errors.New("no reader for the replacement pod's events")
+	}
+	events := &corev1.EventList{}
+	if err := e.events.List(ctx, events,
+		client.InNamespace(pod.Namespace),
+		client.MatchingFields{"involvedObject.uid": string(pod.UID)},
+	); err != nil {
+		return nil, fmt.Errorf("failed to list events for replacement pod %s: %w", pod.Name, err)
+	}
+	for i := range events.Items {
+		event := &events.Items[i]
+		if event.InvolvedObject.UID != pod.UID {
+			continue
+		}
+		// Ignore events timestamped before this migration's Restoring phase started.
+		if job != nil && job.Status.RestoringStartTime != nil && !event.LastTimestamp.IsZero() &&
+			event.LastTimestamp.Before(job.Status.RestoringStartTime) {
+			continue
+		}
+		// Only Warning events report a skipped or failed restore.
+		if event.Type == corev1.EventTypeWarning && isRestoreFailureEvent(event) {
+			return event, nil
+		}
+	}
+	return nil, nil
+}
+
+// isRestoreFailureEvent reports whether a Warning event's reason or message
+// says that GKE Pod Snapshots skipped or failed a restore.
+func isRestoreFailureEvent(event *corev1.Event) bool {
+	switch event.Reason {
+	case "FallbackToColdStart", "FailedRestore", "RestoreFailed", "SkipRestore", "GKEPodSnapshotting":
+		return true
+	}
+	msg := strings.ToLower(event.Message)
+	return strings.Contains(msg, "falling back to a cold start") ||
+		strings.Contains(msg, "failed to restore") ||
+		strings.Contains(msg, "skipped restore")
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // PodSnapshotStorageConfigName names the cluster-scoped storage config of

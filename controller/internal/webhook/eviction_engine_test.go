@@ -41,11 +41,12 @@ import (
 // evictionTestEngine is a snapshot engine whose eligibility verdict and
 // policy are whatever the test configured.
 type evictionTestEngine struct {
-	name      string // "" is eviction-test-engine
-	classes   []string
-	verdict   engine.Verdict
-	policy    *engine.PolicyRef
-	policyErr error
+	name       string // "" is eviction-test-engine
+	classes    []string
+	verdict    engine.Verdict
+	policy     *engine.PolicyRef
+	policyErr  error
+	guarantees *engine.Guarantees
 }
 
 func (e *evictionTestEngine) Name() string {
@@ -64,7 +65,12 @@ func (e *evictionTestEngine) ResolvePolicy(context.Context, *corev1.Pod) (*engin
 }
 func (e *evictionTestEngine) Snapshots() snapshot.Provider      { return nil }
 func (e *evictionTestEngine) RestoreFailures() []restore.Engine { return nil }
-func (e *evictionTestEngine) Guarantees() engine.Guarantees     { return engine.Guarantees{} }
+func (e *evictionTestEngine) Guarantees() engine.Guarantees {
+	if e.guarantees != nil {
+		return *e.guarantees
+	}
+	return engine.Guarantees{Fencing: engine.FencingFrozen, RestoreOnce: true}
+}
 
 func TestEvictionGate_UsesThePodEngine(t *testing.T) {
 	const gvisor, runc = "gvisor", "runc"
@@ -348,5 +354,134 @@ func evictionTestRegistry(routes string, engines ...*evictionTestEngine) func(t 
 			t.Fatalf("SetRoutes(%q): %v", routes, err)
 		}
 		return r
+	}
+}
+
+func TestEvictionGate_UnfencedEngineRequiresPodOptIn(t *testing.T) {
+	const gvisor = "gvisor"
+	const refusalReason = `Snapshot engine "eviction-test-engine" does not fence the source pod after checkpoint (fencing=None) and pod does not carry pod-migration.gke.io/allow-unfenced=true`
+
+	engineWithFencing := func(mode engine.FencingMode) *evictionTestEngine {
+		return &evictionTestEngine{
+			verdict:    engine.Verdict{OK: true},
+			policy:     &engine.PolicyRef{Name: "engine-policy"},
+			guarantees: &engine.Guarantees{Fencing: mode},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		fencing     engine.FencingMode
+		annotations map[string]string
+		wantAllowed bool
+		wantCode    int32
+		wantMessage string
+		wantJob     bool
+		wantEvent   string
+	}{
+		{
+			name:        "FencingNone without allow-unfenced annotation is refused and emits Warning event",
+			fencing:     engine.FencingNone,
+			wantAllowed: true,
+			wantMessage: "skipping migration: " + refusalReason,
+			wantJob:     false,
+			wantEvent:   "Warning MigrationSkippedUnfencedEngine " + refusalReason + "; allowing cold eviction",
+		},
+		{
+			name:        "unset Fencing without allow-unfenced annotation is refused and emits Warning event",
+			fencing:     "",
+			wantAllowed: true,
+			wantMessage: "skipping migration: " + refusalReason,
+			wantJob:     false,
+			wantEvent:   "Warning MigrationSkippedUnfencedEngine " + refusalReason + "; allowing cold eviction",
+		},
+		{
+			name:        "FencingNone with allow-unfenced=true proceeds",
+			fencing:     engine.FencingNone,
+			annotations: map[string]string{engine.AnnotationAllowUnfenced: "true"},
+			wantAllowed: false,
+			wantCode:    http.StatusTooManyRequests,
+			wantMessage: "migration job spawned",
+			wantJob:     true,
+		},
+		{
+			name:        "FencingFrozen without annotation proceeds",
+			fencing:     engine.FencingFrozen,
+			wantAllowed: false,
+			wantCode:    http.StatusTooManyRequests,
+			wantMessage: "migration job spawned",
+			wantJob:     true,
+		},
+		{
+			name:        "FencingStopped without annotation proceeds",
+			fencing:     engine.FencingStopped,
+			wantAllowed: false,
+			wantCode:    http.StatusTooManyRequests,
+			wantMessage: "migration job spawned",
+			wantJob:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			_ = pmv1alpha1.AddToScheme(scheme)
+
+			class := gvisor
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   "default",
+					Name:        "test-pod",
+					UID:         "test-uid-12345",
+					Labels:      map[string]string{"pod-migration.gke.io/enabled": "true"},
+					Annotations: tt.annotations,
+				},
+				Spec: corev1.PodSpec{RuntimeClassName: &class},
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+			recorder := record.NewFakeRecorder(10)
+			reg := evictionTestRegistry("gvisor=eviction-test-engine", engineWithFencing(tt.fencing))(t)
+			gate := &EvictionGate{Client: c, APIReader: c, Recorder: recorder, Engines: reg}
+
+			req := admission.Request{}
+			req.Namespace, req.Name, req.SubResource = "default", "test-pod", "eviction"
+			resp := gate.Handle(context.Background(), req)
+
+			if resp.Allowed != tt.wantAllowed {
+				t.Errorf("Allowed = %t, want %t", resp.Allowed, tt.wantAllowed)
+			}
+			gotMessage, gotCode := "", int32(0)
+			if resp.Result != nil {
+				gotMessage, gotCode = resp.Result.Message, resp.Result.Code
+			}
+			if gotMessage != tt.wantMessage {
+				t.Errorf("message = %q, want %q", gotMessage, tt.wantMessage)
+			}
+			if tt.wantCode != 0 && gotCode != tt.wantCode {
+				t.Errorf("code = %d, want %d", gotCode, tt.wantCode)
+			}
+
+			jobs := &pmv1alpha1.PodMigrationJobList{}
+			if err := c.List(context.Background(), jobs); err != nil {
+				t.Fatalf("listing jobs: %v", err)
+			}
+			wantCount := 0
+			if tt.wantJob {
+				wantCount = 1
+			}
+			if len(jobs.Items) != wantCount {
+				t.Errorf("found %d job(s), want %d", len(jobs.Items), wantCount)
+			}
+
+			var gotEvent string
+			select {
+			case gotEvent = <-recorder.Events:
+			default:
+			}
+			if gotEvent != tt.wantEvent {
+				t.Errorf("event = %q, want %q", gotEvent, tt.wantEvent)
+			}
+		})
 	}
 }

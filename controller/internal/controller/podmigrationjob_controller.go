@@ -37,8 +37,9 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
-// fallbackEventCheckInterval throttles the uncached Events API probe for
-// not-yet-Ready replacement pods: often enough to surface a crashlooping
+// fallbackEventCheckInterval throttles the restore-verdict probe for
+// not-yet-Ready replacement pods (GKE Pod Snapshots answers it with an
+// uncached Events API list): often enough to surface a crashlooping
 // cold-start fallback promptly, coarse enough that a large drain does not
 // spend the QPS budget on event LISTs.
 const fallbackEventCheckInterval = 30 * time.Second
@@ -141,6 +142,12 @@ type PodMigrationJobReconciler struct {
 	// <= 0.
 	FenceLateStopWatch time.Duration
 
+	// RestoreStabilizationWindow is how long a replacement must stay Ready
+	// without a container restart before a restore that the engine only
+	// inferred is accepted (C6, #79). Zero accepts it as soon as the
+	// replacement is Ready. A restore the engine confirms doesn't wait.
+	RestoreStabilizationWindow time.Duration
+
 	// fallbackEventChecks records the last fallback-event probe per PMJ
 	// (namespace/name -> time.Time).  In-memory only; a restart just means
 	// one extra probe per in-flight migration.
@@ -186,7 +193,7 @@ func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, j
 	if snapStatus.Phase == snapshot.PhaseReady {
 		return true
 	}
-	if snapStatus.Phase == snapshot.PhaseFailed {
+	if snapStatus.Phase == snapshot.PhaseFailed || snapStatus.Phase == snapshot.PhaseRefused {
 		return false
 	}
 	if !snapStatus.LastProgressTime.IsZero() && time.Since(snapStatus.LastProgressTime) < timeout {
@@ -269,7 +276,7 @@ func (r *PodMigrationJobReconciler) jobEngine(job *pmv1alpha1.PodMigrationJob) e
 		}
 		log.Log.Error(err, "No snapshot engine for the job; using GKE Pod Snapshots", "job", client.ObjectKeyFromObject(job))
 	}
-	return engine.NewGKEPodSnapshots(r.Client, r.Scheme)
+	return engine.NewGKEPodSnapshots(r.Client, r.Scheme, engine.WithAPIReader(r.liveReader()))
 }
 
 // failEngineNotRegistered fails job, which names a snapshot engine that
@@ -700,6 +707,10 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		}
 	}
 
+	var restoreOrders invariants.RestoreOrderFunc
+	if r.Engines != nil {
+		restoreOrders = r.Engines.InspectRestoreOrder
+	}
 	violations, shouldFailStrict := r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
 		Now:                          time.Now(),
 		Reconciler:                   "PodMigrationJobReconciler",
@@ -712,6 +723,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		HasOrphanedTrigger:           hasOrphanedTrigger,
 		RestoreCrashSignatureMatched: restoreCrashMatched,
 		PrimarySnapshotConditions:    primarySnapshotConditions,
+		RestoreOrders:                restoreOrders,
 	})
 	if shouldFailStrict && len(violations) > 0 && !invariants.IsTerminalPhase(job.Status.Phase) {
 		orig := job.DeepCopy()
@@ -1228,8 +1240,19 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		switch snapStatus.Phase {
-		case snapshot.PhaseFailed:
-			logger.Info("Snapshot provider reported terminal failure, transitioning to Failed", "reason", snapStatus.Reason, "message", snapStatus.Message)
+		case snapshot.PhaseFailed, snapshot.PhaseRefused:
+			// If the snapshot provider does not supply a specific failure reason, fall back
+			// to SnapshotRefused (for providers/engines returning PhaseRefused with an empty reason)
+			// or SnapshotFailed. Note that GKEProvider sets SnapshotTriggerFailed or SnapshotFailed directly.
+			reason := snapStatus.Reason
+			if reason == "" {
+				if snapStatus.Phase == snapshot.PhaseRefused {
+					reason = "SnapshotRefused"
+				} else {
+					reason = "SnapshotFailed"
+				}
+			}
+			logger.Info("Snapshot provider reported terminal failure, transitioning to Failed", "phase", snapStatus.Phase, "reason", reason, "message", snapStatus.Message)
 			_ = r.getSnapshotProvider(job).Cleanup(ctx, job, podName)
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 			now := metav1.Now()
@@ -1237,7 +1260,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 				Type:               "Ready",
 				Status:             metav1.ConditionFalse,
-				Reason:             snapStatus.Reason,
+				Reason:             reason,
 				Message:            snapStatus.Message,
 				ObservedGeneration: job.Generation,
 			})
@@ -1248,7 +1271,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			metrics.MarkPMJInactive(req.NamespacedName.String())
 			metrics.RecordOutcome("failed")
 			r.recordPreviousPhaseDuration(job, pmv1alpha1.PodMigrationJobPhaseSnapshotting)
-			r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Snapshot failed: %s - %s", snapStatus.Reason, snapStatus.Message)
+			r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "Snapshot failed: %s - %s", reason, snapStatus.Message)
 			return ctrl.Result{}, nil
 
 		case snapshot.PhaseReady:
@@ -1587,9 +1610,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
-		// 2. 5-minute safety ceiling measured from RestoringStartTime
-		const restoreTimeout = 5 * time.Minute
-		if time.Since(job.Status.RestoringStartTime.Time) > restoreTimeout {
+		// 2. Safety ceiling measured from RestoringStartTime: 5 minutes, plus
+		// the stabilization window. Having no verdict by then isn't a
+		// success (C6).
+		restoreCeiling := r.restoreCeiling()
+		if time.Since(job.Status.RestoringStartTime.Time) > restoreCeiling {
 			// A crash first OBSERVED after the ceiling is still a crash.  The
 			// ceiling sits above the pod fetch, so without this check a
 			// Consumed PMJ walks straight into SucceededWithoutRestore having
@@ -1614,6 +1639,26 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					logger.Info("Restore crash observed after the 5m ceiling; running the cold-start fallback instead of concluding SucceededWithoutRestore",
 						"job", job.Name, "pod", crashedPod.Name)
 					return r.concludeRestoreCrash(ctx, req, job, origJob, crashedPod, verdict)
+				}
+				if crashedPod != nil {
+					now := time.Now()
+					if readySince, ok := effectiveReadySince(crashedPod, job, now); ok {
+						restarts, _ := containerRestarts(crashedPod)
+						if restarts == 0 && (r.RestoreStabilizationWindow <= 0 || now.Sub(readySince) >= r.RestoreStabilizationWindow) {
+							eng := r.jobEngine(job)
+							restoreV, err := r.restoreVerdict(ctx, job, crashedPod, eng)
+							if err != nil {
+								logger.Error(err, "Failed to get the engine's restore verdict for the replacement pod", "engine", eng.Name())
+								return ctrl.Result{}, err
+							}
+							if restoreV.Outcome == engine.Restored {
+								logger.Info("Replacement pod is healthy and Ready past the stabilization window at restore ceiling; concluding restored",
+									"job", job.Name, "pod", crashedPod.Name, "readySince", readySince)
+								r.fallbackEventChecks.Delete(req.NamespacedName.String())
+								return r.concludeRestored(ctx, req, job, origJob, crashedPod, eng.Name(), restoreV)
+							}
+						}
+					}
 				}
 			}
 
@@ -1648,10 +1693,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 				}
 			}
-			logger.Info("Restore timeout reached (5m), marking SucceededWithoutRestore", "job", job.Name, "pod", podName)
-			if err := r.markSucceededWithoutRestore(ctx, job, origJob, "RestoreTimeout", "Restore timed out after 5 minutes"); err != nil {
+			logger.Info("Restore ceiling reached, marking SucceededWithoutRestore", "job", job.Name, "pod", podName, "ceiling", restoreCeiling)
+			message := "Restore timed out after 5 minutes"
+			if restoreCeiling != restoreTimeout {
+				message = fmt.Sprintf("Restore timed out after %s", restoreCeiling)
+			}
+			if err := r.markSucceededWithoutRestore(ctx, job, origJob, "RestoreTimeout", message); err != nil {
 				return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore on restore timeout")
 			}
+			metrics.RecordRestoreVerdict(r.jobEngine(job).Name(), "timeout")
 			return ctrl.Result{}, nil
 		}
 
@@ -1811,42 +1861,64 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 
-			// 6. Not Ready and not crashed: probe for a cold-start fallback
-			// event on a throttle.  The query goes straight to the API server,
-			// so per-2s-tick probing saturates the QPS budget at 50 workers,
-			// but no probing at all leaves a crashlooping fallback pod
-			// undetected until the 5-minute ceiling.
+			// 6. Not Ready and not crashed: ask the engine for its restore
+			// verdict on a throttle. GKE Pod Snapshots reads the uncached
+			// Events API, so per-2s-tick probing saturates the QPS budget at
+			// 50 workers, but no probing at all leaves a crashlooping
+			// fallback pod undetected until the ceiling. Only a cold start or
+			// a failure concludes here: a restore needs a Ready pod.
 			if r.shouldProbeFallbackEvents(req.NamespacedName.String()) {
-				hasFallback, err := r.hasColdStartFallbackEvent(ctx, job, replacementPod)
+				eng := r.jobEngine(job)
+				verdict, err := r.restoreVerdict(ctx, job, replacementPod, eng)
 				if err != nil {
-					logger.Error(err, "Failed to query events for replacement pod")
+					logger.Error(err, "Failed to get the engine's restore verdict for the replacement pod", "engine", eng.Name())
 					return ctrl.Result{}, err
 				}
-				if hasFallback {
-					logger.Info("GKE runtime skipped snapshot restore and fell back to cold start (pod not yet Ready)", "pod", replacementPod.Name)
+				if verdict.Outcome == engine.ColdStart || verdict.Outcome == engine.RestoreFailed {
 					r.fallbackEventChecks.Delete(req.NamespacedName.String())
-					return ctrl.Result{}, r.markSucceededWithoutRestore(ctx, job, origJob,
-						"FallbackToColdStart", "GKE runtime skipped snapshot restore and fell back to cold start")
+					return ctrl.Result{}, r.concludeWithoutRestore(ctx, job, origJob, replacementPod, eng.Name(), verdict)
 				}
 			}
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
-		// 7. Pod is Ready: a decisive fallback-event check picks between
-		// verified restore and cold-start fallback.
-		hasFallback, err := r.hasColdStartFallbackEvent(ctx, job, replacementPod)
+		// 7. Pod is Ready: the engine's verdict decides (C6).
+		eng := r.jobEngine(job)
+		verdict, err := r.restoreVerdict(ctx, job, replacementPod, eng)
 		if err != nil {
-			logger.Error(err, "Failed to query events for replacement pod")
+			logger.Error(err, "Failed to get the engine's restore verdict for the replacement pod", "engine", eng.Name())
 			return ctrl.Result{}, err
 		}
-		r.fallbackEventChecks.Delete(req.NamespacedName.String())
-		if hasFallback {
-			logger.Info("GKE runtime skipped snapshot restore and fell back to cold start", "pod", replacementPod.Name)
-			return ctrl.Result{}, r.markSucceededWithoutRestore(ctx, job, origJob,
-				"FallbackToColdStart", "GKE runtime skipped snapshot restore and fell back to cold start")
+		// 7a. A cold start or a failure the engine reports concludes first.
+		if verdict.Outcome == engine.ColdStart || verdict.Outcome == engine.RestoreFailed {
+			r.fallbackEventChecks.Delete(req.NamespacedName.String())
+			return ctrl.Result{}, r.concludeWithoutRestore(ctx, job, origJob, replacementPod, eng.Name(), verdict)
+		}
+		// 7b. A container that restarted runs without its restored state,
+		// whatever the engine says about the restore itself.
+		if restarts, container := containerRestarts(replacementPod); restarts > 0 {
+			r.fallbackEventChecks.Delete(req.NamespacedName.String())
+			return ctrl.Result{}, r.concludeRestoreLost(ctx, job, origJob, replacementPod, eng.Name(), restarts, container)
+		}
+		// 7c. The engine is still restoring.
+		if verdict.Outcome != engine.Restored {
+			logger.Info("Replacement pod is Ready, but the engine hasn't reported a restore verdict yet; waiting",
+				"pod", replacementPod.Name, "engine", eng.Name(), "outcome", verdict.Outcome)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		// 7d. A restore the engine only inferred is accepted once the
+		// replacement has stayed up through the stabilization window. One it
+		// confirmed doesn't wait.
+		if !verdict.Confirmed {
+			if remaining := r.stabilizationRemaining(job, replacementPod); remaining > 0 {
+				logger.Info("Restore inferred; waiting for the replacement pod to stay up through the stabilization window",
+					"pod", replacementPod.Name, "engine", eng.Name(), "remaining", remaining)
+				return ctrl.Result{RequeueAfter: remaining + 500*time.Millisecond}, nil
+			}
 		}
 
-		// 8. Verified restore: the pod is Ready with no fallback event.
+		// 8. The restore concluded: RestoreVerified if the engine confirmed
+		// it, RestoreInferred otherwise.
 		// Later restarts of the replacement must start cold instead of
 		// restoring the migration snapshot again (#152), so the engine
 		// completes the restore before Succeeded is recorded. A failure
@@ -1857,34 +1929,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, err
 			}
 		}
-		logger.Info("Pod state restored from snapshot and replacement pod is Ready", "pod", replacementPod.Name)
-		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
-		now := metav1.Now()
-		job.Status.CompletionTime = &now
-		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-			Type:               "Restored",
-			Status:             metav1.ConditionTrue,
-			Reason:             "RestoreVerified",
-			Message:            "Pod state restored from snapshot and replacement pod is Ready",
-			ObservedGeneration: job.Generation,
-		})
-		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "RestoreVerified",
-			Message:            "Pod state restored from snapshot and replacement pod is Ready",
-			ObservedGeneration: job.Generation,
-		})
-		// The pod recovered and came up Ready, so any earlier unrecognised
-		// start failure was transient after all.
-		r.clearUnrecognizedRestoreCrash(job)
-		if err := r.patchStatus(ctx, job, origJob); err != nil {
-			return r.handleStatusError(ctx, err, "Failed to update job status to Succeeded")
-		}
-		metrics.MarkPMJInactive(req.NamespacedName.String())
-		metrics.RecordOutcome("succeeded")
-		r.recordPreviousPhaseDuration(job, pmv1alpha1.PodMigrationJobPhaseRestoring)
-		return ctrl.Result{}, nil
+		r.fallbackEventChecks.Delete(req.NamespacedName.String())
+		return r.concludeRestored(ctx, req, job, origJob, replacementPod, eng.Name(), verdict)
 	}
 
 	return ctrl.Result{}, nil
@@ -2234,53 +2280,6 @@ func isPodReady(pod *corev1.Pod) bool {
 		}
 	}
 	return false
-}
-
-func (r *PodMigrationJobReconciler) hasColdStartFallbackEvent(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (bool, error) {
-	if pod == nil {
-		return false, nil
-	}
-
-	reader := r.liveReader()
-
-	eventList := &corev1.EventList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(pod.Namespace),
-		client.MatchingFields{"involvedObject.uid": string(pod.UID)},
-	}
-	if err := reader.List(ctx, eventList, listOpts...); err != nil {
-		return false, fmt.Errorf("failed to list events for replacement pod %s: %w", pod.Name, err)
-	}
-
-	for _, event := range eventList.Items {
-		if event.InvolvedObject.UID != pod.UID {
-			continue
-		}
-
-		// Ignore events timestamped before this migration's Restoring phase started
-		if job != nil && job.Status.RestoringStartTime != nil && !event.LastTimestamp.IsZero() {
-			if event.LastTimestamp.Before(job.Status.RestoringStartTime) {
-				continue
-			}
-		}
-
-		// Only Warning events indicate an abnormal restore fallback
-		if event.Type == corev1.EventTypeWarning {
-			msg := strings.ToLower(event.Message)
-			reason := event.Reason
-			if reason == "FallbackToColdStart" ||
-				reason == "FailedRestore" ||
-				reason == "RestoreFailed" ||
-				reason == "SkipRestore" ||
-				reason == "GKEPodSnapshotting" ||
-				strings.Contains(msg, "falling back to a cold start") ||
-				strings.Contains(msg, "failed to restore") ||
-				strings.Contains(msg, "skipped restore") {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

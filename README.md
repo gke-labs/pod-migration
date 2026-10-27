@@ -294,6 +294,8 @@ The eviction webhook only migrates Pods whose runtime class is listed in the con
 
 A snapshot engine serves each migratable runtime class. By default, the default engine, GKE Pod Snapshots (`gke-pod-snapshots`), serves every class in `--migratable-runtime-classes`. The controller flag `--runtime-class-engines` routes classes to engines instead (for example `--runtime-class-engines=gvisor=gke-pod-snapshots`), and a `PodMigration` overrides those routes for its namespace with the `pod-migration.gke.io/runtime-class-engines` annotation, in the same syntax; its `EngineRoutesValid` condition reports whether the annotation is valid. A Pod whose class no engine serves is evicted without a migration. The engine picked for a Pod is recorded on its `PodMigrationJob` (annotation `pod-migration.gke.io/engine`) and serves the job to the end; a job that names an engine the controller doesn't have fails with reason `EngineNotRegistered`.
 
+An engine that does not fence the source Pod after checkpointing (`FencingNone` or unset) leaves the source running alongside the replacement until evicted. To migrate a Pod using an unfenced engine, the Pod must explicitly opt in with the annotation `pod-migration.gke.io/allow-unfenced: "true"`. Without this annotation, the eviction webhook and preemption controller refuse live migration, record a `Warning MigrationSkippedUnfencedEngine` event on the Pod, and fall back to cold eviction.
+
 Example (Deployment):
 ```yaml
 apiVersion: apps/v1
@@ -332,6 +334,21 @@ The controller automatically intercepts standard Kubernetes evictions and orches
    ```bash
    kubectl uncordon <node-name>
    ```
+
+### Step 3: Check the Restore Verdict
+The `PodMigrationJob`'s `Restored` condition records how the replacement Pod came up, and its message names the snapshot engine and the evidence:
+
+```bash
+kubectl get podmigrationjob <job-name> -o jsonpath='{.status.conditions[?(@.type=="Restored")]}'
+```
+
+| Phase | `Restored` reason | Meaning |
+|---|---|---|
+| `Succeeded` | `RestoreVerified` | The snapshot engine confirmed the restore with positive evidence. |
+| `Succeeded` | `RestoreInferred` | The engine has no positive restore signal and saw no sign of a failed restore, and the replacement stayed Ready without a container restart for the stabilization window (controller flag `--restore-stabilization-window`, default `30s`). GKE Pod Snapshots reports this verdict. |
+| `SucceededWithoutRestore` | `RestoreLost` | A container of the replacement restarted before the verdict, so it runs without its restored state. A `RestoreLost` Warning event is recorded on the job and on the Pod. |
+| `SucceededWithoutRestore` | `FallbackToColdStart`, `RestoreFailed` | The engine reported a cold start, or a failed restore. |
+| `SucceededWithoutRestore` | `RestoreTimeout` | No verdict within 5 minutes plus the stabilization window. |
 
 ---
 
@@ -451,7 +468,8 @@ The controller registers Prometheus metrics on the standard controller-runtime m
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `pod_migration_active` | Gauge | None | Number of currently active pod migrations in flight. |
-| `pod_migration_outcomes_total` | Counter | `outcome` (`succeeded`, `failed`, `timeout`, `fallback`, `succeeded_without_restore`) | Total completed migrations by outcome. |
+| `pod_migration_outcomes_total` | Counter | `outcome` (`succeeded`, `failed`, `timeout`, `fallback`, `succeeded_without_restore`, `restore_lost`) | Total completed migrations by outcome. |
+| `pod_migration_restore_verdicts_total` | Counter | `engine`, `verdict` (`confirmed`, `inferred`, `cold_start`, `failed`, `lost`, `timeout`) | Restore verdicts on replacement Pods, so a restore the engine confirmed can be told apart from one it inferred. |
 | `pod_migration_phase_duration_seconds` | Histogram | `phase` (`pending`, `snapshotting`, `evicting`, `restoring`) | Latency distribution of individual migration phases. |
 | `pod_migration_restore_crash_fallback_total` | Counter | None | Total cold-start fallbacks triggered by matched gVisor/OCI restore crashes. |
 | `pod_migration_restore_crash_unmatched_total` | Counter | None | Total unrecognised StartError restore-pod crashes with no known signature. |

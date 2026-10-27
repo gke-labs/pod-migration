@@ -46,13 +46,14 @@ import (
 // routedEngine is a snapshot engine for routing tests: each method returns
 // what the test configured.
 type routedEngine struct {
-	name      string
-	classes   []string
-	verdict   engine.Verdict
-	policy    *engine.PolicyRef
-	policyErr error
-	provider  snapshot.Provider
-	failures  []restore.Engine
+	name       string
+	classes    []string
+	verdict    engine.Verdict
+	policy     *engine.PolicyRef
+	policyErr  error
+	provider   snapshot.Provider
+	failures   []restore.Engine
+	guarantees *engine.Guarantees
 }
 
 func (e *routedEngine) Name() string             { return e.name }
@@ -67,6 +68,9 @@ func (e *routedEngine) ResolvePolicy(context.Context, *corev1.Pod) (*engine.Poli
 func (e *routedEngine) Snapshots() snapshot.Provider      { return e.provider }
 func (e *routedEngine) RestoreFailures() []restore.Engine { return e.failures }
 func (e *routedEngine) Guarantees() engine.Guarantees {
+	if e.guarantees != nil {
+		return *e.guarantees
+	}
 	return engine.Guarantees{Fencing: engine.FencingFrozen, RestoreOnce: true}
 }
 
@@ -90,6 +94,21 @@ func (e *orderingEngine) OrderColdStartBypass(pod *corev1.Pod) error {
 	}
 	pod.Annotations[routedRestoreAnnotation] = "none"
 	return nil
+}
+
+func (e *orderingEngine) InspectRestoreOrder(pod *corev1.Pod) (string, bool, bool) {
+	if pod == nil || pod.Annotations == nil {
+		return "", false, false
+	}
+	val, exists := pod.Annotations[routedRestoreAnnotation]
+	if !exists {
+		return "", false, false
+	}
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" || trimmed == "none" {
+		return "", true, true
+	}
+	return trimmed, false, true
 }
 
 // namedClassifier is a restore-failure classifier that only has a name, to
@@ -694,5 +713,169 @@ func TestPodGateReconciler_RestoreOrdersComeFromTheEngine(t *testing.T) {
 				t.Errorf("the pod's migration gate is there: %t, want %t", gated, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestNodePreemptionReconciler_UnfencedEngineRequiresPodOptIn(t *testing.T) {
+	const refusalReason = `Snapshot engine "routed" does not fence the source pod after checkpoint (fencing=None) and pod does not carry pod-migration.gke.io/allow-unfenced=true`
+
+	engineWithFencing := func(mode engine.FencingMode) *routedEngine {
+		return &routedEngine{
+			name:       "routed",
+			classes:    []string{"gvisor"},
+			verdict:    engine.Verdict{OK: true},
+			policy:     &engine.PolicyRef{Name: "engine-policy"},
+			guarantees: &engine.Guarantees{Fencing: mode},
+		}
+	}
+
+	tests := []struct {
+		name            string
+		fencing         engine.FencingMode
+		annotations     map[string]string
+		wantJob         bool
+		wantUnfencedEv  bool
+		wantSkippedDiff float64
+	}{
+		{
+			name:            "FencingNone without allow-unfenced annotation is refused and emits Warning event",
+			fencing:         engine.FencingNone,
+			wantJob:         false,
+			wantUnfencedEv:  true,
+			wantSkippedDiff: 1,
+		},
+		{
+			name:            "FencingNone with allow-unfenced=true proceeds",
+			fencing:         engine.FencingNone,
+			annotations:     map[string]string{engine.AnnotationAllowUnfenced: "true"},
+			wantJob:         true,
+			wantUnfencedEv:  false,
+			wantSkippedDiff: 0,
+		},
+		{
+			name:            "FencingFrozen without annotation proceeds",
+			fencing:         engine.FencingFrozen,
+			wantJob:         true,
+			wantUnfencedEv:  false,
+			wantSkippedDiff: 0,
+		},
+		{
+			name:            "FencingStopped without annotation proceeds",
+			fencing:         engine.FencingStopped,
+			wantJob:         true,
+			wantUnfencedEv:  false,
+			wantSkippedDiff: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			_ = pmv1alpha1.AddToScheme(scheme)
+
+			node := createTestNode("spot-node-fencing", true, "taint-gke")
+			pod := createTestPod("pod-fencing", "default", "spot-node-fencing", "1Gi", "uid-fencing")
+			pod.Annotations = tt.annotations
+
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+				WithObjects(node, pod).
+				Build()
+			recorder := record.NewFakeRecorder(10)
+			r := &NodePreemptionReconciler{
+				Client:                  c,
+				Scheme:                  scheme,
+				Recorder:                recorder,
+				DefaultMigrationTimeout: 10 * time.Minute,
+				SpotPreemptionBudget:    15 * 1024 * 1024 * 1024,
+				Engines:                 registryOf(t, engineWithFencing(tt.fencing)),
+			}
+
+			beforeSkipped := testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unfenced_engine"))
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "spot-node-fencing"}}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			jobs := &pmv1alpha1.PodMigrationJobList{}
+			if err := c.List(context.Background(), jobs); err != nil {
+				t.Fatalf("listing jobs: %v", err)
+			}
+			wantCount := 0
+			if tt.wantJob {
+				wantCount = 1
+			}
+			if len(jobs.Items) != wantCount {
+				t.Errorf("created %d job(s), want %d", len(jobs.Items), wantCount)
+			}
+
+			var events []string
+			for len(recorder.Events) > 0 {
+				events = append(events, <-recorder.Events)
+			}
+			wantEvent := "Warning MigrationSkippedUnfencedEngine " + refusalReason + "; skipping spot preemption migration"
+			sawUnfenced := false
+			for _, ev := range events {
+				if ev == wantEvent {
+					sawUnfenced = true
+				}
+			}
+			if sawUnfenced != tt.wantUnfencedEv {
+				t.Errorf("saw MigrationSkippedUnfencedEngine event = %t, want %t (events: %v)", sawUnfenced, tt.wantUnfencedEv, events)
+			}
+			if gotDiff := testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unfenced_engine")) - beforeSkipped; gotDiff != tt.wantSkippedDiff {
+				t.Errorf("SpotPreemptionSkippedTotal[unfenced_engine] diff = %v, want %v", gotDiff, tt.wantSkippedDiff)
+			}
+		})
+	}
+}
+
+func TestPodMigrationJobReconciler_SnapshottingPhaseRefused(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-pod", UID: "origin-uid-123"}}
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-refused", CreationTimestamp: metav1.Now()},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "test-pod"},
+			TargetPodUID: "origin-uid-123",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(pod, pmj).
+		Build()
+
+	provider := &fakeSnapshotProvider{checkStatusResult: &snapshot.Status{
+		Phase:   snapshot.PhaseRefused,
+		Message: "pod has 2 containers; only single-container pods are supported",
+	}}
+	recorder := record.NewFakeRecorder(10)
+	r := &PodMigrationJobReconciler{
+		Client:   c,
+		Scheme:   scheme,
+		Recorder: recorder,
+		Engines:  registryOf(t, &routedEngine{name: "routed", provider: provider}),
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-refused"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pmj-refused"}, got); err != nil {
+		t.Fatalf("getting the job: %v", err)
+	}
+	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Errorf("phase = %s, want Failed", got.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "SnapshotRefused" {
+		t.Errorf("Ready condition = %+v, want False/SnapshotRefused", cond)
 	}
 }

@@ -91,6 +91,7 @@ func main() {
 		fenceCap             time.Duration
 		fenceLateStopWatch   time.Duration
 		runtimeClassEngines  string
+		restoreStabilization time.Duration
 		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -106,6 +107,7 @@ func main() {
 	flag.DurationVar(&fenceCap, "fence-pre-checkpoint-cap", controller.DefaultFencePreCheckpointCap, "How long a fenced migration source waits for its checkpoint trigger while creating it fails with retryable errors; then the migration fails")
 	flag.DurationVar(&fenceLateStopWatch, "fence-late-stop-watch", controller.DefaultFenceLateStopWatch, "How long the controller watches a source that a failed migration returned to service, to fence and evict it again if the snapshot engine stops it anyway")
 	flag.StringVar(&runtimeClassEngines, "runtime-class-engines", "", "Comma-separated class=engine routes that pick the snapshot engine for the pods of each migratable runtime class, e.g. gvisor="+engine.GKEPodSnapshotsName+" ("+eligibility.DefaultRuntimeClassToken+" matches pods without a runtimeClassName). Unset routes every --migratable-runtime-classes class to the default engine, "+engine.GKEPodSnapshotsName+". A PodMigration overrides routes for its namespace with the "+engine.AnnotationRuntimeClassEngines+" annotation.")
+	flag.DurationVar(&restoreStabilization, "restore-stabilization-window", controller.DefaultRestoreStabilizationWindow, fmt.Sprintf("How long a replacement pod must stay Ready without a container restart before a restore that its snapshot engine only inferred concludes as RestoreInferred; 0 concludes as soon as the pod is Ready. A restore the engine confirms (RestoreVerified) doesn't wait. At most %s.", controller.MaxRestoreStabilizationWindow))
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -145,7 +147,8 @@ func main() {
 		"go", ver.GoVersion,
 		"platform", ver.Platform,
 		"invariantMode", invariantMode,
-		"migratableRuntimeClasses", runtimeClassPolicy.String())
+		"migratableRuntimeClasses", runtimeClassPolicy.String(),
+		"restoreStabilizationWindow", restoreStabilization)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -156,6 +159,11 @@ func main() {
 
 	if migrationTimeout < util.MinMigrationTimeout || migrationTimeout > util.MaxMigrationTimeout {
 		setupLog.Error(fmt.Errorf("migration-timeout %v out of range [%v, %v]", migrationTimeout, util.MinMigrationTimeout, util.MaxMigrationTimeout), "invalid migration timeout flag")
+		os.Exit(1)
+	}
+
+	if restoreStabilization < 0 || restoreStabilization > controller.MaxRestoreStabilizationWindow {
+		setupLog.Error(fmt.Errorf("restore-stabilization-window %v out of range [0s, %v]", restoreStabilization, controller.MaxRestoreStabilizationWindow), "invalid restore stabilization window flag")
 		os.Exit(1)
 	}
 
@@ -217,7 +225,9 @@ func main() {
 	// GKE Pod Snapshots is the only engine and the default. Unless
 	// --runtime-class-engines routes runtime classes to engines, it serves
 	// every class of the --migratable-runtime-classes allow-list.
-	engines, err := engine.NewDefaultRegistry(mgr.GetClient(), mgr.GetScheme(), runtimeClassPolicy)
+	engines, err := engine.NewDefaultRegistry(mgr.GetClient(), mgr.GetScheme(), runtimeClassPolicy,
+		// The restore verifier reads the replacement's events, which aren't cached.
+		engine.WithAPIReader(mgr.GetAPIReader()))
 	if err != nil {
 		setupLog.Error(err, "unable to build the snapshot engine registry")
 		os.Exit(1)
@@ -241,19 +251,20 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.PodMigrationJobReconciler{
-		Client:                  mgr.GetClient(),
-		APIReader:               mgr.GetAPIReader(),
-		Scheme:                  mgr.GetScheme(),
-		Recorder:                eventRecorder,
-		DefaultMigrationTimeout: migrationTimeout,
-		InvariantEngine:         invariantEngine,
+		Client:                     mgr.GetClient(),
+		APIReader:                  mgr.GetAPIReader(),
+		Scheme:                     mgr.GetScheme(),
+		Recorder:                   eventRecorder,
+		DefaultMigrationTimeout:    migrationTimeout,
+		RestoreStabilizationWindow: restoreStabilization,
+		InvariantEngine:            invariantEngine,
 		BudgetChecker: &controller.InFlightBudgetChecker{
 			Client: mgr.GetClient(),
 			DryRun: controller.EvictionBudgetChecker{Client: mgr.GetClient()},
 		},
-		Engines:                 engines,
-		FencePreCheckpointCap:   fenceCap,
-		FenceLateStopWatch:      fenceLateStopWatch,
+		Engines:               engines,
+		FencePreCheckpointCap: fenceCap,
+		FenceLateStopWatch:    fenceLateStopWatch,
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)

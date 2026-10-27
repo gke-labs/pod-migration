@@ -225,6 +225,14 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			"engine", eng.Name(), "runtimeClass", eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName), "reason", verdict.Reason)
 		return admission.Allowed(verdict.Reason)
 	}
+	if ok, reason := engine.AllowsFencing(pod, eng); !ok {
+		logger.Info("Snapshot engine does not fence the source pod and pod has not opted in, allowing eviction immediately",
+			"engine", eng.Name(), "reason", reason)
+		if a.Recorder != nil {
+			a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedUnfencedEngine", "%s; allowing cold eviction", reason)
+		}
+		return admission.Allowed(fmt.Sprintf("skipping migration: %s", reason))
+	}
 
 	// Resolve parent owner details
 	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)

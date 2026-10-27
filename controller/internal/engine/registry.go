@@ -270,6 +270,48 @@ func (r *Registry) ForJob(job *pmv1alpha1.PodMigrationJob) (Engine, error) {
 		job.Namespace, job.Name, name, ErrEngineNotRegistered, strings.Join(r.names, ","))
 }
 
+// InspectRestoreOrder inspects pod for the restore order of engineName (or the
+// default and registered engines when engineName is empty). It falls back to
+// GKE Pod Snapshots when r is nil or when the engine does not implement
+// RestoreOrderer.
+func (r *Registry) InspectRestoreOrder(engineName string, pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool) {
+	if r != nil {
+		name := strings.TrimSpace(engineName)
+		if name != "" {
+			e, ok := r.Get(name)
+			if !ok {
+				if name == GKEPodSnapshotsName {
+					return (*GKEPodSnapshots)(nil).InspectRestoreOrder(pod)
+				}
+				return "", false, false
+			}
+			if orderer, ok := e.(RestoreOrderer); ok {
+				return orderer.InspectRestoreOrder(pod)
+			}
+			return (*GKEPodSnapshots)(nil).InspectRestoreOrder(pod)
+		}
+		if def, err := r.Default(); err == nil {
+			if orderer, ok := def.(RestoreOrderer); ok {
+				if snapRef, bypass, ok := orderer.InspectRestoreOrder(pod); ok {
+					return snapRef, bypass, true
+				}
+			}
+		}
+		for _, regName := range r.Names() {
+			e, ok := r.Get(regName)
+			if !ok {
+				continue
+			}
+			if orderer, ok := e.(RestoreOrderer); ok {
+				if snapRef, bypass, ok := orderer.InspectRestoreOrder(pod); ok {
+					return snapRef, bypass, true
+				}
+			}
+		}
+	}
+	return (*GKEPodSnapshots)(nil).InspectRestoreOrder(pod)
+}
+
 // resolveLocked returns the name of the engine that serves class, given the
 // PodMigration routes overrides, whose engines are all registered.
 func (r *Registry) resolveLocked(class string, overrides Routes) (string, bool) {

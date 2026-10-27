@@ -30,6 +30,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -56,6 +57,11 @@ const (
 	// syntax: "gvisor=gke-pod-snapshots,@default=other-engine". Each class
 	// it routes overrides the controller's route for that class.
 	AnnotationRuntimeClassEngines = "pod-migration.gke.io/runtime-class-engines"
+
+	// AnnotationAllowUnfenced opts a pod into migration with an engine that
+	// declares FencingNone (C4, #150). Without "true", the controller
+	// refuses to migrate the pod on an unfenced engine.
+	AnnotationAllowUnfenced = "pod-migration.gke.io/allow-unfenced"
 )
 
 // Engine is one checkpoint/restore engine.
@@ -93,7 +99,7 @@ type Engine interface {
 	RestoreFailures() []restore.Engine
 
 	// Guarantees are the fencing mode and restore semantics the engine
-	// declares (C4, C5). Nothing enforces them yet.
+	// declares (C4, C5).
 	Guarantees() Guarantees
 }
 
@@ -134,15 +140,88 @@ type Guarantees struct {
 	RestoreOnce bool
 }
 
+// AllowsFencing reports whether pod may be migrated by eng under its declared
+// fencing mode (C4, #150). Engines that declare FencingFrozen or
+// FencingStopped fence the source after the checkpoint. Any other mode
+// (FencingNone or unset) leaves the source running alongside the replacement
+// until the source is evicted, so the pod must opt in with
+// pod-migration.gke.io/allow-unfenced="true".
+func AllowsFencing(pod *corev1.Pod, eng Engine) (bool, string) {
+	if eng == nil {
+		return false, "no snapshot engine selected"
+	}
+	fencing := eng.Guarantees().Fencing
+	if fencing == FencingFrozen || fencing == FencingStopped {
+		return true, ""
+	}
+	if pod != nil && pod.Annotations[AnnotationAllowUnfenced] == "true" {
+		return true, ""
+	}
+	if fencing == "" {
+		fencing = FencingNone
+	}
+	return false, fmt.Sprintf(
+		"Snapshot engine %q does not fence the source pod after checkpoint (fencing=%s) and pod does not carry %s=true",
+		eng.Name(), fencing, AnnotationAllowUnfenced,
+	)
+}
+
 // RestoreOrderer is an optional capability (C5): the engine defines how the
-// controller orders a restore into a replacement pod, and how it releases a
-// replacement without one. Both methods edit pod in memory; the caller
+// controller orders a restore into a replacement pod, how it releases a
+// replacement without one, and how invariant checks read that order back from a
+// pod. OrderRestore and OrderColdStartBypass edit pod in memory; the caller
 // writes it.
 type RestoreOrderer interface {
 	// OrderRestore orders job's checkpoint restored into pod.
 	OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) error
 	// OrderColdStartBypass orders pod started without a restore.
 	OrderColdStartBypass(pod *corev1.Pod) error
+	// InspectRestoreOrder reads the engine's restore order on pod without
+	// mutating it. When present is true, either snapshotRef is the non-empty
+	// checkpoint identifier ordered for restore or coldStartBypass is true.
+	InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool)
+}
+
+// RestoreOutcome is an engine's verdict on a replacement pod's restore (C6).
+type RestoreOutcome string
+
+const (
+	// RestoreInProgress isn't a verdict: the restore is still running, and
+	// the controller keeps polling.
+	RestoreInProgress RestoreOutcome = "InProgress"
+	// Restored: the replacement runs the restored application.
+	Restored RestoreOutcome = "Restored"
+	// ColdStart: the replacement started without the checkpoint.
+	ColdStart RestoreOutcome = "ColdStart"
+	// RestoreFailed: the restore failed.
+	RestoreFailed RestoreOutcome = "Failed"
+)
+
+// RestoreVerdict is an engine's verdict on a replacement pod's restore, with
+// the evidence it came from (C6).
+type RestoreVerdict struct {
+	Outcome RestoreOutcome
+	// Reason says why, for a ColdStart or Failed verdict.
+	Reason string
+	// Evidence names the condition, annotation or event the verdict came
+	// from.
+	Evidence string
+	// Confirmed marks a Restored verdict that positive evidence of the
+	// restore backs. A Restored verdict without it is inferred, for example
+	// from the absence of failure signals, and never makes the job's restore
+	// RestoreVerified (C6).
+	Confirmed bool
+}
+
+// RestoreVerifier is an optional capability (C6): the engine reports the
+// outcome of a replacement pod's restore. The controller asks it while the
+// job is Restoring, and an engine without it gets an inferred verdict from
+// the pod's readiness alone.
+type RestoreVerifier interface {
+	// VerifyRestore reports the verdict on pod, the replacement that job
+	// restores into. It must not change anything, and may be called again
+	// until it returns a verdict other than RestoreInProgress.
+	VerifyRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (RestoreVerdict, error)
 }
 
 // StorageLocationError reports a PodMigration storage location that an

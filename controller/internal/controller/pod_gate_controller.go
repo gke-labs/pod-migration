@@ -121,12 +121,17 @@ func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.
 		}
 	}
 
+	var restoreOrders invariants.RestoreOrderFunc
+	if r.Engines != nil {
+		restoreOrders = r.Engines.InspectRestoreOrder
+	}
 	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
 		Now:           time.Now(),
 		Reconciler:    "PodGateReconciler",
 		PrimaryPod:    pod,
 		PrimaryPMJ:    job,
 		TargetingPMJs: targeting,
+		RestoreOrders: restoreOrders,
 	})
 }
 

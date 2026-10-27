@@ -911,3 +911,98 @@ func TestVerifyVerdictMatchesData(t *testing.T) {
 		t.Fatal("expected run without state checks to fail VerifyVerdictMatchesData")
 	}
 }
+
+// TestRestoreEvidence checks that a job's Restored=True condition records
+// whether its engine confirmed the restore (RestoreVerified) or only inferred
+// it (RestoreInferred), and that both still count as restores (C6, #79).
+func TestRestoreEvidence(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.Create(filepath.Join(dir, "records.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const pmjGVR = "podmigrationjobs.v1alpha1.podmigration.gke.io"
+	const podGVR = "pods.v1"
+	for i, reason := range []string{"RestoreVerified", "RestoreInferred", "RestoreLost"} {
+		src, dst, pmj := "app-"+reason, "app-"+reason+"-restored", "pmj-"+reason
+		offset := time.Duration(i) * time.Second
+		rec(t, f, -time.Minute, "list", podGVR, podObj(src, "uid-src-"+reason, -time.Minute, nil))
+		rec(t, f, 10*time.Second+offset, "add", podGVR, podObj(dst, "uid-dst-"+reason, 10*time.Second+offset, func(o map[string]any) {
+			o["status"] = map[string]any{"conditions": []any{
+				map[string]any{"type": "Ready", "status": "True", "lastTransitionTime": ts(14*time.Second + offset)},
+			}}
+		}))
+		phase, status := "Succeeded", "True"
+		if reason == "RestoreLost" {
+			phase, status = "SucceededWithoutRestore", "False"
+		}
+		obj := pmjObj(pmj, src, "uid-src-"+reason, phase, "snap-"+reason)
+		obj["status"].(map[string]any)["restoredPodName"] = dst
+		obj["status"].(map[string]any)["restoredPodUID"] = "uid-dst-" + reason
+		obj["status"].(map[string]any)["conditions"] = []any{
+			map[string]any{"type": "Restored", "status": status, "reason": reason},
+		}
+		rec(t, f, 50*time.Second+offset, "add", pmjGVR, obj)
+	}
+	f.Close()
+
+	run, err := Analyze(Options{RunDir: dir, WedgeThreshold: 10 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPMJ := map[string]Migration{}
+	for _, m := range run.Migrations {
+		byPMJ[m.PMJ] = m
+	}
+	tests := []struct {
+		pmj, signal, evidence string
+		restored              bool
+	}{
+		{"pmj-RestoreVerified", "pmj:RestoreVerified", EvidenceConfirmed, true},
+		{"pmj-RestoreInferred", "pmj:RestoreInferred", EvidenceInferred, true},
+		{"pmj-RestoreLost", "pmj:RestoreLost", EvidenceJob, false},
+	}
+	for _, tt := range tests {
+		m, ok := byPMJ[tt.pmj]
+		if !ok {
+			t.Errorf("%s: no migration", tt.pmj)
+			continue
+		}
+		if m.RestoreSignal != tt.signal || m.RestoreEvidence != tt.evidence || m.Restored != tt.restored {
+			t.Errorf("%s: signal %q, evidence %q, restored %t; want %q, %q, %t",
+				tt.pmj, m.RestoreSignal, m.RestoreEvidence, m.Restored, tt.signal, tt.evidence, tt.restored)
+		}
+	}
+}
+
+// An inferred restore is still a restore claim, so S7 rejects one whose
+// application lost its state.
+func TestVerifyVerdictMatchesDataWithInferredRestores(t *testing.T) {
+	inferred := Migration{
+		PMJ: "pmj-redis-0", Pod: "redis-0", Population: "measured",
+		Outcome: OutcomeRestored, Restored: true, RestoreSignal: "pmj:RestoreInferred", RestoreEvidence: EvidenceInferred,
+	}
+	run := func(pass bool) *Run {
+		return &Run{
+			Scenario:    "s7-inferred",
+			Populations: map[string]int{"measured": 1},
+			Outcomes:    map[string]int{OutcomeRestored: 1},
+			Migrations:  []Migration{inferred},
+			Checks:      []Check{{Name: "state survived (token-verified)", Group: "redis", Pass: pass, Detail: "token check"}},
+		}
+	}
+	if err := VerifyVerdictMatchesData(run(true)); err != nil {
+		t.Errorf("an inferred restore whose state survived: %v, want no error", err)
+	}
+	err := VerifyVerdictMatchesData(run(false))
+	if err == nil || !strings.Contains(err.Error(), "verdict-data mismatch [S7]") || !strings.Contains(err.Error(), "evidence=inferred") {
+		t.Errorf("an inferred restore whose state was lost: error %v, want an S7 mismatch naming the inferred evidence", err)
+	}
+	// The signal alone makes it a restore claim, even without Restored.
+	signalOnly := run(false)
+	signalOnly.Migrations[0].Restored = false
+	signalOnly.Migrations[0].Outcome = OutcomeReplaced
+	if err := VerifyVerdictMatchesData(signalOnly); err == nil {
+		t.Errorf("a pmj:RestoreInferred signal whose state was lost: want an S7 mismatch")
+	}
+}

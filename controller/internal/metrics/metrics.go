@@ -35,13 +35,23 @@ var (
 	})
 
 	// OutcomesTotal counts completed pod migration jobs by outcome label.
-	// Outcomes: succeeded | failed | timeout | budget_timeout | fallback | succeeded_without_restore | engine_not_registered
+	// Outcomes: succeeded | failed | timeout | budget_timeout | fallback | succeeded_without_restore | engine_not_registered | restore_lost
 	// (budget_timeout: timed out waiting in Pending for the PodDisruptionBudget, with nothing checkpointed;
-	// engine_not_registered: the job names a snapshot engine that the controller doesn't register)
+	// engine_not_registered: the job names a snapshot engine that the controller doesn't register;
+	// restore_lost: a restored replacement's container restarted before the restore was verified)
 	OutcomesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_outcomes_total",
 		Help: "Total number of completed pod migration jobs by outcome.",
 	}, []string{"outcome"})
+
+	// RestoreVerdictsTotal counts restore verdicts on replacement pods (C6),
+	// by engine and verdict, so a restore the engine confirmed can be told
+	// apart from one that was inferred.
+	// Verdicts: confirmed | inferred | cold_start | failed | lost | timeout
+	RestoreVerdictsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_restore_verdicts_total",
+		Help: "Total number of restore verdicts on replacement pods, by engine and verdict.",
+	}, []string{"engine", "verdict"})
 
 	// PhaseDurationSeconds tracks duration of pod migration phases in seconds.
 	// Phases: pending | snapshotting | evicting | restoring
@@ -70,7 +80,7 @@ var (
 	})
 
 	// SpotPreemptionSkippedTotal counts pods skipped on spot preemption by reason.
-	// Reasons: budget_exceeded | no_policy
+	// Reasons: budget_exceeded | no_policy | unknown_memory | unfenced_engine
 	SpotPreemptionSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_spot_preemption_skipped_total",
 		Help: "Total number of pods skipped for spot preemption migration by reason.",
@@ -131,6 +141,7 @@ func init() {
 		FenceWebhookRequestsTotal,
 		SourceFenceTotal,
 		SourceFencedSeconds,
+		RestoreVerdictsTotal,
 	)
 }
 
@@ -145,6 +156,14 @@ func RecordSourceFence(action string) {
 func RecordSourceFencedDuration(outcome string, durationSeconds float64) {
 	if outcome != "" && durationSeconds >= 0 {
 		SourceFencedSeconds.WithLabelValues(outcome).Observe(durationSeconds)
+	}
+}
+
+// RecordRestoreVerdict increments the restore verdict counter for engine and
+// verdict.
+func RecordRestoreVerdict(engine, verdict string) {
+	if verdict != "" {
+		RestoreVerdictsTotal.WithLabelValues(engine, verdict).Inc()
 	}
 }
 
@@ -219,6 +238,9 @@ func OutcomeFor(phase pmv1alpha1.PodMigrationJobPhase, reason string) string {
 	case pmv1alpha1.PodMigrationJobPhaseSucceeded:
 		return "succeeded"
 	case pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore:
+		if reason == "RestoreLost" {
+			return "restore_lost"
+		}
 		if strings.Contains(strings.ToLower(reason), "timeout") {
 			return "timeout"
 		}

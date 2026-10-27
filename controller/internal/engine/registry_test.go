@@ -34,8 +34,9 @@ import (
 
 // fakeEngine is an Engine with a name and runtime classes, and nothing else.
 type fakeEngine struct {
-	name    string
-	classes []string
+	name       string
+	classes    []string
+	guarantees *Guarantees
 }
 
 func (f *fakeEngine) Name() string             { return f.name }
@@ -50,6 +51,9 @@ func (f *fakeEngine) ResolvePolicy(context.Context, *corev1.Pod) (*PolicyRef, er
 func (f *fakeEngine) Snapshots() snapshot.Provider      { return nil }
 func (f *fakeEngine) RestoreFailures() []restore.Engine { return nil }
 func (f *fakeEngine) Guarantees() Guarantees {
+	if f.guarantees != nil {
+		return *f.guarantees
+	}
 	return Guarantees{Fencing: FencingFrozen, RestoreOnce: true}
 }
 
@@ -600,4 +604,152 @@ func TestRegistry_ConcurrentUse(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+type fakeOrderingEngine struct {
+	fakeEngine
+	ann string
+}
+
+func (e *fakeOrderingEngine) OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) error {
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[e.ann] = job.Status.SnapshotRef
+	return nil
+}
+
+func (e *fakeOrderingEngine) OrderColdStartBypass(pod *corev1.Pod) error {
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[e.ann] = ""
+	return nil
+}
+
+func (e *fakeOrderingEngine) InspectRestoreOrder(pod *corev1.Pod) (string, bool, bool) {
+	if pod == nil || pod.Annotations == nil {
+		return "", false, false
+	}
+	v, ok := pod.Annotations[e.ann]
+	if !ok {
+		return "", false, false
+	}
+	if strings.TrimSpace(v) == "" {
+		return "", true, true
+	}
+	return strings.TrimSpace(v), false, true
+}
+
+func TestRegistry_InspectRestoreOrder(t *testing.T) {
+	gke := NewGKEPodSnapshots(nil, nil)
+	criu := &fakeOrderingEngine{
+		fakeEngine: fakeEngine{name: "criu", classes: []string{"@default", "runc"}},
+		ann:        "criu.pod-migration.gke.io/restore-snapshot",
+	}
+	plain := &fakeEngine{name: "plain", classes: []string{"kata"}}
+
+	r := NewRegistry(GKEPodSnapshotsName)
+	mustRegister(t, r, gke, criu, plain)
+
+	criuPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:        "criu-pod",
+		Annotations: map[string]string{"criu.pod-migration.gke.io/restore-snapshot": "ckpt-99"},
+	}}
+	if snap, bypass, ok := r.InspectRestoreOrder("criu", criuPod); !ok || bypass || snap != "ckpt-99" {
+		t.Fatalf("InspectRestoreOrder(criu) = (%q, %t, %t), want (ckpt-99, false, true)", snap, bypass, ok)
+	}
+	if snap, bypass, ok := r.InspectRestoreOrder("", criuPod); !ok || bypass || snap != "ckpt-99" {
+		t.Fatalf("InspectRestoreOrder(\"\") on criu pod = (%q, %t, %t), want (ckpt-99, false, true)", snap, bypass, ok)
+	}
+	if snap, bypass, ok := r.InspectRestoreOrder("missing", criuPod); ok || bypass || snap != "" {
+		t.Fatalf("InspectRestoreOrder(missing) = (%q, %t, %t), want (\"\", false, false)", snap, bypass, ok)
+	}
+
+	gkeBypassPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:        "gke-pod",
+		Annotations: map[string]string{"podsnapshot.gke.io/ps-name": ""},
+	}}
+	if snap, bypass, ok := r.InspectRestoreOrder("plain", gkeBypassPod); !ok || !bypass || snap != "" {
+		t.Fatalf("InspectRestoreOrder(plain fallback to GKE) = (%q, %t, %t), want (\"\", true, true)", snap, bypass, ok)
+	}
+}
+
+func TestAllowsFencing(t *testing.T) {
+	podWithAnnotations := func(annotations map[string]string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", Annotations: annotations}}
+	}
+	engineWithFencing := func(mode FencingMode) Engine {
+		return &fakeEngine{name: "test-engine", guarantees: &Guarantees{Fencing: mode}}
+	}
+
+	tests := []struct {
+		name       string
+		pod        *corev1.Pod
+		eng        Engine
+		wantOK     bool
+		wantReason string
+	}{
+		{
+			name:   "FencingFrozen without annotation is allowed",
+			pod:    podWithAnnotations(nil),
+			eng:    engineWithFencing(FencingFrozen),
+			wantOK: true,
+		},
+		{
+			name:   "FencingStopped without annotation is allowed",
+			pod:    podWithAnnotations(nil),
+			eng:    engineWithFencing(FencingStopped),
+			wantOK: true,
+		},
+		{
+			name:       "FencingNone without annotation is refused",
+			pod:        podWithAnnotations(nil),
+			eng:        engineWithFencing(FencingNone),
+			wantOK:     false,
+			wantReason: `Snapshot engine "test-engine" does not fence the source pod after checkpoint (fencing=None) and pod does not carry pod-migration.gke.io/allow-unfenced=true`,
+		},
+		{
+			name:       "unset Fencing without annotation is treated as FencingNone and refused",
+			pod:        podWithAnnotations(nil),
+			eng:        engineWithFencing(""),
+			wantOK:     false,
+			wantReason: `Snapshot engine "test-engine" does not fence the source pod after checkpoint (fencing=None) and pod does not carry pod-migration.gke.io/allow-unfenced=true`,
+		},
+		{
+			name:       "FencingNone with allow-unfenced=false is refused",
+			pod:        podWithAnnotations(map[string]string{AnnotationAllowUnfenced: "false"}),
+			eng:        engineWithFencing(FencingNone),
+			wantOK:     false,
+			wantReason: `Snapshot engine "test-engine" does not fence the source pod after checkpoint (fencing=None) and pod does not carry pod-migration.gke.io/allow-unfenced=true`,
+		},
+		{
+			name:   "FencingNone with allow-unfenced=true is allowed",
+			pod:    podWithAnnotations(map[string]string{AnnotationAllowUnfenced: "true"}),
+			eng:    engineWithFencing(FencingNone),
+			wantOK: true,
+		},
+		{
+			name:   "unset Fencing with allow-unfenced=true is allowed",
+			pod:    podWithAnnotations(map[string]string{AnnotationAllowUnfenced: "true"}),
+			eng:    engineWithFencing(""),
+			wantOK: true,
+		},
+		{
+			name:       "nil engine is refused",
+			pod:        podWithAnnotations(map[string]string{AnnotationAllowUnfenced: "true"}),
+			eng:        nil,
+			wantOK:     false,
+			wantReason: "no snapshot engine selected",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOK, gotReason := AllowsFencing(tt.pod, tt.eng)
+			if gotOK != tt.wantOK || gotReason != tt.wantReason {
+				t.Errorf("AllowsFencing() = (%t, %q), want (%t, %q)", gotOK, gotReason, tt.wantOK, tt.wantReason)
+			}
+		})
+	}
 }
