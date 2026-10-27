@@ -1156,8 +1156,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
 		// Fence the source before its checkpoint is triggered (#131).
 		if err := r.fenceSource(ctx, job, origJob); err != nil {
+			if reason, message, failed := r.fenceFailure(job, err); failed {
+				return r.failSnapshotting(ctx, req, job, origJob, reason, message)
+			}
 			return r.handleStatusError(ctx, err, "Failed to fence the source before its checkpoint")
 		}
+		// Note: a same-IP engine (such as CRIU) must wait for EndpointSlice
+		// serving: false before checkpointing (#146 C4), so in-flight traffic drains.
 		res, err := r.getSnapshotProvider(job).EnsureTrigger(ctx, job, podName)
 		if err != nil {
 			if reason, message, failed := r.triggerFailure(job, err); failed {

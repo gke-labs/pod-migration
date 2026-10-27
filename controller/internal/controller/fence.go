@@ -108,7 +108,8 @@ func baselineOf(pod *corev1.Pod) fenceBaseline {
 
 // jobFenceBaseline returns the baseline recorded on job, and whether one was
 // recorded at all. The fence records it last, right before the trigger can be
-// created, so a job without one never triggered a checkpoint. A baseline that
+// created, so a job without one never triggered a checkpoint (unless it was
+// already in Snapshotting across a controller upgrade). A baseline that
 // doesn't parse has no containers, so no source matches it.
 func jobFenceBaseline(job *pmv1alpha1.PodMigrationJob) (fenceBaseline, bool) {
 	raw := job.Annotations[util.AnnotationFenceBaseline]
@@ -303,6 +304,40 @@ func (r *PodMigrationJobReconciler) fenceSource(ctx context.Context, job, origJo
 	return nil
 }
 
+// preCheckpointFenceDuration reports how long the source has been fenced (or in
+// the pre-checkpoint phase) before its checkpoint was triggered.
+func (r *PodMigrationJobReconciler) preCheckpointFenceDuration(job *pmv1alpha1.PodMigrationJob) time.Duration {
+	if cond := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced); cond != nil && cond.Status == metav1.ConditionTrue {
+		return time.Since(cond.LastTransitionTime.Time)
+	}
+	if job.Status.SnapshottingStartTime != nil {
+		return time.Since(job.Status.SnapshottingStartTime.Time)
+	}
+	return time.Since(job.CreationTimestamp.Time)
+}
+
+func (r *PodMigrationJobReconciler) fencePreCheckpointCapExceeded(job *pmv1alpha1.PodMigrationJob) (time.Duration, bool) {
+	if job.Status.SnapshotRef != "" {
+		return 0, false
+	}
+	limit := r.fencePreCheckpointCap()
+	if r.preCheckpointFenceDuration(job) < limit {
+		return 0, false
+	}
+	return limit, true
+}
+
+// fenceFailure decides whether a failure to fence the source fails the job.
+// A failing fence write is retried, but a fenced source (or a job trying to
+// fence it) isn't kept out of service for longer than the pre-checkpoint cap.
+func (r *PodMigrationJobReconciler) fenceFailure(job *pmv1alpha1.PodMigrationJob, err error) (reason, message string, failed bool) {
+	limit, exceeded := r.fencePreCheckpointCapExceeded(job)
+	if !exceeded {
+		return "", "", false
+	}
+	return ReasonFenceCapExceeded, fmt.Sprintf("The source stayed fenced for %v while fencing couldn't complete: %v", limit, err), true
+}
+
 // triggerFailure decides whether a failure to create the checkpoint trigger
 // fails the job. The API server's rejection (forbidden, invalid, or denied by
 // admission) won't change on a retry, and nothing was checkpointed. Other
@@ -313,11 +348,11 @@ func (r *PodMigrationJobReconciler) triggerFailure(job *pmv1alpha1.PodMigrationJ
 		return ReasonTriggerCreateFailed, fmt.Sprintf("The checkpoint trigger was rejected, so nothing was checkpointed: %v", err), true
 	}
 	cond := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced)
-	if cond == nil || cond.Status != metav1.ConditionTrue || job.Status.SnapshotRef != "" {
+	if cond == nil || cond.Status != metav1.ConditionTrue {
 		return "", "", false
 	}
-	limit := r.fencePreCheckpointCap()
-	if time.Since(cond.LastTransitionTime.Time) < limit {
+	limit, exceeded := r.fencePreCheckpointCapExceeded(job)
+	if !exceeded {
 		return "", "", false
 	}
 	return ReasonFenceCapExceeded, fmt.Sprintf("The source stayed fenced for %v while its checkpoint trigger couldn't be created: %v", limit, err), true
@@ -327,7 +362,7 @@ func (r *PodMigrationJobReconciler) triggerFailure(job *pmv1alpha1.PodMigrationJ
 // records Failed. resolveSourceFence then settles the source's fence.
 func (r *PodMigrationJobReconciler) failSnapshotting(ctx context.Context, req ctrl.Request, job, origJob *pmv1alpha1.PodMigrationJob, reason, message string) (ctrl.Result, error) {
 	log.FromContext(ctx).Info("Failing migration job before its checkpoint completed", "reason", reason, "message", message)
-	_ = r.getSnapshotProvider().Cleanup(ctx, job, job.Spec.PodRef.Name)
+	_ = r.getSnapshotProvider(job).Cleanup(ctx, job, job.Spec.PodRef.Name)
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 	now := metav1.Now()
 	job.Status.CompletionTime = &now
@@ -384,11 +419,17 @@ func (r *PodMigrationJobReconciler) resolveSourceFence(ctx context.Context, job,
 func (r *PodMigrationJobReconciler) decideSourceFence(ctx context.Context, job, origJob *pmv1alpha1.PodMigrationJob, cond *metav1.Condition) (ctrl.Result, bool, error) {
 	baseline, triggered := jobFenceBaseline(job)
 	if !triggered {
-		pod, err := r.sourcePod(ctx, job, r.liveReader())
-		if err != nil || pod == nil {
-			return ctrl.Result{}, err != nil, err
+		// When the baseline wasn't recorded, the migration failed before its
+		// trigger could be created, unless the job was already in Snapshotting
+		// across a controller upgrade. If the engine can report its checkpoint
+		// state, consult it before unfencing.
+		if _, ok := r.getSnapshotProvider(job).(snapshot.CheckpointReporter); !ok {
+			pod, err := r.sourcePod(ctx, job, r.liveReader())
+			if err != nil || pod == nil {
+				return ctrl.Result{}, err != nil, err
+			}
+			return r.unfenceSource(ctx, job, origJob, pod, cond, "The migration failed before its checkpoint was triggered", false)
 		}
-		return r.unfenceSource(ctx, job, origJob, pod, cond, "The migration failed before its checkpoint was triggered", false)
 	}
 
 	completed, settled, why, err := r.checkpointOutcome(ctx, job)
@@ -415,6 +456,9 @@ func (r *PodMigrationJobReconciler) decideSourceFence(ctx context.Context, job, 
 	if completed {
 		return r.keepSourceFenced(ctx, job, origJob, pod, why)
 	}
+	if !triggered {
+		return r.unfenceSource(ctx, job, origJob, pod, cond, "The migration failed before its checkpoint was triggered", false)
+	}
 	if ok, diff := baseline.unchanged(pod); !ok {
 		return r.keepSourceFenced(ctx, job, origJob, pod, diff)
 	}
@@ -428,7 +472,7 @@ func (r *PodMigrationJobReconciler) checkpointOutcome(ctx context.Context, job *
 	if job.Status.EvictingStartTime != nil || job.Annotations[util.AnnotationEvictingSince] != "" {
 		return true, true, "the snapshot was durable, so the engine stopped the source", nil
 	}
-	provider := r.getSnapshotProvider()
+	provider := r.getSnapshotProvider(job)
 	reporter, ok := provider.(snapshot.CheckpointReporter)
 	if !ok {
 		return true, true, "the snapshot engine doesn't report whether its checkpoint completed", nil

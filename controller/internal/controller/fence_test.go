@@ -490,6 +490,71 @@ func TestTriggerTransientError_CappedWhileFenced(t *testing.T) {
 	}
 }
 
+// TestFenceSource_StatusPatchFailure_CappedWhileFenced: a failing pods/status
+// patch (e.g. mpodfence webhook unreachable) is retried while the source is
+// fenced, until the pre-checkpoint cap expires. The job then fails with
+// FenceCapExceeded and unfences the source pod (removing the label).
+func TestFenceSource_StatusPatchFailure_CappedWhileFenced(t *testing.T) {
+	f := newFenceFixture(t, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, p client.Patch, opts ...client.SubResourcePatchOption) error {
+			if _, isPod := obj.(*corev1.Pod); isPod {
+				return apierrors.NewInternalError(errors.New("fence webhook unreachable"))
+			}
+			return c.SubResource(sub).Patch(ctx, obj, p, opts...)
+		},
+	}, fenceTestSource(fenceTestCID, 0), fenceTestSnapshottingJob())
+	f.provider.state = snapshot.CheckpointState{Settled: true}
+
+	if _, err := f.reconcile(t); err == nil {
+		t.Fatal("Reconcile returned no error while pods/status patch failed")
+	}
+	if phase := f.job(t).Status.Phase; phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Fatalf("phase = %s after failed status patch, want Snapshotting", phase)
+	}
+	if f.provider.ensureCalls != 0 {
+		t.Fatalf("EnsureTrigger calls = %d, want 0 before fence is in place", f.provider.ensureCalls)
+	}
+	// The label was set before the status patch failed.
+	if f.pod(t).Labels[util.LabelFenced] != "true" {
+		t.Fatalf("source pod not labeled %s before status patch failure", util.LabelFenced)
+	}
+
+	// Backdate the fence past the cap.
+	job := f.job(t)
+	orig := job.DeepCopy()
+	cond := fenceCondition(t, job)
+	cond.LastTransitionTime = metav1.NewTime(time.Now().Add(-DefaultFencePreCheckpointCap - time.Second))
+	if err := f.client.Status().Patch(context.Background(), job, client.MergeFrom(orig)); err != nil {
+		t.Fatalf("backdating SourceFenced: %v", err)
+	}
+
+	// Next reconcile: cap has elapsed, so the job fails.
+	if _, err := f.reconcile(t); err != nil {
+		t.Fatalf("Reconcile past the cap: %v", err)
+	}
+	job = f.job(t)
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+		t.Fatalf("phase = %s past the cap, want Failed", job.Status.Phase)
+	}
+	if ready := meta.FindStatusCondition(job.Status.Conditions, "Ready"); ready == nil || ready.Reason != ReasonFenceCapExceeded {
+		t.Errorf("Ready = %+v, want reason %s", ready, ReasonFenceCapExceeded)
+	}
+
+	// The Failed job resolves the fence and removes the label.
+	if _, err := f.reconcile(t); err != nil {
+		t.Fatalf("resolving fence: %v", err)
+	}
+	if pod := f.pod(t); pod == nil || pod.Labels[util.LabelFenced] != "" {
+		t.Fatalf("source = %+v, want fenced label removed", pod)
+	}
+	if cond := fenceCondition(t, f.job(t)); cond.Status != metav1.ConditionFalse || cond.Reason != util.ReasonUnfenced {
+		t.Errorf("SourceFenced = %s/%s, want False/%s", cond.Status, cond.Reason, util.ReasonUnfenced)
+	}
+	if !hasEvent(f.events(), "SourceUnfenced") {
+		t.Error("no SourceUnfenced event")
+	}
+}
+
 // TestResolveSourceFence covers the unfence rules after a failure.
 func TestResolveSourceFence(t *testing.T) {
 	changedID := fencedPod(fenceTestSource("containerd://bbb", 0))
@@ -501,6 +566,7 @@ func TestResolveSourceFence(t *testing.T) {
 		job          *pmv1alpha1.PodMigrationJob
 		pod          *corev1.Pod
 		state        snapshot.CheckpointState
+		stateErr     error
 		noReporter   bool
 		wantStatus   metav1.ConditionStatus
 		wantReason   string
@@ -511,7 +577,23 @@ func TestResolveSourceFence(t *testing.T) {
 	}{
 		"fence never finished: unfence at once": {
 			job: fenceTestFailedJob(false, time.Second), pod: fencedPod(fenceTestSource(fenceTestCID, 0)),
+			state:      snapshot.CheckpointState{Settled: true},
 			wantStatus: metav1.ConditionFalse, wantReason: util.ReasonUnfenced,
+		},
+		"upgrade in flight without baseline, checkpoint completed: keep and evict": {
+			job: fenceTestFailedJob(false, time.Second), pod: fencedPod(fenceTestSource(fenceTestCID, 0)),
+			state:      snapshot.CheckpointState{Settled: true, Completed: true},
+			wantStatus: metav1.ConditionTrue, wantReason: util.ReasonFenceKept, wantEvicted: true, wantHandled: true,
+		},
+		"checkpoint state unreadable within settle window: retry": {
+			job: fenceTestFailedJob(true, time.Second), pod: fencedPod(fenceTestSource(fenceTestCID, 0)),
+			stateErr:   errors.New("transient engine failure"),
+			wantStatus: metav1.ConditionTrue, wantReason: util.ReasonFenced, wantHandled: true, wantRequeue: fenceSettleInterval,
+		},
+		"checkpoint state unreadable past settle window: keep and evict": {
+			job: fenceTestFailedJob(true, fenceSettleTimeout+time.Second), pod: fencedPod(fenceTestSource(fenceTestCID, 0)),
+			stateErr:   errors.New("persistent engine failure"),
+			wantStatus: metav1.ConditionTrue, wantReason: util.ReasonFenceKept, wantEvicted: true, wantHandled: true,
 		},
 		"checkpoint settled without completing, containers unchanged: unfence and watch": {
 			job: fenceTestFailedJob(true, time.Second), pod: fencedPod(fenceTestSource(fenceTestCID, 0)),
@@ -582,6 +664,7 @@ func TestResolveSourceFence(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newFenceFixture(t, interceptor.Funcs{}, tc.pod, tc.job)
 			f.provider.state = tc.state
+			f.provider.stateErr = tc.stateErr
 			if tc.noReporter {
 				f.r.SnapshotProvider = plainProvider{f.provider}
 			}
