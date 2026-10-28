@@ -141,15 +141,22 @@ func (p *GKEProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigr
 // patched. sourceGone reports that the source no longer exists, so nothing can
 // restart from the snapshot.
 func (p *GKEProvider) ensureSourceColdStartBypass(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (sourceGone bool, err error) {
-	return p.setColdStartBypass(ctx, job.Namespace, podName, job.Spec.TargetPodUID)
+	return p.setColdStartBypass(ctx, job.Namespace, podName, job.Spec.TargetPodUID, job.Name)
 }
 
-// setColdStartBypass merge-patches ps-name: "" onto a pod. A non-empty uid is
-// sent as a precondition, so a pod replaced under the same name is never
-// patched. gone reports that the pod no longer exists.
-func (p *GKEProvider) setColdStartBypass(ctx context.Context, namespace, podName, uid string) (gone bool, err error) {
+// setColdStartBypass merge-patches ps-name: "" and the bypassing job's name
+// onto a pod (#151, #163). A non-empty uid is sent as a precondition, so a pod
+// replaced under the same name is never patched. gone reports that the pod no
+// longer exists.
+func (p *GKEProvider) setColdStartBypass(ctx context.Context, namespace, podName, uid, bypassingJob string) (gone bool, err error) {
+	annotations := map[string]interface{}{
+		psNameAnnotation: "",
+	}
+	if bypassingJob != "" {
+		annotations[util.AnnotationColdStartBypassJob] = bypassingJob
+	}
 	meta := map[string]interface{}{
-		"annotations": map[string]interface{}{psNameAnnotation: ""},
+		"annotations": annotations,
 	}
 	if uid != "" {
 		meta["uid"] = uid
