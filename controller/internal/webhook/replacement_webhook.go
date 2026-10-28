@@ -107,7 +107,7 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	// that did not complete. However, if a non-empty ps-name is already present on the pod,
 	// it is either a user/template explicitly requesting a native GKE restore or an upstream
 	// mutating webhook (such as Kubeflow's gke-workspace-snapshot-mutating-webhook /
-	// mutate-pod.podsnapshot.gke.kubeflow.org, which sorts alphabetically before our
+	// mutate-pod.snapshot.workspaces.gke.io, which sorts alphabetically before our
 	// mutating-webhook-configuration / mpodgate.podmigration.gke.io) restoring a paused
 	// Workspace. That restore request is not ours to override, so we preserve it.
 	if assignedPMJ == "" {

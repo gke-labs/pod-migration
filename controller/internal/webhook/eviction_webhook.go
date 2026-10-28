@@ -205,6 +205,15 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return denied429(fmt.Sprintf("pod is still being restored by migration job %s; retrying after that job concludes", restoringJob))
 	}
 
+	// Do not start a new migration job for a pod whose declared readiness gates
+	// are not satisfied (e.g. an external controller is checkpointing/pausing it
+	// or the pod has not finished warming up). Checked after the existing-PMJ
+	// lookup so an already-running migration is never interrupted.
+	if !util.AreReadinessGatesSatisfied(pod) {
+		logger.Info("Pod readiness gates are not satisfied, skipping migration and allowing eviction", "pod", req.Name)
+		return admission.Allowed("skipping migration: pod readiness gates not satisfied")
+	}
+
 	// Pick the snapshot engine for the pod: the one its runtime class routes
 	// to, through the namespace's PodMigration or the controller's routes.
 	// This comes after the job checks above, which answer for a job in

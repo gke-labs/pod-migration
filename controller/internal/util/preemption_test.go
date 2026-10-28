@@ -809,3 +809,93 @@ func TestHasPDBEvictionTimedOut(t *testing.T) {
 		})
 	}
 }
+
+func TestAreReadinessGatesSatisfied(t *testing.T) {
+	gateA := corev1.PodConditionType("example.com/gate-a")
+	gateB := corev1.PodConditionType("snapshot.workspaces.gke.io/active")
+
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		expected bool
+	}{
+		{
+			name:     "nil pod",
+			pod:      nil,
+			expected: false,
+		},
+		{
+			name:     "pod without readiness gates",
+			pod:      &corev1.Pod{},
+			expected: true,
+		},
+		{
+			name: "pod with readiness gate missing condition",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					ReadinessGates: []corev1.PodReadinessGate{{ConditionType: gateA}},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pod with readiness gate condition False",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					ReadinessGates: []corev1.PodReadinessGate{{ConditionType: gateB}},
+				},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{
+						{Type: gateB, Status: corev1.ConditionFalse, Reason: "CheckpointingInProgress"},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pod with multiple readiness gates where one is False",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					ReadinessGates: []corev1.PodReadinessGate{
+						{ConditionType: gateA},
+						{ConditionType: gateB},
+					},
+				},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{
+						{Type: gateA, Status: corev1.ConditionTrue},
+						{Type: gateB, Status: corev1.ConditionFalse},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pod with all readiness gates True",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					ReadinessGates: []corev1.PodReadinessGate{
+						{ConditionType: gateA},
+						{ConditionType: gateB},
+					},
+				},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{
+						{Type: gateA, Status: corev1.ConditionTrue},
+						{Type: gateB, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := AreReadinessGatesSatisfied(tt.pod)
+			if got != tt.expected {
+				t.Errorf("AreReadinessGatesSatisfied() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}

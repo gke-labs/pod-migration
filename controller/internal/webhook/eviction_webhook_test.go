@@ -926,3 +926,68 @@ func TestEvictionGate_PropagatesControllerRevisionHashLabel(t *testing.T) {
 		t.Fatalf("Expected PMJ label %s=%q, got %q", util.LabelControllerRevisionHash, "sts-web-6b7f8c9d4", got)
 	}
 }
+
+func TestEvictionGate_UnsatisfiedReadinessGate_SkipsMigration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+	gvisorRuntime := "gvisor"
+	namespace := "default"
+	podName := "ws-dev-0"
+	podUID := "uid-ws-001"
+	gateType := corev1.PodConditionType("snapshot.workspaces.gke.io/active")
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+			ReadinessGates: []corev1.PodReadinessGate{
+				{ConditionType: gateType},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   gateType,
+					Status: corev1.ConditionFalse,
+					Reason: "CheckpointingInProgress",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+	if !resp.Allowed {
+		t.Fatalf("Expected eviction to be allowed without creating PMJ when readiness gate is False, got denied: %v", resp.Result)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := fakeClient.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("Failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 0 {
+		t.Fatalf("Expected 0 PMJs when readiness gate is unsatisfied, got %d", len(pmjList.Items))
+	}
+}

@@ -152,6 +152,12 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 
+		// Skip pods whose declared readiness gates are not satisfied (e.g.
+		// external checkpoint/pause in progress or restore warmup not complete)
+		if !util.AreReadinessGatesSatisfied(pod) {
+			continue
+		}
+
 		// Check migratable runtime class
 		if !r.RuntimeClassPolicy.Allows(pod.Spec.RuntimeClassName) {
 			continue
