@@ -84,17 +84,18 @@ rules:
 - apiGroups:
   - podmigration.gke.io
   resources:
+  - podmigrationjobs/finalizers
+  - podmigrations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - podmigration.gke.io
+  resources:
   - podmigrationjobs/status
   - podmigrations/status
   verbs:
   - get
   - patch
-  - update
-- apiGroups:
-  - podmigration.gke.io
-  resources:
-  - podmigrations/finalizers
-  verbs:
   - update
 - apiGroups:
   - podsnapshot.gke.io
