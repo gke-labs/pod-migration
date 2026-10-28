@@ -703,3 +703,110 @@ func TestNodePreemptionReconciler_SkipsPodWithUnsatisfiedReadinessGate(t *testin
 		t.Fatalf("expected PMJ for pod-active, got %s", pmjList.Items[0].Spec.PodRef.Name)
 	}
 }
+
+func TestNodePreemptionReconciler_OperatorOwned_RayHeadAndAmbiguousWorker(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	nodeName := "spot-node-ray"
+	node := createTestNode(nodeName, true, "taint-gke")
+
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+
+	// Ray head pod on preempting node (unambiguous)
+	headPod := createTestPod("ray-head", "default", nodeName, "2Gi", "uid-ray-head")
+	headPod.Labels["ray.io/group"] = "headgroup"
+	headPod.Labels["ray.io/node-type"] = "head"
+	headPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: "ray.io/v1",
+			Kind:       clusterKind,
+			Name:       clusterName,
+			UID:        types.UID(clusterUID),
+			Controller: &isController,
+		},
+	}
+
+	// Worker 1 on preempting node
+	worker1 := createTestPod("ray-worker-1", "default", nodeName, "2Gi", "uid-ray-worker-1")
+	worker1.Labels["ray.io/group"] = "workergroup"
+	worker1.Labels["ray.io/node-type"] = "worker"
+	worker1.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: "ray.io/v1",
+			Kind:       clusterKind,
+			Name:       clusterName,
+			UID:        types.UID(clusterUID),
+			Controller: &isController,
+		},
+	}
+
+	// Worker 2 on a different node (alive, shares replica key -> causes ambiguity for worker1)
+	worker2 := createTestPod("ray-worker-2", "default", "other-node", "2Gi", "uid-ray-worker-2")
+	worker2.Labels["ray.io/group"] = "workergroup"
+	worker2.Labels["ray.io/node-type"] = "worker"
+	worker2.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: "ray.io/v1",
+			Kind:       clusterKind,
+			Name:       clusterName,
+			UID:        types.UID(clusterUID),
+			Controller: &isController,
+		},
+	}
+
+	// Operator pod without replica key
+	unknownOpPod := createTestPod("custom-op-pod", "default", nodeName, "2Gi", "uid-custom-op")
+	unknownOpPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: "custom.io/v1",
+			Kind:       "CustomCR",
+			Name:       "custom-name",
+			UID:        "custom-uid",
+			Controller: &isController,
+		},
+	}
+
+	psp := createTestPSP("psp-default", "default")
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(node, headPod, worker1, worker2, unknownOpPod, psp).
+		Build()
+
+	r := &NodePreemptionReconciler{
+		Client:                  cl,
+		Scheme:                  scheme,
+		Recorder:                record.NewFakeRecorder(20),
+		DefaultMigrationTimeout: 10 * time.Minute,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: nodeName},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := cl.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("failed to list PMJs: %v", err)
+	}
+
+	// Only ray-head should have a PMJ created; worker1 (ambiguous) and unknownOpPod (no key) must be skipped!
+	if len(pmjList.Items) != 1 {
+		t.Fatalf("expected exactly 1 PMJ created (only for ray-head), got %d", len(pmjList.Items))
+	}
+	job := pmjList.Items[0]
+	if job.Spec.PodRef.Name != "ray-head" {
+		t.Fatalf("expected PMJ for ray-head, got %s", job.Spec.PodRef.Name)
+	}
+	if job.Annotations[util.AnnotationReplicaIdentityKey] != "ray.io/group=headgroup,ray.io/node-type=head" {
+		t.Fatalf("expected replica identity annotation on PMJ, got %s", job.Annotations[util.AnnotationReplicaIdentityKey])
+	}
+}

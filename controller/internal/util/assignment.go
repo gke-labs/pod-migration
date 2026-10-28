@@ -9,6 +9,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -28,6 +29,8 @@ const (
 	AnnotationMismatchSince      = "pod-migration.gke.io/mismatch-since"
 	AnnotationPDBEvictionTimeout = "pod-migration.gke.io/pdb-eviction-timeout"
 	AnnotationPodSnapshotPolicy  = "pod-migration.gke.io/pod-snapshot-policy"
+	AnnotationReplicaIdentityKey = "pod-migration.gke.io/replica-identity"
+	LabelReplicaKey              = "pod-migration.gke.io/replica-key"
 
 	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
 	// in their assigned-pmj annotation.  Registered at manager startup via
@@ -49,9 +52,12 @@ const (
 	PMJParentKeyIndexKey = "pmj.podmigration.gke.io/parent-key"
 )
 
-// ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, or StatefulSet).
+// ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, StatefulSet,
+// or any custom operator controller=true owner).
 func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod) (string, string, string, error) {
-	for _, ref := range pod.OwnerReferences {
+	var fallbackControllerOwner *metav1.OwnerReference
+	for i := range pod.OwnerReferences {
+		ref := &pod.OwnerReferences[i]
 		if ref.Kind == "ReplicaSet" {
 			rs := &appsv1.ReplicaSet{}
 			err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}, rs)
@@ -67,9 +73,193 @@ func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod
 			}
 		} else if ref.Kind == "Job" || ref.Kind == "StatefulSet" {
 			return ref.Name, ref.Kind, string(ref.UID), nil
+		} else if ref.Controller != nil && *ref.Controller {
+			fallbackControllerOwner = ref
 		}
 	}
+	if fallbackControllerOwner != nil {
+		return fallbackControllerOwner.Name, fallbackControllerOwner.Kind, string(fallbackControllerOwner.UID), nil
+	}
 	return "", "", "", nil
+}
+
+// IsBuiltInWorkloadKind reports whether kind is one of the built-in Kubernetes workload kinds
+// natively understood by the controller (Deployment, ReplicaSet, StatefulSet, Job) or bare pod ("").
+func IsBuiltInWorkloadKind(kind string) bool {
+	switch kind {
+	case "Deployment", "ReplicaSet", "StatefulSet", "Job", "":
+		return true
+	default:
+		return false
+	}
+}
+
+// ResolveOperatorReplicaKey computes the replica identity key for an operator-owned pod.
+// It checks explicit replica annotations/labels, pod-template-hash when present,
+// and per-kind tables (e.g. for RayCluster: ray.io/group plus ray.io/node-type).
+func ResolveOperatorReplicaKey(pod *corev1.Pod, parentKind string) (string, bool) {
+	if pod == nil {
+		return "", false
+	}
+	if pod.Labels != nil {
+		if k := pod.Labels[LabelReplicaKey]; k != "" {
+			return k, true
+		}
+	}
+	if pod.Annotations != nil {
+		if k := pod.Annotations[AnnotationReplicaIdentityKey]; k != "" {
+			return k, true
+		}
+	}
+	if pod.Labels != nil {
+		if hash := pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]; hash != "" {
+			return "pod-template-hash=" + hash, true
+		}
+	}
+	switch parentKind {
+	case "RayCluster":
+		if pod.Labels == nil {
+			return "", false
+		}
+		group := pod.Labels["ray.io/group"]
+		if group == "" {
+			return "", false
+		}
+		nodeType := pod.Labels["ray.io/node-type"]
+		if nodeType != "" {
+			return fmt.Sprintf("ray.io/group=%s,ray.io/node-type=%s", group, nodeType), true
+		}
+		return fmt.Sprintf("ray.io/group=%s", group), true
+	case "LeaderWorkerSet":
+		if pod.Labels == nil {
+			return "", false
+		}
+		gIdx := pod.Labels["leaderworkerset.sigs.k8s.io/group-index"]
+		if gIdx == "" {
+			return "", false
+		}
+		wIdx := pod.Labels["leaderworkerset.sigs.k8s.io/worker-index"]
+		if wIdx != "" {
+			return fmt.Sprintf("lws.group=%s,lws.worker=%s", gIdx, wIdx), true
+		}
+		return fmt.Sprintf("lws.group=%s", gIdx), true
+	default:
+		return "", false
+	}
+}
+
+// JobReplicaIdentityKey extracts the replica identity key recorded on a PodMigrationJob.
+func JobReplicaIdentityKey(job *pmv1alpha1.PodMigrationJob) string {
+	if job == nil {
+		return ""
+	}
+	if job.Annotations != nil {
+		if k := job.Annotations[AnnotationReplicaIdentityKey]; k != "" {
+			return k
+		}
+	}
+	if job.Labels != nil {
+		if hash := job.Labels[LabelPodTemplateHash]; hash != "" {
+			return "pod-template-hash=" + hash
+		}
+	}
+	return ""
+}
+
+// HasAmbiguousOperatorSibling checks if there is any other alive, non-terminating pod
+// under the same parent that shares the same replica identity key.
+func HasAmbiguousOperatorSibling(
+	ctx context.Context,
+	c client.Reader,
+	namespace, parentName, parentKind, parentUID, replicaKey string,
+	excludePodUIDs ...string,
+) (bool, string, error) {
+	if replicaKey == "" || parentName == "" || parentKind == "" {
+		return false, "", nil
+	}
+
+	podList := &corev1.PodList{}
+	if err := c.List(ctx, podList, client.InNamespace(namespace)); err != nil {
+		return false, "", err
+	}
+
+	excludeMap := make(map[string]bool)
+	for _, uid := range excludePodUIDs {
+		if uid != "" {
+			excludeMap[uid] = true
+		}
+	}
+
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if excludeMap[string(p.UID)] || excludeMap[p.Name] {
+			continue
+		}
+		if !isSourcePodAlive(p) {
+			continue
+		}
+
+		// Check if p belongs to the same parent
+		isChild := false
+		for _, ref := range p.OwnerReferences {
+			if ref.Kind == parentKind && ref.Name == parentName {
+				if parentUID == "" || ref.UID == "" || string(ref.UID) == parentUID {
+					isChild = true
+					break
+				}
+			}
+		}
+		if !isChild {
+			continue
+		}
+
+		siblingKey, ok := ResolveOperatorReplicaKey(p, parentKind)
+		if ok && siblingKey == replicaKey {
+			return true, p.Name, nil
+		}
+	}
+
+	return false, "", nil
+}
+
+// HasActivePMJWithReplicaKey checks if there is already an active (unconsumed) PMJ
+// for the given parent with the specified replica identity key.
+func HasActivePMJWithReplicaKey(
+	ctx context.Context,
+	c client.Reader,
+	namespace, parentName, parentKind, replicaKey, excludePMJName string,
+) (bool, string, error) {
+	if replicaKey == "" || parentName == "" || parentKind == "" {
+		return false, "", nil
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := c.List(ctx, pmjList, client.InNamespace(namespace)); err != nil {
+		return false, "", err
+	}
+
+	for i := range pmjList.Items {
+		job := &pmjList.Items[i]
+		if job.Name == excludePMJName {
+			continue
+		}
+		if job.Status.Consumed {
+			continue
+		}
+		phase := job.Status.Phase
+		if phase == pmv1alpha1.PodMigrationJobPhaseFailed ||
+			phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+			continue
+		}
+		if job.Labels[LabelParentName] != parentName || job.Labels[LabelParentKind] != parentKind {
+			continue
+		}
+		if JobReplicaIdentityKey(job) == replicaKey {
+			return true, job.Name, nil
+		}
+	}
+
+	return false, "", nil
 }
 
 // ShortUID returns the first 8 characters of a UID, or the full UID if shorter.
@@ -141,7 +331,7 @@ func isPMJAssignedToPod(ctx context.Context, c client.Reader, namespace, pmjName
 	return len(podList.Items) > 0, nil
 }
 
-func filterCandidates(jobs []pmv1alpha1.PodMigrationJob, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex string) []pmv1alpha1.PodMigrationJob {
+func filterCandidates(jobs []pmv1alpha1.PodMigrationJob, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex, replicaKey string) []pmv1alpha1.PodMigrationJob {
 	var candidates []pmv1alpha1.PodMigrationJob
 	for _, job := range jobs {
 		if job.Status.Consumed {
@@ -173,6 +363,16 @@ func filterCandidates(jobs []pmv1alpha1.PodMigrationJob, parentName, parentKind,
 			if parentKind == "StatefulSet" && job.Spec.PodRef.Name != podName {
 				continue
 			}
+
+			if !IsBuiltInWorkloadKind(parentKind) {
+				if replicaKey == "" {
+					continue
+				}
+				jobKey := JobReplicaIdentityKey(&job)
+				if jobKey == "" || jobKey != replicaKey {
+					continue
+				}
+			}
 		}
 
 		// A replacement exists because its source was evicted, which happens only
@@ -188,6 +388,21 @@ func filterCandidates(jobs []pmv1alpha1.PodMigrationJob, parentName, parentKind,
 			candidates = append(candidates, job)
 		}
 	}
+
+	// For operator-owned workloads, check ambiguity: if multiple candidates share the same replicaKey,
+	// refuse rather than guess.
+	if !IsBuiltInWorkloadKind(parentKind) && replicaKey != "" {
+		matchingCount := 0
+		for _, cand := range candidates {
+			if JobReplicaIdentityKey(&cand) == replicaKey {
+				matchingCount++
+			}
+		}
+		if matchingCount > 1 {
+			return nil
+		}
+	}
+
 	// Prefer the jobs whose source is being evicted; Snapshotting stays a
 	// candidate only for a cache that lags the job's move to Evicting, and
 	// FindUnassignedActivePMJ skips it while its source is alive.
@@ -236,7 +451,19 @@ func isSourcePodAlive(pod *corev1.Pod) bool {
 // O(result) lookups against an index-backed client (e.g. manager cache client).
 // When indexed is false (live APIReader fallback), it performs unindexed namespace lists and in-memory filtering
 // without sending unsupported field selectors to the real apiserver.
-func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string, indexed bool) (string, error) {
+// If replicaKey is provided, it is used to match operator-owned pods.
+func FindUnassignedActivePMJ(
+	ctx context.Context,
+	c client.Reader,
+	namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex string,
+	indexed bool,
+	replicaKey ...string,
+) (string, error) {
+	var opReplicaKey string
+	if len(replicaKey) > 0 {
+		opReplicaKey = replicaKey[0]
+	}
+
 	if indexed {
 		parentKey := FormatParentKey(parentName, parentKind, podName)
 		if parentKey == "" {
@@ -247,12 +474,23 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 			return "", err
 		}
 
-		candidates := filterCandidates(jobList.Items, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex)
+		candidates := filterCandidates(jobList.Items, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex, opReplicaKey)
 		if len(candidates) == 0 {
 			return "", nil
 		}
 
 		for _, job := range candidates {
+			// For operator-owned pods, ensure no other active sibling pod shares this replicaKey
+			if !IsBuiltInWorkloadKind(parentKind) && opReplicaKey != "" {
+				ambiguous, _, err := HasAmbiguousOperatorSibling(ctx, c, namespace, parentName, parentKind, parentUID, opReplicaKey, job.Spec.TargetPodUID, job.Spec.PodRef.Name, podName)
+				if err != nil {
+					return "", err
+				}
+				if ambiguous {
+					return "", nil
+				}
+			}
+
 			// Narrowing for scale-up race: don't match Evicting- or Snapshotting-phase PMJs whose origin
 			// pod still exists and is running. If the origin pod is still alive, any newly arriving candidate
 			// pod is a concurrent scale-up (see requiresSourceGone).
@@ -292,7 +530,7 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 		return "", err
 	}
 
-	candidates := filterCandidates(jobList.Items, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex)
+	candidates := filterCandidates(jobList.Items, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex, opReplicaKey)
 	if len(candidates) == 0 {
 		return "", nil
 	}
@@ -318,6 +556,16 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 	}
 
 	for _, job := range candidates {
+		if !IsBuiltInWorkloadKind(parentKind) && opReplicaKey != "" {
+			ambiguous, _, err := HasAmbiguousOperatorSibling(ctx, c, namespace, parentName, parentKind, parentUID, opReplicaKey, job.Spec.TargetPodUID, job.Spec.PodRef.Name, podName)
+			if err != nil {
+				return "", err
+			}
+			if ambiguous {
+				return "", nil
+			}
+		}
+
 		if requiresSourceGone(job.Status.Phase) {
 			originExists := false
 			if job.Spec.TargetPodUID != "" {
@@ -336,6 +584,17 @@ func FindUnassignedActivePMJ(ctx context.Context, c client.Reader, namespace, po
 	}
 
 	return "", nil
+}
+
+// FindAssignablePMJ searches for an active PMJ under the parent that can be assigned to a replacement pod,
+// supporting built-in workloads and operator-owned workloads identified by a replica identity key.
+func FindAssignablePMJ(
+	ctx context.Context,
+	c client.Reader,
+	namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, replicaKey string,
+	indexed bool,
+) (string, error) {
+	return FindUnassignedActivePMJ(ctx, c, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, indexed, replicaKey)
 }
 
 // ResolveCollision deterministically resolves PMJ assignment races.
@@ -395,13 +654,17 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 
 	var podTemplateHash string
 	var jobCompletionIndex string
+	var replicaKey string
 	if pod.Labels != nil {
 		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
 		jobCompletionIndex = pod.Labels[LabelJobCompletionIndex]
 	}
+	if !IsBuiltInWorkloadKind(parentKind) {
+		replicaKey, _ = ResolveOperatorReplicaKey(pod, parentKind)
+	}
 
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true)
+	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true, replicaKey)
 	if err != nil {
 		return "", false, err
 	}

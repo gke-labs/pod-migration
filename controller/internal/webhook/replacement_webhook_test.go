@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -937,5 +938,237 @@ func TestReplacementWebhook_ColdStartBypassPreservesGKEBypassOnRouteChange(t *te
 	}
 	if !hasBypass {
 		t.Errorf("Expected cold start bypass patch for podsnapshot.gke.io/ps-name, got patches: %+v", resp.Patches)
+	}
+}
+
+func TestReplacementWebhook_RayHead_GatedAndAssigned(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-head-origin",
+			Namespace: namespace,
+			Labels: map[string]string{
+				util.LabelParentName: clusterName,
+				util.LabelParentKind: clusterKind,
+				util.LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				util.AnnotationReplicaIdentityKey: "ray.io/group=headgroup,ray.io/node-type=head",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-head-origin"},
+			TargetPodUID: "origin-head-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:    namespace,
+			GenerateName: "sample-ray-head-",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "headgroup",
+				"ray.io/node-type":             "head",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		Build()
+
+	handler := &PodGateInjector{
+		Client: fakeClient,
+	}
+	_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+	rawPod, _ := json.Marshal(replacementPod)
+	req := admission.Request{}
+	req.Namespace = namespace
+	req.Object = runtime.RawExtension{Raw: rawPod}
+
+	resp := handler.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("Expected allowed, got denied: %+v", resp.Result)
+	}
+
+	hasGate := false
+	hasAssignedPMJ := false
+	for _, patch := range resp.Patches {
+		if patch.Operation == "add" && (patch.Path == "/spec/schedulingGates" || patch.Path == "/spec/schedulingGates/-") {
+			hasGate = true
+		}
+		if patch.Path == "/metadata/annotations" {
+			if valMap, ok := patch.Value.(map[string]interface{}); ok {
+				if val, ok := valMap[util.AnnotationAssignedPMJ]; ok && val == pmj.Name {
+					hasAssignedPMJ = true
+				}
+			}
+		}
+		if patch.Path == "/metadata/annotations/pod-migration.gke.io~1assigned-pmj" && patch.Value == pmj.Name {
+			hasAssignedPMJ = true
+		}
+	}
+
+	if !hasGate {
+		t.Errorf("Expected scheduling gate injected for Ray head replacement pod, got patches: %+v", resp.Patches)
+	}
+	if !hasAssignedPMJ {
+		t.Errorf("Expected assigned-pmj annotation %q on Ray head replacement pod, got patches: %+v", pmj.Name, resp.Patches)
+	}
+}
+
+func TestReplacementWebhook_RayWorker_AmbiguousSibling_BypassedColdStart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-worker-1",
+			Namespace: namespace,
+			Labels: map[string]string{
+				util.LabelParentName: clusterName,
+				util.LabelParentKind: clusterKind,
+				util.LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				util.AnnotationReplicaIdentityKey: "ray.io/group=workergroup,ray.io/node-type=worker",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-worker-1"},
+			TargetPodUID: "worker-1-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	// Sibling worker-2 is running
+	siblingWorker2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "sample-ray-worker-2",
+			UID:       "worker-2-uid",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "workergroup",
+				"ray.io/node-type":             "worker",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	replacementWorker := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:    namespace,
+			GenerateName: "sample-ray-worker-",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "workergroup",
+				"ray.io/node-type":             "worker",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+		WithObjects(pmj, siblingWorker2).
+		Build()
+
+	handler := &PodGateInjector{
+		Client: fakeClient,
+	}
+	_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+	rawPod, _ := json.Marshal(replacementWorker)
+	req := admission.Request{}
+	req.Namespace = namespace
+	req.Object = runtime.RawExtension{Raw: rawPod}
+
+	resp := handler.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("Expected allowed, got denied: %+v", resp.Result)
+	}
+
+	hasBypass := false
+	hasGate := false
+	for _, patch := range resp.Patches {
+		if patch.Path == "/metadata/annotations" {
+			if valMap, ok := patch.Value.(map[string]interface{}); ok {
+				if val, ok := valMap["podsnapshot.gke.io/ps-name"]; ok && val == "" {
+					hasBypass = true
+				}
+			}
+		}
+		if patch.Path == "/metadata/annotations/podsnapshot.gke.io~1ps-name" && patch.Value == "" {
+			hasBypass = true
+		}
+		if patch.Operation == "add" && (patch.Path == "/spec/schedulingGates" || patch.Path == "/spec/schedulingGates/-") {
+			hasGate = true
+		}
+	}
+
+	if hasGate {
+		t.Errorf("Expected ambiguous worker replacement NOT to be gated, but gate was injected")
+	}
+	if !hasBypass {
+		t.Errorf("Expected cold-start bypass (ps-name='') for ambiguous worker replacement, got patches: %+v", resp.Patches)
 	}
 }
