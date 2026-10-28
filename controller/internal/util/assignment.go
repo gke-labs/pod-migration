@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -119,33 +120,22 @@ func ResolveOperatorReplicaKey(pod *corev1.Pod, parentKind string) (string, bool
 	switch parentKind {
 	case "RayCluster":
 		if pod.Labels == nil {
-			return "", false
+			break
 		}
 		group := pod.Labels["ray.io/group"]
 		if group == "" {
-			return "", false
+			break
 		}
 		nodeType := pod.Labels["ray.io/node-type"]
 		if nodeType != "" {
 			return fmt.Sprintf("ray.io/group=%s,ray.io/node-type=%s", group, nodeType), true
 		}
 		return fmt.Sprintf("ray.io/group=%s", group), true
-	case "LeaderWorkerSet":
-		if pod.Labels == nil {
-			return "", false
-		}
-		gIdx := pod.Labels["leaderworkerset.sigs.k8s.io/group-index"]
-		if gIdx == "" {
-			return "", false
-		}
-		wIdx := pod.Labels["leaderworkerset.sigs.k8s.io/worker-index"]
-		if wIdx != "" {
-			return fmt.Sprintf("lws.group=%s,lws.worker=%s", gIdx, wIdx), true
-		}
-		return fmt.Sprintf("lws.group=%s", gIdx), true
-	default:
-		return "", false
 	}
+	if pod.GenerateName == "" && pod.Name != "" {
+		return "pod-name=" + pod.Name, true
+	}
+	return "", false
 }
 
 // JobReplicaIdentityKey extracts the replica identity key recorded on a PodMigrationJob.
@@ -475,6 +465,15 @@ func FindUnassignedActivePMJ(
 		}
 
 		candidates := filterCandidates(jobList.Items, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex, opReplicaKey)
+		if len(candidates) == 0 && !IsBuiltInWorkloadKind(parentKind) && strings.HasPrefix(opReplicaKey, "pod-name=") {
+			// In-flight upgrade compatibility: PMJs created by a pre-upgrade controller for stable-name
+			// operator pods were indexed as bare pods under "<podName>/Pod" with empty parent labels.
+			bareKey := podName + "/Pod"
+			bareJobList := &pmv1alpha1.PodMigrationJobList{}
+			if err := c.List(ctx, bareJobList, client.InNamespace(namespace), client.MatchingFields{PMJParentKeyIndexKey: bareKey}); err == nil {
+				candidates = filterCandidates(bareJobList.Items, "", "", "", podName, "", "", "")
+			}
+		}
 		if len(candidates) == 0 {
 			return "", nil
 		}
@@ -531,6 +530,11 @@ func FindUnassignedActivePMJ(
 	}
 
 	candidates := filterCandidates(jobList.Items, parentName, parentKind, parentUID, podName, podTemplateHash, jobCompletionIndex, opReplicaKey)
+	if len(candidates) == 0 && !IsBuiltInWorkloadKind(parentKind) && strings.HasPrefix(opReplicaKey, "pod-name=") {
+		// In-flight upgrade compatibility: PMJs created by a pre-upgrade controller for stable-name
+		// operator pods were recorded as bare pods with empty parent labels.
+		candidates = filterCandidates(jobList.Items, "", "", "", podName, "", "", "")
+	}
 	if len(candidates) == 0 {
 		return "", nil
 	}
@@ -584,17 +588,6 @@ func FindUnassignedActivePMJ(
 	}
 
 	return "", nil
-}
-
-// FindAssignablePMJ searches for an active PMJ under the parent that can be assigned to a replacement pod,
-// supporting built-in workloads and operator-owned workloads identified by a replica identity key.
-func FindAssignablePMJ(
-	ctx context.Context,
-	c client.Reader,
-	namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, replicaKey string,
-	indexed bool,
-) (string, error) {
-	return FindUnassignedActivePMJ(ctx, c, namespace, podName, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, indexed, replicaKey)
 }
 
 // ResolveCollision deterministically resolves PMJ assignment races.

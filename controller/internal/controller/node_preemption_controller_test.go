@@ -759,8 +759,9 @@ func TestNodePreemptionReconciler_OperatorOwned_RayHeadAndAmbiguousWorker(t *tes
 		},
 	}
 
-	// Operator pod without replica key
+	// Operator pod without replica key (has GenerateName, so not stable name)
 	unknownOpPod := createTestPod("custom-op-pod", "default", nodeName, "2Gi", "uid-custom-op")
+	unknownOpPod.GenerateName = "custom-op-"
 	unknownOpPod.OwnerReferences = []metav1.OwnerReference{
 		{
 			APIVersion: "custom.io/v1",
@@ -808,5 +809,99 @@ func TestNodePreemptionReconciler_OperatorOwned_RayHeadAndAmbiguousWorker(t *tes
 	}
 	if job.Annotations[util.AnnotationReplicaIdentityKey] != "ray.io/group=headgroup,ray.io/node-type=head" {
 		t.Fatalf("expected replica identity annotation on PMJ, got %s", job.Annotations[util.AnnotationReplicaIdentityKey])
+	}
+}
+
+func TestNodePreemptionReconciler_OperatorOwned_InFlightPMJ_Refused(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	nodeName := "spot-node-ray-inflight"
+	node := createTestNode(nodeName, true, "taint-gke")
+
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	headReplicaKey := "ray.io/group=headgroup,ray.io/node-type=head"
+	isController := true
+
+	// Active PMJ already in flight for this RayCluster head
+	existingPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-ray-head-existing",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: clusterName,
+				util.LabelParentKind: clusterKind,
+				util.LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				util.AnnotationReplicaIdentityKey: headReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "ray-head-old"},
+			TargetPodUID: "uid-ray-head-old",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	headPod := createTestPod("ray-head-new", "default", nodeName, "2Gi", "uid-ray-head-new")
+	headPod.Labels["ray.io/group"] = "headgroup"
+	headPod.Labels["ray.io/node-type"] = "head"
+	headPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: "ray.io/v1",
+			Kind:       clusterKind,
+			Name:       clusterName,
+			UID:        types.UID(clusterUID),
+			Controller: &isController,
+		},
+	}
+
+	psp := createTestPSP("psp-default", "default")
+	recorder := record.NewFakeRecorder(20)
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(node, headPod, existingPMJ, psp).
+		Build()
+
+	r := &NodePreemptionReconciler{
+		Client:                  cl,
+		Scheme:                  scheme,
+		Recorder:                recorder,
+		DefaultMigrationTimeout: 10 * time.Minute,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: nodeName},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := cl.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("failed to list PMJs: %v", err)
+	}
+
+	// Should still only have the 1 existing PMJ; no second PMJ created!
+	if len(pmjList.Items) != 1 {
+		t.Fatalf("expected exactly 1 PMJ (the existing one), got %d", len(pmjList.Items))
+	}
+
+	select {
+	case event := <-recorder.Events:
+		expectedMsg := "Operator-owned pod replica identity \"ray.io/group=headgroup,ray.io/node-type=head\" is already in-flight under migration job pmj-ray-head-existing; skipping spot preemption migration"
+		if event != fmt.Sprintf("Warning MigrationSkippedAmbiguousReplicaKey %s", expectedMsg) {
+			t.Errorf("Unexpected event: %s", event)
+		}
+	default:
+		t.Errorf("Expected MigrationSkippedAmbiguousReplicaKey event, but none was recorded")
 	}
 }
