@@ -21,6 +21,8 @@ const (
 
 	// AnnotationAssignedPMJ links a replacement Pod to its owning PodMigrationJob.
 	AnnotationAssignedPMJ = util.AnnotationAssignedPMJ
+	// AnnotationColdStartBypassJob records the PMJ that set the cold-start bypass on a source pod (#163).
+	AnnotationColdStartBypassJob = util.AnnotationColdStartBypassJob
 	// AnnotationRestoreCompleted records the snapshotRef on the replacement Pod after a verified restore (#152).
 	AnnotationRestoreCompleted = util.AnnotationRestoreCompleted
 	// AnnotationPSName is the GKE Pod Snapshots restore annotation on replacement Pods.
@@ -310,14 +312,16 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 // A PMJ may transition to Succeeded (warm restore) iff Status.SnapshotRef is non-empty,
 // Status.RestoredPodName is recorded, and (when the replacement Pod is present in the
 // snapshot) the replacement Pod carries the matching restore order for the job's engine
-// and did not bypass restore via a cold-start bypass order. The annotation check
-// is skipped once another PMJ, created at or after this one and in any phase, targets
-// the replacement's UID: that pod was migrated again and carries the newer job's
-// cold-start bypass (#151), which stays if the newer job fails. The cold-start bypass
-// is also accepted once the PMJ recorded Restored=True (RestoreVerified or RestoreInferred)
-// AND the replacement carries `pod-migration.gke.io/restore-completed` matching Status.SnapshotRef:
-// the controller sets both after the verified restore, so that later restarts of the replacement
-// don't restore the migration snapshot again (#152).
+// and did not bypass restore via a cold-start bypass order. The replacement check matches
+// by RestoredPodUID when recorded, skipping pods replaced under the same name. The cold-start
+// bypass is accepted when another PMJ set the bypass on the pod (stamping its name in
+// AnnotationColdStartBypassJob matching FormatPMJName, #163) or targets the replacement's
+// UID in the snapshot (#151); this exemption is strictly guarded by the empty cold-start
+// bypass order so that a replacement carrying a different snapshot name still violates I2 (#163).
+// The cold-start bypass is also accepted once the PMJ recorded Restored=True (RestoreVerified
+// or RestoreInferred) AND the replacement carries `pod-migration.gke.io/restore-completed`
+// matching Status.SnapshotRef: the controller sets both after the verified restore, so that later
+// restarts of the replacement don't restore the migration snapshot again (#152).
 func EvaluateI2(s *ReconcileSnapshot) []Violation {
 	var violations []Violation
 	jobs := allPMJs(s)
@@ -360,12 +364,22 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 		}
 		if job.Status.RestoredPodName != "" {
 			if pod, ok := podByKey[job.Namespace+"/"+job.Status.RestoredPodName]; ok {
-				if pod.UID != "" && migratedAgain(&job, jobsByTargetUID[string(pod.UID)]) {
+				// If the replacement was replaced under the same name (such as a
+				// recreated StatefulSet pod), it has a different UID from the one
+				// this job restored and its annotations belong to a later lifecycle.
+				if job.Status.RestoredPodUID != "" && pod.UID != "" && string(pod.UID) != job.Status.RestoredPodUID {
 					continue
 				}
 				snapAnn, coldStartBypass, present := inspectPodRestoreOrder(s, jobEngineAnnotation(&job), &pod)
 				restoreCompleted := pod.Annotations[AnnotationRestoreCompleted]
 				if coldStartBypass && restoreVerified(&job) && restoreCompleted != "" && restoreCompleted == job.Status.SnapshotRef {
+					continue
+				}
+				bypassingJob := pod.Annotations[AnnotationColdStartBypassJob]
+				hasBypassJob := pod.UID != "" && bypassingJob != "" && bypassingJob != job.Name && bypassingJob == util.FormatPMJName(pod.Name, string(pod.UID))
+				// The TargetingPMJs / migratedAgain lookup stays alongside the stamp
+				// to support pods that were stamped by an older controller (#156, #163).
+				if coldStartBypass && (hasBypassJob || (pod.UID != "" && migratedAgain(&job, jobsByTargetUID[string(pod.UID)]))) {
 					continue
 				}
 				if !present || snapAnn != job.Status.SnapshotRef || coldStartBypass {

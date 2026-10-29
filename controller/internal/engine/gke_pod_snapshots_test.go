@@ -367,7 +367,7 @@ func TestGKEPodSnapshots_SnapshotsIsTheGKEProvider(t *testing.T) {
 	if err := c.Get(ctx, client.ObjectKeyFromObject(source), got); err != nil {
 		t.Fatalf("getting the source: %v", err)
 	}
-	if want := map[string]string{"keep": "me", "podsnapshot.gke.io/ps-name": ""}; !reflect.DeepEqual(got.Annotations, want) {
+	if want := map[string]string{"keep": "me", "podsnapshot.gke.io/ps-name": "", util.AnnotationColdStartBypassJob: job.Name}; !reflect.DeepEqual(got.Annotations, want) {
 		t.Errorf("source annotations = %v, want %v", got.Annotations, want)
 	}
 
