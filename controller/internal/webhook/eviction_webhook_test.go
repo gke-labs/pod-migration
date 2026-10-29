@@ -991,3 +991,634 @@ func TestEvictionGate_UnsatisfiedReadinessGate_SkipsMigration(t *testing.T) {
 		t.Fatalf("Expected 0 PMJs when readiness gate is unsatisfied, got %d", len(pmjList.Items))
 	}
 }
+
+func TestEvictionGate_OperatorOwned_RayHead_CreatesPMJ(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	gvisorRuntime := "gvisor"
+	namespace := "default"
+	podName := "sample-ray-head-001"
+	podUID := "uid-ray-head-001"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+
+	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
+		psp := &unstructured.Unstructured{}
+		psp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		psp.SetName(name)
+		psp.SetNamespace(namespace)
+		psp.Object["spec"] = map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      "pod-migration.gke.io/enabled",
+						"operator": "In",
+						"values":   []interface{}{"true"},
+					},
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           triggerType,
+				"postCheckpoint": postCheckpoint,
+			},
+		}
+		psp.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+		return psp
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "headgroup",
+				"ray.io/node-type":             "head",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := createPSP("sample-ray-psp", "manual", "stop")
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	recorder := record.NewFakeRecorder(10)
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		Recorder:  recorder,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+
+	if resp.Allowed {
+		t.Fatalf("Expected eviction to be denied (429) for valid RayCluster head pod, got allowed: %v", resp.Result)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := fakeClient.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("Failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 1 {
+		t.Fatalf("Expected 1 PMJ for Ray head, got %d", len(pmjList.Items))
+	}
+
+	job := pmjList.Items[0]
+	if job.Labels[util.LabelParentName] != clusterName || job.Labels[util.LabelParentKind] != clusterKind || job.Labels[util.LabelParentUID] != clusterUID {
+		t.Errorf("PMJ parent labels mismatch: got name=%q, kind=%q, uid=%q",
+			job.Labels[util.LabelParentName], job.Labels[util.LabelParentKind], job.Labels[util.LabelParentUID])
+	}
+	expectedReplicaKey := "ray.io/group=headgroup,ray.io/node-type=head"
+	if job.Annotations[util.AnnotationReplicaIdentityKey] != expectedReplicaKey {
+		t.Errorf("PMJ replica identity annotation mismatch: got %q, want %q",
+			job.Annotations[util.AnnotationReplicaIdentityKey], expectedReplicaKey)
+	}
+}
+
+func TestEvictionGate_OperatorOwned_AmbiguousSiblingWorker_AllowsColdEviction(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	gvisorRuntime := "gvisor"
+	namespace := "default"
+	podName := "sample-ray-worker-1"
+	podUID := "uid-ray-worker-001"
+	siblingName := "sample-ray-worker-2"
+	siblingUID := "uid-ray-worker-002"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+
+	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
+		psp := &unstructured.Unstructured{}
+		psp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		psp.SetName(name)
+		psp.SetNamespace(namespace)
+		psp.Object["spec"] = map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      "pod-migration.gke.io/enabled",
+						"operator": "In",
+						"values":   []interface{}{"true"},
+					},
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           triggerType,
+				"postCheckpoint": postCheckpoint,
+			},
+		}
+		psp.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+		return psp
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "workergroup",
+				"ray.io/node-type":             "worker",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	sibling := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      siblingName,
+			UID:       types.UID(siblingUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "workergroup",
+				"ray.io/node-type":             "worker",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := createPSP("sample-ray-psp", "manual", "stop")
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, sibling, psp).Build()
+	recorder := record.NewFakeRecorder(10)
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		Recorder:  recorder,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+
+	if !resp.Allowed {
+		t.Fatalf("Expected eviction to be allowed (cold eviction) for ambiguous worker pod, got denied: %v", resp.Result)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := fakeClient.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("Failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 0 {
+		t.Fatalf("Expected 0 PMJs created for ambiguous worker pod, got %d", len(pmjList.Items))
+	}
+
+	// Verify Warning event emitted
+	select {
+	case event := <-recorder.Events:
+		if event != "Warning MigrationSkippedAmbiguousReplicaKey Operator-owned pod replica identity \"ray.io/group=workergroup,ray.io/node-type=worker\" is shared with sibling pod sample-ray-worker-2; refusing migration and allowing cold eviction" {
+			t.Errorf("Unexpected event: %s", event)
+		}
+	default:
+		t.Errorf("Expected MigrationSkippedAmbiguousReplicaKey event, but none was recorded")
+	}
+}
+
+func TestEvictionGate_OperatorOwned_NoReplicaKey_AllowsColdEviction(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	gvisorRuntime := "gvisor"
+	namespace := "default"
+	podName := "custom-worker-xyz"
+	podUID := "uid-custom-001"
+	isController := true
+
+	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
+		psp := &unstructured.Unstructured{}
+		psp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		psp.SetName(name)
+		psp.SetNamespace(namespace)
+		psp.Object["spec"] = map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      "pod-migration.gke.io/enabled",
+						"operator": "In",
+						"values":   []interface{}{"true"},
+					},
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           triggerType,
+				"postCheckpoint": postCheckpoint,
+			},
+		}
+		psp.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+		return psp
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:    namespace,
+			Name:         podName,
+			GenerateName: "custom-worker-",
+			UID:          types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "custom.io/v1",
+					Kind:       "CustomOperator",
+					Name:       "custom-cr",
+					UID:        "custom-uid-111",
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := createPSP("custom-psp", "manual", "stop")
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	recorder := record.NewFakeRecorder(10)
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		Recorder:  recorder,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+
+	if !resp.Allowed {
+		t.Fatalf("Expected eviction to be allowed (cold eviction) when operator pod has no replica key, got denied: %v", resp.Result)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := fakeClient.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("Failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 0 {
+		t.Fatalf("Expected 0 PMJs created when operator pod has no replica key, got %d", len(pmjList.Items))
+	}
+
+	select {
+	case event := <-recorder.Events:
+		if event != "Warning MigrationSkippedNoReplicaKey Pod is owned by operator CustomOperator/custom-cr but has no resolvable replica identity key; allowing cold eviction" {
+			t.Errorf("Unexpected event: %s", event)
+		}
+	default:
+		t.Errorf("Expected MigrationSkippedNoReplicaKey event, but none was recorded")
+	}
+}
+
+func TestEvictionGate_OperatorOwned_StableName_CreatesPMJ(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	gvisorRuntime := "gvisor"
+	namespace := "default"
+	podName := "pytorch-worker-0"
+	podUID := "uid-pytorch-001"
+	parentName := "pytorch-job-sample"
+	parentKind := "PyTorchJob"
+	parentUID := "pytorch-uid-123"
+	isController := true
+
+	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
+		psp := &unstructured.Unstructured{}
+		psp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		psp.SetName(name)
+		psp.SetNamespace(namespace)
+		psp.Object["spec"] = map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      "pod-migration.gke.io/enabled",
+						"operator": "In",
+						"values":   []interface{}{"true"},
+					},
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           triggerType,
+				"postCheckpoint": postCheckpoint,
+			},
+		}
+		psp.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+		return psp
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:    namespace,
+			Name:         podName,
+			GenerateName: "", // Stable name!
+			UID:          types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "kubeflow.org/v1",
+					Kind:       parentKind,
+					Name:       parentName,
+					UID:        types.UID(parentUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := createPSP("pytorch-psp", "manual", "stop")
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	recorder := record.NewFakeRecorder(10)
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		Recorder:  recorder,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+
+	if resp.Allowed {
+		t.Fatalf("Expected eviction to be denied (429) for stable-name operator pod, got allowed: %v", resp.Result)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := fakeClient.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("Failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 1 {
+		t.Fatalf("Expected 1 PMJ for stable-name operator pod, got %d", len(pmjList.Items))
+	}
+
+	job := pmjList.Items[0]
+	expectedKey := "pod-name=" + podName
+	if job.Annotations[util.AnnotationReplicaIdentityKey] != expectedKey {
+		t.Errorf("expected replica key %q, got %q", expectedKey, job.Annotations[util.AnnotationReplicaIdentityKey])
+	}
+}
+
+func TestEvictionGate_OperatorOwned_InFlightReplicaKey_Refused(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	gvisorRuntime := "gvisor"
+	namespace := "default"
+	podName := "sample-ray-head-002"
+	podUID := "uid-ray-head-002"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+	headReplicaKey := "ray.io/group=headgroup,ray.io/node-type=head"
+
+	createPSP := func(name, triggerType, postCheckpoint string) *unstructured.Unstructured {
+		psp := &unstructured.Unstructured{}
+		psp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshotPolicy",
+		})
+		psp.SetName(name)
+		psp.SetNamespace(namespace)
+		psp.Object["spec"] = map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchExpressions": []interface{}{
+					map[string]interface{}{
+						"key":      "pod-migration.gke.io/enabled",
+						"operator": "In",
+						"values":   []interface{}{"true"},
+					},
+				},
+			},
+			"triggerConfig": map[string]interface{}{
+				"type":           triggerType,
+				"postCheckpoint": postCheckpoint,
+			},
+		}
+		psp.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{
+					"type":   "Ready",
+					"status": "True",
+				},
+			},
+		}
+		return psp
+	}
+
+	// Active PMJ already in flight for this parent and replica key!
+	existingPMJ := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-head-001",
+			Namespace: namespace,
+			Labels: map[string]string{
+				util.LabelParentName: clusterName,
+				util.LabelParentKind: clusterKind,
+				util.LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				util.AnnotationReplicaIdentityKey: headReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-head-001"},
+			TargetPodUID: "uid-ray-head-001",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "headgroup",
+				"ray.io/node-type":             "head",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := createPSP("sample-ray-psp", "manual", "stop")
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, existingPMJ, psp).Build()
+	recorder := record.NewFakeRecorder(10)
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		Recorder:  recorder,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+
+	if !resp.Allowed {
+		t.Fatalf("Expected eviction to be allowed (cold eviction) when PMJ is already in flight for replica key, got denied: %v", resp.Result)
+	}
+
+	select {
+	case event := <-recorder.Events:
+		if event != "Warning MigrationSkippedAmbiguousReplicaKey Operator-owned pod replica identity \"ray.io/group=headgroup,ray.io/node-type=head\" is already in-flight under migration job pmj-sample-ray-head-001; refusing migration and allowing cold eviction" {
+			t.Errorf("Unexpected event: %s", event)
+		}
+	default:
+		t.Errorf("Expected MigrationSkippedAmbiguousReplicaKey event, but none was recorded")
+	}
+}

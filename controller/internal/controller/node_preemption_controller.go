@@ -55,10 +55,13 @@ type NodePreemptionReconciler struct {
 }
 
 type preemptionCandidate struct {
-	pod    *corev1.Pod
-	engine engine.Engine
-	policy *engine.PolicyRef
-	size   int64
+	pod        *corev1.Pod
+	engine     engine.Engine
+	policy     *engine.PolicyRef
+	size       int64
+	parentName string
+	parentKind string
+	parentUID  string
 }
 
 // engineFor returns the snapshot engine for pod, given pm, the active
@@ -247,11 +250,71 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 
+		// Resolve parent workload details
+		parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.Client, pod)
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "Failed to resolve parent workload for pod", "pod", pod.Name)
+			continue
+		}
+
+		// For operator-owned pods, verify replica identity key and refuse when ambiguous.
+		if !util.IsBuiltInWorkloadKind(parentKind) {
+			replicaKey, hasKey := util.ResolveOperatorReplicaKey(pod, parentKind)
+			if !hasKey || replicaKey == "" {
+				logger.Info("Skipping preemption migration: operator-owned pod has no resolvable replica identity key",
+					"pod", pod.Name, "parentKind", parentKind, "parentName", parentName)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedNoReplicaKey",
+						"Pod is owned by operator %s/%s but has no resolvable replica identity key; skipping spot preemption migration", parentKind, parentName)
+				}
+				metrics.RecordSpotPreemptionSkipped("no_replica_key")
+				r.processedPods.Store(pod.UID, time.Now())
+				continue
+			}
+
+			ambiguousSibling, siblingName, err := util.HasAmbiguousOperatorSibling(ctx, r.Client, pod.Namespace, parentName, parentKind, parentUID, replicaKey, string(pod.UID), pod.Name)
+			if err != nil {
+				logger.Error(err, "Failed to check sibling pods for replica key ambiguity", "pod", pod.Name)
+				continue
+			}
+			if ambiguousSibling {
+				logger.Info("Skipping preemption migration: operator-owned pod replica identity is ambiguous (shared with sibling pod)",
+					"pod", pod.Name, "replicaKey", replicaKey, "siblingPod", siblingName)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedAmbiguousReplicaKey",
+						"Operator-owned pod replica identity %q is shared with sibling pod %s; skipping spot preemption migration", replicaKey, siblingName)
+				}
+				metrics.RecordSpotPreemptionSkipped("ambiguous_replica_key")
+				r.processedPods.Store(pod.UID, time.Now())
+				continue
+			}
+
+			ambiguousPMJ, existingPMJName, err := util.HasActivePMJWithReplicaKey(ctx, r.Client, pod.Namespace, parentName, parentKind, replicaKey, jobName)
+			if err != nil {
+				logger.Error(err, "Failed to check existing PMJs for replica key ambiguity", "pod", pod.Name)
+				continue
+			}
+			if ambiguousPMJ {
+				logger.Info("Skipping preemption migration: operator-owned pod replica identity is ambiguous (in-flight PMJ already exists)",
+					"pod", pod.Name, "replicaKey", replicaKey, "existingPMJ", existingPMJName)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedAmbiguousReplicaKey",
+						"Operator-owned pod replica identity %q is already in-flight under migration job %s; skipping spot preemption migration", replicaKey, existingPMJName)
+				}
+				metrics.RecordSpotPreemptionSkipped("ambiguous_replica_key")
+				r.processedPods.Store(pod.UID, time.Now())
+				continue
+			}
+		}
+
 		candidates = append(candidates, preemptionCandidate{
-			pod:    pod,
-			engine: eng,
-			policy: policy,
-			size:   footprintBytes,
+			pod:        pod,
+			engine:     eng,
+			policy:     policy,
+			size:       footprintBytes,
+			parentName: parentName,
+			parentKind: parentKind,
+			parentUID:  parentUID,
 		})
 	}
 
@@ -300,11 +363,9 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		// Deduct from remaining budget
 		remainingBudget -= reqBytes
 
-		// Resolve parent workload details
-		parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.Client, pod)
-		if err != nil && !apierrors.IsNotFound(err) {
-			logger.Error(err, "Failed to resolve parent workload for pod", "pod", pod.Name)
-		}
+		parentName := cand.parentName
+		parentKind := cand.parentKind
+		parentUID := cand.parentUID
 
 		jobName := util.FormatPMJName(pod.Name, string(pod.UID))
 		// For spot preemption, enforce a short 2-minute deadline so doomed migrations

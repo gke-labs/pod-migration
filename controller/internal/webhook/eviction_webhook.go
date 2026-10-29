@@ -267,6 +267,50 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return denied429("transient error resolving parent workload, retrying")
 	}
 
+	// For operator-owned pods, verify replica identity key and refuse when ambiguous.
+	if !util.IsBuiltInWorkloadKind(parentKind) {
+		replicaKey, hasKey := util.ResolveOperatorReplicaKey(pod, parentKind)
+		if !hasKey || replicaKey == "" {
+			logger.Info("Operator-owned pod has no resolvable replica identity key, skipping migration and allowing eviction",
+				"pod", pod.Name, "parentKind", parentKind, "parentName", parentName)
+			if a.Recorder != nil {
+				a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedNoReplicaKey",
+					"Pod is owned by operator %s/%s but has no resolvable replica identity key; allowing cold eviction", parentKind, parentName)
+			}
+			return admission.Allowed("skipping migration: operator-owned pod has no resolvable replica identity key")
+		}
+
+		ambiguousSibling, siblingName, err := util.HasAmbiguousOperatorSibling(ctx, a.Client, pod.Namespace, parentName, parentKind, parentUID, replicaKey, string(pod.UID), pod.Name)
+		if err != nil {
+			logger.Error(err, "Failed to check sibling pods for replica key ambiguity")
+			return denied429("transient error checking replica key ambiguity, retrying")
+		}
+		if ambiguousSibling {
+			logger.Info("Operator-owned pod replica identity is ambiguous (shared with sibling pod), skipping migration and allowing eviction",
+				"pod", pod.Name, "replicaKey", replicaKey, "siblingPod", siblingName)
+			if a.Recorder != nil {
+				a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedAmbiguousReplicaKey",
+					"Operator-owned pod replica identity %q is shared with sibling pod %s; refusing migration and allowing cold eviction", replicaKey, siblingName)
+			}
+			return admission.Allowed(fmt.Sprintf("skipping migration: operator-owned pod replica identity %q is ambiguous (shared with sibling pod %s)", replicaKey, siblingName))
+		}
+
+		ambiguousPMJ, existingPMJName, err := util.HasActivePMJWithReplicaKey(ctx, a.Client, pod.Namespace, parentName, parentKind, replicaKey, jobName)
+		if err != nil {
+			logger.Error(err, "Failed to check existing PMJs for replica key ambiguity")
+			return denied429("transient error checking PMJ replica key ambiguity, retrying")
+		}
+		if ambiguousPMJ {
+			logger.Info("Operator-owned pod replica identity is ambiguous (in-flight PMJ already exists), skipping migration and allowing eviction",
+				"pod", pod.Name, "replicaKey", replicaKey, "existingPMJ", existingPMJName)
+			if a.Recorder != nil {
+				a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedAmbiguousReplicaKey",
+					"Operator-owned pod replica identity %q is already in-flight under migration job %s; refusing migration and allowing cold eviction", replicaKey, existingPMJName)
+			}
+			return admission.Allowed(fmt.Sprintf("skipping migration: operator-owned pod replica identity %q already in flight on job %s", replicaKey, existingPMJName))
+		}
+	}
+
 	// 1. Find the engine's policy for the pod. For GKE Pod Snapshots, that's
 	// the newest Ready, manual PodSnapshotPolicy that selects the pod, if its
 	// postCheckpoint is stop.
