@@ -1,0 +1,378 @@
+# SPDX-License-Identifier: Apache-2.0
+# WARNING: EXPERIMENTAL — FOR ADDON-OFF TEST CLUSTERS ONLY
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Deployment manifest for the CRIU snapshot engine (engines/criu).
+#
+# Replace <YOUR_CRIU_ENGINE_IMAGE>, <YOUR_CRIU_AGENT_IMAGE>, and
+# <YOUR_CRIU_HOLDER_IMAGE> before applying. Requires cert-manager in the
+# cluster for the restore-injection webhook certificate.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pod-migration-criu-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-migrate-psengine-controller
+  namespace: pod-migration-criu-system
+  labels:
+    pod-migrate.io/component: psengine
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-migrate-agent
+  namespace: pod-migration-criu-system
+  labels:
+    pod-migrate.io/component: psengine
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-migrate-psengine-controller
+  labels:
+    pod-migrate.io/component: psengine
+rules:
+  - apiGroups: ["podsnapshot.gke.io"]
+    resources: ["podsnapshotstorageconfigs", "podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["podsnapshot.gke.io"]
+    resources: ["podsnapshotpolicies/status", "podsnapshotmanualtriggers/status", "podsnapshots/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pod-migrate-psengine-controller
+  labels:
+    pod-migrate.io/component: psengine
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-migrate-psengine-controller
+subjects:
+  - kind: ServiceAccount
+    name: pod-migrate-psengine-controller
+    namespace: pod-migration-criu-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-migrate-psengine-agent
+  labels:
+    pod-migrate.io/component: psengine
+rules:
+  - apiGroups: [""]
+    resources: ["nodes/checkpoint"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["podsnapshot.gke.io"]
+    resources: ["podsnapshots"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["podsnapshot.gke.io"]
+    resources: ["podsnapshots/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pod-migrate-psengine-agent
+  labels:
+    pod-migrate.io/component: psengine
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-migrate-psengine-agent
+subjects:
+  - kind: ServiceAccount
+    name: pod-migrate-agent
+    namespace: pod-migration-criu-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-migrate-psengine-leader-election
+  namespace: pod-migration-criu-system
+  labels:
+    pod-migrate.io/component: psengine
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-migrate-psengine-leader-election
+  namespace: pod-migration-criu-system
+  labels:
+    pod-migrate.io/component: psengine
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-migrate-psengine-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: pod-migrate-psengine-controller
+    namespace: pod-migration-criu-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-migrate-psengine
+  namespace: pod-migration-criu-system
+  labels:
+    app: pod-migrate-psengine
+    pod-migrate.io/component: psengine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-migrate-psengine
+  template:
+    metadata:
+      labels:
+        app: pod-migrate-psengine
+        pod-migrate.io/component: psengine
+    spec:
+      serviceAccountName: pod-migrate-psengine-controller
+      containers:
+        - name: engine
+          image: <YOUR_CRIU_ENGINE_IMAGE>
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect=true
+            - --enable-webhooks=true
+            - --holder-image=<YOUR_CRIU_HOLDER_IMAGE>
+          ports:
+            - name: webhook
+              containerPort: 9443
+              protocol: TCP
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: webhook-cert
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+      volumes:
+        - name: webhook-cert
+          secret:
+            secretName: pod-migrate-psengine-webhook-cert
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pod-migrate-agent
+  namespace: pod-migration-criu-system
+  labels:
+    app: pod-migrate-agent
+    pod-migrate.io/component: psengine
+spec:
+  selector:
+    matchLabels:
+      app: pod-migrate-agent
+  template:
+    metadata:
+      labels:
+        app: pod-migrate-agent
+        pod-migrate.io/component: psengine
+    spec:
+      serviceAccountName: pod-migrate-agent
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agent
+          image: <YOUR_CRIU_AGENT_IMAGE>
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: pod-migrate
+              mountPath: /var/lib/pod-migrate
+              mountPropagation: Bidirectional
+            - name: containerd-sock
+              mountPath: /run/containerd/containerd.sock
+            - name: containerd-state
+              mountPath: /var/lib/containerd
+            - name: kubelet-checkpoints
+              mountPath: /var/lib/kubelet/checkpoints
+            - name: kubelet-pods
+              mountPath: /var/lib/kubelet/pods
+              readOnly: true
+            - name: etc-criu
+              mountPath: /etc/criu
+            - name: host-sbin
+              mountPath: /usr/local/sbin
+            - name: kubelet-seccomp
+              mountPath: /var/lib/kubelet/seccomp
+      volumes:
+        - name: pod-migrate
+          hostPath:
+            path: /var/lib/pod-migrate
+            type: DirectoryOrCreate
+        - name: containerd-sock
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket
+        - name: containerd-state
+          hostPath:
+            path: /var/lib/containerd
+            type: Directory
+        - name: kubelet-checkpoints
+          hostPath:
+            path: /var/lib/kubelet/checkpoints
+            type: DirectoryOrCreate
+        - name: kubelet-pods
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: etc-criu
+          hostPath:
+            path: /etc/criu
+            type: DirectoryOrCreate
+        - name: host-sbin
+          hostPath:
+            path: /usr/local/sbin
+            type: DirectoryOrCreate
+        - name: kubelet-seccomp
+          hostPath:
+            path: /var/lib/kubelet/seccomp
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pod-migrate-psengine-webhook
+  namespace: pod-migration-criu-system
+  labels:
+    pod-migrate.io/component: psengine
+spec:
+  selector:
+    app: pod-migrate-psengine
+  ports:
+    - port: 443
+      targetPort: 9443
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pod-migrate-psengine-selfsigned
+  namespace: pod-migration-criu-system
+  labels:
+    pod-migrate.io/component: psengine
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pod-migrate-psengine-webhook
+  namespace: pod-migration-criu-system
+  labels:
+    pod-migrate.io/component: psengine
+spec:
+  secretName: pod-migrate-psengine-webhook-cert
+  duration: 2160h
+  renewBefore: 720h
+  dnsNames:
+    - pod-migrate-psengine-webhook.pod-migration-system.svc
+    - pod-migrate-psengine-webhook.pod-migration-system.svc.cluster.local
+  issuerRef:
+    name: pod-migrate-psengine-selfsigned
+    kind: Issuer
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: pod-migrate-psengine-restore-inject
+  labels:
+    pod-migrate.io/component: psengine
+  annotations:
+    cert-manager.io/inject-ca-from: pod-migration-system/pod-migrate-psengine-webhook
+webhooks:
+  - name: restore-inject.psengine.pod-migrate.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    reinvocationPolicy: IfNeeded
+    objectSelector:
+      matchLabels:
+        pod-migration.gke.io/enabled: "true"
+    clientConfig:
+      service:
+        name: pod-migrate-psengine-webhook
+        namespace: pod-migration-criu-system
+        path: /psengine-restore-inject
+        port: 443
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
