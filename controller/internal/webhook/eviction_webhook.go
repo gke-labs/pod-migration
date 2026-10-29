@@ -195,10 +195,27 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	// restart's cold-start event as its own and report a warm restore as a
 	// cold start. The wait is bounded: the first job concludes when the pod is
 	// Ready, on a restore crash, or at its 5-minute restore ceiling.
-	restoringJob, err := a.restoringJob(ctx, pod)
+	//
+	// Exception: when a same-name replacement (e.g. a StatefulSet ordinal like
+	// pm-redis-0) replaces its evicted origin pod inside kubectl drain's 5s 429
+	// retry sleep, the origin node's drain retries POST /pods/<name>/eviction by
+	// name without a UID precondition and hits the new replacement pod. Answering
+	// 429 to that stale origin-node drain keeps kubectl drain looping until
+	// Restoring finishes and then spawns a second migration on the healthy
+	// destination node (infinite ping-pong). Answering 404 NotFound when the
+	// origin node is still cordoned and the replacement pod is not on a cordoned
+	// node lets kubectl drain see that the origin pod is gone without deleting
+	// the replacement pod.
+	restoringJob, staleOriginDrain, err := a.checkAssignedMigrationJob(ctx, pod)
 	if err != nil {
 		logger.Error(err, "Failed to read the migration job that restored this pod")
 		return denied429("transient error reading the migration job that restored this pod, retrying")
+	}
+	if staleOriginDrain {
+		logger.Info("Rejecting stale origin-node drain eviction targeting same-name replacement pod with 404 NotFound",
+			"pod", pod.Name, "replacementUID", pod.UID, "job", restoringJob)
+		return denied404(fmt.Sprintf("origin pod %s was already evicted by migration job %s and replaced by pod UID %s",
+			pod.Name, restoringJob, pod.UID))
 	}
 	if restoringJob != "" {
 		logger.Info("Pod is still being restored by its own migration job; not migrating it again yet", "job", restoringJob)
@@ -312,15 +329,21 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	return denied429("migration job spawned")
 }
 
-// restoringJob returns the name of the migration job that is still restoring
-// pod, or "" when there's none. The replacement webhook names that job in the
-// pod's assigned-pmj annotation. A job that hasn't concluded owns its
-// replacement until it does, unless it recorded another pod as the one it
-// restored (the name now belongs to a successor).
-func (a *EvictionGate) restoringJob(ctx context.Context, pod *corev1.Pod) (string, error) {
+const staleOriginDrainPostCompletionWindow = 15 * time.Second
+
+// checkAssignedMigrationJob inspects the PodMigrationJob named in pod's
+// assigned-pmj annotation (set by the replacement webhook).
+//
+// It returns:
+//   - restoringJob: the job's name when that job is still restoring pod (#162)
+//   - staleOriginDrain: true when pod is a same-name replacement (e.g. a
+//     StatefulSet pod) whose origin node is still cordoned while pod itself is
+//     either unscheduled or running on an uncordoned node, indicating a stale
+//     by-name retry from kubectl drain on the origin node.
+func (a *EvictionGate) checkAssignedMigrationJob(ctx context.Context, pod *corev1.Pod) (string, bool, error) {
 	name := pod.Annotations[util.AnnotationAssignedPMJ]
 	if name == "" {
-		return "", nil
+		return "", false, nil
 	}
 	key := types.NamespacedName{Namespace: pod.Namespace, Name: name}
 	job := &pmv1alpha1.PodMigrationJob{}
@@ -329,20 +352,76 @@ func (a *EvictionGate) restoringJob(ctx context.Context, pod *corev1.Pod) (strin
 		err = a.APIReader.Get(ctx, key, job)
 	}
 	if apierrors.IsNotFound(err) {
-		return "", nil
+		return "", false, nil
 	}
 	if err != nil {
-		return "", err
-	}
-	switch job.Status.Phase {
-	case pmv1alpha1.PodMigrationJobPhaseSnapshotting, pmv1alpha1.PodMigrationJobPhaseEvicting, pmv1alpha1.PodMigrationJobPhaseRestoring:
-	default:
-		return "", nil
+		return "", false, err
 	}
 	if job.Status.RestoredPodUID != "" && job.Status.RestoredPodUID != string(pod.UID) {
-		return "", nil
+		return "", false, nil
 	}
-	return job.Name, nil
+
+	inFlight := false
+	switch job.Status.Phase {
+	case pmv1alpha1.PodMigrationJobPhaseSnapshotting, pmv1alpha1.PodMigrationJobPhaseEvicting, pmv1alpha1.PodMigrationJobPhaseRestoring:
+		inFlight = true
+	}
+
+	recentCompletion := job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded &&
+		job.Status.CompletionTime != nil &&
+		time.Since(job.Status.CompletionTime.Time) <= staleOriginDrainPostCompletionWindow
+
+	if (inFlight || recentCompletion) && a.isStaleOriginDrainRetry(ctx, pod, job) {
+		return job.Name, true, nil
+	}
+	if inFlight {
+		return job.Name, false, nil
+	}
+	return "", false, nil
+}
+
+// isStaleOriginDrainRetry reports whether an eviction targeting pod is a stale
+// by-name retry from draining job's origin node after the origin pod was
+// already evicted and replaced under the same name.
+func (a *EvictionGate) isStaleOriginDrainRetry(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) bool {
+	if job.Spec.PodRef.Name != pod.Name || job.Spec.TargetPodUID == string(pod.UID) {
+		return false
+	}
+	originNodeName := job.Status.OriginNodeName
+	if originNodeName == "" || pod.Spec.NodeName == originNodeName {
+		return false
+	}
+	// If the replacement pod is already scheduled onto a destination node that
+	// is itself cordoned (e.g. the next node in a rolling upgrade), this is a
+	// genuine drain of the destination node rather than a stale origin retry.
+	if pod.Spec.NodeName != "" {
+		targetNode := &corev1.Node{}
+		if err := a.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, targetNode); err != nil {
+			return false
+		}
+		if targetNode.Spec.Unschedulable {
+			return false
+		}
+	}
+	originNode := &corev1.Node{}
+	if err := a.Client.Get(ctx, types.NamespacedName{Name: originNodeName}, originNode); err != nil {
+		return false
+	}
+	return originNode.Spec.Unschedulable
+}
+
+func denied404(msg string) admission.Response {
+	return admission.Response{
+		AdmissionResponse: admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status:  metav1.StatusFailure,
+				Reason:  metav1.StatusReasonNotFound,
+				Code:    http.StatusNotFound,
+				Message: msg,
+			},
+		},
+	}
 }
 
 func denied429(msg string) admission.Response {
