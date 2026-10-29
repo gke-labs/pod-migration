@@ -57,7 +57,7 @@ Notes:
 - The webhook must be installed: the controller only sets `Ready` to `False` once, and without the webhook the kubelet's next status write sets it back.
 - A fenced source counts as unhealthy for its PodDisruptionBudgets, so the budget checks of its siblings see the smaller budget.
 - The fence covers Service endpoints only. Services with `publishNotReadyAddresses: true`, clients that connect to the Pod IP directly, and the restarted instance's own outbound work and volume writes aren't fenced.
-- A job that's deleted while it's active leaves its source fenced. Delete the Pod, or remove the label if you know its checkpoint never ran.
+- Deleting an active job settles its source fence before removing the `pod-migration.gke.io/source-fence` finalizer (unfencing if the checkpoint never ran, or keeping the fence and evicting if it did). If eviction remains blocked past the unwedge timeout (default 2 minutes), the finalizer is removed to avoid wedging deletion, leaving the source fenced (Warning event `SourceFenceDeleteTimedOut`): release the source by deleting the Pod (so its controller replaces it), or remove the `pod-migration.gke.io/fenced` label if you know its checkpoint never ran. If the controller is down or rolling back to a version without the finalizer handler, unwedge a deleting job with: `kubectl patch podmigrationjob <name> --type=merge -p '{"metadata":{"finalizers":null}}'`.
 - The fence needs RBAC on `pods/status` (`get`, `patch`), which `deploy.yaml` grants.
 
 ### 4. Design Docs
@@ -468,7 +468,7 @@ The controller registers Prometheus metrics on the standard controller-runtime m
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `pod_migration_active` | Gauge | None | Number of currently active pod migrations in flight. |
-| `pod_migration_outcomes_total` | Counter | `outcome` (`succeeded`, `failed`, `timeout`, `fallback`, `succeeded_without_restore`, `restore_lost`) | Total completed migrations by outcome. |
+| `pod_migration_outcomes_total` | Counter | `outcome` (`succeeded`, `failed`, `timeout`, `fallback`, `succeeded_without_restore`, `restore_lost`, `deleted`) | Total completed migrations by outcome. |
 | `pod_migration_restore_verdicts_total` | Counter | `engine`, `verdict` (`confirmed`, `inferred`, `cold_start`, `failed`, `lost`, `timeout`) | Restore verdicts on replacement Pods, so a restore the engine confirmed can be told apart from one it inferred. |
 | `pod_migration_phase_duration_seconds` | Histogram | `phase` (`pending`, `snapshotting`, `evicting`, `restoring`) | Latency distribution of individual migration phases. |
 | `pod_migration_restore_crash_fallback_total` | Counter | None | Total cold-start fallbacks triggered by matched gVisor/OCI restore crashes. |

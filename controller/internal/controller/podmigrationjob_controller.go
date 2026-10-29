@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -141,6 +142,11 @@ type PodMigrationJobReconciler struct {
 	// stops anyway (#131). Defaults to DefaultFenceLateStopWatch if unset or
 	// <= 0.
 	FenceLateStopWatch time.Duration
+
+	// FenceDeleteUnwedgeTimeout is how long the controller waits for a deleting
+	// job to settle its source fence before stripping the finalizer to unwedge
+	// deletion (#167). Defaults to DefaultFenceDeleteUnwedgeTimeout if unset or <= 0.
+	FenceDeleteUnwedgeTimeout time.Duration
 
 	// RestoreStabilizationWindow is how long a replacement must stay Ready
 	// without a container restart before a restore that the engine only
@@ -607,6 +613,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
@@ -626,7 +633,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // against the invariant engine when enabled. It runs only when the reconcile step completed without error.
 // In strict mode, any violation patches a non-terminal PMJ to PhaseFailed, cleans up triggers, and suppresses requeue.
 func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job *pmv1alpha1.PodMigrationJob, res *ctrl.Result, reconcileErr *error) {
-	if !r.InvariantEngine.Enabled() || job == nil {
+	if !r.InvariantEngine.Enabled() || job == nil || !job.DeletionTimestamp.IsZero() {
 		return
 	}
 	if reconcileErr != nil && *reconcileErr != nil {
@@ -822,6 +829,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	podName := job.Spec.PodRef.Name
 	origJob := job.DeepCopy()
 
+	// Handle deletion if object is being deleted (#167).
+	if !job.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(job, SourceFenceFinalizer) {
+			return r.finalizeSourceFence(ctx, job, origJob)
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Set initial phase if empty
 	if job.Status.Phase == "" {
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhasePending
@@ -957,6 +972,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// evicts it (#131). That has to finish before the job is deleted.
 	if res, handled, err := r.resolveSourceFence(ctx, job, origJob); handled || err != nil {
 		return res, err
+	}
+	if invariants.IsTerminalPhase(job.Status.Phase) {
+		if err := r.removeSourceFenceFinalizer(ctx, job, origJob); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Garbage collect completed PMJs after 30 minutes to allow ample time for large queue drainage.
@@ -1598,6 +1618,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			metrics.RecordSourceFencedDuration("migrated", time.Since(fenced.LastTransitionTime.Time).Seconds())
 		}
 		logger.Info("PodMigrationJob transitioned to Restoring phase", "pod", podName)
+		if err := r.removeSourceFenceFinalizer(ctx, job, origJob); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseRestoring:
