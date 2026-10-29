@@ -527,6 +527,43 @@ evict_pod() {
 EOF
 }
 
+# Trigger migration via `kubectl drain --pod-selector=...` so the full CLI 429 retry loop
+# (every 5s) exercises EvictionGate against same-name StatefulSet replacement pods without
+# entering a multi-hop migration ping-pong loop.
+drain_pod_selector() {
+  local node="$1"
+  local selector="$2"
+  local timeout_s="${3:-180}"
+  log "Running kubectl drain on node ${node} (--pod-selector=${selector}, timeout=${timeout_s}s)"
+  "${KUBECTL_CMD}" drain "${node}" \
+    --pod-selector="${selector}" \
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --force \
+    --grace-period=30 \
+    --timeout="${timeout_s}s"
+}
+
+assert_single_pmj_for_pod() {
+  local run_dir="$1"
+  local pod="$2"
+  local group="${3:-redis}"
+  local pmj_count
+  pmj_count="$("${KUBECTL_CMD}" get podmigrationjobs -n "${NAMESPACE}" -o json \
+    | jq -r --arg p "${pod}" '[.items[] | select(.spec.podRef.name == $p)] | length')"
+  if [[ "${pmj_count}" != "1" ]]; then
+    "${PMPROFILER_BIN}" check --run "${run_dir}" \
+      --name "StatefulSet kubectl drain single-hop completion" --group "${group}" \
+      --pass=false --value 0 --total 1 \
+      --detail "expected 1 PodMigrationJob for ${pod} across kubectl drain, got ${pmj_count}"
+    die "StatefulSet kubectl drain regression: expected 1 PodMigrationJob for ${pod}, got ${pmj_count} (multi-hop drain loop)"
+  fi
+  "${PMPROFILER_BIN}" check --run "${run_dir}" \
+    --name "StatefulSet kubectl drain single-hop completion" --group "${group}" \
+    --pass --value 1 --total 1 \
+    --detail "kubectl drain completed in a single migration hop (1 PodMigrationJob for ${pod})"
+}
+
 exec_with_retry() {
   local max_attempts=8
   local attempt=1
@@ -1306,9 +1343,10 @@ run_scenario_s6() {
 
   src_node="$(kubectl get pod -n "${NAMESPACE}" "${src_pod}" -o jsonpath='{.spec.nodeName}')"
   cordon_node "${src_node}"
-  evict_pod "${src_pod}"
+  drain_pod_selector "${src_node}" "app=t2-redis" 240
 
   wait_for_pmj_terminal "${src_pod}" "Succeeded" 240
+  assert_single_pmj_for_pod "${run_dir}" "${src_pod}" "redis"
   uncordon_all_tracked_nodes
   kubectl rollout status statefulset/t2-redis -n "${NAMESPACE}" --timeout=180s >/dev/null
 
@@ -3225,7 +3263,44 @@ EOF
 
   rm -f "${kubectl_log}" "${fake_kubectl}" "${fake_pssc_kubectl}" "${fake_empty_kubectl}" "${fake_unreconciled_psp}" "${fake_unready_psp}" "${fake_ready_psp}"
 
-  log "Self-test PASSED: S1-S8 analyzed with 0 invariant violations, continuity failure modes (#103), S7 verdict-matches-data & preflight gates (#104), S8 phase-continuity checks (#149/#151/#131), runtime-agnostic templates, and report generated at ${report_html}"
+  # Verify drain_pod_selector and assert_single_pmj_for_pod enforce single-hop StatefulSet kubectl drain completion
+  local drain_test_dir="${OUT_DIR}/drain-single-hop-test"
+  mkdir -p "${drain_test_dir}"
+  local drain_kubectl_log="${drain_test_dir}/kubectl.log"
+  local fake_single_pmj_kubectl="${drain_test_dir}/fake-single-pmj-kubectl.sh"
+  cat >"${fake_single_pmj_kubectl}" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >>"${drain_kubectl_log}"
+if [[ "\$1" == "drain" ]]; then
+  exit 0
+fi
+if [[ "\$*" == *"get podmigrationjobs"* ]]; then
+  printf '{"items":[{"metadata":{"name":"pmj-1"},"spec":{"podRef":{"name":"t2-redis-0"}}}]}'
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${fake_single_pmj_kubectl}"
+  KUBECTL_CMD="${fake_single_pmj_kubectl}" drain_pod_selector "gke-node-a" "app=t2-redis" 180
+  grep -q '^drain gke-node-a --pod-selector=app=t2-redis' "${drain_kubectl_log}" || die "Expected drain_pod_selector to invoke kubectl drain with --pod-selector=app=t2-redis"
+  KUBECTL_CMD="${fake_single_pmj_kubectl}" assert_single_pmj_for_pod "${drain_test_dir}" "t2-redis-0" "redis"
+
+  local fake_multi_pmj_kubectl="${drain_test_dir}/fake-multi-pmj-kubectl.sh"
+  cat >"${fake_multi_pmj_kubectl}" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"get podmigrationjobs"* ]]; then
+  printf '{"items":[{"metadata":{"name":"pmj-1"},"spec":{"podRef":{"name":"t2-redis-0"}}},{"metadata":{"name":"pmj-2"},"spec":{"podRef":{"name":"t2-redis-0"}}}]}'
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${fake_multi_pmj_kubectl}"
+  if (KUBECTL_CMD="${fake_multi_pmj_kubectl}" assert_single_pmj_for_pod "${drain_test_dir}" "t2-redis-0" "redis" >/dev/null 2>&1); then
+    die "Expected assert_single_pmj_for_pod to fail closed when multiple PodMigrationJobs exist for t2-redis-0 (multi-hop drain loop)"
+  fi
+  rm -rf "${drain_test_dir}"
+
+  log "Self-test PASSED: S1-S8 analyzed with 0 invariant violations, continuity failure modes (#103), S7 verdict-matches-data & preflight gates (#104), S8 phase-continuity checks (#149/#151/#131), StatefulSet single-hop kubectl drain check, runtime-agnostic templates, and report generated at ${report_html}"
 }
 
 # ==============================================================================

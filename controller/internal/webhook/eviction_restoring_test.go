@@ -2,8 +2,10 @@ package webhook
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -145,5 +147,130 @@ func TestEvictionGate_DryRunOfRestoringReplacementIsAllowed(t *testing.T) {
 	}
 	if secondJobExists(t, c) {
 		t.Error("a dry run created a job")
+	}
+}
+
+// TestEvictionGate_StaleOriginDrainOnSameNameReplacementAnswers404 verifies
+// that when kubectl drain on the origin node (node-a, unschedulable=true)
+// retries POST /pods/pm-redis-0/eviction by name after the origin pod was
+// evicted and replaced by a new StatefulSet pod with the same name (unscheduled
+// or on uncordoned node-b), EvictionGate answers 404 NotFound (so kubectl drain
+// exits cleanly without deleting the replacement or spawning a second job).
+// When node-b is itself cordoned (rolling upgrade draining node-b), EvictionGate
+// answers 429 while Restoring (#162) and spawns a new migration job once Succeeded.
+func TestEvictionGate_StaleOriginDrainOnSameNameReplacementAnswers404(t *testing.T) {
+	now := metav1.Now()
+	staleCompletion := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+
+	tests := map[string]struct {
+		phase              pmv1alpha1.PodMigrationJobPhase
+		completionTime     *metav1.Time
+		replacementNode    string
+		originCordoned     bool
+		destCordoned       bool
+		wantCode           int32
+		wantReason         metav1.StatusReason
+		wantSecondJobBuilt bool
+	}{
+		"restoring on uncordoned node-b while node-a is cordoned -> 404": {
+			phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+			replacementNode:    "node-b",
+			originCordoned:     true,
+			destCordoned:       false,
+			wantCode:           http.StatusNotFound,
+			wantReason:         metav1.StatusReasonNotFound,
+			wantSecondJobBuilt: false,
+		},
+		"evicting while replacement is unscheduled and node-a is cordoned -> 404": {
+			phase:              pmv1alpha1.PodMigrationJobPhaseEvicting,
+			replacementNode:    "",
+			originCordoned:     true,
+			destCordoned:       false,
+			wantCode:           http.StatusNotFound,
+			wantReason:         metav1.StatusReasonNotFound,
+			wantSecondJobBuilt: false,
+		},
+		"just succeeded (<15s) on uncordoned node-b while node-a is cordoned -> 404": {
+			phase:              pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			completionTime:     &now,
+			replacementNode:    "node-b",
+			originCordoned:     true,
+			destCordoned:       false,
+			wantCode:           http.StatusNotFound,
+			wantReason:         metav1.StatusReasonNotFound,
+			wantSecondJobBuilt: false,
+		},
+		"restoring on cordoned node-b (rolling upgrade of destination node) -> 429 hold (#162)": {
+			phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+			replacementNode:    "node-b",
+			originCordoned:     true,
+			destCordoned:       true,
+			wantCode:           http.StatusTooManyRequests,
+			wantReason:         "",
+			wantSecondJobBuilt: false,
+		},
+		"succeeded on cordoned node-b (rolling upgrade of destination node) -> 429 new job spawned": {
+			phase:              pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			completionTime:     &now,
+			replacementNode:    "node-b",
+			originCordoned:     true,
+			destCordoned:       true,
+			wantCode:           http.StatusTooManyRequests,
+			wantReason:         "",
+			wantSecondJobBuilt: true,
+		},
+		"succeeded long ago (>15s) on uncordoned node-b -> 429 new job spawned": {
+			phase:              pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			completionTime:     &staleCompletion,
+			replacementNode:    "node-b",
+			originCordoned:     true,
+			destCordoned:       false,
+			wantCode:           http.StatusTooManyRequests,
+			wantReason:         "",
+			wantSecondJobBuilt: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			job1 := &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: restoringTestJob, UID: "job1-uid"},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef:       corev1.LocalObjectReference{Name: budgetTestPod},
+					TargetPodUID: "orig-uid",
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:           tc.phase,
+					OriginNodeName:  "node-a",
+					RestoredPodName: budgetTestPod,
+					RestoredPodUID:  budgetTestUID,
+					CompletionTime:  tc.completionTime,
+				},
+			}
+			objs := restoringTestObjects(job1)
+			pod := objs[0].(*corev1.Pod)
+			pod.Spec.NodeName = tc.replacementNode
+			objs = append(objs,
+				&corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+					Spec:       corev1.NodeSpec{Unschedulable: tc.originCordoned},
+				},
+				&corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{Name: "node-b"},
+					Spec:       corev1.NodeSpec{Unschedulable: tc.destCordoned},
+				},
+			)
+
+			resp, c := handleRestoringEviction(t, objs, false, nil)
+			if resp.Allowed || resp.Result == nil || resp.Result.Code != tc.wantCode {
+				t.Fatalf("got allowed=%t result=%+v, want code=%d", resp.Allowed, resp.Result, tc.wantCode)
+			}
+			if tc.wantReason != "" && resp.Result.Reason != tc.wantReason {
+				t.Errorf("result.Reason = %q, want %q", resp.Result.Reason, tc.wantReason)
+			}
+			if got := secondJobExists(t, c); got != tc.wantSecondJobBuilt {
+				t.Errorf("secondJobExists = %t, want %t", got, tc.wantSecondJobBuilt)
+			}
+		})
 	}
 }
