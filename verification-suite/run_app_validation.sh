@@ -59,6 +59,27 @@ wait_for_pod_ready() {
   kubectl wait --for=condition=Ready "pod/$pod_name" --timeout="${timeout}s"
 }
 
+drain_node_and_verify_single_hop() {
+  local node="$1"
+  local pod_name="$2"
+  if ! kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30 --timeout=180s; then
+    echo "[ERROR] kubectl drain on node $node failed or timed out (180s)! Uncordoning $node before exit..." >&2
+    kubectl uncordon "$node" || true
+    exit 1
+  fi
+  if [ -n "$pod_name" ]; then
+    local pmj_count
+    pmj_count=$(kubectl get podmigrationjobs.podmigration.gke.io -o json | jq -r --arg p "$pod_name" '[.items[] | select(.spec.podRef.name == $p)] | length')
+    if [ "$pmj_count" != "1" ]; then
+      echo "[ERROR] Multi-hop drain regression: expected 1 PodMigrationJob for $pod_name, got $pmj_count! Uncordoning $node before exit..." >&2
+      kubectl get podmigrationjobs.podmigration.gke.io -o wide >&2 || true
+      kubectl uncordon "$node" || true
+      exit 1
+    fi
+    echo "[+] Verified single-hop migration (1 PodMigrationJob for $pod_name)."
+  fi
+}
+
 # Cleanup old podsnapshots before starting (Rule 2)
 echo "[*] Cleaning up old podsnapshots..."
 # Temporarily delete VAP to allow finalizer removal
@@ -96,7 +117,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -141,7 +162,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -188,7 +209,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -237,7 +258,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -283,7 +304,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -322,7 +343,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -361,7 +382,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -400,7 +421,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -436,7 +457,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -476,7 +497,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -518,7 +539,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -560,7 +581,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -602,7 +623,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -644,7 +665,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -688,7 +709,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -731,7 +752,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -772,7 +793,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -829,7 +850,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -878,7 +899,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -923,7 +944,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -976,7 +997,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
     
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
     
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"
@@ -1061,7 +1082,7 @@ case "$APP" in
     echo "[*] Pod is running on node: $NODE"
 
     echo "[*] Draining node $NODE..."
-    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+    drain_node_and_verify_single_hop "$NODE" "$POD_NAME"
 
     echo "[*] Restoring node $NODE (uncordon)..."
     kubectl uncordon "$NODE"

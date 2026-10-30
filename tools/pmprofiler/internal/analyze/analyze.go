@@ -1180,6 +1180,74 @@ func VerifyOutcomes(run *Run, allowColdStart bool) error {
 	return nil
 }
 
+// VerifyMaxMigrationsPerPod fails closed when any logical workload pod in the
+// measured population undergoes more than maxPerPod migrations in a single run
+// (#192). It detects both:
+//  1. Same-name replacement loops (e.g. StatefulSet `pm-redis-0` migrated
+//     multiple times across `pmj-1`, `pmj-2`, ...).
+//  2. Distinct-name replacement chains (e.g. Deployment/Job `pod-a -> pod-b`
+//     followed by `pod-b -> pod-c` where a replacement pod is itself migrated).
+func VerifyMaxMigrationsPerPod(run *Run, maxPerPod int) error {
+	if run == nil || maxPerPod <= 0 {
+		return nil
+	}
+	var measured []Migration
+	for _, m := range run.Migrations {
+		if m.Population == "" || m.Population == "measured" {
+			measured = append(measured, m)
+		}
+	}
+	byPod := map[string][]string{}
+	bySrc := map[string]Migration{}
+	for _, m := range measured {
+		if m.Pod == "" {
+			continue
+		}
+		byPod[m.Pod] = append(byPod[m.Pod], m.PMJ)
+		bySrc[m.Pod] = m
+	}
+	var podNames []string
+	for pod := range byPod {
+		podNames = append(podNames, pod)
+	}
+	sort.Strings(podNames)
+	for _, pod := range podNames {
+		pmjs := byPod[pod]
+		if len(pmjs) > maxPerPod {
+			return fmt.Errorf("multi-hop migration loop detected: pod %q was migrated %d times (max %d): %s",
+				pod, len(pmjs), maxPerPod, strings.Join(pmjs, " -> "))
+		}
+	}
+	// Also walk distinct-name replacement chains (pod-a -> pod-b -> pod-c).
+	for _, m := range measured {
+		if m.Pod == "" || m.DstPod == "" || m.DstPod == m.Pod {
+			continue
+		}
+		chainPMJs := []string{m.PMJ}
+		chainPods := []string{m.Pod, m.DstPod}
+		visited := map[string]bool{m.Pod: true, m.DstPod: true}
+		curr := m.DstPod
+		for {
+			next, ok := bySrc[curr]
+			if !ok || next.PMJ == "" {
+				break
+			}
+			chainPMJs = append(chainPMJs, next.PMJ)
+			if next.DstPod == "" || visited[next.DstPod] {
+				break
+			}
+			visited[next.DstPod] = true
+			chainPods = append(chainPods, next.DstPod)
+			curr = next.DstPod
+		}
+		if len(chainPMJs) > maxPerPod {
+			return fmt.Errorf("multi-hop replacement chain detected: %s (%d hops, max %d; jobs: %s)",
+				strings.Join(chainPods, " -> "), len(chainPMJs), maxPerPod, strings.Join(chainPMJs, " -> "))
+		}
+	}
+	return nil
+}
+
 func isStateSurvivalCheck(name string) bool {
 	lower := strings.ToLower(name)
 	return strings.Contains(lower, "state survived") || strings.Contains(lower, "write continuity")
