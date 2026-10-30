@@ -1006,3 +1006,35 @@ func TestVerifyVerdictMatchesDataWithInferredRestores(t *testing.T) {
 		t.Errorf("a pmj:RestoreInferred signal whose state was lost: want an S7 mismatch")
 	}
 }
+
+func TestVerifyMaxMigrationsPerPod(t *testing.T) {
+	singleHop := &Run{
+		Migrations: []Migration{
+			{PMJ: "pmj-redis-0-u1", Pod: "pm-redis-0", DstPod: "pm-redis-0", Outcome: OutcomeRestored},
+			{PMJ: "pmj-counter-a", Pod: "counter-a", DstPod: "counter-b", Outcome: OutcomeRestored},
+		},
+	}
+	if err := VerifyMaxMigrationsPerPod(singleHop, 1); err != nil {
+		t.Fatalf("expected single-hop migrations to pass maxPerPod=1, got: %v", err)
+	}
+
+	statefulSetLoop := &Run{
+		Migrations: []Migration{
+			{PMJ: "pmj-redis-0-u1", Pod: "pm-redis-0", DstPod: "pm-redis-0", Outcome: OutcomeRestored},
+			{PMJ: "pmj-redis-0-u2", Pod: "pm-redis-0", DstPod: "pm-redis-0", Outcome: OutcomeRestored},
+		},
+	}
+	if err := VerifyMaxMigrationsPerPod(statefulSetLoop, 1); err == nil || !strings.Contains(err.Error(), "multi-hop migration loop detected") {
+		t.Fatalf("expected StatefulSet same-name loop to fail maxPerPod=1, got: %v", err)
+	}
+
+	deploymentChain := &Run{
+		Migrations: []Migration{
+			{PMJ: "pmj-app-a", Pod: "app-a", DstPod: "app-b", Outcome: OutcomeRestored},
+			{PMJ: "pmj-app-b", Pod: "app-b", DstPod: "app-c", Outcome: OutcomeRestored},
+		},
+	}
+	if err := VerifyMaxMigrationsPerPod(deploymentChain, 1); err == nil || !strings.Contains(err.Error(), "multi-hop replacement chain detected") {
+		t.Fatalf("expected Deployment replacement chain (app-a -> app-b -> app-c) to fail maxPerPod=1, got: %v", err)
+	}
+}

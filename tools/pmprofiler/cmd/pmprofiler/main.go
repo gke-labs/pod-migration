@@ -207,6 +207,7 @@ func cmdAnalyze(args []string) error {
 	assertZeroInv := fs.Bool("assert-zero-invariants", true, "fail if sum(pod_migration_invariant_violations_total) > 0")
 	assertCleanOutcomes := fs.Bool("assert-clean-outcomes", false, "fail on wedged, failed, no-replacement, or unintended cold-start outcomes")
 	allowColdStart := fs.Bool("allow-cold-start", false, "permit cold-start outcomes when --assert-clean-outcomes is set (e.g. intentional I9 fallback)")
+	maxMigrationsPerPod := fs.Int("max-migrations-per-pod", 0, "fail if any pod or replacement chain migrates more than N times in the run (0 = disabled)")
 	assertVerdictMatchesData := fs.Bool("assert-verdict-matches-data", false, "enforce S7: fail if a migration reports RestoreVerified while the app check failed, or the reverse")
 	enforceSLO := fs.Bool("enforce-slo", false, "enforce wall-clock latency SLO thresholds (T) on p95 gateHoldS, downtimeS, and e2eS")
 	slo := analyze.DefaultSLOThresholds()
@@ -255,6 +256,11 @@ func cmdAnalyze(args []string) error {
 	}
 	if *assertCleanOutcomes {
 		if err := analyze.VerifyOutcomes(run, *allowColdStart); err != nil {
+			return err
+		}
+	}
+	if *maxMigrationsPerPod > 0 {
+		if err := analyze.VerifyMaxMigrationsPerPod(run, *maxMigrationsPerPod); err != nil {
 			return err
 		}
 	}
