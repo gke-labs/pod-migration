@@ -2176,3 +2176,199 @@ func TestPodMigrationReconciler_Finalizer_PostponesDeleteForPolicyAnnotatedJob(t
 	}
 }
 
+// statusWriteCounter wraps c so that every write to a PodMigration's status
+// subresource is recorded in writes.
+func statusWriteCounter(c client.WithWatch, writes *[]string) client.WithWatch {
+	return interceptor.NewClient(c, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if _, ok := obj.(*pmv1alpha1.PodMigration); ok {
+				*writes = append(*writes, "Update "+sub)
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+		SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if _, ok := obj.(*pmv1alpha1.PodMigration); ok {
+				*writes = append(*writes, "Patch "+sub)
+			}
+			return cl.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	})
+}
+
+// A reconcile that finds the status already up to date must not write it
+// (#142).
+func TestPodMigrationReconciler_Status_NoOpDoesNotWrite(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	namespace, name := "default", "status-noop"
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+
+	base := newSyncTestClient(scheme, syncTestPodMigration(namespace, name))
+	reconcileSyncTest(t, base, scheme, namespace, name) // sets Ready=True
+
+	before := &pmv1alpha1.PodMigration{}
+	if err := base.Get(context.Background(), key, before); err != nil {
+		t.Fatalf("Get PodMigration: %v", err)
+	}
+
+	var writes []string
+	reconcileSyncTest(t, statusWriteCounter(base, &writes), scheme, namespace, name)
+
+	if len(writes) != 0 {
+		t.Errorf("reconcile with an unchanged status wrote it: %v", writes)
+	}
+	after := &pmv1alpha1.PodMigration{}
+	if err := base.Get(context.Background(), key, after); err != nil {
+		t.Fatalf("Get PodMigration: %v", err)
+	}
+	if after.ResourceVersion != before.ResourceVersion {
+		t.Errorf("PodMigration resourceVersion changed from %s to %s", before.ResourceVersion, after.ResourceVersion)
+	}
+}
+
+// A reconcile that reads the PodMigration from a stale cache, one that hasn't
+// seen the previous reconcile's status write yet, must not fail with a
+// conflict (#142).
+func TestPodMigrationReconciler_Status_StaleReadDoesNotConflict(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	namespace, name := "default", "status-stale"
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+
+	base := newSyncTestClient(scheme, syncTestPodMigration(namespace, name))
+	stale := &pmv1alpha1.PodMigration{}
+	if err := base.Get(context.Background(), key, stale); err != nil {
+		t.Fatalf("Get PodMigration: %v", err)
+	}
+	reconcileSyncTest(t, base, scheme, namespace, name) // writes Ready=True
+
+	c := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if pm, ok := obj.(*pmv1alpha1.PodMigration); ok && k == key {
+				stale.DeepCopyInto(pm) // the copy from before the status write
+				return nil
+			}
+			return cl.Get(ctx, k, obj, opts...)
+		},
+	})
+	reconcileSyncTest(t, c, scheme, namespace, name)
+
+	got := &pmv1alpha1.PodMigration{}
+	if err := base.Get(context.Background(), key, got); err != nil {
+		t.Fatalf("Get PodMigration: %v", err)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, "Ready"); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Errorf("Ready condition = %+v, want status True", cond)
+	}
+}
+
+// A status change other than Ready is still written: adding the runtime class
+// routes annotation adds the EngineRoutesValid condition while Ready stays
+// True.
+func TestPodMigrationReconciler_Status_RoutesConditionChangeIsWritten(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	namespace, name := "default", "status-routes"
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+
+	base := newSyncTestClient(scheme, syncTestPodMigration(namespace, name))
+	reconcileSyncTest(t, base, scheme, namespace, name) // sets Ready=True
+
+	pm := &pmv1alpha1.PodMigration{}
+	if err := base.Get(context.Background(), key, pm); err != nil {
+		t.Fatalf("Get PodMigration: %v", err)
+	}
+	pm.Annotations = map[string]string{engine.AnnotationRuntimeClassEngines: "gvisor=no-such-engine"}
+	if err := base.Update(context.Background(), pm); err != nil {
+		t.Fatalf("Update PodMigration: %v", err)
+	}
+	reconcileSyncTest(t, base, scheme, namespace, name)
+
+	got := &pmv1alpha1.PodMigration{}
+	if err := base.Get(context.Background(), key, got); err != nil {
+		t.Fatalf("Get PodMigration: %v", err)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, "Ready"); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Errorf("Ready condition = %+v, want status True", cond)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, ConditionEngineRoutesValid); cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Errorf("%s condition = %+v, want status False", ConditionEngineRoutesValid, cond)
+	}
+}
+
+// A change to an existing condition is written: deferring the deletion of a
+// Ready PodMigration, or demoting it as a duplicate, flips its Ready=True
+// condition to False in place.
+func TestPodMigrationReconciler_Status_ReadyTransitionIsWritten(t *testing.T) {
+	ready := metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Reconciled",
+		Message:            "Storage config and policy synced successfully",
+		ObservedGeneration: 1,
+		LastTransitionTime: metav1.Now(),
+	}
+	for _, tc := range []struct {
+		name       string
+		objects    func(namespace, name string) []client.Object
+		wantReason string
+	}{
+		{
+			name: "deletion deferred by an in-flight migration",
+			objects: func(namespace, name string) []client.Object {
+				pm := syncTestPodMigration(namespace, name)
+				now := metav1.Now()
+				pm.DeletionTimestamp = &now
+				pm.Status.Conditions = []metav1.Condition{ready}
+				job := &pmv1alpha1.PodMigrationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: namespace,
+						Name:      "in-flight",
+						OwnerReferences: []metav1.OwnerReference{{
+							APIVersion: pmv1alpha1.GroupVersion.String(),
+							Kind:       "PodMigration",
+							Name:       name,
+						}},
+					},
+					Status: pmv1alpha1.PodMigrationJobStatus{Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting},
+				}
+				return []client.Object{pm, job}
+			},
+			wantReason: "DeletionBlockedByInFlightMigrations",
+		},
+		{
+			name: "demoted as a duplicate",
+			objects: func(namespace, name string) []client.Object {
+				pm := syncTestPodMigration(namespace, name)
+				pm.Status.Conditions = []metav1.Condition{ready}
+				// With equal creation timestamps, the smaller name is active.
+				active := syncTestPodMigration(namespace, "a-"+name)
+				return []client.Object{pm, active}
+			},
+			wantReason: ReasonDuplicatePodMigrationInNamespace,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = pmv1alpha1.AddToScheme(scheme)
+			namespace, name := "default", "status-transition"
+			key := types.NamespacedName{Namespace: namespace, Name: name}
+
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(tc.objects(namespace, name)...).
+				WithStatusSubresource(&pmv1alpha1.PodMigration{}, &pmv1alpha1.PodMigrationJob{}).
+				Build()
+			reconcileSyncTest(t, c, scheme, namespace, name)
+
+			got := &pmv1alpha1.PodMigration{}
+			if err := c.Get(context.Background(), key, got); err != nil {
+				t.Fatalf("Get PodMigration: %v", err)
+			}
+			cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != tc.wantReason {
+				t.Errorf("Ready condition = %+v, want status False, reason %s", cond, tc.wantReason)
+			}
+		})
+	}
+}
