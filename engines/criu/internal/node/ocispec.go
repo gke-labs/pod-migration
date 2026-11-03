@@ -33,7 +33,45 @@ import (
 // so a straight restore fails the mount. In warm migration the authoritative
 // state is the checkpointed memory; the anonymous volume is ephemeral scratch,
 // so it is re-created fresh on the target.
-var anonVolRe = regexp.MustCompile(`/containers/[^/]+/volumes/([^/]+)`)
+var anonVolRe = regexp.MustCompile(`^/var/lib/containerd/[^/]+/containers/[^/]+/volumes/([^/.]+)$`)
+
+// isSafeAnonDestination rejects system and engine-reserved mount destinations
+// so an anonymous image volume from an archive spec can never shadow critical
+// container paths.
+func isSafeAnonDestination(dst string) bool {
+	clean := path.Clean(dst)
+	if !strings.HasPrefix(clean, "/") || clean == "/" {
+		return false
+	}
+	for _, reserved := range []string{
+		"/proc", "/sys", "/dev", "/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64",
+		"/pmhold", "/pminfo", "/var/run/secrets", "/run/secrets",
+	} {
+		if clean == reserved || strings.HasPrefix(clean, reserved+"/") {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeAnonMountOptions restricts anonymous bind-mount options to safe defaults.
+func sanitizeAnonMountOptions(opts []string) []string {
+	allowed := map[string]bool{
+		"rbind": true, "bind": true, "rw": true, "ro": true,
+		"nosuid": true, "nodev": true, "noexec": true,
+		"rprivate": true, "private": true,
+	}
+	var out []string
+	for _, o := range opts {
+		if allowed[o] {
+			out = append(out, o)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"rbind", "rprivate", "nosuid", "nodev"}
+	}
+	return out
+}
 
 // AdaptParams carries everything needed to turn the source container's OCI
 // runtime spec into a bundle spec for the sibling container restored inside
@@ -80,25 +118,30 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	if spec.Root == nil || spec.Linux == nil {
 		return nil, fmt.Errorf("source OCI spec lacks root/linux sections — not a CRI container spec")
 	}
+	if p.TargetSpec == nil || p.TargetSpec.Process == nil || p.TargetSpec.Linux == nil {
+		return nil, fmt.Errorf("destination container OCI spec lacks process/linux sections — refusing unhardened restore")
+	}
 	spec.Root.Path = p.RootfsPath
 	spec.Root.Readonly = false
 
 	// Namespaces: join the target sandbox's net/ipc/uts; keep pid+mount
-	// private (CRIU restores them from the images).
+	// private (CRIU restores them from the images). Always construct a
+	// canonical namespace list rather than iterating over archive entries so an
+	// archive cannot omit PID/Mount namespaces (which would inherit host
+	// namespaces) or inject arbitrary namespace paths.
 	nsPath := func(kind string) string { return fmt.Sprintf("/proc/%d/ns/%s", p.HolderPid, kind) }
-	var out []specs.LinuxNamespace
-	for _, ns := range spec.Linux.Namespaces {
-		switch ns.Type {
-		case specs.NetworkNamespace:
-			ns.Path = nsPath("net")
-		case specs.IPCNamespace:
-			ns.Path = nsPath("ipc")
-		case specs.UTSNamespace:
-			ns.Path = nsPath("uts")
-		case specs.PIDNamespace, specs.MountNamespace:
-			ns.Path = ""
+	out := []specs.LinuxNamespace{
+		{Type: specs.PIDNamespace, Path: ""},
+		{Type: specs.IPCNamespace, Path: nsPath("ipc")},
+		{Type: specs.UTSNamespace, Path: nsPath("uts")},
+		{Type: specs.MountNamespace, Path: ""},
+		{Type: specs.NetworkNamespace, Path: nsPath("net")},
+	}
+	for _, ns := range p.TargetSpec.Linux.Namespaces {
+		if ns.Type == specs.CgroupNamespace {
+			out = append(out, specs.LinuxNamespace{Type: specs.CgroupNamespace, Path: ""})
+			break
 		}
-		out = append(out, ns)
 	}
 	spec.Linux.Namespaces = out
 	notes = append(notes, fmt.Sprintf("joined sandbox namespaces of pid %d (net/ipc/uts)", p.HolderPid))
@@ -109,38 +152,43 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	spec.Hooks = nil
 	notes = append(notes, "scrubbed OCI runtime hooks")
 
-	var targetMounts map[string]specs.Mount
-	if p.TargetSpec != nil {
-		if spec.Process != nil && p.TargetSpec.Process != nil {
-			spec.Process.Capabilities = p.TargetSpec.Process.Capabilities
-			spec.Process.User = p.TargetSpec.Process.User
-			spec.Process.NoNewPrivileges = p.TargetSpec.Process.NoNewPrivileges
-			spec.Process.ApparmorProfile = p.TargetSpec.Process.ApparmorProfile
-			spec.Process.SelinuxLabel = p.TargetSpec.Process.SelinuxLabel
-			spec.Process.OOMScoreAdj = p.TargetSpec.Process.OOMScoreAdj
-			spec.Process.Rlimits = p.TargetSpec.Process.Rlimits
-		}
-		if p.TargetSpec.Linux != nil {
-			spec.Linux.Seccomp = p.TargetSpec.Linux.Seccomp
-			spec.Linux.MaskedPaths = p.TargetSpec.Linux.MaskedPaths
-			spec.Linux.ReadonlyPaths = p.TargetSpec.Linux.ReadonlyPaths
-			spec.Linux.Devices = p.TargetSpec.Linux.Devices
-			spec.Linux.Resources = p.TargetSpec.Linux.Resources
-			spec.Linux.Sysctl = p.TargetSpec.Linux.Sysctl
-		}
+	if spec.Process == nil {
+		spec.Process = &specs.Process{}
+	}
+	spec.Process.Capabilities = p.TargetSpec.Process.Capabilities
+	spec.Process.User = p.TargetSpec.Process.User
+	spec.Process.NoNewPrivileges = p.TargetSpec.Process.NoNewPrivileges
+	spec.Process.ApparmorProfile = p.TargetSpec.Process.ApparmorProfile
+	spec.Process.SelinuxLabel = p.TargetSpec.Process.SelinuxLabel
+	spec.Process.OOMScoreAdj = p.TargetSpec.Process.OOMScoreAdj
+	spec.Process.Rlimits = p.TargetSpec.Process.Rlimits
 
-		targetMounts = make(map[string]specs.Mount)
-		for _, tm := range p.TargetSpec.Mounts {
-			if tm.Destination == "/pmhold" || tm.Destination == "/pminfo" {
-				continue
-			}
-			targetMounts[tm.Destination] = tm
+	spec.Linux.Seccomp = p.TargetSpec.Linux.Seccomp
+	spec.Linux.MaskedPaths = p.TargetSpec.Linux.MaskedPaths
+	spec.Linux.ReadonlyPaths = p.TargetSpec.Linux.ReadonlyPaths
+	spec.Linux.Devices = p.TargetSpec.Linux.Devices
+	spec.Linux.Resources = p.TargetSpec.Linux.Resources
+	spec.Linux.Sysctl = p.TargetSpec.Linux.Sysctl
+	spec.Linux.RootfsPropagation = p.TargetSpec.Linux.RootfsPropagation
+	spec.Linux.MountLabel = p.TargetSpec.Linux.MountLabel
+
+	targetMounts := make(map[string]specs.Mount)
+	for _, tm := range p.TargetSpec.Mounts {
+		dst := path.Clean(tm.Destination)
+		if dst == "/pmhold" || dst == "/pminfo" {
+			continue
 		}
+		tm.Destination = dst
+		if strings.HasPrefix(tm.Source, "/") {
+			tm.Source = path.Clean(tm.Source)
+		}
+		targetMounts[dst] = tm
 	}
 
 	// Remap external bind-mount sources source-pod -> target-pod.
 	for i := range spec.Mounts {
 		m := &spec.Mounts[i]
+		m.Destination = path.Clean(m.Destination)
 		orig := m.Source
 		if p.SourcePodUID != "" && p.TargetPodUID != "" {
 			m.Source = strings.ReplaceAll(m.Source, p.SourcePodUID, p.TargetPodUID)
@@ -153,31 +201,43 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 				m.Source = strings.ReplaceAll(m.Source, rw[0], rw[1])
 			}
 		}
+		if strings.HasPrefix(m.Source, "/") {
+			m.Source = path.Clean(m.Source)
+		}
 		// Anonymous image volume (Dockerfile VOLUME): the source is the source
 		// container's volumes dir, absent on the target. Re-point it at fresh
 		// target scratch when AnonVolumeDir is set.
-		if p.TargetSpec != nil {
-			if p.AnonVolumeDir != "" && anonVolRe.MatchString(m.Source) {
-				mm := anonVolRe.FindStringSubmatch(m.Source)
-				m.Source = path.Join(p.AnonVolumeDir, mm[1])
-			} else if tgtMount, ok := targetMounts[m.Destination]; ok {
+		if tgtMount, ok := targetMounts[m.Destination]; ok {
+			if p.AnonVolumeDir != "" && anonVolRe.MatchString(tgtMount.Source) && isSafeAnonDestination(m.Destination) {
+				mm := anonVolRe.FindStringSubmatch(tgtMount.Source)
+				if mm[1] == "" || mm[1] == "." || mm[1] == ".." || strings.Contains(mm[1], "..") {
+					return notes, fmt.Errorf("invalid anonymous volume name in %q", tgtMount.Source)
+				}
+				cleanAnonDir := path.Clean(p.AnonVolumeDir)
+				m.Source = path.Join(cleanAnonDir, mm[1])
+				if !strings.HasPrefix(m.Source, cleanAnonDir+"/") {
+					return notes, fmt.Errorf("anonymous volume path escaped %s: %s", cleanAnonDir, m.Source)
+				}
+				m.Type = "bind"
+				m.Options = sanitizeAnonMountOptions(tgtMount.Options)
+			} else {
 				m.Source = tgtMount.Source
 				m.Type = tgtMount.Type
 				m.Options = tgtMount.Options
-			} else {
-				return notes, fmt.Errorf("mount %s (source %s) is not permitted by destination container spec", m.Destination, m.Source)
 			}
+		} else if p.AnonVolumeDir != "" && m.Type == "bind" && anonVolRe.MatchString(m.Source) && isSafeAnonDestination(m.Destination) {
+			mm := anonVolRe.FindStringSubmatch(m.Source)
+			if mm[1] == "" || mm[1] == "." || mm[1] == ".." || strings.Contains(mm[1], "..") {
+				return notes, fmt.Errorf("invalid anonymous volume name in %q", m.Source)
+			}
+			cleanAnonDir := path.Clean(p.AnonVolumeDir)
+			m.Source = path.Join(cleanAnonDir, mm[1])
+			if !strings.HasPrefix(m.Source, cleanAnonDir+"/") {
+				return notes, fmt.Errorf("anonymous volume path escaped %s: %s", cleanAnonDir, m.Source)
+			}
+			m.Options = sanitizeAnonMountOptions(m.Options)
 		} else {
-			if p.AnonVolumeDir != "" {
-				if mm := anonVolRe.FindStringSubmatch(m.Source); mm != nil {
-					m.Source = path.Join(p.AnonVolumeDir, mm[1])
-				}
-			}
-			if m.Type == "bind" {
-				if !(strings.HasPrefix(m.Source, "/var/lib/kubelet/pods/") || strings.HasPrefix(m.Source, "/var/lib/containerd/") || (p.AnonVolumeDir != "" && strings.HasPrefix(m.Source, p.AnonVolumeDir))) {
-					return notes, fmt.Errorf("mount %s (source %s) is not permitted in legacy mode", m.Destination, m.Source)
-				}
-			}
+			return notes, fmt.Errorf("mount %s (source %s) is not permitted by destination container spec", m.Destination, m.Source)
 		}
 
 		// Container-scoped paths (termination-log lives under .../containers/

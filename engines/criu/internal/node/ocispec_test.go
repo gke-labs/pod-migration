@@ -16,6 +16,10 @@
 package node
 
 import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -54,6 +58,40 @@ func sampleSpec() *specs.Spec {
 	}
 }
 
+func sampleTargetSpec() *specs.Spec {
+	return &specs.Spec{
+		Root: &specs.Root{Path: "rootfs"},
+		Process: &specs.Process{
+			Args:            []string{"/pmhold/holder", "wrap", "/pminfo/annotations", "--", "/app"},
+			Capabilities:    &specs.LinuxCapabilities{Bounding: []string{}},
+			User:            specs.User{UID: 1000, GID: 1000},
+			NoNewPrivileges: true,
+		},
+		Mounts: []specs.Mount{
+			{Destination: "/etc/hosts", Type: "bind",
+				Source: "/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes/tgtsandbox222/etc-hosts"},
+			{Destination: "/var/run/secrets/kubernetes.io/serviceaccount", Type: "bind",
+				Source: "/var/lib/kubelet/pods/tgt-uid/volumes/kubernetes.io~projected/kube-api-access-x"},
+			{Destination: "/dev/termination-log", Type: "bind",
+				Source: "/var/lib/kubelet/pods/tgt-uid/containers/counter/abc123"},
+			{Destination: "/proc", Type: "proc", Source: "proc"},
+			{Destination: "/pmhold", Type: "bind", Source: "/var/lib/kubelet/pods/tgt-uid/volumes/kubernetes.io~empty-dir/pmhold"},
+			{Destination: "/pminfo", Type: "bind", Source: "/var/lib/kubelet/pods/tgt-uid/volumes/kubernetes.io~downward-api/pminfo"},
+		},
+		Linux: &specs.Linux{
+			Seccomp:     &specs.LinuxSeccomp{DefaultAction: specs.ActErrno},
+			MaskedPaths: []string{"/proc/kcore"},
+			Namespaces: []specs.LinuxNamespace{
+				{Type: specs.PIDNamespace},
+				{Type: specs.IPCNamespace, Path: "/proc/2222/ns/ipc"},
+				{Type: specs.UTSNamespace, Path: "/proc/2222/ns/uts"},
+				{Type: specs.MountNamespace},
+				{Type: specs.NetworkNamespace, Path: "/proc/2222/ns/net"},
+			},
+		},
+	}
+}
+
 func params() AdaptParams {
 	return AdaptParams{
 		RootfsPath:      "/var/lib/pod-migrate/bundles/pm-mig1/rootfs",
@@ -63,6 +101,7 @@ func params() AdaptParams {
 		TargetPodUID:    "tgt-uid",
 		SourceSandboxID: "srcsandbox111",
 		TargetSandboxID: "tgtsandbox222",
+		TargetSpec:      sampleTargetSpec(),
 	}
 }
 
@@ -145,28 +184,21 @@ func TestAdaptSpecRepointsAnonymousImageVolume(t *testing.T) {
 	}
 }
 
-// Without AnonVolumeDir the anon-volume mount is left untouched.
-func TestAdaptSpecLeavesAnonVolumeWhenDirUnset(t *testing.T) {
+// Without AnonVolumeDir an anonymous volume mount not in TargetSpec is rejected.
+func TestAdaptSpecRejectsAnonVolumeWhenDirUnset(t *testing.T) {
 	s := sampleSpec()
 	orig := "/var/lib/containerd/io.containerd.grpc.v1.cri/containers/abc/volumes/xyz"
 	s.Mounts = append(s.Mounts, specs.Mount{Destination: "/data", Type: "bind", Source: orig})
-	if _, err := AdaptSpec(s, params()); err != nil { // AnonVolumeDir empty
-		t.Fatal(err)
-	}
-	for i := range s.Mounts {
-		if s.Mounts[i].Destination == "/data" && s.Mounts[i].Source != orig {
-			t.Errorf("anon volume rewritten despite empty AnonVolumeDir: %s", s.Mounts[i].Source)
-		}
+	if _, err := AdaptSpec(s, params()); err == nil { // AnonVolumeDir empty
+		t.Fatal("expected unmapped anon volume to be rejected when AnonVolumeDir is empty")
 	}
 }
 
 func TestAdaptSpecRefusesLingeringSourceRef(t *testing.T) {
 	s := sampleSpec()
 	p := params()
-	p.TargetPodUID = "" // remap disabled -> source refs survive -> must refuse
-	p.SourcePodUID = ""
-	p.SourceSandboxID = ""
-	// Simulate a weird mount that still carries the uid literal.
+	// Simulate a target mount that still carries the source pod UID literal.
+	p.TargetSpec.Mounts[1].Source = "/var/lib/kubelet/pods/src-uid/volumes/kubernetes.io~projected/kube-api-access-x"
 	p.SourcePodUID = "src-uid"
 	if _, err := AdaptSpec(s, p); err == nil {
 		t.Fatal("AdaptSpec accepted a spec still referencing the source pod")
@@ -176,6 +208,11 @@ func TestAdaptSpecRefusesLingeringSourceRef(t *testing.T) {
 func TestAdaptSpecNilSections(t *testing.T) {
 	if _, err := AdaptSpec(&specs.Spec{}, params()); err == nil {
 		t.Fatal("nil root/linux accepted")
+	}
+	p := params()
+	p.TargetSpec = nil
+	if _, err := AdaptSpec(sampleSpec(), p); err == nil {
+		t.Fatal("nil TargetSpec accepted")
 	}
 }
 
@@ -294,17 +331,265 @@ func TestAdaptSpecWithTargetSpec(t *testing.T) {
 	}
 }
 
-func TestAdaptSpecLegacyRejectsBadBindMount(t *testing.T) {
+func TestAdaptSpecRejectsDotDotAnonVolumeAndNilTargetSpec(t *testing.T) {
 	s := sampleSpec()
 	s.Mounts = append(s.Mounts, specs.Mount{
-		Destination: "/host", Type: "bind", Source: "/",
+		Destination: "/data", Type: "bind",
+		Source: "/var/lib/containerd/io.containerd.grpc.v1.cri/containers/7cb5e8acf3c8/volumes/..",
 	})
 	p := params()
-	_, err := AdaptSpec(s, p)
-	if err == nil {
-		t.Fatal("expected error rejecting / bind mount in legacy mode, got nil")
+	p.AnonVolumeDir = "/var/lib/pod-migrate/bundles/pm-mig1/anon-volumes"
+	if _, err := AdaptSpec(s, p); err == nil {
+		t.Fatal("expected error rejecting .. anonymous volume name, got nil")
 	}
-	if !strings.Contains(err.Error(), "not permitted in legacy mode") {
-		t.Errorf("expected legacy mode error, got: %v", err)
+}
+
+func TestRestoreEndToEndEnforcesTargetSpec(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "etc-criu")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "runc.conf"), []byte("file-validation buildid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	chkDir := filepath.Join(tmpDir, "chk")
+	if err := os.MkdirAll(filepath.Join(chkDir, "checkpoint"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var preparedImage string
+	holderSpec := sampleTargetSpec()
+	r := &restorer{
+		pmRootDir:       tmpDir,
+		criuConfDirPath: confDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "holder-ctr-1",
+				SandboxID: "tgtsandbox222",
+				Pid:       2222,
+				Spec:      holderSpec,
+				ImageName: "gcr.io/trusted/app:v1",
+			}, nil
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice/cri-containerd-holder.scope\n"), nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error) {
+			preparedImage = imageName
+			rf := filepath.Join(bundleDir, "rootfs")
+			_ = os.MkdirAll(rf, 0o755)
+			return rf, nil
+		},
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "Version: 3.19", nil
+		},
+		execRestoreFn: func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
+			for i := 0; i < len(args)-1; i++ {
+				if args[i] == "--pid-file" {
+					_ = os.WriteFile(args[i+1], []byte("4321\n"), 0o644)
+				}
+			}
+			return "", nil
+		},
+	}
+
+	// 1. Archive attempts privilege escalation (UID 0, CAP_SYS_ADMIN, hooks,
+	// host UserNamespace) AND an unauthorized /host bind mount -> restore() must refuse!
+	badArchiveSpec := sampleSpec()
+	badArchiveSpec.Process.User = specs.User{UID: 0}
+	badArchiveSpec.Process.Capabilities = &specs.LinuxCapabilities{Bounding: []string{"CAP_SYS_ADMIN"}}
+	badArchiveSpec.Hooks = &specs.Hooks{Prestart: []specs.Hook{{Path: "/bin/sh"}}}
+	badArchiveSpec.Mounts = append(badArchiveSpec.Mounts, specs.Mount{
+		Destination: "/host", Type: "bind", Source: "/var/lib/kubelet/pods/../../",
+	})
+	_, err := r.restore(ctx, restoreInputs{
+		MigrationName: "mig-bad",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		ContainerName: "app",
+		SourcePodUID:  "src-uid",
+		TargetPodUID:  "tgt-uid",
+		CheckpointDir: chkDir,
+		SrcSpec:       badArchiveSpec,
+		ImageName:     "evil.example.com/attacker:latest",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not permitted by destination container spec") {
+		t.Fatalf("expected restore() to reject unauthorized /host mount, got: %v", err)
+	}
+
+	// 2. With valid mounts, restore() succeeds, uses holder.ImageName (ignoring
+	// archive ImageName), and writes config.json enforcing holder.Spec's UID 1000,
+	// empty capabilities, Seccomp, stripped hooks, and canonical namespaces.
+	goodArchiveSpec := sampleSpec()
+	goodArchiveSpec.Process.User = specs.User{UID: 0}
+	goodArchiveSpec.Process.Capabilities = &specs.LinuxCapabilities{Bounding: []string{"CAP_SYS_ADMIN"}}
+	goodArchiveSpec.Hooks = &specs.Hooks{Prestart: []specs.Hook{{Path: "/bin/sh"}}}
+	goodArchiveSpec.Linux.Namespaces = []specs.LinuxNamespace{
+		{Type: specs.UserNamespace, Path: "/proc/1/ns/user"},
+	}
+
+	out, err := r.restore(ctx, restoreInputs{
+		MigrationName: "mig-good",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		ContainerName: "app",
+		SourcePodUID:  "src-uid",
+		TargetPodUID:  "tgt-uid",
+		CheckpointDir: chkDir,
+		SrcSpec:       goodArchiveSpec,
+		ImageName:     "evil.example.com/attacker:latest",
+	})
+	if err != nil {
+		t.Fatalf("restore() failed: %v", err)
+	}
+	if out.Pid != 4321 {
+		t.Fatalf("out.Pid = %d, want 4321", out.Pid)
+	}
+	if preparedImage != "gcr.io/trusted/app:v1" {
+		t.Fatalf("preparedImage = %q, want holder image gcr.io/trusted/app:v1", preparedImage)
+	}
+
+	cfgBytes, err := os.ReadFile(filepath.Join(tmpDir, "bundles", "pm-mig-good", "config.json"))
+	if err != nil {
+		t.Fatalf("read written config.json: %v", err)
+	}
+	var written specs.Spec
+	if err := json.Unmarshal(cfgBytes, &written); err != nil {
+		t.Fatalf("decode written config.json: %v", err)
+	}
+	if written.Process.User.UID != 1000 {
+		t.Errorf("written UID = %d, want 1000 from holder.Spec", written.Process.User.UID)
+	}
+	if len(written.Process.Capabilities.Bounding) != 0 {
+		t.Errorf("written Bounding capabilities = %v, want empty from holder.Spec", written.Process.Capabilities.Bounding)
+	}
+	if !written.Process.NoNewPrivileges {
+		t.Errorf("written NoNewPrivileges = false, want true")
+	}
+	if written.Hooks != nil {
+		t.Errorf("written Hooks = %+v, want nil", written.Hooks)
+	}
+	if written.Linux.Seccomp == nil || written.Linux.Seccomp.DefaultAction != specs.ActErrno {
+		t.Errorf("written Seccomp = %+v, want ActErrno from holder.Spec", written.Linux.Seccomp)
+	}
+	for _, ns := range written.Linux.Namespaces {
+		if ns.Type == specs.UserNamespace {
+			t.Errorf("archive UserNamespace survived in written config.json")
+		}
+	}
+}
+
+func TestBuildAdaptParamsWiresTargetSpecAndRejectsMissingHolderMetadata(t *testing.T) {
+	srcSpec := sampleSpec()
+	targetSpec := sampleSpec()
+	in := restoreInputs{
+		MigrationName: "mig1",
+		SourcePodUID:  "src-uid",
+		TargetPodUID:  "tgt-uid",
+		SrcSpec:       srcSpec,
+		ImageName:     "evil.example.com/attacker:latest",
+	}
+
+	t.Run("missing holder spec rejected", func(t *testing.T) {
+		_, _, err := buildAdaptParams(in, &containerRef{Pid: 2222, ImageName: "redis:7"}, "/rootfs", "slice", "pm-mig1", "/anon", nil)
+		if err == nil || !strings.Contains(err.Error(), "no OCI spec") {
+			t.Fatalf("expected missing OCI spec error, got %v", err)
+		}
+	})
+
+	t.Run("missing holder image rejected instead of falling back to archive image", func(t *testing.T) {
+		_, _, err := buildAdaptParams(in, &containerRef{Pid: 2222, Spec: targetSpec}, "/rootfs", "slice", "pm-mig1", "/anon", nil)
+		if err == nil || !strings.Contains(err.Error(), "no image name") {
+			t.Fatalf("expected missing image name error, got %v", err)
+		}
+	})
+
+	t.Run("wires TargetSpec and uses holder image", func(t *testing.T) {
+		holder := &containerRef{
+			Pid:       2222,
+			SandboxID: "tgtsandbox222",
+			Spec:      targetSpec,
+			ImageName: "redis:7-alpine",
+		}
+		ap, img, err := buildAdaptParams(in, holder, "/rootfs", "slice", "pm-mig1", "/anon", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if ap.TargetSpec != targetSpec {
+			t.Fatalf("TargetSpec was not wired from holder.Spec")
+		}
+		if img != "redis:7-alpine" {
+			t.Fatalf("image = %q, want holder image redis:7-alpine", img)
+		}
+	})
+}
+
+func TestAdaptSpecEnforcesCanonicalNamespacesAndTargetSecurityPosture(t *testing.T) {
+	// Archive attempts to omit PID/Mount namespaces (to inherit host ns),
+	// inject a host UserNamespace path, and omit Process section.
+	s := sampleSpec()
+	s.Process = nil
+	s.Linux.Namespaces = []specs.LinuxNamespace{
+		{Type: specs.UserNamespace, Path: "/proc/1/ns/user"},
+		{Type: specs.NetworkNamespace, Path: "/proc/1/ns/net"},
+	}
+	// Archive attempts to shadow /etc/hosts using an anon-volume-shaped source.
+	s.Mounts[0].Source = "/var/lib/containerd/io.containerd.grpc.v1.cri/containers/7cb5e8acf3c8/volumes/aad7845112f5"
+	s.Mounts[0].Options = []string{"rw", "suid", "dev"}
+
+	p := params()
+	p.AnonVolumeDir = "/var/lib/pod-migrate/bundles/pm-mig1/anon-volumes"
+	p.TargetSpec = &specs.Spec{
+		Process: &specs.Process{
+			Capabilities:    &specs.LinuxCapabilities{Bounding: []string{"CAP_NET_BIND_SERVICE"}},
+			User:            specs.User{UID: 1000, GID: 1000},
+			NoNewPrivileges: true,
+		},
+		Linux: &specs.Linux{
+			Seccomp:     &specs.LinuxSeccomp{DefaultAction: specs.ActErrno},
+			MaskedPaths: []string{"/proc/kcore"},
+			Namespaces: []specs.LinuxNamespace{
+				{Type: specs.CgroupNamespace},
+			},
+		},
+		Mounts: []specs.Mount{
+			{Destination: "/etc/hosts", Type: "bind", Source: "/target/etc-hosts", Options: []string{"rbind", "ro"}},
+			{Destination: "/var/run/secrets/kubernetes.io/serviceaccount", Type: "bind", Source: "/target/sa", Options: []string{"rbind", "ro"}},
+			{Destination: "/dev/termination-log", Type: "bind", Source: "/target/term", Options: []string{"rbind", "rw"}},
+			{Destination: "/proc", Type: "proc", Source: "proc"},
+		},
+	}
+
+	if _, err := AdaptSpec(s, p); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Process must be populated from TargetSpec even when archive had nil Process.
+	if s.Process == nil || s.Process.User.UID != 1000 || !s.Process.NoNewPrivileges {
+		t.Fatalf("Process not populated from TargetSpec: %+v", s.Process)
+	}
+
+	// Namespaces must contain private PID/Mount/Cgroup and holder net/ipc/uts, and no UserNamespace.
+	nsMap := map[specs.LinuxNamespaceType]string{}
+	for _, ns := range s.Linux.Namespaces {
+		if ns.Type == specs.UserNamespace {
+			t.Fatalf("archive UserNamespace was not stripped")
+		}
+		nsMap[ns.Type] = ns.Path
+	}
+	if _, ok := nsMap[specs.PIDNamespace]; !ok || nsMap[specs.PIDNamespace] != "" {
+		t.Fatalf("PIDNamespace missing or not private: %v", nsMap)
+	}
+	if _, ok := nsMap[specs.MountNamespace]; !ok || nsMap[specs.MountNamespace] != "" {
+		t.Fatalf("MountNamespace missing or not private: %v", nsMap)
+	}
+
+	// /etc/hosts is a reserved system path and in targetMounts: anonVolRe must NOT shadow /etc/hosts!
+	// Wait: in targetMounts, /etc/hosts has Source "/target/etc-hosts", while archive had anonVolRe source.
+	// Wait — let's check what s.Mounts[0] got!
+	if s.Mounts[0].Destination == "/etc/hosts" && strings.HasPrefix(s.Mounts[0].Source, p.AnonVolumeDir) {
+		t.Fatalf("anonVolRe was allowed to shadow /etc/hosts: %+v", s.Mounts[0])
 	}
 }

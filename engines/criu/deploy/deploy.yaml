@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# WARNING: EXPERIMENTAL — FOR ADDON-OFF TEST CLUSTERS ONLY
+# WARNING: EXPERIMENTAL — FOR ADDON-OFF TEST CLUSTERS ONLY (#129).
+# See https://github.com/gke-labs/pod-migration/issues/129 for the security
+# hardening and follow-up tracker: checkpoint archives in GCS do not yet carry
+# cryptographic provenance (R2) and the hostNetwork agent uses the node's
+# default GCE service account (R5), so anyone who can write to the checkpoint
+# GCS bucket can get root on a restoring node until R2 and R5 land. Never
+# deploy to production or addon-enabled clusters.
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -97,6 +103,9 @@ rules:
   - apiGroups: ["podsnapshot.gke.io"]
     resources: ["podsnapshots/status"]
     verbs: ["get", "update", "patch"]
+  - apiGroups: ["pod-migration.gke.io"]
+    resources: ["podmigrationjobs"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "update", "patch"]
@@ -268,8 +277,6 @@ spec:
               mountPath: /etc/criu
             - name: host-sbin
               mountPath: /usr/local/sbin
-            - name: kubelet-seccomp
-              mountPath: /var/lib/kubelet/seccomp
       volumes:
         - name: pod-migrate
           hostPath:
@@ -298,10 +305,6 @@ spec:
         - name: host-sbin
           hostPath:
             path: /usr/local/sbin
-            type: DirectoryOrCreate
-        - name: kubelet-seccomp
-          hostPath:
-            path: /var/lib/kubelet/seccomp
             type: DirectoryOrCreate
 ---
 apiVersion: v1
@@ -340,8 +343,8 @@ spec:
   duration: 2160h
   renewBefore: 720h
   dnsNames:
-    - pod-migrate-psengine-webhook.pod-migration-system.svc
-    - pod-migrate-psengine-webhook.pod-migration-system.svc.cluster.local
+    - pod-migrate-psengine-webhook.pod-migration-criu-system.svc
+    - pod-migrate-psengine-webhook.pod-migration-criu-system.svc.cluster.local
   issuerRef:
     name: pod-migrate-psengine-selfsigned
     kind: Issuer
@@ -353,7 +356,7 @@ metadata:
   labels:
     pod-migrate.io/component: psengine
   annotations:
-    cert-manager.io/inject-ca-from: pod-migration-system/pod-migrate-psengine-webhook
+    cert-manager.io/inject-ca-from: pod-migration-criu-system/pod-migrate-psengine-webhook
 webhooks:
   - name: restore-inject.psengine.pod-migrate.io
     admissionReviewVersions: ["v1"]

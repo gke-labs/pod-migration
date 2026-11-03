@@ -279,42 +279,129 @@ func TestNodeRestoreCorruptTarDetected(t *testing.T) {
 
 func TestNodeRestoreRefusesUnassignedOrMismatchedPMJ(t *testing.T) {
 	ctx := context.Background()
-	psName := "ps-1"
+	psName := "ps-web-0-deadbeef"
 
-	ps := contract.New(contract.GVKPodSnapshot)
-	ps.SetNamespace("default")
-	ps.SetName(psName)
-	contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
-	unstructured.SetNestedField(ps.Object, "gs://b/ps", "spec", "path")
-	unstructured.SetNestedField(ps.Object, "src-pod", "spec", "sourcePodName")
+	makePS := func() *unstructured.Unstructured {
+		ps := workOrderSnapshot(psName)
+		_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
+		return ps
+	}
 
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "tgt-pod",
-			Annotations: map[string]string{
-				contract.AnnotationPSName: psName,
-				AnnotationInjected:        "true",
-				// Missing PMJ annotation!
+	validPMJ := func(pmj *unstructured.Unstructured) {
+		_ = unstructured.SetNestedField(pmj.Object, "web-0", "spec", "podRef", "name")
+		_ = unstructured.SetNestedField(pmj.Object, "Restoring", "status", "phase")
+		_ = unstructured.SetNestedField(pmj.Object, psName, "status", "snapshotRef")
+		_ = unstructured.SetNestedField(pmj.Object, "tgt-uid", "status", "restoredPodUID")
+		_ = unstructured.SetNestedField(pmj.Object, "web-1", "status", "restoredPodName")
+	}
+
+	cases := []struct {
+		name      string
+		pmjMutate func(pmj *unstructured.Unstructured)
+		noPMJAnno bool
+	}{
+		{
+			name:      "missing assigned-pmj annotation",
+			noPMJAnno: true,
+		},
+		{
+			name: "mismatched spec.podRef.name",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "other-pod", "spec", "podRef", "name")
 			},
 		},
-		Spec:   corev1.PodSpec{NodeName: "node1"},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		{
+			name: "non-Restoring status.phase",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "Succeeded", "status", "phase")
+			},
+		},
+		{
+			name: "empty status.snapshotRef",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "", "status", "snapshotRef")
+			},
+		},
+		{
+			name: "mismatched status.snapshotRef",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "ps-other-snapshot", "status", "snapshotRef")
+			},
+		},
+		{
+			name: "empty status.restoredPodUID",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "", "status", "restoredPodUID")
+			},
+		},
+		{
+			name: "mismatched status.restoredPodUID",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "some-other-uid", "status", "restoredPodUID")
+			},
+		},
+		{
+			name: "mismatched status.restoredPodName",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "some-other-pod", "status", "restoredPodName")
+			},
+		},
+		{
+			name: "legacy spec.podName and status.snapshotName rejected",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(pmj.Object, "web-0", "spec", "podName")
+				_ = unstructured.SetNestedField(pmj.Object, psName, "status", "snapshotName")
+			},
+		},
 	}
 
-	r := &NodeRestoreReconciler{
-		Client:   fake.NewClientBuilder().WithRuntimeObjects(ps, pod).Build(),
-		NodeName: "node1",
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := makePS()
+			pod := replacementPodOnNode(psName)
+			if tc.noPMJAnno {
+				delete(pod.Annotations, contract.AnnotationAssignedPMJ)
+			}
+			pmj := contract.New(contract.GVKPodMigrationJob)
+			pmj.SetNamespace("default")
+			pmj.SetName("test-pmj")
+			if tc.pmjMutate != nil {
+				tc.pmjMutate(pmj)
+			}
 
-	_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "tgt-pod"}})
-	if err != nil {
-		t.Fatalf("Reconcile should return nil (update status on error), got %v", err)
-	}
+			c := fake.NewClientBuilder().
+				WithScheme(testScheme(t)).
+				WithObjects(ps, pod, pmj).
+				Build()
+			ops := &fakeRestoreOps{}
+			r := &NodeRestoreReconciler{
+				Client:   c,
+				NodeName: "node-a",
+				Ops:      ops,
+				Store:    readySnapshotWithArchive(t, newMemStore()),
+				WorkDir:  t.TempDir(),
+			}
 
-	updated := &corev1.Pod{}
-	r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "tgt-pod"}, updated)
-	if updated.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
-		t.Errorf("expected RestoreStatusFailed due to missing PMJ annotation")
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+			if err != nil {
+				t.Fatalf("Reconcile should return nil (update status on error), got %v", err)
+			}
+			if len(ops.restored) != 0 {
+				t.Fatalf("expected 0 restores for %s, got %d", tc.name, len(ops.restored))
+			}
+
+			updated := &corev1.Pod{}
+			_ = r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "web-1"}, updated)
+			if updated.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
+				t.Errorf("expected RestoreStatusFailed for %s, got %q", tc.name, updated.Annotations[contract.AnnotationRestoreStatus])
+			}
+		})
 	}
 }

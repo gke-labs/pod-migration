@@ -91,14 +91,6 @@ func installCRIUBundle() (version string, err error) {
 		return "", fmt.Errorf("install criu wrapper on host PATH: %w", err)
 	}
 
-	// Provide a seccomp profile to safely bypass io_uring on modern datastores.
-	seccompDir := "/var/lib/kubelet/seccomp"
-	_ = os.MkdirAll(seccompDir, 0o755)
-	profile := `{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["io_uring_setup"],"action":"SCMP_ACT_ERRNO","errnoRet":38}]}`
-	if err := os.WriteFile(filepath.Join(seccompDir, "disable-iouring.json"), []byte(profile), 0o644); err != nil {
-		return "", fmt.Errorf("write seccomp profile: %w", err)
-	}
-
 	return strings.TrimSpace(string(v)), nil
 }
 

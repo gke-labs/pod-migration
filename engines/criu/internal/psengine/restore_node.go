@@ -85,6 +85,7 @@ type NodeRestoreReconciler struct {
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pod-migration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 
 func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("pod", req.NamespacedName, "node", r.NodeName)
@@ -156,12 +157,25 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 	if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pmjName}, pmj); err != nil {
 		return fmt.Errorf("resolve assigned PodMigrationJob %s: %w", pmjName, err)
 	}
-	pmjSrcPod, _, _ := unstructured.NestedString(pmj.Object, "spec", "podName")
-	if pmjSrcPod != spec.SourcePod {
-		return fmt.Errorf("PodMigrationJob %s targets sourcePod %q, but PodSnapshot %s is for %q", pmjName, pmjSrcPod, psName, spec.SourcePod)
+	pmjSrcPod, _, _ := unstructured.NestedString(pmj.Object, "spec", "podRef", "name")
+	if pmjSrcPod == "" || pmjSrcPod != spec.SourcePod {
+		return fmt.Errorf("PodMigrationJob %s targets spec.podRef.name %q, but PodSnapshot %s is for %q", pmjName, pmjSrcPod, psName, spec.SourcePod)
 	}
-	if pmjSnap, _, _ := unstructured.NestedString(pmj.Object, "status", "snapshotName"); pmjSnap != "" && pmjSnap != psName {
-		return fmt.Errorf("PodMigrationJob %s targets snapshot %q, but PodSnapshot %s is %q", pmjName, pmjSnap, psName, psName)
+	pmjPhase, _, _ := unstructured.NestedString(pmj.Object, "status", "phase")
+	if pmjPhase != "Restoring" {
+		return fmt.Errorf("PodMigrationJob %s is in phase %q (want Restoring); refusing restore", pmjName, pmjPhase)
+	}
+	pmjSnap, _, _ := unstructured.NestedString(pmj.Object, "status", "snapshotRef")
+	if pmjSnap == "" || pmjSnap != psName {
+		return fmt.Errorf("PodMigrationJob %s has status.snapshotRef %q, but PodSnapshot is %q", pmjName, pmjSnap, psName)
+	}
+	restoredPodUID, _, _ := unstructured.NestedString(pmj.Object, "status", "restoredPodUID")
+	if restoredPodUID == "" || restoredPodUID != string(pod.UID) {
+		return fmt.Errorf("PodMigrationJob %s is bound to restoredPodUID %q, not pod %s (%q)", pmjName, restoredPodUID, pod.Name, pod.UID)
+	}
+	restoredPodName, _, _ := unstructured.NestedString(pmj.Object, "status", "restoredPodName")
+	if restoredPodName == "" || restoredPodName != pod.Name {
+		return fmt.Errorf("PodMigrationJob %s is bound to restoredPodName %q, not pod %s", pmjName, restoredPodName, pod.Name)
 	}
 	if !contract.IsSnapshotReady(ps) {
 		return fmt.Errorf("PodSnapshot %s is not Ready; refusing to restore an unverified archive", psName)
@@ -184,6 +198,9 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 	var mf Manifest
 	if err := json.Unmarshal(mfBytes, &mf); err != nil {
 		return fmt.Errorf("manifest decode: %w", err)
+	}
+	if mf.SpecSHA256 == "" || mf.TarSHA256 == "" {
+		return fmt.Errorf("manifest missing required sha256 digests (specSha256=%q, tarSha256=%q)", mf.SpecSHA256, mf.TarSHA256)
 	}
 	// CPU-family guard: refuse a cross-family restore before touching runc
 	// (the holder then cold-starts — state lost, app correct).
@@ -233,13 +250,17 @@ func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, 
 	}
 	h := sha256.New()
 	small := &boundedBuffer{limit: 4 << 20}
-	n, err := io.Copy(io.MultiWriter(f, h, small), rc)
+	const maxDownloadBytes = 8 << 30
+	n, err := io.Copy(io.MultiWriter(f, h, small), io.LimitReader(rc, maxDownloadBytes+1))
 	cerr := f.Close()
 	if err != nil {
 		return nil, err
 	}
 	if cerr != nil {
 		return nil, cerr
+	}
+	if n > maxDownloadBytes {
+		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxDownloadBytes)
 	}
 	if expectedSHA != "" {
 		if got := hex.EncodeToString(h.Sum(nil)); got != expectedSHA {

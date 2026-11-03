@@ -89,8 +89,11 @@ func newClient(t *testing.T, objs ...client.Object) client.Client {
 	pmj := contract.New(contract.GVKPodMigrationJob)
 	pmj.SetNamespace("default")
 	pmj.SetName("test-pmj")
-	unstructured.SetNestedField(pmj.Object, "web-0", "spec", "podName")
-	unstructured.SetNestedField(pmj.Object, "ps-web-0-deadbeef", "status", "snapshotName")
+	_ = unstructured.SetNestedField(pmj.Object, "web-0", "spec", "podRef", "name")
+	_ = unstructured.SetNestedField(pmj.Object, "Restoring", "status", "phase")
+	_ = unstructured.SetNestedField(pmj.Object, "ps-web-0-deadbeef", "status", "snapshotRef")
+	_ = unstructured.SetNestedField(pmj.Object, "tgt-uid", "status", "restoredPodUID")
+	_ = unstructured.SetNestedField(pmj.Object, "web-1", "status", "restoredPodName")
 	objs = append(objs, pmj)
 	return fake.NewClientBuilder().
 		WithScheme(testScheme(t)).

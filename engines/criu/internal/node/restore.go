@@ -51,7 +51,13 @@ type restorer struct {
 	cclient *containerd.Client
 	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p).
 	// Swappable in tests.
-	execHost func(ctx context.Context, env []string, name string, args ...string) (string, error)
+	execHost         func(ctx context.Context, env []string, name string, args ...string) (string, error)
+	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
+	findContainerFn  func(ctx context.Context, podNS, podName, containerName string) (*containerRef, error)
+	prepareRootfsFn  func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error)
+	readProcCgroupFn func(pid int) ([]byte, error)
+	pmRootDir        string
+	criuConfDirPath  string
 }
 
 func newRestorer(c *containerd.Client) *restorer {
@@ -134,13 +140,17 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, containerN
 			continue
 		}
 		ref := &containerRef{ID: c.ID()}
-		if spec, err := c.Spec(ctx); err == nil {
-			ref.Spec = spec
-			ref.SandboxID = spec.Annotations["io.kubernetes.cri.sandbox-id"]
+		spec, err := c.Spec(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("containerd spec for %s: %w", c.ID(), err)
 		}
-		if info, err := c.Info(ctx); err == nil {
-			ref.ImageName = info.Image
+		ref.Spec = spec
+		ref.SandboxID = spec.Annotations["io.kubernetes.cri.sandbox-id"]
+		info, err := c.Info(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("containerd info for %s: %w", c.ID(), err)
 		}
+		ref.ImageName = info.Image
 		if task, err := c.Task(ctx, nil); err == nil {
 			ref.Pid = int(task.Pid())
 		}
@@ -241,22 +251,28 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	if in.SrcSpec == nil {
 		return out, fmt.Errorf("no source OCI spec in the bundle")
 	}
-	srcSandboxID := in.SrcSpec.Annotations["io.kubernetes.cri.sandbox-id"]
 	// The target pod's app container runs the seeded holder binary and keeps
 	// the source container's name. The kubelet may report the pod Running a
 	// beat before containerd's task pid is queryable — wait for it briefly
 	// rather than failing the restore on a startup race.
 	var holder *containerRef
 	deadline := time.Now().Add(30 * time.Second)
+	findFn := r.findContainer
+	if r.findContainerFn != nil {
+		findFn = r.findContainerFn
+	}
 	for {
 		var err error
-		holder, err = r.findContainer(ctx, in.PodNamespace, in.TargetPod, in.ContainerName)
-		if err == nil && holder.Pid != 0 {
+		holder, err = findFn(ctx, in.PodNamespace, in.TargetPod, in.ContainerName)
+		if err == nil && holder.Pid != 0 && holder.Spec != nil && holder.ImageName != "" {
 			break
 		}
 		if time.Now().After(deadline) {
 			if err != nil {
 				return out, fmt.Errorf("target holder container not found within 30s: %w", err)
+			}
+			if holder.Spec == nil || holder.ImageName == "" {
+				return out, fmt.Errorf("target holder container metadata incomplete (spec=%v, image=%q)", holder.Spec != nil, holder.ImageName)
 			}
 			return out, fmt.Errorf("target holder task pid not up within 30s — sandbox slow to start")
 		}
@@ -264,7 +280,11 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	}
 
 	// Pod cgroup slice of the target, from the holder's own cgroup.
-	procCg, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", holder.Pid))
+	readCg := func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)) }
+	if r.readProcCgroupFn != nil {
+		readCg = r.readProcCgroupFn
+	}
+	procCg, err := readCg(holder.Pid)
 	if err != nil {
 		return out, fmt.Errorf("read holder cgroup: %w", err)
 	}
@@ -273,8 +293,12 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		return out, err
 	}
 
+	rootDir := pmRoot
+	if r.pmRootDir != "" {
+		rootDir = r.pmRootDir
+	}
 	id := "pm-" + in.MigrationName
-	bundleDir := filepath.Join(pmRoot, "bundles", id)
+	bundleDir := filepath.Join(rootDir, "bundles", id)
 
 	// Clean up any leftover runc container from a previous failed restore
 	// attempt.
@@ -287,33 +311,29 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		return out, err
 	}
 
-	imgName := holder.ImageName
-	if imgName == "" {
-		imgName = in.ImageName
-	}
-	rootfs, err := r.prepareRootfs(ctx, imgName, id, bundleDir, filepath.Join(in.CheckpointDir, "rootfs-diff.tar"))
-	if err != nil {
-		return out, err
-	}
-
+	rootfsPath := filepath.Join(bundleDir, "rootfs")
+	anonVolDir := filepath.Join(bundleDir, "anon-volumes")
 	// The projected SA-token volume dir carries a per-pod random suffix
 	// (kube-api-access-XXXXX) that survives the UID swap — map source name to
 	// the target's actual dir (globbed from the target pod's volumes).
 	rewrites := projectedVolumeRewrites(in.SrcSpec, in.TargetPodUID)
+	adaptParams, imgName, err := buildAdaptParams(in, holder, rootfsPath, podSlice, id, anonVolDir, rewrites)
+	if err != nil {
+		return out, err
+	}
 
-	anonVolDir := filepath.Join(bundleDir, "anon-volumes")
+	prepFn := r.prepareRootfs
+	if r.prepareRootfsFn != nil {
+		prepFn = r.prepareRootfsFn
+	}
+	rootfs, err := prepFn(ctx, imgName, id, bundleDir, filepath.Join(in.CheckpointDir, "rootfs-diff.tar"))
+	if err != nil {
+		return out, err
+	}
+	adaptParams.RootfsPath = rootfs
+
 	spec := *in.SrcSpec // shallow copy; AdaptSpec rewrites in place
-	notes, err := AdaptSpec(&spec, AdaptParams{
-		RootfsPath:      rootfs,
-		HolderPid:       holder.Pid,
-		CgroupsPath:     podSlice + "/" + id,
-		SourcePodUID:    in.SourcePodUID,
-		TargetPodUID:    in.TargetPodUID,
-		SourceSandboxID: srcSandboxID,
-		TargetSandboxID: holder.SandboxID,
-		ExtraRewrites:   rewrites,
-		AnonVolumeDir:   anonVolDir,
-	})
+	notes, err := AdaptSpec(&spec, adaptParams)
 	out.Notes = append(out.Notes, notes...)
 	if err != nil {
 		return out, err
@@ -337,7 +357,11 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 
 	// CRIU options (file-validation, tcp-close, skip-in-flight) come from
 	// /etc/criu/runc.conf, written once at bootstrap.
-	if b, err := os.ReadFile(filepath.Join(criuConfDir, "runc.conf")); err != nil || !strings.Contains(string(b), "file-validation") {
+	confDir := criuConfDir
+	if r.criuConfDirPath != "" {
+		confDir = r.criuConfDirPath
+	}
+	if b, err := os.ReadFile(filepath.Join(confDir, "runc.conf")); err != nil || !strings.Contains(string(b), "file-validation") {
 		return out, fmt.Errorf("criu runc.conf missing or lacks file-validation (bootstrap owns it): %v", err)
 	}
 	out.FileValidationUsed = true
@@ -371,8 +395,12 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	var lastOut string
 	var lastErr error
 	logPath := filepath.Join(bundleDir, "runc-stdout.log")
+	execRest := r.execRestore
+	if r.execRestoreFn != nil {
+		execRest = r.execRestoreFn
+	}
 	for vi, args := range variants {
-		lastOut, lastErr = r.execRestore(ctx, env, logPath, "runc", args...)
+		lastOut, lastErr = execRest(ctx, env, logPath, "runc", args...)
 		if lastErr == nil {
 			break
 		}
@@ -420,6 +448,34 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		}
 	}
 	return out, nil
+}
+
+// buildAdaptParams validates the destination holder container reference and
+// constructs AdaptParams anchored to the destination container's OCI spec and
+// image name (never falling back to untrusted archive metadata).
+func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSlice, id, anonVolDir string, rewrites [][2]string) (AdaptParams, string, error) {
+	if in.SrcSpec == nil {
+		return AdaptParams{}, "", fmt.Errorf("no source OCI spec in the bundle")
+	}
+	if holder == nil || holder.Spec == nil {
+		return AdaptParams{}, "", fmt.Errorf("target holder container has no OCI spec; refusing unhardened restore")
+	}
+	if holder.ImageName == "" {
+		return AdaptParams{}, "", fmt.Errorf("target holder container has no image name; refusing to fall back to archive image")
+	}
+	srcSandboxID := in.SrcSpec.Annotations["io.kubernetes.cri.sandbox-id"]
+	return AdaptParams{
+		RootfsPath:      rootfsPath,
+		HolderPid:       holder.Pid,
+		CgroupsPath:     podSlice + "/" + id,
+		SourcePodUID:    in.SourcePodUID,
+		TargetPodUID:    in.TargetPodUID,
+		SourceSandboxID: srcSandboxID,
+		TargetSandboxID: holder.SandboxID,
+		ExtraRewrites:   rewrites,
+		AnonVolumeDir:   anonVolDir,
+		TargetSpec:      holder.Spec,
+	}, holder.ImageName, nil
 }
 
 // cleanup tears down restore artifacts. keepContainer=true leaves the restored

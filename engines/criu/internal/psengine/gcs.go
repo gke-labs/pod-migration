@@ -55,8 +55,10 @@ type ObjectStore interface {
 	Delete(ctx context.Context, bucket, object string) error
 }
 
-// GCSStore talks to the GCS JSON API using Workload Identity via the GCE
-// metadata server. Base URLs are injectable for tests.
+// GCSStore talks to the GCS JSON API using the GCE metadata server's default
+// service account token (note: because the node agent runs with hostNetwork,
+// GKE Workload Identity does not intercept metadata requests; dedicated
+// credentials are tracked in #129 R5). Base URLs are injectable for tests.
 type GCSStore struct {
 	HTTP       *http.Client
 	UploadBase string // default https://storage.googleapis.com/upload/storage/v1
