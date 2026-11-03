@@ -8,6 +8,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -176,6 +177,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 						"namespace", config.Namespace,
 						"inFlightCount", len(inFlight),
 						"jobs", inFlight)
+					before := config.Status.DeepCopy()
 					changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
 						Type:               "Ready",
 						Status:             metav1.ConditionFalse,
@@ -184,7 +186,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 						ObservedGeneration: config.Generation,
 					})
 					if changed {
-						if err := r.Status().Update(ctx, config); err != nil {
+						if err := r.patchStatus(ctx, config, before); err != nil {
 							logger.Error(err, "Failed to update PodMigration status during deletion deferral")
 							return ctrl.Result{}, err
 						}
@@ -260,6 +262,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		msg := fmt.Sprintf("Only one PodMigration resource is allowed per namespace; active configuration is %q", active.Name)
 		logger.Info("Skipping reconciliation for duplicate PodMigration in namespace",
 			"name", config.Name, "namespace", config.Namespace, "active", active.Name)
+		before := config.Status.DeepCopy()
 		changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -271,7 +274,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			if r.Recorder != nil {
 				r.Recorder.Event(config, corev1.EventTypeWarning, ReasonDuplicatePodMigrationInNamespace, msg)
 			}
-			if err := r.Status().Update(ctx, config); err != nil {
+			if err := r.patchStatus(ctx, config, before); err != nil {
 				logger.Error(err, "Failed to update status on duplicate PodMigration")
 				return ctrl.Result{}, err
 			}
@@ -301,6 +304,8 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		logger.Error(err, "No snapshot engine registry to render the namespace resources")
 		return ctrl.Result{}, err
 	}
+	// The status changes below are written with patchStatus, against this copy.
+	before := config.Status.DeepCopy()
 	setEngineRoutesCondition(config, registry)
 	engines := registry.EnginesFor(config)
 	if len(engines) == 0 {
@@ -325,7 +330,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 					Message:            err.Error(),
 					ObservedGeneration: config.Generation,
 				})
-				if updateErr := r.Status().Update(ctx, config); updateErr != nil {
+				if updateErr := r.patchStatus(ctx, config, before); updateErr != nil {
 					logger.Error(updateErr, "Failed to update status on invalid storage location")
 				}
 			}
@@ -349,13 +354,34 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		Message:            "Storage config and policy synced successfully",
 		ObservedGeneration: config.Generation,
 	})
-	err = r.Status().Update(ctx, config)
-	if err != nil {
+	if err := r.patchStatus(ctx, config, before); err != nil {
 		logger.Error(err, "Failed to update PodMigration status")
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// patchStatus writes the changes that this reconcile made to config's status
+// since before, as a JSON merge patch. The patch carries no resourceVersion, so
+// a config read from a stale cache, one that hasn't seen the previous
+// reconcile's status write yet, doesn't make the write fail with a conflict
+// (#142). Nothing is written when the status is unchanged.
+//
+// A merge patch replaces status.conditions as a whole (custom resources don't
+// support strategic merge patch), so a write computed from a stale copy can
+// overwrite newer conditions and restamp a LastTransitionTime. That's safe
+// only because this reconciler is the sole writer of PodMigration status, and
+// the write's own watch event reconciles the PodMigration again from a newer
+// copy. A second writer would need server-side apply or
+// client.MergeFromWithOptimisticLock.
+func (r *PodMigrationReconciler) patchStatus(ctx context.Context, config *pmv1alpha1.PodMigration, before *pmv1alpha1.PodMigrationStatus) error {
+	if equality.Semantic.DeepEqual(before, &config.Status) {
+		return nil
+	}
+	orig := config.DeepCopy()
+	orig.Status = *before
+	return r.Status().Patch(ctx, config, client.MergeFrom(orig))
 }
 
 // getPSSCName names a PodMigration's cluster-scoped PodSnapshotStorageConfig.
