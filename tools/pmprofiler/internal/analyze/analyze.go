@@ -1060,7 +1060,7 @@ func fmtTime(t time.Time) string {
 }
 
 // ParseInvariantViolationsFromPrometheus extracts per-invariant counter values
-// for `pod_migration_invariant_violations_total{invariant="I1..I9"}` from a
+// for `pod_migration_invariant_violations_total{invariant="I<n>"}` from a
 // Prometheus text exposition payload.
 func ParseInvariantViolationsFromPrometheus(body string) map[string]float64 {
 	out := map[string]float64{}
@@ -1121,8 +1121,8 @@ func fetchMetricsURL(url string) (string, error) {
 	return string(raw), nil
 }
 
-// extractInvariantIDFromMessage extracts "I1".."I9" from controller event
-// messages formatted like "[I1:AtMostOnceRestore] ...".
+// extractInvariantIDFromMessage extracts the invariant ID (for example "I10")
+// from controller event messages formatted like "[I1:AtMostOnceRestore] ...".
 func extractInvariantIDFromMessage(msg string) string {
 	if strings.HasPrefix(msg, "[") {
 		if end := strings.IndexAny(msg, ":]"); end > 1 {

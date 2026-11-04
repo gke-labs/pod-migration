@@ -11,7 +11,7 @@ Live Pod Migration (`pod-migration`) is a Kubernetes controller and pluggable sn
 Key capabilities:
 - **Stateful live migration:** Coordinates pod freezing/checkpointing, storage detachment/reattachment, network endpoint fencing, and warm memory restore into replacement pods.
 - **Pluggable snapshot engines:** Supports multiple runtime backends via a unified snapshot engine contract (`docs/design/engine-contract.md`), including `GKEPodSnapshots` for gVisor sandboxed containers.
-- **Formal safety invariants (`I1`–`I11`):** Continuous in-memory runtime verification (`docs/invariants.md`) guarantees safety properties such as at-most-once restore, no silent cold-start fallback, gate liveness, and source fencing.
+- **Formal safety invariants (`I1`–`I12`):** Continuous in-memory runtime verification (`docs/invariants.md`) guarantees safety properties such as at-most-once restore, no silent cold-start fallback, gate liveness, and source fencing.
 
 ---
 
@@ -25,8 +25,8 @@ Key capabilities:
   - `controller/internal/engine/`: Pluggable snapshot engine interface (`Engine`) and registry (`Registry`).
   - `controller/internal/snapshot/`: Snapshot provider implementations (e.g., GKE Pod Snapshots).
   - `controller/internal/util/`: Shared controller constants, annotations, and helpers.
-  - `controller/internal/invariants/`: Stateless runtime invariant verification engine and rules (`I1`–`I11`).
-- `docs/invariants.md`: Authoritative specification of the runtime safety invariants (`I1`–`I11`).
+  - `controller/internal/invariants/`: Stateless runtime invariant verification engine and rules (`I1`–`I12`).
+- `docs/invariants.md`: Authoritative specification of the runtime safety invariants (`I1`–`I12`).
 - `docs/design/engine-contract.md`: Contract specification defining pluggable snapshot engine requirements (`C1`–`C11`).
 - `verification-suite/`: Automated verification suite:
   - `verification-suite/verify_invariant_governance.sh`: Tier-0 (T0) Two-Lane CODEOWNERS governance gate.
@@ -67,7 +67,7 @@ Before opening a PR or pushing changes, verify that your branch complies with in
 
 ---
 
-## 4. Two-Lane CODEOWNERS Invariant Governance (`I1`–`I11`)
+## 4. Two-Lane CODEOWNERS Invariant Governance (`I1`–`I12`)
 
 The runtime safety invariants defined in `docs/invariants.md` and implemented in `controller/internal/invariants/` protect against split-brain states, silent cold-start fallbacks, orphan resources, and controller deadlocks. Changes to invariants are strictly governed by `.github/CODEOWNERS` and `./verification-suite/verify_invariant_governance.sh`:
 
@@ -112,7 +112,7 @@ Before creating or requesting review on a pull request, run a two-pass self-revi
    - Split-brain or dual-writer windows (source pod unfenced while replacement runs, or pre-checkpoint fence leaks).
    - Silent cold-start masquerading as a warm checkpoint restore (`I2`).
    - RBAC, container capability, or OCI specification privilege escalations in admission webhooks.
-   - Weakened or bypassed `I1`–`I11` invariants or missing negative test cases.
+   - Weakened or bypassed `I1`–`I12` invariants or missing negative test cases.
 2. **Docs-Drift Pass (`review-docs-drift`):**
    Follow `.agents/skills/review-docs-drift/SKILL.md` to ensure CLI flags, annotations, CRD fields, and engine contracts match canonical documentation (`README.md`, `docs/invariants.md`, `docs/design/engine-contract.md`).
 

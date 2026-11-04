@@ -27,7 +27,7 @@ Inspect every modified code path against its canonical documentation target:
 | **CLI Flags & Startup Config** | `controller/cmd/main.go` | `README.md` (CLI flag reference, execution modes), `docs/invariants.md` (`--invariant-mode`) |
 | **CRD Types & Status Fields** | `controller/api/v1alpha1/*_types.go` | `README.md` (CRD samples, architecture), `docs/design/` |
 | **Annotations, Labels & Gates** | `controller/internal/util/`, `controller/internal/webhook/` | `README.md` (Pod annotations table), `docs/invariants.md` (gate names, fenced labels, bypass annotations) |
-| **Safety Invariants (`I1`–`I11`)** | `controller/internal/invariants/` | `docs/invariants.md` (Authoritative invariant descriptions, triggers, grace periods, debouncing) |
+| **Safety Invariants (`I1`–`I12`)** | `controller/internal/invariants/` | `docs/invariants.md` (Authoritative invariant descriptions, triggers, grace periods, debouncing) |
 | **Pluggable Engine Contract** | `controller/internal/engine/` | `docs/design/engine-contract.md` (`C1`–`C11` clauses) |
 | **Operational & Deploy Scripts** | `patches/setup-storage.sh`, `controller/deploy.yaml` | `README.md` (Installation and prerequisite sections) |
 
@@ -44,11 +44,11 @@ Inspect every modified code path against its canonical documentation target:
 - If an annotation was added, renamed, or deprecated, is the table of supported annotations in `README.md` updated?
 - Are semantics like bypass markers (`podsnapshot.gke.io/ps-name: ""`) or fenced markers (`pod-migration.gke.io/fenced: "true"`) clearly explained in both `README.md` and `docs/invariants.md`?
 
-### 3. Invariants (`I1`–`I11`)
+### 3. Invariants (`I1`–`I12`)
 - If any invariant rule in `controller/internal/invariants/` was updated (Lane 2):
   - Is the corresponding section in `docs/invariants.md` updated?
   - Do timing constants (e.g., grace windows, debounce sample counts) in `docs/invariants.md` match the implementation in Go code?
-  - Does the header and table of contents reflect the current invariant range (`I1`–`I11`)?
+  - Does the header and table of contents reflect the current invariant range (`I1`–`I12` today; `DefaultRules` in `controller/internal/invariants/rules.go` is the source of truth)?
 
 ### 4. Pluggable Snapshot Engine Contract (`C1`–`C11`)
 - If `controller/internal/engine/` changed its lifecycle hooks or interfaces:
