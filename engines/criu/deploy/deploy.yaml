@@ -103,7 +103,7 @@ rules:
   - apiGroups: ["podsnapshot.gke.io"]
     resources: ["podsnapshots/status"]
     verbs: ["get", "update", "patch"]
-  - apiGroups: ["pod-migration.gke.io"]
+  - apiGroups: ["podmigration.gke.io"]
     resources: ["podmigrationjobs"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]

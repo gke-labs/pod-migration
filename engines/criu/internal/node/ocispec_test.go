@@ -364,7 +364,10 @@ func TestRestoreEndToEndEnforcesTargetSpec(t *testing.T) {
 	r := &restorer{
 		pmRootDir:       tmpDir,
 		criuConfDirPath: confDir,
-		findContainerFn: func(ctx context.Context, podNS, podName, containerName string) (*containerRef, error) {
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			if podUID != "tgt-uid" {
+				t.Fatalf("findContainerFn called with podUID=%q, want tgt-uid", podUID)
+			}
 			return &containerRef{
 				ID:        "holder-ctr-1",
 				SandboxID: "tgtsandbox222",
@@ -591,5 +594,24 @@ func TestAdaptSpecEnforcesCanonicalNamespacesAndTargetSecurityPosture(t *testing
 	// Wait — let's check what s.Mounts[0] got!
 	if s.Mounts[0].Destination == "/etc/hosts" && strings.HasPrefix(s.Mounts[0].Source, p.AnonVolumeDir) {
 		t.Fatalf("anonVolRe was allowed to shadow /etc/hosts: %+v", s.Mounts[0])
+	}
+}
+
+func TestAdaptSpecDropsInjectedHolderMountsForSecondHopMigration(t *testing.T) {
+	// A pod that was once a gated replacement pod carries /pmhold and /pminfo
+	// mounts injected by the webhook. When it is migrated again, its archive
+	// spec includes those mounts; AdaptSpec must drop them rather than failing.
+	s := sampleSpec()
+	s.Mounts = append(s.Mounts,
+		specs.Mount{Destination: "/pmhold", Type: "bind", Source: "/var/lib/kubelet/pods/src-uid/volumes/kubernetes.io~empty-dir/pmhold"},
+		specs.Mount{Destination: "/pminfo", Type: "bind", Source: "/var/lib/kubelet/pods/src-uid/volumes/kubernetes.io~downward-api/pminfo"},
+	)
+	if _, err := AdaptSpec(s, params()); err != nil {
+		t.Fatalf("expected second-hop restore to drop /pmhold and /pminfo, got error: %v", err)
+	}
+	for _, m := range s.Mounts {
+		if m.Destination == "/pmhold" || m.Destination == "/pminfo" {
+			t.Errorf("expected %s mount to be dropped from adapted spec, still present: %+v", m.Destination, m)
+		}
 	}
 }

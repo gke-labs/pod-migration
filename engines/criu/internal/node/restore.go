@@ -53,7 +53,7 @@ type restorer struct {
 	// Swappable in tests.
 	execHost         func(ctx context.Context, env []string, name string, args ...string) (string, error)
 	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
-	findContainerFn  func(ctx context.Context, podNS, podName, containerName string) (*containerRef, error)
+	findContainerFn  func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error)
 	prepareRootfsFn  func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error)
 	readProcCgroupFn func(pid int) ([]byte, error)
 	pmRootDir        string
@@ -122,12 +122,16 @@ type containerRef struct {
 }
 
 // findContainer locates the CRI container for pod/container by containerd
-// labels (namespace k8s.io is set on the client).
-func (r *restorer) findContainer(ctx context.Context, podNS, podName, containerName string) (*containerRef, error) {
+// labels (namespace k8s.io is set on the client). When podUID is non-empty,
+// containers from earlier pods with the same name are skipped. If multiple
+// containers match (e.g. a stopped attempt with Pid == 0 alongside a running
+// one), prefers a container with a live task Pid.
+func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
 	cs, err := r.cclient.Containers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd list: %w", err)
 	}
+	var fallback *containerRef
 	for _, c := range cs {
 		labels, err := c.Labels(ctx)
 		if err != nil {
@@ -137,6 +141,9 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, containerN
 			labels["io.kubernetes.pod.name"] != podName ||
 			labels["io.kubernetes.container.name"] != containerName ||
 			labels["io.cri-containerd.kind"] != "container" {
+			continue
+		}
+		if podUID != "" && labels["io.kubernetes.pod.uid"] != podUID {
 			continue
 		}
 		ref := &containerRef{ID: c.ID()}
@@ -154,9 +161,15 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, containerN
 		if task, err := c.Task(ctx, nil); err == nil {
 			ref.Pid = int(task.Pid())
 		}
-		return ref, nil
+		if ref.Pid != 0 && ref.Spec != nil && ref.ImageName != "" {
+			return ref, nil
+		}
+		fallback = ref
 	}
-	return nil, fmt.Errorf("container %s/%s/%s not found in containerd", podNS, podName, containerName)
+	if fallback != nil {
+		return fallback, nil
+	}
+	return nil, fmt.Errorf("container %s/%s/%s (uid=%s) not found in containerd", podNS, podName, containerName, podUID)
 }
 
 // prepareRootfs makes a fresh writable snapshot of the app image and applies
@@ -263,7 +276,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	}
 	for {
 		var err error
-		holder, err = findFn(ctx, in.PodNamespace, in.TargetPod, in.ContainerName)
+		holder, err = findFn(ctx, in.PodNamespace, in.TargetPod, in.TargetPodUID, in.ContainerName)
 		if err == nil && holder.Pid != 0 && holder.Spec != nil && holder.ImageName != "" {
 			break
 		}

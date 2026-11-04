@@ -28,10 +28,12 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	k8syaml "sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
@@ -312,10 +314,24 @@ func TestNodeRestoreRefusesUnassignedOrMismatchedPMJ(t *testing.T) {
 			},
 		},
 		{
-			name: "non-Restoring status.phase",
+			name: "disallowed status.phase Failed",
 			pmjMutate: func(pmj *unstructured.Unstructured) {
 				validPMJ(pmj)
-				_ = unstructured.SetNestedField(pmj.Object, "Succeeded", "status", "phase")
+				_ = unstructured.SetNestedField(pmj.Object, "Failed", "status", "phase")
+			},
+		},
+		{
+			name: "disallowed status.phase SucceededWithoutRestore",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "SucceededWithoutRestore", "status", "phase")
+			},
+		},
+		{
+			name: "disallowed status.phase Evicting",
+			pmjMutate: func(pmj *unstructured.Unstructured) {
+				validPMJ(pmj)
+				_ = unstructured.SetNestedField(pmj.Object, "Evicting", "status", "phase")
 			},
 		},
 		{
@@ -403,5 +419,141 @@ func TestNodeRestoreRefusesUnassignedOrMismatchedPMJ(t *testing.T) {
 				t.Errorf("expected RestoreStatusFailed for %s, got %q", tc.name, updated.Annotations[contract.AnnotationRestoreStatus])
 			}
 		})
+	}
+}
+
+func TestNodeRestoreAcceptsSucceededPhaseWhenBoundToThisPod(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	if err := contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	c := newClient(t, ps, pod)
+
+	// Simulate the no-readiness-probe race: the PMJ controller already marked
+	// the PMJ Succeeded on the same pod update while bound to this pod's UID.
+	pmj := contract.New(contract.GVKPodMigrationJob)
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-pmj"}, pmj); err != nil {
+		t.Fatal(err)
+	}
+	_ = unstructured.SetNestedField(pmj.Object, "Succeeded", "status", "phase")
+	if err := c.Status().Update(context.Background(), pmj); err != nil {
+		// unstructured status update fallback
+		_ = c.Update(context.Background(), pmj)
+	}
+
+	ops := &fakeRestoreOps{}
+	r := &NodeRestoreReconciler{
+		Client:   c,
+		NodeName: "node-a",
+		Ops:      ops,
+		Store:    readySnapshotWithArchive(t, newMemStore()),
+		WorkDir:  t.TempDir(),
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops.restored) != 1 {
+		t.Fatalf("expected 1 restore when PMJ is Succeeded and bound to this pod UID, got %d", len(ops.restored))
+	}
+	got := &corev1.Pod{}
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
+	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusRestored {
+		t.Fatalf("restore status = %q, want %q", got.Annotations[contract.AnnotationRestoreStatus], contract.RestoreStatusRestored)
+	}
+}
+
+func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deploy.yaml"))
+	if err != nil {
+		t.Fatalf("read deploy.yaml: %v", err)
+	}
+	if strings.Contains(string(raw), "pod-migration.gke.io") && strings.Contains(string(raw), `apiGroups: ["pod-migration.gke.io"]`) {
+		t.Fatalf("deploy.yaml uses hyphenated apiGroup pod-migration.gke.io; real group is %q", contract.GVKPodMigrationJob.Group)
+	}
+
+	var agentRole, controllerRole *rbacv1.ClusterRole
+	for _, doc := range strings.Split(string(raw), "\n---") {
+		doc = strings.TrimSpace(doc)
+		if doc == "" || !strings.Contains(doc, "kind: ClusterRole\n") {
+			continue
+		}
+		var cr rbacv1.ClusterRole
+		if err := k8syaml.Unmarshal([]byte(doc), &cr); err != nil {
+			t.Fatalf("unmarshal ClusterRole from deploy.yaml: %v", err)
+		}
+		if cr.Kind != "ClusterRole" {
+			continue
+		}
+		switch cr.Name {
+		case "pod-migrate-psengine-agent":
+			cp := cr
+			agentRole = &cp
+		case "pod-migrate-psengine-controller":
+			cp := cr
+			controllerRole = &cp
+		}
+	}
+	if agentRole == nil {
+		t.Fatal("ClusterRole pod-migrate-psengine-agent not found in deploy.yaml")
+	}
+	if controllerRole == nil {
+		t.Fatal("ClusterRole pod-migrate-psengine-controller not found in deploy.yaml")
+	}
+
+	hasRule := func(cr *rbacv1.ClusterRole, group, resource string, wantVerbs ...string) bool {
+		for _, rule := range cr.Rules {
+			groupMatch := false
+			for _, g := range rule.APIGroups {
+				if g == group {
+					groupMatch = true
+					break
+				}
+			}
+			resMatch := false
+			for _, r := range rule.Resources {
+				if r == resource {
+					resMatch = true
+					break
+				}
+			}
+			if !groupMatch || !resMatch {
+				continue
+			}
+			verbSet := map[string]bool{}
+			for _, v := range rule.Verbs {
+				verbSet[v] = true
+			}
+			allVerbs := true
+			for _, wv := range wantVerbs {
+				if !verbSet[wv] {
+					allVerbs = false
+					break
+				}
+			}
+			if allVerbs {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasRule(agentRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "get", "list", "watch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/list/watch on %s/podmigrationjobs", contract.GVKPodMigrationJob.Group)
+	}
+	if !hasRule(agentRole, contract.GVKPodSnapshot.Group, "podsnapshots", "get", "list", "watch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/list/watch on %s/podsnapshots", contract.GVKPodSnapshot.Group)
+	}
+	if !hasRule(controllerRole, contract.GVKStorageConfig.Group, "podsnapshotstorageconfigs", "get", "list", "watch") {
+		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list/watch on %s/podsnapshotstorageconfigs", contract.GVKStorageConfig.Group)
+	}
+
+	rnBytes, err := os.ReadFile("restore_node.go")
+	if err != nil {
+		t.Fatalf("read restore_node.go: %v", err)
+	}
+	wantMarker := "+kubebuilder:rbac:groups=" + contract.GVKPodMigrationJob.Group + ",resources=podmigrationjobs"
+	if !strings.Contains(string(rnBytes), wantMarker) {
+		t.Fatalf("restore_node.go missing %q marker", wantMarker)
 	}
 }

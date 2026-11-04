@@ -51,7 +51,7 @@ func (r *Node) PSEngineCheckpoint(ctx context.Context, ns, pod, container string
 // image name — they travel with the archive (the restore node has no source
 // container to inspect).
 func (r *Node) PSEngineSourceInfo(ctx context.Context, ns, pod, container string) ([]byte, string, error) {
-	ref, err := r.Restorer.findContainer(ctx, ns, pod, container)
+	ref, err := r.Restorer.findContainer(ctx, ns, pod, "", container)
 	if err != nil {
 		return nil, "", err
 	}
@@ -69,7 +69,7 @@ func (r *Node) PSEngineSourceInfo(ctx context.Context, ns, pod, container string
 // upload: SIGKILL the container's task via containerd (the kubelet API
 // checkpoints without stopping).
 func (r *Node) PSEngineStopContainer(ctx context.Context, ns, pod, container string) error {
-	ref, err := r.Restorer.findContainer(ctx, ns, pod, container)
+	ref, err := r.Restorer.findContainer(ctx, ns, pod, "", container)
 	if err != nil {
 		return err
 	}

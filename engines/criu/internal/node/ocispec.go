@@ -171,6 +171,11 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	spec.Linux.Sysctl = p.TargetSpec.Linux.Sysctl
 	spec.Linux.RootfsPropagation = p.TargetSpec.Linux.RootfsPropagation
 	spec.Linux.MountLabel = p.TargetSpec.Linux.MountLabel
+	spec.Linux.UIDMappings = p.TargetSpec.Linux.UIDMappings
+	spec.Linux.GIDMappings = p.TargetSpec.Linux.GIDMappings
+	spec.Linux.Personality = p.TargetSpec.Linux.Personality
+	spec.Linux.IntelRdt = p.TargetSpec.Linux.IntelRdt
+	spec.Linux.TimeOffsets = p.TargetSpec.Linux.TimeOffsets
 
 	targetMounts := make(map[string]specs.Mount)
 	for _, tm := range p.TargetSpec.Mounts {
@@ -186,9 +191,16 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	}
 
 	// Remap external bind-mount sources source-pod -> target-pod.
+	// Drop /pmhold and /pminfo from the archive spec so a pod that was once a
+	// migration replacement can be checkpointed and migrated again.
+	keptMounts := make([]specs.Mount, 0, len(spec.Mounts))
 	for i := range spec.Mounts {
-		m := &spec.Mounts[i]
+		m := spec.Mounts[i]
 		m.Destination = path.Clean(m.Destination)
+		if m.Destination == "/pmhold" || m.Destination == "/pminfo" {
+			notes = append(notes, fmt.Sprintf("dropped holder mount %s from archive spec", m.Destination))
+			continue
+		}
 		orig := m.Source
 		if p.SourcePodUID != "" && p.TargetPodUID != "" {
 			m.Source = strings.ReplaceAll(m.Source, p.SourcePodUID, p.TargetPodUID)
@@ -220,10 +232,14 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 				}
 				m.Type = "bind"
 				m.Options = sanitizeAnonMountOptions(tgtMount.Options)
+				m.UIDMappings = nil
+				m.GIDMappings = nil
 			} else {
 				m.Source = tgtMount.Source
 				m.Type = tgtMount.Type
 				m.Options = tgtMount.Options
+				m.UIDMappings = tgtMount.UIDMappings
+				m.GIDMappings = tgtMount.GIDMappings
 			}
 		} else if p.AnonVolumeDir != "" && m.Type == "bind" && anonVolRe.MatchString(m.Source) && isSafeAnonDestination(m.Destination) {
 			mm := anonVolRe.FindStringSubmatch(m.Source)
@@ -236,6 +252,8 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 				return notes, fmt.Errorf("anonymous volume path escaped %s: %s", cleanAnonDir, m.Source)
 			}
 			m.Options = sanitizeAnonMountOptions(m.Options)
+			m.UIDMappings = nil
+			m.GIDMappings = nil
 		} else {
 			return notes, fmt.Errorf("mount %s (source %s) is not permitted by destination container spec", m.Destination, m.Source)
 		}
@@ -248,7 +266,9 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 		if p.SourcePodUID != "" && strings.Contains(m.Source, p.SourcePodUID) {
 			return notes, fmt.Errorf("mount %s still references source pod uid after remap: %s", m.Destination, m.Source)
 		}
+		keptMounts = append(keptMounts, m)
 	}
+	spec.Mounts = keptMounts
 
 	// The restored process must not be re-hooked to containerd's shim
 	// lifecycle; scrub CRI bookkeeping that no longer holds.

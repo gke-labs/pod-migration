@@ -25,7 +25,7 @@
 >   land.
 > - **Known follow-ups tracked in [#129](https://github.com/gke-labs/pod-migration/issues/129):**
 >   - `cmd/holder`: downward-API volume propagation lag after gate removal can
->     exceed the initial 10s `ps-name` poll window and trigger a cold-start
+>     exceed the initial 2s `ps-name` poll window and trigger a cold-start
 >     fallback before the annotation projects into `/pminfo/annotations`.
 >   - `internal/psengine/restore_node.go`: `fetch()` caps its in-memory return
 >     buffer at 4 MiB (`manifest.json` / `spec.json`).

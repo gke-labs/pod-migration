@@ -85,7 +85,7 @@ type NodeRestoreReconciler struct {
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch
-// +kubebuilder:rbac:groups=pod-migration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 
 func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("pod", req.NamespacedName, "node", r.NodeName)
@@ -162,8 +162,13 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 		return fmt.Errorf("PodMigrationJob %s targets spec.podRef.name %q, but PodSnapshot %s is for %q", pmjName, pmjSrcPod, psName, spec.SourcePod)
 	}
 	pmjPhase, _, _ := unstructured.NestedString(pmj.Object, "status", "phase")
-	if pmjPhase != "Restoring" {
-		return fmt.Errorf("PodMigrationJob %s is in phase %q (want Restoring); refusing restore", pmjName, pmjPhase)
+	// Without a readiness probe, the holder container becomes Ready as soon as
+	// it starts, and the PMJ controller can transition the job from Restoring
+	// to Succeeded on the same pod update that triggers this reconciler.
+	// Accepting Succeeded (while still requiring restoredPodUID/restoredPodName
+	// to match this exact pod) avoids losing that race.
+	if pmjPhase != "Restoring" && pmjPhase != "Succeeded" {
+		return fmt.Errorf("PodMigrationJob %s is in phase %q (want Restoring or Succeeded); refusing restore", pmjName, pmjPhase)
 	}
 	pmjSnap, _, _ := unstructured.NestedString(pmj.Object, "status", "snapshotRef")
 	if pmjSnap == "" || pmjSnap != psName {
