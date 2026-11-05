@@ -54,7 +54,8 @@ func isSafeAnonDestination(dst string) bool {
 	return true
 }
 
-// sanitizeAnonMountOptions restricts anonymous bind-mount options to safe defaults.
+// sanitizeAnonMountOptions restricts anonymous bind-mount options to safe
+// defaults and always enforces nosuid and nodev.
 func sanitizeAnonMountOptions(opts []string) []string {
 	allowed := map[string]bool{
 		"rbind": true, "bind": true, "rw": true, "ro": true,
@@ -62,13 +63,26 @@ func sanitizeAnonMountOptions(opts []string) []string {
 		"rprivate": true, "private": true,
 	}
 	var out []string
+	hasNosuid, hasNodev := false, false
 	for _, o := range opts {
 		if allowed[o] {
 			out = append(out, o)
+			if o == "nosuid" {
+				hasNosuid = true
+			}
+			if o == "nodev" {
+				hasNodev = true
+			}
 		}
 	}
 	if len(out) == 0 {
 		return []string{"rbind", "rprivate", "nosuid", "nodev"}
+	}
+	if !hasNosuid {
+		out = append(out, "nosuid")
+	}
+	if !hasNodev {
+		out = append(out, "nodev")
 	}
 	return out
 }
@@ -138,9 +152,15 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 		{Type: specs.NetworkNamespace, Path: nsPath("net")},
 	}
 	for _, ns := range p.TargetSpec.Linux.Namespaces {
-		if ns.Type == specs.CgroupNamespace {
+		switch ns.Type {
+		case specs.CgroupNamespace:
 			out = append(out, specs.LinuxNamespace{Type: specs.CgroupNamespace, Path: ""})
-			break
+		case specs.UserNamespace:
+			nsTarget := ""
+			if ns.Path != "" {
+				nsTarget = nsPath("user")
+			}
+			out = append(out, specs.LinuxNamespace{Type: specs.UserNamespace, Path: nsTarget})
 		}
 	}
 	spec.Linux.Namespaces = out
@@ -270,13 +290,23 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	}
 	spec.Mounts = keptMounts
 
-	// The restored process must not be re-hooked to containerd's shim
-	// lifecycle; scrub CRI bookkeeping that no longer holds.
-	if spec.Annotations != nil {
-		delete(spec.Annotations, "io.kubernetes.cri.sandbox-id")
-		delete(spec.Annotations, "io.kubernetes.cri.sandbox-name")
-		delete(spec.Annotations, "io.kubernetes.cri.sandbox-uid")
+	// Build annotations from the destination spec rather than the archive so a
+	// checkpoint cannot inject runtime overrides (such as org.criu.config), drop
+	// CRI sandbox keys so the restored process is not re-hooked to containerd's
+	// shim lifecycle, and pin org.criu.config to /etc/criu/runc.conf.
+	ann := make(map[string]string, len(p.TargetSpec.Annotations)+1)
+	for k, v := range p.TargetSpec.Annotations {
+		switch k {
+		case "io.kubernetes.cri.sandbox-id",
+			"io.kubernetes.cri.sandbox-name",
+			"io.kubernetes.cri.sandbox-uid":
+			continue
+		default:
+			ann[k] = v
+		}
 	}
+	ann["org.criu.config"] = "/etc/criu/runc.conf"
+	spec.Annotations = ann
 	return notes, nil
 }
 

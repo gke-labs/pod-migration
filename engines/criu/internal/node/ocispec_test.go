@@ -424,11 +424,14 @@ func TestRestoreEndToEndEnforcesTargetSpec(t *testing.T) {
 
 	// 2. With valid mounts, restore() succeeds, uses holder.ImageName (ignoring
 	// archive ImageName), and writes config.json enforcing holder.Spec's UID 1000,
-	// empty capabilities, Seccomp, stripped hooks, and canonical namespaces.
+	// empty capabilities, Seccomp, stripped hooks, canonical namespaces, and pinned
+	// org.criu.config annotation.
 	goodArchiveSpec := sampleSpec()
 	goodArchiveSpec.Process.User = specs.User{UID: 0}
 	goodArchiveSpec.Process.Capabilities = &specs.LinuxCapabilities{Bounding: []string{"CAP_SYS_ADMIN"}}
 	goodArchiveSpec.Hooks = &specs.Hooks{Prestart: []specs.Hook{{Path: "/bin/sh"}}}
+	goodArchiveSpec.Annotations["org.criu.config"] = "/tmp/attacker-criu.conf"
+	goodArchiveSpec.Annotations["attacker.injected/key"] = "pwn"
 	goodArchiveSpec.Linux.Namespaces = []specs.LinuxNamespace{
 		{Type: specs.UserNamespace, Path: "/proc/1/ns/user"},
 	}
@@ -476,6 +479,12 @@ func TestRestoreEndToEndEnforcesTargetSpec(t *testing.T) {
 	}
 	if written.Linux.Seccomp == nil || written.Linux.Seccomp.DefaultAction != specs.ActErrno {
 		t.Errorf("written Seccomp = %+v, want ActErrno from holder.Spec", written.Linux.Seccomp)
+	}
+	if got := written.Annotations["org.criu.config"]; got != "/etc/criu/runc.conf" {
+		t.Errorf("written org.criu.config = %q, want /etc/criu/runc.conf", got)
+	}
+	if _, ok := written.Annotations["attacker.injected/key"]; ok {
+		t.Errorf("archive annotation attacker.injected/key survived in written config.json")
 	}
 	for _, ns := range written.Linux.Namespaces {
 		if ns.Type == specs.UserNamespace {
@@ -613,5 +622,92 @@ func TestAdaptSpecDropsInjectedHolderMountsForSecondHopMigration(t *testing.T) {
 		if m.Destination == "/pmhold" || m.Destination == "/pminfo" {
 			t.Errorf("expected %s mount to be dropped from adapted spec, still present: %+v", m.Destination, m)
 		}
+	}
+}
+
+func TestAdaptSpecScrubsAnnotationsEnforcesUsernsAndAnonNosuidNodev(t *testing.T) {
+	s := sampleSpec()
+	// Archive tries to disable runc.conf with empty org.criu.config, inject
+	// UIDMappings/Personality/IntelRdt, omit UserNamespace, and mount an anon
+	// volume with [rbind, suid, dev].
+	s.Annotations["org.criu.config"] = ""
+	s.Annotations["evil.annotation"] = "1"
+	s.Linux.UIDMappings = []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: 65536}}
+	s.Linux.Personality = &specs.LinuxPersonality{Domain: specs.PerLinux32}
+	s.Linux.IntelRdt = &specs.LinuxIntelRdt{ClosID: "evil"}
+	s.Mounts = append(s.Mounts, specs.Mount{
+		Destination: "/data",
+		Type:        "bind",
+		Source:      "/var/lib/containerd/io.containerd.grpc.v1.cri/containers/7cb5e8acf3c8/volumes/aad7845112f5",
+		Options:     []string{"rbind", "suid", "dev"},
+	})
+
+	p := params()
+	p.AnonVolumeDir = "/var/lib/pod-migrate/bundles/pm-mig1/anon-volumes"
+	p.TargetSpec.Annotations = map[string]string{
+		"io.kubernetes.cri.sandbox-id":     "tgtsandbox222",
+		"io.kubernetes.cri.container-name": "app",
+		"org.criu.config":                  "",
+	}
+	p.TargetSpec.Linux.Namespaces = append(p.TargetSpec.Linux.Namespaces, specs.LinuxNamespace{
+		Type: specs.UserNamespace,
+		Path: "/proc/9999/ns/user",
+	})
+	p.TargetSpec.Linux.UIDMappings = []specs.LinuxIDMapping{{ContainerID: 0, HostID: 100000, Size: 65536}}
+
+	if _, err := AdaptSpec(s, p); err != nil {
+		t.Fatalf("AdaptSpec failed: %v", err)
+	}
+	if got := s.Annotations["org.criu.config"]; got != "/etc/criu/runc.conf" {
+		t.Errorf("org.criu.config = %q, want /etc/criu/runc.conf", got)
+	}
+	if _, ok := s.Annotations["evil.annotation"]; ok {
+		t.Errorf("archive annotation evil.annotation survived")
+	}
+	if _, ok := s.Annotations["io.kubernetes.cri.sandbox-id"]; ok {
+		t.Errorf("sandbox-id annotation survived")
+	}
+	if got := s.Annotations["io.kubernetes.cri.container-name"]; got != "app" {
+		t.Errorf("target annotation container-name = %q, want app", got)
+	}
+
+	var userNSPath string
+	var foundUserNS bool
+	for _, ns := range s.Linux.Namespaces {
+		if ns.Type == specs.UserNamespace {
+			foundUserNS = true
+			userNSPath = ns.Path
+		}
+	}
+	if !foundUserNS || userNSPath != "/proc/2222/ns/user" {
+		t.Errorf("UserNamespace = (%v, %q), want (true, /proc/2222/ns/user)", foundUserNS, userNSPath)
+	}
+	if len(s.Linux.UIDMappings) != 1 || s.Linux.UIDMappings[0].HostID != 100000 {
+		t.Errorf("UIDMappings = %+v, want HostID 100000 from TargetSpec", s.Linux.UIDMappings)
+	}
+	if s.Linux.Personality != nil || s.Linux.IntelRdt != nil {
+		t.Errorf("Personality/IntelRdt survived from archive: %+v / %+v", s.Linux.Personality, s.Linux.IntelRdt)
+	}
+
+	var dataOpts []string
+	for _, m := range s.Mounts {
+		if m.Destination == "/data" {
+			dataOpts = m.Options
+		}
+	}
+	hasNosuid, hasNodev := false, false
+	for _, o := range dataOpts {
+		if o == "nosuid" {
+			hasNosuid = true
+		}
+		if o == "nodev" {
+			hasNodev = true
+		}
+		if o == "suid" || o == "dev" {
+			t.Errorf("unsafe option %q survived in %v", o, dataOpts)
+		}
+	}
+	if !hasNosuid || !hasNodev {
+		t.Errorf("anon volume options %v missing nosuid or nodev", dataOpts)
 	}
 }
