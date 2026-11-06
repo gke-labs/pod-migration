@@ -180,7 +180,7 @@ func TestDetectAndVerifyEvictingStallAndColdStartTemplates(t *testing.T) {
 
 func TestDetectBlindSpotsSkipsAlreadyCaughtAndHealthyRuns(t *testing.T) {
 	runDir := t.TempDir()
-	// 1. Run where I1-I9 already recorded invariantViolations map (real pmprofiler schema): not a blind spot.
+	// 1. Run where existing invariants already recorded the invariantViolations map (real pmprofiler schema): not a blind spot.
 	caughtMapJSON := `{
   "scenario": "already-caught-map",
   "outcomes": {"failed": 1},

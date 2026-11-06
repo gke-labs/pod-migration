@@ -2,7 +2,7 @@
 
 `invariant-gen` implements the deterministic CLI and T0 CI governance foundation of **Track 5 (`PR E` — [Issue #54](https://github.com/gke-labs/pod-migration/issues/54))** of the LPM Correctness Guard Rail ([Epic #49](https://github.com/gke-labs/pod-migration/issues/49)).
 
-It bridges `tools/pmprofiler` trace classification and `controller/internal/invariants` (`I1`–`I9` -> `I10+`) under a **Two-Lane CI Governance** model.
+It bridges `tools/pmprofiler` trace classification and `controller/internal/invariants` (existing invariants -> new candidate invariants) under a **Two-Lane CI Governance** model.
 
 ---
 
@@ -12,7 +12,7 @@ It bridges `tools/pmprofiler` trace classification and `controller/internal/inva
 
 1. **Deterministic Blind-Spot Detection (`Trigger A`)**:
    - Inspects `<run-dir>/run.json` and `<run-dir>/records.ndjson` produced by `pmprofiler` (supporting `pmprofiler`'s `map[string]float64` `invariantViolations`, `totalInvariantViolations`, and `pod` / `snapshotName` / `phase` / `tTerminal` fields).
-   - Identifies any migration ending in an unhealthy outcome (`wedged`, `stalled`, `failed`, `no-replacement`, `restore_crash_unmatched`, or unintended `cold-start`) **while `invariantViolations == 0`** (meaning `I1`–`I9` did not fire).
+   - Identifies any migration ending in an unhealthy outcome (`wedged`, `stalled`, `failed`, `no-replacement`, `restore_crash_unmatched`, or unintended `cold-start`) **while `invariantViolations == 0`** (meaning no existing invariant fired).
    - Reconstructs the point-in-time Kubernetes state from `records.ndjson` into a JSON fixture wire-compatible with `invariants.ReconcileSnapshot` (`testdata/i<N>_<slug>_snapshot.json`).
 2. **Built-In `ReconcileSnapshot`-Native Templates vs. Author Scaffolds**:
    - Classifies each blind spot (or `Trigger B` bugfix PR / `Trigger C` `/extract-invariant` directive) against 4 built-in structural predicate templates that evaluate strictly over fields present on `invariants.ReconcileSnapshot` (`PodListFailed`, `PMJListFailed`, `PrimarySnapshotConditions`), `pmv1alpha1.PodMigrationJob`, and `corev1.Pod`:
@@ -32,7 +32,7 @@ It bridges `tools/pmprofiler` trace classification and `controller/internal/inva
 
 | Lane | Branch Pattern | Rule Enforced in `T0` CI | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Lane 1** | All non-`invariant/*` branches (`feature/*`, `fix/*`, etc.) | **Forbids** modifying any file under `controller/internal/invariants/**`, `.github/CODEOWNERS`, or `verification-suite/verify_invariant_governance.sh` | Prevents feature or bugfix PRs from silently weakening `I1`–`I9` or disabling the governance gate |
+| **Lane 1** | All non-`invariant/*` branches (`feature/*`, `fix/*`, etc.) | **Forbids** modifying any file under `controller/internal/invariants/**`, `.github/CODEOWNERS`, or `verification-suite/verify_invariant_governance.sh` | Prevents feature or bugfix PRs from silently weakening existing invariants or disabling the governance gate |
 | **Lane 2** | `invariant/*` (e.g. `invariant/i10-wedged-restoring-orphan`) | **Requires** all modified files to be strictly inside `controller/internal/invariants/**` | Keeps invariant additions self-contained (`rules.go`, `invariants_test.go`, `testdata/`) for fast human review |
 | **Reconciler + Invariant Co-Change** | Non-`invariant/*` branch with commit trailer `Invariant-Cochange: <reason>`, PR label `allow-invariant-cochange` (`ALLOW_INVARIANT_COCHANGE=true`), or `--allow-cochange` | Permits co-dependent `ReconcileSnapshot` / reconciler + `controller/internal/invariants/**` changes when explicitly justified (does **not** authorize governance-file edits via commit trailer) | Unblocks legitimate `ReconcileSnapshot` struct extensions (#88) without bypassing CI visibility |
 | **Governance Files** | Any branch modifying `.github/CODEOWNERS` or `verification-suite/verify_invariant_governance.sh` | Requires PR label `allow-invariant-cochange` (`ALLOW_INVARIANT_COCHANGE=true`) in CI or `--allow-cochange` locally; **cannot** be bypassed by an author-controlled branch name or `Invariant-Cochange:` commit trailer | Prevents a PR author from unilaterally weakening `.github/CODEOWNERS` or `verify_invariant_governance.sh` |

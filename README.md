@@ -31,8 +31,9 @@ The controller is implemented as a custom Operator consisting of the following c
   2. Monitors the resulting `PodSnapshot` until it becomes `Ready` (uploaded to GCS).
   3. Transitions the job to `Evicting` phase, which signals the Eviction Webhook that it is safe to allow the source Pod deletion.
   4. Waits for the source Pod to be deleted and its volumes to fully detach from the GCE node.
-  5. Transitions the job to `Succeeded`, signaling the Pod Gate Reconciler that it is safe to release the replacement Pod.
-- **Pod Gate Reconciler**: Monitors replacement Pods injected with the `gke.io/pod-migration-gate` scheduling gate. It holds them in a pending state and releases the gate only after the matched `PodMigrationJob` reaches `Succeeded` (confirming snapshot readiness and volume detachment), then injects the GKE snapshot name annotation to force restore, and removes the scheduling gate to allow startup. It bypasses gate injection for normal scale-up pods.
+  5. Transitions the job to `Restoring`, signaling the Pod Gate Reconciler that it is safe to release the replacement Pod.
+  6. Watches the restore and concludes the job: `Succeeded` once the restore is verified or inferred, `SucceededWithoutRestore` if the replacement runs without its restored state or the restore isn't confirmed in time (for example after a cold start or the restore timeout), or `Failed` (for example after a restore crash).
+- **Pod Gate Reconciler**: Monitors replacement Pods injected with the `gke.io/pod-migration-gate` scheduling gate. It holds them in a pending state and releases the gate once the matched `PodMigrationJob` reaches `Restoring` (confirming snapshot readiness and volume detachment), then injects the GKE snapshot name annotation to force restore, and removes the scheduling gate to allow startup. It bypasses gate injection for normal scale-up pods.
 
 ### 3. Source Fence
 
@@ -62,7 +63,7 @@ Notes:
 
 ### 4. Design Docs
 - [Snapshot engine contract](docs/design/engine-contract.md): what the controller requires from a snapshot engine (GKE Pod Snapshots today; CRIU and upstream pod checkpoint/restore next).
-- [Core safety invariants](docs/invariants.md): the invariants the controller can check after each reconcile (off by default; see `--invariant-mode`).
+- [Safety invariants](docs/invariants.md): the invariants the controller can check after each reconcile (off by default; see `--invariant-mode`).
 
 ---
 

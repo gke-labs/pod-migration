@@ -53,7 +53,7 @@ Inspect security boundaries across webhooks and snapshot engines:
 
 ### 5. Invariant Governance & Negative Unit Testing
 - **Two-Lane Governance Compliance:** Verify that `controller/internal/invariants/**` and `.github/CODEOWNERS` are untouched unless the PR explicitly follows Lane 2 rules or includes a verified `Invariant-Cochange` trailer.
-- **No Weakened Invariants:** Ensure existing invariant predicates (`I1`–`I11`) have not been relaxed, bypassed, or commented out.
+- **No Weakened Invariants:** Ensure existing invariant predicates (`I1`–`I12`) have not been relaxed, bypassed, or commented out.
 - **Negative Test Coverage:** Does every new error condition, validation failure, or edge case have a corresponding negative unit test asserting expected failure behavior?
 
 ---

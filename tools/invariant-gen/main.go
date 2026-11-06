@@ -640,7 +640,7 @@ func classifyBlindSpot(m pmMigrationJSON, snap ReconcileSnapshotJSON) (TemplateC
 	return TemplateCustomScaffold,
 		"CustomExtractedInvariant",
 		"custom_blind_spot",
-		fmt.Sprintf("Unhealthy migration outcome %q observed on PMJ %q with 0 existing I1-I9 violations (requires author predicate over ReconcileSnapshot)",
+		fmt.Sprintf("Unhealthy migration outcome %q observed on PMJ %q with 0 existing invariant violations (requires author predicate over ReconcileSnapshot)",
 			m.Outcome, derefStr(m.PMJ))
 }
 

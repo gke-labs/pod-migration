@@ -67,10 +67,10 @@ var (
 		Help: "Number of currently active pod migrations.",
 	})
 
-	// InvariantViolationsTotal counts detected correctness invariant violations by invariant ID (I1-I9).
+	// InvariantViolationsTotal counts detected correctness invariant violations by invariant ID.
 	InvariantViolationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_invariant_violations_total",
-		Help: "Total number of detected correctness invariant violations by invariant ID (I1-I9).",
+		Help: "Total number of detected correctness invariant violations by invariant ID.",
 	}, []string{"invariant"})
 
 	// SpotPreemptionTriggeredTotal counts pods for which spot preemption migration was initiated.
