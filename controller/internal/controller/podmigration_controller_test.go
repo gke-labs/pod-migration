@@ -2056,6 +2056,283 @@ func TestPodMigrationReconciler_Sync_NoOpDoesNotWrite(t *testing.T) {
 	}
 }
 
+// managedWriteCounter records the Update and Patch calls on the managed
+// policy and storage objects. Creates aren't recorded.
+func managedWriteCounter(c client.WithWatch, writes *[]string) client.WithWatch {
+	isManaged := func(obj client.Object) bool {
+		switch obj.GetObjectKind().GroupVersionKind().Kind {
+		case psscGVKForTest.Kind, pspGVKForTest.Kind:
+			return true
+		}
+		return false
+	}
+	return interceptor.NewClient(c, interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if isManaged(obj) {
+				*writes = append(*writes, "Update "+obj.GetName())
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if isManaged(obj) {
+				*writes = append(*writes, "Patch "+obj.GetName())
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+}
+
+// createTerminatingForTest creates a managed object with spec, held by a
+// foreign finalizer, and deletes it. Like the API server, the fake client
+// then only sets its deletionTimestamp.
+func createTerminatingForTest(t *testing.T, c client.Client, gvk schema.GroupVersionKind, key types.NamespacedName, spec map[string]interface{}) {
+	t.Helper()
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	obj.SetNamespace(key.Namespace)
+	obj.SetName(key.Name)
+	obj.SetFinalizers([]string{"example.com/hold"})
+	obj.Object["spec"] = spec
+	if err := c.Create(context.Background(), obj); err != nil {
+		t.Fatalf("Create %s %s: %v", gvk.Kind, key, err)
+	}
+	if err := c.Delete(context.Background(), obj); err != nil {
+		t.Fatalf("Delete %s %s: %v", gvk.Kind, key, err)
+	}
+	if got := getManagedForTest(t, c, gvk, key); got.GetDeletionTimestamp() == nil {
+		t.Fatalf("%s %s has no deletionTimestamp after Delete", gvk.Kind, key)
+	}
+}
+
+func readyConditionForTest(t *testing.T, c client.Client, namespace, name string) *metav1.Condition {
+	t.Helper()
+	pm := &pmv1alpha1.PodMigration{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: name}, pm); err != nil {
+		t.Fatalf("Get PodMigration %s/%s: %v", namespace, name, err)
+	}
+	return meta.FindStatusCondition(pm.Status.Conditions, "Ready")
+}
+
+// terminatingTestCase is a managed object that is being deleted, and the
+// other managed object of the same PodMigration.
+type terminatingTestCase struct {
+	kind     string
+	gvk      schema.GroupVersionKind
+	key      types.NamespacedName
+	wantSpec map[string]interface{}
+	drifted  map[string]interface{}
+	otherGVK schema.GroupVersionKind
+	otherKey types.NamespacedName
+}
+
+func terminatingTestCases(namespace, name string) []terminatingTestCase {
+	psscKey := types.NamespacedName{Name: getPSSCName(namespace, name)}
+	pspKey := types.NamespacedName{Namespace: namespace, Name: getPSPManualName(name)}
+	driftedPSP := wantPSPSpec(psscKey.Name)
+	driftedPSP["triggerConfig"] = map[string]interface{}{"type": "manual", "postCheckpoint": "resume"}
+	return []terminatingTestCase{
+		{
+			kind:     "PodSnapshotStorageConfig",
+			gvk:      psscGVKForTest,
+			key:      psscKey,
+			wantSpec: wantPSSCSpec(),
+			drifted: map[string]interface{}{
+				"snapshotStorageConfig": map[string]interface{}{
+					"gcs": map[string]interface{}{"bucket": "stale-bucket"},
+				},
+			},
+			otherGVK: pspGVKForTest,
+			otherKey: pspKey,
+		},
+		{
+			kind:     "PodSnapshotPolicy",
+			gvk:      pspGVKForTest,
+			key:      pspKey,
+			wantSpec: wantPSPSpec(psscKey.Name),
+			drifted:  driftedPSP,
+			otherGVK: psscGVKForTest,
+			otherKey: psscKey,
+		},
+	}
+}
+
+// A managed object that is being deleted is not patched, even with a drifted
+// spec: it only waits for a foreign finalizer, and it can be recreated only
+// once it's gone. While either object is terminating, the PodMigration isn't
+// Ready, and the reconcile comes back to recreate the object (#144).
+func TestPodMigrationReconciler_Sync_TerminatingObjectIsNotPatched(t *testing.T) {
+	namespace, name := "default", "sync-terminating"
+	for _, tc := range terminatingTestCases(namespace, name) {
+		t.Run(tc.kind, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = pmv1alpha1.AddToScheme(scheme)
+			base := newSyncTestClient(scheme, syncTestPodMigration(namespace, name))
+			// The drifted spec gives a reconcile that ignores the
+			// deletionTimestamp something to patch.
+			createTerminatingForTest(t, base, tc.gvk, tc.key, tc.drifted)
+
+			var writes []string
+			r := &PodMigrationReconciler{Client: managedWriteCounter(base, &writes), Scheme: scheme}
+			res, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Namespace: namespace, Name: name},
+			})
+
+			if err != nil {
+				t.Errorf("Reconcile returned %v, want nil: a terminating object is waited for, not an error", err)
+			}
+			if len(writes) != 0 {
+				t.Errorf("terminating %s was written: %v", tc.kind, writes)
+			}
+			if ready := readyConditionForTest(t, base, namespace, name); ready == nil ||
+				ready.Status != metav1.ConditionFalse || ready.Reason != ReasonManagedObjectTerminating {
+				t.Errorf("Ready = %+v, want False with reason %s", ready, ReasonManagedObjectTerminating)
+			}
+			if res.RequeueAfter <= 0 {
+				t.Errorf("RequeueAfter = %v, want > 0 while the %s is terminating", res.RequeueAfter, tc.kind)
+			}
+			// The other object is still synced.
+			getManagedForTest(t, base, tc.otherGVK, tc.otherKey)
+		})
+	}
+}
+
+// Once the terminating object is gone, its deletion event maps back to the
+// PodMigration, and that reconcile recreates the object and reports Ready
+// again. No PodMigration event is involved (#144).
+func TestPodMigrationReconciler_Sync_TerminatingObjectRecreatedOnceGone(t *testing.T) {
+	namespace, name := "default", "sync-recreate"
+	for _, tc := range terminatingTestCases(namespace, name) {
+		t.Run(tc.kind, func(t *testing.T) {
+			ctx := context.Background()
+			scheme := runtime.NewScheme()
+			_ = pmv1alpha1.AddToScheme(scheme)
+			c := newSyncTestClient(scheme, syncTestPodMigration(namespace, name))
+			createTerminatingForTest(t, c, tc.gvk, tc.key, tc.drifted)
+			r := &PodMigrationReconciler{Client: c, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile while terminating: %v", err)
+			}
+
+			// The foreign finalizer is removed, so the object is gone.
+			gone := getManagedForTest(t, c, tc.gvk, tc.key)
+			gone.SetFinalizers(nil)
+			if err := c.Update(ctx, gone); err != nil {
+				t.Fatalf("removing the finalizer: %v", err)
+			}
+			probe := &unstructured.Unstructured{}
+			probe.SetGroupVersionKind(tc.gvk)
+			if err := c.Get(ctx, tc.key, probe); !apierrors.IsNotFound(err) {
+				t.Fatalf("Get %s after removing its finalizer: %v, want NotFound", tc.kind, err)
+			}
+
+			// Its deletion event maps to the PodMigration.
+			reqs := r.podMigrationsForManagedObject(ctx, gone)
+			if !reflect.DeepEqual(reqs, []ctrl.Request{req}) {
+				t.Fatalf("deleted %s maps to %v, want [%v]", tc.kind, reqs, req)
+			}
+			res, err := r.Reconcile(ctx, reqs[0])
+			if err != nil {
+				t.Fatalf("Reconcile after the deletion: %v", err)
+			}
+			if res.RequeueAfter != 0 {
+				t.Errorf("RequeueAfter = %v, want 0 once the %s is recreated", res.RequeueAfter, tc.kind)
+			}
+
+			got := getManagedForTest(t, c, tc.gvk, tc.key)
+			if got.GetDeletionTimestamp() != nil {
+				t.Errorf("recreated %s has a deletionTimestamp", tc.kind)
+			}
+			if !reflect.DeepEqual(got.Object["spec"], tc.wantSpec) {
+				t.Errorf("recreated %s spec = %v, want %v", tc.kind, got.Object["spec"], tc.wantSpec)
+			}
+			if ready := readyConditionForTest(t, c, namespace, name); ready == nil || ready.Status != metav1.ConditionTrue {
+				t.Errorf("Ready = %+v, want True once the %s is recreated", ready, tc.kind)
+			}
+		})
+	}
+}
+
+// A spec edit on a managed object is reverted by the reconcile that the
+// object's own update event maps to. No PodMigration event is involved
+// (#144).
+func TestPodMigrationReconciler_Sync_SpecEditRevertedFromManagedObjectEvent(t *testing.T) {
+	namespace, name := "default", "sync-edit"
+	for _, tc := range terminatingTestCases(namespace, name) {
+		t.Run(tc.kind, func(t *testing.T) {
+			ctx := context.Background()
+			scheme := runtime.NewScheme()
+			_ = pmv1alpha1.AddToScheme(scheme)
+			c := newSyncTestClient(scheme, syncTestPodMigration(namespace, name))
+			reconcileSyncTest(t, c, scheme, namespace, name) // creates both objects
+
+			edited := getManagedForTest(t, c, tc.gvk, tc.key)
+			edited.Object["spec"] = tc.drifted
+			if err := c.Update(ctx, edited); err != nil {
+				t.Fatalf("editing the %s spec: %v", tc.kind, err)
+			}
+
+			r := &PodMigrationReconciler{Client: c, Scheme: scheme}
+			reqs := r.podMigrationsForManagedObject(ctx, edited)
+			want := []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}}
+			if !reflect.DeepEqual(reqs, want) {
+				t.Fatalf("edited %s maps to %v, want %v", tc.kind, reqs, want)
+			}
+			if _, err := r.Reconcile(ctx, reqs[0]); err != nil {
+				t.Fatalf("Reconcile after the edit: %v", err)
+			}
+
+			if got := getManagedForTest(t, c, tc.gvk, tc.key); !reflect.DeepEqual(got.Object["spec"], tc.wantSpec) {
+				t.Errorf("%s spec = %v, want %v", tc.kind, got.Object["spec"], tc.wantSpec)
+			}
+		})
+	}
+}
+
+// An event on a managed object maps to the PodMigration that renders an
+// object of that kind, namespace and name. Other objects map to nothing.
+func TestPodMigrationReconciler_MapsManagedObjectToPodMigration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	pm := syncTestPodMigration("default", "map-me")
+	other := syncTestPodMigration("other", "map-other")
+	invalid := syncTestPodMigration("invalid", "map-invalid")
+	invalid.Spec.Storage.Location = "no-scheme/path"
+	r := &PodMigrationReconciler{Client: newSyncTestClient(scheme, pm, other, invalid), Scheme: scheme}
+
+	managed := func(gvk schema.GroupVersionKind, namespace, name string, labels map[string]string) *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		obj.SetNamespace(namespace)
+		obj.SetName(name)
+		obj.SetLabels(labels)
+		return obj
+	}
+	psscName := getPSSCName(pm.Namespace, pm.Name)
+	wantPM := []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name}}}
+
+	for _, tc := range []struct {
+		desc string
+		obj  *unstructured.Unstructured
+		want []ctrl.Request
+	}{
+		{"storage config", managed(psscGVKForTest, "", psscName, map[string]string{OwnerUIDLabelKey: string(pm.UID)}), wantPM},
+		{"storage config without the owner label", managed(psscGVKForTest, "", psscName, nil), wantPM},
+		{"storage config of an earlier PodMigration with the same name", managed(psscGVKForTest, "", psscName, map[string]string{OwnerUIDLabelKey: "uid-earlier"}), wantPM},
+		{"policy", managed(pspGVKForTest, pm.Namespace, getPSPManualName(pm.Name), nil), wantPM},
+		{"policy named for a PodMigration in another namespace", managed(pspGVKForTest, pm.Namespace, getPSPManualName(other.Name), nil), nil},
+		{"unrelated policy", managed(pspGVKForTest, pm.Namespace, "psp-someone-else", nil), nil},
+		{"unrelated storage config", managed(psscGVKForTest, "", "pssc-someone-else", nil), nil},
+		{"policy of a PodMigration that renders nothing", managed(pspGVKForTest, invalid.Namespace, getPSPManualName(invalid.Name), nil), nil},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if got := r.podMigrationsForManagedObject(context.Background(), tc.obj); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("maps to %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPodMigrationReconciler_Finalizer_PostponesDeleteForPolicyAnnotatedJob(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = pmv1alpha1.AddToScheme(scheme)

@@ -38,7 +38,24 @@ const (
 	OwnerUIDLabelKey                       = engine.OwnerUIDLabel
 	ReasonDuplicatePodMigrationInNamespace = "DuplicatePodMigrationInNamespace"
 	maxDeletionDeferral                    = 10 * time.Minute
+
+	// ReasonManagedObjectTerminating: a policy or storage object rendered for
+	// the PodMigration is being deleted, so it isn't Ready until the object is
+	// gone and recreated (#144).
+	ReasonManagedObjectTerminating = "ManagedObjectTerminating"
+	// managedObjectTerminatingRequeue is how often a reconcile that waits for
+	// a managed object to finish deleting checks again. The watch on the
+	// object usually wakes it sooner.
+	managedObjectTerminatingRequeue = 5 * time.Second
 )
+
+// managedObjectGVKs are the kinds of the policy and storage objects that the
+// reconciler syncs and watches: those GKE Pod Snapshots renders. An engine
+// with its own API group (#135) adds its kinds here.
+var managedObjectGVKs = []schema.GroupVersionKind{
+	{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshotStorageConfig"},
+	{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshotPolicy"},
+}
 
 const (
 	// ConditionEngineRoutesValid reports whether the runtime-class routes
@@ -318,6 +335,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		logger.Error(err, "No snapshot engine to render the namespace resources")
 		return ctrl.Result{}, err
 	}
+	var terminating []string
 	for _, eng := range engines {
 		resources, err := eng.NamespaceResources(config)
 		if err != nil {
@@ -339,11 +357,35 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 		for _, desired := range resources {
 			logger.Info("Syncing "+desired.GetKind(), "engine", eng.Name(), "name", desired.GetName(), "namespace", desired.GetNamespace())
-			if err := r.syncResource(ctx, desired); err != nil {
+			deleting, err := r.syncResource(ctx, desired)
+			if err != nil {
 				logger.Error(err, "Failed to sync "+desired.GetKind(), "engine", eng.Name(), "name", desired.GetName())
 				return ctrl.Result{}, err
 			}
+			if deleting {
+				terminating = append(terminating, managedObjectRef(desired))
+			}
 		}
+	}
+
+	// A managed object that is being deleted is left alone until it's gone,
+	// then recreated (#144). Until then the PodMigration isn't Ready. The
+	// watch on the object wakes this reconcile once it's deleted; the requeue
+	// covers a deletion event that doesn't map back to this PodMigration.
+	if len(terminating) > 0 {
+		logger.Info("Waiting for managed objects to finish deleting before recreating them", "objects", terminating)
+		meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonManagedObjectTerminating,
+			Message:            fmt.Sprintf("Waiting for %s to finish deleting; it is recreated once gone", strings.Join(terminating, ", ")),
+			ObservedGeneration: config.Generation,
+		})
+		if err := r.patchStatus(ctx, config, before); err != nil {
+			logger.Error(err, "Failed to update PodMigration status while a managed object is terminating")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: managedObjectTerminatingRequeue}, nil
 	}
 
 	// Set status condition to Ready
@@ -603,15 +645,22 @@ func deferralExpired(config *pmv1alpha1.PodMigration) bool {
 // desired. Labels, annotations and finalizers that other components add, such
 // as a snapshot engine's selector label, are left untouched. Nothing is
 // written when the object is already in the desired state.
-func (r *PodMigrationReconciler) syncResource(ctx context.Context, desired *unstructured.Unstructured) error {
+//
+// An object that is being deleted is left alone, and syncResource reports it
+// as terminating: it only waits for other components to remove their
+// finalizers, and it can be recreated only once it's gone (#144).
+func (r *PodMigrationReconciler) syncResource(ctx context.Context, desired *unstructured.Unstructured) (terminating bool, err error) {
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(desired.GroupVersionKind())
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
+	err = r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return r.Create(ctx, desired)
+			return false, r.Create(ctx, desired)
 		}
-		return err
+		return false, err
+	}
+	if existing.GetDeletionTimestamp() != nil {
+		return true, nil
 	}
 
 	updated := existing.DeepCopy()
@@ -632,12 +681,21 @@ func (r *PodMigrationReconciler) syncResource(ctx context.Context, desired *unst
 	patch := client.MergeFrom(existing)
 	data, err := patch.Data(updated)
 	if err != nil {
-		return fmt.Errorf("computing patch for %s %s: %w", desired.GetKind(), desired.GetName(), err)
+		return false, fmt.Errorf("computing patch for %s %s: %w", desired.GetKind(), desired.GetName(), err)
 	}
 	if string(data) == "{}" {
-		return nil
+		return false, nil
 	}
-	return r.Patch(ctx, updated, patch)
+	return false, r.Patch(ctx, updated, patch)
+}
+
+// managedObjectRef names a managed object for logs and status messages:
+// its kind, then namespace/name, or just its name if it's cluster-scoped.
+func managedObjectRef(obj *unstructured.Unstructured) string {
+	if obj.GetNamespace() == "" {
+		return obj.GetKind() + " " + obj.GetName()
+	}
+	return obj.GetKind() + " " + obj.GetNamespace() + "/" + obj.GetName()
 }
 
 // selectActivePodMigration deterministically elects the single active PodMigration
@@ -666,10 +724,88 @@ func (r *PodMigrationReconciler) enqueueNamespacePeers(ctx context.Context, obj 
 	return reqs
 }
 
+// podMigrationsForManagedObject maps an event on a policy or storage object
+// to the PodMigration it was rendered for: the one whose engines render an
+// object of the same kind, namespace and name. That's the owner whether or
+// not the object still carries OwnerUIDLabel, and for a storage config left
+// behind by a PodMigration that was deleted and recreated under the same
+// name, it's the new PodMigration. Objects that no PodMigration renders map
+// to nothing.
+func (r *PodMigrationReconciler) podMigrationsForManagedObject(ctx context.Context, obj client.Object) []reconcile.Request {
+	logger := log.FromContext(ctx)
+	registry, err := r.engines()
+	if err != nil {
+		logger.Error(err, "No snapshot engine registry to map a managed object to its PodMigration")
+		return nil
+	}
+	gk := obj.GetObjectKind().GroupVersionKind().GroupKind()
+
+	// A namespaced object is rendered for a PodMigration in its namespace; a
+	// cluster-scoped one, such as the storage config, can belong to any.
+	var opts []client.ListOption
+	if obj.GetNamespace() != "" {
+		opts = append(opts, client.InNamespace(obj.GetNamespace()))
+	}
+	var list pmv1alpha1.PodMigrationList
+	if err := r.List(ctx, &list, opts...); err != nil {
+		logger.Error(err, "Failed to list PodMigrations to map a managed object", "kind", gk.Kind, "name", obj.GetName())
+		return nil
+	}
+
+	var reqs []reconcile.Request
+	for i := range list.Items {
+		pm := &list.Items[i]
+		if rendersObject(registry, pm, gk, obj.GetNamespace(), obj.GetName()) {
+			reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(pm)})
+		}
+	}
+	return reqs
+}
+
+// rendersObject reports whether the engines that serve pm render an object of
+// kind gk named namespace/name. An engine that can't render pm's objects, for
+// example because its storage location is invalid, renders nothing.
+func rendersObject(registry *engine.Registry, pm *pmv1alpha1.PodMigration, gk schema.GroupKind, namespace, name string) bool {
+	for _, eng := range registry.EnginesFor(pm) {
+		resources, err := eng.NamespaceResources(pm)
+		if err != nil {
+			continue
+		}
+		for _, res := range resources {
+			if res.GroupVersionKind().GroupKind() == gk && res.GetNamespace() == namespace && res.GetName() == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // SetupWithManager sets up the controller with the Manager.
+//
+// Besides PodMigrations, it watches the policy and storage objects that the
+// reconciler syncs, so a spec edit is reverted and a deleted object is
+// recreated without waiting for the next PodMigration event (#144). Like the
+// PodMigrationJob reconciler, it skips a kind whose CRD isn't installed: the
+// controller still starts, and syncing that kind fails until it's installed
+// and the controller restarts.
 func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	logger := mgr.GetLogger().WithName("podmigration-setup")
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigration{}).
-		Watches(&pmv1alpha1.PodMigration{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNamespacePeers)).
-		Complete(r)
+		Watches(&pmv1alpha1.PodMigration{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNamespacePeers))
+
+	for _, gvk := range managedObjectGVKs {
+		watch, err := shouldWatchCRD(mgr.GetRESTMapper(), gvk)
+		if err != nil {
+			return err
+		}
+		if !watch {
+			logger.Info(gvk.Kind + " CRD not registered; not watching it")
+			continue
+		}
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		bldr = bldr.Watches(obj, handler.EnqueueRequestsFromMapFunc(r.podMigrationsForManagedObject))
+	}
+	return bldr.Complete(r)
 }
