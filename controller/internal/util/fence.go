@@ -21,6 +21,11 @@ const (
 	// ReasonUnfenced means a failed migration returned it to service.
 	ConditionSourceFenced = "SourceFenced"
 
+	// SourceFenceFinalizer prevents deletion of a PodMigrationJob while its
+	// source pod is fenced, ensuring the fence is settled (unfenced or evicted)
+	// before the job is removed (#167).
+	SourceFenceFinalizer = "pod-migration.gke.io/source-fence"
+
 	// ReasonFenced is the SourceFenced reason while the migration runs.
 	ReasonFenced = "Fenced"
 	// ReasonFenceKept is the SourceFenced reason when a failed migration kept

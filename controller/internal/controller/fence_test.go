@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
@@ -331,7 +332,7 @@ func TestFenceSource_FencesBeforeTheTrigger(t *testing.T) {
 	if f.provider.ensureCalls != 1 {
 		t.Fatalf("EnsureTrigger calls = %d, want 1", f.provider.ensureCalls)
 	}
-	want := []string{"job status", "pod patch", "pod status", "job patch"}
+	want := []string{"job patch", "job status", "pod patch", "pod status", "job patch"}
 	if got := f.writes.list(); len(got) < len(want) || strings.Join(got[:len(want)], ",") != strings.Join(want, ",") {
 		t.Errorf("writes = %v, want them to start with %v", got, want)
 	}
@@ -907,5 +908,526 @@ func TestFenceSource_SatisfiesI11(t *testing.T) {
 	delete(unlabeled.Labels, util.LabelFenced)
 	if vs := invariants.EvaluateI11(snapshotAt(unlabeled)); len(vs) == 0 {
 		t.Fatal("I11 didn't fire for a fenced job whose source lost the label")
+	}
+}
+
+// TestFenceSource_FinalizerLifecycle covers adding SourceFenceFinalizer before
+// fencing and removing it when transitioning past eviction or settling (#167).
+func TestFenceSource_FinalizerLifecycle(t *testing.T) {
+	t.Run("finalizer added before trigger", func(t *testing.T) {
+		f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSource(fenceTestCID, 0), fenceTestSnapshottingJob())
+		f.provider.onEnsure = func() {
+			job := f.job(t)
+			if !controllerutil.ContainsFinalizer(job, SourceFenceFinalizer) {
+				t.Errorf("at trigger time job missing finalizer %s: %v", SourceFenceFinalizer, job.Finalizers)
+			}
+		}
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if f.provider.ensureCalls != 1 {
+			t.Fatalf("EnsureTrigger calls = %d, want 1", f.provider.ensureCalls)
+		}
+		job := f.job(t)
+		if !controllerutil.ContainsFinalizer(job, SourceFenceFinalizer) {
+			t.Errorf("job missing finalizer %s: %v", SourceFenceFinalizer, job.Finalizers)
+		}
+	})
+
+	t.Run("finalizer retained across multiple active reconciles", func(t *testing.T) {
+		f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSource(fenceTestCID, 0), fenceTestSnapshottingJob())
+		// First reconcile: adds finalizer, fences pod, sets baseline.
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("first Reconcile: %v", err)
+		}
+		if !controllerutil.ContainsFinalizer(f.job(t), SourceFenceFinalizer) {
+			t.Fatalf("finalizer missing after first reconcile")
+		}
+		// Second reconcile while still active Snapshotting: finalizer must NOT be stripped!
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("second Reconcile: %v", err)
+		}
+		if !controllerutil.ContainsFinalizer(f.job(t), SourceFenceFinalizer) {
+			t.Fatalf("finalizer was stripped on second active reconcile")
+		}
+	})
+
+	t.Run("pre-upgrade job with baseline acquires finalizer", func(t *testing.T) {
+		job := fenceTestSnapshottingJob()
+		data, _ := json.Marshal(baselineOf(fenceTestSource(fenceTestCID, 0)))
+		job.Annotations = map[string]string{util.AnnotationFenceBaseline: string(data)}
+		// No finalizer yet (simulating pre-upgrade)
+		f := newFenceFixture(t, interceptor.Funcs{}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if !controllerutil.ContainsFinalizer(f.job(t), SourceFenceFinalizer) {
+			t.Errorf("pre-upgrade job did not acquire finalizer %s", SourceFenceFinalizer)
+		}
+	})
+
+	t.Run("finalizer removed when settling fence on failure without watch", func(t *testing.T) {
+		job := fenceTestFailedJob(false, time.Second)
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		f := newFenceFixture(t, interceptor.Funcs{}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+		f.provider.state = snapshot.CheckpointState{Settled: true}
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if controllerutil.ContainsFinalizer(f.job(t), SourceFenceFinalizer) {
+			t.Errorf("finalizer %s was not removed after fence settled", SourceFenceFinalizer)
+		}
+	})
+
+	t.Run("finalizer removed after late-stop watch expires", func(t *testing.T) {
+		job := fenceTestFailedJob(true, DefaultFenceLateStopWatch+time.Second)
+		job.Status.Conditions[1] = metav1.Condition{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionFalse,
+			Reason:             util.ReasonUnfenced,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-DefaultFenceLateStopWatch - time.Second)),
+		}
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSource(fenceTestCID, 0), job)
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if controllerutil.ContainsFinalizer(f.job(t), SourceFenceFinalizer) {
+			t.Errorf("finalizer %s was not removed after late-stop watch expired", SourceFenceFinalizer)
+		}
+	})
+
+	t.Run("finalizer retained during Evicting and removed at Restoring transition", func(t *testing.T) {
+		job := fenceTestSnapshottingJob()
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		// Pod eviction refused by PDB: job stays in Evicting across reconciles
+		f := newFenceFixture(t, interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, sub string, obj client.Object, subObj client.Object, opts ...client.SubResourceCreateOption) error {
+				return apierrors.NewTooManyRequests("PDB refused eviction", 0)
+			},
+		}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+
+		// First reconcile in Evicting: finalizer retained
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("first Evicting reconcile: %v", err)
+		}
+		if !controllerutil.ContainsFinalizer(f.job(t), SourceFenceFinalizer) {
+			t.Errorf("finalizer removed on first Evicting reconcile")
+		}
+
+		// Second reconcile in Evicting: finalizer still retained (IsTerminalPhase guard)
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("second Evicting reconcile: %v", err)
+		}
+		if !controllerutil.ContainsFinalizer(f.job(t), SourceFenceFinalizer) {
+			t.Errorf("finalizer removed on second Evicting reconcile")
+		}
+
+		// Source pod is evicted (gone). Next reconcile transitions to Restoring and removes finalizer.
+		if err := f.client.Delete(context.Background(), fencedPod(fenceTestSource(fenceTestCID, 0))); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatalf("deleting source pod: %v", err)
+		}
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("reconcile after source pod evicted: %v", err)
+		}
+		j := f.job(t)
+		if j.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+			t.Errorf("phase = %s, want Restoring", j.Status.Phase)
+		}
+		if controllerutil.ContainsFinalizer(j, SourceFenceFinalizer) {
+			t.Errorf("finalizer %s was not removed upon transition to Restoring", SourceFenceFinalizer)
+		}
+	})
+
+	t.Run("job deleted during late-stop watch exits watch and removes finalizer", func(t *testing.T) {
+		now := metav1.Now()
+		job := fenceTestFailedJob(true, time.Minute)
+		job.Status.Conditions[1] = metav1.Condition{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionFalse,
+			Reason:             util.ReasonUnfenced,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-time.Minute)),
+		}
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &now
+
+		f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSource(fenceTestCID, 0), job)
+		res, err := f.reconcile(t)
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if res.RequeueAfter != 0 {
+			t.Errorf("RequeueAfter = %v, want 0 (watch should exit immediately on delete)", res.RequeueAfter)
+		}
+		deletedJob := &pmv1alpha1.PodMigrationJob{}
+		if err := f.client.Get(context.Background(), types.NamespacedName{Namespace: fenceTestNS, Name: fenceTestJob}, deletedJob); err == nil {
+			if controllerutil.ContainsFinalizer(deletedJob, SourceFenceFinalizer) {
+				t.Errorf("finalizer %s was not removed on delete during watch", SourceFenceFinalizer)
+			}
+		}
+	})
+}
+
+// TestDeleteActiveJob_PreCheckpoint verifies that deleting an active job before
+// its checkpoint completes releases the source pod and removes the finalizer (#167).
+func TestDeleteActiveJob_PreCheckpoint(t *testing.T) {
+	t.Run("deleted before checkpoint was triggered", func(t *testing.T) {
+		now := metav1.Now()
+		job := fenceTestSnapshottingJob()
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &now
+		job.Status.Conditions = []metav1.Condition{{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionTrue,
+			Reason:             util.ReasonFenced,
+			LastTransitionTime: now,
+		}}
+
+		f := newFenceFixture(t, interceptor.Funcs{}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+		f.provider.state = snapshot.CheckpointState{Settled: true}
+
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+
+		// Source pod must be unfenced.
+		pod := f.pod(t)
+		if pod == nil {
+			t.Fatal("source pod was deleted, want it unfenced and preserved")
+		}
+		if pod.Labels[util.LabelFenced] != "" {
+			t.Errorf("source pod labels = %v, want %s removed", pod.Labels, util.LabelFenced)
+		}
+
+		// Finalizer must be removed from the job.
+		deletedJob := &pmv1alpha1.PodMigrationJob{}
+		err := f.client.Get(context.Background(), types.NamespacedName{Namespace: fenceTestNS, Name: fenceTestJob}, deletedJob)
+		if err == nil && controllerutil.ContainsFinalizer(deletedJob, SourceFenceFinalizer) {
+			t.Errorf("job still contains %s finalizer: %v", SourceFenceFinalizer, deletedJob.Finalizers)
+		}
+
+		if !hasEvent(f.events(), "SourceUnfenced") {
+			t.Error("expected SourceUnfenced event")
+		}
+	})
+
+	t.Run("deleted after trigger created but checkpoint never completed", func(t *testing.T) {
+		now := metav1.Now()
+		job := fenceTestSnapshottingJob()
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &now
+		job.Status.Conditions = []metav1.Condition{{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionTrue,
+			Reason:             util.ReasonFenced,
+			LastTransitionTime: now,
+		}}
+		data, _ := json.Marshal(baselineOf(fenceTestSource(fenceTestCID, 0)))
+		job.Annotations = map[string]string{util.AnnotationFenceBaseline: string(data)}
+
+		f := newFenceFixture(t, interceptor.Funcs{}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+		// Checkpoint provider reports trigger settled without completing.
+		f.provider.state = snapshot.CheckpointState{Settled: true, Completed: false}
+
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+
+		pod := f.pod(t)
+		if pod == nil {
+			t.Fatal("source pod was deleted, want it unfenced")
+		}
+		if pod.Labels[util.LabelFenced] != "" {
+			t.Errorf("source pod labels = %v, want %s removed", pod.Labels, util.LabelFenced)
+		}
+
+		deletedJob := &pmv1alpha1.PodMigrationJob{}
+		err := f.client.Get(context.Background(), types.NamespacedName{Namespace: fenceTestNS, Name: fenceTestJob}, deletedJob)
+		if err == nil && controllerutil.ContainsFinalizer(deletedJob, SourceFenceFinalizer) {
+			t.Errorf("job still contains %s finalizer: %v", SourceFenceFinalizer, deletedJob.Finalizers)
+		}
+		if !hasEvent(f.events(), "SourceUnfenced") {
+			t.Error("expected SourceUnfenced event")
+		}
+	})
+
+	t.Run("deleted mid-checkpoint while trigger in-flight", func(t *testing.T) {
+		now := metav1.Now()
+		job := fenceTestSnapshottingJob()
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &now
+		job.Status.Conditions = []metav1.Condition{{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionTrue,
+			Reason:             util.ReasonFenced,
+			LastTransitionTime: now,
+		}}
+		data, _ := json.Marshal(baselineOf(fenceTestSource(fenceTestCID, 0)))
+		job.Annotations = map[string]string{util.AnnotationFenceBaseline: string(data)}
+
+		f := newFenceFixture(t, interceptor.Funcs{}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+		// Checkpoint provider: not settled yet, in flight.
+		f.provider.state = snapshot.CheckpointState{Settled: false, Completed: false}
+
+		res, err := f.reconcile(t)
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		// While within fenceSettleTimeout, must requeue to wait for checkpoint to settle.
+		if res.RequeueAfter != fenceSettleInterval {
+			t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, fenceSettleInterval)
+		}
+		if f.provider.cleanupCalls == 0 {
+			t.Error("expected Cleanup to be called on deletion")
+		}
+		// Phase must be transitioned to Failed with reason Deleted so eviction webhook allows cold eviction if needed.
+		updatedJob := f.job(t)
+		if updatedJob.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+			t.Errorf("phase = %s, want Failed", updatedJob.Status.Phase)
+		}
+		if ready := meta.FindStatusCondition(updatedJob.Status.Conditions, "Ready"); ready == nil || ready.Reason != "Deleted" {
+			t.Errorf("Ready condition = %+v, want reason Deleted", ready)
+		}
+		// Now simulate checkpoint settled without completing:
+		f.provider.state = snapshot.CheckpointState{Settled: true, Completed: false}
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("second Reconcile: %v", err)
+		}
+		// Pod is unfenced, finalizer removed.
+		pod := f.pod(t)
+		if pod == nil || pod.Labels[util.LabelFenced] != "" {
+			t.Fatalf("pod = %+v, want unfenced", pod)
+		}
+		deletedJob := &pmv1alpha1.PodMigrationJob{}
+		err = f.client.Get(context.Background(), types.NamespacedName{Namespace: fenceTestNS, Name: fenceTestJob}, deletedJob)
+		if err == nil && controllerutil.ContainsFinalizer(deletedJob, SourceFenceFinalizer) {
+			t.Errorf("finalizer %s was not removed", SourceFenceFinalizer)
+		}
+	})
+
+	t.Run("controller down at delete: active snapshotting job deleted 3m ago waits for settle window before unwedge", func(t *testing.T) {
+		// DeletionTimestamp is 3 minutes in the past, but Phase is Snapshotting and CompletionTime is nil
+		// (simulating controller being down/upgrading for 3 minutes after kubectl delete).
+		deletedAt := metav1.NewTime(time.Now().Add(-3 * time.Minute))
+		job := fenceTestSnapshottingJob()
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &deletedAt
+		job.Status.Conditions = []metav1.Condition{{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionTrue,
+			Reason:             util.ReasonFenced,
+			LastTransitionTime: deletedAt,
+		}}
+		data, _ := json.Marshal(baselineOf(fenceTestSource(fenceTestCID, 0)))
+		job.Annotations = map[string]string{util.AnnotationFenceBaseline: string(data)}
+
+		// Checkpoint is not yet settled.
+		f := newFenceFixture(t, interceptor.Funcs{}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+		f.provider.state = snapshot.CheckpointState{Settled: false, Completed: false}
+
+		res, err := f.reconcile(t)
+		if err != nil {
+			t.Fatalf("first Reconcile: %v", err)
+		}
+
+		// First reconcile: should transition to Failed (reason Deleted), set CompletionTime to ~now,
+		// and requeue for fence settle (fenceSettleInterval).
+		updatedJob := f.job(t)
+		if updatedJob.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+			t.Errorf("phase = %s, want Failed", updatedJob.Status.Phase)
+		}
+		if ready := meta.FindStatusCondition(updatedJob.Status.Conditions, "Ready"); ready == nil || ready.Reason != "Deleted" {
+			t.Errorf("Ready condition = %+v, want Reason=Deleted", ready)
+		}
+		if updatedJob.Status.CompletionTime == nil {
+			t.Fatal("CompletionTime was not set on first reconcile")
+		}
+		if res.RequeueAfter != fenceSettleInterval {
+			t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, fenceSettleInterval)
+		}
+
+		// MUST retain SourceFenceFinalizer and NOT fire SourceFenceDeleteTimedOut!
+		if !controllerutil.ContainsFinalizer(updatedJob, SourceFenceFinalizer) {
+			t.Errorf("finalizer %s was prematurely removed on first reconcile", SourceFenceFinalizer)
+		}
+		if hasEvent(f.events(), "SourceFenceDeleteTimedOut") {
+			t.Error("unexpected SourceFenceDeleteTimedOut warning event on first reconcile")
+		}
+	})
+}
+
+// TestDeleteActiveJob_PostCheckpoint verifies that deleting an active job after
+// its checkpoint completed keeps the source fenced, evicts it, and removes the finalizer (#167).
+func TestDeleteActiveJob_PostCheckpoint(t *testing.T) {
+	t.Run("checkpoint completed: source kept fenced and evicted", func(t *testing.T) {
+		now := metav1.Now()
+		job := fenceTestSnapshottingJob()
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &now
+		job.Status.Conditions = []metav1.Condition{{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionTrue,
+			Reason:             util.ReasonFenced,
+			LastTransitionTime: now,
+		}}
+		data, _ := json.Marshal(baselineOf(fenceTestSource(fenceTestCID, 0)))
+		job.Annotations = map[string]string{util.AnnotationFenceBaseline: string(data)}
+
+		f := newFenceFixture(t, interceptor.Funcs{}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+		f.provider.state = snapshot.CheckpointState{Settled: true, Completed: true}
+
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+
+		// In fake client, eviction deletes the source pod.
+		if f.pod(t) != nil {
+			t.Error("source pod was not evicted")
+		}
+
+		deletedJob := &pmv1alpha1.PodMigrationJob{}
+		err := f.client.Get(context.Background(), types.NamespacedName{Namespace: fenceTestNS, Name: fenceTestJob}, deletedJob)
+		if err == nil && controllerutil.ContainsFinalizer(deletedJob, SourceFenceFinalizer) {
+			t.Errorf("job still contains %s finalizer: %v", SourceFenceFinalizer, deletedJob.Finalizers)
+		}
+		if !hasEvent(f.events(), "SourceKeptFenced") {
+			t.Error("expected SourceKeptFenced event")
+		}
+	})
+
+	t.Run("source container changed: kept fenced and evicted even if checkpoint not completed", func(t *testing.T) {
+		now := metav1.Now()
+		job := fenceTestSnapshottingJob()
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &now
+		job.Status.Conditions = []metav1.Condition{{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionTrue,
+			Reason:             util.ReasonFenced,
+			LastTransitionTime: now,
+		}}
+		data, _ := json.Marshal(baselineOf(fenceTestSource(fenceTestCID, 0)))
+		job.Annotations = map[string]string{util.AnnotationFenceBaseline: string(data)}
+
+		// Source pod has restarted container
+		restartedPod := fencedPod(fenceTestSource("containerd://restarted", 1))
+		f := newFenceFixture(t, interceptor.Funcs{}, restartedPod, job)
+		f.provider.state = snapshot.CheckpointState{Settled: true, Completed: false}
+
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+
+		if f.pod(t) != nil {
+			t.Error("restarted source pod was not evicted")
+		}
+
+		deletedJob := &pmv1alpha1.PodMigrationJob{}
+		err := f.client.Get(context.Background(), types.NamespacedName{Namespace: fenceTestNS, Name: fenceTestJob}, deletedJob)
+		if err == nil && controllerutil.ContainsFinalizer(deletedJob, SourceFenceFinalizer) {
+			t.Errorf("job still contains %s finalizer: %v", SourceFenceFinalizer, deletedJob.Finalizers)
+		}
+		if !hasEvent(f.events(), "SourceKeptFenced") {
+			t.Error("expected SourceKeptFenced event")
+		}
+	})
+
+	t.Run("eviction refused by budget retries and retains finalizer", func(t *testing.T) {
+		now := metav1.Now()
+		job := fenceTestSnapshottingJob()
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &now
+		job.Status.Conditions = []metav1.Condition{{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionTrue,
+			Reason:             util.ReasonFenceKept,
+			LastTransitionTime: now,
+		}}
+
+		f := newFenceFixture(t, interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, sub string, obj client.Object, subObj client.Object, opts ...client.SubResourceCreateOption) error {
+				return apierrors.NewTooManyRequests("PDB refused eviction", 0)
+			},
+		}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+
+		res, err := f.reconcile(t)
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if res.RequeueAfter != keptSourceEvictionRetryInterval {
+			t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, keptSourceEvictionRetryInterval)
+		}
+
+		// Source must still be fenced and finalizer must still be present.
+		assertFenced(t, f.pod(t))
+		retainedJob := f.job(t)
+		if !controllerutil.ContainsFinalizer(retainedJob, SourceFenceFinalizer) {
+			t.Error("finalizer was removed while eviction was refused")
+		}
+	})
+
+	t.Run("eviction blocked past unwedge deadline removes finalizer to avoid permanent wedge", func(t *testing.T) {
+		// Both DeletionTimestamp and CompletionTime are 3 minutes ago (> DefaultFenceDeleteUnwedgeTimeout 2m).
+		deletedAt := metav1.NewTime(time.Now().Add(-3 * time.Minute))
+		job := fenceTestSnapshottingJob()
+		controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+		job.DeletionTimestamp = &deletedAt
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+		job.Status.CompletionTime = &deletedAt
+		job.Status.Conditions = []metav1.Condition{{
+			Type:               ConditionSourceFenced,
+			Status:             metav1.ConditionTrue,
+			Reason:             util.ReasonFenceKept,
+			LastTransitionTime: deletedAt,
+		}}
+
+		f := newFenceFixture(t, interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, sub string, obj client.Object, subObj client.Object, opts ...client.SubResourceCreateOption) error {
+				return apierrors.NewTooManyRequests("PDB refused eviction", 0)
+			},
+		}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+
+		if _, err := f.reconcile(t); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+
+		// Source pod stays fenced because eviction failed.
+		assertFenced(t, f.pod(t))
+		// But finalizer MUST be removed so deleting the PMJ doesn't wedge forever!
+		deletedJob := &pmv1alpha1.PodMigrationJob{}
+		err := f.client.Get(context.Background(), types.NamespacedName{Namespace: fenceTestNS, Name: fenceTestJob}, deletedJob)
+		if err == nil && controllerutil.ContainsFinalizer(deletedJob, SourceFenceFinalizer) {
+			t.Errorf("job still contains %s finalizer after unwedge deadline", SourceFenceFinalizer)
+		}
+		if !hasEvent(f.events(), "SourceFenceDeleteTimedOut") {
+			t.Error("expected SourceFenceDeleteTimedOut warning event")
+		}
+	})
+}
+
+// TestDeleteJob_NeverFenced verifies that deleting a job that never fenced a source
+// completes immediately without touching the source pod (#167).
+func TestDeleteJob_NeverFenced(t *testing.T) {
+	now := metav1.Now()
+	job := fenceTestSnapshottingJob()
+	job.Status.Phase = pmv1alpha1.PodMigrationJobPhasePending
+	job.Finalizers = []string{"other.io/cleanup"}
+	job.DeletionTimestamp = &now
+	// No SourceFenceFinalizer, never fenced.
+	pod := fenceTestSource(fenceTestCID, 0)
+
+	f := newFenceFixture(t, interceptor.Funcs{}, pod, job)
+	if _, err := f.reconcile(t); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// Source pod must remain untouched.
+	p := f.pod(t)
+	if p == nil {
+		t.Fatal("source pod was deleted")
+	}
+	if p.Labels[util.LabelFenced] != "" {
+		t.Errorf("source pod was fenced unexpectedly: %v", p.Labels)
 	}
 }

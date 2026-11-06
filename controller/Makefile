@@ -159,6 +159,12 @@ deploy: install ## Deploy controller (Deployment + RBAC + webhooks) to the clust
 	sed 's|<YOUR_CONTROLLER_IMAGE>|$(IMG)|g' deploy.yaml | kubectl apply -f -
 
 undeploy: ## Undeploy controller from the cluster.
+	@if kubectl get crd podmigrationjobs.podmigration.gke.io >/dev/null 2>&1; then \
+		kubectl delete podmigrationjobs.podmigration.gke.io --all --all-namespaces --ignore-not-found=true --wait=true --timeout=150s || true; \
+		kubectl get podmigrationjobs.podmigration.gke.io -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null | while read -r ns name; do \
+			[ -n "$$name" ] && kubectl patch podmigrationjob.podmigration.gke.io -n "$$ns" "$$name" --type=merge -p '{"metadata":{"finalizers":null}}' || true; \
+		done; \
+	fi
 	@if kubectl get crd podmigrations.podmigration.gke.io >/dev/null 2>&1; then \
 		kubectl delete podmigrations.podmigration.gke.io --all --all-namespaces --ignore-not-found=true --wait=true --timeout=600s || true; \
 	fi

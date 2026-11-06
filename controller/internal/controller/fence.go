@@ -15,9 +15,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
@@ -44,6 +46,8 @@ import (
 const (
 	// ConditionSourceFenced records the source's fence on the job.
 	ConditionSourceFenced = util.ConditionSourceFenced
+	// SourceFenceFinalizer prevents deletion of a job while its source is fenced (#167).
+	SourceFenceFinalizer = util.SourceFenceFinalizer
 
 	// ReasonTriggerCreateFailed fails a job whose checkpoint trigger the API
 	// server rejected (forbidden, invalid, or denied by admission). Retrying
@@ -59,6 +63,10 @@ const (
 	// DefaultFenceLateStopWatch is how long the controller watches a source it
 	// returned to service after a failed migration.
 	DefaultFenceLateStopWatch = 5 * time.Minute
+	// DefaultFenceDeleteUnwedgeTimeout bounds how long a deleting job waits for
+	// its source fence to settle before removing its finalizer to unwedge
+	// deletion (#167).
+	DefaultFenceDeleteUnwedgeTimeout = 2 * time.Minute
 
 	// fenceSettleTimeout bounds how long, after a failure, the controller
 	// waits for the engine's checkpoint to finish or go away. If it doesn't,
@@ -85,6 +93,13 @@ func (r *PodMigrationJobReconciler) fenceLateStopWatch() time.Duration {
 		return r.FenceLateStopWatch
 	}
 	return DefaultFenceLateStopWatch
+}
+
+func (r *PodMigrationJobReconciler) fenceDeleteUnwedgeTimeout() time.Duration {
+	if r.FenceDeleteUnwedgeTimeout > 0 {
+		return r.FenceDeleteUnwedgeTimeout
+	}
+	return DefaultFenceDeleteUnwedgeTimeout
 }
 
 // fenceBaseline records the source's containers when it was fenced, before its
@@ -258,10 +273,14 @@ func (r *PodMigrationJobReconciler) applyFence(ctx context.Context, pod *corev1.
 // fence.
 func (r *PodMigrationJobReconciler) fenceSource(ctx context.Context, job, origJob *pmv1alpha1.PodMigrationJob) error {
 	if _, done := jobFenceBaseline(job); done {
-		return nil
+		return r.addSourceFenceFinalizer(ctx, job, origJob)
 	}
 	pod, err := r.sourcePod(ctx, job, r.liveReader())
 	if err != nil || pod == nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		return err
+	}
+
+	if err := r.addSourceFenceFinalizer(ctx, job, origJob); err != nil {
 		return err
 	}
 
@@ -446,6 +465,9 @@ func (r *PodMigrationJobReconciler) decideSourceFence(ctx context.Context, job, 
 			return ctrl.Result{RequeueAfter: fenceSettleInterval}, true, nil
 		}
 		why = fmt.Sprintf("the checkpoint didn't finish within %v of the failure", fenceSettleTimeout)
+		if !job.DeletionTimestamp.IsZero() {
+			why = fmt.Sprintf("the checkpoint didn't finish within %v of deletion", fenceSettleTimeout)
+		}
 		completed = true
 	}
 
@@ -457,12 +479,16 @@ func (r *PodMigrationJobReconciler) decideSourceFence(ctx context.Context, job, 
 		return r.keepSourceFenced(ctx, job, origJob, pod, why)
 	}
 	if !triggered {
-		return r.unfenceSource(ctx, job, origJob, pod, cond, "The migration failed before its checkpoint was triggered", false)
+		why := "The migration failed before its checkpoint was triggered"
+		if !job.DeletionTimestamp.IsZero() {
+			why = "The migration was deleted before its checkpoint was triggered"
+		}
+		return r.unfenceSource(ctx, job, origJob, pod, cond, why, false)
 	}
 	if ok, diff := baseline.unchanged(pod); !ok {
 		return r.keepSourceFenced(ctx, job, origJob, pod, diff)
 	}
-	return r.unfenceSource(ctx, job, origJob, pod, cond, "The source never stopped, and its checkpoint never completed", true)
+	return r.unfenceSource(ctx, job, origJob, pod, cond, "The source never stopped, and its checkpoint never completed", job.DeletionTimestamp.IsZero())
 }
 
 // checkpointOutcome reports whether the job's checkpoint of the source
@@ -575,7 +601,7 @@ func (r *PodMigrationJobReconciler) watchUnfencedSource(ctx context.Context, job
 	}
 	baseline, triggered := jobFenceBaseline(job)
 	remaining := time.Until(cond.LastTransitionTime.Add(r.fenceLateStopWatch()))
-	if !triggered || remaining <= 0 {
+	if !triggered || remaining <= 0 || !job.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, false, nil
 	}
 	next := ctrl.Result{RequeueAfter: min(lateStopPollInterval, remaining)}
@@ -650,4 +676,92 @@ func (r *PodMigrationJobReconciler) evictKeptSource(ctx context.Context, job *pm
 	default:
 		return ctrl.Result{}, true, fmt.Errorf("evicting fenced source pod %s: %w", pod.Name, err)
 	}
+}
+
+// addSourceFenceFinalizer records SourceFenceFinalizer on job before its source
+// is fenced (#167).
+func (r *PodMigrationJobReconciler) addSourceFenceFinalizer(ctx context.Context, job, origJob *pmv1alpha1.PodMigrationJob) error {
+	if controllerutil.ContainsFinalizer(job, SourceFenceFinalizer) || !job.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	before := job.DeepCopy()
+	controllerutil.AddFinalizer(job, SourceFenceFinalizer)
+	if err := r.Patch(ctx, job, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("adding %s finalizer: %w", SourceFenceFinalizer, err)
+	}
+	*origJob = *job.DeepCopy()
+	return nil
+}
+
+// removeSourceFenceFinalizer removes SourceFenceFinalizer from job when the
+// fence has settled or the source is no longer fenced by this job (#167).
+func (r *PodMigrationJobReconciler) removeSourceFenceFinalizer(ctx context.Context, job, origJob *pmv1alpha1.PodMigrationJob) error {
+	if !controllerutil.ContainsFinalizer(job, SourceFenceFinalizer) {
+		return nil
+	}
+	before := job.DeepCopy()
+	controllerutil.RemoveFinalizer(job, SourceFenceFinalizer)
+	if err := r.Patch(ctx, job, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("removing %s finalizer: %w", SourceFenceFinalizer, err)
+	}
+	*origJob = *job.DeepCopy()
+	return nil
+}
+
+// finalizeSourceFence settles the source pod's fence before a deleting
+// PodMigrationJob is removed (#167). It marks an active job Failed (reason
+// Deleted) so the eviction webhook allows eviction, then reuses
+// resolveSourceFence. Once settled (or if settling remains blocked past the
+// unwedge timeout), the finalizer is removed.
+func (r *PodMigrationJobReconciler) finalizeSourceFence(ctx context.Context, job, origJob *pmv1alpha1.PodMigrationJob) (ctrl.Result, error) {
+	// Clean up any snapshot trigger so no checkpoint can start or proceed while deleting.
+	_ = r.getSnapshotProvider(job).Cleanup(ctx, job, job.Spec.PodRef.Name)
+
+	// Transition active jobs to Failed (reason Deleted) so the eviction webhook
+	// allows eviction instead of rejecting with 429 (#167), and resolveSourceFence
+	// applies the standard failure settlement rules.
+	if !invariants.IsTerminalPhase(job.Status.Phase) {
+		prevPhase := job.Status.Phase
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
+		now := metav1.Now()
+		if job.Status.CompletionTime == nil {
+			job.Status.CompletionTime = &now
+		}
+		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "Deleted",
+			Message:            "PodMigrationJob was deleted before migration completed",
+			ObservedGeneration: job.Generation,
+		})
+		if err := r.patchStatus(ctx, job, origJob); err != nil {
+			return ctrl.Result{}, err
+		}
+		*origJob = *job.DeepCopy()
+		metrics.MarkPMJInactive(job.Namespace + "/" + job.Name)
+		metrics.RecordOutcome("deleted")
+		r.recordPreviousPhaseDuration(job, prevPhase)
+		r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "MigrationFailed", "PodMigrationJob was deleted before migration completed")
+	}
+
+	res, handled, err := r.resolveSourceFence(ctx, job, origJob)
+	if !handled && err == nil {
+		return ctrl.Result{}, r.removeSourceFenceFinalizer(ctx, job, origJob)
+	}
+	if err == nil {
+		if live, lerr := r.sourcePod(ctx, job, r.liveReader()); lerr == nil && (live == nil || live.DeletionTimestamp != nil) {
+			return ctrl.Result{}, r.removeSourceFenceFinalizer(ctx, job, origJob)
+		}
+	}
+	unwedgeAnchor := job.DeletionTimestamp.Time
+	if job.Status.CompletionTime != nil && job.Status.CompletionTime.Time.After(unwedgeAnchor) {
+		unwedgeAnchor = job.Status.CompletionTime.Time
+	}
+	if time.Since(unwedgeAnchor) >= r.fenceDeleteUnwedgeTimeout() {
+		log.FromContext(ctx).Info("Timed out settling source fence after job deletion; removing finalizer to unwedge deletion", "job", job.Name, "error", err)
+		r.recordPodEvent(ctx, job, corev1.EventTypeWarning, "SourceFenceDeleteTimedOut",
+			"Timed out settling source fence after job deletion; removing finalizer with source still fenced")
+		return ctrl.Result{}, r.removeSourceFenceFinalizer(ctx, job, origJob)
+	}
+	return res, err
 }
