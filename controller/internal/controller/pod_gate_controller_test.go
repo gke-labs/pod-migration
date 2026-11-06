@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestPodGateReconciler_Reconcile(t *testing.T) {
@@ -2477,5 +2478,126 @@ func TestPodGate_EmptyRestoredPodName_UsesLiveReader(t *testing.T) {
 	}
 	if updatedPMJ.Status.RestoredPodUID != "uid-consumer-live" {
 		t.Errorf("PMJ RestoredPodUID must not be overwritten, got %q", updatedPMJ.Status.RestoredPodUID)
+	}
+}
+
+func TestPodGateReconciler_OperatorOwned_RayHead_UnGatedAndRestored(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+	pmjName := "pmj-sample-ray-head"
+	snapshotRef := "snapshot-ray-head-123"
+
+	gatedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "sample-ray-head-new",
+			UID:       "uid-head-replacement",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "headgroup",
+				"ray.io/node-type":             "head",
+			},
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ: pmjName,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: MigrationGateName},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+			Labels: map[string]string{
+				util.LabelParentName: clusterName,
+				util.LabelParentKind: clusterKind,
+				util.LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				util.AnnotationReplicaIdentityKey: "ray.io/group=headgroup,ray.io/node-type=head",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-head-origin"},
+			TargetPodUID: "uid-head-origin",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:       pmv1alpha1.PodMigrationJobPhaseRestoring,
+			SnapshotRef: snapshotRef,
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithObjects(gatedPod, pmj).
+		Build()
+
+	r := &PodGateReconciler{
+		Client:    client,
+		APIReader: client,
+		Scheme:    scheme,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      "sample-ray-head-new",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// 1. Verify gate is removed from replacement pod
+	updatedPod := &corev1.Pod{}
+	if err := client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "sample-ray-head-new"}, updatedPod); err != nil {
+		t.Fatalf("failed to fetch updated replacement pod: %v", err)
+	}
+	if podHasMigrationGate(updatedPod) {
+		t.Errorf("expected scheduling gate to be removed from Ray head replacement pod")
+	}
+
+	// 2. Verify snapshot restore annotation is injected
+	if updatedPod.Annotations["podsnapshot.gke.io/ps-name"] != snapshotRef {
+		t.Errorf("expected podsnapshot.gke.io/ps-name=%q, got %q", snapshotRef, updatedPod.Annotations["podsnapshot.gke.io/ps-name"])
+	}
+
+	// 3. Verify PMJ status updated
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ); err != nil {
+		t.Fatalf("failed to fetch updated PMJ: %v", err)
+	}
+	if !updatedPMJ.Status.Consumed {
+		t.Errorf("expected PMJ to be marked Consumed=true")
+	}
+	if !updatedPMJ.Status.GateReleased {
+		t.Errorf("expected PMJ to be marked GateReleased=true")
+	}
+	if updatedPMJ.Status.RestoredPodUID != "uid-head-replacement" {
+		t.Errorf("expected PMJ RestoredPodUID=%q, got %q", "uid-head-replacement", updatedPMJ.Status.RestoredPodUID)
 	}
 }

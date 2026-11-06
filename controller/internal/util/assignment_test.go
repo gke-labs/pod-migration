@@ -1387,3 +1387,800 @@ func TestFindUnassignedActivePMJ_OriginPodTransientReadError_SkipsCandidate(t *t
 		t.Errorf("expected candidate to be skipped, got %q", got)
 	}
 }
+
+func TestResolveParentWorkload_OperatorOwnedPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterUID := "ray-uid-1234"
+	clusterName := "my-raycluster"
+	isController := true
+	isNotController := false
+
+	tests := []struct {
+		name            string
+		ownerReferences []metav1.OwnerReference
+		expectedParent  string
+		expectedKind    string
+		expectedUID     string
+	}{
+		{
+			name: "RayCluster controller owner",
+			ownerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       "RayCluster",
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+			expectedParent: clusterName,
+			expectedKind:   "RayCluster",
+			expectedUID:    clusterUID,
+		},
+		{
+			name: "Non-controller owner followed by controller owner",
+			ownerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "custom.io/v1",
+					Kind:       "SomeGroup",
+					Name:       "group-1",
+					UID:        "group-uid-1",
+					Controller: &isNotController,
+				},
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       "RayCluster",
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+			expectedParent: clusterName,
+			expectedKind:   "RayCluster",
+			expectedUID:    clusterUID,
+		},
+		{
+			name: "Bare pod with only non-controller owner",
+			ownerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "custom.io/v1",
+					Kind:       "SomeGroup",
+					Name:       "group-1",
+					UID:        "group-uid-1",
+					Controller: &isNotController,
+				},
+			},
+			expectedParent: "",
+			expectedKind:   "",
+			expectedUID:    "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "test-pod",
+					Namespace:       namespace,
+					OwnerReferences: tc.ownerReferences,
+				},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+			parentName, parentKind, parentUID, err := ResolveParentWorkload(context.Background(), cl, pod)
+			if err != nil {
+				t.Fatalf("ResolveParentWorkload failed: %v", err)
+			}
+			if parentName != tc.expectedParent || parentKind != tc.expectedKind || parentUID != tc.expectedUID {
+				t.Errorf("expected (%q, %q, %q), got (%q, %q, %q)",
+					tc.expectedParent, tc.expectedKind, tc.expectedUID, parentName, parentKind, parentUID)
+			}
+		})
+	}
+}
+
+func TestResolveOperatorReplicaKey(t *testing.T) {
+	tests := []struct {
+		name        string
+		pod         *corev1.Pod
+		parentKind  string
+		expectedKey string
+		expectedOK  bool
+	}{
+		{
+			name: "RayCluster head pod with group and node-type",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"ray.io/group":     "headgroup",
+						"ray.io/node-type": "head",
+					},
+				},
+			},
+			parentKind:  "RayCluster",
+			expectedKey: "ray.io/group=headgroup,ray.io/node-type=head",
+			expectedOK:  true,
+		},
+		{
+			name: "RayCluster worker pod with group only",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"ray.io/group": "workergroup",
+					},
+				},
+			},
+			parentKind:  "RayCluster",
+			expectedKey: "ray.io/group=workergroup",
+			expectedOK:  true,
+		},
+		{
+			name: "RayCluster missing group",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"ray.io/node-type": "head",
+					},
+				},
+			},
+			parentKind:  "RayCluster",
+			expectedKey: "",
+			expectedOK:  false,
+		},
+		{
+			name: "Operator pod with pod-template-hash",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						appsv1.DefaultDeploymentUniqueLabelKey: "7b4c9f",
+					},
+				},
+			},
+			parentKind:  "CustomWorkload",
+			expectedKey: "pod-template-hash=7b4c9f",
+			expectedOK:  true,
+		},
+		{
+			name: "Explicit replica identity annotation takes precedence",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						AnnotationReplicaIdentityKey: "custom-identity-0",
+					},
+				},
+			},
+			parentKind:  "CustomWorkload",
+			expectedKey: "custom-identity-0",
+			expectedOK:  true,
+		},
+		{
+			name: "Stable-name operator pod without generateName",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:         "pytorch-worker-0",
+					GenerateName: "",
+				},
+			},
+			parentKind:  "PyTorchJob",
+			expectedKey: "pod-name=pytorch-worker-0",
+			expectedOK:  true,
+		},
+		{
+			name: "Generated-name operator pod without keys returns false",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:         "custom-worker-xyz",
+					GenerateName: "custom-worker-",
+					Labels: map[string]string{
+						"app": "foo",
+					},
+				},
+			},
+			parentKind:  "UnknownOperator",
+			expectedKey: "",
+			expectedOK:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotKey, gotOK := ResolveOperatorReplicaKey(tc.pod, tc.parentKind)
+			if gotOK != tc.expectedOK || gotKey != tc.expectedKey {
+				t.Errorf("ResolveOperatorReplicaKey() = (%q, %v), want (%q, %v)",
+					gotKey, gotOK, tc.expectedKey, tc.expectedOK)
+			}
+		})
+	}
+}
+
+func TestFindUnassignedActivePMJ_RayCluster_HeadPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	headReplicaKey := "ray.io/group=headgroup,ray.io/node-type=head"
+
+	// Pre-existing PMJ for the head pod
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-head-origin",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: clusterName,
+				LabelParentKind: clusterKind,
+				LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				AnnotationReplicaIdentityKey: headReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-head-origin"},
+			TargetPodUID: "origin-pod-uid-999",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	cIndexed := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		Build()
+
+	cLive := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj).
+		Build()
+
+	ctx := context.Background()
+
+	// 1. Indexed lookup for newly created replacement head pod
+	got, err := FindUnassignedActivePMJ(ctx, cIndexed, namespace, "sample-ray-head-new-generated", clusterName, clusterKind, clusterUID, "", "", true, headReplicaKey)
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ indexed failed: %v", err)
+	}
+	if got != pmj.Name {
+		t.Fatalf("expected indexed assignment to %q, got %q", pmj.Name, got)
+	}
+
+	// 2. Unindexed live reader fallback for replacement head pod
+	gotLive, errLive := FindUnassignedActivePMJ(ctx, cLive, namespace, "sample-ray-head-new-generated", clusterName, clusterKind, clusterUID, "", "", false, headReplicaKey)
+	if errLive != nil {
+		t.Fatalf("FindUnassignedActivePMJ live failed: %v", errLive)
+	}
+	if gotLive != pmj.Name {
+		t.Fatalf("expected live fallback assignment to %q, got %q", pmj.Name, gotLive)
+	}
+}
+
+func TestFindUnassignedActivePMJ_RayCluster_AmbiguousWorkerGroup_Refused(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	workerReplicaKey := "ray.io/group=workergroup,ray.io/node-type=worker"
+	isController := true
+
+	// PMJ for worker-1
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-worker-1",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: clusterName,
+				LabelParentKind: clusterKind,
+				LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				AnnotationReplicaIdentityKey: workerReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-worker-1"},
+			TargetPodUID: "worker-1-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	// Sibling worker-2 is alive and running in the cluster with the same replica key!
+	siblingWorker2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sample-ray-worker-2",
+			Namespace: namespace,
+			UID:       "worker-2-uid",
+			Labels: map[string]string{
+				"ray.io/group":     "workergroup",
+				"ray.io/node-type": "worker",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(pmj, siblingWorker2).
+		Build()
+
+	ctx := context.Background()
+
+	// A replacement pod arrives. Because siblingWorker2 shares the same replica key, it is ambiguous!
+	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "sample-ray-worker-new", clusterName, clusterKind, clusterUID, "", "", true, workerReplicaKey)
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ failed: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected assignment to be REFUSED due to ambiguous sibling, but got %q", got)
+	}
+}
+
+func TestFindUnassignedActivePMJ_Operator_MultipleCandidatePMJs_Refused(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	workerReplicaKey := "ray.io/group=workergroup,ray.io/node-type=worker"
+
+	// Two in-flight PMJs for the same parent with the exact same replica identity key!
+	pmj1 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-worker-1",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: clusterName,
+				LabelParentKind: clusterKind,
+				LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				AnnotationReplicaIdentityKey: workerReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-worker-1"},
+			TargetPodUID: "worker-1-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+	pmj2 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-worker-2",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: clusterName,
+				LabelParentKind: clusterKind,
+				LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				AnnotationReplicaIdentityKey: workerReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-worker-2"},
+			TargetPodUID: "worker-2-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(pmj1, pmj2).
+		Build()
+
+	ctx := context.Background()
+
+	// A replacement pod arrives. Because two active PMJs match the same replica key, it must refuse!
+	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "sample-ray-worker-new", clusterName, clusterKind, clusterUID, "", "", true, workerReplicaKey)
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ failed: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected assignment to be REFUSED due to multiple candidate PMJs, but got %q", got)
+	}
+}
+
+func TestFindUnassignedActivePMJ_IncarnationProtection_Operator(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	oldClusterUID := "ray-uid-old"
+	newClusterUID := "ray-uid-new"
+	headReplicaKey := "ray.io/group=headgroup,ray.io/node-type=head"
+
+	// PMJ from deleted previous incarnation of RayCluster
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-old-incarnation",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: clusterName,
+				LabelParentKind: clusterKind,
+				LabelParentUID:  oldClusterUID,
+			},
+			Annotations: map[string]string{
+				AnnotationReplicaIdentityKey: headReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-head"},
+			TargetPodUID: "old-pod-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		Build()
+
+	ctx := context.Background()
+
+	// Pod created under new RayCluster UID must NOT match the old PMJ!
+	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "sample-ray-head-new", clusterName, clusterKind, newClusterUID, "", "", true, headReplicaKey)
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ failed: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected old incarnation PMJ to be rejected, but matched %q", got)
+	}
+}
+
+func TestFindUnassignedActivePMJ_RayCluster_DifferentReplicaKey_Rejection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	workerReplicaKey := "ray.io/group=workergroup,ray.io/node-type=worker"
+	headReplicaKey := "ray.io/group=headgroup,ray.io/node-type=head"
+
+	// Active PMJ under RayCluster is for a worker pod
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-worker",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: clusterName,
+				LabelParentKind: clusterKind,
+				LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				AnnotationReplicaIdentityKey: workerReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-worker-0"},
+			TargetPodUID: "worker-0-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		Build()
+
+	ctx := context.Background()
+
+	// A replacement head pod arrives with headReplicaKey -> must NOT match the worker's PMJ!
+	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "sample-ray-head-new", clusterName, clusterKind, clusterUID, "", "", true, headReplicaKey)
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ failed: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected PMJ with different replica key to be rejected, but matched %q", got)
+	}
+}
+
+func TestFindUnassignedActivePMJ_InFlightUpgradeFallback_StableNameOperatorPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "pytorch-worker-0"
+	parentName := "pytorch-job-1"
+	parentKind := "PyTorchJob"
+	parentUID := "pytorch-uid-111"
+	replicaKey := "pod-name=" + podName
+
+	// PMJ created by pre-upgrade controller: bare-pod format (empty parent labels, indexed under <podName>/Pod)
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-pytorch-worker-0-preupgrade",
+			Namespace: namespace,
+			Labels:    map[string]string{
+				// Empty parent labels, as created by pre-upgrade controller
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "old-worker-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	cIndexed := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		Build()
+
+	cLive := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj).
+		Build()
+
+	ctx := context.Background()
+
+	// 1. Indexed lookup: replacement pod with parent PyTorchJob should fall back to bare-pod PMJ
+	got, err := FindUnassignedActivePMJ(ctx, cIndexed, namespace, podName, parentName, parentKind, parentUID, "", "", true, replicaKey)
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ indexed failed: %v", err)
+	}
+	if got != pmj.Name {
+		t.Fatalf("expected indexed in-flight upgrade fallback to match %q, got %q", pmj.Name, got)
+	}
+
+	// 2. Unindexed live reader fallback: replacement pod should also match
+	gotLive, errLive := FindUnassignedActivePMJ(ctx, cLive, namespace, podName, parentName, parentKind, parentUID, "", "", false, replicaKey)
+	if errLive != nil {
+		t.Fatalf("FindUnassignedActivePMJ live failed: %v", errLive)
+	}
+	if gotLive != pmj.Name {
+		t.Fatalf("expected live fallback to match %q, got %q", pmj.Name, gotLive)
+	}
+}
+
+func TestFindUnassignedActivePMJ_Unindexed_LiveSiblingAmbiguity(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	workerReplicaKey := "ray.io/group=workergroup,ray.io/node-type=worker"
+	isController := true
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-sample-ray-worker-1",
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: clusterName,
+				LabelParentKind: clusterKind,
+				LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				AnnotationReplicaIdentityKey: workerReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-worker-1"},
+			TargetPodUID: "worker-1-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	// Sibling worker-2 is running with the same replica key
+	siblingWorker2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sample-ray-worker-2",
+			Namespace: namespace,
+			UID:       "worker-2-uid",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "workergroup",
+				"ray.io/node-type":             "worker",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pmj, siblingWorker2).
+		Build()
+
+	ctx := context.Background()
+
+	// Calling FindUnassignedActivePMJ with indexed=false when an ambiguous sibling exists must refuse!
+	got, err := FindUnassignedActivePMJ(ctx, cl, namespace, "sample-ray-worker-new", clusterName, clusterKind, clusterUID, "", "", false, workerReplicaKey)
+	if err != nil {
+		t.Fatalf("FindUnassignedActivePMJ failed: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected unindexed assignment to be REFUSED due to ambiguous live sibling, got %q", got)
+	}
+}
+
+func TestResolveCollision_OperatorOwned_LoserIdentified(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	headReplicaKey := "ray.io/group=headgroup,ray.io/node-type=head"
+	isController := true
+	pmjName := "pmj-sample-ray-head"
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pmjName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelParentName: clusterName,
+				LabelParentKind: clusterKind,
+				LabelParentUID:  clusterUID,
+			},
+			Annotations: map[string]string{
+				AnnotationReplicaIdentityKey: headReplicaKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-head-origin"},
+			TargetPodUID: "head-origin-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	now := time.Now()
+	// Pod 1 was created earlier (winner)
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sample-ray-head-repl-1",
+			Namespace:         namespace,
+			UID:               "pod1-uid",
+			CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Second)),
+			Labels: map[string]string{
+				"ray.io/group":     "headgroup",
+				"ray.io/node-type": "head",
+			},
+			Annotations: map[string]string{
+				AnnotationAssignedPMJ: pmjName,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	// Pod 2 was created later (loser)
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sample-ray-head-repl-2",
+			Namespace:         namespace,
+			UID:               "pod2-uid",
+			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Second)),
+			Labels: map[string]string{
+				"ray.io/group":     "headgroup",
+				"ray.io/node-type": "head",
+			},
+			Annotations: map[string]string{
+				AnnotationAssignedPMJ: pmjName,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
+		WithObjects(pmj, pod1, pod2).
+		Build()
+
+	ctx := context.Background()
+
+	// 1. Resolve collision for winner (pod1) -> unchanged
+	correctedWinner, changedWinner, errWinner := ResolveCollision(ctx, cl, pod1, pmjName, clusterName, clusterKind, clusterUID)
+	if errWinner != nil {
+		t.Fatalf("ResolveCollision for winner failed: %v", errWinner)
+	}
+	if changedWinner {
+		t.Errorf("expected winner to remain unchanged, but changed was true")
+	}
+	if correctedWinner != pmjName {
+		t.Errorf("expected winner to keep PMJ %q, got %q", pmjName, correctedWinner)
+	}
+
+	// 2. Resolve collision for loser (pod2) -> loser identified, cleared (changed=true, corrected="")
+	correctedLoser, changedLoser, errLoser := ResolveCollision(ctx, cl, pod2, pmjName, clusterName, clusterKind, clusterUID)
+	if errLoser != nil {
+		t.Fatalf("ResolveCollision for loser failed: %v", errLoser)
+	}
+	if !changedLoser {
+		t.Errorf("expected loser changed=true")
+	}
+	if correctedLoser != "" {
+		t.Errorf("expected loser to have PMJ assignment cleared (empty), got %q", correctedLoser)
+	}
+}

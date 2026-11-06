@@ -65,13 +65,17 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 
 	var podTemplateHash string
 	var jobCompletionIndex string
+	var replicaKey string
 	if pod.Labels != nil {
 		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
 		jobCompletionIndex = pod.Labels[util.LabelJobCompletionIndex]
 	}
+	if !util.IsBuiltInWorkloadKind(parentKind) {
+		replicaKey, _ = util.ResolveOperatorReplicaKey(pod, parentKind)
+	}
 
 	// Find active unassigned PMJ
-	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true)
+	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true, replicaKey)
 	if err != nil {
 		logger.Error(err, "Failed to check unassigned active PMJs")
 		return admission.Errored(http.StatusInternalServerError, err)
@@ -91,7 +95,11 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 				return admission.Errored(http.StatusInternalServerError, err)
 			}
 		}
-		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex, false)
+		liveReplicaKey := replicaKey
+		if !util.IsBuiltInWorkloadKind(liveParentKind) {
+			liveReplicaKey, _ = util.ResolveOperatorReplicaKey(pod, liveParentKind)
+		}
+		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex, false, liveReplicaKey)
 		if err != nil {
 			logger.Error(err, "Failed to check unassigned active PMJs via APIReader fallback")
 			return admission.Errored(http.StatusInternalServerError, err)

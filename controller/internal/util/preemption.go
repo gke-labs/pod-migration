@@ -332,6 +332,14 @@ func BuildPMJLabelsAndAnnotationsForPolicy(
 	}
 
 	var jobAnnotations map[string]string
+	if pod != nil && !IsBuiltInWorkloadKind(parentKind) {
+		if rk, ok := ResolveOperatorReplicaKey(pod, parentKind); ok && rk != "" {
+			if jobAnnotations == nil {
+				jobAnnotations = make(map[string]string)
+			}
+			jobAnnotations[AnnotationReplicaIdentityKey] = rk
+		}
+	}
 	baseTimeout := defaultTimeout
 	if baseTimeout <= 0 {
 		baseTimeout = DefaultMigrationTimeout
