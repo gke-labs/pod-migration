@@ -143,9 +143,15 @@ func TestEnsureTrigger_SetsColdStartBypassBeforeCreatingTrigger(t *testing.T) {
 	if v, ok := body.Metadata.Annotations[psNameAnnotation]; !ok || v != "" {
 		t.Errorf("patch sets %s = %q (present: %t), want an empty value", psNameAnnotation, v, ok)
 	}
+	if v := body.Metadata.Annotations[util.AnnotationColdStartBypassJob]; v != "test-job" {
+		t.Errorf("patch sets %s = %q, want %q", util.AnnotationColdStartBypassJob, v, "test-job")
+	}
 
 	got := sourceAnnotations(t, c)
 	assertColdStartBypass(t, got)
+	if v := got[util.AnnotationColdStartBypassJob]; v != "test-job" {
+		t.Errorf("source %s = %q, want %q", util.AnnotationColdStartBypassJob, v, "test-job")
+	}
 	if got["keep"] != "me" {
 		t.Errorf("other annotations were not preserved: %v", got)
 	}
@@ -205,8 +211,8 @@ func TestEnsureTrigger_ColdStartBypassIsIdempotent(t *testing.T) {
 func TestEnsureTrigger_NoTriggerWhenColdStartBypassFails(t *testing.T) {
 	scheme := setupTestScheme()
 	for name, patchErr := range map[string]error{
-		// The API server's answer when the pod was replaced under the same name.
-		"uid precondition fails": apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, bypassTestPodName, errors.New("Precondition failed: UID in precondition")),
+		// The API server's answer when the pod was replaced under the same name: 422 Invalid (field is immutable).
+		"uid precondition fails": apierrors.NewInvalid(schema.GroupKind{Group: "", Kind: "Pod"}, bypassTestPodName, nil),
 		"transient error":        errors.New("connection reset by peer"),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -223,8 +229,12 @@ func TestEnsureTrigger_NoTriggerWhenColdStartBypassFails(t *testing.T) {
 				}).
 				Build()
 
-			if _, err := NewGKEProvider(c, scheme).EnsureTrigger(context.Background(), bypassTestJob(), bypassTestPodName); err == nil {
-				t.Fatal("expected an error so the job requeues")
+			_, err := NewGKEProvider(c, scheme).EnsureTrigger(context.Background(), bypassTestJob(), bypassTestPodName)
+			if err == nil {
+				t.Fatal("expected an error so the job requeues or fails")
+			}
+			if name == "uid precondition fails" && !apierrors.IsInvalid(err) {
+				t.Errorf("expected apierrors.IsInvalid, got: %v", err)
 			}
 			if triggerExists(t, c) {
 				t.Fatal("trigger was created without the cold-start bypass")
@@ -330,6 +340,9 @@ func TestEnsureSourceColdStartBypass_Envtest(t *testing.T) {
 	}
 	got := readAnnotations()
 	assertColdStartBypass(t, got)
+	if got[util.AnnotationColdStartBypassJob] != job.Name {
+		t.Errorf("source %s = %q, want %q", util.AnnotationColdStartBypassJob, got[util.AnnotationColdStartBypassJob], job.Name)
+	}
 	if got["keep"] != "me" {
 		t.Errorf("other annotations were not preserved: %v", got)
 	}
@@ -341,6 +354,7 @@ func TestEnsureSourceColdStartBypass_Envtest(t *testing.T) {
 	assertColdStartBypass(t, readAnnotations())
 
 	// A pod replaced under the same name has another UID and must not be patched.
+	// The real API server rejects the immutable metadata.uid mismatch with 422 Invalid.
 	replaced := job.DeepCopy()
 	replaced.Spec.TargetPodUID = "00000000-0000-0000-0000-000000000000"
 	if err := c.Patch(ctx, pod, client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"annotations":{"podsnapshot.gke.io/ps-name":"older-snapshot"}}}`))); err != nil {
@@ -348,6 +362,8 @@ func TestEnsureSourceColdStartBypass_Envtest(t *testing.T) {
 	}
 	if _, err := provider.ensureSourceColdStartBypass(ctx, replaced, "source"); err == nil {
 		t.Fatal("expected the UID precondition to refuse the patch")
+	} else if !apierrors.IsInvalid(err) {
+		t.Errorf("expected 422 Invalid from real API server, got: %v", err)
 	}
 	if v := readAnnotations()[psNameAnnotation]; v != "older-snapshot" {
 		t.Errorf("annotation changed despite the UID mismatch: %q", v)

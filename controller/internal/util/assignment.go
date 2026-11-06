@@ -24,6 +24,7 @@ const (
 	LabelJobCompletionIndex      = batchv1.JobCompletionIndexAnnotation
 	LabelOriginPodName           = "pod-migration.gke.io/origin-pod-name"
 	AnnotationAssignedPMJ        = "pod-migration.gke.io/assigned-pmj"
+	AnnotationColdStartBypassJob = "pod-migration.gke.io/cold-start-bypass-job"
 	AnnotationRestoreCompleted   = "pod-migration.gke.io/restore-completed"
 	AnnotationMismatchSince      = "pod-migration.gke.io/mismatch-since"
 	AnnotationPDBEvictionTimeout = "pod-migration.gke.io/pdb-eviction-timeout"

@@ -15,6 +15,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 func TestParseMode(t *testing.T) {
@@ -256,6 +257,169 @@ func TestInvariants_I2_ReplacementMigratedAgain_TargetingPMJs(t *testing.T) {
 	vs := EvaluateI2(&ReconcileSnapshot{PrimaryPod: replacement, PrimaryPMJ: first})
 	if len(vs) != 1 || vs[0].Reason != "SucceededPodMissingRestoreAnnotation" {
 		t.Fatalf("expected I2 SucceededPodMissingRestoreAnnotation without it, got %+v", vs)
+	}
+}
+
+// TestInvariants_I2_ExemptionNarrowedToBypassAndStampedJob covers #163:
+//  1. Guarding migratedAgain with coldStartBypass: if the replacement carries a different
+//     non-empty snapshot name, I2 must still flag it even if a newer job targets the pod.
+//  2. Stamping the bypassing job's name (AnnotationColdStartBypassJob): I2 exempts on that
+//     annotation matching FormatPMJName even if the newer job was deleted from the snapshot/cluster.
+//  3. Requiring FormatPMJName prevents arbitrary annotations from suppressing I2.
+func TestInvariants_I2_ExemptionNarrowedToBypassAndStampedJob(t *testing.T) {
+	created := metav1.NewTime(time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC))
+	first := pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-first", CreationTimestamp: created},
+		Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "uid-source"},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			SnapshotRef:     "snap-first",
+			RestoredPodName: "repl-pod",
+			RestoredPodUID:  "uid-repl",
+		},
+	}
+	secondJobName := util.FormatPMJName("repl-pod", "uid-repl")
+	second := pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: secondJobName, CreationTimestamp: metav1.NewTime(created.Add(time.Minute))},
+		Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "uid-repl"},
+		Status:     pmv1alpha1.PodMigrationJobStatus{Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting},
+	}
+
+	t.Run("different non-empty snapshot name violates I2 even with newer job", func(t *testing.T) {
+		podWithWrongSnap := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "repl-pod",
+				UID:       types.UID("uid-repl"),
+				Annotations: map[string]string{
+					AnnotationAssignedPMJ:        "pmj-first",
+					AnnotationPSName:             "wrong-snapshot",
+					AnnotationColdStartBypassJob: secondJobName,
+				},
+			},
+		}
+		s := &ReconcileSnapshot{
+			PrimaryPMJ:    &first,
+			NamespacePMJs: []pmv1alpha1.PodMigrationJob{first, second},
+			NamespacePods: []corev1.Pod{podWithWrongSnap},
+		}
+		vs := EvaluateI2(s)
+		if len(vs) != 1 || vs[0].Reason != "SucceededPodMissingRestoreAnnotation" {
+			t.Fatalf("expected I2 violation when replacement carries wrong snapshot name, got %+v", vs)
+		}
+	})
+
+	t.Run("cold-start bypass exempt when bypass job annotation is present even after job is deleted", func(t *testing.T) {
+		podWithBypassJob := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "repl-pod",
+				UID:       types.UID("uid-repl"),
+				Annotations: map[string]string{
+					AnnotationAssignedPMJ:        "pmj-first",
+					AnnotationPSName:             "",
+					AnnotationColdStartBypassJob: secondJobName,
+				},
+			},
+		}
+		// second is NOT in NamespacePMJs (simulating manual deletion)
+		s := &ReconcileSnapshot{
+			PrimaryPMJ:    &first,
+			NamespacePMJs: []pmv1alpha1.PodMigrationJob{first},
+			NamespacePods: []corev1.Pod{podWithBypassJob},
+		}
+		vs := EvaluateI2(s)
+		if len(vs) != 0 {
+			t.Fatalf("expected no I2 violation when AnnotationColdStartBypassJob matches FormatPMJName, got %+v", vs)
+		}
+	})
+
+	t.Run("cold-start bypass with own job name does not exempt", func(t *testing.T) {
+		podWithOwnJob := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "repl-pod",
+				UID:       types.UID("uid-repl"),
+				Annotations: map[string]string{
+					AnnotationAssignedPMJ:        "pmj-first",
+					AnnotationPSName:             "",
+					AnnotationColdStartBypassJob: "pmj-first", // self, not a newer bypassing job
+				},
+			},
+		}
+		s := &ReconcileSnapshot{
+			PrimaryPMJ:    &first,
+			NamespacePMJs: []pmv1alpha1.PodMigrationJob{first},
+			NamespacePods: []corev1.Pod{podWithOwnJob},
+		}
+		vs := EvaluateI2(s)
+		if len(vs) != 1 || vs[0].Reason != "SucceededPodMissingRestoreAnnotation" {
+			t.Fatalf("expected I2 violation when AnnotationColdStartBypassJob names self, got %+v", vs)
+		}
+	})
+
+	t.Run("cold-start bypass with spoofed or malformed bypass job name does not exempt", func(t *testing.T) {
+		podWithSpoofedJob := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "repl-pod",
+				UID:       types.UID("uid-repl"),
+				Annotations: map[string]string{
+					AnnotationAssignedPMJ:        "pmj-first",
+					AnnotationPSName:             "",
+					AnnotationColdStartBypassJob: "arbitrary-unformatted-name",
+				},
+			},
+		}
+		s := &ReconcileSnapshot{
+			PrimaryPMJ:    &first,
+			NamespacePMJs: []pmv1alpha1.PodMigrationJob{first},
+			NamespacePods: []corev1.Pod{podWithSpoofedJob},
+		}
+		vs := EvaluateI2(s)
+		if len(vs) != 1 || vs[0].Reason != "SucceededPodMissingRestoreAnnotation" {
+			t.Fatalf("expected I2 violation when AnnotationColdStartBypassJob does not match FormatPMJName, got %+v", vs)
+		}
+	})
+}
+
+// TestInvariants_I2_ReplacedPodWithSameNameIgnored covers #163 Note 2:
+// If a replacement pod (such as a StatefulSet pod web-0) is migrated again within the
+// 30-minute GC window, the new web-0 carries a new UID and snap2. I2 must match by
+// RestoredPodUID and skip the check when pod.UID != RestoredPodUID, preventing false
+// violations on job#1.
+func TestInvariants_I2_ReplacedPodWithSameNameIgnored(t *testing.T) {
+	created := metav1.NewTime(time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC))
+	job1 := pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-job-1", CreationTimestamp: created},
+		Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "uid-source-0"},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:           pmv1alpha1.PodMigrationJobPhaseSucceeded,
+			SnapshotRef:     "snap-1",
+			RestoredPodName: "web-0",
+			RestoredPodUID:  "uid-web-0-v1",
+		},
+	}
+	// Recreated StatefulSet pod web-0 with a new UID and snap-2 from job-2
+	newWeb0 := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "web-0",
+			UID:       types.UID("uid-web-0-v2"),
+			Annotations: map[string]string{
+				AnnotationAssignedPMJ: "pmj-job-2",
+				AnnotationPSName:      "snap-2",
+			},
+		},
+	}
+	s := &ReconcileSnapshot{
+		PrimaryPMJ:    &job1,
+		NamespacePMJs: []pmv1alpha1.PodMigrationJob{job1},
+		NamespacePods: []corev1.Pod{newWeb0},
+	}
+	vs := EvaluateI2(s)
+	if len(vs) != 0 {
+		t.Fatalf("expected no I2 violation for job#1 when web-0 UID does not match RestoredPodUID, got %+v", vs)
 	}
 }
 
