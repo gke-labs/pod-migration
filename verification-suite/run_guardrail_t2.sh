@@ -501,6 +501,7 @@ finish_and_assert_run() {
     --controller-ns "${CONTROLLER_NS}"
     --assert-zero-invariants
     --assert-clean-outcomes
+    --max-migrations-per-pod 1
     --assert-verdict-matches-data
   )
   if [[ "${allow_cold_start}" == "true" ]]; then
@@ -1246,13 +1247,19 @@ run_scenario_s4() {
   while IFS= read -r c_pod_line; do
     [[ -n "${c_pod_line}" ]] && c_pods+=("${c_pod_line}")
   done < <(get_active_pods "app=t2-counter")
-  for p in "${c_pods[@]}" "${pg_pod}"; do
+  for p in "${c_pods[@]}"; do
     evict_pod "${p}"
   done
+  local pg_node
+  pg_node="$(kubectl get pod -n "${NAMESPACE}" "${pg_pod}" -o jsonpath='{.spec.nodeName}')"
+  cordon_node "${pg_node}"
+  drain_pod_selector "${pg_node}" "app=t2-postgres" 240
 
   for p in "${c_pods[@]}" "${pg_pod}"; do
     wait_for_pmj_terminal "${p}" "Succeeded" 300
   done
+  assert_single_pmj_for_pod "${run_dir}" "${pg_pod}" "postgres"
+  uncordon_all_tracked_nodes
   kubectl rollout status deployment/t2-counter -n "${NAMESPACE}" --timeout=180s >/dev/null
   kubectl rollout status statefulset/t2-postgres -n "${NAMESPACE}" --timeout=180s >/dev/null
 
@@ -3299,6 +3306,23 @@ EOF
     die "Expected assert_single_pmj_for_pod to fail closed when multiple PodMigrationJobs exist for t2-redis-0 (multi-hop drain loop)"
   fi
   rm -rf "${drain_test_dir}"
+
+  # Verify pmprofiler analyze --max-migrations-per-pod 1 fails closed on multi-hop migration loops (#192)
+  # even when every hop individually succeeds with Outcome=restored.
+  local neg_multihop_dir="${OUT_DIR}/neg-multi-hop"
+  cp -r "${OUT_DIR}/s6" "${neg_multihop_dir}"
+  rm -f "${neg_multihop_dir}/run.json"
+  cat >>"${neg_multihop_dir}/records.ndjson" <<'EOF'
+{"ts":"2026-09-27T10:00:20Z","type":"add","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-s6-hop2","uid":"uid-pmj-s6-hop2","creationTimestamp":"2026-09-27T10:00:20Z"},"spec":{"podRef":{"name":"redis-s6-0"},"targetPodUID":"uid-redis-s6-0-dst"},"status":{"phase":"Pending"}}}
+{"ts":"2026-09-27T10:00:22Z","type":"add","gvr":"pods.v1.","obj":{"metadata":{"name":"redis-s6-0","uid":"uid-redis-s6-0-hop3","creationTimestamp":"2026-09-27T10:00:22Z","labels":{"app":"redis"},"annotations":{"podmigration.gke.io/assigned-pmj":"pmj-s6-hop2","podsnapshot.gke.io/ps-name":"snap-redis-s6-0-hop2"}},"spec":{"nodeName":"gke-node-a"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-09-27T10:00:28Z"}]}}}
+{"ts":"2026-09-27T10:00:30Z","type":"update","gvr":"podmigrationjobs.v1alpha1.podmigration.gke.io","obj":{"metadata":{"name":"pmj-s6-hop2","uid":"uid-pmj-s6-hop2","creationTimestamp":"2026-09-27T10:00:20Z"},"spec":{"podRef":{"name":"redis-s6-0"},"targetPodUID":"uid-redis-s6-0-dst"},"status":{"phase":"Succeeded","completionTime":"2026-09-27T10:00:30Z","restoredPodName":"redis-s6-0","restoredPodUID":"uid-redis-s6-0-hop3","conditions":[{"type":"Restored","status":"True","reason":"RestoreVerified","lastTransitionTime":"2026-09-27T10:00:30Z"}]}}}
+EOF
+  local multihop_out=""
+  if multihop_out="$("${PMPROFILER_BIN}" analyze --run "${neg_multihop_dir}" --assert-zero-invariants --assert-clean-outcomes --max-migrations-per-pod 1 --assert-verdict-matches-data 2>&1)"; then
+    die "Expected pmprofiler analyze --max-migrations-per-pod 1 to fail closed on multi-hop migration loop (#192)"
+  fi
+  grep -q 'multi-hop migration loop detected' <<<"${multihop_out}" || die "Expected multi-hop failure output to report 'multi-hop migration loop detected', got: ${multihop_out}"
+  rm -rf "${neg_multihop_dir}"
 
   log "Self-test PASSED: S1-S8 analyzed with 0 invariant violations, continuity failure modes (#103), S7 verdict-matches-data & preflight gates (#104), S8 phase-continuity checks (#149/#151/#131), StatefulSet single-hop kubectl drain check, runtime-agnostic templates, and report generated at ${report_html}"
 }

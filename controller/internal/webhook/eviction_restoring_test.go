@@ -274,3 +274,296 @@ func TestEvictionGate_StaleOriginDrainOnSameNameReplacementAnswers404(t *testing
 		})
 	}
 }
+
+// simulateKubectlDrainStep models one 5-second iteration of kubectl/pkg/drain's
+// evictPod + waitForDelete loop for a single pod name:
+//  1. Sends POST /api/v1/namespaces/<ns>/pods/<podName>/eviction by name only
+//     (no Preconditions.UID).
+//  2. On 404 NotFound (or 200 Allowed), breaks out of evictPod and runs
+//     waitForDelete, which checks whether the pod is gone or its UID changed
+//     from originalUID.
+//  3. On 429 TooManyRequests, calls GET /pods/<podName> and only checks
+//     IsNotFound(err) (does NOT compare UID inside evictPod), remaining in the
+//     retry loop.
+func simulateKubectlDrainStep(
+	ctx context.Context,
+	t *testing.T,
+	c client.Client,
+	gate *EvictionGate,
+	namespace, podName string,
+	originalUID types.UID,
+) (drainComplete bool, statusCode int32) {
+	t.Helper()
+	dryRun := false
+	req := admission.Request{}
+	req.Namespace = namespace
+	req.Name = podName
+	req.SubResource = "eviction"
+	req.DryRun = &dryRun
+	resp := gate.Handle(ctx, req)
+
+	if resp.Allowed {
+		var p corev1.Pod
+		if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &p); err == nil {
+			_ = c.Delete(ctx, &p)
+		}
+		var after corev1.Pod
+		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &after)
+		if err != nil || after.UID != originalUID {
+			return true, http.StatusOK
+		}
+		return false, http.StatusOK
+	}
+
+	code := int32(0)
+	if resp.Result != nil {
+		code = resp.Result.Code
+	}
+	if code == http.StatusNotFound && resp.Result.Reason == metav1.StatusReasonNotFound {
+		// kubectl drain evictPod treats apierrors.IsNotFound(err) as success (nil)
+		// and proceeds to waitForDelete, which verifies UID != originalUID.
+		var after corev1.Pod
+		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &after)
+		if err != nil || after.UID != originalUID {
+			return true, http.StatusNotFound
+		}
+		t.Fatalf("EvictionGate returned 404 NotFound while original pod UID %s is still present", originalUID)
+	}
+
+	if code == http.StatusTooManyRequests {
+		// kubectl drain evictPod sleeps 5s, then GETs the pod by name and only
+		// exits if IsNotFound(err) is true (ignoring UID changes until POST /eviction
+		// returns 200 or 404).
+		var current corev1.Pod
+		if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: podName}, &current); err != nil {
+			return true, http.StatusTooManyRequests
+		}
+		return false, http.StatusTooManyRequests
+	}
+
+	t.Fatalf("unexpected admission response in kubectl drain loop: allowed=%t result=%+v", resp.Allowed, resp.Result)
+	return false, code
+}
+
+func countPMJsInNamespace(ctx context.Context, t *testing.T, c client.Client, namespace string) int {
+	t.Helper()
+	var list pmv1alpha1.PodMigrationJobList
+	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		t.Fatalf("list PodMigrationJobs: %v", err)
+	}
+	return len(list.Items)
+}
+
+// TestKubectlDrainLoop_StatefulSetSingleHopAndRollingDrain is the Tier-1 (T1)
+// guardrail regression test for #192: it drives the full client-go `kubectl drain`
+// 5-second retry loop across a StatefulSet pod migration lifecycle and asserts:
+//  1. Single-node drain of `node-a` terminates cleanly in 1 migration hop (never
+//     spawning a 2nd PMJ when the same-name replacement pod lands on uncordoned `node-b`).
+//  2. Sequential rolling drain (`node-a` followed by `node-b`) holds with 429 on
+//     `node-b` while hop 1 is still Restoring (#162), then spawns exactly 1 second
+//     migration (`node-b` -> `node-c`) once hop 1 reaches Succeeded, and terminates
+//     cleanly at 2 total PMJs (never a 3rd hop).
+func TestKubectlDrainLoop_StatefulSetSingleHopAndRollingDrain(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	const (
+		ns      = "default"
+		podName = "pm-redis-0"
+		uid1    = types.UID("11111111-aaaa-bbbb-cccc-000000000001")
+		uid2    = types.UID("22222222-aaaa-bbbb-cccc-000000000002")
+		uid3    = types.UID("33333333-aaaa-bbbb-cccc-000000000003")
+	)
+
+	gvisorClass := "gvisor"
+	makeStatefulSetPod := func(uid types.UID, nodeName string, annotations map[string]string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   ns,
+				Name:        podName,
+				UID:         uid,
+				Labels:      map[string]string{"pod-migration.gke.io/enabled": "true", "app": "redis"},
+				Annotations: annotations,
+			},
+			Spec: corev1.PodSpec{
+				NodeName:         nodeName,
+				RuntimeClassName: &gvisorClass,
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+	}
+
+	baseObjs := budgetTestObjects(nil)
+	// Replace the default budgetTestPod with our StatefulSet pod pm-redis-0 on node-a.
+	objs := []client.Object{
+		baseObjs[1], // PodMigration policy in default namespace
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Spec: corev1.NodeSpec{Unschedulable: true}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}, Spec: corev1.NodeSpec{Unschedulable: false}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-c"}, Spec: corev1.NodeSpec{Unschedulable: false}},
+		makeStatefulSetPod(uid1, "node-a", nil),
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		Build()
+
+	gate := &EvictionGate{
+		Client:    c,
+		APIReader: c,
+		Recorder:  record.NewFakeRecorder(32),
+	}
+
+	// --- Hop 1: kubectl drain node-a ---
+	// Tick 1 (T=0s): initial eviction creates J1 and returns 429.
+	done, code := simulateKubectlDrainStep(ctx, t, c, gate, ns, podName, uid1)
+	if done || code != http.StatusTooManyRequests {
+		t.Fatalf("Hop 1 Tick 1: got done=%t code=%d, want done=false code=429", done, code)
+	}
+	if got := countPMJsInNamespace(ctx, t, c, ns); got != 1 {
+		t.Fatalf("Hop 1 Tick 1: expected 1 PMJ, got %d", got)
+	}
+
+	job1Name := util.FormatPMJName(podName, string(uid1))
+	var job1 pmv1alpha1.PodMigrationJob
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: job1Name}, &job1); err != nil {
+		t.Fatalf("get job1 %s: %v", job1Name, err)
+	}
+	job1.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
+	job1.Status.OriginNodeName = "node-a"
+	if err := c.Status().Update(ctx, &job1); err != nil {
+		t.Fatalf("update job1 Snapshotting: %v", err)
+	}
+
+	// Tick 2 (T=5s): J1 is Snapshotting -> 429.
+	done, code = simulateKubectlDrainStep(ctx, t, c, gate, ns, podName, uid1)
+	if done || code != http.StatusTooManyRequests {
+		t.Fatalf("Hop 1 Tick 2: got done=%t code=%d, want done=false code=429", done, code)
+	}
+
+	// Controller deletes source pod (uid1) on node-a, transitions J1 to Restoring,
+	// and StatefulSet creates same-name replacement pod (uid2) on uncordoned node-b.
+	if err := c.Delete(ctx, makeStatefulSetPod(uid1, "node-a", nil)); err != nil {
+		t.Fatalf("delete source pod uid1: %v", err)
+	}
+	pod2 := makeStatefulSetPod(uid2, "node-b", map[string]string{
+		util.AnnotationAssignedPMJ: job1Name,
+	})
+	if err := c.Create(ctx, pod2); err != nil {
+		t.Fatalf("create replacement pod uid2: %v", err)
+	}
+	job1.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+	job1.Status.RestoredPodName = podName
+	job1.Status.RestoredPodUID = string(uid2)
+	if err := c.Status().Update(ctx, &job1); err != nil {
+		t.Fatalf("update job1 Restoring: %v", err)
+	}
+
+	// Tick 3 (T=10s): kubectl drain node-a retries while J1 is Restoring and uid2 is on uncordoned node-b.
+	// EvictionGate MUST answer 404 NotFound so kubectl drain exits cleanly in 1 hop.
+	done, code = simulateKubectlDrainStep(ctx, t, c, gate, ns, podName, uid1)
+	if !done || code != http.StatusNotFound {
+		t.Fatalf("Hop 1 Tick 3: got done=%t code=%d, want done=true code=404", done, code)
+	}
+	if got := countPMJsInNamespace(ctx, t, c, ns); got != 1 {
+		t.Fatalf("after Hop 1 drain completion: expected exactly 1 PMJ, got %d", got)
+	}
+
+	// Verify that even if J1 completes (Succeeded) right as a late origin-drain retry arrives,
+	// EvictionGate still answers 404 and does NOT spawn a 2nd PMJ while node-b is uncordoned.
+	completedAt := metav1.Now()
+	job1.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+	job1.Status.CompletionTime = &completedAt
+	if err := c.Status().Update(ctx, &job1); err != nil {
+		t.Fatalf("update job1 Succeeded: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: podName}, pod2); err != nil {
+		t.Fatalf("get pod2: %v", err)
+	}
+	pod2.Annotations[util.AnnotationRestoreCompleted] = "snap-1"
+	if err := c.Update(ctx, pod2); err != nil {
+		t.Fatalf("update pod2 restore-completed: %v", err)
+	}
+	done, code = simulateKubectlDrainStep(ctx, t, c, gate, ns, podName, uid1)
+	if !done || code != http.StatusNotFound {
+		t.Fatalf("Hop 1 post-Succeeded retry: got done=%t code=%d, want done=true code=404", done, code)
+	}
+	if got := countPMJsInNamespace(ctx, t, c, ns); got != 1 {
+		t.Fatalf("after Hop 1 post-Succeeded retry: expected 1 PMJ, got %d", got)
+	}
+
+	// --- Hop 2: Sequential rolling drain of node-b ---
+	// First put J1 back in Restoring and cordon node-b to verify #162 holds with 429 during Restoring.
+	job1.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+	job1.Status.CompletionTime = nil
+	if err := c.Status().Update(ctx, &job1); err != nil {
+		t.Fatalf("revert job1 to Restoring for rolling drain test: %v", err)
+	}
+	var nodeB corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: "node-b"}, &nodeB); err != nil {
+		t.Fatalf("get node-b: %v", err)
+	}
+	nodeB.Spec.Unschedulable = true
+	if err := c.Update(ctx, &nodeB); err != nil {
+		t.Fatalf("cordon node-b: %v", err)
+	}
+
+	// Tick 1 on node-b (while J1 is Restoring): must return 429 (#162) and NOT spawn J2 yet.
+	done, code = simulateKubectlDrainStep(ctx, t, c, gate, ns, podName, uid2)
+	if done || code != http.StatusTooManyRequests {
+		t.Fatalf("Hop 2 Tick 1 (J1 Restoring on cordoned node-b): got done=%t code=%d, want done=false code=429", done, code)
+	}
+	if got := countPMJsInNamespace(ctx, t, c, ns); got != 1 {
+		t.Fatalf("Hop 2 Tick 1: expected still 1 PMJ while J1 is Restoring, got %d", got)
+	}
+
+	// J1 finishes Succeeded; next 5s tick of `kubectl drain node-b` must spawn J2 (429).
+	completedAt2 := metav1.Now()
+	job1.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+	job1.Status.CompletionTime = &completedAt2
+	if err := c.Status().Update(ctx, &job1); err != nil {
+		t.Fatalf("update job1 Succeeded for Hop 2: %v", err)
+	}
+	done, code = simulateKubectlDrainStep(ctx, t, c, gate, ns, podName, uid2)
+	if done || code != http.StatusTooManyRequests {
+		t.Fatalf("Hop 2 Tick 2 (J1 Succeeded on cordoned node-b): got done=%t code=%d, want done=false code=429", done, code)
+	}
+	if got := countPMJsInNamespace(ctx, t, c, ns); got != 2 {
+		t.Fatalf("Hop 2 Tick 2: expected 2 PMJs after J2 spawned, got %d", got)
+	}
+
+	// Controller migrates uid2 (node-b) -> uid3 (uncordoned node-c) under J2.
+	job2Name := util.FormatPMJName(podName, string(uid2))
+	var job2 pmv1alpha1.PodMigrationJob
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: job2Name}, &job2); err != nil {
+		t.Fatalf("get job2 %s: %v", job2Name, err)
+	}
+	if err := c.Delete(ctx, pod2); err != nil {
+		t.Fatalf("delete pod2: %v", err)
+	}
+	pod3 := makeStatefulSetPod(uid3, "node-c", map[string]string{
+		util.AnnotationAssignedPMJ: job2Name,
+	})
+	if err := c.Create(ctx, pod3); err != nil {
+		t.Fatalf("create pod3 on node-c: %v", err)
+	}
+	job2.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
+	job2.Status.OriginNodeName = "node-b"
+	job2.Status.RestoredPodName = podName
+	job2.Status.RestoredPodUID = string(uid3)
+	if err := c.Status().Update(ctx, &job2); err != nil {
+		t.Fatalf("update job2 Restoring: %v", err)
+	}
+
+	// Tick 3 on node-b: uid3 is now on uncordoned node-c -> EvictionGate answers 404 and node-b drain completes!
+	done, code = simulateKubectlDrainStep(ctx, t, c, gate, ns, podName, uid2)
+	if !done || code != http.StatusNotFound {
+		t.Fatalf("Hop 2 Tick 3: got done=%t code=%d, want done=true code=404", done, code)
+	}
+	if got := countPMJsInNamespace(ctx, t, c, ns); got != 2 {
+		t.Fatalf("after Hop 2 drain completion: expected 2 total PMJs, got %d", got)
+	}
+}
