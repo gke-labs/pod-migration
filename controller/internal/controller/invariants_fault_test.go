@@ -220,8 +220,8 @@ func createTestNamespace(t *testing.T, ctx context.Context, k8sClient client.Cli
 }
 
 // TestT1_EnvtestFaultInjectionMatrix is the Tier 1 (T1) per-merge fault-injection suite
-// exercising Invariants I1-I9 against a real kube-apiserver + etcd (envtest) under
-// --invariant-mode=strict.
+// (scenarios S1-S8 plus the RestoreOrders I2 wiring check, covering invariants I1-I7, I9,
+// I11 and I12) run against a real kube-apiserver + etcd (envtest) under --invariant-mode=strict.
 func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS not set; skipping envtest T1 fault-injection matrix")

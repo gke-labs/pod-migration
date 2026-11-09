@@ -23,7 +23,7 @@
 #       * continuity   : Continuous monotonic sequence writer + reader-identity probe
 #                        catching lost acknowledged writes, empty-source serving, and
 #                        double-restore rollbacks across migration.
-#   - 8 Adversarial T2 Scenarios (S1-S8) exercising invariants I1-I11:
+#   - 8 Adversarial T2 Scenarios (S1-S8):
 #       * S1 : Deployment rolling upgrade during active node drain (I6, I2)
 #       * S2 : PDB minAvailable: 100% block followed by budget release (I7, I2)
 #       * S3 : Corrupted checkpoint artifact in GCS -> deterministic I9 cold-start fallback

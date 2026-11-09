@@ -115,7 +115,7 @@ test: generate fmt vet manifests envtest ## Run unit + envtest suite.
 	fi; \
 	KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test ./... -coverprofile cover.out
 
-test-t1-invariants: envtest ## Run T1 per-merge envtest fault-injection matrix (I1-I9) under strict mode.
+test-t1-invariants: envtest ## Run T1 per-merge envtest fault-injection matrix under strict mode.
 	@KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path || $(SETUP_ENVTEST) use -p path)"; \
 	if [ -z "$$KUBEBUILDER_ASSETS" ]; then \
 		echo "Error: setup-envtest failed to locate Kubernetes assets for version $(ENVTEST_K8S_VERSION)." >&2; \

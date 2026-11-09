@@ -36,7 +36,7 @@ object-carried timestamps (condition `lastTransitionTime`, `deletionTimestamp`,
 `evictingStartTime`, `completionTime`) and falling back to receipt times only
 where the API server does not timestamp a transition. Each migration is
 classified as `restored`, `cold-start`, `replaced`, `failed`, `wedged`, or
-`no-replacement`, with warning events, invariant violations (`I1`–`I9`), and
+`no-replacement`, with warning events, invariant violations (by invariant ID), and
 snapshot sizes joined in. Output is `run.json`.
 
 By default, `analyze` enforces `--assert-zero-invariants=true`, exiting non-zero

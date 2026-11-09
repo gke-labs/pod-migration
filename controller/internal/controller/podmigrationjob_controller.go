@@ -108,7 +108,7 @@ type PodMigrationJobReconciler struct {
 	// events).
 	Recorder record.EventRecorder
 
-	// InvariantEngine evaluates stateless correctness invariants (I1-I9) at the
+	// InvariantEngine evaluates stateless correctness invariants (I1-I12) at the
 	// end of each reconcile step with zero extra API calls. Optional: nil skips
 	// evaluation.
 	InvariantEngine *invariants.Engine
