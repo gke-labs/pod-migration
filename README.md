@@ -64,6 +64,7 @@ Notes:
 ### 4. Design Docs
 - [Snapshot engine contract](docs/design/engine-contract.md): what the controller requires from a snapshot engine (GKE Pod Snapshots today; CRIU and upstream pod checkpoint/restore next).
 - [Safety invariants](docs/invariants.md): the invariants the controller can check after each reconcile (off by default; see `--invariant-mode`).
+- [Cooperative workload and TCP continuity harness](docs/design/cooperative-workload.md): a synthetic counter whose exact in-memory state can be checked across checkpoint/restore, and a single-connection TCP observer for cutover tests.
 
 ---
 
