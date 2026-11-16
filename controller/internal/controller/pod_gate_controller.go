@@ -66,6 +66,14 @@ type PodGateReconciler struct {
 	// pod gets: the job's engine for a restore, the pod's for a cold start.
 	// Optional: nil selects GKE Pod Snapshots.
 	Engines *engine.Registry
+
+	// RestorePlacement places a restored replacement on a node that can
+	// restore its checkpoint (C8, #14): the job's engine's node constraints
+	// go into the pod's required node affinity when the gate is released
+	// with a restore order. When no node meets them, the job concludes
+	// without a restore and the pod starts cold. Off adds no constraints;
+	// a pod already held because no node met them still starts cold.
+	RestorePlacement bool
 }
 
 // jobRestoreOrderer returns how to order job's restore: through the engine
@@ -151,6 +159,7 @@ func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
@@ -293,6 +302,48 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			return ctrl.Result{}, r.Update(ctx, pod)
 		}
 
+		// No node could restore the checkpoint (C8, #14): wait for the job
+		// to conclude without a restore, which releases the gate cold
+		// (above). The PMJ watch enqueues the pod when it does. A hold only
+		// counts while the job is Restoring, the only phase that concludes
+		// on it.
+		if _, held := noCompatibleNode(job); held {
+			logger.Info("No node can restore the checkpoint; waiting for the job to conclude without a restore", "pmj", correctedPMJ)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
+		// Place the restore on a node that can restore it (C8, #14). The
+		// constraints go into the update that removes the gate, the only
+		// time Kubernetes lets them be added, and they can't be removed
+		// after it. So before anything is written for the release, check
+		// that some node meets them, and if none does, hold the pod: the
+		// job then concludes without a restore, and the pod starts cold.
+		// Only a Restoring job is checked, because only then does the job
+		// reconciler conclude a hold; in another phase a new release gets
+		// no constraints, as without placement. A release that is already
+		// under way isn't checked again, and the engine isn't asked yet:
+		// either it's this pod's own release, which gets the constraints
+		// below, or another pod's, and the branch below releases this one
+		// cold.
+		var placement []corev1.NodeSelectorRequirement
+		underWay := releaseUnderWay(job, pod)
+		if phase == pmv1alpha1.PodMigrationJobPhaseRestoring && !underWay {
+			if placement, err = r.restorePlacement(ctx, job); err != nil {
+				logger.Error(err, "Failed to get the restore's node constraints", "pmj", correctedPMJ)
+				return ctrl.Result{}, err
+			}
+			if len(placement) > 0 {
+				fits, err := r.someNodeFits(ctx, pod, placement)
+				if err != nil {
+					logger.Error(err, "Failed to check the nodes against the restore's node constraints", "pmj", correctedPMJ)
+					return ctrl.Result{}, err
+				}
+				if !fits {
+					return r.holdForNoCompatibleNode(ctx, pod, job, placement)
+				}
+			}
+		}
+
 		logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 
 		if job.Status.Consumed && job.Status.RestoredPodUID != string(pod.UID) {
@@ -351,6 +402,12 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			logger.Error(err, "No engine to order the restore; waiting for the job to fail", "pmj", correctedPMJ)
 			return ctrl.Result{}, err
 		}
+		if underWay {
+			if placement, err = r.restorePlacement(ctx, job); err != nil {
+				logger.Error(err, "Failed to get the restore's node constraints", "pmj", correctedPMJ)
+				return ctrl.Result{}, err
+			}
+		}
 		if err := orderer.OrderRestore(pod, job); err != nil {
 			logger.Error(err, "Failed to order the restore", "pmj", correctedPMJ)
 			return ctrl.Result{}, err
@@ -384,14 +441,23 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			}
 		}
 
-		// 2. Irreversible step: remove scheduling gate on the candidate pod.
+		// 2. Irreversible step: remove scheduling gate on the candidate pod,
+		// in the same update that adds the restore's node constraints.
+		addRequiredNodeAffinity(pod, placement)
 		r.removeGate(pod)
 		if err := r.Update(ctx, pod); err != nil {
 			return ctrl.Result{}, err
 		}
 
 		if r.Recorder != nil {
-			r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation", MigrationGateName)
+			switch {
+			case len(placement) > 0:
+				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s, injected snapshot restore annotation and required node affinity %s", MigrationGateName, describeRequirements(placement))
+			case r.RestorePlacement:
+				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation, without node constraints", MigrationGateName)
+			default:
+				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation", MigrationGateName)
+			}
 		}
 
 		return ctrl.Result{}, nil
