@@ -628,6 +628,7 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // The recorder publishes restore-crash Warning events, which needs write access.
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
 // evaluateInvariants evaluates the PodMigrationJob and local informer-cached namespace state
 // against the invariant engine when enabled. It runs only when the reconcile step completed without error.
@@ -1045,7 +1046,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
 		var annotationUpdated bool
-		// Capture PV Names, origin node name, and migration timeout before starting checkpoint (pod is guaranteed to exist).
+		// Capture PV Names, origin node name (and its machine type and version), and migration timeout before starting checkpoint (pod is guaranteed to exist).
 		// A job waiting for the disruption budget checks the source again on every pass,
 		// since the source can be deleted, replaced, or finish during the wait (#42).
 		if len(job.Status.PVsToDetach) == 0 || job.Status.OriginNodeName == "" || (job.Annotations == nil || job.Annotations[util.AnnotationMigrationTimeout] == "") ||
@@ -1146,6 +1147,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if job.Status.OriginNodeName == "" && originPod.Spec.NodeName != "" {
 				job.Status.OriginNodeName = originPod.Spec.NodeName
 			}
+			// The source node can be gone by the time the replacement is
+			// released, so record its machine type and version now (#14).
+			// Best effort, with its own merge patch: it never holds the job back.
+			r.recordSourceNode(ctx, job, origJob, originPod.Spec.NodeName)
 
 			if job.Annotations == nil {
 				job.Annotations = make(map[string]string)
