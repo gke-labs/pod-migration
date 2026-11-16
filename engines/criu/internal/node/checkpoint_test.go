@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -41,22 +42,91 @@ func createTestTar(t *testing.T, entries []tar.Header) string {
 	return tarPath
 }
 
-func TestCheckpointTar_RejectsGNUSparse(t *testing.T) {
-	headers := []tar.Header{
-		{Name: "spec.dump", Mode: 0o644, Typeflag: tar.TypeReg, Size: 10},
-		{Name: "config.dump", Mode: 0o644, Typeflag: tar.TypeReg, Size: 10},
-		{Name: "checkpoint/pstree.img", Mode: 0o644, Typeflag: tar.TypeReg, Size: 10},
-		{Name: "checkpoint/pages-1.img", Mode: 0o644, Typeflag: tar.TypeGNUSparse, Size: 10},
+func writeRawOldGNUSparseHeader(w io.Writer, name string, size int64, realSize int64) error {
+	var blk [512]byte
+	copy(blk[0:100], name)
+	copy(blk[100:108], fmt.Sprintf("%07o\x00", 0o644))
+	copy(blk[108:116], fmt.Sprintf("%07o\x00", 0))
+	copy(blk[116:124], fmt.Sprintf("%07o\x00", 0))
+	copy(blk[124:136], fmt.Sprintf("%011o\x00", size))
+	copy(blk[136:148], fmt.Sprintf("%011o\x00", time.Now().Unix()))
+	for i := 148; i < 156; i++ {
+		blk[i] = ' '
 	}
-	tarPath := createTestTar(t, headers)
+	blk[156] = tar.TypeGNUSparse
+	copy(blk[257:265], "ustar  \x00")
+	// sparse map entry 0: offset at 386:398, length at 398:410
+	copy(blk[386:398], fmt.Sprintf("%011o\x00", 0))
+	copy(blk[398:410], fmt.Sprintf("%011o\x00", size))
+	// realSize at 483:495
+	copy(blk[483:495], fmt.Sprintf("%011o\x00", realSize))
+	var sum int64
+	for _, b := range blk {
+		sum += int64(b)
+	}
+	copy(blk[148:156], fmt.Sprintf("%06o\x00 ", sum))
+	_, err := w.Write(blk[:])
+	return err
+}
 
-	if err := validateCheckpointTarFile(tarPath); err == nil {
-		t.Fatalf("validateCheckpointTarFile accepted TypeGNUSparse tar, want error")
+func TestCheckpointTar_RejectsGNUSparse(t *testing.T) {
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "gnu_sparse.tar")
+	f, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatalf("create tar: %v", err)
+	}
+
+	tw := tar.NewWriter(f)
+	for _, name := range []string{"spec.dump", "config.dump", "checkpoint/pstree.img"} {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Mode:     0o644,
+			Typeflag: tar.TypeReg,
+			Size:     5,
+		}); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		if _, err := tw.Write([]byte("12345")); err != nil {
+			t.Fatalf("write data: %v", err)
+		}
+	}
+	if err := tw.Flush(); err != nil {
+		t.Fatalf("flush tw: %v", err)
+	}
+
+	// Write raw OldGNU sparse header 'S' with realSize 1000 and payload size 5
+	if err := writeRawOldGNUSparseHeader(f, "checkpoint/pages-1.img", 5, 1000); err != nil {
+		t.Fatalf("write raw gnu sparse header: %v", err)
+	}
+	var dataPadded [512]byte
+	copy(dataPadded[:], []byte("12345"))
+	if _, err := f.Write(dataPadded[:]); err != nil {
+		t.Fatalf("write data payload: %v", err)
+	}
+
+	// Two 512-byte zero blocks for tar EOF
+	var zeroBlocks [1024]byte
+	if _, err := f.Write(zeroBlocks[:]); err != nil {
+		t.Fatalf("write tar eof: %v", err)
+	}
+	f.Close()
+
+	valErr := validateCheckpointTarFile(tarPath)
+	if valErr == nil {
+		t.Fatalf("validateCheckpointTarFile accepted OldGNU sparse tar, want error")
+	}
+	if !strings.Contains(valErr.Error(), "sparse") {
+		t.Fatalf("validateCheckpointTarFile error = %v, want error mentioning 'sparse'", valErr)
 	}
 
 	dst := t.TempDir()
-	if _, err := extractCheckpoint(tarPath, dst); err == nil {
-		t.Fatalf("extractCheckpoint accepted TypeGNUSparse tar, want error")
+	_, extErr := extractCheckpoint(tarPath, dst)
+	if extErr == nil {
+		t.Fatalf("extractCheckpoint accepted OldGNU sparse tar, want error")
+	}
+	if !strings.Contains(extErr.Error(), "sparse") {
+		t.Fatalf("extractCheckpoint error = %v, want error mentioning 'sparse'", extErr)
 	}
 }
 

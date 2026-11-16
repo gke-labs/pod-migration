@@ -734,6 +734,7 @@ func TestAdaptSpecProcessAllowlist(t *testing.T) {
 			Rlimits: []specs.POSIXRlimit{
 				{Type: "RLIMIT_NOFILE", Hard: 1024, Soft: 1024},
 			},
+			Scheduler: &specs.Scheduler{Policy: specs.SchedBatch},
 		},
 		Linux: &specs.Linux{
 			Seccomp:     &specs.LinuxSeccomp{DefaultAction: specs.ActKill},
@@ -753,8 +754,12 @@ func TestAdaptSpecProcessAllowlist(t *testing.T) {
 	}
 
 	// 1. Unallowlisted archive Process fields must be dropped
-	if s.Process.IOPriority != nil || s.Process.Scheduler != nil {
-		t.Errorf("IOPriority/Scheduler survived from archive: %+v / %+v", s.Process.IOPriority, s.Process.Scheduler)
+	if s.Process.IOPriority != nil {
+		t.Errorf("IOPriority survived from archive: %+v", s.Process.IOPriority)
+	}
+	// Destination scheduler from TargetSpec must be preserved
+	if s.Process.Scheduler == nil || s.Process.Scheduler.Policy != specs.SchedBatch {
+		t.Errorf("Scheduler from TargetSpec not preserved: %+v", s.Process.Scheduler)
 	}
 
 	// 2. Allowlisted execution fields from archive must be preserved

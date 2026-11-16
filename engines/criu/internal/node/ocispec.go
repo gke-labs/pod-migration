@@ -176,21 +176,17 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	if archiveProc == nil {
 		archiveProc = &specs.Process{}
 	}
-	spec.Process = &specs.Process{
-		Terminal:        archiveProc.Terminal,
-		ConsoleSize:     archiveProc.ConsoleSize,
-		User:            p.TargetSpec.Process.User,
-		Args:            archiveProc.Args,
-		CommandLine:     archiveProc.CommandLine,
-		Env:             archiveProc.Env,
-		Cwd:             archiveProc.Cwd,
-		Capabilities:    p.TargetSpec.Process.Capabilities,
-		Rlimits:         p.TargetSpec.Process.Rlimits,
-		NoNewPrivileges: p.TargetSpec.Process.NoNewPrivileges,
-		ApparmorProfile: p.TargetSpec.Process.ApparmorProfile,
-		OOMScoreAdj:     p.TargetSpec.Process.OOMScoreAdj,
-		SelinuxLabel:    p.TargetSpec.Process.SelinuxLabel,
+	targetProc := specs.Process{}
+	if p.TargetSpec.Process != nil {
+		targetProc = *p.TargetSpec.Process
 	}
+	targetProc.Terminal = archiveProc.Terminal
+	targetProc.ConsoleSize = archiveProc.ConsoleSize
+	targetProc.Args = archiveProc.Args
+	targetProc.CommandLine = archiveProc.CommandLine
+	targetProc.Env = archiveProc.Env
+	targetProc.Cwd = archiveProc.Cwd
+	spec.Process = &targetProc
 	notes = append(notes, "rebuilt Process spec with explicit allowlist (destination security posture)")
 
 	spec.Linux.Seccomp = p.TargetSpec.Linux.Seccomp
