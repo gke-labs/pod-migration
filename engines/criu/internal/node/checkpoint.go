@@ -94,6 +94,25 @@ func (k *kubeletCheckpoint) checkpoint(ctx context.Context, ns, pod, container s
 	return res, nil
 }
 
+func checkSafeTarHeader(hdr *tar.Header) error {
+	name := filepath.Clean(hdr.Name)
+	if strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
+		return fmt.Errorf("checkpoint tar has unsafe path %q", hdr.Name)
+	}
+	if hdr.Typeflag == tar.TypeGNUSparse {
+		return fmt.Errorf("sparse tar entry %q not supported", hdr.Name)
+	}
+	if hdr.Typeflag != tar.TypeDir && hdr.Typeflag != tar.TypeReg {
+		return fmt.Errorf("unsupported tar entry type: %v", hdr.Typeflag)
+	}
+	for k := range hdr.PAXRecords {
+		if strings.HasPrefix(k, "GNU.sparse.") || k == "GNU.sparse" {
+			return fmt.Errorf("PAX sparse tar entry %q not supported", hdr.Name)
+		}
+	}
+	return nil
+}
+
 // validateCheckpointTarFile lists the tar's entries and verifies that the
 // required CRIU checkpoint files are present without extracting.
 func validateCheckpointTarFile(tarPath string) error {
@@ -116,6 +135,9 @@ func validateCheckpointTarFile(tarPath string) error {
 		}
 		if err != nil {
 			return fmt.Errorf("read checkpoint tar: %w", err)
+		}
+		if err := checkSafeTarHeader(hdr); err != nil {
+			return err
 		}
 		entries = append(entries, hdr.Name)
 	}
@@ -146,15 +168,12 @@ func extractCheckpoint(tarPath, dst string) ([]string, error) {
 		if err != nil {
 			return entries, fmt.Errorf("read checkpoint tar: %w", err)
 		}
-		name := filepath.Clean(hdr.Name)
-		if strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
-			return entries, fmt.Errorf("checkpoint tar has unsafe path %q", hdr.Name)
+		if err := checkSafeTarHeader(hdr); err != nil {
+			return entries, err
 		}
+		name := filepath.Clean(hdr.Name)
 		entries = append(entries, hdr.Name)
 		target := filepath.Join(dst, name)
-		if hdr.Typeflag != tar.TypeDir && hdr.Typeflag != tar.TypeReg {
-			return entries, fmt.Errorf("unsupported tar entry type: %v", hdr.Typeflag)
-		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {

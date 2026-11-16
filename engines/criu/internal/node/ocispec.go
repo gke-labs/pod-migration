@@ -172,16 +172,26 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	spec.Hooks = nil
 	notes = append(notes, "scrubbed OCI runtime hooks")
 
-	if spec.Process == nil {
-		spec.Process = &specs.Process{}
+	archiveProc := spec.Process
+	if archiveProc == nil {
+		archiveProc = &specs.Process{}
 	}
-	spec.Process.Capabilities = p.TargetSpec.Process.Capabilities
-	spec.Process.User = p.TargetSpec.Process.User
-	spec.Process.NoNewPrivileges = p.TargetSpec.Process.NoNewPrivileges
-	spec.Process.ApparmorProfile = p.TargetSpec.Process.ApparmorProfile
-	spec.Process.SelinuxLabel = p.TargetSpec.Process.SelinuxLabel
-	spec.Process.OOMScoreAdj = p.TargetSpec.Process.OOMScoreAdj
-	spec.Process.Rlimits = p.TargetSpec.Process.Rlimits
+	spec.Process = &specs.Process{
+		Terminal:        archiveProc.Terminal,
+		ConsoleSize:     archiveProc.ConsoleSize,
+		User:            p.TargetSpec.Process.User,
+		Args:            archiveProc.Args,
+		CommandLine:     archiveProc.CommandLine,
+		Env:             archiveProc.Env,
+		Cwd:             archiveProc.Cwd,
+		Capabilities:    p.TargetSpec.Process.Capabilities,
+		Rlimits:         p.TargetSpec.Process.Rlimits,
+		NoNewPrivileges: p.TargetSpec.Process.NoNewPrivileges,
+		ApparmorProfile: p.TargetSpec.Process.ApparmorProfile,
+		OOMScoreAdj:     p.TargetSpec.Process.OOMScoreAdj,
+		SelinuxLabel:    p.TargetSpec.Process.SelinuxLabel,
+	}
+	notes = append(notes, "rebuilt Process spec with explicit allowlist (destination security posture)")
 
 	spec.Linux.Seccomp = p.TargetSpec.Linux.Seccomp
 	spec.Linux.MaskedPaths = p.TargetSpec.Linux.MaskedPaths

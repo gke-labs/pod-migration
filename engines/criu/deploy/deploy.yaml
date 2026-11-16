@@ -4,7 +4,9 @@
 # hardening and follow-up tracker: checkpoint archives in GCS do not yet carry
 # cryptographic provenance (R2) and the hostNetwork agent uses the node's
 # default GCE service account (R5), so anyone who can write to the checkpoint
-# GCS bucket can get root on a restoring node until R2 and R5 land. Never
+# GCS bucket can get root on a restoring node until R2 and R5 land. The agent
+# holds cluster-wide pods (update/patch) and nodes (patch/checkpoint) RBAC, and
+# a residual dual-start window exists if holder fallback precedes restore. Never
 # deploy to production or addon-enabled clusters.
 # Copyright 2026 Google LLC
 #

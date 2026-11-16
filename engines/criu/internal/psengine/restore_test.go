@@ -544,6 +544,18 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	if !hasRule(agentRole, contract.GVKPodSnapshot.Group, "podsnapshots", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/list/watch on %s/podsnapshots", contract.GVKPodSnapshot.Group)
 	}
+	if !hasRule(agentRole, contract.GVKPodSnapshot.Group, "podsnapshots/status", "get", "update", "patch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/update/patch on %s/podsnapshots/status", contract.GVKPodSnapshot.Group)
+	}
+	if !hasRule(agentRole, "", "pods", "get", "list", "watch", "update", "patch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing update/patch on core/pods")
+	}
+	if !hasRule(agentRole, "", "nodes", "get", "patch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/patch on core/nodes")
+	}
+	if !hasRule(agentRole, "", "nodes/checkpoint", "create") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing create on core/nodes/checkpoint")
+	}
 	if !hasRule(controllerRole, contract.GVKStorageConfig.Group, "podsnapshotstorageconfigs", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list/watch on %s/podsnapshotstorageconfigs", contract.GVKStorageConfig.Group)
 	}

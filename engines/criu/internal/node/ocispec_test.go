@@ -711,3 +711,94 @@ func TestAdaptSpecScrubsAnnotationsEnforcesUsernsAndAnonNosuidNodev(t *testing.T
 		t.Errorf("anon volume options %v missing nosuid or nodev", dataOpts)
 	}
 }
+
+func TestAdaptSpecProcessAllowlist(t *testing.T) {
+	s := sampleSpec()
+	s.Process = &specs.Process{
+		Terminal:   true,
+		Args:       []string{"/bin/sh", "-c", "echo hello"},
+		Env:        []string{"FOO=bar", "BAZ=qux"},
+		Cwd:        "/app",
+		IOPriority: &specs.LinuxIOPriority{Class: specs.IOPRIO_CLASS_RT},
+		Scheduler:  &specs.Scheduler{Policy: specs.SchedFIFO},
+	}
+
+	p := params()
+	p.TargetSpec = &specs.Spec{
+		Process: &specs.Process{
+			User:            specs.User{UID: 10001, GID: 10001},
+			Capabilities:    &specs.LinuxCapabilities{Bounding: []string{"CAP_NET_BIND_SERVICE"}},
+			NoNewPrivileges: true,
+			ApparmorProfile: "runtime/default",
+			SelinuxLabel:    "system_u:system_r:container_t:s0:c1,c2",
+			Rlimits: []specs.POSIXRlimit{
+				{Type: "RLIMIT_NOFILE", Hard: 1024, Soft: 1024},
+			},
+		},
+		Linux: &specs.Linux{
+			Seccomp:     &specs.LinuxSeccomp{DefaultAction: specs.ActKill},
+			MaskedPaths: []string{"/proc/kcore"},
+		},
+		Mounts: []specs.Mount{
+			{Destination: "/etc/hosts", Type: "bind", Source: "/target/etc-hosts"},
+			{Destination: "/var/run/secrets/kubernetes.io/serviceaccount", Type: "bind", Source: "/target/sa"},
+			{Destination: "/dev/termination-log", Type: "bind", Source: "/target/term"},
+			{Destination: "/proc", Type: "proc", Source: "proc"},
+		},
+	}
+
+	notes, err := AdaptSpec(s, p)
+	if err != nil {
+		t.Fatalf("AdaptSpec failed: %v", err)
+	}
+
+	// 1. Unallowlisted archive Process fields must be dropped
+	if s.Process.IOPriority != nil || s.Process.Scheduler != nil {
+		t.Errorf("IOPriority/Scheduler survived from archive: %+v / %+v", s.Process.IOPriority, s.Process.Scheduler)
+	}
+
+	// 2. Allowlisted execution fields from archive must be preserved
+	if !s.Process.Terminal {
+		t.Errorf("Terminal not preserved from archive")
+	}
+	if len(s.Process.Args) != 3 || s.Process.Args[2] != "echo hello" {
+		t.Errorf("Args not preserved from archive: %v", s.Process.Args)
+	}
+	if len(s.Process.Env) != 2 || s.Process.Env[0] != "FOO=bar" {
+		t.Errorf("Env not preserved from archive: %v", s.Process.Env)
+	}
+	if s.Process.Cwd != "/app" {
+		t.Errorf("Cwd not preserved from archive: %q", s.Process.Cwd)
+	}
+
+	// 3. Security posture must strictly come from TargetSpec
+	if s.Process.User.UID != 10001 || s.Process.User.GID != 10001 {
+		t.Errorf("User UID/GID = %d/%d, want 10001/10001", s.Process.User.UID, s.Process.User.GID)
+	}
+	if len(s.Process.Capabilities.Bounding) != 1 || s.Process.Capabilities.Bounding[0] != "CAP_NET_BIND_SERVICE" {
+		t.Errorf("Capabilities = %+v, want CAP_NET_BIND_SERVICE", s.Process.Capabilities)
+	}
+	if !s.Process.NoNewPrivileges {
+		t.Errorf("NoNewPrivileges not set from TargetSpec")
+	}
+	if s.Process.ApparmorProfile != "runtime/default" {
+		t.Errorf("ApparmorProfile = %q, want runtime/default", s.Process.ApparmorProfile)
+	}
+	if s.Process.SelinuxLabel != "system_u:system_r:container_t:s0:c1,c2" {
+		t.Errorf("SelinuxLabel = %q, want target label", s.Process.SelinuxLabel)
+	}
+	if len(s.Process.Rlimits) != 1 || s.Process.Rlimits[0].Type != "RLIMIT_NOFILE" {
+		t.Errorf("Rlimits = %+v, want target Rlimits", s.Process.Rlimits)
+	}
+
+	foundNote := false
+	for _, n := range notes {
+		if strings.Contains(n, "rebuilt Process spec with explicit allowlist") {
+			foundNote = true
+			break
+		}
+	}
+	if !foundNote {
+		t.Errorf("missing allowlist note in notes: %v", notes)
+	}
+}

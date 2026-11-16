@@ -85,7 +85,11 @@ type NodeRestoreReconciler struct {
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch
+// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;patch
+// +kubebuilder:rbac:groups="",resources=nodes/checkpoint,verbs=create
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("pod", req.NamespacedName, "node", r.NodeName)
@@ -193,10 +197,15 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 	// staged copies are scratch; GCS stays authoritative
 	defer func() { _ = os.RemoveAll(dir) }()
 
+	const (
+		maxMetadataBytes = 4 << 20 // 4 MiB max for metadata files (manifest.json, spec.json)
+		maxTarBytes      = 8 << 30 // 8 GiB max for checkpoint.tar archive
+	)
+
 	prefix := ArchivePrefix(spec.Path, psName)
 
 	// manifest first — it is the upload-complete marker and integrity record.
-	mfBytes, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "manifest.json"), filepath.Join(dir, "manifest.json"), "")
+	mfBytes, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "manifest.json"), filepath.Join(dir, "manifest.json"), "", maxMetadataBytes)
 	if err != nil {
 		return fmt.Errorf("fetch manifest: %w", err)
 	}
@@ -213,12 +222,12 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 		return fmt.Errorf("cpu family mismatch: archive from %q, this node is %q — refusing cross-family restore", mf.CPUFamily, r.CPUFamily)
 	}
 
-	specJSON, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "spec.json"), filepath.Join(dir, "spec.json"), mf.SpecSHA256)
+	specJSON, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "spec.json"), filepath.Join(dir, "spec.json"), mf.SpecSHA256, maxMetadataBytes)
 	if err != nil {
 		return fmt.Errorf("fetch spec.json: %w", err)
 	}
 	tarPath := filepath.Join(dir, "checkpoint.tar")
-	if _, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "checkpoint.tar"), tarPath, mf.TarSHA256); err != nil {
+	if _, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "checkpoint.tar"), tarPath, mf.TarSHA256, maxTarBytes); err != nil {
 		return fmt.Errorf("fetch checkpoint.tar: %w", err)
 	}
 
@@ -242,7 +251,7 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 // fetch downloads bucket/object to dst, verifying sha256 when expected != "".
 // Returns the content bytes only for small objects (expected use: manifest,
 // spec); for the tar the caller reads from dst.
-func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, expectedSHA string) ([]byte, error) {
+func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, expectedSHA string, maxBytes int64) ([]byte, error) {
 	rc, err := r.Store.Get(ctx, bucket, object)
 	if err != nil {
 		return nil, err
@@ -255,8 +264,7 @@ func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, 
 	}
 	h := sha256.New()
 	small := &boundedBuffer{limit: 4 << 20}
-	const maxDownloadBytes = 8 << 30
-	n, err := io.Copy(io.MultiWriter(f, h, small), io.LimitReader(rc, maxDownloadBytes+1))
+	n, err := io.Copy(io.MultiWriter(f, h, small), io.LimitReader(rc, maxBytes+1))
 	cerr := f.Close()
 	if err != nil {
 		return nil, err
@@ -264,8 +272,8 @@ func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, 
 	if cerr != nil {
 		return nil, cerr
 	}
-	if n > maxDownloadBytes {
-		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxDownloadBytes)
+	if n > maxBytes {
+		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxBytes)
 	}
 	if expectedSHA != "" {
 		if got := hex.EncodeToString(h.Sum(nil)); got != expectedSHA {
