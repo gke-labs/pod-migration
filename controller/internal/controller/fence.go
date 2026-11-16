@@ -670,6 +670,9 @@ func (r *PodMigrationJobReconciler) evictKeptSource(ctx context.Context, job *pm
 	case err == nil || apierrors.IsNotFound(err):
 		logger.Info("Evicted the fenced source of a failed migration", "pod", pod.Name)
 		return ctrl.Result{RequeueAfter: fenceSettleInterval}, true, nil
+	// IsInternalError covers the multi-PDB rejection, a 500 with no Reason,
+	// only via its unknown-reason + HTTP 500 fallback. Pinned by
+	// TestResolveSourceFence_ReasonlessMultiPDB500Retries (#43).
 	case apierrors.IsTooManyRequests(err) || apierrors.IsConflict(err) || apierrors.IsInternalError(err):
 		logger.Info("The fenced source's eviction was refused for now; retrying", "pod", pod.Name, "error", err.Error())
 		return ctrl.Result{RequeueAfter: keptSourceEvictionRetryInterval}, true, nil
