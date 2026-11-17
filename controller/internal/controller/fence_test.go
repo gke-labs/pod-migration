@@ -795,6 +795,29 @@ func TestResolveSourceFence_EvictionRefusedRetriesAndDefersGC(t *testing.T) {
 	assertFenced(t, f.pod(t))
 }
 
+// TestResolveSourceFence_ReasonlessMultiPDB500Retries: the multi-PDB
+// rejection carries no Reason, and a kept source's eviction still treats it as
+// a refusal to retry rather than an error (#43).
+func TestResolveSourceFence_ReasonlessMultiPDB500Retries(t *testing.T) {
+	job := fenceTestFailedJob(true, time.Hour)
+	job.Status.Conditions[1].Reason = util.ReasonFenceKept
+	f := newFenceFixture(t, interceptor.Funcs{
+		SubResourceCreate: func(ctx context.Context, c client.Client, sub string, obj client.Object, subObj client.Object, opts ...client.SubResourceCreateOption) error {
+			return multiPDBEvictionError()
+		},
+	}, fencedPod(fenceTestSource(fenceTestCID, 0)), job)
+
+	res, err := f.reconcile(t)
+	if err != nil {
+		t.Fatalf("Reconcile: %v (reason-less multi-PDB 500 fell through to the default branch)", err)
+	}
+	if res.RequeueAfter != keptSourceEvictionRetryInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, keptSourceEvictionRetryInterval)
+	}
+	f.job(t)
+	assertFenced(t, f.pod(t))
+}
+
 // TestLateStopWatch covers the watch that follows an unfence.
 func TestLateStopWatch(t *testing.T) {
 	unfencedJob := func(unfencedAgo time.Duration) *pmv1alpha1.PodMigrationJob {

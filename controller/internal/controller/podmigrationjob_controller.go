@@ -1525,6 +1525,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					}
 				}
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			// The API server's multi-PDB rejection is a 500 with no Reason, so
+			// IsInternalError matches it only via its unknown-reason + HTTP 500
+			// fallback. A strict match on StatusReasonInternalError would send it to
+			// the default branch. Pinned by
+			// TestPodMigrationJobReconciler_Evicting_ReasonlessMultiPDB500_SetsEvictionMisconfigured (#43).
 			case apierrors.IsInternalError(err):
 				logger.Error(err, "Pod eviction failed with 500 InternalServerError (check if pod is covered by multiple conflicting PDBs)", "pod", podName)
 				cond := metav1.Condition{

@@ -5453,6 +5453,98 @@ func TestPodMigrationJobReconciler_Evicting_500InternalServerError_SetsEvictionM
 	}
 }
 
+// multiPDBEvictionError is the exact error the API server returns when an
+// evicted pod is covered by more than one PodDisruptionBudget. The Status has
+// no Reason, so apierrors.IsInternalError matches it only through its
+// unknown-reason + HTTP 500 fallback (#43).
+func multiPDBEvictionError() error {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    500,
+		Message: "This pod has more than one PodDisruptionBudget, which the eviction subresource does not support.",
+	}}
+}
+
+// TestPodMigrationJobReconciler_Evicting_ReasonlessMultiPDB500_SetsEvictionMisconfigured
+// pins the classification of the real multi-PDB rejection, which carries no
+// Reason, to the EvictionMisconfigured branch (#43).
+func TestPodMigrationJobReconciler_Evicting_ReasonlessMultiPDB500_SetsEvictionMisconfigured(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = storagev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "multi-pdb-pod"
+	podUID := "uid-multi-pdb-123"
+	jobName := "pmj-" + podName
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				"pod-migration.gke.io/evicting-since": time.Now().Add(-35 * time.Second).Format(time.RFC3339),
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+				if subResourceName == "eviction" {
+					return multiPDBEvictionError()
+				}
+				return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+			},
+		}).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v (reason-less multi-PDB 500 fell through to the default branch)", err)
+	}
+	if res.RequeueAfter != 5*time.Second {
+		t.Errorf("Expected RequeueAfter 5s on reason-less multi-PDB 500, got %v", res.RequeueAfter)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, updatedPMJ); err != nil {
+		t.Fatalf("Failed to get updated PMJ: %v", err)
+	}
+	cond := meta.FindStatusCondition(updatedPMJ.Status.Conditions, "EvictionMisconfigured")
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "MultiplePDBsOrInternalError" {
+		t.Errorf("Expected EvictionMisconfigured condition True/MultiplePDBsOrInternalError, got: %+v", cond)
+	}
+}
+
 func TestPodMigrationJobReconciler_Evicting_SuccessAfter429_ClearsBlockedByPDB(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
