@@ -36,7 +36,9 @@ package psengine
 // does containerd resume the container (#106). Waiting for the call keeps
 // Cancelled honest (the source is running again when it's written), keeps
 // the per-node single-flight covering the dump, and lets the agent delete the
-// tar it was handed.
+// tar it was handed. A call that times out anyway is reported Failed, never
+// Cancelled: the dump may still be running, and past the kubelet's CRI
+// deadline the source can stay frozen until resumed by hand.
 
 import (
 	"context"

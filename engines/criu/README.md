@@ -85,7 +85,15 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      (contract clause C9, #106). The agent needs `get` on
      `podsnapshotmanualtriggers` for this. If the dump outlasts the
      orchestrator's 30 s settle wait, the orchestrator keeps the source fenced
-     and cold-evicts it.
+     and cold-evicts it. The agent waits up to 150 s for the kubelet
+     checkpoint call, past the kubelet's default 2 min CRI deadline. A call
+     that still times out is reported `Failed`, not `Cancelled`, because the
+     dump may still be running, and past the CRI deadline containerd can leave
+     the source frozen until it is resumed by hand. The agent never overwrites
+     an outcome already recorded on the `PodSnapshot`. The engine controller
+     labels each `PodSnapshot` `gke-pod-snapshot-triggered-by: <trigger>` (when
+     the trigger name fits in a label value), so the orchestrator finds
+     unfinished snapshots after the trigger is deleted.
    - Reconciles replacement pods on its node carrying
      `podsnapshot.gke.io/ps-name` (`psengine.NodeRestoreReconciler`): downloads
      and SHA-256 verifies the archive from GCS, checks CPU family compatibility,
