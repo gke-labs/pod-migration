@@ -77,9 +77,14 @@ func TestPodMigrationJobReconciler_BudgetRecheckStopsAtTheDeadline(t *testing.T)
 	c := fake.NewClientBuilder().WithScheme(budgetScheme()).
 		WithObjects(budgetSourcePod(), budgetJob(time.Now().Add(-9*time.Minute-50*time.Second), nil, blocked)).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).Build()
-	res, _ := reconcileBudget(t, c, &stubBudgetChecker{reason: reasonBudgetExhausted, err: budgetRefusal()}, record.NewFakeRecorder(20))
-	if res.RequeueAfter < 9*time.Second || res.RequeueAfter > 12*time.Second {
-		t.Errorf("RequeueAfter = %v, want about 11 s: the deadline is 10 s away", res.RequeueAfter)
+	before := time.Now()
+	res, job := reconcileBudget(t, c, &stubBudgetChecker{reason: reasonBudgetExhausted, err: budgetRefusal()}, record.NewFakeRecorder(20))
+	after := time.Now()
+	deadline := job.CreationTimestamp.Add(10 * time.Minute)
+	minWant := max(deadline.Sub(after)+time.Second, time.Second)
+	maxWant := deadline.Sub(before) + time.Second
+	if res.RequeueAfter < minWant || res.RequeueAfter > maxWant {
+		t.Errorf("RequeueAfter = %v, want in [%v, %v] (deadline - now + 1s, not 30s backoff)", res.RequeueAfter, minWant, maxWant)
 	}
 }
 
