@@ -34,17 +34,6 @@ const (
 	AnnotationReplicaIdentityKey = "pod-migration.gke.io/replica-identity"
 	LabelReplicaKey              = "pod-migration.gke.io/replica-key"
 
-	// AnnotationSourceInstanceType records, on a PodMigrationJob, the machine
-	// type of the node its source pod ran on (the node's
-	// node.kubernetes.io/instance-type label). A checkpoint only restores on a
-	// node of a compatible shape (#14).
-	AnnotationSourceInstanceType = "pod-migration.gke.io/source-instance-type"
-	// AnnotationSourceNodeVersion records, on a PodMigrationJob, the kubelet
-	// version of the node its source pod ran on. On GKE that's the node's GKE
-	// version, which GKE Pod Snapshots requires the restoring node to match
-	// (#14).
-	AnnotationSourceNodeVersion = "pod-migration.gke.io/source-node-version"
-
 	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
 	// in their assigned-pmj annotation.  Registered at manager startup via
 	// controller.RegisterFieldIndexes.

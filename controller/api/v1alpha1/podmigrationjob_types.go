@@ -40,6 +40,21 @@ type PodMigrationJobStatus struct {
 	// to the origin node.
 	// +optional
 	OriginNodeName string `json:"originNodeName,omitempty"`
+
+	// OriginNodeInstanceType records the machine type of the origin node, its
+	// node.kubernetes.io/instance-type label, while the job is Pending. A checkpoint
+	// only restores on a node of a compatible machine type. Empty when the node
+	// couldn't be read or has no such label.
+	// +optional
+	OriginNodeInstanceType string `json:"originNodeInstanceType,omitempty"`
+
+	// OriginNodeKubeletVersion records the kubelet version of the origin node while
+	// the job is Pending. On GKE that's the node's GKE version, which GKE Pod
+	// Snapshots checks against the node it restores on. Empty when the node couldn't
+	// be read.
+	// +optional
+	OriginNodeKubeletVersion string `json:"originNodeKubeletVersion,omitempty"`
+
 	// CompletionTime is the timestamp when this job transitioned to a terminal phase (Succeeded/Failed).
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`

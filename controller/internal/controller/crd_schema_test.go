@@ -72,6 +72,8 @@ func TestCRDSchema_PodMigrationJob_StatusFields(t *testing.T) {
 	job.Status.Consumed = true
 	job.Status.RestoredPodUID = "uid-123"
 	job.Status.RestoredPodName = "pod-xyz"
+	job.Status.OriginNodeInstanceType = "n2-standard-4"
+	job.Status.OriginNodeKubeletVersion = "v1.37.1-gke.2097000"
 	now := metav1.NewTime(time.Now().Truncate(time.Second))
 	job.Status.RestoringStartTime = &now
 	if err := k8sClient.Status().Update(ctx, job); err != nil {
@@ -92,6 +94,13 @@ func TestCRDSchema_PodMigrationJob_StatusFields(t *testing.T) {
 	}
 	if fetched.Status.RestoredPodName != "pod-xyz" {
 		t.Errorf("Expected fetched.Status.RestoredPodName == %q, got %q", "pod-xyz", fetched.Status.RestoredPodName)
+	}
+	// The CRD must carry the source node fields, or the API server drops them.
+	if fetched.Status.OriginNodeInstanceType != "n2-standard-4" {
+		t.Errorf("Expected fetched.Status.OriginNodeInstanceType == %q, got %q", "n2-standard-4", fetched.Status.OriginNodeInstanceType)
+	}
+	if fetched.Status.OriginNodeKubeletVersion != "v1.37.1-gke.2097000" {
+		t.Errorf("Expected fetched.Status.OriginNodeKubeletVersion == %q, got %q", "v1.37.1-gke.2097000", fetched.Status.OriginNodeKubeletVersion)
 	}
 	if fetched.Status.RestoringStartTime == nil || !fetched.Status.RestoringStartTime.Equal(&now) {
 		t.Errorf("Expected fetched.Status.RestoringStartTime == %v, got %v", now, fetched.Status.RestoringStartTime)

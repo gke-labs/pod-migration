@@ -1149,8 +1149,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 			// The source node can be gone by the time the replacement is
 			// released, so record its machine type and version now (#14).
-			// Best effort, with its own merge patch: it never holds the job back.
-			r.recordSourceNode(ctx, job, origJob, originPod.Spec.NodeName)
+			// Best effort; like OriginNodeName, they go out with the status
+			// write that ends this pass.
+			r.recordSourceNode(ctx, job, originPod.Spec.NodeName)
 
 			if job.Annotations == nil {
 				job.Annotations = make(map[string]string)

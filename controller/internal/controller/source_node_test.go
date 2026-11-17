@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,7 +38,9 @@ import (
 
 // TestPodMigrationJobReconciler_Pending_RecordsSourceNode checks that a
 // pending job records the machine type and version of its source pod's node
-// before the checkpoint (#14), and that recording never holds the job back.
+// in its status before the checkpoint (#14), that recording never holds the
+// job back, and that the values go out with the status write that moves the
+// job on, with no write of their own.
 func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 	const (
 		namespace = "default"
@@ -54,28 +57,12 @@ func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 		}
 	}
 	n2Standard4 := map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-4"}
-	recorded := map[string]string{
-		util.AnnotationSourceInstanceType: "n2-standard-4",
-		util.AnnotationSourceNodeVersion:  "v1.37.1-gke.2097000",
-	}
-	nothingRecorded := map[string]string{
-		util.AnnotationSourceInstanceType: "",
-		util.AnnotationSourceNodeVersion:  "",
-	}
 	failNodeReads := interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Node); ok {
 				return apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, key.Name, errors.New("injected"))
 			}
 			return c.Get(ctx, key, obj, opts...)
-		},
-	}
-	failJobPatches := interceptor.Funcs{
-		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if _, ok := obj.(*pmv1alpha1.PodMigrationJob); ok {
-				return apierrors.NewInternalError(errors.New("injected"))
-			}
-			return c.Patch(ctx, obj, patch, opts...)
 		},
 	}
 
@@ -86,102 +73,93 @@ func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 		podMemory   string            // the pod's memory request, if any
 		annotations map[string]string // the job's annotations before the reconcile
 		funcs       interceptor.Funcs
-		// want maps annotations to their expected values; "" means unset.
-		want map[string]string
+		// recordedType and recordedVersion are already in the job's status
+		// before the reconcile.
+		recordedType, recordedVersion string
+		wantType, wantVersion         string
+		// wantTimeout, if set, is the expected timeout annotation.
+		wantTimeout string
+		// wantJobWrites is how many writes the reconcile makes to the job
+		// itself, outside its status.
+		wantJobWrites int
+		// skipsNodeRead: the reconcile doesn't read the node at all.
+		skipsNodeRead bool
 	}{
 		{
 			name:        "records the machine type and the version",
 			node:        node(n2Standard4, "v1.37.1-gke.2097000"),
 			podNodeName: nodeName,
-			want:        recorded,
+			wantType:    "n2-standard-4",
+			wantVersion: "v1.37.1-gke.2097000",
 		},
 		{
 			name:        "a node without an instance-type label records the version only",
 			node:        node(nil, "v1.37.1-gke.2097000"),
 			podNodeName: nodeName,
-			want: map[string]string{
-				util.AnnotationSourceInstanceType: "",
-				util.AnnotationSourceNodeVersion:  "v1.37.1-gke.2097000",
-			},
+			wantVersion: "v1.37.1-gke.2097000",
 		},
 		{
 			name:        "a node that is gone records nothing",
 			podNodeName: nodeName,
-			want:        nothingRecorded,
 		},
 		{
 			name:        "a node read that fails records nothing",
 			node:        node(n2Standard4, "v1.37.1-gke.2097000"),
 			podNodeName: nodeName,
 			funcs:       failNodeReads,
-			want:        nothingRecorded,
 		},
 		{
-			name:        "a patch that fails records nothing and doesn't hold the job back",
-			node:        node(n2Standard4, "v1.37.1-gke.2097000"),
-			podNodeName: nodeName,
-			funcs:       failJobPatches,
-			want:        nothingRecorded,
+			name:          "an unscheduled pod records nothing",
+			node:          node(n2Standard4, "v1.37.1-gke.2097000"),
+			podNodeName:   "",
+			skipsNodeRead: true,
 		},
 		{
-			name:        "an unscheduled pod records nothing",
-			node:        node(n2Standard4, "v1.37.1-gke.2097000"),
-			podNodeName: "",
-			want:        nothingRecorded,
+			name:            "recorded values are not replaced",
+			node:            node(map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-8"}, "v1.37.1-gke.2097000"),
+			podNodeName:     nodeName,
+			recordedType:    "n2-standard-4",
+			recordedVersion: "v1.37.1-gke.1697000",
+			wantType:        "n2-standard-4",
+			wantVersion:     "v1.37.1-gke.1697000",
+			skipsNodeRead:   true,
 		},
 		{
-			name:        "recorded values are not overwritten",
-			node:        node(map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-8"}, "v1.37.1-gke.2097000"),
-			podNodeName: nodeName,
-			annotations: map[string]string{
-				util.AnnotationSourceInstanceType: "n2-standard-4",
-				util.AnnotationSourceNodeVersion:  "v1.37.1-gke.1697000",
-			},
-			want: map[string]string{
-				util.AnnotationSourceInstanceType: "n2-standard-4",
-				util.AnnotationSourceNodeVersion:  "v1.37.1-gke.1697000",
-			},
+			name:            "only the missing machine type is recorded",
+			node:            node(n2Standard4, "v1.37.1-gke.2097000"),
+			podNodeName:     nodeName,
+			recordedVersion: "v1.37.1-gke.1697000",
+			wantType:        "n2-standard-4",
+			wantVersion:     "v1.37.1-gke.1697000",
 		},
 		{
-			name:        "only the missing value is recorded",
-			node:        node(n2Standard4, "v1.37.1-gke.2097000"),
-			podNodeName: nodeName,
-			annotations: map[string]string{util.AnnotationSourceNodeVersion: "v1.37.1-gke.1697000"},
-			want: map[string]string{
-				util.AnnotationSourceInstanceType: "n2-standard-4",
-				util.AnnotationSourceNodeVersion:  "v1.37.1-gke.1697000",
-			},
-		},
-		{
-			name:        "empty values are filled in",
-			node:        node(n2Standard4, "v1.37.1-gke.2097000"),
-			podNodeName: nodeName,
-			annotations: nothingRecorded,
-			want:        recorded,
+			name:         "only the missing version is recorded",
+			node:         node(map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-8"}, "v1.37.1-gke.2097000"),
+			podNodeName:  nodeName,
+			recordedType: "n2-standard-4",
+			wantType:     "n2-standard-4",
+			wantVersion:  "v1.37.1-gke.2097000",
 		},
 		{
 			name:        "a timeout set when the job was created is kept",
 			node:        node(n2Standard4, "v1.37.1-gke.2097000"),
 			podNodeName: nodeName,
 			annotations: map[string]string{util.AnnotationMigrationTimeout: "12m"},
-			want: map[string]string{
-				util.AnnotationSourceInstanceType: "n2-standard-4",
-				util.AnnotationSourceNodeVersion:  "v1.37.1-gke.2097000",
-				util.AnnotationMigrationTimeout:   "12m",
-			},
+			wantType:    "n2-standard-4",
+			wantVersion: "v1.37.1-gke.2097000",
+			wantTimeout: "12m",
 		},
 		{
-			// The node annotations are patched first, so the timeout's own
-			// Update has to start from the patched object or it conflicts.
-			name:        "a timeout computed while pending is written too",
-			node:        node(n2Standard4, "v1.37.1-gke.2097000"),
-			podNodeName: nodeName,
-			podMemory:   "100Mi", // 10m default + 100Mi / 50MiB/s = 10m2s
-			want: map[string]string{
-				util.AnnotationSourceInstanceType: "n2-standard-4",
-				util.AnnotationSourceNodeVersion:  "v1.37.1-gke.2097000",
-				util.AnnotationMigrationTimeout:   "10m2s",
-			},
+			// The timeout's Update writes the whole job; the recorded values
+			// are in its status, so they must survive it.
+			name:          "a timeout computed while pending is written too",
+			node:          node(n2Standard4, "v1.37.1-gke.2097000"),
+			podNodeName:   nodeName,
+			podMemory:     "100Mi", // 10m default + 100Mi / 50MiB/s = 10m2s
+			wantType:      "n2-standard-4",
+			wantVersion:   "v1.37.1-gke.2097000",
+			wantTimeout:   "10m2s",
+			wantJobWrites: 1,
 		},
 	}
 
@@ -215,17 +193,64 @@ func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 					PodRef:       corev1.LocalObjectReference{Name: podName},
 					TargetPodUID: podUID,
 				},
-				Status: pmv1alpha1.PodMigrationJobStatus{Phase: pmv1alpha1.PodMigrationJobPhasePending},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:                    pmv1alpha1.PodMigrationJobPhasePending,
+					OriginNodeInstanceType:   tc.recordedType,
+					OriginNodeKubeletVersion: tc.recordedVersion,
+				},
 			}
 			objs := []client.Object{pod, pmj}
 			if tc.node != nil {
 				objs = append(objs, tc.node)
 			}
+			// Count the node reads, the writes to the job itself, and the
+			// writes to its status, on top of the case's own interceptors.
+			nodeReads, jobWrites, statusWrites := 0, 0, 0
+			funcs := tc.funcs
+			funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Node); ok {
+					nodeReads++
+				}
+				if tc.funcs.Get != nil {
+					return tc.funcs.Get(ctx, c, key, obj, opts...)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			}
+			funcs.Patch = func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if _, ok := obj.(*pmv1alpha1.PodMigrationJob); ok {
+					jobWrites++
+				}
+				if tc.funcs.Patch != nil {
+					return tc.funcs.Patch(ctx, c, obj, patch, opts...)
+				}
+				return c.Patch(ctx, obj, patch, opts...)
+			}
+			funcs.Update = func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*pmv1alpha1.PodMigrationJob); ok {
+					jobWrites++
+				}
+				if tc.funcs.Update != nil {
+					return tc.funcs.Update(ctx, c, obj, opts...)
+				}
+				return c.Update(ctx, obj, opts...)
+			}
+			funcs.SubResourcePatch = func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if _, ok := obj.(*pmv1alpha1.PodMigrationJob); ok && sub == "status" {
+					statusWrites++
+				}
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			}
+			funcs.SubResourceUpdate = func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if _, ok := obj.(*pmv1alpha1.PodMigrationJob); ok && sub == "status" {
+					statusWrites++
+				}
+				return c.SubResource(sub).Update(ctx, obj, opts...)
+			}
 			c := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(objs...).
 				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-				WithInterceptorFuncs(tc.funcs).
+				WithInterceptorFuncs(funcs).
 				Build()
 			r := &PodMigrationJobReconciler{Client: c, Scheme: scheme}
 
@@ -244,18 +269,84 @@ func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 			if got.Status.OriginNodeName != tc.podNodeName {
 				t.Errorf("originNodeName = %q, want %q", got.Status.OriginNodeName, tc.podNodeName)
 			}
-			for annotation, want := range tc.want {
-				value, ok := got.Annotations[annotation]
-				if want == "" {
-					if ok {
-						t.Errorf("annotation %s = %q, want it unset", annotation, value)
-					}
-					continue
-				}
-				if value != want {
-					t.Errorf("annotation %s = %q, want %q", annotation, value, want)
-				}
+			if got.Status.OriginNodeInstanceType != tc.wantType {
+				t.Errorf("originNodeInstanceType = %q, want %q", got.Status.OriginNodeInstanceType, tc.wantType)
+			}
+			if got.Status.OriginNodeKubeletVersion != tc.wantVersion {
+				t.Errorf("originNodeKubeletVersion = %q, want %q", got.Status.OriginNodeKubeletVersion, tc.wantVersion)
+			}
+			if tc.wantTimeout != "" && got.Annotations[util.AnnotationMigrationTimeout] != tc.wantTimeout {
+				t.Errorf("timeout annotation = %q, want %q", got.Annotations[util.AnnotationMigrationTimeout], tc.wantTimeout)
+			}
+			if jobWrites != tc.wantJobWrites {
+				t.Errorf("writes to the job outside its status = %d, want %d", jobWrites, tc.wantJobWrites)
+			}
+			// The values ride the one status write that moves the job on.
+			if statusWrites != 1 {
+				t.Errorf("status writes = %d, want 1", statusWrites)
+			}
+			if tc.skipsNodeRead && nodeReads != 0 {
+				t.Errorf("node reads = %d, want none", nodeReads)
 			}
 		})
 	}
+}
+
+// TestPodMigrationJobReconciler_Pending_SourceNodeSurvivesBudgetWait checks
+// that a job held in Pending by its disruption budget saves the source node's
+// machine type and version with the status write that records the wait, that
+// a recheck with nothing new writes nothing, and that the values are kept
+// when the budget lets the job move on.
+func TestPodMigrationJobReconciler_Pending_SourceNodeSurvivesBudgetWait(t *testing.T) {
+	const nodeName = "gvisor-node-a"
+	pod := budgetSourcePod()
+	pod.Spec.NodeName = nodeName
+	job := budgetJob(time.Now(), nil)
+	job.Annotations = map[string]string{util.AnnotationMigrationTimeout: "12m"}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName, Labels: map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-4"}},
+		Status:     corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "v1.37.1-gke.2097000"}},
+	}
+	statusWrites := 0
+	c := fake.NewClientBuilder().WithScheme(budgetScheme()).
+		WithObjects(pod, job, node).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if _, ok := obj.(*pmv1alpha1.PodMigrationJob); ok && sub == "status" {
+					statusWrites++
+				}
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+	checker := &stubBudgetChecker{reason: reasonBudgetExhausted, err: budgetRefusal()}
+	recorded := func(t *testing.T, got *pmv1alpha1.PodMigrationJob) {
+		t.Helper()
+		if got.Status.OriginNodeInstanceType != "n2-standard-4" || got.Status.OriginNodeKubeletVersion != "v1.37.1-gke.2097000" {
+			t.Errorf("originNodeInstanceType = %q, originNodeKubeletVersion = %q; want n2-standard-4, v1.37.1-gke.2097000",
+				got.Status.OriginNodeInstanceType, got.Status.OriginNodeKubeletVersion)
+		}
+	}
+
+	_, got := reconcileBudget(t, c, checker, nil)
+	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
+		t.Fatalf("phase = %s, want Pending while the budget is exhausted", got.Status.Phase)
+	}
+	recorded(t, got)
+	if statusWrites != 1 {
+		t.Errorf("status writes on the first pass = %d, want 1", statusWrites)
+	}
+
+	_, _ = reconcileBudget(t, c, checker, nil)
+	if statusWrites != 1 {
+		t.Errorf("status writes after a recheck with nothing new = %d, want still 1", statusWrites)
+	}
+
+	checker.reason, checker.err = reasonBudgetAllowed, nil
+	_, got = reconcileBudget(t, c, checker, nil)
+	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Fatalf("phase = %s, want Snapshotting once the budget allows it", got.Status.Phase)
+	}
+	recorded(t, got)
 }

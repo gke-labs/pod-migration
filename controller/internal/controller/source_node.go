@@ -19,77 +19,45 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
-	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
-// recordSourceNode records on job the machine type and the kubelet version of
-// nodeName, the node the source pod runs on (#14). A checkpoint only restores
-// on a node of a compatible shape and, for GKE Pod Snapshots, the same GKE
-// version, and the source node can be gone by the time the replacement is
-// released, so these facts are captured before the checkpoint.
+// recordSourceNode records in job's status the machine type and the kubelet
+// version of nodeName, the node the source pod runs on (#14). A checkpoint
+// only restores on a node of a compatible machine type and, for GKE Pod
+// Snapshots, the same GKE version, and the source node can be gone by the
+// time the replacement is released, so these facts are captured before the
+// checkpoint.
+//
+// It only sets job.Status in memory, like the caller does for
+// status.originNodeName, so the values go out with the status write that
+// already ends the Pending pass and cost no write of their own. Only the
+// controller is granted write access to the status subresource, so editing
+// the job's metadata or spec (its annotations, say) can't change them.
 //
 // It is best effort and never holds the job back. It reads the node from the
-// cache; a node it can't read, or a value the node doesn't carry, leaves that
-// annotation unset. It writes only the missing annotations, with a merge patch
-// that doesn't conflict with other writers, and only logs when the patch
-// fails. It never overwrites a non-empty annotation. On success it copies the
-// patched metadata into job and origJob, so the caller's later writes start
-// from it; job's in-memory status is left alone.
-func (r *PodMigrationJobReconciler) recordSourceNode(ctx context.Context, job, origJob *pmv1alpha1.PodMigrationJob, nodeName string) {
-	missing := r.sourceNodeAnnotations(ctx, job, nodeName)
-	if len(missing) == 0 {
-		return
-	}
-
-	patched := job.DeepCopy()
-	if patched.Annotations == nil {
-		patched.Annotations = make(map[string]string)
-	}
-	for key, value := range missing {
-		patched.Annotations[key] = value
-	}
-	if err := r.Patch(ctx, patched, client.MergeFrom(job)); err != nil {
-		log.FromContext(ctx).Info("Couldn't record the source node's machine type and version; continuing without them",
-			"node", nodeName, "error", err.Error())
-		return
-	}
-	job.ObjectMeta = *patched.ObjectMeta.DeepCopy()
-	if origJob != nil {
-		origJob.ObjectMeta = *patched.ObjectMeta.DeepCopy()
-	}
-}
-
-// sourceNodeAnnotations returns the source node annotations that job doesn't
-// have yet and that nodeName can provide: its node.kubernetes.io/instance-type
-// label and its kubelet version. It returns nil when there's nothing to add,
-// including when the node can't be read.
-func (r *PodMigrationJobReconciler) sourceNodeAnnotations(ctx context.Context, job *pmv1alpha1.PodMigrationJob, nodeName string) map[string]string {
+// cache; a node it can't read leaves the missing fields empty, and a node
+// without the label leaves the machine type empty. It never replaces a
+// recorded value.
+func (r *PodMigrationJobReconciler) recordSourceNode(ctx context.Context, job *pmv1alpha1.PodMigrationJob, nodeName string) {
 	if nodeName == "" {
-		return nil
+		return
 	}
-	haveType := job.Annotations[util.AnnotationSourceInstanceType] != ""
-	haveVersion := job.Annotations[util.AnnotationSourceNodeVersion] != ""
-	if haveType && haveVersion {
-		return nil
+	if job.Status.OriginNodeInstanceType != "" && job.Status.OriginNodeKubeletVersion != "" {
+		return
 	}
-
 	node := &corev1.Node{}
 	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
 		log.FromContext(ctx).Info("Couldn't read the source node; not recording its machine type and version",
 			"node", nodeName, "error", err.Error())
-		return nil
+		return
 	}
-
-	missing := make(map[string]string)
-	if instanceType := node.Labels[corev1.LabelInstanceTypeStable]; !haveType && instanceType != "" {
-		missing[util.AnnotationSourceInstanceType] = instanceType
+	if job.Status.OriginNodeInstanceType == "" {
+		job.Status.OriginNodeInstanceType = node.Labels[corev1.LabelInstanceTypeStable]
 	}
-	if version := node.Status.NodeInfo.KubeletVersion; !haveVersion && version != "" {
-		missing[util.AnnotationSourceNodeVersion] = version
+	if job.Status.OriginNodeKubeletVersion == "" {
+		job.Status.OriginNodeKubeletVersion = node.Status.NodeInfo.KubeletVersion
 	}
-	return missing
 }
