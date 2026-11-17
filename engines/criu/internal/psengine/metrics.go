@@ -27,7 +27,7 @@ import (
 var (
 	checkpointOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pm_psengine_checkpoint_outcomes_total",
-		Help: "criu-snapshot-engine checkpoint outcomes by reason (Succeeded|Failed|Refused)",
+		Help: "criu-snapshot-engine checkpoint outcomes by reason (Succeeded|Failed|Refused|Cancelled)",
 	}, []string{"reason"})
 	restoreOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pm_psengine_restore_outcomes_total",

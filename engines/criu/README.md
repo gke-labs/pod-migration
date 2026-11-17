@@ -75,6 +75,17 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      uploads `spec.json`, `checkpoint.tar`, and `manifest.json` to GCS with
      MD5/size verification, stops the source container via containerd (`SIGKILL`),
      and marks the `PodSnapshot` `Ready=True`.
+     If the `PodSnapshotManualTrigger` is deleted first, the engine controller
+     sets `Checkpoint=Unknown` with the reason `CancelRequested`, and the agent
+     also reads the trigger itself before the checkpoint and right before the
+     stop. A cancelled agent starts nothing new. It waits for an in-flight
+     kubelet checkpoint to return, because cancelling the call doesn't end the
+     freeze. It aborts uploads and doesn't stop the source container. It then
+     marks `Checkpoint` and `Ready` `False` with the reason `Cancelled`
+     (contract clause C9, #106). The agent needs `get` on
+     `podsnapshotmanualtriggers` for this. If the dump outlasts the
+     orchestrator's 30 s settle wait, the orchestrator keeps the source fenced
+     and cold-evicts it.
    - Reconciles replacement pods on its node carrying
      `podsnapshot.gke.io/ps-name` (`psengine.NodeRestoreReconciler`): downloads
      and SHA-256 verifies the archive from GCS, checks CPU family compatibility,

@@ -1034,6 +1034,8 @@ func TestIsTerminalSnapshotFailureReason(t *testing.T) {
 		{reason: "DeadlineExceeded", want: true},
 		{reason: "Refused", want: true},
 		{reason: "refused", want: true},
+		{reason: "Cancelled", want: true},
+		{reason: "CancelRequested", want: false},
 		{reason: "", want: false},
 		{reason: "NoError", want: false},
 		{reason: "NotReady", want: false},

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -39,10 +40,33 @@ type fakeNodeOps struct {
 	stopped    []string
 	events     []string
 	t          *testing.T
+
+	// afterCheckpoint runs once the checkpoint is taken, before it returns.
+	afterCheckpoint func()
+	// blockCheckpoint, when set, is closed once the checkpoint starts; the
+	// call then blocks until releaseCheckpoint is closed or its context is
+	// cancelled (or 10s pass).
+	blockCheckpoint        chan struct{}
+	releaseCheckpoint      chan struct{}
+	checkpointCtxCancelled bool
 }
 
-func (f *fakeNodeOps) Checkpoint(_ context.Context, ns, pod, container string) (string, error) {
+func (f *fakeNodeOps) Checkpoint(ctx context.Context, ns, pod, container string) (string, error) {
 	f.events = append(f.events, "checkpoint")
+	if f.blockCheckpoint != nil {
+		close(f.blockCheckpoint)
+		select {
+		case <-f.releaseCheckpoint:
+		case <-ctx.Done():
+			f.checkpointCtxCancelled = true
+			return "", ctx.Err()
+		case <-time.After(10 * time.Second):
+			return "", errors.New("checkpoint was never released")
+		}
+	}
+	if f.afterCheckpoint != nil {
+		defer f.afterCheckpoint()
+	}
 	if f.failDump {
 		return "", errors.New("criu dump failed: fsnotify handle")
 	}

@@ -578,13 +578,15 @@ func podSnapshotCheckpointProgress(snap *unstructured.Unstructured) (completed, 
 // to cleanly initiate fallback or reschedule rather than burning the migration deadline on known terminal states.
 // Refused means the snapshot engine declined to checkpoint this pod (for example, a pod shape it does not
 // support). That is a policy decision that will not change within the same PMJ, so it is terminal as well.
+// Cancelled means the engine abandoned the checkpoint because its trigger was deleted, without stopping the
+// source (C9, #106). It is handled as Failed.
 func isTerminalSnapshotFailureReason(reason string) bool {
 	r := strings.ToLower(reason)
 	if r == "" || r == "noerror" || strings.HasPrefix(r, "not") || strings.HasPrefix(r, "non") {
 		return false
 	}
 	switch r {
-	case "failed", "error", "deadlineexceeded", "refused":
+	case "failed", "error", "deadlineexceeded", "refused", "cancelled":
 		return true
 	}
 	return false

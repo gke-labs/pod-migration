@@ -94,6 +94,9 @@ func TestGKEProviderCheckpointState(t *testing.T) {
 	checkpointFailed := [3]string{"Checkpoint", "False", "Failed"}
 	readyFailed := [3]string{"Ready", "False", "Failed"}
 	refused := [3]string{"Checkpoint", "False", "Refused"}
+	cancelled := [3]string{"Checkpoint", "False", "Cancelled"}
+	readyCancelled := [3]string{"Ready", "False", "Cancelled"}
+	cancelRequested := [3]string{"Checkpoint", "Unknown", "CancelRequested"}
 
 	tests := map[string]struct {
 		snapshotRef string
@@ -121,6 +124,14 @@ func TestGKEProviderCheckpointState(t *testing.T) {
 		},
 		"a snapshot the engine refused": {
 			objects: []client.Object{checkpointTestSnapshot("snap", true, refused)},
+			want:    CheckpointState{Settled: true},
+		},
+		"a cancel the engine hasn't confirmed yet (#106)": {
+			objects: []client.Object{checkpointTestSnapshot("snap", true, cancelRequested)},
+			want:    CheckpointState{Settled: false},
+		},
+		"a snapshot the engine cancelled after its trigger was deleted (#106)": {
+			objects: []client.Object{checkpointTestSnapshot("snap", true, cancelled, readyCancelled)},
 			want:    CheckpointState{Settled: true},
 		},
 		"a Ready snapshot": {

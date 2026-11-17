@@ -96,7 +96,7 @@ func main() {
 	ops := &nodeOpsAdapter{n: nd}
 	cpuFam := node.PSEngineCPUFamily()
 	if err := (&psengine.NodeSnapshotReconciler{
-		Client: mgr.GetClient(), NodeName: nodeName,
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node snapshot reconciler")

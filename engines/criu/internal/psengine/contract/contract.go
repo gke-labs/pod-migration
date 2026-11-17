@@ -73,6 +73,15 @@ const (
 	ReasonFailed  = "Failed"
 	ReasonRefused = "Refused"
 	ReasonPending = "Pending"
+	// ReasonCancelRequested (on Checkpoint=Unknown) = the engine controller
+	// saw the PodSnapshotManualTrigger deleted and asked the node agent to
+	// cancel (C9, #106). Not terminal: the orchestrator keeps waiting.
+	ReasonCancelRequested = "CancelRequested"
+	// ReasonCancelled = the node agent abandoned the work order after its
+	// trigger was deleted, and did not stop the source (C9, #106). Terminal;
+	// written only once the agent's work has stopped. The orchestrator
+	// treats it like Failed.
+	ReasonCancelled = "Cancelled"
 
 	// AnnotationRestoreStatus is engine-internal: the node agent stamps it on
 	// the replacement pod so the holder wrapper — which only sees the

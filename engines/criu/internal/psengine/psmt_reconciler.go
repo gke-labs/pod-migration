@@ -28,7 +28,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
@@ -87,13 +89,17 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	psmt := contract.New(contract.GVKManualTrigger)
 	if err := r.Get(ctx, req.NamespacedName, psmt); err != nil {
 		if apierrors.IsNotFound(err) {
-			// PSMT deletion = orchestrator moved on (Evicting cleanup or
-			// timeout, podmigrationjob_controller.go:91-99,405-419). The
-			// PodSnapshot deliberately survives — the replacement pod's
-			// restore still needs it.
-			return ctrl.Result{}, nil
+			// PSMT deletion = orchestrator moved on: Evicting cleanup after
+			// the snapshot went Ready, or a failure or timeout. A Ready
+			// PodSnapshot survives, since the replacement pod's restore
+			// still needs it. A work order that hasn't finished gets a
+			// cancel request (C9, #106); the node agent acts on it.
+			return ctrl.Result{}, r.cancelWorkOrders(ctx, req.NamespacedName)
 		}
 		return ctrl.Result{}, err
+	}
+	if psmt.GetDeletionTimestamp() != nil {
+		return ctrl.Result{}, r.cancelWorkOrders(ctx, req.NamespacedName)
 	}
 
 	podName, ok := contract.TriggerTargetPod(psmt)
@@ -141,6 +147,9 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			"sourcePod":    pod.Name,
 			"sourcePodUID": string(pod.UID),
 			"nodeName":     pod.Spec.NodeName,
+			// The trigger this work order answers: its deletion cancels
+			// the work order (cancelWorkOrders, podSnapshotToTrigger).
+			specTriggerName: req.Name,
 		}
 		if len(pod.Spec.Containers) > 0 {
 			spec["container"] = pod.Spec.Containers[0].Name
@@ -299,10 +308,67 @@ func (r *PSMTReconciler) patchSnapshotConditions(ctx context.Context, namespace,
 	return r.Status().Update(ctx, ps)
 }
 
-// SetupWithManager registers the PSMT watcher.
+// specTriggerName is the PodSnapshot spec field naming the PSMT the work
+// order answers. Engine-internal: the orchestrator doesn't read it.
+const specTriggerName = "triggerName"
+
+func snapshotTrigger(ps *unstructured.Unstructured) string {
+	name, _, _ := unstructured.NestedString(ps.Object, "spec", specTriggerName)
+	return name
+}
+
+// cancelWorkOrders asks the node agent to cancel every unfinished CRIU work
+// order that answers the deleted trigger (Checkpoint=Unknown/CancelRequested).
+// The request is deliberately not terminal: the agent writes Cancelled once
+// its work has actually stopped, so the orchestrator doesn't treat the
+// checkpoint as settled while the source may still be frozen. Work orders
+// created before the trigger name was recorded can't be matched here (the
+// agent still honours a deleted PodSnapshot). If a trigger with the same name
+// is created again before the agent acts, its reconcile replaces the request
+// with Pending and the work order carries on for the new trigger.
+func (r *PSMTReconciler) cancelWorkOrders(ctx context.Context, trigger types.NamespacedName) error {
+	list := contract.NewList(contract.GVKPodSnapshot)
+	if err := r.List(ctx, list, client.InNamespace(trigger.Namespace),
+		client.MatchingLabels{contract.LabelEngine: contract.EngineCRIU}); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		ps := &list.Items[i]
+		if snapshotTrigger(ps) != trigger.Name || contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) || cancelRequested(ps) {
+			continue
+		}
+		log.FromContext(ctx).Info("trigger deleted; asking the node agent to cancel its work order", "snapshot", ps.GetName())
+		if err := r.patchSnapshotConditions(ctx, trigger.Namespace, ps.GetName(), metav1.Condition{
+			Type: contract.CondCheckpoint, Status: metav1.ConditionUnknown, Reason: contract.ReasonCancelRequested,
+			Message: fmt.Sprintf("trigger %s was deleted; waiting for the node agent to confirm the cancel", trigger.Name),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// podSnapshotToTrigger maps an unfinished CRIU work order to its trigger, so
+// the trigger is reconciled (and a deleted one cancels the work order) even
+// when the PSMT delete event was missed, for example across an engine restart.
+func podSnapshotToTrigger(_ context.Context, obj client.Object) []reconcile.Request {
+	ps, ok := obj.(*unstructured.Unstructured)
+	if !ok || ps.GetLabels()[contract.LabelEngine] != contract.EngineCRIU {
+		return nil
+	}
+	trigger := snapshotTrigger(ps)
+	if trigger == "" || contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) || cancelRequested(ps) {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: ps.GetNamespace(), Name: trigger}}}
+}
+
+// SetupWithManager registers the PSMT watcher, plus a PodSnapshot watch that
+// maps each unfinished work order back to its trigger.
 func (r *PSMTReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(contract.New(contract.GVKManualTrigger)).
+		Watches(contract.New(contract.GVKPodSnapshot), handler.EnqueueRequestsFromMapFunc(podSnapshotToTrigger)).
 		Named("psengine-psmt").
 		Complete(r)
 }
