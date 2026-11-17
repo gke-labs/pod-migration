@@ -737,3 +737,26 @@ func TestPreStopCheckDoesNotRetryHopelessErrors(t *testing.T) {
 		}
 	})
 }
+
+// timeoutErr is what the node agent's kubelet client returns when the
+// checkpoint call ran out of time.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string { return "kubelet checkpoint: deadline exceeded" }
+func (timeoutErr) Timeout() bool { return true }
+
+// A checkpoint call that timed out may have left the dump running with the
+// source frozen (#106). A pending cancel must not be confirmed as Cancelled,
+// which says the source runs again; the outcome is Failed, saying so.
+func TestCheckpointTimeoutIsNotReportedCancelled(t *testing.T) {
+	c := cancelFixture(t)
+	ops := &fakeNodeOps{t: t, checkpointErr: fmt.Errorf("wrapped: %w", timeoutErr{}), afterCheckpoint: func() { deleteTrigger(t, c, true) }}
+	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Hour})
+	if len(ops.stopped) != 0 {
+		t.Fatalf("source stopped after a timed-out checkpoint: %v", ops.events)
+	}
+	cond := condition(getSnapshot(t, c, cancelSnapshot), contract.CondCheckpoint)
+	if cond == nil || cond.Reason != contract.ReasonFailed || !strings.Contains(cond.Message, "frozen") {
+		t.Fatalf("want Failed saying the source may be frozen, got %+v", cond)
+	}
+}

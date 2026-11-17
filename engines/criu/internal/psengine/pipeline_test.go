@@ -37,9 +37,11 @@ import (
 type fakeNodeOps struct {
 	tarContent string
 	failDump   bool
-	stopped    []string
-	events     []string
-	t          *testing.T
+	// checkpointErr, when set, is returned by Checkpoint (after afterCheckpoint).
+	checkpointErr error
+	stopped       []string
+	events        []string
+	t             *testing.T
 
 	// afterCheckpoint runs once the checkpoint is taken, before it returns.
 	afterCheckpoint func()
@@ -66,6 +68,9 @@ func (f *fakeNodeOps) Checkpoint(ctx context.Context, ns, pod, container string)
 	}
 	if f.afterCheckpoint != nil {
 		defer f.afterCheckpoint()
+	}
+	if f.checkpointErr != nil {
+		return "", f.checkpointErr
 	}
 	if f.failDump {
 		return "", errors.New("criu dump failed: fsnotify handle")

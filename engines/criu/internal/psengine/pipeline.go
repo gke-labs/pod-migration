@@ -357,6 +357,11 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	if tarPath != "" {
 		defer os.Remove(tarPath) // uploaded or failed — either way the node copy is scratch
 	}
+	if isTimeout(err) {
+		// Checked before a cancel: Cancelled says the source runs again, and
+		// after a timeout the agent doesn't know that.
+		return fmt.Errorf("kubelet checkpoint timed out; the dump may still be running, and past the kubelet's CRI deadline the source can stay frozen until it is resumed by hand (#106); source container not stopped: %w", err)
+	}
 	if c := cancelledAt("during the checkpoint"); c != nil {
 		return c
 	}
@@ -531,6 +536,13 @@ func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, r
 		checkpointOutcomes.WithLabelValues(reason).Inc()
 	}
 	return err
+}
+
+// isTimeout: the error says it ran out of time (the node agent's kubelet
+// client marks both its own timeout and the kubelet's CRI deadline).
+func isTimeout(err error) bool {
+	var te interface{ Timeout() bool }
+	return errors.As(err, &te) && te.Timeout()
 }
 
 func hasTerminalCheckpoint(ps *unstructured.Unstructured) bool {
