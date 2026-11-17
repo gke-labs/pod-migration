@@ -188,7 +188,11 @@ func main() {
 						if !ok {
 							return obj, nil
 						}
-						// Strip heavy cached image metadata not needed by node preemption controller
+						// Strip heavy cached image metadata. Keep labels and
+						// status.nodeInfo: the node preemption controller reads
+						// node state, and the PodMigrationJob reconciler records
+						// the source node's instance-type label and kubelet
+						// version (#14).
 						node.Status.Images = nil
 						node.ManagedFields = nil
 						return node, nil
