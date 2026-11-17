@@ -140,6 +140,43 @@ func (h *hookStore) Put(ctx context.Context, bucket, object string, r io.Reader)
 	return h.memStore.Put(ctx, bucket, object, r)
 }
 
+// podSnapshotToTrigger only enqueues the trigger of an unfinished CRIU work
+// order that hasn't been asked to cancel yet.
+func TestPodSnapshotToTriggerSkipsSettledAndForeign(t *testing.T) {
+	cond := func(typ string, status metav1.ConditionStatus, reason string) func(*unstructured.Unstructured) {
+		return func(ps *unstructured.Unstructured) {
+			if err := contract.SetCondition(ps, metav1.Condition{Type: typ, Status: status, Reason: reason}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cases := map[string]func(*unstructured.Unstructured){
+		"Ready":           cond(contract.CondReady, metav1.ConditionTrue, contract.ReasonSucceeded),
+		"Failed":          cond(contract.CondCheckpoint, metav1.ConditionFalse, contract.ReasonFailed),
+		"Refused":         cond(contract.CondCheckpoint, metav1.ConditionFalse, contract.ReasonRefused),
+		"Cancelled":       cond(contract.CondCheckpoint, metav1.ConditionFalse, contract.ReasonCancelled),
+		"CancelRequested": cond(contract.CondCheckpoint, metav1.ConditionUnknown, contract.ReasonCancelRequested),
+		"another engine":  func(ps *unstructured.Unstructured) { ps.SetLabels(map[string]string{contract.LabelEngine: "gke"}) },
+		"no engine label": func(ps *unstructured.Unstructured) { ps.SetLabels(nil) },
+		"no trigger name": func(ps *unstructured.Unstructured) {
+			unstructured.RemoveNestedField(ps.Object, "spec", specTriggerName)
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			ps := workOrderSnapshot(cancelSnapshot)
+			_ = unstructured.SetNestedField(ps.Object, cancelTrigger, "spec", specTriggerName)
+			if reqs := podSnapshotToTrigger(context.Background(), ps); len(reqs) != 1 {
+				t.Fatalf("test setup: the unmodified work order must enqueue its trigger, got %v", reqs)
+			}
+			mutate(ps)
+			if reqs := podSnapshotToTrigger(context.Background(), ps); len(reqs) != 0 {
+				t.Fatalf("want no request, got %v", reqs)
+			}
+		})
+	}
+}
+
 func TestPSMTRecordsTriggerOnWorkOrder(t *testing.T) {
 	c := cancelFixture(t)
 	ps := getSnapshot(t, c, cancelSnapshot)
@@ -211,6 +248,26 @@ func TestCancelAfterUploadSkipsStop(t *testing.T) {
 	}
 }
 
+// The commit point: a trigger deleted once the stop has begun is not seen.
+// The source is stopped and Ready=True wins, even over the controller half's
+// CancelRequested, so the orchestrator reads a completed checkpoint, which is
+// the truth.
+func TestTriggerDeletedDuringStopStaysReady(t *testing.T) {
+	for name, controllerUp := range map[string]bool{"controller half up": true, "controller half down": false} {
+		t.Run(name, func(t *testing.T) {
+			c := cancelFixture(t)
+			ops := &fakeNodeOps{tarContent: "TARBYTES", t: t, beforeStop: func() { deleteTrigger(t, c, controllerUp) }}
+			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Millisecond})
+			if len(ops.stopped) != 1 {
+				t.Fatalf("want the committed stop: events %v", ops.events)
+			}
+			if ps := getSnapshot(t, c, cancelSnapshot); !contract.IsSnapshotReady(ps) {
+				t.Fatalf("want Ready=True after the committed stop, got %+v", contract.Conditions(ps))
+			}
+		})
+	}
+}
+
 // (b, earlier) The trigger is deleted once the checkpoint is taken: nothing
 // is uploaded and the source is not stopped.
 func TestCancelAfterCheckpointSkipsUploadAndStop(t *testing.T) {
@@ -248,8 +305,15 @@ func TestCancelDuringCheckpointWaitsForTheCall(t *testing.T) {
 				err = errors.New("terminal outcome written while the checkpoint call was still running")
 			}
 		}
-		// Give the 5ms poller time to see the request before the call returns.
+		// Give the 5ms poller time to see the request before the call returns,
+		// and check again: the poller must not have written an outcome either.
 		time.Sleep(50 * time.Millisecond)
+		if err == nil {
+			ps := contract.New(contract.GVKPodSnapshot)
+			if err = c.Get(context.Background(), cancelSnapshotKey, ps); err == nil && hasTerminalCheckpoint(ps) {
+				err = errors.New("terminal outcome written after the poller ticked, while the checkpoint call was still running")
+			}
+		}
 		close(release)
 		errs <- err
 	}()

@@ -45,6 +45,8 @@ type fakeNodeOps struct {
 
 	// afterCheckpoint runs once the checkpoint is taken, before it returns.
 	afterCheckpoint func()
+	// beforeStop runs when StopContainer is called, before the stop.
+	beforeStop func()
 	// blockCheckpoint, when set, is closed once the checkpoint starts; the
 	// call then blocks until releaseCheckpoint is closed or its context is
 	// cancelled (or 10s pass).
@@ -89,6 +91,9 @@ func (f *fakeNodeOps) SourceInfo(_ context.Context, ns, pod, container string) (
 }
 
 func (f *fakeNodeOps) StopContainer(_ context.Context, ns, pod, container string) error {
+	if f.beforeStop != nil {
+		f.beforeStop()
+	}
 	f.events = append(f.events, "stop")
 	f.stopped = append(f.stopped, ns+"/"+pod+"/"+container)
 	return nil
