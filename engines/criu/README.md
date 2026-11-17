@@ -23,12 +23,20 @@
 >   nodes sharing the default GCE service account) can get root on a restoring
 >   node** until `R2` (archive provenance) and `R5` (dedicated GCS credentials)
 >   land.
+> - **Agent RBAC Breadth (`pod-migrate-psengine-agent`):** The node DaemonSet holds
+>   cluster-wide `pods` (`get`, `list`, `watch`, `update`, `patch`), `nodes` (`get`,
+>   `patch`), and `nodes/checkpoint` (`create`) permissions to annotate restored pods
+>   with `pod-migration.gke.io/restore-status` and trigger Kubelet container checkpoints.
+> - **Residual Dual-Start Window:** If the holder container downward-API poll times out
+>   or falls through to cold-start execution before sibling restore initiates, a residual
+>   dual-start race window exists where both cold-started app processes and restored CRIU
+>   processes could execute concurrently.
 > - **Known follow-ups tracked in [#129](https://github.com/gke-labs/pod-migration/issues/129):**
 >   - `cmd/holder`: downward-API volume propagation lag after gate removal can
 >     exceed the initial 2s `ps-name` poll window and trigger a cold-start
 >     fallback before the annotation projects into `/pminfo/annotations`.
->   - `internal/psengine/restore_node.go`: `fetch()` caps its in-memory return
->     buffer at 4 MiB (`manifest.json` / `spec.json`).
+>   - `internal/psengine/restore_node.go`: `fetch()` enforces a 4 MiB download cap on
+>     metadata (`manifest.json`, `spec.json`) and an 8 GiB cap on `checkpoint.tar`.
 >   - `internal/node/capability.go`: `Bootstrap` installs `/usr/local/sbin/criu`
 >     and `/etc/criu/runc.conf` on the host node; removing the DaemonSet does
 >     not automatically uninstall those host files.

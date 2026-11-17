@@ -20,8 +20,10 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -544,6 +546,18 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	if !hasRule(agentRole, contract.GVKPodSnapshot.Group, "podsnapshots", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/list/watch on %s/podsnapshots", contract.GVKPodSnapshot.Group)
 	}
+	if !hasRule(agentRole, contract.GVKPodSnapshot.Group, "podsnapshots/status", "get", "update", "patch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/update/patch on %s/podsnapshots/status", contract.GVKPodSnapshot.Group)
+	}
+	if !hasRule(agentRole, "", "pods", "get", "list", "watch", "update", "patch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing update/patch on core/pods")
+	}
+	if !hasRule(agentRole, "", "nodes", "get", "patch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/patch on core/nodes")
+	}
+	if !hasRule(agentRole, "", "nodes/checkpoint", "create") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing create on core/nodes/checkpoint")
+	}
 	if !hasRule(controllerRole, contract.GVKStorageConfig.Group, "podsnapshotstorageconfigs", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list/watch on %s/podsnapshotstorageconfigs", contract.GVKStorageConfig.Group)
 	}
@@ -556,4 +570,110 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	if !strings.Contains(string(rnBytes), wantMarker) {
 		t.Fatalf("restore_node.go missing %q marker", wantMarker)
 	}
+}
+
+type trackingStore struct {
+	*memStore
+	gets []string
+}
+
+func (s *trackingStore) Get(ctx context.Context, bucket, object string) (io.ReadCloser, error) {
+	s.gets = append(s.gets, object)
+	return s.memStore.Get(ctx, bucket, object)
+}
+
+func TestNodeRestore_RejectsOversizedMetadata(t *testing.T) {
+	const prefix = "snaps/ps-web-0-deadbeef/"
+
+	t.Run("manifest exceeding 4 MiB fails before fetching spec.json", func(t *testing.T) {
+		ps := workOrderSnapshot("ps-web-0-deadbeef")
+		_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
+		pod := replacementPodOnNode("ps-web-0-deadbeef")
+		c := newClient(t, ps, pod)
+
+		store := &trackingStore{memStore: newMemStore()}
+		validManifest := Manifest{
+			Snapshot: "ps-web-0-deadbeef", SourcePod: "web-0", SourcePodUID: "src-uid",
+			Container: "app", Node: "node-a", ImageName: "redis:7",
+			TarSHA256: "dummy", TarBytes: 8, SpecSHA256: "dummy", EngineVersion: engineVersion,
+		}
+		rawMF, _ := json.Marshal(validManifest)
+		// Pad with valid JSON whitespace up to 4 MiB + 1
+		oversizedManifest := bytes.Repeat([]byte(" "), (4<<20)+1)
+		copy(oversizedManifest, rawMF)
+
+		store.objects["bkt/"+prefix+"manifest.json"] = oversizedManifest
+		store.objects["bkt/"+prefix+"spec.json"] = []byte(`{"ociVersion":"1.1.0"}`)
+		store.objects["bkt/"+prefix+"checkpoint.tar"] = []byte("TARBYTES")
+
+		ops := &fakeRestoreOps{}
+		r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
+			t.Fatal(err)
+		}
+
+		if len(ops.restored) != 0 {
+			t.Fatalf("restore called %d times, want 0", len(ops.restored))
+		}
+		got := &corev1.Pod{}
+		_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
+		if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
+			t.Fatalf("restore status: %q, want %q", got.Annotations[contract.AnnotationRestoreStatus], contract.RestoreStatusFailed)
+		}
+
+		for _, fetched := range store.gets {
+			if strings.Contains(fetched, "spec.json") {
+				t.Fatalf("spec.json was fetched (%s); oversized manifest must abort before fetching spec", fetched)
+			}
+			if strings.Contains(fetched, "checkpoint.tar") {
+				t.Fatalf("checkpoint.tar was fetched (%s); oversized manifest must abort before fetching tar", fetched)
+			}
+		}
+	})
+
+	t.Run("spec.json exceeding 4 MiB fails before fetching checkpoint.tar", func(t *testing.T) {
+		ps := workOrderSnapshot("ps-web-0-deadbeef")
+		_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
+		pod := replacementPodOnNode("ps-web-0-deadbeef")
+		c := newClient(t, ps, pod)
+
+		store := &trackingStore{memStore: newMemStore()}
+		oversizedSpec := make([]byte, (4<<20)+1)
+		specSHA, _, _ := SHA256Reader(bytes.NewReader(oversizedSpec))
+		tar := []byte("TARBYTES")
+		tarSHA, _, _ := SHA256Reader(bytes.NewReader(tar))
+
+		mf := Manifest{
+			Snapshot: "ps-web-0-deadbeef", SourcePod: "web-0", SourcePodUID: "src-uid",
+			Container: "app", Node: "node-a", ImageName: "redis:7",
+			TarSHA256: tarSHA, TarBytes: int64(len(tar)), SpecSHA256: specSHA, EngineVersion: engineVersion,
+		}
+		mfJSON, _ := json.Marshal(mf)
+		store.objects["bkt/"+prefix+"manifest.json"] = mfJSON
+		store.objects["bkt/"+prefix+"spec.json"] = oversizedSpec
+		store.objects["bkt/"+prefix+"checkpoint.tar"] = tar
+
+		ops := &fakeRestoreOps{}
+		r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
+			t.Fatal(err)
+		}
+
+		if len(ops.restored) != 0 {
+			t.Fatalf("restore called %d times, want 0", len(ops.restored))
+		}
+		got := &corev1.Pod{}
+		_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
+		if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
+			t.Fatalf("restore status: %q, want %q", got.Annotations[contract.AnnotationRestoreStatus], contract.RestoreStatusFailed)
+		}
+
+		for _, fetched := range store.gets {
+			if strings.Contains(fetched, "checkpoint.tar") {
+				t.Fatalf("checkpoint.tar was fetched (%s); oversized spec.json must abort before fetching tar", fetched)
+			}
+		}
+	})
 }

@@ -172,16 +172,22 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	spec.Hooks = nil
 	notes = append(notes, "scrubbed OCI runtime hooks")
 
-	if spec.Process == nil {
-		spec.Process = &specs.Process{}
+	archiveProc := spec.Process
+	if archiveProc == nil {
+		archiveProc = &specs.Process{}
 	}
-	spec.Process.Capabilities = p.TargetSpec.Process.Capabilities
-	spec.Process.User = p.TargetSpec.Process.User
-	spec.Process.NoNewPrivileges = p.TargetSpec.Process.NoNewPrivileges
-	spec.Process.ApparmorProfile = p.TargetSpec.Process.ApparmorProfile
-	spec.Process.SelinuxLabel = p.TargetSpec.Process.SelinuxLabel
-	spec.Process.OOMScoreAdj = p.TargetSpec.Process.OOMScoreAdj
-	spec.Process.Rlimits = p.TargetSpec.Process.Rlimits
+	targetProc := specs.Process{}
+	if p.TargetSpec.Process != nil {
+		targetProc = *p.TargetSpec.Process
+	}
+	targetProc.Terminal = archiveProc.Terminal
+	targetProc.ConsoleSize = archiveProc.ConsoleSize
+	targetProc.Args = archiveProc.Args
+	targetProc.CommandLine = archiveProc.CommandLine
+	targetProc.Env = archiveProc.Env
+	targetProc.Cwd = archiveProc.Cwd
+	spec.Process = &targetProc
+	notes = append(notes, "rebuilt Process spec with explicit allowlist (destination security posture)")
 
 	spec.Linux.Seccomp = p.TargetSpec.Linux.Seccomp
 	spec.Linux.MaskedPaths = p.TargetSpec.Linux.MaskedPaths

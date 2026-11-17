@@ -54,6 +54,7 @@ type restorer struct {
 	execHost         func(ctx context.Context, env []string, name string, args ...string) (string, error)
 	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
 	findContainerFn  func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error)
+	listContainersFn func(ctx context.Context) ([]containerd.Container, error)
 	prepareRootfsFn  func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error)
 	readProcCgroupFn func(pid int) ([]byte, error)
 	pmRootDir        string
@@ -127,7 +128,16 @@ type containerRef struct {
 // containers match (e.g. a stopped attempt with Pid == 0 alongside a running
 // one), prefers a container with a live task Pid.
 func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
-	cs, err := r.cclient.Containers(ctx)
+	listFn := func(ctx context.Context) ([]containerd.Container, error) {
+		if r.cclient == nil {
+			return nil, fmt.Errorf("containerd client not initialized")
+		}
+		return r.cclient.Containers(ctx)
+	}
+	if r.listContainersFn != nil {
+		listFn = r.listContainersFn
+	}
+	cs, err := listFn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd list: %w", err)
 	}
