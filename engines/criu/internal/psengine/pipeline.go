@@ -152,6 +152,10 @@ const defaultCancelPollInterval = 2 * time.Second
 // withdrawn (trigger deleted).
 var errCancelled = errors.New("cancelled: the trigger was deleted")
 
+// errFinished marks a pipeline that stopped because its PodSnapshot already
+// has an outcome; there is nothing to write.
+var errFinished = errors.New("the PodSnapshot already has an outcome")
+
 // errStopCommitted ends the cancel poller once the pipeline commits to the
 // source stop.
 var errStopCommitted = errors.New("source stop committed")
@@ -170,41 +174,59 @@ func (r *NodeSnapshotReconciler) cancelPollInterval() time.Duration {
 	return defaultCancelPollInterval
 }
 
-// cancelCheck reports whether the work order was withdrawn, and why: the
-// PodSnapshot is gone, being deleted, or carries a cancel request; or, with
-// checkTrigger, the trigger it answers is gone or being deleted. Reading the
-// trigger directly means a cancel isn't missed while the engine controller
-// is down or behind. Work orders from before the trigger name was recorded
-// skip the trigger check.
-func cancelCheck(ctx context.Context, rd client.Reader, key types.NamespacedName, checkTrigger bool) (bool, string, error) {
+// workOrderState is what cancelCheck found.
+type workOrderState int
+
+const (
+	// workOrderActive: carry on.
+	workOrderActive workOrderState = iota
+	// workOrderCancelled: the work order was withdrawn.
+	workOrderCancelled
+	// workOrderFinished: the PodSnapshot already has an outcome (Ready, or a
+	// terminal reason). Nothing more to do, and nothing to write.
+	workOrderFinished
+)
+
+// cancelCheck reports whether the work order was withdrawn or already has an
+// outcome, and why. Withdrawn: the PodSnapshot is gone, being deleted, or
+// carries a cancel request; or, with checkTrigger, the trigger it answers is
+// gone or being deleted. Reading the trigger directly means a cancel isn't
+// missed while the engine controller is down or behind. Work orders from
+// before the trigger name was recorded skip the trigger check. An outcome is
+// checked before the trigger, because deleting the trigger of a Ready
+// snapshot is the normal Evicting cleanup, not a cancel.
+func cancelCheck(ctx context.Context, rd client.Reader, key types.NamespacedName, checkTrigger bool) (workOrderState, string, error) {
 	ps := contract.New(contract.GVKPodSnapshot)
 	if err := rd.Get(ctx, key, ps); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, "the PodSnapshot was deleted", nil
+			return workOrderCancelled, "the PodSnapshot was deleted", nil
 		}
-		return false, "", err
+		return workOrderActive, "", err
 	}
 	if ps.GetDeletionTimestamp() != nil {
-		return true, "the PodSnapshot is being deleted", nil
+		return workOrderCancelled, "the PodSnapshot is being deleted", nil
+	}
+	if contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) {
+		return workOrderFinished, "the PodSnapshot already has an outcome", nil
 	}
 	if cancelRequested(ps) {
-		return true, "the engine controller saw the trigger deleted", nil
+		return workOrderCancelled, "the engine controller saw the trigger deleted", nil
 	}
 	trigger := snapshotTrigger(ps)
 	if !checkTrigger || trigger == "" {
-		return false, "", nil
+		return workOrderActive, "", nil
 	}
 	psmt := contract.New(contract.GVKManualTrigger)
 	if err := rd.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: trigger}, psmt); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, fmt.Sprintf("trigger %s was deleted", trigger), nil
+			return workOrderCancelled, fmt.Sprintf("trigger %s was deleted", trigger), nil
 		}
-		return false, "", err
+		return workOrderActive, "", err
 	}
 	if psmt.GetDeletionTimestamp() != nil {
-		return true, fmt.Sprintf("trigger %s is being deleted", trigger), nil
+		return workOrderCancelled, fmt.Sprintf("trigger %s is being deleted", trigger), nil
 	}
-	return false, "", nil
+	return workOrderActive, "", nil
 }
 
 // cancelRequested: the controller half asked for a cancel, or the agent
@@ -235,10 +257,17 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) {
 		return ctrl.Result{}, nil
 	}
+	if b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket"); b == "" {
+		// No bucket means no work order: the controller half withheld it for
+		// a refusal or a storage failure, and records that outcome itself.
+		// Writing Failed here (from every node's agent) would pre-empt its
+		// Refused, which patchSnapshotConditions then won't overwrite.
+		return ctrl.Result{}, nil
+	}
 	spec, err := readSnapshotSpec(ps)
 	if err != nil {
-		// The controller half owns refusals; an unreadable work order on an
-		// engine-labeled snapshot is a bug — report as Failed.
+		// An unreadable work order that does carry a bucket is a bug —
+		// report as Failed.
 		return ctrl.Result{}, r.finish(ctx, req, contract.ReasonFailed, err.Error())
 	}
 	if spec.NodeName != r.NodeName {
@@ -252,10 +281,15 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// The cache can lag a cancel, and the engine controller may not have
 	// seen the trigger's deletion yet; ask the API server before taking a
-	// checkpoint.
-	if cancelled, why, err := cancelCheck(ctx, r.liveReader(), req.NamespacedName, true); err != nil {
+	// checkpoint. The cache can also lag an outcome: a stale Pending copy of
+	// a snapshot that already went Ready, whose trigger the orchestrator
+	// then deleted, must not be cancelled.
+	switch state, why, err := cancelCheck(ctx, r.liveReader(), req.NamespacedName, true); {
+	case err != nil:
 		return ctrl.Result{}, err
-	} else if cancelled {
+	case state == workOrderFinished:
+		return ctrl.Result{}, nil
+	case state == workOrderCancelled:
 		logger.Info("work order cancelled before the pipeline started; not checkpointing", "why", why)
 		return ctrl.Result{}, r.finish(ctx, req, contract.ReasonCancelled,
 			fmt.Sprintf("cancelled before the checkpoint started (%s); the source container was not touched", why))
@@ -265,6 +299,10 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		"dest", fmt.Sprintf("gs://%s/%s", spec.Bucket, ArchivePrefix(spec.Path, ps.GetName())))
 
 	if err := r.run(ctx, req.NamespacedName, spec); err != nil {
+		if errors.Is(err, errFinished) {
+			logger.Info("the PodSnapshot got an outcome elsewhere; source container not stopped", "detail", err.Error())
+			return ctrl.Result{}, nil
+		}
 		if errors.Is(err, errCancelled) {
 			logger.Info("checkpoint pipeline cancelled; source container left running", "detail", err.Error())
 			return ctrl.Result{}, r.finish(ctx, req, contract.ReasonCancelled, truncateMsg(err.Error(), 1500))
@@ -296,7 +334,8 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 		if !cancelled {
 			// A cached read: cheap, and the live read before the stop is
 			// the one that has to be fresh.
-			cancelled, _, _ = cancelCheck(parent, r.Client, key, false)
+			state, _, _ := cancelCheck(parent, r.Client, key, false)
+			cancelled = state == workOrderCancelled
 		}
 		if cancelled {
 			return fmt.Errorf("%w %s; source container not stopped", errCancelled, stage)
@@ -389,19 +428,22 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	if errors.Is(context.Cause(ctx), errCancelled) {
 		return fmt.Errorf("%w before the stop; source container not stopped", errCancelled)
 	}
-	var cancelled bool
+	var state workOrderState
 	var why string
 	err = retry.OnError(wait.Backoff{Steps: 3, Duration: 200 * time.Millisecond, Factor: 2},
 		func(error) bool { return true },
 		func() (err error) {
-			cancelled, why, err = cancelCheck(parent, r.liveReader(), key, true)
+			state, why, err = cancelCheck(parent, r.liveReader(), key, true)
 			return err
 		})
 	if err != nil {
 		return fmt.Errorf("archive durable, but could not confirm the trigger before stopping the source (source container not stopped): %w", err)
 	}
-	if cancelled {
+	switch state {
+	case workOrderCancelled:
 		return fmt.Errorf("%w before the stop (%s); source container not stopped", errCancelled, why)
+	case workOrderFinished:
+		return fmt.Errorf("%w before the stop; source container not stopped", errFinished)
 	}
 
 	// postCheckpoint: stop — only after the archive is provably durable.
@@ -421,7 +463,7 @@ func (r *NodeSnapshotReconciler) pollForCancel(ctx context.Context, cancel conte
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if cancelled, _, _ := cancelCheck(ctx, r.Client, key, false); cancelled && ctx.Err() == nil {
+			if state, _, _ := cancelCheck(ctx, r.Client, key, false); state == workOrderCancelled && ctx.Err() == nil {
 				cancel(errCancelled)
 				return
 			}
@@ -432,14 +474,18 @@ func (r *NodeSnapshotReconciler) pollForCancel(ctx context.Context, cancel conte
 // finish writes the terminal conditions the orchestrator polls. It retries on
 // conflict, re-reading past the cache: the controller half may write the same
 // PodSnapshot concurrently (Pending, or CancelRequested), and a dropped
-// outcome would re-run the pipeline on the requeue.
+// outcome would re-run the pipeline on the requeue. Like
+// patchSnapshotConditions, it never overwrites an outcome already recorded:
+// a Cancelled or Failed written over Ready would misreport a source that was
+// already stopped.
 func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, reason, msg string) error {
-	checkpointOutcomes.WithLabelValues(reason).Inc()
 	status := metav1.ConditionFalse
 	if reason == contract.ReasonSucceeded {
 		status = metav1.ConditionTrue
 	}
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+	wrote := false
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		wrote = false
 		ps := contract.New(contract.GVKPodSnapshot)
 		if err := r.liveReader().Get(ctx, req.NamespacedName, ps); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -450,6 +496,9 @@ func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, r
 				return client.IgnoreNotFound(err)
 			}
 		}
+		if contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) {
+			return nil
+		}
 		for _, c := range []metav1.Condition{
 			{Type: contract.CondCheckpoint, Status: status, Reason: reason, Message: msg},
 			{Type: contract.CondReady, Status: status, Reason: reason, Message: msg},
@@ -458,8 +507,16 @@ func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, r
 				return err
 			}
 		}
-		return r.Status().Update(ctx, ps)
+		if err := r.Status().Update(ctx, ps); err != nil {
+			return err
+		}
+		wrote = true
+		return nil
 	})
+	if err == nil && wrote {
+		checkpointOutcomes.WithLabelValues(reason).Inc()
+	}
+	return err
 }
 
 func hasTerminalCheckpoint(ps *unstructured.Unstructured) bool {

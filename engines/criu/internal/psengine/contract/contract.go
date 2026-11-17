@@ -55,6 +55,11 @@ const (
 	// policies carrying LabelEngine=EngineCRIU.
 	LabelEngine = "pod-migrate.io/engine"
 	EngineCRIU  = "criu"
+	// LabelTriggeredBy is the label GKE Pod Snapshots puts on the PodSnapshots
+	// it creates for a manual trigger, valued with the trigger's name. The
+	// orchestrator's CheckpointState finds a job's snapshots by it once the
+	// trigger is gone (gke_provider.go snapshotTriggeredByLabel).
+	LabelTriggeredBy = "gke-pod-snapshot-triggered-by"
 
 	// Condition types/reasons the orchestrator's PMJ controller polls on
 	// PodSnapshot (podmigrationjob_controller.go:310-324): ready iff

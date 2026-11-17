@@ -134,6 +134,10 @@ func TestGKEProviderCheckpointState(t *testing.T) {
 			objects: []client.Object{checkpointTestSnapshot("snap", true, cancelled, readyCancelled)},
 			want:    CheckpointState{Settled: true},
 		},
+		"an unfinished CRIU work order found by its label after the trigger is gone (#106)": {
+			objects: []client.Object{checkpointTestSnapshot("snap", true, [3]string{"Checkpoint", "Unknown", "Pending"})},
+			want:    CheckpointState{Settled: false},
+		},
 		"a Ready snapshot": {
 			objects: []client.Object{checkpointTestSnapshot("snap", true, checkpointed, ready)},
 			want:    CheckpointState{Settled: true, Completed: true},

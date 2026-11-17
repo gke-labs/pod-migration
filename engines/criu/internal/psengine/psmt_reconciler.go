@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -142,7 +143,16 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		ps = contract.New(contract.GVKPodSnapshot)
 		ps.SetName(snapshotName)
 		ps.SetNamespace(req.Namespace)
-		ps.SetLabels(map[string]string{contract.LabelEngine: contract.EngineCRIU})
+		psLabels := map[string]string{contract.LabelEngine: contract.EngineCRIU}
+		// The label GKE Pod Snapshots puts on its snapshots, so the
+		// orchestrator's CheckpointState finds this one after the trigger is
+		// gone, even if the job never recorded status.snapshotRef. A trigger
+		// name too long for a label value (pod names over 49 characters)
+		// gets no label; the create would otherwise be rejected.
+		if len(validation.IsValidLabelValue(req.Name)) == 0 {
+			psLabels[contract.LabelTriggeredBy] = req.Name
+		}
+		ps.SetLabels(psLabels)
 		spec := map[string]interface{}{
 			"sourcePod":    pod.Name,
 			"sourcePodUID": string(pod.UID),

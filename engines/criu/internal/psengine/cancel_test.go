@@ -22,11 +22,13 @@ package psengine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -433,4 +435,178 @@ func (f *flakyReader) Get(ctx context.Context, key client.ObjectKey, obj client.
 		return errors.New("apiserver unavailable")
 	}
 	return f.Reader.Get(ctx, key, obj, opts...)
+}
+
+// staleSnapshotClient serves a fixed, stale copy of one PodSnapshot from Get,
+// the way a lagging informer cache would; everything else, including the
+// status writes, goes to the real client.
+type staleSnapshotClient struct {
+	client.Client
+	key   types.NamespacedName
+	stale *unstructured.Unstructured
+}
+
+func (s *staleSnapshotClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if u, ok := obj.(*unstructured.Unstructured); ok && key == s.key && u.GetKind() == contract.GVKPodSnapshot.Kind {
+		s.stale.DeepCopyInto(u)
+		return nil
+	}
+	return s.Client.Get(ctx, key, obj, opts...)
+}
+
+func outcomeCount(reason string) float64 {
+	return testutil.ToFloat64(checkpointOutcomes.WithLabelValues(reason))
+}
+
+// A reconcile that reads a stale Pending copy after the snapshot went Ready
+// must neither work it again nor change its outcome. With the trigger
+// deleted (the normal Evicting cleanup) it must not turn the completed
+// snapshot into Cancelled: the source is already stopped. With the trigger
+// still there, it must not checkpoint and stop the source a second time.
+func TestStaleReadAfterReadyDoesNotRerunOrCancel(t *testing.T) {
+	for name, deleted := range map[string]bool{"trigger deleted": true, "trigger present": false} {
+		t.Run(name, func(t *testing.T) {
+			c := cancelFixture(t)
+			stale := getSnapshot(t, c, cancelSnapshot).DeepCopy()
+			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore()})
+			if deleted {
+				deleteTrigger(t, c, true)
+			}
+			want := contract.Conditions(getSnapshot(t, c, cancelSnapshot))
+			before := outcomeCount(contract.ReasonCancelled)
+
+			ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+			runAgent(t, &NodeSnapshotReconciler{
+				Client:    &staleSnapshotClient{Client: c, key: cancelSnapshotKey, stale: stale},
+				APIReader: c, NodeName: "node-a", Ops: ops, Store: newMemStore(),
+			})
+
+			if len(ops.events) != 0 {
+				t.Fatalf("a finished snapshot must not be worked again: %v", ops.events)
+			}
+			if got := contract.Conditions(getSnapshot(t, c, cancelSnapshot)); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("a Ready snapshot was overwritten:\n got %+v\nwant %+v", got, want)
+			}
+			if got := outcomeCount(contract.ReasonCancelled); got != before {
+				t.Fatalf("a skipped outcome was counted: Cancelled %v -> %v", before, got)
+			}
+		})
+	}
+}
+
+// If the snapshot gets an outcome from elsewhere while the agent uploads, the
+// live read before the stop sees it and the source is not stopped.
+func TestOutcomeBeforeStopSkipsStop(t *testing.T) {
+	c := cancelFixture(t)
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	store := &hookStore{memStore: newMemStore(), object: "manifest.json", onPut: func() {
+		if err := (&PSMTReconciler{Client: c}).setSnapshotTerminal(context.Background(), "default", cancelSnapshot, contract.ReasonFailed, "elsewhere"); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
+	if len(ops.stopped) != 0 {
+		t.Fatalf("source stopped although the snapshot already had an outcome: events %v", ops.events)
+	}
+	if cond := condition(getSnapshot(t, c, cancelSnapshot), contract.CondCheckpoint); cond == nil || cond.Message != "elsewhere" {
+		t.Fatalf("the existing outcome must stand, got %+v", cond)
+	}
+}
+
+// finish never overwrites an outcome already recorded (matching
+// patchSnapshotConditions), and doesn't count a write it skipped.
+func TestFinishKeepsExistingOutcome(t *testing.T) {
+	outcomes := map[string]func(t *testing.T, c client.Client){
+		"Ready": func(t *testing.T, c client.Client) {
+			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore()})
+		},
+		contract.ReasonRefused: func(t *testing.T, c client.Client) {
+			if err := (&PSMTReconciler{Client: c}).setSnapshotTerminal(context.Background(), "default", cancelSnapshot, contract.ReasonRefused, "policy"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		contract.ReasonCancelled: func(t *testing.T, c client.Client) {
+			deleteTrigger(t, c, true)
+			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{t: t}, Store: newMemStore()})
+		},
+	}
+	for name, setup := range outcomes {
+		for _, reason := range []string{contract.ReasonCancelled, contract.ReasonFailed, contract.ReasonSucceeded} {
+			t.Run(name+" then "+reason, func(t *testing.T) {
+				c := cancelFixture(t)
+				setup(t, c)
+				want := contract.Conditions(getSnapshot(t, c, cancelSnapshot))
+				before := outcomeCount(reason)
+				r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a"}
+				if err := r.finish(context.Background(), ctrl.Request{NamespacedName: cancelSnapshotKey}, reason, "late"); err != nil {
+					t.Fatal(err)
+				}
+				got := contract.Conditions(getSnapshot(t, c, cancelSnapshot))
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Fatalf("outcome overwritten:\n got %+v\nwant %+v", got, want)
+				}
+				if after := outcomeCount(reason); after != before {
+					t.Fatalf("a skipped outcome was counted: %s %v -> %v", reason, before, after)
+				}
+			})
+		}
+	}
+}
+
+// A work order without a bucket belongs to the controller half (a refusal or
+// a storage failure it is about to record): no node agent writes an outcome
+// for it, so the controller's Refused isn't pre-empted by an agent's Failed.
+func TestAgentLeavesBucketlessWorkOrderToController(t *testing.T) {
+	ps := workOrderSnapshot(cancelSnapshot)
+	unstructured.RemoveNestedField(ps.Object, "spec", "bucket")
+	unstructured.RemoveNestedField(ps.Object, "spec", "path")
+	c := newClient(t, ps)
+	for _, node := range []string{"node-a", "node-b"} {
+		ops := &fakeNodeOps{t: t}
+		runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: node, Ops: ops, Store: newMemStore()})
+		if len(ops.events) != 0 {
+			t.Fatalf("agent on %s acted on a work order without a bucket: %v", node, ops.events)
+		}
+	}
+	if conds := contract.Conditions(getSnapshot(t, c, cancelSnapshot)); len(conds) != 0 {
+		t.Fatalf("an agent wrote an outcome for a controller-owned work order: %+v", conds)
+	}
+	if err := (&PSMTReconciler{Client: c}).setSnapshotTerminal(context.Background(), "default", cancelSnapshot, contract.ReasonRefused, "policy"); err != nil {
+		t.Fatal(err)
+	}
+	if cond := condition(getSnapshot(t, c, cancelSnapshot), contract.CondCheckpoint); cond == nil || cond.Reason != contract.ReasonRefused {
+		t.Fatalf("want the controller's Refused, got %+v", cond)
+	}
+}
+
+// The work order carries the label GKE Pod Snapshots puts on its snapshots,
+// valued with the trigger's name, so the orchestrator's CheckpointState finds
+// an unfinished CRIU snapshot after the trigger is gone even when the job
+// never recorded status.snapshotRef. A trigger name too long for a label
+// value gets no label rather than a create the API server rejects.
+func TestPSMTLabelsWorkOrderWithTrigger(t *testing.T) {
+	c := cancelFixture(t)
+	if got := getSnapshot(t, c, cancelSnapshot).GetLabels()[contract.LabelTriggeredBy]; got != cancelTrigger {
+		t.Fatalf("%s = %q, want %q", contract.LabelTriggeredBy, got, cancelTrigger)
+	}
+
+	long := strings.Repeat("p", 50) // psmt-<50>-<uid8> is 64 characters
+	pod := sourcePod(long, 1, "node-a")
+	trigger := psmtFor(long)
+	if len(trigger.GetName()) <= 63 {
+		t.Fatalf("test setup: trigger name %q fits in a label value", trigger.GetName())
+	}
+	c = newClient(t,
+		pssc("pssc-x", "bkt", "snaps"),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		pod, criuNode("node-a", true), trigger,
+	)
+	reconcilePSMT(t, c, nil, trigger.GetName())
+	ps := getSnapshot(t, c, contract.PodSnapshotName(long, string(pod.UID)))
+	if v, ok := ps.GetLabels()[contract.LabelTriggeredBy]; ok {
+		t.Fatalf("an invalid label value was set: %q", v)
+	}
+	if snapshotTrigger(ps) != trigger.GetName() {
+		t.Fatalf("the work order must still record its trigger, got %q", snapshotTrigger(ps))
+	}
 }
