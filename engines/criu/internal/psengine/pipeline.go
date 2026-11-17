@@ -148,6 +148,16 @@ type NodeSnapshotReconciler struct {
 
 const defaultCancelPollInterval = 2 * time.Second
 
+// The live check before the source stop retries for about 3.5 s (waits of
+// 0.5, 1 and 2 s between four attempts), each attempt bounded by
+// preStopCheckTimeout, before it fails closed. A brief API server blip then
+// doesn't turn a durable archive into Failed, and one hung request can't use
+// up the budget. Variables so tests can shrink the waits.
+var (
+	preStopCheckBackoff = wait.Backoff{Steps: 4, Duration: 500 * time.Millisecond, Factor: 2}
+	preStopCheckTimeout = 2 * time.Second
+)
+
 // errCancelled marks a pipeline that stopped because its work order was
 // withdrawn (trigger deleted).
 var errCancelled = errors.New("cancelled: the trigger was deleted")
@@ -430,10 +440,14 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	}
 	var state workOrderState
 	var why string
-	err = retry.OnError(wait.Backoff{Steps: 3, Duration: 200 * time.Millisecond, Factor: 2},
-		func(error) bool { return true },
+	err = retry.OnError(preStopCheckBackoff,
+		// Forbidden won't fix itself, and a done parent means the agent is
+		// shutting down.
+		func(err error) bool { return parent.Err() == nil && !apierrors.IsForbidden(err) },
 		func() (err error) {
-			state, why, err = cancelCheck(parent, r.liveReader(), key, true)
+			attempt, cancelAttempt := context.WithTimeout(parent, preStopCheckTimeout)
+			defer cancelAttempt()
+			state, why, err = cancelCheck(attempt, r.liveReader(), key, true)
 			return err
 		})
 	if err != nil {

@@ -29,8 +29,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -407,6 +409,7 @@ func TestPSMTDeletionIgnoresOtherWorkOrders(t *testing.T) {
 // A failed pre-stop read must not stop the source: if the agent can't confirm
 // the trigger still wants the stop, it leaves the source running.
 func TestCancelCheckErrorBeforeStopLeavesSourceRunning(t *testing.T) {
+	fastPreStopBackoff(t)
 	c := cancelFixture(t)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	reader := &flakyReader{Reader: c}
@@ -609,4 +612,128 @@ func TestPSMTLabelsWorkOrderWithTrigger(t *testing.T) {
 	if snapshotTrigger(ps) != trigger.GetName() {
 		t.Fatalf("the work order must still record its trigger, got %q", snapshotTrigger(ps))
 	}
+}
+
+// scriptedReader runs onGet for every PodSnapshot Get once armed; a non-nil
+// error fails the Get. calls counts the armed PodSnapshot Gets: one per
+// pre-stop attempt, then one for finish's read.
+type scriptedReader struct {
+	client.Reader
+	armed bool
+	calls int
+	onGet func(ctx context.Context, call int) error
+}
+
+func (s *scriptedReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if u, ok := obj.(*unstructured.Unstructured); ok && s.armed && u.GetKind() == contract.GVKPodSnapshot.Kind {
+		s.calls++
+		if err := s.onGet(ctx, s.calls); err != nil {
+			return err
+		}
+	}
+	return s.Reader.Get(ctx, key, obj, opts...)
+}
+
+// fastPreStopBackoff keeps the production step count and growth but shrinks
+// the waits, so the retry tests run quickly.
+func fastPreStopBackoff(t *testing.T) {
+	t.Helper()
+	saved, savedTimeout := preStopCheckBackoff, preStopCheckTimeout
+	preStopCheckBackoff.Duration = time.Millisecond
+	preStopCheckTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { preStopCheckBackoff, preStopCheckTimeout = saved, savedTimeout })
+}
+
+func runWithPreStopReader(t *testing.T, ctx context.Context, onGet func(context.Context, int) error) (client.Client, *fakeNodeOps, *scriptedReader) {
+	t.Helper()
+	c := cancelFixture(t)
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	reader := &scriptedReader{Reader: c, onGet: onGet}
+	store := &hookStore{memStore: newMemStore(), object: "manifest.json", onPut: func() { reader.armed = true }}
+	_, _ = (&NodeSnapshotReconciler{Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour}).
+		Reconcile(ctx, ctrl.Request{NamespacedName: cancelSnapshotKey})
+	return c, ops, reader
+}
+
+// The pre-stop budget rides out a few seconds of API server trouble before
+// it fails closed, and bounds each attempt.
+func TestPreStopCheckBudget(t *testing.T) {
+	var total time.Duration
+	d := preStopCheckBackoff.Duration
+	for i := 1; i < preStopCheckBackoff.Steps; i++ {
+		total += d
+		d = time.Duration(float64(d) * preStopCheckBackoff.Factor)
+	}
+	if total < 3*time.Second || total > 4*time.Second {
+		t.Fatalf("pre-stop retry waits %v in total, want 3-4s", total)
+	}
+	if preStopCheckTimeout <= 0 || preStopCheckTimeout > 3*time.Second {
+		t.Fatalf("per-attempt timeout %v, want a bound of a few seconds", preStopCheckTimeout)
+	}
+}
+
+// Three failed reads in a row, then a good one: the source is stopped and the
+// snapshot goes Ready, instead of a durable archive being marked Failed.
+func TestPreStopCheckRidesOutBriefOutage(t *testing.T) {
+	fastPreStopBackoff(t)
+	c, ops, reader := runWithPreStopReader(t, context.Background(), func(_ context.Context, call int) error {
+		if call <= 3 {
+			return errors.New("apiserver unavailable")
+		}
+		return nil
+	})
+	if len(ops.stopped) != 1 || !contract.IsSnapshotReady(getSnapshot(t, c, cancelSnapshot)) {
+		t.Fatalf("want the stop after the outage: events %v, attempts %d, conditions %+v",
+			ops.events, reader.calls, contract.Conditions(getSnapshot(t, c, cancelSnapshot)))
+	}
+}
+
+// Each attempt has its own deadline, so one hung request can't use up the
+// budget.
+func TestPreStopCheckBoundsEachAttempt(t *testing.T) {
+	fastPreStopBackoff(t)
+	timedOut := false
+	c, ops, _ := runWithPreStopReader(t, context.Background(), func(ctx context.Context, call int) error {
+		if call > 1 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+			return errors.New("the attempt had no deadline")
+		}
+	})
+	if !timedOut {
+		t.Fatal("the hung attempt was not cut off by a per-attempt deadline")
+	}
+	if len(ops.stopped) != 1 || !contract.IsSnapshotReady(getSnapshot(t, c, cancelSnapshot)) {
+		t.Fatalf("want the stop once the hung attempt timed out: events %v", ops.events)
+	}
+}
+
+// Forbidden won't fix itself, and a cancelled parent means the agent is
+// shutting down: neither is retried, and the source is not stopped.
+func TestPreStopCheckDoesNotRetryHopelessErrors(t *testing.T) {
+	fastPreStopBackoff(t)
+	t.Run("forbidden", func(t *testing.T) {
+		_, ops, reader := runWithPreStopReader(t, context.Background(), func(context.Context, int) error {
+			return apierrors.NewForbidden(schema.GroupResource{Group: contract.Group, Resource: "podsnapshots"}, cancelSnapshot, errors.New("rbac"))
+		})
+		if len(ops.stopped) != 0 || reader.calls != 2 {
+			t.Fatalf("want one attempt (plus finish's read) and no stop: reads %d, events %v", reader.calls, ops.events)
+		}
+	})
+	t.Run("parent cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		_, ops, reader := runWithPreStopReader(t, ctx, func(context.Context, int) error {
+			cancel()
+			return errors.New("apiserver unavailable")
+		})
+		if len(ops.stopped) != 0 || reader.calls != 2 {
+			t.Fatalf("want one attempt (plus finish's read) and no stop: reads %d, events %v", reader.calls, ops.events)
+		}
+	})
 }
