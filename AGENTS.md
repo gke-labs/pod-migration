@@ -62,7 +62,7 @@ Before opening a PR or pushing changes, verify that your branch complies with in
 
 ### Generated Code & Code Hygiene
 - **Generated deepcopy code:** Never manually edit or regenerate `zz_generated.deepcopy.go` unless API types under `controller/api/v1alpha1/` have been modified.
-- **License headers:** All new `.go` and `.sh` files must carry the standard 13-line Apache-2.0 license header used across the repository.
+- **License headers:** All new `.go` and `.sh` files must carry the Apache-2.0 license header. For Go files that is the header in `controller/hack/boilerplate.go.txt`: an `SPDX-License-Identifier: Apache-2.0` line, `Copyright <year> Google LLC`, then the standard notice, followed by a blank line (any `//go:build` line stays above it). CI enforces this for Go files via `verification-suite/verify_license_headers.sh` (`make -C controller verify-license-headers`). Shell scripts use the same text with `#` comments (not yet enforced).
 - **Formatting:** Maintain standard Go formatting with `gofmt` / `goimports`.
 
 ---

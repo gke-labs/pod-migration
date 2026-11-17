@@ -22,7 +22,7 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_GEN_VERSION)
 ENVTEST_K8S_VERSION ?= 1.36.2
 SETUP_ENVTEST_VERSION ?= v0.25.0
 SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest-$(SETUP_ENVTEST_VERSION)
-.PHONY: help generate verify-generate verify-invariant-governance manifests fmt vet build run envtest test test-t1-invariants test-pmprofiler test-t2-guardrail test-scalesim test-t3-guardrail test-invariant-gen test-t5-guardrail install uninstall deploy undeploy docker-build docker-push controller-gen
+.PHONY: help generate verify-generate verify-invariant-governance verify-license-headers manifests fmt vet build run envtest test test-t1-invariants test-pmprofiler test-t2-guardrail test-scalesim test-t3-guardrail test-invariant-gen test-t5-guardrail install uninstall deploy undeploy docker-build docker-push controller-gen
 
 VERIFY_ARTIFACTS := api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml
 
@@ -140,6 +140,9 @@ test-t3-guardrail: test-pmprofiler test-scalesim ## Run T3 pmprofiler SLO gate s
 verify-invariant-governance: ## Run T0 Two-Lane CODEOWNERS governance gate.
 	../verification-suite/verify_invariant_governance.sh --self-test
 	../verification-suite/verify_invariant_governance.sh
+
+verify-license-headers: ## Fail on any Go file without the Apache-2.0 header (#133).
+	../verification-suite/verify_license_headers.sh
 
 test-invariant-gen: ## Run unit tests for tools/invariant-gen blind-spot detector & replay verifier.
 	@test "$$(awk '/^go / {print $$2}' go.mod)" = "$$(awk '/^go / {print $$2}' ../tools/invariant-gen/go.mod)" || { echo "Error: go version mismatch between controller/go.mod and tools/invariant-gen/go.mod" >&2; exit 1; }
