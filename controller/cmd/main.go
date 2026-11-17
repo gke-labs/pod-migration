@@ -95,6 +95,7 @@ func main() {
 		criuAPIGroup          string
 		restoreStabilization  time.Duration
 		restorePlacement      bool
+		placementDeadline     time.Duration
 		shortenReadinessDelay bool
 		showVersion           bool
 	)
@@ -113,7 +114,8 @@ func main() {
 	flag.StringVar(&runtimeClassEngines, "runtime-class-engines", "", "Comma-separated class=engine routes that pick the snapshot engine for the pods of each migratable runtime class, e.g. gvisor="+engine.GKEPodSnapshotsName+" ("+eligibility.DefaultRuntimeClassToken+" matches pods without a runtimeClassName). Unset routes every --migratable-runtime-classes class to the default engine, "+engine.GKEPodSnapshotsName+". A PodMigration overrides routes for its namespace with the "+engine.AnnotationRuntimeClassEngines+" annotation.")
 	flag.StringVar(&criuAPIGroup, "criu-api-group", engine.DefaultCRIUAPIGroup, "Kubernetes API group of the CRIU snapshot engine's CRDs and <group>/ps-name restore annotation; defaults to "+engine.DefaultCRIUAPIGroup+" (can be set to "+engine.DefaultAPIGroup+" for legacy single-group CRIU installs).")
 	flag.DurationVar(&restoreStabilization, "restore-stabilization-window", controller.DefaultRestoreStabilizationWindow, fmt.Sprintf("How long a replacement pod must stay Ready without a container restart before a restore that its snapshot engine only inferred concludes as RestoreInferred; 0 concludes as soon as the pod is Ready. A restore the engine confirms (RestoreVerified) doesn't wait. At most %s.", controller.MaxRestoreStabilizationWindow))
-	flag.BoolVar(&restorePlacement, "restore-placement", false, "Experimental: place a replacement pod that restores a snapshot on a node its snapshot engine can restore on: the engine's node constraints (for GKE Pod Snapshots, the source node's machine type, if the job recorded it) go into the pod's required node affinity when its scheduling gate is released. If no Ready node that the pod's node selector, node affinity and tolerations allow (a cordoned node counts only if the pod tolerates it) meets them, the pod starts cold instead, and the job concludes SucceededWithoutRestore with reason "+controller.ReasonNoCompatibleNode+". The check decides once, when the gate is due for release, without waiting for a node to become Ready or be added, and a gated pod doesn't make the cluster autoscaler add one. It doesn't look at resources, volume zones, host ports, or pod affinity and topology spread, and nothing recovers a pod that passes it but stays Pending: once its job has concluded, delete the pod so that its controller recreates it without the constraints. This check is interim, until the controller can recreate a replacement that isn't scheduled by a deadline.")
+	flag.BoolVar(&restorePlacement, "restore-placement", true, "Place a replacement pod that restores a snapshot on a node its snapshot engine can restore on (on by default; --restore-placement=false turns it off): the engine's node constraints (for GKE Pod Snapshots, the source node's machine type, if the job recorded it) go into the pod's required node affinity when its scheduling gate is released, unless the pod's own node selector or node affinity already requires them. If no node meets them at that moment, a pod that its ReplicaSet or StatefulSet would recreate is released with them anyway, so that a node can still come up, for example one that the cluster autoscaler adds; see --restore-placement-deadline. Another pod starts cold instead if a node can take it without them, and the job concludes SucceededWithoutRestore with reason "+controller.ReasonNoCompatibleNode+"; if none can, it's released without them, as with --restore-placement=false. The node check counts Ready nodes that the pod's node selector, node affinity and tolerations allow (a cordoned node counts only if the pod tolerates it); it doesn't look at resources, volume zones, host ports, pod affinity and topology spread, or other scheduling gates.")
+	flag.DurationVar(&placementDeadline, "restore-placement-deadline", controller.DefaultRestorePlacementDeadline, "How long a replacement pod released with --restore-placement's node constraints may stay unschedulable. Then, if its ReplicaSet or StatefulSet would recreate it and a node that doesn't meet the constraints could take it, the job concludes SucceededWithoutRestore with reason "+controller.ReasonPlacementTimeout+", and the pod is deleted so that its owner recreates it to start cold. Otherwise it keeps waiting, because deleting it wouldn't get it scheduled sooner, or nothing would recreate it the same way. At the restore ceiling, a pod that its ReplicaSet or StatefulSet would recreate is deleted anyway, so that any node can be added for it. A pod that the scheduler hasn't tried (another scheduling gate may hold it) or has nominated a node for isn't deleted until the scheduler reports that no node can take it. If the restore ceiling concludes its job RestoreTimeout first, the job keeps checking it until the job is garbage collected, 30m after it concluded. Must be more than 0, and at least 1m shorter than the restore ceiling, 5m plus --restore-stabilization-window: at most 4m30s with the default window.")
 	flag.BoolVar(&shortenReadinessDelay, "shorten-restored-readiness-delay", true, "Clear readinessProbe.initialDelaySeconds on gated restore-candidate replacement pods unless annotated with "+util.AnnotationPreserveReadinessDelay+"=true; liveness and startup probes are never changed")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
@@ -169,6 +171,7 @@ func main() {
 		"criuAPIGroup", criuAPIGroup,
 		"restoreStabilizationWindow", restoreStabilization,
 		"restorePlacement", restorePlacement,
+		"restorePlacementDeadline", placementDeadline,
 		"shortenRestoredReadinessDelay", shortenReadinessDelay)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
@@ -185,6 +188,11 @@ func main() {
 
 	if restoreStabilization < 0 || restoreStabilization > controller.MaxRestoreStabilizationWindow {
 		setupLog.Error(fmt.Errorf("restore-stabilization-window %v out of range [0s, %v]", restoreStabilization, controller.MaxRestoreStabilizationWindow), "invalid restore stabilization window flag")
+		os.Exit(1)
+	}
+
+	if err := controller.ValidateRestorePlacementDeadline(placementDeadline, restoreStabilization); err != nil {
+		setupLog.Error(err, "invalid restore placement deadline flag")
 		os.Exit(1)
 	}
 
@@ -295,6 +303,7 @@ func main() {
 		Recorder:                   eventRecorder,
 		DefaultMigrationTimeout:    migrationTimeout,
 		RestoreStabilizationWindow: restoreStabilization,
+		RestorePlacementDeadline:   placementDeadline,
 		InvariantEngine:            invariantEngine,
 		BudgetChecker: &controller.InFlightBudgetChecker{
 			Client: mgr.GetClient(),

@@ -18,6 +18,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -103,6 +104,30 @@ func placementPod() *corev1.Pod {
 			Tolerations:     []corev1.Toleration{{Key: gvisorLabel, Operator: corev1.TolerationOpEqual, Value: "gvisor", Effect: corev1.TaintEffectNoSchedule}},
 		},
 	}
+}
+
+// ownedPlacementPod is placementPod owned by a StatefulSet, which would
+// recreate it if it were deleted.
+func ownedPlacementPod() *corev1.Pod {
+	pod := placementPod()
+	controller := true
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1",
+		Kind:       "StatefulSet",
+		Name:       "redis",
+		UID:        "statefulset-uid",
+		Controller: &controller,
+	}}
+	return pod
+}
+
+// placementPodWith is placementPod changed by mutate.
+func placementPodWith(mutate ...func(*corev1.Pod)) *corev1.Pod {
+	pod := placementPod()
+	for _, m := range mutate {
+		m(pod)
+	}
+	return pod
 }
 
 // placementJob returns a Restoring job with a durable snapshot, whose source
@@ -237,12 +262,46 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		if !run.job.Status.Consumed || !run.job.Status.GateReleased || run.job.Status.RestoredPodUID != placementPodUID {
 			t.Errorf("job status = %+v, want consumed by the pod with the gate released", run.job.Status)
 		}
-		if !hasEventWith(run.events, "MigrationRestoreReleased", "n2-standard-4") {
+		cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement)
+		if !restorePlacementRecorded(run.job) || !strings.Contains(cond.Message, "node.kubernetes.io/instance-type In [n2-standard-4]") || strings.Contains(cond.Message, "no node met") {
+			t.Errorf("RestorePlacement condition = %+v, want True (%s) naming the constraint", cond, ReasonNodeConstraintsAdded)
+		}
+		if !hasEventWith(run.events, "MigrationRestoreReleased", "n2-standard-4") || hasEventWith(run.events, "no node meets it yet") {
 			t.Errorf("events = %q, want MigrationRestoreReleased naming the constraint", run.events)
 		}
 	})
 
-	t.Run("no node fits: holds the pod and records NoCompatibleNode", func(t *testing.T) {
+	t.Run("no node fits an owned pod: releases it with the constraint to wait for one", func(t *testing.T) {
+		// A node of the type can still come up, for example one that the
+		// cluster autoscaler adds once it sees the pod. If none does, the
+		// job reconciler deletes the pod after the placement deadline for
+		// its StatefulSet to recreate, if a node of another type could take
+		// it.
+		run := reconcilePlacement(t, true, nil, ownedPlacementPod(), placementJob(),
+			placementNode("n2-cordoned", "n2-standard-4", func(n *corev1.Node) { n.Spec.Unschedulable = true }),
+			placementNode("e2-a", "e2-medium"))
+		if run.err != nil {
+			t.Fatalf("Reconcile() error = %v", run.err)
+		}
+		if podHasMigrationGate(run.pod) || run.pod.Annotations["podsnapshot.gke.io/ps-name"] != placementSnapshot {
+			t.Errorf("pod gated %t, ps-name %q; want it released with the restore order", podHasMigrationGate(run.pod), run.pod.Annotations["podsnapshot.gke.io/ps-name"])
+		}
+		if got := requiredTerms(run.pod); !reflect.DeepEqual(got, wantTerms) {
+			t.Errorf("required node affinity terms = %+v, want %+v", got, wantTerms)
+		}
+		cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement)
+		if !run.job.Status.GateReleased || !restorePlacementRecorded(run.job) || !strings.Contains(cond.Message, "no node met it at the release") {
+			t.Errorf("GateReleased %t, RestorePlacement condition %+v; want the release recorded, with no node met", run.job.Status.GateReleased, cond)
+		}
+		if _, held := noCompatibleNode(run.job); held || run.job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+			t.Errorf("job status = %+v, want it still Restoring and not held", run.job.Status)
+		}
+		if !hasEventWith(run.events, "MigrationRestoreReleased", "n2-standard-4", "no node meets it yet") {
+			t.Errorf("events = %q, want the release event to say no node meets the constraint yet", run.events)
+		}
+	})
+
+	t.Run("no node fits a pod without an owner: holds it and records NoCompatibleNode", func(t *testing.T) {
 		notReady := placementNode("n2-down", "n2-standard-4", func(n *corev1.Node) {
 			n.Status.Conditions[0].Status = corev1.ConditionFalse
 		})
@@ -274,6 +333,122 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		}
 		if !hasEventWith(run.events, "Warning", ReasonNoCompatibleNode) {
 			t.Errorf("events = %q, want a %s Warning on the pod", run.events, ReasonNoCompatibleNode)
+		}
+	})
+
+	t.Run("no node fits a pod that a Job controls: holds it like a pod without an owner", func(t *testing.T) {
+		// The Job controller would count the pod as failed toward the Job's
+		// backoffLimit if the placement deadline deleted it.
+		run := reconcilePlacement(t, true, nil, placementPodWith(controlledBy("batch/v1", "Job")), placementJob(), placementNode("e2-a", "e2-medium"))
+		if run.err != nil {
+			t.Fatalf("Reconcile() error = %v", run.err)
+		}
+		if !podHasMigrationGate(run.pod) {
+			t.Error("pod was released, want it held")
+		}
+		if cond, held := noCompatibleNode(run.job); !held {
+			t.Errorf("RestorePlacement condition = %+v, want False, %s", cond, ReasonNoCompatibleNode)
+		}
+	})
+
+	t.Run("the pod's own node affinity already requires the constraint: releases it without adding or checking", func(t *testing.T) {
+		// Holding it to start cold, or deleting it at the placement
+		// deadline, couldn't get it scheduled anywhere else: a pod
+		// recreated in its place would have the same affinity. An owned
+		// pod would otherwise be released with a record, and the deadline
+		// would delete it.
+		for name, pod := range map[string]*corev1.Pod{"owned": ownedPlacementPod(), "without a controller": placementPod()} {
+			t.Run(name, func(t *testing.T) {
+				addRequiredNodeAffinity(pod, []corev1.NodeSelectorRequirement{instanceTypeIn("n2-standard-4")})
+				run := reconcilePlacement(t, true, nil, pod, placementJob(), placementNode("e2-a", "e2-medium"))
+				if run.err != nil {
+					t.Fatalf("Reconcile() error = %v", run.err)
+				}
+				if podHasMigrationGate(run.pod) || run.pod.Annotations["podsnapshot.gke.io/ps-name"] != placementSnapshot {
+					t.Errorf("pod gated %t, ps-name %q; want it released with the restore order", podHasMigrationGate(run.pod), run.pod.Annotations["podsnapshot.gke.io/ps-name"])
+				}
+				if got := requiredTerms(run.pod); !reflect.DeepEqual(got, wantTerms) {
+					t.Errorf("required node affinity terms = %+v, want its own, %+v", got, wantTerms)
+				}
+				if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
+					t.Errorf("RestorePlacement condition = %+v, want none", cond)
+				}
+				if !hasEventWith(run.events, "MigrationRestoreReleased", "without adding node constraints") {
+					t.Errorf("events = %q, want the release event to say no node constraints were added", run.events)
+				}
+			})
+		}
+	})
+
+	t.Run("one of the pod's terms lacks the constraint: adds it there and checks", func(t *testing.T) {
+		zoneA := corev1.NodeSelectorRequirement{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}
+		pod := placementPod()
+		pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{instanceTypeIn("n2-standard-4")}},
+				{MatchExpressions: []corev1.NodeSelectorRequirement{zoneA}},
+			},
+		}}}
+		run := reconcilePlacement(t, true, nil, pod, placementJob(), placementNode("e2-a", "e2-medium", func(n *corev1.Node) {
+			n.Labels[corev1.LabelTopologyZone] = "a"
+		}))
+		if run.err != nil {
+			t.Fatalf("Reconcile() error = %v", run.err)
+		}
+		if cond, held := noCompatibleNode(run.job); !held || !podHasMigrationGate(run.pod) {
+			t.Errorf("pod gated %t, RestorePlacement condition %+v; want it held after the check", podHasMigrationGate(run.pod), cond)
+		}
+	})
+
+	t.Run("no node can take a pod that nothing recreates, even without the constraint: released without it", func(t *testing.T) {
+		// Starting it cold wouldn't get it running any sooner: it would wait
+		// for the same node. So it's released as with placement off, and
+		// can still restore once a node comes up.
+		for name, pod := range map[string]*corev1.Pod{
+			"without a controller": placementPod(),
+			"a Job's":              placementPodWith(controlledBy("batch/v1", "Job")),
+		} {
+			t.Run(name, func(t *testing.T) {
+				run := reconcilePlacement(t, true, nil, pod, placementJob(),
+					placementNode("n2-cordoned", "n2-standard-4", func(n *corev1.Node) { n.Spec.Unschedulable = true }),
+					placementNode("e2-plain", "e2-medium", func(n *corev1.Node) {
+						delete(n.Labels, gvisorLabel)
+						n.Spec.Taints = nil
+					}))
+				if run.err != nil {
+					t.Fatalf("Reconcile() error = %v", run.err)
+				}
+				if podHasMigrationGate(run.pod) || run.pod.Annotations["podsnapshot.gke.io/ps-name"] != placementSnapshot {
+					t.Errorf("pod gated %t, ps-name %q; want it released with the restore order", podHasMigrationGate(run.pod), run.pod.Annotations["podsnapshot.gke.io/ps-name"])
+				}
+				if terms := requiredTerms(run.pod); terms != nil {
+					t.Errorf("pod has required node affinity %+v, want none", terms)
+				}
+				if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
+					t.Errorf("RestorePlacement condition = %+v, want none", cond)
+				}
+				if !hasEventWith(run.events, "MigrationRestoreReleased", "without adding node constraints") {
+					t.Errorf("events = %q, want the release event to say no node constraints were added", run.events)
+				}
+			})
+		}
+	})
+
+	t.Run("the pod's node selector already pins the machine type: releases it without adding or checking", func(t *testing.T) {
+		for name, pinned := range map[string]*corev1.Pod{"owned": ownedPlacementPod(), "without a controller": placementPod()} {
+			t.Run(name, func(t *testing.T) {
+				pinned.Spec.NodeSelector[corev1.LabelInstanceTypeStable] = "n2-standard-4"
+				run := reconcilePlacement(t, true, nil, pinned, placementJob(), placementNode("e2-a", "e2-medium"))
+				if run.err != nil {
+					t.Fatalf("Reconcile() error = %v", run.err)
+				}
+				if podHasMigrationGate(run.pod) || requiredTerms(run.pod) != nil {
+					t.Errorf("pod gated %t, terms %+v; want it released without a constraint", podHasMigrationGate(run.pod), requiredTerms(run.pod))
+				}
+				if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
+					t.Errorf("RestorePlacement condition = %+v, want none", cond)
+				}
+			})
 		}
 	})
 
@@ -339,7 +514,31 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 
 	t.Run("a job that isn't Restoring isn't checked", func(t *testing.T) {
 		// Only a Restoring job concludes on a hold, so a hold now would
-		// keep the pod gated for good.
+		// keep the pod gated for good. Another pod's job is released cold
+		// before the check, so this one isn't consumed: a new release in
+		// another phase goes ahead as without placement.
+		eng := &placementEngine{
+			orderingEngine: orderingEngine{routedEngine{name: "placing", provider: &fakeSnapshotProvider{}}},
+			reqs:           []corev1.NodeSelectorRequirement{instanceTypeIn("n2-standard-4")},
+		}
+		job := placementJob()
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+		run := reconcilePlacement(t, true, registryOf(t, eng), placementPod(), job, placementNode("e2-a", "e2-medium"))
+		if run.err != nil {
+			t.Fatalf("Reconcile() error = %v", run.err)
+		}
+		if podHasMigrationGate(run.pod) || requiredTerms(run.pod) != nil {
+			t.Errorf("pod gated %t, terms %+v; want it released without a constraint", podHasMigrationGate(run.pod), requiredTerms(run.pod))
+		}
+		if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
+			t.Errorf("RestorePlacement condition = %+v, want none", cond)
+		}
+		if eng.calls != 0 {
+			t.Errorf("Placement() called %d times, want 0", eng.calls)
+		}
+	})
+
+	t.Run("another pod's job that isn't Restoring: released cold without a check", func(t *testing.T) {
 		eng := &placementEngine{
 			orderingEngine: orderingEngine{routedEngine{name: "placing", provider: &fakeSnapshotProvider{}}},
 			reqs:           []corev1.NodeSelectorRequirement{instanceTypeIn("n2-standard-4")},
@@ -435,7 +634,7 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		if !hasEventWith(run.events, "Removed scheduling gate gke.io/pod-migration-gate and injected snapshot restore annotation") {
 			t.Errorf("events = %q, want the release event without a constraint", run.events)
 		}
-		if hasEventWith(run.events, "without node constraints") {
+		if hasEventWith(run.events, "node constraints") {
 			t.Errorf("events = %q, want the release event as before placement", run.events)
 		}
 	})
@@ -456,31 +655,110 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
 			t.Errorf("RestorePlacement condition = %+v, want none", cond)
 		}
-		if !hasEventWith(run.events, "MigrationRestoreReleased", "without node constraints") {
+		if !hasEventWith(run.events, "MigrationRestoreReleased", "without adding node constraints") {
 			t.Errorf("events = %q, want the release event to say there are no node constraints", run.events)
 		}
 	})
 
-	t.Run("gate release already recorded: releases with the constraint without checking", func(t *testing.T) {
-		// A pod update that failed after GateReleased was recorded is
-		// retried as is, even if no node fits any more.
+	// underWayJob returns the placement job as an earlier attempt to release
+	// the pod left it: consumed by the pod, and with GateReleased if
+	// gateReleased.
+	underWayJob := func(gateReleased bool) *pmv1alpha1.PodMigrationJob {
 		job := placementJob()
 		job.Status.Consumed = true
 		job.Status.RestoredPodUID = placementPodUID
 		job.Status.RestoredPodName = placementPodName
-		job.Status.GateReleased = true
-		run := reconcilePlacement(t, true, nil, placementPod(), job)
+		job.Status.GateReleased = gateReleased
+		return job
+	}
+	// releasedWith checks that the pod was released, with terms in its
+	// required node affinity, and the job records whether that was with
+	// constraints.
+	releasedWith := func(t *testing.T, run placementRun, terms []corev1.NodeSelectorTerm) {
+		t.Helper()
 		if run.err != nil {
 			t.Fatalf("Reconcile() error = %v", run.err)
 		}
-		if podHasMigrationGate(run.pod) {
-			t.Error("pod is still gated, want it released")
+		if podHasMigrationGate(run.pod) || !run.job.Status.GateReleased {
+			t.Errorf("pod gated %t, GateReleased %t; want it released", podHasMigrationGate(run.pod), run.job.Status.GateReleased)
 		}
-		if got := requiredTerms(run.pod); !reflect.DeepEqual(got, wantTerms) {
-			t.Errorf("required node affinity terms = %+v, want %+v", got, wantTerms)
+		if got := requiredTerms(run.pod); !reflect.DeepEqual(got, terms) {
+			t.Errorf("required node affinity terms = %+v, want %+v", got, terms)
 		}
-		if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
-			t.Errorf("RestorePlacement condition = %+v, want none", cond)
+		// A release with the constraint is recorded now, so the placement
+		// deadline counts from it.
+		if recorded := restorePlacementRecorded(run.job); recorded != (terms != nil) {
+			t.Errorf("RestorePlacement recorded %t, conditions %+v; want %t", recorded, run.job.Status.Conditions, terms != nil)
+		}
+	}
+
+	t.Run("a release under way isn't held, even if no node fits any more", func(t *testing.T) {
+		// A failed GateReleased patch (Consumed recorded) or a failed pod
+		// update (GateReleased recorded) is retried. Holding now would
+		// conclude a consumed job with the pod still gated, and a check
+		// would hold the pod that nothing recreates: a node of another type
+		// can take it.
+		for _, gateReleased := range []bool{false, true} {
+			t.Run(fmt.Sprintf("GateReleased %t", gateReleased), func(t *testing.T) {
+				t.Run("owned: released with the constraint", func(t *testing.T) {
+					releasedWith(t, reconcilePlacement(t, true, nil, ownedPlacementPod(), underWayJob(gateReleased), placementNode("e2-a", "e2-medium")), wantTerms)
+				})
+				t.Run("nothing recreates it: released without the constraint, which no node meets", func(t *testing.T) {
+					// An earlier attempt may have released it without the
+					// constraint because no node could take it.
+					releasedWith(t, reconcilePlacement(t, true, nil, placementPod(), underWayJob(gateReleased), placementNode("e2-a", "e2-medium")), nil)
+				})
+				t.Run("nothing recreates it, and a node meets the constraint: released with it", func(t *testing.T) {
+					releasedWith(t, reconcilePlacement(t, true, nil, placementPod(), underWayJob(gateReleased), placementNode("n2-a", "n2-standard-4")), wantTerms)
+				})
+			})
+		}
+	})
+
+	t.Run("a retry that adds no constraints removes an earlier attempt's record", func(t *testing.T) {
+		// The record must match the pod, or the placement deadline would act
+		// on a pod without the constraints.
+		recordedJob := func() *pmv1alpha1.PodMigrationJob {
+			job := underWayJob(true)
+			recordRestorePlacement(job, []corev1.NodeSelectorRequirement{instanceTypeIn("n2-standard-4")}, false)
+			return job
+		}
+		t.Run("nothing recreates the pod, and no node meets them now", func(t *testing.T) {
+			releasedWith(t, reconcilePlacement(t, true, nil, placementPod(), recordedJob(), placementNode("e2-a", "e2-medium")), nil)
+		})
+		t.Run("placement turned off since", func(t *testing.T) {
+			releasedWith(t, reconcilePlacement(t, false, nil, ownedPlacementPod(), recordedJob(), placementNode("e2-a", "e2-medium")), nil)
+		})
+	})
+
+	// failNodeList fails the nth list of nodes, counting from 1.
+	failNodeList := func(n int) interceptor.Funcs {
+		lists := 0
+		return interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.NodeList); ok {
+				if lists++; lists == n {
+					return errors.New("cache not synced")
+				}
+			}
+			return c.List(ctx, list, opts...)
+		}}
+	}
+	t.Run("a node list that fails when deciding whether to hold: the pod stays gated", func(t *testing.T) {
+		run := reconcilePlacementWith(t, true, nil, failNodeList(2), placementPod(), placementJob(), placementNode("e2-a", "e2-medium"))
+		if run.err == nil {
+			t.Error("Reconcile() error = nil, want the node list error")
+		}
+		if !podHasMigrationGate(run.pod) || run.job.Status.Consumed || meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement) != nil {
+			t.Errorf("pod gated %t, job status %+v; want the pod gated and nothing recorded", podHasMigrationGate(run.pod), run.job.Status)
+		}
+	})
+	t.Run("a node list that fails on a retry of a release under way: the pod stays gated", func(t *testing.T) {
+		run := reconcilePlacementWith(t, true, nil, failNodeList(1), placementPod(), underWayJob(false), placementNode("e2-a", "e2-medium"))
+		if run.err == nil {
+			t.Error("Reconcile() error = nil, want the node list error")
+		}
+		if !podHasMigrationGate(run.pod) || run.job.Status.GateReleased {
+			t.Errorf("pod gated %t, GateReleased %t; want the pod gated and the release not recorded", podHasMigrationGate(run.pod), run.job.Status.GateReleased)
 		}
 	})
 
@@ -512,29 +790,6 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		}
 		if podHasMigrationGate(run.pod) || requiredTerms(run.pod) != nil {
 			t.Errorf("pod gated %t, terms %+v; want it released without a constraint", podHasMigrationGate(run.pod), requiredTerms(run.pod))
-		}
-	})
-
-	t.Run("this pod already consumed the job: releases with the constraint without checking", func(t *testing.T) {
-		// The Consumed write followed a check that passed, and then the
-		// GateReleased patch failed. Holding now would conclude a consumed
-		// job with the pod still gated.
-		job := placementJob()
-		job.Status.Consumed = true
-		job.Status.RestoredPodUID = placementPodUID
-		job.Status.RestoredPodName = placementPodName
-		run := reconcilePlacement(t, true, nil, placementPod(), job)
-		if run.err != nil {
-			t.Fatalf("Reconcile() error = %v", run.err)
-		}
-		if podHasMigrationGate(run.pod) || !run.job.Status.GateReleased {
-			t.Errorf("pod gated %t, GateReleased %t; want it released", podHasMigrationGate(run.pod), run.job.Status.GateReleased)
-		}
-		if got := requiredTerms(run.pod); !reflect.DeepEqual(got, wantTerms) {
-			t.Errorf("required node affinity terms = %+v, want %+v", got, wantTerms)
-		}
-		if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
-			t.Errorf("RestorePlacement condition = %+v, want none", cond)
 		}
 	})
 
@@ -656,6 +911,37 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		}
 	})
 
+	t.Run("the recorded consumer is still terminating: waits before checking", func(t *testing.T) {
+		// No node fits, and the pod has no owner, so a check would hold it
+		// and conclude the job cold. The consumer that is going away comes
+		// first: once it's gone, this pod can adopt the job.
+		job := placementJob()
+		job.Status.Consumed = true
+		job.Status.RestoredPodUID = "terminating-uid"
+		job.Status.RestoredPodName = "terminating-replacement"
+		now := metav1.Now()
+		terminating := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace:         placementNamespace,
+			Name:              "terminating-replacement",
+			UID:               "terminating-uid",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"example.com/hold"},
+		}}
+		run := reconcilePlacement(t, true, nil, placementPod(), job, terminating, placementNode("e2-a", "e2-medium"))
+		if run.err != nil || run.result.RequeueAfter != 5*time.Second {
+			t.Fatalf("Reconcile() = %+v, %v; want a 5s requeue to wait for the consumer", run.result, run.err)
+		}
+		if !podHasMigrationGate(run.pod) {
+			t.Error("pod was released, want it gated")
+		}
+		if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
+			t.Errorf("RestorePlacement condition = %+v, want none while the consumer is going away", cond)
+		}
+		if run.job.Status.RestoredPodUID != "terminating-uid" {
+			t.Errorf("RestoredPodUID = %q, want the terminating consumer's", run.job.Status.RestoredPodUID)
+		}
+	})
+
 	t.Run("NoCompatibleNode recorded and placement turned off since: keeps holding", func(t *testing.T) {
 		// The job reconciler concludes the job on the hold either way, so
 		// the pod waits for the cold release rather than being released
@@ -708,8 +994,8 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 				}
 				run := reconcilePlacement(t, true, registryOf(t, eng), placementPod(), placementJob(), placementNode("n2-a", "n2-standard-4"))
 				releasedWithout(t, run, eng)
-				if !hasEventWith(run.events, "MigrationRestoreReleased", "without node constraints") {
-					t.Errorf("events = %q, want the release event to say there are no node constraints", run.events)
+				if !hasEventWith(run.events, "MigrationRestoreReleased", "without adding node constraints") {
+					t.Errorf("events = %q, want the release event to say no node constraints were added", run.events)
 				}
 			})
 		}
@@ -724,37 +1010,6 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 			job.Status.RestoredPodName = placementPodName
 			releasedWithout(t, reconcilePlacement(t, true, registryOf(t, eng), placementPod(), job), eng)
 		})
-	})
-
-	t.Run("the recorded consumer is still terminating: waits before checking", func(t *testing.T) {
-		// No node fits, so a check would hold the pod and conclude the job
-		// cold. The consumer that is going away comes first: once it's
-		// gone, this pod can adopt the job.
-		job := placementJob()
-		job.Status.Consumed = true
-		job.Status.RestoredPodUID = "terminating-uid"
-		job.Status.RestoredPodName = "terminating-replacement"
-		now := metav1.Now()
-		terminating := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-			Namespace:         placementNamespace,
-			Name:              "terminating-replacement",
-			UID:               "terminating-uid",
-			DeletionTimestamp: &now,
-			Finalizers:        []string{"example.com/hold"},
-		}}
-		run := reconcilePlacement(t, true, nil, placementPod(), job, terminating, placementNode("e2-a", "e2-medium"))
-		if run.err != nil || run.result.RequeueAfter != 5*time.Second {
-			t.Fatalf("Reconcile() = %+v, %v; want a 5s requeue to wait for the consumer", run.result, run.err)
-		}
-		if !podHasMigrationGate(run.pod) {
-			t.Error("pod was released, want it gated")
-		}
-		if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
-			t.Errorf("RestorePlacement condition = %+v, want none while the consumer is going away", cond)
-		}
-		if run.job.Status.RestoredPodUID != "terminating-uid" {
-			t.Errorf("RestoredPodUID = %q, want the terminating consumer's", run.job.Status.RestoredPodUID)
-		}
 	})
 
 	t.Run("a stale view on a retry can't release the pod onto a concluded job", func(t *testing.T) {
@@ -817,11 +1072,11 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		if err := cl.Get(ctx, key, got); err != nil {
 			t.Fatalf("getting the job: %v", err)
 		}
-		if got.Status.GateReleased {
+		if got.Status.GateReleased || restorePlacementRecorded(got) {
 			t.Errorf("job status = %+v, want no gate release recorded on the concluded job", got.Status)
 		}
-		if patched == nil || patched.Status.GateReleased {
-			t.Errorf("job in memory after the failed patch = %+v, want it as it was read, without GateReleased", patched)
+		if patched == nil || patched.Status.GateReleased || restorePlacementRecorded(patched) {
+			t.Errorf("job in memory after the failed patch = %+v, want it as it was read, without GateReleased or a placement record", patched)
 		}
 		pod := &corev1.Pod{}
 		if err := cl.Get(ctx, types.NamespacedName{Namespace: placementNamespace, Name: placementPodName}, pod); err != nil {
@@ -829,6 +1084,52 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		}
 		if !podHasMigrationGate(pod) {
 			t.Error("pod was released, want it gated")
+		}
+	})
+}
+
+func TestSomeNodeFits(t *testing.T) {
+	reqs := []corev1.NodeSelectorRequirement{instanceTypeIn("n2-standard-4")}
+	someNodeFitsWith := func(t *testing.T, funcs interceptor.Funcs, nodes ...client.Object) bool {
+		t.Helper()
+		scheme := runtime.NewScheme()
+		_ = corev1.AddToScheme(scheme)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodes...).WithInterceptorFuncs(funcs).Build()
+		r := &PodGateReconciler{Client: cl, Scheme: scheme}
+		fits, err := r.someNodeFits(context.Background(), placementPod(), reqs)
+		if err != nil {
+			t.Fatalf("someNodeFits() error = %v", err)
+		}
+		return fits
+	}
+
+	t.Run("narrows the node list by the constraint's labels", func(t *testing.T) {
+		var selector string
+		funcs := interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			listOpts := &client.ListOptions{}
+			listOpts.ApplyOptions(opts)
+			if listOpts.LabelSelector != nil {
+				selector = listOpts.LabelSelector.String()
+			}
+			return c.List(ctx, list, opts...)
+		}}
+		if !someNodeFitsWith(t, funcs, placementNode("n2-a", "n2-standard-4")) {
+			t.Error("someNodeFits() = false, want true")
+		}
+		if selector != "node.kubernetes.io/instance-type in (n2-standard-4)" {
+			t.Errorf("node list label selector = %q, want the constraint", selector)
+		}
+	})
+
+	t.Run("checks the constraint on a list it couldn't narrow", func(t *testing.T) {
+		// An engine's constraint may not convert to a label selector; then
+		// every node is listed, and the node check must reject the wrong
+		// machine type itself.
+		ignoreSelector := interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			return c.List(ctx, list)
+		}}
+		if someNodeFitsWith(t, ignoreSelector, placementNode("n2x8-a", "n2-standard-8")) {
+			t.Error("someNodeFits() = true for a node of another machine type, want false")
 		}
 	})
 }
@@ -1108,6 +1409,147 @@ func TestAddRequiredNodeAffinity(t *testing.T) {
 	})
 }
 
+// requiredAffinity returns an affinity that requires terms.
+func requiredAffinity(terms ...corev1.NodeSelectorTerm) *corev1.Affinity {
+	return &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: terms},
+	}}
+}
+
+// termOf returns a node selector term of reqs.
+func termOf(reqs ...corev1.NodeSelectorRequirement) corev1.NodeSelectorTerm {
+	return corev1.NodeSelectorTerm{MatchExpressions: reqs}
+}
+
+// TestWithoutRequirements pins that withoutRequirements undoes
+// addRequiredNodeAffinity, so the backstop judges the pod as its owner
+// recreates it.
+func TestWithoutRequirements(t *testing.T) {
+	req := instanceTypeIn("n2-standard-4")
+	reqs := []corev1.NodeSelectorRequirement{req}
+	zoneA := corev1.NodeSelectorRequirement{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}
+	zoneB := corev1.NodeSelectorRequirement{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}
+	byName := corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"node-1"}}
+	preferred := []corev1.PreferredSchedulingTerm{{Weight: 1, Preference: termOf(zoneB)}}
+
+	for _, tc := range []struct {
+		name string
+		in   *corev1.Affinity
+	}{
+		{name: "no affinity"},
+		{name: "only preferred terms", in: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{PreferredDuringSchedulingIgnoredDuringExecution: preferred}}},
+		{name: "pod affinity only", in: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{}}},
+		{name: "terms of its own", in: requiredAffinity(termOf(zoneA), termOf(zoneB), corev1.NodeSelectorTerm{MatchFields: []corev1.NodeSelectorRequirement{byName}})},
+		{name: "an empty term of its own", in: requiredAffinity(corev1.NodeSelectorTerm{}, termOf(zoneA))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{Spec: corev1.PodSpec{Affinity: tc.in.DeepCopy()}}
+			placed := pod.DeepCopy()
+			addRequiredNodeAffinity(placed, reqs)
+			before := placed.DeepCopy()
+			got := withoutRequirements(placed, reqs)
+			if !reflect.DeepEqual(requiredTerms(got), requiredTerms(pod)) {
+				t.Errorf("required terms = %+v, want the pod's own, %+v", requiredTerms(got), requiredTerms(pod))
+			}
+			if !reflect.DeepEqual(placed, before) {
+				t.Errorf("the input changed to %+v", placed.Spec.Affinity)
+			}
+		})
+	}
+
+	t.Run("a term of its own that has the requirement loses it too", func(t *testing.T) {
+		// restorePlacement adds nothing when every term has it, so this
+		// only happens when the pod's terms differ in it.
+		placed := &corev1.Pod{Spec: corev1.PodSpec{Affinity: requiredAffinity(termOf(req, zoneA), termOf(zoneB))}}
+		addRequiredNodeAffinity(placed, reqs)
+		want := []corev1.NodeSelectorTerm{termOf(zoneA), termOf(zoneB)}
+		if got := requiredTerms(withoutRequirements(placed, reqs)); !reflect.DeepEqual(got, want) {
+			t.Errorf("required terms = %+v, want %+v", got, want)
+		}
+	})
+}
+
+func TestNarrows(t *testing.T) {
+	req := instanceTypeIn("n2-standard-4")
+	zoneA := corev1.NodeSelectorRequirement{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}
+	for _, tc := range []struct {
+		name     string
+		affinity *corev1.Affinity
+		want     bool
+	}{
+		{name: "no affinity", want: true},
+		{name: "a term without it", affinity: requiredAffinity(termOf(zoneA)), want: true},
+		{name: "another value of the key", affinity: requiredAffinity(termOf(instanceTypeIn("n2-standard-8"))), want: true},
+		{name: "one of two terms lacks it", affinity: requiredAffinity(termOf(req), termOf(zoneA)), want: true},
+		{name: "its only term has it", affinity: requiredAffinity(termOf(req))},
+		{name: "every term has it, among others", affinity: requiredAffinity(termOf(zoneA, req), termOf(req))},
+	} {
+		pod := &corev1.Pod{Spec: corev1.PodSpec{Affinity: tc.affinity}}
+		if got := narrows(pod, []corev1.NodeSelectorRequirement{req}); got != tc.want {
+			t.Errorf("%s: narrows() = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+
+	for _, tc := range []struct {
+		name         string
+		nodeSelector map[string]string
+		reqs         []corev1.NodeSelectorRequirement
+		want         bool
+	}{
+		{name: "a node selector that pins the type", nodeSelector: map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-4"}, reqs: []corev1.NodeSelectorRequirement{req}},
+		{name: "a node selector with another type", nodeSelector: map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-8"}, reqs: []corev1.NodeSelectorRequirement{req}, want: true},
+		{name: "a node selector without the key", nodeSelector: map[string]string{gvisorLabel: "gvisor"}, reqs: []corev1.NodeSelectorRequirement{req}, want: true},
+		{
+			name:         "NotIn, pinned to another value",
+			nodeSelector: map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-4"},
+			reqs:         []corev1.NodeSelectorRequirement{{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"e2-medium"}}},
+		},
+		{
+			name:         "NotIn, pinned to a listed value",
+			nodeSelector: map[string]string{corev1.LabelInstanceTypeStable: "e2-medium"},
+			reqs:         []corev1.NodeSelectorRequirement{{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"e2-medium"}}},
+			want:         true,
+		},
+		{
+			name:         "Exists, pinned",
+			nodeSelector: map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-4"},
+			reqs:         []corev1.NodeSelectorRequirement{{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpExists}},
+		},
+		{
+			name:         "one of two requirements pinned",
+			nodeSelector: map[string]string{corev1.LabelInstanceTypeStable: "n2-standard-4"},
+			reqs:         []corev1.NodeSelectorRequirement{req, zoneA},
+			want:         true,
+		},
+	} {
+		pod := &corev1.Pod{Spec: corev1.PodSpec{NodeSelector: tc.nodeSelector}}
+		if got := narrows(pod, tc.reqs); got != tc.want {
+			t.Errorf("%s: narrows() = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestRecreatedByOwner(t *testing.T) {
+	notController := ownedPlacementPod()
+	notController.OwnerReferences[0].Controller = nil
+	for name, tc := range map[string]struct {
+		pod  *corev1.Pod
+		want bool
+	}{
+		"a StatefulSet":                      {pod: ownedPlacementPod(), want: true},
+		"a ReplicaSet":                       {pod: placementPodWith(controlledBy("apps/v1", "ReplicaSet")), want: true},
+		"no owner":                           {pod: placementPod()},
+		"a Job":                              {pod: placementPodWith(controlledBy("batch/v1", "Job"))},
+		"a DaemonSet":                        {pod: placementPodWith(controlledBy("apps/v1", "DaemonSet"))},
+		"a ReplicaSet of another API group":  {pod: placementPodWith(controlledBy("example.com/v1", "ReplicaSet"))},
+		"an owner that isn't its controller": {pod: notController},
+	} {
+		if got := recreatedByOwner(tc.pod); got != tc.want {
+			t.Errorf("%s: recreatedByOwner() = %t, want %t", name, got, tc.want)
+		}
+	}
+}
+
 func TestNodeFits(t *testing.T) {
 	pod := placementPod()
 	addRequiredNodeAffinity(pod, []corev1.NodeSelectorRequirement{instanceTypeIn("n2-standard-4")})
@@ -1218,7 +1660,7 @@ func TestRestorePlacement_KeepsValidConstraints(t *testing.T) {
 				reqs:           []corev1.NodeSelectorRequirement{req},
 			}
 			r := &PodGateReconciler{RestorePlacement: true, Engines: registryOf(t, eng)}
-			got, err := r.restorePlacement(context.Background(), placementJob())
+			got, err := r.restorePlacement(context.Background(), placementJob(), placementPod())
 			if err != nil || !reflect.DeepEqual(got, []corev1.NodeSelectorRequirement{req}) {
 				t.Errorf("restorePlacement() = %+v, %v; want %+v kept", got, err, req)
 			}
@@ -1275,6 +1717,12 @@ type placementFlow struct {
 
 func newPlacementFlow(t *testing.T, job *pmv1alpha1.PodMigrationJob, nodes ...client.Object) *placementFlow {
 	t.Helper()
+	return newPlacementFlowFor(t, placementPod(), job, nodes...)
+}
+
+// newPlacementFlowFor is newPlacementFlow with pod as the replacement.
+func newPlacementFlowFor(t *testing.T, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, nodes ...client.Object) *placementFlow {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
@@ -1284,7 +1732,7 @@ func newPlacementFlow(t *testing.T, job *pmv1alpha1.PodMigrationJob, nodes ...cl
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(append([]client.Object{placementPod(), job}, nodes...)...).
+		WithObjects(append([]client.Object{pod, job}, nodes...)...).
 		Build()
 	recorder := record.NewFakeRecorder(100)
 	checks := invariants.NewEngine(invariants.ModeObserve, recorder)
@@ -1443,5 +1891,79 @@ func TestRestorePlacement_StrandedJobHoldFlow(t *testing.T) {
 	}
 	if got := f.job().Status; got.RestoredPodUID != placementPodUID || got.RestoredPodName != placementPodName {
 		t.Errorf("job records pod %s (%s), want the pod that started cold", got.RestoredPodName, got.RestoredPodUID)
+	}
+}
+
+// TestRestorePlacement_PlacementTimeoutFlow runs the whole flow for an owned
+// replacement when no node meets the constraint, through both reconcilers
+// with the invariants on: the pod gate releases the pod with the constraint
+// so that a node can still come up, the scheduler finds none, and after the
+// placement deadline the job concludes without a restore and deletes the
+// pod. Its owner recreates it, and the new pod, which no job claims, starts
+// cold. No invariant may fire on the way, I10 in particular: the job
+// concludes before its replacement is deleted.
+func TestRestorePlacement_PlacementTimeoutFlow(t *testing.T) {
+	f := newPlacementFlowFor(t, ownedPlacementPod(), placementJob(), placementNode("e2-a", "e2-medium"))
+	ctx := context.Background()
+
+	f.reconcileGate("pod gate releases with the constraint")
+	pod := f.pod()
+	if podHasMigrationGate(pod) || requiredTerms(pod) == nil {
+		t.Fatalf("pod gated %t, terms %+v; want it released with the constraint", podHasMigrationGate(pod), requiredTerms(pod))
+	}
+	f.reconcileJob("job waits for the pod")
+	if phase := f.job().Status.Phase; phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+		t.Fatalf("phase = %s, want Restoring before the deadline", phase)
+	}
+
+	// The scheduler finds no node, and the deadline passes. The job has been
+	// Restoring for long enough that I10 would report it if its replacement
+	// went missing while it's still Restoring.
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable}}
+	if err := f.cl.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("marking the pod unschedulable: %v", err)
+	}
+	job := f.job()
+	released := metav1.NewTime(time.Now().Add(-DefaultRestorePlacementDeadline - time.Minute))
+	job.Status.RestoringStartTime = &released
+	for i := range job.Status.Conditions {
+		if job.Status.Conditions[i].Type == ConditionRestorePlacement {
+			job.Status.Conditions[i].LastTransitionTime = released
+		}
+	}
+	if err := f.cl.Status().Update(ctx, job); err != nil {
+		t.Fatalf("moving the release back past the deadline: %v", err)
+	}
+
+	f.reconcileJob("job concludes and deletes the pod")
+	job = f.job()
+	cond := meta.FindStatusCondition(job.Status.Conditions, "Restored")
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore || cond == nil || cond.Reason != ReasonPlacementTimeout {
+		t.Fatalf("job status = %+v, want SucceededWithoutRestore with reason %s", job.Status, ReasonPlacementTimeout)
+	}
+	if err := f.cl.Get(ctx, types.NamespacedName{Namespace: placementNamespace, Name: placementPodName}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("getting the pod: %v, want it deleted", err)
+	}
+
+	// The StatefulSet recreates the pod. No job claims it, so the webhook
+	// neither gates nor assigns it, and it starts cold.
+	recreated := ownedPlacementPod()
+	recreated.UID = "recreated-uid"
+	recreated.Annotations = nil
+	recreated.Spec.SchedulingGates = nil
+	if err := f.cl.Create(ctx, recreated); err != nil {
+		t.Fatalf("recreating the pod: %v", err)
+	}
+	f.reconcileJob("job settles")
+	if err := f.cl.Get(ctx, types.NamespacedName{Namespace: placementNamespace, Name: placementPodName}, &corev1.Pod{}); err != nil {
+		t.Fatalf("getting the recreated pod: %v, want it kept", err)
+	}
+
+	events := f.events()
+	for _, v := range violations(events) {
+		t.Errorf("invariant violation: %s", v)
+	}
+	if !hasEventWith(events, "Warning", ReasonPlacementTimeout) {
+		t.Errorf("events = %q, want %s Warnings", events, ReasonPlacementTimeout)
 	}
 }

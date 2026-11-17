@@ -169,6 +169,16 @@ type PodMigrationJobReconciler struct {
 	// replacement is Ready. A restore the engine confirms doesn't wait.
 	RestoreStabilizationWindow time.Duration
 
+	// RestorePlacementDeadline is how long a replacement that the pod gate
+	// released with the restore's node constraints may stay unschedulable
+	// (C8, #14). Then, if its ReplicaSet or StatefulSet would recreate it
+	// and a node without the constraints could take it, the job concludes
+	// SucceededWithoutRestore with reason PlacementTimeout, and the pod is
+	// deleted for that owner to recreate. At the restore ceiling, it's
+	// deleted even without such a node.
+	// Defaults to DefaultRestorePlacementDeadline if unset or <= 0.
+	RestorePlacementDeadline time.Duration
+
 	// fallbackEventChecks records the last fallback-event probe per PMJ
 	// (namespace/name -> time.Time).  In-memory only; a restart just means
 	// one extra probe per in-flight migration.
@@ -1090,6 +1100,25 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
+	// A placement timeout writes its conclusion before it deletes the
+	// replacement too (C8, #14), so retry a delete that failed here. A pod
+	// left stuck with the constraints might never be scheduled.
+	if placementTimedOut(job) {
+		if err := r.ensurePlacementTimedOutPodDeleted(ctx, job, nil); err != nil {
+			logger.Error(err, "Failed to complete the placement-timeout pod deletion; will retry", "pod", job.Status.RestoredPodName)
+			return ctrl.Result{}, err
+		}
+	}
+	// A job that concluded RestoreTimeout can still have a replacement
+	// released with the restore's node constraints that isn't scheduled
+	// (C8, #14): recreate it once it's unschedulable, and look again soon
+	// until then. This is best effort: an error is retried on the next look,
+	// and must not hold the rest of this path, such as garbage collection.
+	placementRecheck, err := r.recreateUnplacedAfterRestoreTimeout(ctx, job)
+	if err != nil {
+		logger.Error(err, "Failed to check the replacement released with the restore's node constraints; will retry", "pod", job.Status.RestoredPodName)
+	}
+
 	// A job that fenced its source and then concluded without a restore still
 	// owns the fence: it returns the source to service, or keeps it fenced and
 	// evicts it (#131). That has to finish before the job is deleted.
@@ -1160,6 +1189,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if job.Status.CompletionTime != nil {
 			ttl := time.Minute * 30
 			requeueIn := ttl - time.Since(job.Status.CompletionTime.Time)
+			if placementRecheck > 0 && placementRecheck < requeueIn {
+				requeueIn = placementRecheck
+			}
 			return ctrl.Result{RequeueAfter: requeueIn}, nil
 		}
 		return ctrl.Result{}, nil
@@ -1787,6 +1819,17 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{}, nil
 		}
 
+		// The pod gate released the replacement with the restore's node
+		// constraints, and it's still unscheduled past the placement
+		// deadline (C8, #14): if a node without them could take it, or once
+		// the restore ceiling has passed, conclude without a restore, and
+		// delete it for its ReplicaSet or StatefulSet to recreate. This comes
+		// before the restore ceiling, so that the job concludes
+		// PlacementTimeout, not RestoreTimeout.
+		if res, handled, err := r.placementBackstop(ctx, job); handled || err != nil {
+			return res, err
+		}
+
 		// 2. Safety ceiling measured from RestoringStartTime: 5 minutes, plus
 		// the stabilization window. Having no verdict by then isn't a
 		// success (C6).
@@ -1856,6 +1899,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					// The deferral is unbounded by design (a gated pod cannot have
 					// started), so it must be visible: operators can alert on this
 					// condition if a wedged PodGate worker holds PMJs here.
+					// The patch checks the resourceVersion: a merge patch replaces
+					// the conditions list as a whole, and a stale view must not
+					// drop a condition written since, such as the pod gate's
+					// RestorePlacement record (#14).
+					before := job.DeepCopy()
 					if meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 						Type:               "Ready",
 						Status:             metav1.ConditionFalse,
@@ -1863,7 +1911,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						Message:            "Restore ceiling reached but replacement pod is still gated awaiting the PodGate worker",
 						ObservedGeneration: job.Generation,
 					}) {
-						if updateErr := r.patchStatus(ctx, job, origJob); updateErr != nil {
+						if updateErr := r.patchStatus(ctx, job, before, client.MergeFromWithOptimisticLock{}); updateErr != nil {
+							*job = *before
 							return r.handleStatusError(ctx, updateErr, "Failed to update status on WaitingOnGateRelease condition")
 						}
 					}
@@ -1875,7 +1924,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if restoreCeiling != restoreTimeout {
 				message = fmt.Sprintf("Restore timed out after %s", restoreCeiling)
 			}
-			if err := r.markSucceededWithoutRestore(ctx, job, origJob, "RestoreTimeout", message); err != nil {
+			// As above, a stale view must not conclude the job, or drop a
+			// condition written since: the pod gate may have released the
+			// replacement with the restore's node constraints. The placement
+			// backstop above handles that pod, and after this conclusion
+			// recreateUnplacedAfterRestoreTimeout finds it by that record.
+			before := job.DeepCopy()
+			if err := r.markSucceededWithoutRestore(ctx, job, before, reasonRestoreTimeout, message, client.MergeFromWithOptimisticLock{}); err != nil {
+				*job = *before
 				return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore on restore timeout")
 			}
 			metrics.RecordRestoreVerdict(r.jobEngine(job).Name(), "timeout")

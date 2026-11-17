@@ -24,10 +24,13 @@
 #       * Verifies stateful pod warm restore across distinct worker nodes and enforces
 #         wall-clock SLO thresholds (T). When --require-cross-shape is passed on a
 #         multi-shape gVisor pool, also asserts src_type != dst_type. That needs a
-#         controller without --restore-placement (#14): with it, a warm restore stays on
-#         the source machine type. With it, T3-S1 also needs another Ready gVisor node of
-#         the source machine type, or the job concludes NoCompatibleNode and the
-#         warm-restore check fails.
+#         controller run with --restore-placement=false: placement is on by default
+#         (#14) and keeps a warm restore on the source machine type, so with placement
+#         on, --require-cross-shape fails fast. With placement on, T3-S1 also needs
+#         another Ready gVisor node of the source machine type, or the replacement
+#         waits for one and is recreated to start cold (PlacementTimeout): at
+#         --restore-placement-deadline if a node of another type can take it, or at
+#         the restore ceiling otherwise. That fails the warm-restore check.
 #   - T3-S2 : 50-Pod Multi-Workload Concurrent Evacuation Wave & Latency SLO (T) Benchmark
 #       * Deploys a 50-pod fleet across 5 mixed workloads (counter, redis, postgres,
 #         memcached, nginx), executes a concurrent node drain wave with stateful
@@ -40,10 +43,13 @@
 #       * Exercises cross-pool/cross-shape evacuation and controlled I9
 #         (SucceededWithoutRestore / RestoreFailedColdStart) fallback across
 #         multi-replica stateful pods, asserting 100% Ready convergence within SLO (T).
-#         With --restore-placement (#14), cordoning every source-shape node leaves no
-#         compatible node, so on a multi-shape pool the job concludes
-#         SucceededWithoutRestore (NoCompatibleNode) before any restore. The run still
-#         passes, but it doesn't exercise a cross-shape restore or the I9 fallback.
+#         With --restore-placement (on by default, #14), cordoning every source-shape
+#         node leaves no compatible node: the replacements wait for one up to
+#         --restore-placement-deadline, then are recreated to start cold
+#         (PlacementTimeout), which can exceed the end-to-end SLO and doesn't exercise a
+#         cross-shape restore or the I9 fallback. So on a multi-shape pool, T3-S3 logs
+#         SKIPPED unless the controller runs with --restore-placement=false, and fails
+#         fast with --require-cross-shape.
 #   - T3-S4 : Multi-Wave Sequential Rolling Node Drain Soak & I5 Resource Leak Audit
 #       * Executes back-to-back sequential node drain waves (Wave 1 -> Wave 2) on a
 #         multi-replica stateful deployment, verifying cumulative state survival across
@@ -87,7 +93,7 @@ Options:
   --slo-downtime-p95 <dur>          Max p95 serving blackout duration (default: 60s)
   --slo-e2e-p95 <dur>               Max p95 end-to-end migration duration (default: 180s)
   --require-cross-shape             Assert src_type != dst_type in T3-S1/T3-S3 (requires multi-shape pool,
-                                    and a controller without --restore-placement)
+                                    and a controller run with --restore-placement=false)
   --allow-simulated-s3              Run T3-S3 on a single-shape pool as an explicit simulated exit-128 fallback
                                     test (otherwise T3-S3 logs SKIPPED when <2 gVisor shapes exist)
   --self-test                       Run offline end-to-end self-test of scalesim, pmprofiler
@@ -256,6 +262,26 @@ log() {
 die() {
   printf "\033[1;31m[FAIL]\033[0m %s\n" "$*" >&2
   exit 1
+}
+
+# restore_placement_on succeeds when the controller places restored replacements
+# on the source node's machine type (#14). --restore-placement is on by default,
+# so that's unless a container of a Deployment in ${CONTROLLER_NS} passes
+# --restore-placement=false; as with Go flags, the last occurrence wins. If the
+# Deployments can't be read, placement counts as on, the default.
+restore_placement_on() {
+  local args last value
+  args="$(kubectl get deployments -n "${CONTROLLER_NS}" -o json 2>/dev/null \
+    | jq -r '.items[].spec.template.spec.containers[] | ((.command // []) + (.args // []))[]' 2>/dev/null || true)"
+  last="$(grep -E -- '^--?restore-placement(=|$)' <<<"${args}" | tail -n 1 || true)"
+  value="true"
+  if [[ "${last}" == *=* ]]; then
+    value="${last#*=}"
+  fi
+  case "${value}" in
+    0|f|F|false|FALSE|False) return 1 ;;
+  esac
+  return 0
 }
 
 PMPROFILER_BIN=""
@@ -629,6 +655,11 @@ run_scalesim_model() {
 scenario_t3_s1() {
   local run_dir="${OUT_DIR}/t3_s1"
   log "=== Scenario T3-S1: Cross-Node Stateful Drain Verification ==="
+  # With restore placement on, a warm restore stays on the source machine type
+  # (#14), so the cross-shape assertion can't pass: fail before touching the cluster.
+  if [[ "${REQUIRE_CROSS_SHAPE}" == "true" ]] && restore_placement_on; then
+    die "T3-S1: --require-cross-shape needs the controller in ${CONTROLLER_NS} to run with --restore-placement=false: with placement on (the default, #14), a warm restore stays on the source machine type"
+  fi
   resolve_gcs_bucket
   clean_t3_workloads
   clean_stale_migration_resources
@@ -1151,6 +1182,18 @@ scenario_t3_s3() {
       return 0
     fi
     log "SKIPPED [T3-S3 heterogeneous cross-shape claim]: cluster has ${distinct_shapes} gVisor machine shape (${shape_list:-unknown}); running opt-in --allow-simulated-s3 same-shape exit-128 fallback"
+  fi
+
+  # With restore placement on (the default, #14), cordoning every source-shape node
+  # leaves the replacement no node it may use: it waits up to
+  # --restore-placement-deadline and is then recreated to start cold, so no
+  # cross-shape restore or I9 fallback is exercised.
+  if [[ "${distinct_shapes}" -gt 1 ]] && restore_placement_on; then
+    if [[ "${REQUIRE_CROSS_SHAPE}" == "true" ]]; then
+      die "T3-S3: --require-cross-shape needs the controller in ${CONTROLLER_NS} to run with --restore-placement=false: with placement on (the default, #14), the replacement can't restore on another machine shape"
+    fi
+    log "SKIPPED [T3-S3]: heterogeneous cross-shape drain needs the controller in ${CONTROLLER_NS} to run with --restore-placement=false: with placement on (the default, #14), the replacement waits for a node of its source shape and is then recreated to start cold (gVisor shapes: ${shape_list})"
+    return 0
   fi
 
   resolve_gcs_bucket
@@ -1912,6 +1955,96 @@ EOF
     die "Self-test failure: expected scenario_t3_s3 to fail closed on single-shape pool when --require-cross-shape is set"
   fi
   log "PASS [self-test]: scenario_t3_s3 single-shape SKIPPED and --require-cross-shape fail-closed verified"
+
+  # 12b. Verify the restore placement preflight (#14): restore_placement_on reads the
+  # controller Deployment's flags, T3-S3 logs SKIPPED on a multi-shape pool while
+  # placement is on, and T3-S1 and T3-S3 fail closed then with --require-cross-shape.
+  local deploy_placement_on deploy_placement_off deploy_placement_reenabled deploy_placement_off_with_deadline
+  deploy_placement_on='{"items":[{"spec":{"template":{"spec":{"containers":[{"name":"manager","command":["/manager"],"args":["--leader-elect=true","--restore-placement-deadline=3m"]}]}}}}]}'
+  deploy_placement_off='{"items":[{"spec":{"template":{"spec":{"containers":[{"name":"manager","command":["/manager"],"args":["--leader-elect=true","--restore-placement=false"]}]}}}}]}'
+  deploy_placement_reenabled='{"items":[{"spec":{"template":{"spec":{"containers":[{"name":"manager","args":["--restore-placement=false","-restore-placement"]}]}}}}]}'
+  deploy_placement_off_with_deadline='{"items":[{"spec":{"template":{"spec":{"containers":[{"name":"manager","args":["--restore-placement=false","--restore-placement-deadline=3m"]}]}}}}]}'
+  (
+    kubectl() { [[ "$*" == *"get deployments"* ]] && printf '%s' "${deploy_placement_on}"; }
+    restore_placement_on
+  ) || die "Self-test failure: restore_placement_on reported placement off for a controller without --restore-placement=false"
+  if (
+    kubectl() { [[ "$*" == *"get deployments"* ]] && printf '%s' "${deploy_placement_off}"; }
+    restore_placement_on
+  ); then
+    die "Self-test failure: restore_placement_on reported placement on for a controller with --restore-placement=false"
+  fi
+  (
+    kubectl() { [[ "$*" == *"get deployments"* ]] && printf '%s' "${deploy_placement_reenabled}"; }
+    restore_placement_on
+  ) || die "Self-test failure: restore_placement_on didn't take the last --restore-placement flag"
+  if (
+    kubectl() { [[ "$*" == *"get deployments"* ]] && printf '%s' "${deploy_placement_off_with_deadline}"; }
+    restore_placement_on
+  ); then
+    die "Self-test failure: restore_placement_on took --restore-placement-deadline for --restore-placement"
+  fi
+  (
+    kubectl() { return 1; }
+    restore_placement_on
+  ) || die "Self-test failure: restore_placement_on didn't count placement as on when the controller can't be read"
+
+  local s3_placement_out
+  s3_placement_out="$(
+    OUT_DIR="${base_dir}/test-s3-placement-skip"
+    REQUIRE_CROSS_SHAPE="false"
+    ALLOW_SIMULATED_S3="false"
+    kubectl() {
+      if [[ "$*" == *"get nodes -l sandbox.gke.io/runtime=gvisor"* ]]; then
+        printf "n2-standard-4\nn2-standard-8\n"
+        return 0
+      fi
+      if [[ "$*" == *"get deployments"* ]]; then
+        printf '%s' "${deploy_placement_on}"
+        return 0
+      fi
+      return 1
+    }
+    scenario_t3_s3 2>&1
+  )" || die "Self-test failure: scenario_t3_s3 failed instead of skipping on a multi-shape pool with restore placement on: ${s3_placement_out}"
+  grep -q 'SKIPPED \[T3-S3\].*--restore-placement=false' <<<"${s3_placement_out}" || die "Self-test failure: expected SKIPPED [T3-S3] naming --restore-placement=false, got: ${s3_placement_out}"
+  if [[ -d "${base_dir}/test-s3-placement-skip/t3_s3" ]]; then
+    die "Self-test failure: expected scenario_t3_s3 not to emit a t3_s3 run directory when skipped for restore placement"
+  fi
+  s3_placement_out="$(
+    OUT_DIR="${base_dir}/test-s3-placement-require"
+    REQUIRE_CROSS_SHAPE="true"
+    ALLOW_SIMULATED_S3="false"
+    kubectl() {
+      if [[ "$*" == *"get nodes -l sandbox.gke.io/runtime=gvisor"* ]]; then
+        printf "n2-standard-4\nn2-standard-8\n"
+        return 0
+      fi
+      if [[ "$*" == *"get deployments"* ]]; then
+        printf '%s' "${deploy_placement_on}"
+        return 0
+      fi
+      return 1
+    }
+    scenario_t3_s3 2>&1
+  )" && die "Self-test failure: expected scenario_t3_s3 to fail closed with --require-cross-shape while restore placement is on"
+  grep -q 'T3-S3: --require-cross-shape needs the controller' <<<"${s3_placement_out}" || die "Self-test failure: expected the T3-S3 restore placement preflight to fail it, got: ${s3_placement_out}"
+
+  local s1_placement_out
+  s1_placement_out="$(
+    OUT_DIR="${base_dir}/test-s1-placement-require"
+    REQUIRE_CROSS_SHAPE="true"
+    kubectl() {
+      if [[ "$*" == *"get deployments"* ]]; then
+        printf '%s' "${deploy_placement_on}"
+        return 0
+      fi
+      return 1
+    }
+    scenario_t3_s1 2>&1
+  )" && die "Self-test failure: expected scenario_t3_s1 to fail closed with --require-cross-shape while restore placement is on"
+  grep -q 'T3-S1: --require-cross-shape needs the controller' <<<"${s1_placement_out}" || die "Self-test failure: expected the T3-S1 restore placement preflight to fail it, got: ${s1_placement_out}"
+  log "PASS [self-test]: restore placement preflight verified (T3-S3 SKIPPED, --require-cross-shape fail-closed)"
 
   # 13. Verify clean_stale_migration_resources scopes deletion to T3 artifacts and preserves non-T3 resources (Issue #97)
   local clean_calls_log="${base_dir}/clean-stale-kubectl.log"

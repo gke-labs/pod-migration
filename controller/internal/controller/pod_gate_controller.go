@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -70,9 +71,15 @@ type PodGateReconciler struct {
 	// RestorePlacement places a restored replacement on a node that can
 	// restore its checkpoint (C8, #14): the job's engine's node constraints
 	// go into the pod's required node affinity when the gate is released
-	// with a restore order. When no node meets them, the job concludes
-	// without a restore and the pod starts cold. Off adds no constraints;
-	// a pod already held because no node met them still starts cold.
+	// with a restore order. When no node meets them yet, a pod that its
+	// ReplicaSet or StatefulSet would recreate is released with them
+	// anyway, and if it isn't scheduled within the placement deadline while
+	// a node without them could take it, or by the restore ceiling, the job
+	// reconciler deletes it for that owner to recreate, to start cold.
+	// Another pod is held if a node can take it without them, the job
+	// concludes without a restore, and the pod starts cold; if no node can,
+	// it's released without them. Off adds no constraints; a pod already
+	// held because no node met them still starts cold.
 	RestorePlacement bool
 }
 
@@ -340,7 +347,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 				// costs nothing because the candidate is safely held in Pending by its
 				// scheduling gate. Once the terminating consumer finishes and disappears from
 				// the API server, this candidate will recover: it adopts the PMJ snapshot, or,
-				// if the placement check below finds no node, holds and clears the consumer's
+				// if the placement check below holds it, the hold clears the consumer's
 				// record. This comes before the placement check, so that a check can't
 				// conclude the job without a restore while the consumer is going away.
 				logger.Info("Assigned PMJ consumer pod still exists (possibly terminating); requeuing to wait for completion",
@@ -354,19 +361,32 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		// constraints go into the update that removes the gate, the only
 		// time Kubernetes lets them be added, and they can't be removed
 		// after it. So before anything is written for the release, check
-		// that some node meets them, and if none does, hold the pod: the
-		// job then concludes without a restore, and the pod starts cold.
-		// The hold also clears the record of a consumer that is gone
-		// (adoptStranded), so the job doesn't conclude consumed while this
-		// pod is still gated. Only a Restoring job is checked, because only
-		// then does the job reconciler conclude a hold; in another phase a
-		// new release gets no constraints, as without placement. A release
-		// that is already under way, this pod's own, isn't checked again,
-		// and the engine isn't asked yet: it gets the constraints below.
+		// that some node meets them. If none does yet, a pod that its
+		// ReplicaSet or StatefulSet would recreate is released with them
+		// anyway: a node can still come up, such as one that isn't Ready
+		// yet, one being replaced, or one that the cluster autoscaler adds
+		// once it sees the pod, which it doesn't while the pod is gated. If
+		// the pod isn't scheduled within the placement deadline while a node
+		// without them could take it, or by the restore ceiling, the job
+		// reconciler concludes the job and deletes the pod for that owner to
+		// recreate, and the new pod starts cold. Another pod couldn't be
+		// recreated the same way, so it's held instead if a node can take it
+		// without them: the job concludes without a restore, and the pod
+		// starts cold. The hold also clears the record of a consumer that is
+		// gone (adoptStranded), so the job doesn't conclude consumed while
+		// this pod is still gated. If no node can, it's released without
+		// them. Only a
+		// Restoring job is checked, because only then does the job
+		// reconciler conclude a hold; in another phase a new release gets
+		// no constraints, as without placement. A release that is already
+		// under way, this pod's own, isn't held, and the engine isn't asked
+		// yet: the constraints are added below, to a pod that no ReplicaSet
+		// or StatefulSet would recreate only if a node meets them.
 		var placement []corev1.NodeSelectorRequirement
 		underWay := releaseUnderWay(job, pod)
+		noNodeYet := false
 		if phase == pmv1alpha1.PodMigrationJobPhaseRestoring && !underWay {
-			if placement, err = r.restorePlacement(ctx, job); err != nil {
+			if placement, err = r.restorePlacement(ctx, job, pod); err != nil {
 				logger.Error(err, "Failed to get the restore's node constraints", "pmj", correctedPMJ)
 				return ctrl.Result{}, err
 			}
@@ -377,7 +397,29 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 					return ctrl.Result{}, err
 				}
 				if !fits {
-					return r.holdForNoCompatibleNode(ctx, pod, job, placement, adoptStranded)
+					if recreatedByOwner(pod) {
+						noNodeYet = true
+						logger.Info("No node meets the restore's node constraints yet; releasing the replacement with them so that one can come up",
+							"pmj", correctedPMJ, "constraints", describeRequirements(placement))
+					} else {
+						// No ReplicaSet or StatefulSet would recreate the pod if
+						// it got stuck with the constraints, so it starts cold
+						// now, on a node that can take it without them. If no
+						// node can, starting cold wouldn't get it running any
+						// sooner, and would only lose the restore: release it
+						// without them, as with placement off.
+						anyFits, err := r.someNodeFits(ctx, pod, nil)
+						if err != nil {
+							logger.Error(err, "Failed to check the nodes for the replacement", "pmj", correctedPMJ)
+							return ctrl.Result{}, err
+						}
+						if anyFits {
+							return r.holdForNoCompatibleNode(ctx, pod, job, placement, adoptStranded)
+						}
+						logger.Info("No node can take the replacement yet, with or without the restore's node constraints; releasing it without them, as with placement off",
+							"pmj", correctedPMJ, "constraints", describeRequirements(placement))
+						placement = nil
+					}
 				}
 			}
 		}
@@ -410,9 +452,25 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			return ctrl.Result{}, err
 		}
 		if underWay {
-			if placement, err = r.restorePlacement(ctx, job); err != nil {
+			if placement, err = r.restorePlacement(ctx, job, pod); err != nil {
 				logger.Error(err, "Failed to get the restore's node constraints", "pmj", correctedPMJ)
 				return ctrl.Result{}, err
+			}
+			// A pod that no ReplicaSet or StatefulSet would recreate gets the
+			// constraints only if a node meets them now. An earlier attempt
+			// may have released it without them because no node could take
+			// it, and it can't be held any more: it has consumed the job.
+			if len(placement) > 0 && !recreatedByOwner(pod) {
+				fits, err := r.someNodeFits(ctx, pod, placement)
+				if err != nil {
+					logger.Error(err, "Failed to check the nodes against the restore's node constraints", "pmj", correctedPMJ)
+					return ctrl.Result{}, err
+				}
+				if !fits {
+					logger.Info("No node meets the restore's node constraints, and the replacement's release is under way; releasing it without them",
+						"pmj", correctedPMJ, "constraints", describeRequirements(placement))
+					placement = nil
+				}
 			}
 		}
 		if err := orderer.OrderRestore(pod, job); err != nil {
@@ -469,10 +527,22 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		// overwriting it. That matters on a retry, where the Consumed write above is skipped: a
 		// stale view must not release this pod with a restore order onto a job that has
 		// concluded since, for example without a restore after another pod's hold.
-		if !job.Status.GateReleased {
+		// The same patch records the restore's node constraints (C8, #14), which the job
+		// reconciler's placement deadline counts from, and keeps the record in step with
+		// this release: a retry may add none where an earlier attempt recorded some (a pod
+		// that no ReplicaSet or StatefulSet would recreate, with no node meeting them now,
+		// or placement turned off since), and neither the placement deadline nor the
+		// check after a RestoreTimeout conclusion may act on a pod without them.
+		recorded := restorePlacementRecorded(job)
+		if !job.Status.GateReleased || (len(placement) > 0) != recorded {
 			orig := job.DeepCopy()
 			patch := client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
 			job.Status.GateReleased = true
+			if len(placement) > 0 {
+				recordRestorePlacement(job, placement, noNodeYet)
+			} else if recorded {
+				meta.RemoveStatusCondition(&job.Status.Conditions, ConditionRestorePlacement)
+			}
 			if err := r.Status().Patch(ctx, job, patch); err != nil {
 				// Nothing was written, so keep the job as it was read.
 				*job = *orig
@@ -491,10 +561,12 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 		if r.Recorder != nil {
 			switch {
+			case len(placement) > 0 && noNodeYet:
+				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s, injected snapshot restore annotation and required node affinity %s; no node meets it yet, so the pod waits for one, and may be recreated to start cold if none comes in time", MigrationGateName, describeRequirements(placement))
 			case len(placement) > 0:
 				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s, injected snapshot restore annotation and required node affinity %s", MigrationGateName, describeRequirements(placement))
 			case r.RestorePlacement:
-				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation, without node constraints", MigrationGateName)
+				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation, without adding node constraints", MigrationGateName)
 			default:
 				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation", MigrationGateName)
 			}

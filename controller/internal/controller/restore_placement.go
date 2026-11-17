@@ -19,15 +19,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
 	schedulinghelper "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
@@ -40,13 +43,19 @@ import (
 )
 
 const (
-	// ConditionRestorePlacement, on a PodMigrationJob, reports that the pod
-	// gate reconciler couldn't place the restore (C8, #14). It is only set
-	// False, with reason ReasonNoCompatibleNode.
+	// ConditionRestorePlacement, on a PodMigrationJob, records how the pod
+	// gate reconciler placed the restore (C8, #14). True with reason
+	// ReasonNodeConstraintsAdded: the replacement was released with the
+	// snapshot engine's node constraints. False with reason
+	// ReasonNoCompatibleNode: no node met them, no ReplicaSet or StatefulSet
+	// would recreate the replacement, and a node could take it without them,
+	// so it's held to start cold.
 	ConditionRestorePlacement = "RestorePlacement"
 	// ReasonNoCompatibleNode: when the replacement was due for release, no
-	// node met the snapshot engine's placement constraints, so the job
-	// concludes SucceededWithoutRestore and the replacement starts cold.
+	// node met the snapshot engine's placement constraints, no ReplicaSet or
+	// StatefulSet would recreate the replacement, and a node could take it
+	// without them, so the job concludes SucceededWithoutRestore and the
+	// replacement starts cold.
 	ReasonNoCompatibleNode = "NoCompatibleNode"
 
 	// tolerationComparisonOperators makes the node check match Gt and Lt
@@ -58,18 +67,21 @@ const (
 	tolerationComparisonOperators = true
 )
 
-// restorePlacement returns the node constraints that restoring job's
-// checkpoint needs (C8, #14), from the engine that orders the restore: the
-// job's engine, or GKE Pod Snapshots without a registry, as for the restore
-// order. An engine without the PlacementAdvisor capability states none, and
-// so does every engine while RestorePlacement is off. Constraints that
-// aren't valid node label requirements are dropped too: the API server would
-// reject the update that adds them, so the release, retried as is, would
-// keep failing, or the scheduler could never match them. Like
-// jobRestoreOrderer, it fails when job names an engine that isn't
-// registered: another engine's constraints would place the wrong restore,
-// and the job reconciler fails such a job (#80).
-func (r *PodGateReconciler) restorePlacement(ctx context.Context, job *pmv1alpha1.PodMigrationJob) ([]corev1.NodeSelectorRequirement, error) {
+// restorePlacement returns the node constraints to add to pod, the
+// replacement, for restoring job's checkpoint (C8, #14), from the engine
+// that orders the restore: the job's engine, or GKE Pod Snapshots without a
+// registry, as for the restore order. An engine without the
+// PlacementAdvisor capability states none, and so does every engine while
+// RestorePlacement is off. Constraints that aren't valid node label
+// requirements are dropped too: the API server would reject the update that
+// adds them, so the release, retried as is, would keep failing, or the
+// scheduler could never match them. None are added either when pod's own
+// node selector, or every term of its required node affinity, already
+// requires them: they'd narrow nothing, and pod is placed by its own pins,
+// as with RestorePlacement off. Like jobRestoreOrderer, it fails when job
+// names an engine that isn't registered: another engine's constraints would
+// place the wrong restore, and the job reconciler fails such a job (#80).
+func (r *PodGateReconciler) restorePlacement(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) ([]corev1.NodeSelectorRequirement, error) {
 	if !r.RestorePlacement {
 		return nil, nil
 	}
@@ -104,6 +116,15 @@ func (r *PodGateReconciler) restorePlacement(ctx context.Context, job *pmv1alpha
 			"pmj", job.Name, "engine", eng.Name(), "constraints", describeRequirements(reqs))
 		return nil, nil
 	}
+	if !narrows(pod, reqs) {
+		// The pod is pinned to what the restore needs by its own node
+		// selector or affinity, which a pod recreated in its place would
+		// have too. So holding it to start cold, or deleting it at the
+		// placement deadline, couldn't get it scheduled anywhere else.
+		log.FromContext(ctx).Info("The replacement already requires the restore's node constraints, so none are added",
+			"pmj", job.Name, "constraints", describeRequirements(reqs))
+		return nil, nil
+	}
 	return reqs, nil
 }
 
@@ -111,12 +132,80 @@ func (r *PodGateReconciler) restorePlacement(ctx context.Context, job *pmv1alpha
 // aren't valid node label requirements.
 var errInvalidPlacement = errors.New("invalid node constraints")
 
+// narrows reports whether reqs narrow where pod can run: whether one of them
+// isn't already required by the pod's node selector, or by every term of its
+// required node affinity.
+func narrows(pod *corev1.Pod, reqs []corev1.NodeSelectorRequirement) bool {
+	for _, req := range reqs {
+		if !selectorRequires(pod.Spec.NodeSelector, req) && !everyTermHas(pod, req) {
+			return true
+		}
+	}
+	return false
+}
+
+// selectorRequires reports whether nodeSelector only matches nodes that meet
+// req.
+func selectorRequires(nodeSelector map[string]string, req corev1.NodeSelectorRequirement) bool {
+	value, ok := nodeSelector[req.Key]
+	switch req.Operator {
+	case corev1.NodeSelectorOpIn:
+		return ok && slices.Contains(req.Values, value)
+	case corev1.NodeSelectorOpNotIn:
+		return ok && !slices.Contains(req.Values, value)
+	case corev1.NodeSelectorOpExists:
+		return ok
+	}
+	return false
+}
+
+// everyTermHas reports whether every term of pod's required node affinity
+// has req. An empty term matches no node, so it doesn't count, as in
+// addRequiredNodeAffinity.
+func everyTermHas(pod *corev1.Pod, req corev1.NodeSelectorRequirement) bool {
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil ||
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return false
+	}
+	terms := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) == 0 {
+		return false
+	}
+	for _, term := range terms {
+		if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 {
+			continue
+		}
+		if !hasNodeSelectorRequirement(term.MatchExpressions, req) {
+			return false
+		}
+	}
+	return true
+}
+
+// recreatedByOwner reports whether pod's controller is a ReplicaSet or a
+// StatefulSet, which recreates the pod if it's deleted, at no cost to the
+// workload. That's what the placement deadline relies on. Another
+// controller may not recreate it the same way: a Job, for one, counts a
+// deleted pod as failed toward its backoffLimit.
+func recreatedByOwner(pod *corev1.Pod) bool {
+	ref := metav1.GetControllerOf(pod)
+	if ref == nil {
+		return false
+	}
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil || gv.Group != appsv1.GroupName {
+		return false
+	}
+	return ref.Kind == "ReplicaSet" || ref.Kind == "StatefulSet"
+}
+
 // releaseUnderWay reports whether pod's release with a restore order has
 // started: the job records the gate as released, or pod has consumed the
-// job. The release then goes ahead without a placement check. A check
-// normally passed before pod consumed the job (unless placement was turned
-// on in between), and holding a pod that consumed the job would leave a
-// concluded, consumed job with the pod still gated.
+// job. The release then goes ahead without a hold: holding a pod that
+// consumed the job would leave a concluded, consumed job with the pod still
+// gated. A pod that no ReplicaSet or StatefulSet would recreate gets the
+// constraints only if a node meets them then, since an earlier attempt may
+// have released it without them.
 func releaseUnderWay(job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) bool {
 	return job.Status.GateReleased || (job.Status.Consumed && job.Status.RestoredPodUID == string(pod.UID))
 }
@@ -137,8 +226,37 @@ func noCompatibleNode(job *pmv1alpha1.PodMigrationJob) (*metav1.Condition, bool)
 	return cond, true
 }
 
+// restorePlacementRecorded reports whether job records that its replacement
+// was released with the restore's node constraints.
+func restorePlacementRecorded(job *pmv1alpha1.PodMigrationJob) bool {
+	cond := meta.FindStatusCondition(job.Status.Conditions, ConditionRestorePlacement)
+	return cond != nil && cond.Status == metav1.ConditionTrue && cond.Reason == ReasonNodeConstraintsAdded
+}
+
+// recordRestorePlacement records on job that its replacement is released
+// with reqs in its required node affinity, and whether no node met them at
+// the release. The condition's last transition time is the release, which
+// the job reconciler's placement deadline counts from.
+func recordRestorePlacement(job *pmv1alpha1.PodMigrationJob, reqs []corev1.NodeSelectorRequirement, noNodeYet bool) {
+	message := fmt.Sprintf("Released with required node affinity %s", describeRequirements(reqs))
+	if noNodeYet {
+		message += "; no node met it at the release"
+	}
+	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+		Type:               ConditionRestorePlacement,
+		Status:             metav1.ConditionTrue,
+		Reason:             ReasonNodeConstraintsAdded,
+		Message:            message,
+		ObservedGeneration: job.Generation,
+	})
+}
+
 // holdForNoCompatibleNode records on job that no node can restore its
-// checkpoint, and leaves pod gated. The job reconciler then concludes the job
+// checkpoint, and leaves pod gated. It's only for a pod that no ReplicaSet
+// or StatefulSet would recreate (recreatedByOwner): one released with the
+// constraints and stuck couldn't be recreated without them. And only when a
+// node can take the pod without them: otherwise starting it cold wouldn't
+// get it running sooner. The job reconciler then concludes the job
 // SucceededWithoutRestore with reason NoCompatibleNode, and the gate is
 // released with the cold-start bypass and without the constraints. The job
 // concludes before the pod starts, so a pod that started cold is never
@@ -250,15 +368,59 @@ func hasNodeSelectorRequirement(reqs []corev1.NodeSelectorRequirement, req corev
 	return false
 }
 
+// withoutRequirements returns a copy of pod with reqs taken out of its
+// required node affinity: the pod as its owner recreates it, without the
+// constraints that addRequiredNodeAffinity added. A term left with nothing
+// held only reqs, the term added to a pod without terms, so it's dropped,
+// and a pod left without terms has no required node affinity. An empty term
+// that the pod had is kept: addRequiredNodeAffinity leaves those alone. A
+// requirement that one of the pod's own terms already had is taken out too;
+// restorePlacement adds none when every term has them, so that only matters
+// for a pod whose terms differ in it.
+func withoutRequirements(pod *corev1.Pod, reqs []corev1.NodeSelectorRequirement) *corev1.Pod {
+	stripped := pod.DeepCopy()
+	if stripped.Spec.Affinity == nil || stripped.Spec.Affinity.NodeAffinity == nil ||
+		stripped.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return stripped
+	}
+	required := stripped.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	var terms []corev1.NodeSelectorTerm
+	for _, term := range required.NodeSelectorTerms {
+		if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 {
+			terms = append(terms, term)
+			continue
+		}
+		var kept []corev1.NodeSelectorRequirement
+		for _, expr := range term.MatchExpressions {
+			if !hasNodeSelectorRequirement(reqs, expr) {
+				kept = append(kept, expr)
+			}
+		}
+		if len(kept) == 0 && len(term.MatchFields) == 0 {
+			continue
+		}
+		term.MatchExpressions = kept
+		terms = append(terms, term)
+	}
+	if len(terms) == 0 {
+		stripped.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
+		return stripped
+	}
+	required.NodeSelectorTerms = terms
+	return stripped
+}
+
 // someNodeFits reports whether some node could run pod once reqs are added
 // to its required node affinity. It checks the nodes in the cache with a
-// subset of the scheduler's filters: the node is Ready and not being
-// deleted, isn't cordoned (unless the pod tolerates that), matches the pod's
-// node selector and required node affinity with reqs added, and has no
-// NoSchedule or NoExecute taint that the pod doesn't tolerate. It doesn't
-// check resources, the node affinity of bound volumes, host ports, or pod
-// affinity and topology spread, so a node that passes may still not take
-// the pod. The nodes are narrowed to those whose labels meet reqs.
+// subset of the scheduler's filters: the node isn't being deleted, isn't
+// cordoned (unless the pod tolerates that), matches the pod's node selector
+// and required node affinity with reqs added, and has no NoSchedule or
+// NoExecute taint that the pod doesn't tolerate. It also requires the node to
+// be Ready, which is stricter than the scheduler, which leaves that to the
+// not-ready taints; it errs toward "no node". It doesn't check resources,
+// the node affinity of bound volumes, host ports, pod affinity and topology
+// spread, or other scheduling gates, so a node that passes may still not
+// take the pod. The nodes are narrowed to those whose labels meet reqs.
 func (r *PodGateReconciler) someNodeFits(ctx context.Context, pod *corev1.Pod, reqs []corev1.NodeSelectorRequirement) (bool, error) {
 	placed := pod.DeepCopy()
 	addRequiredNodeAffinity(placed, reqs)
