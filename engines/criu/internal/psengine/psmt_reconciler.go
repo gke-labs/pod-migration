@@ -196,6 +196,15 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, r.setSnapshotTerminal(ctx, req.Namespace, snapshotName, contract.ReasonFailed,
 			fmt.Sprintf("resolving storage: %v", storageErr))
 	}
+	if b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket"); b == "" {
+		// An earlier pass withheld the bucket (refused, or no storage then)
+		// and failed to record that outcome. Node agents ignore a work order
+		// without a bucket, so it would sit Pending until the job's deadline.
+		// Fail it, as before agents ignored such orders, rather than fill in
+		// the work order under an agent that may be watching it.
+		return ctrl.Result{}, r.setSnapshotTerminal(ctx, req.Namespace, snapshotName, contract.ReasonFailed,
+			"the work order was created without storage on an earlier pass that couldn't record why; it can't be handed to the node agent")
+	}
 
 	if r.Checkpointer != nil {
 		// Direct-call mode (tests / future fast path).
@@ -306,8 +315,9 @@ func (r *PSMTReconciler) patchSnapshotConditions(ctx context.Context, namespace,
 		return err
 	}
 	// Never regress a snapshot the node agent already progressed: Ready
-	// (upload verified) and terminal reasons outrank the controller half.
-	if contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) {
+	// (upload verified), terminal reasons and a timed-out checkpoint outrank
+	// the controller half.
+	if hasOutcome(ps) {
 		return nil
 	}
 	for _, c := range conds {
@@ -344,7 +354,7 @@ func (r *PSMTReconciler) cancelWorkOrders(ctx context.Context, trigger types.Nam
 	}
 	for i := range list.Items {
 		ps := &list.Items[i]
-		if snapshotTrigger(ps) != trigger.Name || contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) || cancelRequested(ps) {
+		if snapshotTrigger(ps) != trigger.Name || hasOutcome(ps) || cancelRequested(ps) {
 			continue
 		}
 		log.FromContext(ctx).Info("trigger deleted; asking the node agent to cancel its work order", "snapshot", ps.GetName())
@@ -367,7 +377,7 @@ func podSnapshotToTrigger(_ context.Context, obj client.Object) []reconcile.Requ
 		return nil
 	}
 	trigger := snapshotTrigger(ps)
-	if trigger == "" || contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) || cancelRequested(ps) {
+	if trigger == "" || hasOutcome(ps) || cancelRequested(ps) {
 		return nil
 	}
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: ps.GetNamespace(), Name: trigger}}}

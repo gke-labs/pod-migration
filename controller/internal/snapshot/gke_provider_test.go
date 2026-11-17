@@ -309,6 +309,38 @@ func TestGKEProvider_CheckStatus(t *testing.T) {
 		}
 	})
 
+	// A CRIU checkpoint that timed out (#106) is not a failure the job can
+	// act on: the source may be frozen, so it must stay in progress until the
+	// job's own deadline, then the fence settle wait keeps the source fenced.
+	t.Run("CRIUCheckpointTimedOut_StaysInProgress", func(t *testing.T) {
+		trigger := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "podsnapshot.gke.io/v1",
+			"kind":       "PodSnapshotManualTrigger",
+			"metadata":   map[string]interface{}{"name": triggerName, "namespace": "default"},
+			"status":     map[string]interface{}{"snapshotCreated": map[string]interface{}{"name": snapshotName}},
+		}}
+		snapshot := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "podsnapshot.gke.io/v1",
+			"kind":       "PodSnapshot",
+			"metadata":   map[string]interface{}{"name": snapshotName, "namespace": "default"},
+			"status": map[string]interface{}{"conditions": []interface{}{
+				map[string]interface{}{"type": "Checkpoint", "status": "Unknown", "reason": "CheckpointTimedOut", "lastTransitionTime": "2026-11-17T00:00:00Z"},
+			}},
+		}}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(trigger, snapshot).Build()
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
+			Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "pod-uid-456"},
+		}
+		status, err := NewGKEProvider(client, scheme).CheckStatus(context.Background(), job, "test-pod")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status.Phase != PhaseInProgress {
+			t.Errorf("expected PhaseInProgress, got %v (%s)", status.Phase, status.Message)
+		}
+	})
+
 	t.Run("SnapshotInProgress_PopulatesSnapshotRef", func(t *testing.T) {
 		trigger := &unstructured.Unstructured{
 			Object: map[string]interface{}{
@@ -1036,6 +1068,7 @@ func TestIsTerminalSnapshotFailureReason(t *testing.T) {
 		{reason: "refused", want: true},
 		{reason: "Cancelled", want: true},
 		{reason: "CancelRequested", want: false},
+		{reason: "CheckpointTimedOut", want: false},
 		{reason: "", want: false},
 		{reason: "NoError", want: false},
 		{reason: "NotReady", want: false},

@@ -87,9 +87,12 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      orchestrator's 30 s settle wait, the orchestrator keeps the source fenced
      and cold-evicts it. The agent waits up to 150 s for the kubelet
      checkpoint call, past the kubelet's default 2 min CRI deadline. A call
-     that still times out is reported `Failed`, not `Cancelled`, because the
-     dump may still be running, and past the CRI deadline containerd can leave
-     the source frozen until it is resumed by hand. The agent never overwrites
+     that still times out is recorded as `Checkpoint=Unknown` with the reason
+     `CheckpointTimedOut`, never `Failed` or `Cancelled`, because the dump may
+     still be running, and past the CRI deadline containerd can leave the
+     source frozen until it is resumed by hand. The snapshot then never
+     settles, so the orchestrator keeps the source fenced and cold-evicts it
+     instead of unfencing it. The agent never overwrites
      an outcome already recorded on the `PodSnapshot`. The engine controller
      labels each `PodSnapshot` `gke-pod-snapshot-triggered-by: <trigger>` (when
      the trigger name fits in a label value), so the orchestrator finds

@@ -138,6 +138,10 @@ func TestGKEProviderCheckpointState(t *testing.T) {
 			objects: []client.Object{checkpointTestSnapshot("snap", true, [3]string{"Checkpoint", "Unknown", "Pending"})},
 			want:    CheckpointState{Settled: false},
 		},
+		"a CRIU checkpoint that timed out never settles, so the source stays fenced (#106)": {
+			objects: []client.Object{checkpointTestSnapshot("snap", true, [3]string{"Checkpoint", "Unknown", "CheckpointTimedOut"})},
+			want:    CheckpointState{Settled: false},
+		},
 		"a Ready snapshot": {
 			objects: []client.Object{checkpointTestSnapshot("snap", true, checkpointed, ready)},
 			want:    CheckpointState{Settled: true, Completed: true},

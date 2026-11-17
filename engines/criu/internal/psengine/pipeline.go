@@ -36,9 +36,12 @@ package psengine
 // does containerd resume the container (#106). Waiting for the call keeps
 // Cancelled honest (the source is running again when it's written), keeps
 // the per-node single-flight covering the dump, and lets the agent delete the
-// tar it was handed. A call that times out anyway is reported Failed, never
-// Cancelled: the dump may still be running, and past the kubelet's CRI
-// deadline the source can stay frozen until resumed by hand.
+// tar it was handed. A call that times out anyway is recorded as
+// Checkpoint=Unknown/CheckpointTimedOut, never Cancelled or Failed: the dump
+// may still be running, and past the kubelet's CRI deadline the source can
+// stay frozen until resumed by hand. A terminal outcome would let the
+// orchestrator unfence that source; one that never settles keeps it fenced
+// and cold-evicts it.
 
 import (
 	"context"
@@ -150,9 +153,11 @@ type NodeSnapshotReconciler struct {
 
 const defaultCancelPollInterval = 2 * time.Second
 
-// The live check before the source stop retries for about 3.5 s (waits of
-// 0.5, 1 and 2 s between four attempts), each attempt bounded by
-// preStopCheckTimeout, before it fails closed. A brief API server blip then
+// The live check before the source stop makes four attempts with waits of
+// 0.5, 1 and 2 s between them (3.5 s), each attempt bounded by
+// preStopCheckTimeout, before it fails closed: about 11.5 s in the worst
+// case, when every attempt hangs to its deadline. That stays inside the
+// orchestrator's 30 s checkpoint-settle wait. A brief API server blip then
 // doesn't turn a durable archive into Failed, and one hung request can't use
 // up the budget. Variables so tests can shrink the waits.
 var (
@@ -167,6 +172,9 @@ var errCancelled = errors.New("cancelled: the trigger was deleted")
 // errFinished marks a pipeline that stopped because its PodSnapshot already
 // has an outcome; there is nothing to write.
 var errFinished = errors.New("the PodSnapshot already has an outcome")
+
+// errCheckpointTimedOut marks a kubelet checkpoint call that timed out.
+var errCheckpointTimedOut = errors.New("kubelet checkpoint timed out")
 
 // errStopCommitted ends the cancel poller once the pipeline commits to the
 // source stop.
@@ -218,7 +226,7 @@ func cancelCheck(ctx context.Context, rd client.Reader, key types.NamespacedName
 	if ps.GetDeletionTimestamp() != nil {
 		return workOrderCancelled, "the PodSnapshot is being deleted", nil
 	}
-	if contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) {
+	if hasOutcome(ps) {
 		return workOrderFinished, "the PodSnapshot already has an outcome", nil
 	}
 	if cancelRequested(ps) {
@@ -266,7 +274,7 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if ps.GetLabels()[contract.LabelEngine] != contract.EngineCRIU {
 		return ctrl.Result{}, nil
 	}
-	if contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) {
+	if hasOutcome(ps) {
 		return ctrl.Result{}, nil
 	}
 	if b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket"); b == "" {
@@ -315,6 +323,10 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			logger.Info("the PodSnapshot got an outcome elsewhere; source container not stopped", "detail", err.Error())
 			return ctrl.Result{}, nil
 		}
+		if errors.Is(err, errCheckpointTimedOut) {
+			logger.Error(err, "kubelet checkpoint timed out; the source may be frozen")
+			return ctrl.Result{}, r.finish(ctx, req, contract.ReasonCheckpointTimedOut, truncateMsg(err.Error(), 1500))
+		}
 		if errors.Is(err, errCancelled) {
 			logger.Info("checkpoint pipeline cancelled; source container left running", "detail", err.Error())
 			return ctrl.Result{}, r.finish(ctx, req, contract.ReasonCancelled, truncateMsg(err.Error(), 1500))
@@ -362,7 +374,7 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	if isTimeout(err) {
 		// Checked before a cancel: Cancelled says the source runs again, and
 		// after a timeout the agent doesn't know that.
-		return fmt.Errorf("kubelet checkpoint timed out; the dump may still be running, and past the kubelet's CRI deadline the source can stay frozen until it is resumed by hand (#106); source container not stopped: %w", err)
+		return fmt.Errorf("%w; the dump may still be running, and past the kubelet's CRI deadline the source can stay frozen until it is resumed by hand (#106); source container not stopped: %w", errCheckpointTimedOut, err)
 	}
 	if c := cancelledAt("during the checkpoint"); c != nil {
 		return c
@@ -498,11 +510,18 @@ func (r *NodeSnapshotReconciler) pollForCancel(ctx context.Context, cancel conte
 // outcome would re-run the pipeline on the requeue. Like
 // patchSnapshotConditions, it never overwrites an outcome already recorded:
 // a Cancelled or Failed written over Ready would misreport a source that was
-// already stopped.
+// already stopped. CheckpointTimedOut is written as Checkpoint=Unknown only,
+// so the orchestrator never sees it settle.
 func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, reason, msg string) error {
-	status := metav1.ConditionFalse
-	if reason == contract.ReasonSucceeded {
-		status = metav1.ConditionTrue
+	conds := []metav1.Condition{
+		{Type: contract.CondCheckpoint, Status: metav1.ConditionFalse, Reason: reason, Message: msg},
+		{Type: contract.CondReady, Status: metav1.ConditionFalse, Reason: reason, Message: msg},
+	}
+	switch reason {
+	case contract.ReasonSucceeded:
+		conds[0].Status, conds[1].Status = metav1.ConditionTrue, metav1.ConditionTrue
+	case contract.ReasonCheckpointTimedOut:
+		conds[0].Status, conds = metav1.ConditionUnknown, conds[:1]
 	}
 	wrote := false
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -517,13 +536,10 @@ func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, r
 				return client.IgnoreNotFound(err)
 			}
 		}
-		if contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) {
+		if hasOutcome(ps) {
 			return nil
 		}
-		for _, c := range []metav1.Condition{
-			{Type: contract.CondCheckpoint, Status: status, Reason: reason, Message: msg},
-			{Type: contract.CondReady, Status: status, Reason: reason, Message: msg},
-		} {
+		for _, c := range conds {
 			if err := contract.SetCondition(ps, c); err != nil {
 				return err
 			}
@@ -545,6 +561,24 @@ func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, r
 func isTimeout(err error) bool {
 	var te interface{ Timeout() bool }
 	return errors.As(err, &te) && te.Timeout()
+}
+
+// checkpointTimedOut: the node agent recorded a timed-out kubelet checkpoint.
+func checkpointTimedOut(ps *unstructured.Unstructured) bool {
+	for _, c := range contract.Conditions(ps) {
+		if c.Type == contract.CondCheckpoint && c.Reason == contract.ReasonCheckpointTimedOut {
+			return true
+		}
+	}
+	return false
+}
+
+// hasOutcome: nothing more will happen to the snapshot. It is Ready, failed
+// terminally, or its checkpoint timed out; the last isn't terminal for the
+// orchestrator (see ReasonCheckpointTimedOut), but it is the engine's last
+// word, so neither half of the engine writes over it or works it again.
+func hasOutcome(ps *unstructured.Unstructured) bool {
+	return contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) || checkpointTimedOut(ps)
 }
 
 func hasTerminalCheckpoint(ps *unstructured.Unstructured) bool {

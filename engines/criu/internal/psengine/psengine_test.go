@@ -32,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
@@ -86,6 +87,11 @@ func enginePSP(name, ns, scName string) *unstructured.Unstructured {
 
 func newClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
+	return newClientWithInterceptor(t, interceptor.Funcs{}, objs...)
+}
+
+func newClientWithInterceptor(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) client.Client {
+	t.Helper()
 	pmj := contract.New(contract.GVKPodMigrationJob)
 	pmj.SetNamespace("default")
 	pmj.SetName("test-pmj")
@@ -99,6 +105,7 @@ func newClient(t *testing.T, objs ...client.Object) client.Client {
 		WithScheme(testScheme(t)).
 		WithObjects(objs...).
 		WithStatusSubresource(contract.New(contract.GVKPolicy), contract.New(contract.GVKManualTrigger), contract.New(contract.GVKPodSnapshot)).
+		WithInterceptorFuncs(funcs).
 		Build()
 }
 

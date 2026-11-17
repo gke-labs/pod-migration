@@ -451,12 +451,14 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 
 // snapshotTriggeredByLabel is the label GKE Pod Snapshots puts on every
 // PodSnapshot it creates for a manual trigger. Its value is the trigger's name.
+// The CRIU engine's controller sets it too, when the trigger's name fits in a
+// label value (#106).
 const snapshotTriggeredByLabel = "gke-pod-snapshot-triggered-by"
 
 // CheckpointState reports whether the job's checkpoint of the source has
 // settled and whether it completed (#131). It finds the job's PodSnapshots by
 // the trigger's status, the snapshot recorded on the job, and the label the
-// agent puts on every snapshot it creates for the trigger, so it still finds
+// engine puts on every snapshot it creates for the trigger, so it still finds
 // them after Cleanup deleted the trigger.
 //
 // A trigger that still exists can start a checkpoint, and a snapshot that's

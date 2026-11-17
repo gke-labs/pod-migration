@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
@@ -810,17 +811,120 @@ func (timeoutErr) Error() string { return "kubelet checkpoint: deadline exceeded
 func (timeoutErr) Timeout() bool { return true }
 
 // A checkpoint call that timed out may have left the dump running with the
-// source frozen (#106). A pending cancel must not be confirmed as Cancelled,
-// which says the source runs again; the outcome is Failed, saying so.
-func TestCheckpointTimeoutIsNotReportedCancelled(t *testing.T) {
-	c := cancelFixture(t)
-	ops := &fakeNodeOps{t: t, checkpointErr: fmt.Errorf("wrapped: %w", timeoutErr{}), afterCheckpoint: func() { deleteTrigger(t, c, true) }}
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Hour})
-	if len(ops.stopped) != 0 {
-		t.Fatalf("source stopped after a timed-out checkpoint: %v", ops.events)
+// source frozen (#106). The agent records Checkpoint=Unknown with the reason
+// CheckpointTimedOut, which is not terminal: a terminal Failed would let the
+// orchestrator's checkpoint-settle wait unfence a source that may be frozen,
+// while a snapshot that never settles keeps the fence and cold-evicts it. A
+// pending cancel isn't confirmed as Cancelled either.
+func TestCheckpointTimeoutLeavesSnapshotUnsettled(t *testing.T) {
+	for name, cancelPending := range map[string]bool{"no cancel": false, "cancel pending": true} {
+		t.Run(name, func(t *testing.T) {
+			c := cancelFixture(t)
+			ops := &fakeNodeOps{t: t, checkpointErr: fmt.Errorf("wrapped: %w", timeoutErr{})}
+			if cancelPending {
+				ops.afterCheckpoint = func() { deleteTrigger(t, c, true) }
+			}
+			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Hour})
+			if len(ops.stopped) != 0 {
+				t.Fatalf("source stopped after a timed-out checkpoint: %v", ops.events)
+			}
+			requireTimedOut(t, c)
+
+			// Nothing works the snapshot again: not the agent ...
+			again := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: again, Store: newMemStore()})
+			if len(again.events) != 0 {
+				t.Fatalf("a timed-out snapshot was worked again: %v", again.events)
+			}
+			// ... nor the controller half, re-reconciling a live trigger
+			// (Pending) or a deleted one (CancelRequested).
+			if !cancelPending {
+				reconcilePSMT(t, c, nil, cancelTrigger)
+				requireTimedOut(t, c)
+				deleteTrigger(t, c, true)
+			}
+			requireTimedOut(t, c)
+			if reqs := podSnapshotToTrigger(context.Background(), getSnapshot(t, c, cancelSnapshot)); len(reqs) != 0 {
+				t.Fatalf("a timed-out snapshot must not enqueue its trigger: %v", reqs)
+			}
+		})
 	}
-	cond := condition(getSnapshot(t, c, cancelSnapshot), contract.CondCheckpoint)
-	if cond == nil || cond.Reason != contract.ReasonFailed || !strings.Contains(cond.Message, "frozen") {
-		t.Fatalf("want Failed saying the source may be frozen, got %+v", cond)
+}
+
+func requireTimedOut(t *testing.T, c client.Client) {
+	t.Helper()
+	ps := getSnapshot(t, c, cancelSnapshot)
+	if contract.IsSnapshotReady(ps) || hasTerminalCheckpoint(ps) {
+		t.Fatalf("a timed-out checkpoint must not be terminal: %+v", contract.Conditions(ps))
+	}
+	cond := condition(ps, contract.CondCheckpoint)
+	if cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != contract.ReasonCheckpointTimedOut || !strings.Contains(cond.Message, "frozen") {
+		t.Fatalf("want Checkpoint=Unknown/%s saying the source may be frozen, got %+v", contract.ReasonCheckpointTimedOut, cond)
+	}
+	if ready := condition(ps, contract.CondReady); ready != nil {
+		t.Fatalf("a timed-out checkpoint must not set Ready: %+v", ready)
+	}
+}
+
+// A first pass that withholds the bucket (no storage yet, or the node can't
+// be read) and then fails to record that outcome leaves a bucketless
+// PodSnapshot behind. If the retry finds the trigger eligible, the work order
+// can't be handed to an agent (agents ignore bucketless orders), so it must
+// end Failed, as main did, rather than wait as Pending until the job's
+// deadline.
+func TestPSMTRetryFailsBucketlessWorkOrder(t *testing.T) {
+	cases := map[string]struct {
+		missing client.Object // absent on the first pass, present on the retry
+	}{
+		"storage unavailable on the first pass": {missing: pssc("pssc-x", "bkt", "snaps")},
+		"node unreadable on the first pass":     {missing: criuNode("node-a", true)},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			objs := []client.Object{
+				pssc("pssc-x", "bkt", "snaps"),
+				readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+				sourcePod("web-0", 1, "node-a"),
+				criuNode("node-a", true),
+				psmtFor("web-0"),
+			}
+			var first []client.Object
+			for _, o := range objs {
+				if o.GetName() != tc.missing.GetName() || o.GetObjectKind().GroupVersionKind().Kind != tc.missing.GetObjectKind().GroupVersionKind().Kind {
+					first = append(first, o)
+				}
+			}
+			failOnce := true
+			c := newClientWithInterceptor(t, interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == contract.GVKPodSnapshot.Kind && failOnce {
+						failOnce = false
+						return errors.New("apiserver unavailable")
+					}
+					return cl.SubResource(sub).Update(ctx, obj, opts...)
+				},
+			}, first...)
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: cancelTrigger}}
+			if _, err := (&PSMTReconciler{Client: c}).Reconcile(context.Background(), req); err == nil {
+				t.Fatal("test setup: the first pass should fail to record its outcome")
+			}
+			if b, _, _ := unstructured.NestedString(getSnapshot(t, c, cancelSnapshot).Object, "spec", "bucket"); b != "" {
+				t.Fatalf("test setup: the first pass should withhold the bucket, got %q", b)
+			}
+			if err := c.Create(context.Background(), tc.missing); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (&PSMTReconciler{Client: c}).Reconcile(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			ps := getSnapshot(t, c, cancelSnapshot)
+			cond := condition(ps, contract.CondCheckpoint)
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != contract.ReasonFailed {
+				t.Fatalf("want Checkpoint=False/Failed, got %+v", cond)
+			}
+			if b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket"); b != "" {
+				t.Fatalf("the work order must not be changed after creation, got bucket %q", b)
+			}
+		})
 	}
 }

@@ -87,6 +87,15 @@ const (
 	// written only once the agent's work has stopped. The orchestrator
 	// treats it like Failed.
 	ReasonCancelled = "Cancelled"
+	// ReasonCheckpointTimedOut (on Checkpoint=Unknown) = the kubelet
+	// checkpoint call timed out, so the dump may still be running and the
+	// source may be frozen, past the kubelet's CRI deadline until resumed by
+	// hand (#106). Deliberately not terminal, and the node agent's last word
+	// on the snapshot: the orchestrator never sees it settle, so it keeps the
+	// source fenced and cold-evicts it rather than unfencing a source that
+	// may be frozen. Must not be "DeadlineExceeded", which the orchestrator
+	// treats as a terminal failure.
+	ReasonCheckpointTimedOut = "CheckpointTimedOut"
 
 	// AnnotationRestoreStatus is engine-internal: the node agent stamps it on
 	// the replacement pod so the holder wrapper — which only sees the
