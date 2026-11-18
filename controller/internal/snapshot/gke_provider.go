@@ -298,19 +298,19 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		if !ok {
 			continue
 		}
+		cType, _ := cond["type"].(string)
+		cStatus, _ := cond["status"].(string)
+		cReason, _ := cond["reason"].(string)
+
 		var condTransitionTime time.Time
 		if lttStr, ok := cond["lastTransitionTime"].(string); ok {
 			if t, err := time.Parse(time.RFC3339Nano, lttStr); err == nil {
 				condTransitionTime = t
-				if t.After(lastProgress) {
+				if t.After(lastProgress) && !isSnapshotStalledReason(cType, cReason) {
 					lastProgress = t
 				}
 			}
 		}
-
-		cType, _ := cond["type"].(string)
-		cStatus, _ := cond["status"].(string)
-		cReason, _ := cond["reason"].(string)
 
 		switch cType {
 		case "Checkpoint", "StorageReplicated":
@@ -592,6 +592,14 @@ func isTerminalSnapshotFailureReason(reason string) bool {
 		return true
 	}
 	return false
+}
+
+// isSnapshotStalledReason: a CRIU engine condition that isn't progress, so
+// its lastTransitionTime mustn't extend the job's deadline (#106). A
+// checkpoint that timed out won't move again, and a cancel waits for the node
+// agent to confirm it.
+func isSnapshotStalledReason(cType, reason string) bool {
+	return cType == "Checkpoint" && (reason == "CheckpointTimedOut" || reason == "CancelRequested")
 }
 
 func isSnapshotRefusedReason(reason string) bool {

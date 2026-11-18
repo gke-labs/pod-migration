@@ -312,6 +312,47 @@ func TestGKEProvider_CheckStatus(t *testing.T) {
 	// A CRIU checkpoint that timed out (#106) is not a failure the job can
 	// act on: the source may be frozen, so it must stay in progress until the
 	// job's own deadline, then the fence settle wait keeps the source fenced.
+	// A CRIU checkpoint that timed out, or a cancel the agent hasn't
+	// confirmed, isn't progress (#106). If its condition is the newest one
+	// (the engine controller's Pending never landed), counting its
+	// lastTransitionTime as progress would let isSnapshotProgressing keep the
+	// job in Snapshotting past its deadline, where I4 flags it.
+	for _, reason := range []string{"CheckpointTimedOut", "CancelRequested"} {
+		t.Run("CRIU"+reason+"_IsNotProgress", func(t *testing.T) {
+			created := time.Now().Add(-20 * time.Minute).UTC().Truncate(time.Second)
+			recent := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339)
+			trigger := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshotManualTrigger",
+				"metadata":   map[string]interface{}{"name": triggerName, "namespace": "default"},
+				"status":     map[string]interface{}{"snapshotCreated": map[string]interface{}{"name": snapshotName}},
+			}}
+			snapshot := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshot",
+				"metadata":   map[string]interface{}{"name": snapshotName, "namespace": "default", "creationTimestamp": created.Format(time.RFC3339)},
+				"status": map[string]interface{}{"conditions": []interface{}{
+					map[string]interface{}{"type": "Checkpoint", "status": "Unknown", "reason": reason, "lastTransitionTime": recent},
+				}},
+			}}
+			client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(trigger, snapshot).Build()
+			job := &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
+				Spec:       pmv1alpha1.PodMigrationJobSpec{TargetPodUID: "pod-uid-456"},
+			}
+			status, err := NewGKEProvider(client, scheme).CheckStatus(context.Background(), job, "test-pod")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if status.Phase != PhaseInProgress {
+				t.Fatalf("expected PhaseInProgress, got %v", status.Phase)
+			}
+			if time.Since(status.LastProgressTime) < 15*time.Minute {
+				t.Errorf("LastProgressTime = %v: the %s condition was counted as progress", status.LastProgressTime, reason)
+			}
+		})
+	}
+
 	t.Run("CRIUCheckpointTimedOut_StaysInProgress", func(t *testing.T) {
 		trigger := &unstructured.Unstructured{Object: map[string]interface{}{
 			"apiVersion": "podsnapshot.gke.io/v1",
