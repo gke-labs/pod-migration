@@ -74,10 +74,29 @@ type ReconcileSnapshot struct {
 	// Checkpoint / StorageReplicated / Ready sub-conditions without extra API calls.
 	PrimarySnapshotConditions []metav1.Condition
 
+	// SnapshotProgress maps "<namespace>/<pmj-name>" to the latest in-memory
+	// checkpoint progress observed for active Snapshotting PodMigrationJobs
+	// without issuing extra API server requests.
+	SnapshotProgress map[string]SnapshotProgress `json:"SnapshotProgress,omitempty"`
+
 	// RestoreOrders optionally inspects a pod's engine-specific restore order or
 	// cold-start bypass without mutating the pod (C5). When nil, invariants fall
 	// back to the GKE Pod Snapshots podsnapshot.gke.io/ps-name annotation.
 	RestoreOrders RestoreOrderFunc `json:"-"`
+}
+
+// SnapshotProgress captures the point-in-time checkpoint progress observed for an
+// active Snapshotting PodMigrationJob without issuing additional API requests.
+type SnapshotProgress struct {
+	// Ready is true when the snapshot provider reports the checkpoint is ready
+	// to advance to Evicting.
+	Ready bool `json:"Ready,omitempty"`
+	// Failed is true when the snapshot provider reports a terminal snapshot failure
+	// or refusal (PhaseFailed / PhaseRefused).
+	Failed bool `json:"Failed,omitempty"`
+	// LastProgressTime is the most recent timestamp at which the snapshot made
+	// forward progress.
+	LastProgressTime time.Time `json:"LastProgressTime,omitempty"`
 }
 
 // RestoreOrderFunc inspects a replacement pod for the restore order of

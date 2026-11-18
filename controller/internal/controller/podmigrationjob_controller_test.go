@@ -8685,3 +8685,328 @@ func TestPodMigrationJobReconciler_EvaluateInvariants_PopulatesListFailedAndPodS
 			capture.captured.PodListFailed, capture.captured.PMJListFailed)
 	}
 }
+
+func TestPodMigrationJobReconciler_Snapshotting_Progressing_StrictMode_I4(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	const (
+		namespace = "default"
+		podName   = "long-snap-pod"
+		podUID    = "uid-long-snap"
+		jobName   = "pmj-" + podName
+		snapName  = "snap-long-progressing"
+	)
+
+	now := time.Now()
+	started15mAgo := metav1.NewTime(now.Add(-15 * time.Minute))
+	created16mAgo := metav1.NewTime(now.Add(-16 * time.Minute))
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       podUID,
+			Labels:    map[string]string{util.LabelFenced: "true"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionFalse,
+					Reason: util.ReasonPodMigrationFenced,
+				},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              jobName,
+			UID:               "pmj-uid-long",
+			CreationTimestamp: created16mAgo,
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: podUID,
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:                 pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+			SnapshotRef:           snapName,
+			SnapshottingStartTime: &started15mAgo,
+			Conditions: []metav1.Condition{
+				{
+					Type:               util.ConditionSourceFenced,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Fenced",
+					LastTransitionTime: started15mAgo,
+				},
+			},
+		},
+	}
+
+	t.Run("positive_provider_progress_tolerated_in_strict_mode", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+			WithStatusSubresource(&corev1.Pod{}, &pmv1alpha1.PodMigrationJob{}).
+			WithObjects(pod.DeepCopy(), pmj.DeepCopy()).
+			Build()
+
+		recorder := record.NewFakeRecorder(16)
+		eng := invariants.NewEngine(invariants.ModeStrict, recorder)
+		r := &PodMigrationJobReconciler{
+			Client:   fakeClient,
+			Scheme:   scheme,
+			Recorder: recorder,
+			SnapshotProvider: &fakeSnapshotProvider{
+				checkStatusResult: &snapshot.Status{
+					Phase:            snapshot.PhaseInProgress,
+					SnapshotRef:      snapName,
+					Reason:           "Snapshotting",
+					Message:          "Uploading chunk 80/100",
+					LastProgressTime: now.Add(-1 * time.Minute),
+				},
+			},
+			InvariantEngine: eng,
+		}
+
+		res, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: namespace, Name: jobName},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if res.RequeueAfter != 30*time.Second {
+			t.Fatalf("expected RequeueAfter=30s while snapshot is progressing, got %+v", res)
+		}
+
+		got := &pmv1alpha1.PodMigrationJob{}
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, got); err != nil {
+			t.Fatalf("get PMJ: %v", err)
+		}
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+			t.Fatalf("expected progressing Snapshotting job to stay in Snapshotting under strict mode, got %s (conditions=%+v)",
+				got.Status.Phase, got.Status.Conditions)
+		}
+		close(recorder.Events)
+		for ev := range recorder.Events {
+			if strings.Contains(ev, invariants.EventReasonInvariantViolation) {
+				t.Fatalf("unexpected InvariantViolation event for progressing Snapshotting job: %s", ev)
+			}
+		}
+	})
+
+	t.Run("positive_namespace_peer_in_progress_via_cached_PodSnapshot_strict_mode", func(t *testing.T) {
+		peerPodName := "peer-snap-pod"
+		peerPodUID := "uid-peer-snap"
+		peerJobName := "pmj-" + peerPodName
+		peerSnapName := "ps-peer-long"
+		peerTriggerName := util.FormatPSMTName(peerPodName, peerPodUID)
+
+		peerPod := pod.DeepCopy()
+		peerPod.Name = peerPodName
+		peerPod.UID = types.UID(peerPodUID)
+
+		peerPMJ := pmj.DeepCopy()
+		peerPMJ.Name = peerJobName
+		peerPMJ.UID = "pmj-uid-peer"
+		peerPMJ.Spec.PodRef.Name = peerPodName
+		peerPMJ.Spec.TargetPodUID = peerPodUID
+		peerPMJ.Status.SnapshotRef = peerSnapName
+
+		// Primary job is younger (within 10m), while peer job in the same namespace
+		// has been Snapshotting for 25m with active PodSnapshot progress 1m ago.
+		youngStarted := metav1.NewTime(now.Add(-2 * time.Minute))
+		youngPMJ := pmj.DeepCopy()
+		youngPMJ.Status.SnapshottingStartTime = &youngStarted
+
+		peerTrigger := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshotManualTrigger",
+				"metadata": map[string]any{
+					"namespace": namespace,
+					"name":      peerTriggerName,
+				},
+				"status": map[string]any{
+					"snapshotCreated": map[string]any{"name": peerSnapName},
+				},
+			},
+		}
+		peerSnapshot := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshot",
+				"metadata": map[string]any{
+					"namespace":         namespace,
+					"name":              peerSnapName,
+					"creationTimestamp": created16mAgo.UTC().Format(time.RFC3339),
+				},
+				"status": map[string]any{
+					"conditions": []any{
+						map[string]any{
+							"type":               "Checkpoint",
+							"status":             "False",
+							"reason":             "InProgress",
+							"lastTransitionTime": now.Add(-1 * time.Minute).UTC().Format(time.RFC3339Nano),
+						},
+					},
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+			WithStatusSubresource(&corev1.Pod{}, &pmv1alpha1.PodMigrationJob{}).
+			WithObjects(pod.DeepCopy(), peerPod, youngPMJ, peerPMJ, peerTrigger, peerSnapshot).
+			Build()
+
+		recorder := record.NewFakeRecorder(16)
+		eng := invariants.NewEngine(invariants.ModeStrict, recorder)
+		r := &PodMigrationJobReconciler{
+			Client:   fakeClient,
+			Scheme:   scheme,
+			Recorder: recorder,
+			SnapshotProvider: &fakeSnapshotProvider{
+				checkStatusResult: &snapshot.Status{
+					Phase:            snapshot.PhaseInProgress,
+					SnapshotRef:      snapName,
+					Reason:           "Snapshotting",
+					Message:          "Still running",
+					LastProgressTime: now.Add(-30 * time.Second),
+				},
+			},
+			InvariantEngine: eng,
+		}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: namespace, Name: youngPMJ.Name},
+		}); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+
+		got := &pmv1alpha1.PodMigrationJob{}
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: youngPMJ.Name}, got); err != nil {
+			t.Fatalf("get primary PMJ: %v", err)
+		}
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+			t.Fatalf("expected primary PMJ not to be failed in strict mode due to progressing peer PMJ, got %s (conditions=%+v)",
+				got.Status.Phase, got.Status.Conditions)
+		}
+	})
+
+	t.Run("negative_stalled_snapshot_triggers_I4_strict_abort", func(t *testing.T) {
+		stalledPMJ := pmj.DeepCopy()
+		stalledSnap := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "podsnapshot.gke.io/v1",
+				"kind":       "PodSnapshot",
+				"metadata": map[string]any{
+					"namespace":         namespace,
+					"name":              snapName,
+					"creationTimestamp": created16mAgo.UTC().Format(time.RFC3339),
+				},
+				"status": map[string]any{
+					"conditions": []any{
+						map[string]any{
+							"type":               "Checkpoint",
+							"status":             "False",
+							"reason":             "InProgress",
+							"lastTransitionTime": now.Add(-12 * time.Minute).UTC().Format(time.RFC3339Nano),
+						},
+					},
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+			WithStatusSubresource(&corev1.Pod{}, &pmv1alpha1.PodMigrationJob{}).
+			WithObjects(pod.DeepCopy(), stalledPMJ, stalledSnap).
+			Build()
+
+		recorder := record.NewFakeRecorder(16)
+		eng := invariants.NewEngine(invariants.ModeStrict, recorder)
+		r := &PodMigrationJobReconciler{
+			Client:          fakeClient,
+			Scheme:          scheme,
+			Recorder:        recorder,
+			InvariantEngine: eng,
+		}
+
+		var recErr error
+		res := ctrl.Result{RequeueAfter: 30 * time.Second}
+		r.evaluateInvariantsWithSnapshot(context.Background(), stalledPMJ, &snapshot.Status{
+			Phase:            snapshot.PhaseInProgress,
+			SnapshotRef:      snapName,
+			LastProgressTime: now.Add(-12 * time.Minute),
+		}, &res, &recErr)
+
+		if res.Requeue || res.RequeueAfter != 0 {
+			t.Fatalf("expected strict abort to suppress requeue, got %+v", res)
+		}
+		got := &pmv1alpha1.PodMigrationJob{}
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, got); err != nil {
+			t.Fatalf("get stalled PMJ: %v", err)
+		}
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+			t.Fatalf("expected stalled Snapshotting PMJ to fail in strict mode, got %s", got.Status.Phase)
+		}
+		readyCond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+		if readyCond == nil || readyCond.Reason != invariants.EventReasonInvariantViolation || !strings.Contains(readyCond.Message, "[I4:TerminalProgress]") {
+			t.Fatalf("expected Ready condition with I4 InvariantViolation, got %+v", readyCond)
+		}
+	})
+
+	t.Run("negative_exceeded_MaxMigrationTimeout_cap_triggers_I4_strict_abort", func(t *testing.T) {
+		overCapStart := metav1.NewTime(now.Add(-(util.MaxMigrationTimeout + 2*time.Minute)))
+		overCapPMJ := pmj.DeepCopy()
+		overCapPMJ.ObjectMeta.CreationTimestamp = metav1.NewTime(now.Add(-(util.MaxMigrationTimeout + 5*time.Minute)))
+		overCapPMJ.Status.SnapshottingStartTime = &overCapStart
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJSnapshotRefIndex, PMJSnapshotRefIndexValue).
+			WithStatusSubresource(&corev1.Pod{}, &pmv1alpha1.PodMigrationJob{}).
+			WithObjects(pod.DeepCopy(), overCapPMJ).
+			Build()
+
+		recorder := record.NewFakeRecorder(16)
+		eng := invariants.NewEngine(invariants.ModeStrict, recorder)
+		r := &PodMigrationJobReconciler{
+			Client:          fakeClient,
+			Scheme:          scheme,
+			Recorder:        recorder,
+			InvariantEngine: eng,
+		}
+
+		var recErr error
+		res := ctrl.Result{RequeueAfter: 30 * time.Second}
+		r.evaluateInvariantsWithSnapshot(context.Background(), overCapPMJ, &snapshot.Status{
+			Phase:            snapshot.PhaseInProgress,
+			SnapshotRef:      snapName,
+			LastProgressTime: now.Add(-1 * time.Minute),
+		}, &res, &recErr)
+
+		if res.Requeue || res.RequeueAfter != 0 {
+			t.Fatalf("expected strict abort to suppress requeue past MaxMigrationTimeout, got %+v", res)
+		}
+		got := &pmv1alpha1.PodMigrationJob{}
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: jobName}, got); err != nil {
+			t.Fatalf("get over-cap PMJ: %v", err)
+		}
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+			t.Fatalf("expected Snapshotting PMJ past MaxMigrationTimeout to fail in strict mode, got %s", got.Status.Phase)
+		}
+		readyCond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+		if readyCond == nil || readyCond.Reason != invariants.EventReasonInvariantViolation || !strings.Contains(readyCond.Message, "[I4:TerminalProgress]") {
+			t.Fatalf("expected Ready condition with I4 InvariantViolation, got %+v", readyCond)
+		}
+	})
+}
