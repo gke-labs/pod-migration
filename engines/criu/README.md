@@ -76,7 +76,9 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      MD5/size verification, stops the source container via containerd (`SIGKILL`),
      and marks the `PodSnapshot` `Ready=True`.
      If the `PodSnapshotManualTrigger` is deleted first, the engine controller
-     sets `Checkpoint=Unknown` with the reason `CancelRequested`, and the agent
+     sets `Checkpoint=Unknown` with the reason `CancelRequested` (on a work
+     order without a bucket, which no agent acts on, it records `Cancelled`
+     itself), and the agent
      also reads the trigger itself before the checkpoint and right before the
      stop. A cancelled agent starts nothing new. It waits for an in-flight
      kubelet checkpoint to return, because cancelling the call doesn't end the
