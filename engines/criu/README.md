@@ -138,7 +138,12 @@ the controller can target the engine's group
 To test another group, change it in `deploy/crds.yaml` (each CRD's name and
 `spec.group`) and in the `deploy/deploy.yaml` RBAC rules, pass the same
 `--api-group` to both binaries, and use a holder image from this release or
-later (older holders reject `--ps-name-annotation`).
+later (older holders reject `--ps-name-annotation`). Change the group only
+when no migrations are in flight, and roll the engine and the agent together:
+each wrapped replacement pod has its restore key built into its command.
+With `--enable-webhooks=false`, replacement pods aren't wrapped, so they start
+cold instead of being restored; also delete the
+`pod-migrate-psengine-restore-inject` MutatingWebhookConfiguration then.
 
 ## Node & Cluster Requirements
 

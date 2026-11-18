@@ -118,8 +118,9 @@ func verifyRestoreWebhookScope(ctx context.Context, c client.Reader, group strin
 		}
 		return fmt.Errorf("preflight: CRD %s belongs to another snapshot provider%s, and the restore webhook "+
 			"would also rewrite the replacement pods that provider restores — refusing to start psengine on "+
-			"--api-group=%s with webhooks on. Run it with --enable-webhooks=false, or on a cluster without "+
-			"that provider, until the webhook takes only this engine's pods",
+			"--api-group=%s with webhooks on. Run it on a cluster without that provider, or with "+
+			"--enable-webhooks=false (replacement pods then start cold instead of being restored), until the "+
+			"webhook takes only this engine's pods",
 			name, describeForeignOwner(crd), group)
 	}
 	return nil

@@ -93,7 +93,7 @@ func InjectHolder(pod *corev1.Pod, holderImage string) (bool, string) {
 func injectHolder(pod *corev1.Pod, holderImage, psNameAnnotation string) (bool, string) {
 	// Only migration replacement candidates: the orchestrator's replacement
 	// webhook injected the gate + assignment in the same admission chain
-	// (replacement_webhook.go:83-91); ours runs after via reinvocation.
+	// (replacement_webhook.go:171-180); ours runs after via reinvocation.
 	gated := false
 	for _, g := range pod.Spec.SchedulingGates {
 		if g.Name == contract.SchedulingGate {

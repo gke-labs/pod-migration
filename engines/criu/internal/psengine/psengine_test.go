@@ -414,7 +414,7 @@ func TestVerifyCRDOwnershipClobbered(t *testing.T) {
 		cc.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
 		cc.SetName(n)
 		cc.SetLabels(map[string]string{ComponentLabel: ComponentLabelValue})
-		if n == "podsnapshots.podsnapshot.gke.io" {
+		if n == "podsnapshots."+contract.Group {
 			cc.SetLabels(map[string]string{
 				ComponentLabel:                    ComponentLabelValue,
 				"addonmanager.kubernetes.io/mode": "EnsureExists",

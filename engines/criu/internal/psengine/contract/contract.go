@@ -55,11 +55,11 @@ const (
 	restoreAnnotationName = "ps-name"
 
 	// AnnotationAssignedPMJ marks a replacement pod's PMJ assignment
-	// (replacement_webhook.go:91) — the trigger for holder injection.
+	// (replacement_webhook.go:179) — the trigger for holder injection.
 	AnnotationAssignedPMJ = "pod-migration.gke.io/assigned-pmj"
-	// LabelEnabled is the workload opt-in (eviction_webhook.go:69).
+	// LabelEnabled is the workload opt-in (replacement_webhook.go:65).
 	LabelEnabled = "pod-migration.gke.io/enabled"
-	// SchedulingGate holds replacement pods (replacement_webhook.go:84).
+	// SchedulingGate holds replacement pods (replacement_webhook.go:171).
 	SchedulingGate = "gke.io/pod-migration-gate"
 
 	// LabelEngine partitions PSPs (and the objects the engine creates)

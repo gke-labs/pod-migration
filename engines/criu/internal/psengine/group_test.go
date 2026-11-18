@@ -165,6 +165,12 @@ func TestRestoreWebhookScopeRefusesTheAddon(t *testing.T) {
 			t.Fatal("the add-on's markers mean the add-on is still there, so preflight must fail")
 		}
 	})
+	t.Run("unlabeled CRDs without add-on markers: refused", func(t *testing.T) {
+		err := verifyRestoreWebhookScope(ctx, newCRDClient(t, crdsOf(contract.GKEPodSnapshotsGroup, nil)...), ownGroup)
+		if err == nil || !strings.Contains(err.Error(), "owner unknown") {
+			t.Fatalf("CRDs this engine didn't install belong to some other provider, so preflight must fail, got %v", err)
+		}
+	})
 	t.Run("own group, no add-on: pass", func(t *testing.T) {
 		if err := verifyRestoreWebhookScope(ctx, newCRDClient(t, crdsOf(ownGroup, ourCRDLabels)...), ownGroup); err != nil {
 			t.Fatal(err)

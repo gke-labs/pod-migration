@@ -155,6 +155,7 @@ func TestParseWrapArgs(t *testing.T) {
 			wantOrig: []string{"redis-server"},
 		},
 		{name: "no separator", args: []string{"/pminfo/annotations", "redis-server"}, wantErr: true},
+		{name: "no separator, longer command", args: []string{"/pminfo/annotations", "redis-server", "--appendonly", "yes"}, wantErr: true},
 		{name: "no command", args: []string{"/pminfo/annotations", "--"}, wantErr: true},
 		{name: "empty key", args: []string{"--ps-name-annotation=", "/pminfo/annotations", "--", "redis-server"}, wantErr: true},
 		{name: "unknown flag", args: []string{"--bogus", "/pminfo/annotations", "--", "redis-server"}, wantErr: true},
