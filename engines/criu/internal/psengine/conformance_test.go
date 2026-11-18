@@ -251,7 +251,7 @@ func TestPreflightCRDOwnership(t *testing.T) {
 	}
 	t.Run("all ours: pass", func(t *testing.T) {
 		var objs []client.Object
-		for _, n := range contractCRDs {
+		for _, n := range contract.CRDNames(contract.Group) {
 			objs = append(objs, ours(n))
 		}
 		if err := VerifyCRDOwnership(context.Background(), newCRDClient(t, objs...)); err != nil {
@@ -266,7 +266,7 @@ func TestPreflightCRDOwnership(t *testing.T) {
 	})
 	t.Run("foreign-owned: fail loudly", func(t *testing.T) {
 		var objs []client.Object
-		for i, n := range contractCRDs {
+		for i, n := range contract.CRDNames(contract.Group) {
 			u := ours(n)
 			if i == 2 {
 				u.SetLabels(nil) // the addon's CRD
@@ -280,7 +280,7 @@ func TestPreflightCRDOwnership(t *testing.T) {
 	})
 	t.Run("GKE addon markers named in the refusal", func(t *testing.T) {
 		var objs []client.Object
-		for i, n := range contractCRDs {
+		for i, n := range contract.CRDNames(contract.Group) {
 			u := ours(n)
 			if i == 0 {
 				// The managed addon's CRDs carry addon-manager labels.
@@ -298,7 +298,7 @@ func TestPreflightCRDOwnership(t *testing.T) {
 	})
 	t.Run("unknown foreign owner reported honestly", func(t *testing.T) {
 		var objs []client.Object
-		for i, n := range contractCRDs {
+		for i, n := range contract.CRDNames(contract.Group) {
 			u := ours(n)
 			if i == 1 {
 				u.SetLabels(nil) // no markers at all

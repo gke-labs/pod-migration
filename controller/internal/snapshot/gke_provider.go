@@ -270,47 +270,92 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		return nil, err
 	}
 
+	return checkPodSnapshotStatus(targetSnapshot, p.nowFunc(), logger.Info), nil
+}
+
+// CheckPodSnapshotStatus evaluates the progress and readiness of a cached GKE PodSnapshot
+// unstructured object without issuing any API server requests.
+func CheckPodSnapshotStatus(targetSnapshot *unstructured.Unstructured, now time.Time) *Status {
+	return checkPodSnapshotStatus(targetSnapshot, now, nil)
+}
+
+func checkPodSnapshotStatus(targetSnapshot *unstructured.Unstructured, now time.Time, logInfo func(string, ...interface{})) *Status {
+	if targetSnapshot == nil {
+		return nil
+	}
+	snapshotName := targetSnapshot.GetName()
 	snapStatus, ok := targetSnapshot.Object["status"].(map[string]interface{})
 	if !ok {
-		logger.Info("Snapshot status subresource not found, waiting...")
+		if logInfo != nil {
+			logInfo("Snapshot status subresource not found, waiting...")
+		}
 		return &Status{
 			Phase:       PhaseInProgress,
 			SnapshotRef: snapshotName,
 			Reason:      "Snapshotting",
 			Message:     fmt.Sprintf("Waiting for GKE PodSnapshot %q status to be populated", snapshotName),
-		}, nil
+		}
 	}
 
-	conditions, _ := snapStatus["conditions"].([]interface{})
+	rawConditions, _ := snapStatus["conditions"].([]interface{})
+	conditions := make([]metav1.Condition, 0, len(rawConditions))
+	for _, c := range rawConditions {
+		cond, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cType, _ := cond["type"].(string)
+		cStatus, _ := cond["status"].(string)
+		cReason, _ := cond["reason"].(string)
+		cMsg, _ := cond["message"].(string)
+		mc := metav1.Condition{
+			Type:    cType,
+			Status:  metav1.ConditionStatus(cStatus),
+			Reason:  cReason,
+			Message: cMsg,
+		}
+		if lttStr, ok := cond["lastTransitionTime"].(string); ok {
+			if t, err := time.Parse(time.RFC3339Nano, lttStr); err == nil {
+				mc.LastTransitionTime = metav1.NewTime(t)
+			}
+		}
+		conditions = append(conditions, mc)
+	}
+	topPhase, _ := snapStatus["phase"].(string)
+	return statusFromConditions(snapshotName, conditions, targetSnapshot.GetCreationTimestamp().Time, topPhase, now, logInfo)
+}
 
+// StatusFromConditions evaluates GKE PodSnapshot status from already-extracted
+// conditions without issuing any API server requests.
+func StatusFromConditions(snapshotName string, conditions []metav1.Condition, creationTime time.Time, topPhase string, now time.Time) *Status {
+	return statusFromConditions(snapshotName, conditions, creationTime, topPhase, now, nil)
+}
+
+func statusFromConditions(snapshotName string, conditions []metav1.Condition, creationTime time.Time, topPhase string, now time.Time, logInfo func(string, ...interface{})) *Status {
 	// Scan conditions for terminal failures, progress, transition timestamps, and readiness in a single pass.
 	var (
 		lastProgress            time.Time
-		terminalSubcond         map[string]interface{}
-		readyTerminalCond       map[string]interface{}
+		terminalSubcond         *metav1.Condition
+		readyTerminalCond       *metav1.Condition
 		readyTerminalTransition time.Time
 		subconditionInProgress  bool
 		isReady                 bool
 	)
 
-	for _, c := range conditions {
-		cond, ok := c.(map[string]interface{})
-		if !ok {
-			continue
-		}
+	for i := range conditions {
+		cond := &conditions[i]
+		cType := cond.Type
+		cStatus := string(cond.Status)
+		cReason := cond.Reason
+
 		var condTransitionTime time.Time
-		if lttStr, ok := cond["lastTransitionTime"].(string); ok {
-			if t, err := time.Parse(time.RFC3339Nano, lttStr); err == nil {
-				condTransitionTime = t
-				if t.After(lastProgress) {
-					lastProgress = t
-				}
+		if !cond.LastTransitionTime.IsZero() {
+			t := cond.LastTransitionTime.Time
+			condTransitionTime = t
+			if t.After(lastProgress) && !isSnapshotStalledReason(cType, cReason) {
+				lastProgress = t
 			}
 		}
-
-		cType, _ := cond["type"].(string)
-		cStatus, _ := cond["status"].(string)
-		cReason, _ := cond["reason"].(string)
 
 		switch cType {
 		case "Checkpoint", "StorageReplicated":
@@ -332,21 +377,20 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		}
 	}
 	if lastProgress.IsZero() {
-		lastProgress = targetSnapshot.GetCreationTimestamp().Time
+		lastProgress = creationTime
 	}
 
 	// 1. If an underlying constituent sub-condition has terminally failed, fast-fail immediately.
 	if terminalSubcond != nil {
-		cType, _ := terminalSubcond["type"].(string)
-		cReason, _ := terminalSubcond["reason"].(string)
-		cMsg, _ := terminalSubcond["message"].(string)
-		logger.Info("PodSnapshot reported terminal failure in sub-condition", "snapshot", snapshotName, "type", cType, "reason", cReason, "message", cMsg)
+		if logInfo != nil {
+			logInfo("PodSnapshot reported terminal failure in sub-condition", "snapshot", snapshotName, "type", terminalSubcond.Type, "reason", terminalSubcond.Reason, "message", terminalSubcond.Message)
+		}
 		return &Status{
-			Phase:       phaseForTerminalReason(cReason),
+			Phase:       phaseForTerminalReason(terminalSubcond.Reason),
 			SnapshotRef: snapshotName,
 			Reason:      "SnapshotFailed",
-			Message:     fmt.Sprintf("GKE PodSnapshot %s failed (%s): %s", cType, cReason, cMsg),
-		}, nil
+			Message:     fmt.Sprintf("GKE PodSnapshot %s failed (%s): %s", terminalSubcond.Type, terminalSubcond.Reason, terminalSubcond.Message),
+		}
 	}
 
 	// 2. Check Ready condition for terminal failure (#75, #95).
@@ -358,53 +402,57 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	// Ready's own lastTransitionTime is valid and within transientReadyFailureSuppressionWindow (60s).
 	// Anchoring on Ready's lastTransitionTime (rather than the sub-condition's) ensures a transient
 	// Ready blip midway through a multi-minute large-pod checkpoint still gets a full 60s window.
-	// Note: lastTransitionTime is stamped by the node agent's clock while nowFunc() is ours
+	// Note: lastTransitionTime is stamped by the node agent's clock while now is ours
 	// (cross-process comparison); 60s dwarfs normal NTP skew, so do not shrink this to a few seconds.
 	if readyTerminalCond != nil {
-		cReason, _ := readyTerminalCond["reason"].(string)
-		cMsg, _ := readyTerminalCond["message"].(string)
-		now := p.nowFunc()
+		if now.IsZero() {
+			now = time.Now()
+		}
 		inSuppressionWindow := !readyTerminalTransition.IsZero() &&
 			now.Sub(readyTerminalTransition) <= transientReadyFailureSuppressionWindow
 		if subconditionInProgress && inSuppressionWindow {
-			logger.Info("PodSnapshot reported Ready=False failure while sub-conditions are still in progress within suppression window; ignoring transient failure",
-				"snapshot", snapshotName,
-				"reason", cReason,
-				"message", cMsg,
-				"readyLastTransitionTime", readyTerminalTransition,
-				"window", transientReadyFailureSuppressionWindow,
-			)
-		} else {
-			if subconditionInProgress {
-				logger.Info("PodSnapshot reported Ready=False failure and Ready transition exceeded suppression window; treating as terminal failure",
+			if logInfo != nil {
+				logInfo("PodSnapshot reported Ready=False failure while sub-conditions are still in progress within suppression window; ignoring transient failure",
 					"snapshot", snapshotName,
-					"reason", cReason,
-					"message", cMsg,
+					"reason", readyTerminalCond.Reason,
+					"message", readyTerminalCond.Message,
 					"readyLastTransitionTime", readyTerminalTransition,
 					"window", transientReadyFailureSuppressionWindow,
 				)
-			} else {
-				logger.Info("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", "Ready", "reason", cReason, "message", cMsg)
+			}
+		} else {
+			if logInfo != nil {
+				if subconditionInProgress {
+					logInfo("PodSnapshot reported Ready=False failure and Ready transition exceeded suppression window; treating as terminal failure",
+						"snapshot", snapshotName,
+						"reason", readyTerminalCond.Reason,
+						"message", readyTerminalCond.Message,
+						"readyLastTransitionTime", readyTerminalTransition,
+						"window", transientReadyFailureSuppressionWindow,
+					)
+				} else {
+					logInfo("PodSnapshot reported terminal failure", "snapshot", snapshotName, "type", "Ready", "reason", readyTerminalCond.Reason, "message", readyTerminalCond.Message)
+				}
 			}
 			return &Status{
-				Phase:       phaseForTerminalReason(cReason),
+				Phase:       phaseForTerminalReason(readyTerminalCond.Reason),
 				SnapshotRef: snapshotName,
 				Reason:      "SnapshotFailed",
-				Message:     fmt.Sprintf("GKE PodSnapshot %s failed (%s): %s", "Ready", cReason, cMsg),
-			}, nil
+				Message:     fmt.Sprintf("GKE PodSnapshot %s failed (%s): %s", "Ready", readyTerminalCond.Reason, readyTerminalCond.Message),
+			}
 		}
 	}
 
 	// 3. Top-level status.phase terminal failure check (unconditional).
-	if topPhase, ok := snapStatus["phase"].(string); ok {
-		if isTerminalSnapshotFailureReason(topPhase) {
-			logger.Info("PodSnapshot reported terminal failure via phase", "snapshot", snapshotName, "phase", topPhase)
-			return &Status{
-				Phase:       phaseForTerminalReason(topPhase),
-				SnapshotRef: snapshotName,
-				Reason:      "SnapshotFailed",
-				Message:     fmt.Sprintf("GKE PodSnapshot failed with phase=%s", topPhase),
-			}, nil
+	if topPhase != "" && isTerminalSnapshotFailureReason(topPhase) {
+		if logInfo != nil {
+			logInfo("PodSnapshot reported terminal failure via phase", "snapshot", snapshotName, "phase", topPhase)
+		}
+		return &Status{
+			Phase:       phaseForTerminalReason(topPhase),
+			SnapshotRef: snapshotName,
+			Reason:      "SnapshotFailed",
+			Message:     fmt.Sprintf("GKE PodSnapshot failed with phase=%s", topPhase),
 		}
 	}
 
@@ -413,17 +461,19 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		return &Status{
 			Phase:       PhaseReady,
 			SnapshotRef: snapshotName,
-		}, nil
+		}
 	}
 
-	logger.Info("Snapshot is not ready yet, waiting...")
+	if logInfo != nil {
+		logInfo("Snapshot is not ready yet, waiting...")
+	}
 	return &Status{
 		Phase:            PhaseInProgress,
 		SnapshotRef:      snapshotName,
 		Reason:           "Snapshotting",
 		Message:          fmt.Sprintf("Waiting for GKE PodSnapshot %q checkpoint to complete", snapshotName),
 		LastProgressTime: lastProgress,
-	}, nil
+	}
 }
 
 func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) error {
@@ -451,12 +501,14 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 
 // snapshotTriggeredByLabel is the label GKE Pod Snapshots puts on every
 // PodSnapshot it creates for a manual trigger. Its value is the trigger's name.
+// The CRIU engine's controller sets it too, when the trigger's name fits in a
+// label value (#106).
 const snapshotTriggeredByLabel = "gke-pod-snapshot-triggered-by"
 
 // CheckpointState reports whether the job's checkpoint of the source has
 // settled and whether it completed (#131). It finds the job's PodSnapshots by
 // the trigger's status, the snapshot recorded on the job, and the label the
-// agent puts on every snapshot it creates for the trigger, so it still finds
+// engine puts on every snapshot it creates for the trigger, so it still finds
 // them after Cleanup deleted the trigger.
 //
 // A trigger that still exists can start a checkpoint, and a snapshot that's
@@ -578,16 +630,26 @@ func podSnapshotCheckpointProgress(snap *unstructured.Unstructured) (completed, 
 // to cleanly initiate fallback or reschedule rather than burning the migration deadline on known terminal states.
 // Refused means the snapshot engine declined to checkpoint this pod (for example, a pod shape it does not
 // support). That is a policy decision that will not change within the same PMJ, so it is terminal as well.
+// Cancelled means the engine abandoned the checkpoint because its trigger was deleted, without stopping the
+// source (C9, #106). It is handled as Failed.
 func isTerminalSnapshotFailureReason(reason string) bool {
 	r := strings.ToLower(reason)
 	if r == "" || r == "noerror" || strings.HasPrefix(r, "not") || strings.HasPrefix(r, "non") {
 		return false
 	}
 	switch r {
-	case "failed", "error", "deadlineexceeded", "refused":
+	case "failed", "error", "deadlineexceeded", "refused", "cancelled":
 		return true
 	}
 	return false
+}
+
+// isSnapshotStalledReason: a CRIU engine condition that isn't progress, so
+// its lastTransitionTime mustn't extend the job's deadline (#106). A
+// checkpoint that timed out won't move again, and a cancel waits for the node
+// agent to confirm it.
+func isSnapshotStalledReason(cType, reason string) bool {
+	return cType == "Checkpoint" && (reason == "CheckpointTimedOut" || reason == "CancelRequested")
 }
 
 func isSnapshotRefusedReason(reason string) bool {

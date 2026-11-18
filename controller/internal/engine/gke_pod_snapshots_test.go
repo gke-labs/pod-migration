@@ -831,3 +831,66 @@ func TestGKEPodSnapshots_InspectRestoreOrder(t *testing.T) {
 		})
 	}
 }
+
+func TestGKEPodSnapshots_Placement(t *testing.T) {
+	e := NewGKEPodSnapshots(nil, nil)
+	jobWith := func(instanceType, kubeletVersion string) *pmv1alpha1.PodMigrationJob {
+		return &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj"},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				OriginNodeInstanceType:   instanceType,
+				OriginNodeKubeletVersion: kubeletVersion,
+			},
+		}
+	}
+	// The pre-status annotation must not steer placement: only the
+	// controller writes the job's status.
+	annotated := jobWith("", "v1.37.1-gke.2097000")
+	annotated.Annotations = map[string]string{"pod-migration.gke.io/source-instance-type": "e2-medium"}
+	cases := []struct {
+		name string
+		job  *pmv1alpha1.PodMigrationJob
+		want []corev1.NodeSelectorRequirement
+	}{
+		{
+			name: "the source node's machine type",
+			job:  jobWith("n2-standard-4", "v1.37.1-gke.2097000"),
+			want: []corev1.NodeSelectorRequirement{{
+				Key:      "node.kubernetes.io/instance-type",
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{"n2-standard-4"},
+			}},
+		},
+		{
+			name: "no machine type recorded",
+			job:  jobWith("", "v1.37.1-gke.2097000"),
+		},
+		{
+			name: "nothing recorded",
+			job:  jobWith("", ""),
+		},
+		{
+			name: "a machine type that isn't a label value",
+			job:  jobWith("n2 standard 4", ""),
+		},
+		{
+			name: "an annotation doesn't count",
+			job:  annotated,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := e.Placement(context.Background(), tc.job)
+			if err != nil {
+				t.Fatalf("Placement() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Placement() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	if _, err := e.Placement(context.Background(), nil); err == nil {
+		t.Error("Placement(nil job) succeeded, want an error")
+	}
+}

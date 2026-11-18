@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -27,15 +28,18 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine"
+	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
 
 var scheme = runtime.NewScheme()
+
+// preflightTimeout bounds the startup checks' reads of the API server.
+const preflightTimeout = 30 * time.Second
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -47,6 +51,7 @@ func main() {
 	var enableWebhooks bool
 	var webhookCertDir string
 	var holderImage string
+	var apiGroup string
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
 
@@ -56,6 +61,7 @@ func main() {
 	flag.BoolVar(&enableWebhooks, "enable-webhooks", true, "serve the /psengine-restore-inject admission webhook on :9443")
 	flag.StringVar(&webhookCertDir, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "TLS cert directory for the webhook server")
 	flag.StringVar(&holderImage, "holder-image", os.Getenv("HOLDER_IMAGE"), "placeholder container image injected into gated replacement pods")
+	flag.StringVar(&apiGroup, "api-group", contract.DefaultGroup, "API group of the snapshot engine CRDs this engine serves; the restore-order annotation is <group>/ps-name. The node agent's --api-group and the installed CRDs must use the same group")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 50, "Kubernetes API client QPS limit")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 100, "Kubernetes API client burst limit")
 	opts := zap.Options{Development: true}
@@ -64,6 +70,12 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	log := ctrl.Log.WithName("setup")
+
+	if err := contract.SetGroup(apiGroup); err != nil {
+		log.Error(err, "invalid --api-group")
+		os.Exit(1)
+	}
+	log.Info("serving the snapshot engine API", "group", contract.Group, "restoreAnnotation", contract.AnnotationPSName)
 
 	if enableWebhooks && holderImage == "" {
 		log.Error(fmt.Errorf("--holder-image (or HOLDER_IMAGE) is required when --enable-webhooks is true"), "missing holder image")
@@ -93,12 +105,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Preflight: refuse to start if the podsnapshot.gke.io CRDs are missing or
-	// owned by another provider (such as the managed GKE Pod Snapshots addon).
-	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		return psengine.VerifyCRDOwnership(ctx, mgr.GetAPIReader())
-	})); err != nil {
-		log.Error(err, "unable to register psengine preflight")
+	// Preflight: refuse to start if the contract CRDs of --api-group are
+	// missing or owned by another provider (such as the managed GKE Pod
+	// Snapshots addon, on its podsnapshot.gke.io group), or if the restore
+	// webhook would rewrite pods that such a provider restores. It runs
+	// before the manager starts: the manager starts the webhook server ahead
+	// of leader-elected runnables, so a check run as a runnable would let the
+	// webhook serve first.
+	preflightCtx, cancelPreflight := context.WithTimeout(context.Background(), preflightTimeout)
+	err = psengine.Preflight(preflightCtx, mgr.GetAPIReader(), enableWebhooks)
+	cancelPreflight()
+	if err != nil {
+		log.Error(err, "psengine preflight failed")
 		os.Exit(1)
 	}
 

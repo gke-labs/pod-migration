@@ -43,18 +43,38 @@ type kubeletCheckpoint struct {
 	Client    *http.Client
 }
 
+// kubeletCheckpointTimeout outlasts the kubelet's own deadline on the CRI
+// checkpoint call (its --runtime-request-timeout, 2 min by default), with a
+// margin for the response. The kubelet runs that call on the request's
+// context, so a client that gives up first cancels it while the dump keeps
+// running with the source frozen, and the agent would hear back before the
+// source runs again (#106). A kubelet configured with a longer runtime
+// request timeout than this brings that back.
+const kubeletCheckpointTimeout = 150 * time.Second
+
 func newKubeletCheckpoint() *kubeletCheckpoint {
 	return &kubeletCheckpoint{
 		TokenPath: "/var/run/secrets/kubernetes.io/serviceaccount/token",
 		Endpoint:  "https://localhost:10250",
 		Client: &http.Client{
-			Timeout: 90 * time.Second,
+			Timeout: kubeletCheckpointTimeout,
 			// kubelet serves a self-signed serving cert; authn is the bearer
 			// token, authz is nodes/checkpoint.
 			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 		},
 	}
 }
+
+// checkpointTimeoutError marks a checkpoint call that ran out of time: the
+// client's timeout, or the kubelet's CRI deadline. The dump may still be
+// running, and past the CRI deadline containerd can leave the source frozen
+// until it is resumed by hand (#106). Callers find it through
+// errors.As(err, &interface{ Timeout() bool }).
+type checkpointTimeoutError struct{ err error }
+
+func (e *checkpointTimeoutError) Error() string { return e.err.Error() }
+func (e *checkpointTimeoutError) Unwrap() error { return e.err }
+func (e *checkpointTimeoutError) Timeout() bool { return true }
 
 type checkpointResult struct {
 	TarPath    string
@@ -78,7 +98,12 @@ func (k *kubeletCheckpoint) checkpoint(ctx context.Context, ns, pod, container s
 	start := time.Now()
 	resp, err := k.Client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("kubelet checkpoint: %w", err)
+		err = fmt.Errorf("kubelet checkpoint: %w", err)
+		var te interface{ Timeout() bool }
+		if errors.As(err, &te) && te.Timeout() {
+			return nil, &checkpointTimeoutError{err}
+		}
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -89,7 +114,14 @@ func (k *kubeletCheckpoint) checkpoint(ctx context.Context, ns, pod, container s
 			strings.Contains(bodyStr, "CheckCriu") {
 			return res, fmt.Errorf("%w (kubelet HTTP %d: %s)", ErrContainerdCachedCRIU, resp.StatusCode, truncate(bodyStr, 300))
 		}
-		return res, fmt.Errorf("kubelet checkpoint HTTP %d: %s", resp.StatusCode, truncate(bodyStr, 300))
+		err := fmt.Errorf("kubelet checkpoint HTTP %d: %s", resp.StatusCode, truncate(bodyStr, 300))
+		// The kubelet reports its CRI deadline as a gRPC DeadlineExceeded
+		// inside a 500.
+		if resp.StatusCode == http.StatusInternalServerError &&
+			(strings.Contains(bodyStr, "DeadlineExceeded") || strings.Contains(bodyStr, "context deadline exceeded")) {
+			return res, &checkpointTimeoutError{err}
+		}
+		return res, err
 	}
 	var out struct {
 		Items []string `json:"items"`

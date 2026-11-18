@@ -12,6 +12,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -510,16 +511,45 @@ func EvaluateI3(s *ReconcileSnapshot) []Violation {
 
 // EffectiveMigrationTimeout reads the effective migration deadline stamped on the PMJ's
 // `pod-migration.gke.io/timeout` annotation (which PR #57 stamps at creation / Pending),
-// falling back to MaxMigrationDuration (10m) when unset or invalid.
+// capped at util.MaxMigrationTimeout (2h) to match the reconciler, and falling back to
+// MaxMigrationDuration (10m) when unset or invalid.
 func EffectiveMigrationTimeout(job *pmv1alpha1.PodMigrationJob) time.Duration {
 	if job != nil && job.Annotations != nil {
 		if raw := job.Annotations[AnnotationMigrationTimeout]; raw != "" {
 			if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+				if d > util.MaxMigrationTimeout {
+					return util.MaxMigrationTimeout
+				}
 				return d
 			}
 		}
 	}
 	return MaxMigrationDuration
+}
+
+func snapshotProgressForJob(s *ReconcileSnapshot, job *pmv1alpha1.PodMigrationJob, now time.Time) (SnapshotProgress, bool) {
+	if s == nil || job == nil {
+		return SnapshotProgress{}, false
+	}
+	if s.SnapshotProgress != nil {
+		if prog, ok := s.SnapshotProgress[job.Namespace+"/"+job.Name]; ok {
+			return prog, true
+		}
+	}
+	if s.PrimaryPMJ != nil &&
+		job.Namespace == s.PrimaryPMJ.Namespace &&
+		job.Name == s.PrimaryPMJ.Name &&
+		len(s.PrimarySnapshotConditions) > 0 {
+		st := snapshot.StatusFromConditions(job.Status.SnapshotRef, s.PrimarySnapshotConditions, time.Time{}, "", now)
+		if st != nil {
+			return SnapshotProgress{
+				Ready:            st.Phase == snapshot.PhaseReady,
+				Failed:           st.Phase == snapshot.PhaseFailed || st.Phase == snapshot.PhaseRefused,
+				LastProgressTime: st.LastProgressTime,
+			}, true
+		}
+	}
+	return SnapshotProgress{}, false
 }
 
 // EvaluateI4 enforces I4 (Terminal Progress):
@@ -528,6 +558,9 @@ func EffectiveMigrationTimeout(job *pmv1alpha1.PodMigrationJob) time.Duration {
 // without transitioning to a terminal phase, and a deleting PodMigration CR with
 // StorageCleanupFinalizer must not remain un-finalized past MaxMigrationDuration (10m).
 // The PMJ deadline runs from creation while Pending and from Status.SnapshottingStartTime after.
+// Healthy progressing Snapshotting jobs (with a non-empty Status.SnapshotRef and Ready or recent
+// LastProgressTime) and Evicting jobs within their phase budget are tolerated up to the 2h
+// MaxMigrationTimeout hard cap.
 func EvaluateI4(s *ReconcileSnapshot) []Violation {
 	var violations []Violation
 	now := time.Now()
@@ -553,6 +586,19 @@ func EvaluateI4(s *ReconcileSnapshot) []Violation {
 			anchor, anchorLabel := job.CreationTimestamp.Time, "created"
 			if job.Status.SnapshottingStartTime != nil && !job.Status.SnapshottingStartTime.IsZero() {
 				anchor, anchorLabel = job.Status.SnapshottingStartTime.Time, "snapshotting started"
+			}
+
+			// During Snapshotting, the reconciler extends the deadline while the snapshot
+			// is actively progressing (Ready, or non-zero LastProgressTime within the
+			// effective timeout), bounded by the hard MaxMigrationTimeout (2h) wall-clock cap.
+			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting &&
+				job.Status.SnapshotRef != "" &&
+				(anchor.IsZero() || now.Sub(anchor) <= util.MaxMigrationTimeout+progressGraceSlack) {
+				if prog, ok := snapshotProgressForJob(s, &job, now); ok && !prog.Failed {
+					if prog.Ready || (!prog.LastProgressTime.IsZero() && now.Sub(prog.LastProgressTime) <= budget) {
+						continue
+					}
+				}
 			}
 
 			// During Evicting, PR #57 anchors the eviction phase budget on Status.EvictingStartTime

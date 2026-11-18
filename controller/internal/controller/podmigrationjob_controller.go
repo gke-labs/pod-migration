@@ -200,27 +200,32 @@ func migrationDeadlineAnchor(job *pmv1alpha1.PodMigrationJob) time.Time {
 }
 
 func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, job *pmv1alpha1.PodMigrationJob, timeout time.Duration) bool {
+	_, progressing := r.checkSnapshotProgressing(ctx, job, timeout)
+	return progressing
+}
+
+func (r *PodMigrationJobReconciler) checkSnapshotProgressing(ctx context.Context, job *pmv1alpha1.PodMigrationJob, timeout time.Duration) (*snapshot.Status, bool) {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || job.Status.SnapshotRef == "" {
-		return false
+		return nil, false
 	}
 	if time.Since(migrationDeadlineAnchor(job)) > util.MaxMigrationTimeout {
-		return false
+		return nil, false
 	}
 	podName := job.Spec.PodRef.Name
 	snapStatus, err := r.getSnapshotProvider(job).CheckStatus(ctx, job, podName)
 	if err != nil || snapStatus == nil {
-		return false
+		return nil, false
 	}
 	if snapStatus.Phase == snapshot.PhaseReady {
-		return true
+		return snapStatus, true
 	}
 	if snapStatus.Phase == snapshot.PhaseFailed || snapStatus.Phase == snapshot.PhaseRefused {
-		return false
+		return snapStatus, false
 	}
 	if !snapStatus.LastProgressTime.IsZero() && time.Since(snapStatus.LastProgressTime) < timeout {
-		return true
+		return snapStatus, true
 	}
-	return false
+	return snapStatus, false
 }
 
 func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMigrationJob) bool {
@@ -649,6 +654,18 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // against the invariant engine when enabled. It runs only when the reconcile step completed without error.
 // In strict mode, any violation patches a non-terminal PMJ to PhaseFailed, cleans up triggers, and suppresses requeue.
 func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job *pmv1alpha1.PodMigrationJob, res *ctrl.Result, reconcileErr *error) {
+	r.evaluateInvariantsWithSnapshot(ctx, job, nil, res, reconcileErr)
+}
+
+func snapshotProgressFromStatus(st *snapshot.Status) invariants.SnapshotProgress {
+	return invariants.SnapshotProgress{
+		Ready:            st.Phase == snapshot.PhaseReady,
+		Failed:           st.Phase == snapshot.PhaseFailed || st.Phase == snapshot.PhaseRefused,
+		LastProgressTime: st.LastProgressTime,
+	}
+}
+
+func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.Context, job *pmv1alpha1.PodMigrationJob, lastSnapStatus *snapshot.Status, res *ctrl.Result, reconcileErr *error) {
 	if !r.InvariantEngine.Enabled() || job == nil || !job.DeletionTimestamp.IsZero() {
 		return
 	}
@@ -656,6 +673,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		return
 	}
 
+	now := time.Now()
 	var namespacePMJs []pmv1alpha1.PodMigrationJob
 	pmjListFailed := false
 	pmjList := &pmv1alpha1.PodMigrationJobList{}
@@ -709,6 +727,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 	}
 
 	var primarySnapshotConditions []metav1.Condition
+	var primarySnapObj *unstructured.Unstructured
 	if snapName != "" {
 		snapObj := &unstructured.Unstructured{}
 		snapObj.SetGroupVersionKind(schema.GroupVersionKind{
@@ -717,7 +736,54 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 			Kind:    "PodSnapshot",
 		})
 		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
+			primarySnapObj = snapObj
 			primarySnapshotConditions = extractUnstructuredConditions(snapObj)
+		}
+	}
+
+	var snapshotProgress map[string]invariants.SnapshotProgress
+	recordSnapshotProgress := func(jobKey string, st *snapshot.Status) {
+		if st == nil {
+			return
+		}
+		if snapshotProgress == nil {
+			snapshotProgress = make(map[string]invariants.SnapshotProgress)
+		}
+		snapshotProgress[jobKey] = snapshotProgressFromStatus(st)
+	}
+	primaryKey := job.Namespace + "/" + job.Name
+	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		if lastSnapStatus != nil {
+			recordSnapshotProgress(primaryKey, lastSnapStatus)
+		} else if primarySnapObj != nil {
+			recordSnapshotProgress(primaryKey, snapshot.CheckPodSnapshotStatus(primarySnapObj, now))
+		}
+	}
+	for i := range namespacePMJs {
+		other := &namespacePMJs[i]
+		otherKey := other.Namespace + "/" + other.Name
+		if otherKey == primaryKey {
+			continue
+		}
+		if other.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || other.Status.SnapshotRef == "" {
+			continue
+		}
+		anchor := migrationDeadlineAnchor(other)
+		if anchor.IsZero() || now.Sub(anchor) <= invariants.EffectiveMigrationTimeout(other) || now.Sub(anchor) > util.MaxMigrationTimeout+30*time.Second {
+			continue
+		}
+		otherSnapObj := &unstructured.Unstructured{}
+		otherSnapObj.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "podsnapshot.gke.io",
+			Version: "v1",
+			Kind:    "PodSnapshot",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Namespace: other.Namespace, Name: other.Status.SnapshotRef}, otherSnapObj); err == nil {
+			recordSnapshotProgress(otherKey, snapshot.CheckPodSnapshotStatus(otherSnapObj, now))
+		} else if (apierrors.IsNotFound(err) || meta.IsNoMatchError(err)) && r.SnapshotProvider != nil {
+			if st, checkErr := r.SnapshotProvider.CheckStatus(ctx, other, other.Spec.PodRef.Name); checkErr == nil && st != nil {
+				recordSnapshotProgress(otherKey, st)
+			}
 		}
 	}
 
@@ -735,7 +801,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		restoreOrders = r.Engines.InspectRestoreOrder
 	}
 	violations, shouldFailStrict := r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
-		Now:                          time.Now(),
+		Now:                          now,
 		Reconciler:                   "PodMigrationJobReconciler",
 		PrimaryPMJ:                   job,
 		PrimaryPod:                   primaryPod,
@@ -746,6 +812,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		HasOrphanedTrigger:           hasOrphanedTrigger,
 		RestoreCrashSignatureMatched: restoreCrashMatched,
 		PrimarySnapshotConditions:    primarySnapshotConditions,
+		SnapshotProgress:             snapshotProgress,
 		RestoreOrders:                restoreOrders,
 	})
 	if shouldFailStrict && len(violations) > 0 && !invariants.IsTerminalPhase(job.Status.Phase) {
@@ -838,8 +905,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	var lastSnapStatus *snapshot.Status
 	defer func() {
-		r.evaluateInvariants(ctx, job, &res, &reconcileErr)
+		r.evaluateInvariantsWithSnapshot(ctx, job, lastSnapStatus, &res, &reconcileErr)
 	}()
 
 	podName := job.Spec.PodRef.Name
@@ -880,7 +948,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 		migrationTimeout := r.getMigrationTimeout(job)
 		if time.Since(migrationDeadlineAnchor(job)) > migrationTimeout {
-			if r.isSnapshotProgressing(ctx, job, migrationTimeout) {
+			snapStatus, progressing := r.checkSnapshotProgressing(ctx, job, migrationTimeout)
+			if snapStatus != nil {
+				lastSnapStatus = snapStatus
+			}
+			if progressing {
 				logger.Info("Migration exceeded baseline timeout but snapshot is actively progressing; extending deadline",
 					"job", job.Name, "snapshot", job.Status.SnapshotRef, "timeout", migrationTimeout)
 			} else if r.isEvictionWithinBudget(job) {
@@ -1279,6 +1351,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Error(err, "Failed to check snapshot status")
 			return ctrl.Result{}, err
 		}
+		lastSnapStatus = snapStatus
 
 		switch snapStatus.Phase {
 		case snapshot.PhaseFailed, snapshot.PhaseRefused:
@@ -1659,6 +1732,26 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
+		// The pod gate found no node that can restore the checkpoint (C8,
+		// #14) and holds the replacement: conclude without a restore, and
+		// the gate then releases it cold. This comes before the restore
+		// ceiling, which waits for a gated replacement. The patch checks the
+		// resourceVersion, so a stale view can't conclude a job whose
+		// replacement the gate has since released with a restore order.
+		if cond, held := noCompatibleNode(job); held {
+			logger.Info("No node can restore the checkpoint; concluding without a restore", "job", job.Name)
+			orig := job.DeepCopy()
+			if err := r.markSucceededWithoutRestore(ctx, job, orig, ReasonNoCompatibleNode, cond.Message, client.MergeFromWithOptimisticLock{}); err != nil {
+				// Nothing was written, so the invariant checks after this
+				// reconcile must see the job as it is, not concluded.
+				*job = *orig
+				return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore on NoCompatibleNode")
+			}
+			metrics.RecordRestoreVerdict(r.jobEngine(job).Name(), "no_compatible_node")
+			r.eventf(job, corev1.EventTypeWarning, ReasonNoCompatibleNode, "%s", cond.Message)
+			return ctrl.Result{}, nil
+		}
+
 		// 2. Safety ceiling measured from RestoringStartTime: 5 minutes, plus
 		// the stabilization window. Having no verdict by then isn't a
 		// success (C6).
@@ -1978,7 +2071,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 // markSucceededWithoutRestore concludes the PMJ with the given reason on both
 // the Restored (False) and Ready (True) conditions, updates Prometheus metrics
 // (marking PMJ inactive, recording outcome, and recording previous phase duration).
-func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob, reason, message string) error {
+// opts apply to the status patch.
+func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob, reason, message string, opts ...client.MergeFromOption) error {
 	prevPhase := job.Status.Phase
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 	now := metav1.Now()
@@ -2000,7 +2094,7 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 	// The job is concluding, so a standing "unrecognised start failure" report
 	// no longer describes anything actionable.
 	r.clearUnrecognizedRestoreCrash(job)
-	if err := r.patchStatus(ctx, job, orig); err != nil {
+	if err := r.patchStatus(ctx, job, orig, opts...); err != nil {
 		return err
 	}
 	metrics.MarkPMJInactive(types.NamespacedName{Namespace: job.Namespace, Name: job.Name}.String())
@@ -2417,9 +2511,9 @@ func (r *PodMigrationJobReconciler) mapSnapshotToPMJ(ctx context.Context, obj cl
 
 // patchStatus updates the PodMigrationJob status using a MergeFrom patch,
 // falling back to Update if orig is nil.
-func (r *PodMigrationJobReconciler) patchStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob) error {
+func (r *PodMigrationJobReconciler) patchStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob, opts ...client.MergeFromOption) error {
 	if orig != nil {
-		patch := client.MergeFrom(orig)
+		patch := client.MergeFromWithOptions(orig, opts...)
 		return r.Status().Patch(ctx, job, patch)
 	}
 	return r.Status().Update(ctx, job)
