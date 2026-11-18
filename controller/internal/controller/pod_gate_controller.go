@@ -312,40 +312,9 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 
-		// Place the restore on a node that can restore it (C8, #14). The
-		// constraints go into the update that removes the gate, the only
-		// time Kubernetes lets them be added, and they can't be removed
-		// after it. So before anything is written for the release, check
-		// that some node meets them, and if none does, hold the pod: the
-		// job then concludes without a restore, and the pod starts cold.
-		// Only a Restoring job is checked, because only then does the job
-		// reconciler conclude a hold; in another phase a new release gets
-		// no constraints, as without placement. A release that is already
-		// under way isn't checked again, and the engine isn't asked yet:
-		// either it's this pod's own release, which gets the constraints
-		// below, or another pod's, and the branch below releases this one
-		// cold.
-		var placement []corev1.NodeSelectorRequirement
-		underWay := releaseUnderWay(job, pod)
-		if phase == pmv1alpha1.PodMigrationJobPhaseRestoring && !underWay {
-			if placement, err = r.restorePlacement(ctx, job); err != nil {
-				logger.Error(err, "Failed to get the restore's node constraints", "pmj", correctedPMJ)
-				return ctrl.Result{}, err
-			}
-			if len(placement) > 0 {
-				fits, err := r.someNodeFits(ctx, pod, placement)
-				if err != nil {
-					logger.Error(err, "Failed to check the nodes against the restore's node constraints", "pmj", correctedPMJ)
-					return ctrl.Result{}, err
-				}
-				if !fits {
-					return r.holdForNoCompatibleNode(ctx, pod, job, placement)
-				}
-			}
-		}
-
 		logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 
+		adoptStranded := false
 		if job.Status.Consumed && job.Status.RestoredPodUID != string(pod.UID) {
 			// Single-use isolation: a migration that already concluded (Succeeded)
 			// or whose scheduling gate was already released on the consumer pod must
@@ -370,12 +339,50 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 				// Do NOT un-gate this candidate pod with cold-start bypass yet: waiting
 				// costs nothing because the candidate is safely held in Pending by its
 				// scheduling gate. Once the terminating consumer finishes and disappears from
-				// the API server, this candidate will recover and adopt the PMJ snapshot.
+				// the API server, this candidate will recover: it adopts the PMJ snapshot, or,
+				// if the placement check below finds no node, holds and clears the consumer's
+				// record. This comes before the placement check, so that a check can't
+				// conclude the job without a restore while the consumer is going away.
 				logger.Info("Assigned PMJ consumer pod still exists (possibly terminating); requeuing to wait for completion",
 					"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
+			adoptStranded = true
+		}
 
+		// Place the restore on a node that can restore it (C8, #14). The
+		// constraints go into the update that removes the gate, the only
+		// time Kubernetes lets them be added, and they can't be removed
+		// after it. So before anything is written for the release, check
+		// that some node meets them, and if none does, hold the pod: the
+		// job then concludes without a restore, and the pod starts cold.
+		// The hold also clears the record of a consumer that is gone
+		// (adoptStranded), so the job doesn't conclude consumed while this
+		// pod is still gated. Only a Restoring job is checked, because only
+		// then does the job reconciler conclude a hold; in another phase a
+		// new release gets no constraints, as without placement. A release
+		// that is already under way, this pod's own, isn't checked again,
+		// and the engine isn't asked yet: it gets the constraints below.
+		var placement []corev1.NodeSelectorRequirement
+		underWay := releaseUnderWay(job, pod)
+		if phase == pmv1alpha1.PodMigrationJobPhaseRestoring && !underWay {
+			if placement, err = r.restorePlacement(ctx, job); err != nil {
+				logger.Error(err, "Failed to get the restore's node constraints", "pmj", correctedPMJ)
+				return ctrl.Result{}, err
+			}
+			if len(placement) > 0 {
+				fits, err := r.someNodeFits(ctx, pod, placement)
+				if err != nil {
+					logger.Error(err, "Failed to check the nodes against the restore's node constraints", "pmj", correctedPMJ)
+					return ctrl.Result{}, err
+				}
+				if !fits {
+					return r.holdForNoCompatibleNode(ctx, pod, job, placement, adoptStranded)
+				}
+			}
+		}
+
+		if adoptStranded {
 			logger.Info("Recorded consumer pod no longer exists and gate was never released; recovering stranded PMJ for adoption",
 				"deadConsumerPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "pmj", correctedPMJ)
 
@@ -430,12 +437,17 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 		// 1. Durable record first: mark GateReleased = true on PMJ status before un-gating the pod.
 		// If this fails, the pod is still gated, fails closed, and cannot restore until retried.
-		// Using Patch avoids cached-Get stale resourceVersion conflicts and avoids clobbering
-		// sibling status fields touched by concurrent reconcilers.
+		// A merge patch with a resourceVersion check fails on any concurrent change instead of
+		// overwriting it. That matters on a retry, where the Consumed write above is skipped: a
+		// stale view must not release this pod with a restore order onto a job that has
+		// concluded since, for example without a restore after another pod's hold.
 		if !job.Status.GateReleased {
-			patch := client.MergeFrom(job.DeepCopy())
+			orig := job.DeepCopy()
+			patch := client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
 			job.Status.GateReleased = true
 			if err := r.Status().Patch(ctx, job, patch); err != nil {
+				// Nothing was written, so keep the job as it was read.
+				*job = *orig
 				logger.Error(err, "Failed to patch GateReleased on PMJ status", "job", job.Name)
 				return ctrl.Result{}, err
 			}

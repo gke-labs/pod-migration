@@ -546,7 +546,10 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		return job
 	}
 
-	t.Run("a dead pod consumed the job and no node fits: holds before adopting", func(t *testing.T) {
+	t.Run("a dead pod consumed the job and no node fits: holds, and clears the dead pod's record", func(t *testing.T) {
+		// The dead pod's gate was never released, so it never restored.
+		// With its record cleared, the job concludes unconsumed, so I3
+		// doesn't report this pod while it waits for the cold release.
 		run := reconcilePlacement(t, true, nil, placementPod(), strandedJob(), placementNode("e2-a", "e2-medium"))
 		if run.err != nil {
 			t.Fatalf("Reconcile() error = %v", run.err)
@@ -554,8 +557,8 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		if !podHasMigrationGate(run.pod) {
 			t.Error("pod was released, want it held")
 		}
-		if run.job.Status.RestoredPodUID != "dead-uid" {
-			t.Errorf("RestoredPodUID = %q, want the dead pod's: the held pod doesn't adopt the job", run.job.Status.RestoredPodUID)
+		if got := run.job.Status; got.Consumed || got.RestoredPodUID != "" || got.RestoredPodName != "" || got.GateReleased {
+			t.Errorf("job status = %+v, want the dead pod's record cleared, and the held pod not adopting the job", got)
 		}
 		if _, held := noCompatibleNode(run.job); !held {
 			t.Errorf("conditions = %+v, want NoCompatibleNode", run.job.Status.Conditions)
@@ -650,6 +653,182 @@ func TestPodGateReconciler_RestorePlacement(t *testing.T) {
 		}
 		if !podHasMigrationGate(run.pod) || run.job.Status.Consumed || len(run.job.Status.Conditions) != 0 {
 			t.Errorf("pod gated %t, job status %+v; want the pod gated and the job untouched", podHasMigrationGate(run.pod), run.job.Status)
+		}
+	})
+
+	t.Run("NoCompatibleNode recorded and placement turned off since: keeps holding", func(t *testing.T) {
+		// The job reconciler concludes the job on the hold either way, so
+		// the pod waits for the cold release rather than being released
+		// with the restore order meanwhile.
+		job := placementJob()
+		job.Status.Conditions = []metav1.Condition{noCompatibleNodeCondition()}
+		run := reconcilePlacement(t, false, nil, placementPod(), job, placementNode("n2-a", "n2-standard-4"))
+		if run.err != nil || run.result.RequeueAfter != 30*time.Second {
+			t.Fatalf("Reconcile() = %+v, %v; want a 30s backstop requeue", run.result, run.err)
+		}
+		if !podHasMigrationGate(run.pod) || run.job.Status.Consumed || run.job.Status.GateReleased {
+			t.Errorf("pod gated %t, job status %+v; want the pod held and the job neither consumed nor released", podHasMigrationGate(run.pod), run.job.Status)
+		}
+	})
+
+	t.Run("the engine states constraints that aren't valid label requirements: releases without them", func(t *testing.T) {
+		// The API server would reject the pod update that adds them, and a
+		// retry would fail the same way, or the scheduler could never match
+		// them (Gt with a non-number), so the pod gets none, as for an
+		// engine that states none.
+		invalid := map[string]corev1.NodeSelectorRequirement{
+			"unknown operator":         {Key: "example.com/cpu", Operator: "Near", Values: []string{"icelake"}},
+			"In without values":        {Key: "example.com/cpu", Operator: corev1.NodeSelectorOpIn},
+			"Gt with a non-number":     {Key: "example.com/cores", Operator: corev1.NodeSelectorOpGt, Values: []string{"many"}},
+			"a key that isn't a label": {Key: "not a key", Operator: corev1.NodeSelectorOpExists},
+		}
+		releasedWithout := func(t *testing.T, run placementRun, eng *placementEngine) {
+			t.Helper()
+			if run.err != nil {
+				t.Fatalf("Reconcile() error = %v", run.err)
+			}
+			if podHasMigrationGate(run.pod) || !run.job.Status.GateReleased || run.pod.Annotations[routedRestoreAnnotation] != placementSnapshot {
+				t.Errorf("pod gated %t, restore order %q, job status %+v; want it released with the engine's restore order", podHasMigrationGate(run.pod), run.pod.Annotations[routedRestoreAnnotation], run.job.Status)
+			}
+			if terms := requiredTerms(run.pod); terms != nil {
+				t.Errorf("pod has required node affinity %+v, want none", terms)
+			}
+			if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
+				t.Errorf("RestorePlacement condition = %+v, want none", cond)
+			}
+			if eng.calls != 1 {
+				t.Errorf("Placement() called %d times, want 1", eng.calls)
+			}
+		}
+		for name, req := range invalid {
+			t.Run(name, func(t *testing.T) {
+				eng := &placementEngine{
+					orderingEngine: orderingEngine{routedEngine{name: "placing", provider: &fakeSnapshotProvider{}}},
+					reqs:           []corev1.NodeSelectorRequirement{instanceTypeIn("n2-standard-4"), req},
+				}
+				run := reconcilePlacement(t, true, registryOf(t, eng), placementPod(), placementJob(), placementNode("n2-a", "n2-standard-4"))
+				releasedWithout(t, run, eng)
+				if !hasEventWith(run.events, "MigrationRestoreReleased", "without node constraints") {
+					t.Errorf("events = %q, want the release event to say there are no node constraints", run.events)
+				}
+			})
+		}
+		t.Run("on a retry of a release under way", func(t *testing.T) {
+			eng := &placementEngine{
+				orderingEngine: orderingEngine{routedEngine{name: "placing", provider: &fakeSnapshotProvider{}}},
+				reqs:           []corev1.NodeSelectorRequirement{invalid["unknown operator"]},
+			}
+			job := placementJob()
+			job.Status.Consumed = true
+			job.Status.RestoredPodUID = placementPodUID
+			job.Status.RestoredPodName = placementPodName
+			releasedWithout(t, reconcilePlacement(t, true, registryOf(t, eng), placementPod(), job), eng)
+		})
+	})
+
+	t.Run("the recorded consumer is still terminating: waits before checking", func(t *testing.T) {
+		// No node fits, so a check would hold the pod and conclude the job
+		// cold. The consumer that is going away comes first: once it's
+		// gone, this pod can adopt the job.
+		job := placementJob()
+		job.Status.Consumed = true
+		job.Status.RestoredPodUID = "terminating-uid"
+		job.Status.RestoredPodName = "terminating-replacement"
+		now := metav1.Now()
+		terminating := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace:         placementNamespace,
+			Name:              "terminating-replacement",
+			UID:               "terminating-uid",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"example.com/hold"},
+		}}
+		run := reconcilePlacement(t, true, nil, placementPod(), job, terminating, placementNode("e2-a", "e2-medium"))
+		if run.err != nil || run.result.RequeueAfter != 5*time.Second {
+			t.Fatalf("Reconcile() = %+v, %v; want a 5s requeue to wait for the consumer", run.result, run.err)
+		}
+		if !podHasMigrationGate(run.pod) {
+			t.Error("pod was released, want it gated")
+		}
+		if cond := meta.FindStatusCondition(run.job.Status.Conditions, ConditionRestorePlacement); cond != nil {
+			t.Errorf("RestorePlacement condition = %+v, want none while the consumer is going away", cond)
+		}
+		if run.job.Status.RestoredPodUID != "terminating-uid" {
+			t.Errorf("RestoredPodUID = %q, want the terminating consumer's", run.job.Status.RestoredPodUID)
+		}
+	})
+
+	t.Run("a stale view on a retry can't release the pod onto a concluded job", func(t *testing.T) {
+		// This pod consumed the job, and the GateReleased write failed; on
+		// the retry the Consumed write is skipped. Meanwhile the job
+		// concluded without a restore. The GateReleased patch checks the
+		// resourceVersion, so the stale view can't release the pod with a
+		// restore order onto a job that reports a cold start. And the
+		// failed patch leaves the job in memory as it was read.
+		scheme := runtime.NewScheme()
+		_ = corev1.AddToScheme(scheme)
+		_ = pmv1alpha1.AddToScheme(scheme)
+		key := types.NamespacedName{Namespace: placementNamespace, Name: placementJobName}
+		consumed := placementJob()
+		consumed.Status.Consumed = true
+		consumed.Status.RestoredPodUID = placementPodUID
+		consumed.Status.RestoredPodName = placementPodName
+		var stale, patched *pmv1alpha1.PodMigrationJob
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			WithObjects(placementPod(), consumed, placementNode("n2-a", "n2-standard-4")).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if job, ok := obj.(*pmv1alpha1.PodMigrationJob); ok && stale != nil && k == key {
+						stale.DeepCopyInto(job)
+						return nil
+					}
+					return c.Get(ctx, k, obj, opts...)
+				},
+				SubResourcePatch: func(ctx context.Context, c client.Client, subResource string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					if job, ok := obj.(*pmv1alpha1.PodMigrationJob); ok && subResource == "status" {
+						patched = job
+					}
+					return c.SubResource(subResource).Patch(ctx, obj, patch, opts...)
+				},
+			}).
+			Build()
+		ctx := context.Background()
+		read := &pmv1alpha1.PodMigrationJob{}
+		if err := cl.Get(ctx, key, read); err != nil {
+			t.Fatalf("getting the job: %v", err)
+		}
+		concluded := read.DeepCopy()
+		concluded.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+		if err := cl.Status().Update(ctx, concluded); err != nil {
+			t.Fatalf("concluding the job: %v", err)
+		}
+		stale = read
+
+		r := &PodGateReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(20), RestorePlacement: true}
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: placementNamespace, Name: placementPodName}})
+		stale = nil
+		if !apierrors.IsConflict(err) {
+			t.Fatalf("Reconcile() error = %v, want a conflict", err)
+		}
+		got := &pmv1alpha1.PodMigrationJob{}
+		if err := cl.Get(ctx, key, got); err != nil {
+			t.Fatalf("getting the job: %v", err)
+		}
+		if got.Status.GateReleased {
+			t.Errorf("job status = %+v, want no gate release recorded on the concluded job", got.Status)
+		}
+		if patched == nil || patched.Status.GateReleased {
+			t.Errorf("job in memory after the failed patch = %+v, want it as it was read, without GateReleased", patched)
+		}
+		pod := &corev1.Pod{}
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: placementNamespace, Name: placementPodName}, pod); err != nil {
+			t.Fatalf("getting the pod: %v", err)
+		}
+		if !podHasMigrationGate(pod) {
+			t.Error("pod was released, want it gated")
 		}
 	})
 }
@@ -794,11 +973,13 @@ func TestPodMigrationJobReconciler_NoCompatibleNode(t *testing.T) {
 	})
 
 	t.Run("a conclusion that conflicts isn't judged by the invariant checks", func(t *testing.T) {
-		// A replacement consumed the job and died before its release, and
-		// the next one is held. When the conclusion's patch conflicts,
-		// nothing is written, so the checks after the reconcile must see
-		// the job still Restoring: concluded and consumed, with a gated
-		// replacement, it would be an I3 violation.
+		// The job records a consumer, and the next replacement is held, so
+		// the checks would report a conclusion they wrongly saw: a
+		// concluded, consumed job with a gated replacement is an I3
+		// violation. (The pod gate's hold clears a dead consumer's record;
+		// here the record only makes a wrong view visible.) When the
+		// conclusion's patch conflicts, nothing is written, so the checks
+		// after the reconcile must see the job still Restoring.
 		scheme := runtime.NewScheme()
 		_ = corev1.AddToScheme(scheme)
 		_ = pmv1alpha1.AddToScheme(scheme)
@@ -991,6 +1172,19 @@ func TestNodeFits(t *testing.T) {
 			node: placementNode("n", "n2-standard-4", tierTaint),
 			pod:  tolerating(corev1.Toleration{Key: "example.com/tier", Operator: corev1.TolerationOpLt, Value: "3", Effect: corev1.TaintEffectNoSchedule}),
 		},
+		{
+			// The API server accepts Gt with a value that isn't a number,
+			// but the scheduler can't parse it, so the term matches no
+			// node. Match reports that as an error with false.
+			name: "a required term that the scheduler can't parse",
+			node: placementNode("n", "n2-standard-4"),
+			pod: func() *corev1.Pod {
+				p := pod.DeepCopy()
+				term := &p.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0]
+				term.MatchExpressions = append(term.MatchExpressions, corev1.NodeSelectorRequirement{Key: "example.com/tier", Operator: corev1.NodeSelectorOpGt, Values: []string{"abc"}})
+				return p
+			}(),
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1000,6 +1194,33 @@ func TestNodeFits(t *testing.T) {
 			}
 			if got := nodeFits(context.Background(), tc.node, p, nodeaffinity.GetRequiredNodeAffinity(p)); got != tc.want {
 				t.Errorf("nodeFits() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRestorePlacement_KeepsValidConstraints pins the valid side of the
+// check that drops an engine's invalid constraints: a valid requirement with
+// any operator that node affinity accepts must reach the pod.
+func TestRestorePlacement_KeepsValidConstraints(t *testing.T) {
+	valid := []corev1.NodeSelectorRequirement{
+		instanceTypeIn("n2-standard-4"),
+		{Key: "example.com/cpu", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"icelake"}},
+		{Key: "example.com/gpu", Operator: corev1.NodeSelectorOpExists},
+		{Key: "example.com/spot", Operator: corev1.NodeSelectorOpDoesNotExist},
+		{Key: "example.com/cores", Operator: corev1.NodeSelectorOpGt, Values: []string{"4"}},
+		{Key: "example.com/cores", Operator: corev1.NodeSelectorOpLt, Values: []string{"64"}},
+	}
+	for _, req := range valid {
+		t.Run(string(req.Operator), func(t *testing.T) {
+			eng := &placementEngine{
+				orderingEngine: orderingEngine{routedEngine{name: "placing", provider: &fakeSnapshotProvider{}}},
+				reqs:           []corev1.NodeSelectorRequirement{req},
+			}
+			r := &PodGateReconciler{RestorePlacement: true, Engines: registryOf(t, eng)}
+			got, err := r.restorePlacement(context.Background(), placementJob())
+			if err != nil || !reflect.DeepEqual(got, []corev1.NodeSelectorRequirement{req}) {
+				t.Errorf("restorePlacement() = %+v, %v; want %+v kept", got, err, req)
 			}
 		})
 	}
@@ -1192,12 +1413,12 @@ func TestRestorePlacement_NoCompatibleNodeFlow(t *testing.T) {
 
 // TestRestorePlacement_StrandedJobHoldFlow runs the flow for a job that a
 // replacement consumed and then died before its gate was released, when no
-// node can restore the checkpoint for the next replacement. The job
-// concludes consumed while that replacement is still gated, so I3 reports
-// it until the pod gate releases the pod, as it already does for a stranded
-// job that reaches the restore ceiling. Once the pod is released, no
-// invariant fires. The job keeps naming the dead pod, as it does on that
-// path too: the cold release doesn't rewrite a consumed job's record.
+// node can restore the checkpoint for the next replacement. The hold clears
+// the dead pod's record, so the job concludes unconsumed while the next
+// replacement is still gated, and no invariant fires at any step: a job that
+// concluded consumed with a gated pod would be an I3 violation. The cold
+// release then records the pod that started cold, as in the flow without a
+// dead consumer.
 func TestRestorePlacement_StrandedJobHoldFlow(t *testing.T) {
 	job := placementJob()
 	job.Status.Consumed = true
@@ -1207,12 +1428,11 @@ func TestRestorePlacement_StrandedJobHoldFlow(t *testing.T) {
 
 	f.reconcileGate("pod gate holds")
 	f.reconcileJob("job concludes")
-	if phase := f.job().Status.Phase; phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
-		t.Fatalf("phase = %s, want SucceededWithoutRestore", phase)
+	if got := f.job().Status; got.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore || got.Consumed {
+		t.Fatalf("job status = %+v, want SucceededWithoutRestore and unconsumed", got)
 	}
-	before := f.events()
-	if found := violations(before); len(found) > 0 && !hasEventWith(found, "[I3:") {
-		t.Errorf("violations while the pod is held = %q, want at most I3", found)
+	for _, v := range violations(f.events()) {
+		t.Errorf("invariant violation while the pod is held: %s", v)
 	}
 
 	f.reconcileGate("pod gate releases cold")
@@ -1221,7 +1441,7 @@ func TestRestorePlacement_StrandedJobHoldFlow(t *testing.T) {
 	for _, v := range violations(f.events()) {
 		t.Errorf("invariant violation after the release: %s", v)
 	}
-	if got := f.job().Status; got.RestoredPodUID != "dead-uid" || got.RestoredPodName != "dead-replacement" {
-		t.Errorf("job records pod %s (%s), want the dead pod still", got.RestoredPodName, got.RestoredPodUID)
+	if got := f.job().Status; got.RestoredPodUID != placementPodUID || got.RestoredPodName != placementPodName {
+		t.Errorf("job records pod %s (%s), want the pod that started cold", got.RestoredPodName, got.RestoredPodUID)
 	}
 }

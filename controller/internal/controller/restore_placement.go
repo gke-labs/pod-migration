@@ -62,7 +62,10 @@ const (
 // checkpoint needs (C8, #14), from the engine that orders the restore: the
 // job's engine, or GKE Pod Snapshots without a registry, as for the restore
 // order. An engine without the PlacementAdvisor capability states none, and
-// so does every engine while RestorePlacement is off. Like
+// so does every engine while RestorePlacement is off. Constraints that
+// aren't valid node label requirements are dropped too: the API server would
+// reject the update that adds them, so the release, retried as is, would
+// keep failing, or the scheduler could never match them. Like
 // jobRestoreOrderer, it fails when job names an engine that isn't
 // registered: another engine's constraints would place the wrong restore,
 // and the job reconciler fails such a job (#80).
@@ -85,13 +88,28 @@ func (r *PodGateReconciler) restorePlacement(ctx context.Context, job *pmv1alpha
 		return nil, nil
 	}
 	reqs, err := advisor.Placement(ctx, job)
-	if err == nil && len(reqs) == 0 {
+	if err != nil {
+		return nil, err
+	}
+	if len(reqs) == 0 {
 		// For GKE Pod Snapshots: the job recorded no machine type.
 		log.FromContext(ctx).Info("The snapshot engine states no node constraints for the restore, so the replacement gets none",
 			"pmj", job.Name, "engine", eng.Name())
+		return nil, nil
 	}
-	return reqs, err
+	if _, ok := labelSelectorFor(reqs); !ok {
+		// An engine bug: the replacement gets no constraints, as for data
+		// the engine can't use (C8), rather than staying gated.
+		log.FromContext(ctx).Error(errInvalidPlacement, "The snapshot engine states node constraints that aren't valid node label requirements, so the replacement gets none",
+			"pmj", job.Name, "engine", eng.Name(), "constraints", describeRequirements(reqs))
+		return nil, nil
+	}
+	return reqs, nil
 }
+
+// errInvalidPlacement is logged when an engine states node constraints that
+// aren't valid node label requirements.
+var errInvalidPlacement = errors.New("invalid node constraints")
 
 // releaseUnderWay reports whether pod's release with a restore order has
 // started: the job records the gate as released, or pod has consumed the
@@ -125,11 +143,19 @@ func noCompatibleNode(job *pmv1alpha1.PodMigrationJob) (*metav1.Condition, bool)
 // released with the cold-start bypass and without the constraints. The job
 // concludes before the pod starts, so a pod that started cold is never
 // counted as restored (I2).
-func (r *PodGateReconciler) holdForNoCompatibleNode(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, reqs []corev1.NodeSelectorRequirement) (ctrl.Result, error) {
+//
+// deadConsumer says that job records another pod as its consumer, one that
+// no longer exists and whose gate was never released, so it never restored.
+// The same patch clears that record: the job then concludes unconsumed, and
+// the cold release records pod as the one that fell back. A job that
+// concluded consumed while pod is still gated would be reported by I3 until
+// the release.
+func (r *PodGateReconciler) holdForNoCompatibleNode(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, reqs []corev1.NodeSelectorRequirement, deadConsumer bool) (ctrl.Result, error) {
 	message := fmt.Sprintf("No Ready node that pod %s can run on, by its node selector, node affinity and tolerations, meets the restore's node constraints (%s), so the pod starts without the restore",
 		pod.Name, describeRequirements(reqs))
 	// The conditions list is replaced as a whole by a merge patch, so don't
-	// overwrite a concurrent change to it.
+	// overwrite a concurrent change to it. The resourceVersion check also
+	// keeps a dead consumer's record from being cleared on a stale view.
 	orig := job.DeepCopy()
 	patch := client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
 	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
@@ -139,6 +165,11 @@ func (r *PodGateReconciler) holdForNoCompatibleNode(ctx context.Context, pod *co
 		Message:            message,
 		ObservedGeneration: job.Generation,
 	})
+	if deadConsumer {
+		job.Status.Consumed = false
+		job.Status.RestoredPodUID = ""
+		job.Status.RestoredPodName = ""
+	}
 	if err := r.Status().Patch(ctx, job, patch); err != nil {
 		// Nothing was written, so the invariant checks after this
 		// reconcile must see the job as it is.
@@ -151,8 +182,12 @@ func (r *PodGateReconciler) holdForNoCompatibleNode(ctx context.Context, pod *co
 		}
 		return ctrl.Result{}, err
 	}
-	log.FromContext(ctx).Info("No node can restore the checkpoint; holding the replacement until the job concludes without a restore",
-		"pmj", job.Name, "constraints", describeRequirements(reqs))
+	keysAndValues := []any{"pmj", job.Name, "constraints", describeRequirements(reqs)}
+	if deadConsumer {
+		keysAndValues = append(keysAndValues,
+			"clearedConsumerPodName", orig.Status.RestoredPodName, "clearedConsumerPodUID", orig.Status.RestoredPodUID)
+	}
+	log.FromContext(ctx).Info("No node can restore the checkpoint; holding the replacement until the job concludes without a restore", keysAndValues...)
 	if r.Recorder != nil {
 		r.Recorder.Eventf(pod, corev1.EventTypeWarning, ReasonNoCompatibleNode, "%s", message)
 	}
@@ -257,7 +292,9 @@ func nodeFits(ctx context.Context, node *corev1.Node, pod *corev1.Pod, affinity 
 	if node.Spec.Unschedulable && !schedulinghelper.TolerationsTolerateTaint(logger, pod.Spec.Tolerations, cordoned, tolerationComparisonOperators) {
 		return false
 	}
-	if match, err := affinity.Match(node); err != nil || !match {
+	// Match returns an error only together with false: no term matched,
+	// and a term couldn't be parsed. So an error doesn't count as a fit.
+	if match, _ := affinity.Match(node); !match {
 		return false
 	}
 	_, untolerated := schedulinghelper.FindMatchingUntoleratedTaint(logger, node.Spec.Taints, pod.Spec.Tolerations, func(t *corev1.Taint) bool {
@@ -275,9 +312,10 @@ func nodeReady(node *corev1.Node) bool {
 	return false
 }
 
-// labelSelectorFor converts reqs to a label selector that narrows a node
-// list. It reports false when one doesn't convert; nodeFits checks every
-// requirement anyway.
+// labelSelectorFor converts reqs to a label selector. It reports false when
+// one doesn't convert, because it isn't a valid label requirement:
+// restorePlacement then drops the engine's constraints, and someNodeFits
+// otherwise uses the selector to narrow the node list.
 func labelSelectorFor(reqs []corev1.NodeSelectorRequirement) (labels.Selector, bool) {
 	operators := map[corev1.NodeSelectorOperator]selection.Operator{
 		corev1.NodeSelectorOpIn:           selection.In,
