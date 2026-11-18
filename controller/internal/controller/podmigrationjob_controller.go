@@ -1659,6 +1659,26 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
+		// The pod gate found no node that can restore the checkpoint (C8,
+		// #14) and holds the replacement: conclude without a restore, and
+		// the gate then releases it cold. This comes before the restore
+		// ceiling, which waits for a gated replacement. The patch checks the
+		// resourceVersion, so a stale view can't conclude a job whose
+		// replacement the gate has since released with a restore order.
+		if cond, held := noCompatibleNode(job); held {
+			logger.Info("No node can restore the checkpoint; concluding without a restore", "job", job.Name)
+			orig := job.DeepCopy()
+			if err := r.markSucceededWithoutRestore(ctx, job, orig, ReasonNoCompatibleNode, cond.Message, client.MergeFromWithOptimisticLock{}); err != nil {
+				// Nothing was written, so the invariant checks after this
+				// reconcile must see the job as it is, not concluded.
+				*job = *orig
+				return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore on NoCompatibleNode")
+			}
+			metrics.RecordRestoreVerdict(r.jobEngine(job).Name(), "no_compatible_node")
+			r.eventf(job, corev1.EventTypeWarning, ReasonNoCompatibleNode, "%s", cond.Message)
+			return ctrl.Result{}, nil
+		}
+
 		// 2. Safety ceiling measured from RestoringStartTime: 5 minutes, plus
 		// the stabilization window. Having no verdict by then isn't a
 		// success (C6).
@@ -1978,7 +1998,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 // markSucceededWithoutRestore concludes the PMJ with the given reason on both
 // the Restored (False) and Ready (True) conditions, updates Prometheus metrics
 // (marking PMJ inactive, recording outcome, and recording previous phase duration).
-func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob, reason, message string) error {
+// opts apply to the status patch.
+func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob, reason, message string, opts ...client.MergeFromOption) error {
 	prevPhase := job.Status.Phase
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 	now := metav1.Now()
@@ -2000,7 +2021,7 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 	// The job is concluding, so a standing "unrecognised start failure" report
 	// no longer describes anything actionable.
 	r.clearUnrecognizedRestoreCrash(job)
-	if err := r.patchStatus(ctx, job, orig); err != nil {
+	if err := r.patchStatus(ctx, job, orig, opts...); err != nil {
 		return err
 	}
 	metrics.MarkPMJInactive(types.NamespacedName{Namespace: job.Namespace, Name: job.Name}.String())
@@ -2417,9 +2438,9 @@ func (r *PodMigrationJobReconciler) mapSnapshotToPMJ(ctx context.Context, obj cl
 
 // patchStatus updates the PodMigrationJob status using a MergeFrom patch,
 // falling back to Update if orig is nil.
-func (r *PodMigrationJobReconciler) patchStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob) error {
+func (r *PodMigrationJobReconciler) patchStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, orig *pmv1alpha1.PodMigrationJob, opts ...client.MergeFromOption) error {
 	if orig != nil {
-		patch := client.MergeFrom(orig)
+		patch := client.MergeFromWithOptions(orig, opts...)
 		return r.Status().Patch(ctx, job, patch)
 	}
 	return r.Status().Update(ctx, job)

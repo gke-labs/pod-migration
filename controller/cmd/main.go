@@ -93,6 +93,7 @@ func main() {
 		fenceLateStopWatch   time.Duration
 		runtimeClassEngines  string
 		restoreStabilization time.Duration
+		restorePlacement     bool
 		showVersion          bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -109,6 +110,7 @@ func main() {
 	flag.DurationVar(&fenceLateStopWatch, "fence-late-stop-watch", controller.DefaultFenceLateStopWatch, "How long the controller watches a source that a failed migration returned to service, to fence and evict it again if the snapshot engine stops it anyway")
 	flag.StringVar(&runtimeClassEngines, "runtime-class-engines", "", "Comma-separated class=engine routes that pick the snapshot engine for the pods of each migratable runtime class, e.g. gvisor="+engine.GKEPodSnapshotsName+" ("+eligibility.DefaultRuntimeClassToken+" matches pods without a runtimeClassName). Unset routes every --migratable-runtime-classes class to the default engine, "+engine.GKEPodSnapshotsName+". A PodMigration overrides routes for its namespace with the "+engine.AnnotationRuntimeClassEngines+" annotation.")
 	flag.DurationVar(&restoreStabilization, "restore-stabilization-window", controller.DefaultRestoreStabilizationWindow, fmt.Sprintf("How long a replacement pod must stay Ready without a container restart before a restore that its snapshot engine only inferred concludes as RestoreInferred; 0 concludes as soon as the pod is Ready. A restore the engine confirms (RestoreVerified) doesn't wait. At most %s.", controller.MaxRestoreStabilizationWindow))
+	flag.BoolVar(&restorePlacement, "restore-placement", false, "Experimental: place a replacement pod that restores a snapshot on a node its snapshot engine can restore on: the engine's node constraints (for GKE Pod Snapshots, the source node's machine type, if the job recorded it) go into the pod's required node affinity when its scheduling gate is released. If no Ready node that the pod's node selector, node affinity and tolerations allow (a cordoned node counts only if the pod tolerates it) meets them, the pod starts cold instead, and the job concludes SucceededWithoutRestore with reason "+controller.ReasonNoCompatibleNode+". The check decides once, when the gate is due for release, without waiting for a node to become Ready or be added, and a gated pod doesn't make the cluster autoscaler add one. It doesn't look at resources, volume zones, host ports, or pod affinity and topology spread, and nothing recovers a pod that passes it but stays Pending: once its job has concluded, delete the pod so that its controller recreates it without the constraints. This check is interim, until the controller can recreate a replacement that isn't scheduled by a deadline.")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -149,7 +151,8 @@ func main() {
 		"platform", ver.Platform,
 		"invariantMode", invariantMode,
 		"migratableRuntimeClasses", runtimeClassPolicy.String(),
-		"restoreStabilizationWindow", restoreStabilization)
+		"restoreStabilizationWindow", restoreStabilization,
+		"restorePlacement", restorePlacement)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -192,7 +195,9 @@ func main() {
 						// status.nodeInfo: the node preemption controller reads
 						// node state, and the PodMigrationJob reconciler records
 						// the source node's instance-type label and kubelet
-						// version (#14).
+						// version (#14). The pod gate's placement check also
+						// reads labels, spec.unschedulable, spec.taints and the
+						// Ready condition.
 						node.Status.Images = nil
 						node.ManagedFields = nil
 						return node, nil
@@ -278,12 +283,13 @@ func main() {
 	// PodGateReconciler hardcodes MaxConcurrentReconciles: 1 in its own
 	// SetupWithManager — see the comment there for the serialization contract.
 	if err := (&controller.PodGateReconciler{
-		Client:          mgr.GetClient(),
-		APIReader:       mgr.GetAPIReader(),
-		Scheme:          mgr.GetScheme(),
-		Recorder:        eventRecorder,
-		InvariantEngine: invariantEngine,
-		Engines:         engines,
+		Client:           mgr.GetClient(),
+		APIReader:        mgr.GetAPIReader(),
+		Scheme:           mgr.GetScheme(),
+		Recorder:         eventRecorder,
+		InvariantEngine:  invariantEngine,
+		Engines:          engines,
+		RestorePlacement: restorePlacement,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
 		os.Exit(1)

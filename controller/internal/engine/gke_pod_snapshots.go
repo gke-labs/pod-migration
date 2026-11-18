@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -68,9 +69,10 @@ type GKEPodSnapshots struct {
 }
 
 var (
-	_ Engine          = (*GKEPodSnapshots)(nil)
-	_ RestoreOrderer  = (*GKEPodSnapshots)(nil)
-	_ RestoreVerifier = (*GKEPodSnapshots)(nil)
+	_ Engine           = (*GKEPodSnapshots)(nil)
+	_ RestoreOrderer   = (*GKEPodSnapshots)(nil)
+	_ RestoreVerifier  = (*GKEPodSnapshots)(nil)
+	_ PlacementAdvisor = (*GKEPodSnapshots)(nil)
 )
 
 // GKEOption configures the GKE Pod Snapshots engine.
@@ -274,6 +276,35 @@ func (*GKEPodSnapshots) InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string
 		return "", true, true
 	}
 	return trimmed, false, true
+}
+
+// Placement implements PlacementAdvisor. A gVisor checkpoint restored on a
+// node of another machine type can fail restore validation and crash-loop
+// (#14), so the replacement must land on a node of the source node's machine
+// type: the node.kubernetes.io/instance-type label value that the job
+// recorded in status.originNodeInstanceType while it was Pending.
+//
+// An empty value means the machine type is unknown: the source node couldn't
+// be read while the job was Pending, it has no such label, or the job was
+// past Pending when the controller started recording it. Such a job gets no
+// constraint, as before, and so does a value that isn't a valid label value,
+// since no node could carry it.
+//
+// The node's GKE version has to match too, or GKE Pod Snapshots starts the
+// pod cold, but no node label carries it, so it isn't a constraint here.
+func (*GKEPodSnapshots) Placement(_ context.Context, job *pmv1alpha1.PodMigrationJob) ([]corev1.NodeSelectorRequirement, error) {
+	if job == nil {
+		return nil, errors.New("placing a restore needs a job")
+	}
+	instanceType := job.Status.OriginNodeInstanceType
+	if instanceType == "" || len(validation.IsValidLabelValue(instanceType)) > 0 {
+		return nil, nil
+	}
+	return []corev1.NodeSelectorRequirement{{
+		Key:      corev1.LabelInstanceTypeStable,
+		Operator: corev1.NodeSelectorOpIn,
+		Values:   []string{instanceType},
+	}}, nil
 }
 
 // gkeColdStartReason is the Reason of the ColdStart verdict.
