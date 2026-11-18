@@ -31,6 +31,7 @@ import (
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/node"
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine"
+	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
 
 var scheme = runtime.NewScheme()
@@ -41,9 +42,11 @@ func init() {
 
 func main() {
 	var probeAddr string
+	var apiGroup string
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8091", "health probe bind address (hostNetwork)")
+	flag.StringVar(&apiGroup, "api-group", contract.DefaultGroup, "API group of the snapshot engine CRDs; must match the engine controller's --api-group")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 20, "Kubernetes API client QPS limit")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 40, "Kubernetes API client burst limit")
 	opts := zap.Options{Development: true}
@@ -52,6 +55,12 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	log := ctrl.Log.WithName("setup")
+
+	if err := contract.SetGroup(apiGroup); err != nil {
+		log.Error(err, "invalid --api-group")
+		os.Exit(1)
+	}
+	log.Info("serving the snapshot engine API", "group", contract.Group, "restoreAnnotation", contract.AnnotationPSName)
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {

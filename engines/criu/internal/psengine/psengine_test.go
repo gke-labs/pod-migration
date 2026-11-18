@@ -409,7 +409,7 @@ func TestVerifyCRDOwnershipClobbered(t *testing.T) {
 		"addonmanager.kubernetes.io/mode": "EnsureExists",
 	})
 	var objs []runtime.Object
-	for _, n := range contractCRDs {
+	for _, n := range contract.CRDNames(contract.Group) {
 		cc := &unstructured.Unstructured{}
 		cc.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
 		cc.SetName(n)

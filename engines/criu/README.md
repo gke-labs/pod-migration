@@ -42,8 +42,9 @@
 >     not automatically uninstall those host files.
 
 `engines/criu` is a standalone snapshot engine for the `gke-labs/pod-migration`
-controller that implements the `podsnapshot.gke.io/v1` CustomResource contract
-for single-container `runc` pods using [CRIU](https://criu.org/).
+controller that implements the snapshot engine CustomResource contract
+(`podsnapshot.gke.io/v1` by default; see [API group](#api-group)) for
+single-container `runc` pods using [CRIU](https://criu.org/).
 
 ## Architecture
 
@@ -51,9 +52,11 @@ The CRIU snapshot engine consists of three binaries built from this Go module
 (`github.com/gke-labs/pod-migration/engines/criu`):
 
 1. **`cmd/engine` (cluster controller + mutating webhook):**
-   - Runs a startup preflight (`psengine.VerifyCRDOwnership`) that refuses to
-     start if the `podsnapshot.gke.io` CRDs are missing or owned by the managed
-     GKE Pod Snapshots addon.
+   - Runs a startup preflight (`psengine.Preflight`) before it serves
+     anything. It refuses to start if the contract CRDs of its API group are
+     missing or owned by another provider (on the default group, the managed
+     GKE Pod Snapshots addon). On another group with the restore webhook on,
+     it also refuses to start next to the addon.
    - Reconciles `PodSnapshotPolicy` objects labeled
      `pod-migrate.io/engine: criu`, probing the referenced
      `PodSnapshotStorageConfig` GCS bucket and publishing `Ready=True` +
@@ -99,8 +102,8 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      labels each `PodSnapshot` `gke-pod-snapshot-triggered-by: <trigger>` (when
      the trigger name fits in a label value), so the orchestrator finds
      unfinished snapshots after the trigger is deleted.
-   - Reconciles replacement pods on its node carrying
-     `podsnapshot.gke.io/ps-name` (`psengine.NodeRestoreReconciler`): downloads
+   - Reconciles replacement pods on its node carrying the restore order,
+     `<group>/ps-name` (`psengine.NodeRestoreReconciler`): downloads
      and SHA-256 verifies the archive from GCS, checks CPU family compatibility,
      prepares an overlayfs rootfs with `rootfs-diff.tar`, rewrites the OCI spec
      (`node.AdaptSpec`), restores the process tree as a sibling `runc` container
@@ -109,16 +112,42 @@ The CRIU snapshot engine consists of three binaries built from this Go module
 3. **`cmd/holder` (static scratch binary):**
    - Seeded into replacement pods via an `initContainer` (`/holder seed`).
    - Wraps the replacement container's entrypoint (`/holder wrap`): reads
-     `podsnapshot.gke.io/ps-name` and `pod-migrate.io/psengine-restore` from a
+     the restore order and `pod-migrate.io/psengine-restore` from a
      downward-API volume, holding the pod sandbox alive when `restored` or
      falling through to `exec` the original command on restore failure/timeout.
+
+## API group
+
+The engine serves its four contract CRs (`PodSnapshotStorageConfig`,
+`PodSnapshotPolicy`, `PodSnapshotManualTrigger`, `PodSnapshot`) in one API
+group, set with `--api-group` on both `cmd/engine` and `cmd/agent`; the two
+must match. The restore order follows the group: the agent restores pods
+annotated with `<group>/ps-name`, and the restore webhook passes that key to
+`holder wrap` as `--ps-name-annotation` whenever it isn't the holder's
+default, `podsnapshot.gke.io/ps-name`.
+
+The default group is `podsnapshot.gke.io`, the GKE Pod Snapshots addon's
+group. Another group doesn't yet change where the engine can run: the
+pod-migration controller still uses only `podsnapshot.gke.io` objects and the
+`podsnapshot.gke.io/ps-name` restore order, and the restore webhook rewires
+every gated replacement pod, including gVisor pods that the addon restores.
+So on another group with the webhook on, the engine refuses to start if the
+addon's CRDs are present. Keep the default, on addon-off clusters only, until
+the controller can target the engine's group
+([#135](https://github.com/gke-labs/pod-migration/issues/135)).
+To test another group, change it in `deploy/crds.yaml` (each CRD's name and
+`spec.group`) and in the `deploy/deploy.yaml` RBAC rules, pass the same
+`--api-group` to both binaries, and use a holder image from this release or
+later (older holders reject `--ps-name-annotation`).
 
 ## Node & Cluster Requirements
 
 - **Addon-off test clusters only (v1):** Apply `deploy/crds.yaml` only on
-  clusters where the managed GKE Pod Snapshots addon is disabled. The engine's
-  startup preflight refuses to run if foreign-owned `podsnapshot.gke.io` CRDs
-  are present.
+  clusters where the managed GKE Pod Snapshots addon is disabled. On the
+  default group, the engine's startup preflight refuses to run if
+  foreign-owned `podsnapshot.gke.io` CRDs are present; on another group it
+  refuses only while the restore webhook is on (the default), since that
+  webhook would also rewrite the gVisor pods the addon restores.
 - **Linux kernel & runtime:** Nodes running `containerd` 2.x + `runc` with
   kubelet `ContainerCheckpoint` enabled and a kernel passing `criu check`.
 - **Workload scope (v1):**

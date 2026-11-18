@@ -16,7 +16,10 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,6 +32,9 @@ import (
 // Annotation keys read from the downward-API annotations file (duplicated as
 // literals so the holder stays stdlib-only / scratch-buildable).
 const (
+	// annPSName is the restore order the wrapper waits for unless
+	// --ps-name-annotation names another: the key of the GKE Pod Snapshots
+	// group. An engine on another group passes its own key (#135).
 	annPSName        = "podsnapshot.gke.io/ps-name"
 	annRestoreStatus = "pod-migrate.io/psengine-restore"
 	statusRestored   = "restored"
@@ -56,15 +62,16 @@ const (
 
 // decideAction polls the downward-API annotations file and chooses between
 // holding the sandbox (restore succeeded) and falling through to the
-// original entrypoint (bypass, restore failed, or timeout). Pure over the
-// file path + timeouts so unit tests run in milliseconds.
-func decideAction(annotationsFile string, assignWait, restoreWait, poll time.Duration) (wrapOutcome, string) {
+// original entrypoint (bypass, restore failed, or timeout). psNameAnnotation
+// is the restore order to wait for. Pure over the file path + timeouts so
+// unit tests run in milliseconds.
+func decideAction(annotationsFile, psNameAnnotation string, assignWait, restoreWait, poll time.Duration) (wrapOutcome, string) {
 	// Phase 1 — is this pod ordered to restore?
 	assignDeadline := time.Now().Add(assignWait)
 	psName := ""
 	for {
 		anns := readAnnotationsFile(annotationsFile)
-		if v, ok := anns[annPSName]; ok {
+		if v, ok := anns[psNameAnnotation]; ok {
 			if v != "" {
 				psName = v
 				break
@@ -122,16 +129,38 @@ func readAnnotationsFile(path string) map[string]string {
 	return out
 }
 
+// wrapUsage is the wrap mode's command line.
+const wrapUsage = "usage: holder wrap [--ps-name-annotation=<key>] <annotations-file> -- <cmd> [args...]"
+
+// parseWrapArgs parses the wrap mode's arguments,
+// [--ps-name-annotation=<key>] <annotations-file> -- <cmd> [args...], and
+// returns the annotations file, the restore-order annotation (annPSName
+// unless the flag names another) and the original command.
+func parseWrapArgs(args []string) (annFile, psNameAnnotation string, orig []string, err error) {
+	fs := flag.NewFlagSet("wrap", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	key := fs.String("ps-name-annotation", annPSName, "restore-order annotation to wait for")
+	if err := fs.Parse(args); err != nil {
+		return "", "", nil, err
+	}
+	rest := fs.Args()
+	if len(rest) < 3 || rest[1] != "--" {
+		return "", "", nil, errors.New("want an annotations file, then --, then the command")
+	}
+	if *key == "" {
+		return "", "", nil, errors.New("--ps-name-annotation is empty")
+	}
+	return rest[0], *key, rest[2:], nil
+}
+
 func runWrap(args []string) {
-	// args: <annotations-file> -- <orig-cmd...>
-	if len(args) < 3 || args[1] != "--" {
-		fmt.Fprintf(os.Stderr, "usage: holder wrap <annotations-file> -- <cmd> [args...]\n")
+	annFile, psNameAnnotation, orig, err := parseWrapArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "holder wrap: %v\n%s\n", err, wrapUsage)
 		os.Exit(2)
 	}
-	annFile := args[0]
-	orig := args[2:]
 
-	outcome, reason := decideAction(annFile, defaultAssignWait, defaultRestoreWait, pollInterval)
+	outcome, reason := decideAction(annFile, psNameAnnotation, defaultAssignWait, defaultRestoreWait, pollInterval)
 	fmt.Fprintf(os.Stderr, "holder wrap: %s\n", reason)
 
 	if outcome == outcomeHold {

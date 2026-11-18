@@ -13,35 +13,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package contract pins the podsnapshot.gke.io surface the gke-labs
+// Package contract pins the snapshot engine surface the gke-labs
 // pod-migration orchestrator reads and writes. This is the entire engine
 // interface: four unstructured CRs plus one restore annotation. Every
 // accessor here mirrors a specific call site in the orchestrator (citations
 // inline, paths relative to its repo's controller/ directory). If the
 // orchestrator moves a field, this package — and its tests — is the single
 // place that breaks.
+//
+// The CRs live in the engine's API group (Group), which defaults to
+// DefaultGroup; SetGroup moves them to another group, and the restore
+// annotation follows the group (#135).
 package contract
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
-	// Group/Version of the snapshot engine API.
-	Group   = "podsnapshot.gke.io"
+	// GKEPodSnapshotsGroup is the API group of the managed GKE Pod
+	// Snapshots add-on. An engine serving it can only run where the add-on
+	// is off, because the add-on owns those CRDs.
+	GKEPodSnapshotsGroup = "podsnapshot.gke.io"
+	// DefaultGroup is the API group the engine serves unless SetGroup
+	// picks another.
+	DefaultGroup = GKEPodSnapshotsGroup
+	// Version of the snapshot engine API.
 	Version = "v1"
 
-	// AnnotationPSName is the restore order: set by the orchestrator's pod
-	// gate controller on the replacement pod (pod_gate_controller.go:125),
-	// "" means restore-bypass (replacement_webhook.go:62).
-	AnnotationPSName = "podsnapshot.gke.io/ps-name"
+	// restoreAnnotationName is the name part of the restore order; the
+	// engine's group is its prefix (RestoreAnnotation).
+	restoreAnnotationName = "ps-name"
+
 	// AnnotationAssignedPMJ marks a replacement pod's PMJ assignment
 	// (replacement_webhook.go:91) — the trigger for holder injection.
 	AnnotationAssignedPMJ = "pod-migration.gke.io/assigned-pmj"
@@ -106,14 +118,101 @@ const (
 	RestoreStatusFailed     = "failed"
 )
 
-// GroupVersionKinds of the four contract CRs.
+// The engine's API group and what follows from it. They hold DefaultGroup
+// until SetGroup changes them. They aren't synchronized: main sets the group
+// once at startup, before any client, cache or controller reads them.
 var (
-	GVKStorageConfig   = schema.GroupVersionKind{Group: Group, Version: Version, Kind: "PodSnapshotStorageConfig"}
-	GVKPolicy          = schema.GroupVersionKind{Group: Group, Version: Version, Kind: "PodSnapshotPolicy"}
-	GVKManualTrigger   = schema.GroupVersionKind{Group: Group, Version: Version, Kind: "PodSnapshotManualTrigger"}
+	// Group is the API group of the four contract CRs.
+	Group = DefaultGroup
+
+	// AnnotationPSName is the restore order on a replacement pod, with Group
+	// as its prefix. The orchestrator sets it to the snapshot name
+	// (gke_pod_snapshots.go:243), and to "" for a restore bypass
+	// (gke_pod_snapshots.go:257, replacement_webhook.go:150) — so far only
+	// for DefaultGroup, until it can target another group (#135).
+	AnnotationPSName = RestoreAnnotation(DefaultGroup)
+
+	// GroupVersionKinds of the four contract CRs, in Group.
+	GVKStorageConfig = gvk(DefaultGroup, kindStorageConfig)
+	GVKPolicy        = gvk(DefaultGroup, kindPolicy)
+	GVKManualTrigger = gvk(DefaultGroup, kindManualTrigger)
+	GVKPodSnapshot   = gvk(DefaultGroup, kindPodSnapshot)
+
+	// GVKPodMigrationJob is the orchestrator's own job kind. Its group
+	// doesn't follow Group.
 	GVKPodMigrationJob = schema.GroupVersionKind{Group: "podmigration.gke.io", Version: "v1alpha1", Kind: "PodMigrationJob"}
-	GVKPodSnapshot     = schema.GroupVersionKind{Group: Group, Version: Version, Kind: "PodSnapshot"}
 )
+
+// Kinds of the four contract CRs, and their CRD plurals.
+const (
+	kindStorageConfig = "PodSnapshotStorageConfig"
+	kindPolicy        = "PodSnapshotPolicy"
+	kindManualTrigger = "PodSnapshotManualTrigger"
+	kindPodSnapshot   = "PodSnapshot"
+)
+
+var crdPlurals = []string{
+	"podsnapshotstorageconfigs",
+	"podsnapshotpolicies",
+	"podsnapshotmanualtriggers",
+	"podsnapshots",
+}
+
+func gvk(group, kind string) schema.GroupVersionKind {
+	return schema.GroupVersionKind{Group: group, Version: Version, Kind: kind}
+}
+
+// SetGroup sets the engine's API group; Group, AnnotationPSName and the four
+// contract GVKs follow it. It rejects a group that a
+// CustomResourceDefinition can't declare (ValidateGroup), and then changes
+// nothing. Call it once at startup, before anything reads the contract; it
+// isn't safe for concurrent use.
+func SetGroup(group string) error {
+	if err := ValidateGroup(group); err != nil {
+		return err
+	}
+	Group = group
+	AnnotationPSName = RestoreAnnotation(group)
+	GVKStorageConfig = gvk(group, kindStorageConfig)
+	GVKPolicy = gvk(group, kindPolicy)
+	GVKManualTrigger = gvk(group, kindManualTrigger)
+	GVKPodSnapshot = gvk(group, kindPodSnapshot)
+	return nil
+}
+
+// ValidateGroup checks that group can be the API group of the contract
+// CRDs: a DNS subdomain with at least one dot (apiextensions rejects a CRD
+// group without one), short enough that every CRD name, <plural>.<group>,
+// is a valid DNS subdomain too.
+func ValidateGroup(group string) error {
+	if errs := validation.IsDNS1123Subdomain(group); len(errs) > 0 {
+		return fmt.Errorf("invalid API group %q: %s", group, strings.Join(errs, "; "))
+	}
+	if !strings.Contains(group, ".") {
+		return fmt.Errorf("invalid API group %q: a CustomResourceDefinition group must contain a dot", group)
+	}
+	for _, name := range CRDNames(group) {
+		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			return fmt.Errorf("invalid API group %q: CRD name %q: %s", group, name, strings.Join(errs, "; "))
+		}
+	}
+	return nil
+}
+
+// RestoreAnnotation returns the restore-order annotation key of an engine
+// that serves group: "<group>/ps-name".
+func RestoreAnnotation(group string) string {
+	return group + "/" + restoreAnnotationName
+}
+
+// CRDNames returns the names of the four contract CRDs in group.
+func CRDNames(group string) []string {
+	names := make([]string, 0, len(crdPlurals))
+	for _, plural := range crdPlurals {
+		names = append(names, plural+"."+group)
+	}
+	return names
+}
 
 // New returns an empty unstructured object of the given contract kind.
 func New(gvk schema.GroupVersionKind) *unstructured.Unstructured {
