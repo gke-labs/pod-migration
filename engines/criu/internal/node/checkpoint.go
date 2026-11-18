@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,10 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrContainerdCachedCRIU indicates that containerd ran a CheckpointContainer call before
+// CRIU was discoverable on its PATH and cached the failure in sync.Once.
+var ErrContainerdCachedCRIU = errors.New("containerd cached failed CRIU lookup; restart containerd to clear")
 
 // kubeletCheckpoint drives POST /checkpoint/{ns}/{pod}/{container} on the
 // node-local kubelet (agent runs hostNetwork, so localhost:10250) using the
@@ -79,7 +84,12 @@ func (k *kubeletCheckpoint) checkpoint(ctx context.Context, ns, pod, container s
 	body, _ := io.ReadAll(resp.Body)
 	res := &checkpointResult{DurationMs: time.Since(start).Milliseconds(), HTTPStatus: resp.StatusCode}
 	if resp.StatusCode != http.StatusOK {
-		return res, fmt.Errorf("kubelet checkpoint HTTP %d: %s", resp.StatusCode, truncate(string(body), 300))
+		bodyStr := string(body)
+		if strings.Contains(bodyStr, "criu binary not found in shim path or system PATH") ||
+			strings.Contains(bodyStr, "CheckCriu") {
+			return res, fmt.Errorf("%w (kubelet HTTP %d: %s)", ErrContainerdCachedCRIU, resp.StatusCode, truncate(bodyStr, 300))
+		}
+		return res, fmt.Errorf("kubelet checkpoint HTTP %d: %s", resp.StatusCode, truncate(bodyStr, 300))
 	}
 	var out struct {
 		Items []string `json:"items"`

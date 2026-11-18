@@ -24,6 +24,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -39,6 +40,9 @@ import (
 func (r *Node) PSEngineCheckpoint(ctx context.Context, ns, pod, container string) (string, error) {
 	res, err := r.Kubelet.checkpoint(ctx, ns, pod, container)
 	if err != nil {
+		if errors.Is(err, ErrContainerdCachedCRIU) {
+			_ = annotateNode(ctx, r.Client, r.NodeName, "", false)
+		}
 		return "", err
 	}
 	if err := validateCheckpointTarFile(res.TarPath); err != nil {
