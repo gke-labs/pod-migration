@@ -298,19 +298,19 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 		if !ok {
 			continue
 		}
+		cType, _ := cond["type"].(string)
+		cStatus, _ := cond["status"].(string)
+		cReason, _ := cond["reason"].(string)
+
 		var condTransitionTime time.Time
 		if lttStr, ok := cond["lastTransitionTime"].(string); ok {
 			if t, err := time.Parse(time.RFC3339Nano, lttStr); err == nil {
 				condTransitionTime = t
-				if t.After(lastProgress) {
+				if t.After(lastProgress) && !isSnapshotStalledReason(cType, cReason) {
 					lastProgress = t
 				}
 			}
 		}
-
-		cType, _ := cond["type"].(string)
-		cStatus, _ := cond["status"].(string)
-		cReason, _ := cond["reason"].(string)
 
 		switch cType {
 		case "Checkpoint", "StorageReplicated":
@@ -451,12 +451,14 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 
 // snapshotTriggeredByLabel is the label GKE Pod Snapshots puts on every
 // PodSnapshot it creates for a manual trigger. Its value is the trigger's name.
+// The CRIU engine's controller sets it too, when the trigger's name fits in a
+// label value (#106).
 const snapshotTriggeredByLabel = "gke-pod-snapshot-triggered-by"
 
 // CheckpointState reports whether the job's checkpoint of the source has
 // settled and whether it completed (#131). It finds the job's PodSnapshots by
 // the trigger's status, the snapshot recorded on the job, and the label the
-// agent puts on every snapshot it creates for the trigger, so it still finds
+// engine puts on every snapshot it creates for the trigger, so it still finds
 // them after Cleanup deleted the trigger.
 //
 // A trigger that still exists can start a checkpoint, and a snapshot that's
@@ -578,16 +580,26 @@ func podSnapshotCheckpointProgress(snap *unstructured.Unstructured) (completed, 
 // to cleanly initiate fallback or reschedule rather than burning the migration deadline on known terminal states.
 // Refused means the snapshot engine declined to checkpoint this pod (for example, a pod shape it does not
 // support). That is a policy decision that will not change within the same PMJ, so it is terminal as well.
+// Cancelled means the engine abandoned the checkpoint because its trigger was deleted, without stopping the
+// source (C9, #106). It is handled as Failed.
 func isTerminalSnapshotFailureReason(reason string) bool {
 	r := strings.ToLower(reason)
 	if r == "" || r == "noerror" || strings.HasPrefix(r, "not") || strings.HasPrefix(r, "non") {
 		return false
 	}
 	switch r {
-	case "failed", "error", "deadlineexceeded", "refused":
+	case "failed", "error", "deadlineexceeded", "refused", "cancelled":
 		return true
 	}
 	return false
+}
+
+// isSnapshotStalledReason: a CRIU engine condition that isn't progress, so
+// its lastTransitionTime mustn't extend the job's deadline (#106). A
+// checkpoint that timed out won't move again, and a cancel waits for the node
+// agent to confirm it.
+func isSnapshotStalledReason(cType, reason string) bool {
+	return cType == "Checkpoint" && (reason == "CheckpointTimedOut" || reason == "CancelRequested")
 }
 
 func isSnapshotRefusedReason(reason string) bool {

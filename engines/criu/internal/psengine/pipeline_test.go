@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,13 +37,43 @@ import (
 type fakeNodeOps struct {
 	tarContent string
 	failDump   bool
-	stopped    []string
-	events     []string
-	t          *testing.T
+	// checkpointErr, when set, is returned by Checkpoint (after afterCheckpoint).
+	checkpointErr error
+	stopped       []string
+	events        []string
+	t             *testing.T
+
+	// afterCheckpoint runs once the checkpoint is taken, before it returns.
+	afterCheckpoint func()
+	// beforeStop runs when StopContainer is called, before the stop.
+	beforeStop func()
+	// blockCheckpoint, when set, is closed once the checkpoint starts; the
+	// call then blocks until releaseCheckpoint is closed or its context is
+	// cancelled (or 10s pass).
+	blockCheckpoint        chan struct{}
+	releaseCheckpoint      chan struct{}
+	checkpointCtxCancelled bool
 }
 
-func (f *fakeNodeOps) Checkpoint(_ context.Context, ns, pod, container string) (string, error) {
+func (f *fakeNodeOps) Checkpoint(ctx context.Context, ns, pod, container string) (string, error) {
 	f.events = append(f.events, "checkpoint")
+	if f.blockCheckpoint != nil {
+		close(f.blockCheckpoint)
+		select {
+		case <-f.releaseCheckpoint:
+		case <-ctx.Done():
+			f.checkpointCtxCancelled = true
+			return "", ctx.Err()
+		case <-time.After(10 * time.Second):
+			return "", errors.New("checkpoint was never released")
+		}
+	}
+	if f.afterCheckpoint != nil {
+		defer f.afterCheckpoint()
+	}
+	if f.checkpointErr != nil {
+		return "", f.checkpointErr
+	}
 	if f.failDump {
 		return "", errors.New("criu dump failed: fsnotify handle")
 	}
@@ -60,6 +91,9 @@ func (f *fakeNodeOps) SourceInfo(_ context.Context, ns, pod, container string) (
 }
 
 func (f *fakeNodeOps) StopContainer(_ context.Context, ns, pod, container string) error {
+	if f.beforeStop != nil {
+		f.beforeStop()
+	}
 	f.events = append(f.events, "stop")
 	f.stopped = append(f.stopped, ns+"/"+pod+"/"+container)
 	return nil
@@ -102,10 +136,14 @@ func (m *memStore) Delete(_ context.Context, bucket, object string) error {
 type failingStore struct {
 	*memStore
 	failSubstr string
+	onFail     func() // runs before the failure is returned
 }
 
 func (f *failingStore) Put(ctx context.Context, bucket, object string, r io.Reader) (*ObjectInfo, error) {
 	if strings.Contains(object, f.failSubstr) {
+		if f.onFail != nil {
+			f.onFail()
+		}
 		return nil, errors.New("gcs put: HTTP 503 backend unavailable")
 	}
 	return f.memStore.Put(ctx, bucket, object, r)

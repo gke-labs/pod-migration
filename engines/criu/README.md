@@ -75,6 +75,30 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      uploads `spec.json`, `checkpoint.tar`, and `manifest.json` to GCS with
      MD5/size verification, stops the source container via containerd (`SIGKILL`),
      and marks the `PodSnapshot` `Ready=True`.
+     If the `PodSnapshotManualTrigger` is deleted first, the engine controller
+     sets `Checkpoint=Unknown` with the reason `CancelRequested` (on a work
+     order without a bucket, which no agent acts on, it records `Cancelled`
+     itself), and the agent
+     also reads the trigger itself before the checkpoint and right before the
+     stop. A cancelled agent starts nothing new. It waits for an in-flight
+     kubelet checkpoint to return, because cancelling the call doesn't end the
+     freeze. It aborts uploads and doesn't stop the source container. It then
+     marks `Checkpoint` and `Ready` `False` with the reason `Cancelled`
+     (contract clause C9, #106). The agent needs `get` on
+     `podsnapshotmanualtriggers` for this. If the dump outlasts the
+     orchestrator's 30 s settle wait, the orchestrator keeps the source fenced
+     and cold-evicts it. The agent waits up to 150 s for the kubelet
+     checkpoint call, past the kubelet's default 2 min CRI deadline. A call
+     that still times out is recorded as `Checkpoint=Unknown` with the reason
+     `CheckpointTimedOut`, never `Failed` or `Cancelled`, because the dump may
+     still be running, and past the CRI deadline containerd can leave the
+     source frozen until it is resumed by hand. The snapshot then never
+     settles, so the orchestrator keeps the source fenced and cold-evicts it
+     instead of unfencing it. The agent never overwrites
+     an outcome already recorded on the `PodSnapshot`. The engine controller
+     labels each `PodSnapshot` `gke-pod-snapshot-triggered-by: <trigger>` (when
+     the trigger name fits in a label value), so the orchestrator finds
+     unfinished snapshots after the trigger is deleted.
    - Reconciles replacement pods on its node carrying
      `podsnapshot.gke.io/ps-name` (`psengine.NodeRestoreReconciler`): downloads
      and SHA-256 verifies the archive from GCS, checks CPU family compatibility,

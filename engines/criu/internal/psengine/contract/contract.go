@@ -55,6 +55,11 @@ const (
 	// policies carrying LabelEngine=EngineCRIU.
 	LabelEngine = "pod-migrate.io/engine"
 	EngineCRIU  = "criu"
+	// LabelTriggeredBy is the label GKE Pod Snapshots puts on the PodSnapshots
+	// it creates for a manual trigger, valued with the trigger's name. The
+	// orchestrator's CheckpointState finds a job's snapshots by it once the
+	// trigger is gone (gke_provider.go snapshotTriggeredByLabel).
+	LabelTriggeredBy = "gke-pod-snapshot-triggered-by"
 
 	// Condition types/reasons the orchestrator's PMJ controller polls on
 	// PodSnapshot (podmigrationjob_controller.go:310-324): ready iff
@@ -73,6 +78,24 @@ const (
 	ReasonFailed  = "Failed"
 	ReasonRefused = "Refused"
 	ReasonPending = "Pending"
+	// ReasonCancelRequested (on Checkpoint=Unknown) = the engine controller
+	// saw the PodSnapshotManualTrigger deleted and asked the node agent to
+	// cancel (C9, #106). Not terminal: the orchestrator keeps waiting.
+	ReasonCancelRequested = "CancelRequested"
+	// ReasonCancelled = the node agent abandoned the work order after its
+	// trigger was deleted, and did not stop the source (C9, #106). Terminal;
+	// written only once the agent's work has stopped. The orchestrator
+	// treats it like Failed.
+	ReasonCancelled = "Cancelled"
+	// ReasonCheckpointTimedOut (on Checkpoint=Unknown) = the kubelet
+	// checkpoint call timed out, so the dump may still be running and the
+	// source may be frozen, past the kubelet's CRI deadline until resumed by
+	// hand (#106). Deliberately not terminal, and the node agent's last word
+	// on the snapshot: the orchestrator never sees it settle, so it keeps the
+	// source fenced and cold-evicts it rather than unfencing a source that
+	// may be frozen. Must not be "DeadlineExceeded", which the orchestrator
+	// treats as a terminal failure.
+	ReasonCheckpointTimedOut = "CheckpointTimedOut"
 
 	// AnnotationRestoreStatus is engine-internal: the node agent stamps it on
 	// the replacement pod so the holder wrapper — which only sees the
