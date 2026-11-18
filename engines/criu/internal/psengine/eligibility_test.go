@@ -345,3 +345,60 @@ func TestRecreatedTriggerRevokesCancelWithoutRejudging(t *testing.T) {
 	reconcilePSMT(t, c, nil, cancelTrigger)
 	requirePendingWorkOrder(t, c)
 }
+
+// A failed read of the work order is returned, not judged: an empty
+// PodSnapshot would look bucketless and get Failed over a running order.
+func TestPSMTLaterPassPodSnapshotGetFails(t *testing.T) {
+	failOnce := false
+	c := newClientWithInterceptor(t, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == contract.GVKPodSnapshot.Kind && failOnce {
+				failOnce = false
+				return errors.New("apiserver unavailable")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	}, eligibilityObjects(t)...)
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	requirePendingWorkOrder(t, c)
+
+	failOnce = true
+	if _, err := (&PSMTReconciler{Client: c}).Reconcile(context.Background(), eligibilityTriggerReq); err == nil {
+		t.Fatal("a failed PodSnapshot read must be returned, not judged")
+	}
+	requirePendingWorkOrder(t, c)
+}
+
+// If another writer creates the work order between this pass's read and its
+// Create, the pass requeues instead of recording its own verdict, which was
+// formed without seeing that order.
+func TestPSMTCreateAlreadyExistsRequeuesWithoutVerdict(t *testing.T) {
+	objs := eligibilityObjects(t)
+	delete(eligibilityPod(objs).Labels, contract.LabelEnabled) // this pass would refuse
+	racer := workOrderSnapshot(cancelSnapshot)                 // a bucketed order, created by the racing writer
+	_ = unstructured.SetNestedField(racer.Object, cancelTrigger, "spec", specTriggerName)
+	c := newClientWithInterceptor(t, interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == contract.GVKPodSnapshot.Kind {
+				if err := cl.Create(ctx, racer.DeepCopy()); err != nil {
+					t.Fatalf("test setup: racing create: %v", err)
+				}
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	}, objs...)
+	res, err := (&PSMTReconciler{Client: c}).Reconcile(context.Background(), eligibilityTriggerReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := getSnapshot(t, c, cancelSnapshot)
+	if b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket"); b == "" {
+		t.Fatal("test setup: the racing writer's bucketed order should have won")
+	}
+	if hasOutcome(ps) {
+		t.Fatalf("a lost create race must not write a verdict onto the winner's order: %+v", contract.Conditions(ps))
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("a lost create race must requeue, got %+v", res)
+	}
+}

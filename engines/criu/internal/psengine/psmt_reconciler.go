@@ -191,7 +191,12 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			spec["bucket"], spec["path"] = bucket, path
 		}
 		ps.Object["spec"] = spec
-		if err := r.Create(ctx, ps); err != nil && !apierrors.IsAlreadyExists(err) {
+		if err := r.Create(ctx, ps); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// Another writer created the work order since the Get. This
+				// pass's verdict didn't see it; judge again from a fresh read.
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
 			return ctrl.Result{}, err
 		}
 	}
