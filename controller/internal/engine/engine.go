@@ -225,6 +225,25 @@ type RestoreVerifier interface {
 	VerifyRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (RestoreVerdict, error)
 }
 
+// PlacementAdvisor is an optional capability (C8, #14): the engine states
+// the node constraints a replacement pod must meet to restore a job's
+// checkpoint. With --restore-placement, the pod gate reconciler adds them to
+// the replacement's required node affinity when it releases the gate with a
+// restore order. An engine without it states none, so the replacement can
+// land on any node.
+type PlacementAdvisor interface {
+	// Placement returns the requirements a node must meet, all of them, to
+	// restore job's checkpoint. They're node label requirements: each one
+	// goes into the replacement's required node affinity as a
+	// matchExpressions entry, and the pod gate reconciler drops them all if
+	// one isn't valid as a label requirement. None means no constraint: the
+	// replacement can land on any node. It must not change anything. An
+	// error must be one that a retry can clear: the replacement stays gated
+	// until Placement succeeds, so an engine returns no requirements, not an
+	// error, for data it can't use.
+	Placement(ctx context.Context, job *pmv1alpha1.PodMigrationJob) ([]corev1.NodeSelectorRequirement, error)
+}
+
 // StorageLocationError reports a PodMigration storage location that an
 // engine can't use. The PodMigration reconciler reports it as the
 // InvalidStorageLocation condition, with Message as the condition message.

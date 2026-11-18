@@ -23,7 +23,11 @@
 #   - T3-S1 : Cross-Node Stateful Drain & Placement Verification (I2; I8 with --require-cross-shape)
 #       * Verifies stateful pod warm restore across distinct worker nodes and enforces
 #         wall-clock SLO thresholds (T). When --require-cross-shape is passed on a
-#         multi-shape gVisor pool, also asserts src_type != dst_type (pending #14).
+#         multi-shape gVisor pool, also asserts src_type != dst_type. That needs a
+#         controller without --restore-placement (#14): with it, a warm restore stays on
+#         the source machine type. With it, T3-S1 also needs another Ready gVisor node of
+#         the source machine type, or the job concludes NoCompatibleNode and the
+#         warm-restore check fails.
 #   - T3-S2 : 50-Pod Multi-Workload Concurrent Evacuation Wave & Latency SLO (T) Benchmark
 #       * Deploys a 50-pod fleet across 5 mixed workloads (counter, redis, postgres,
 #         memcached, nginx), executes a concurrent node drain wave with stateful
@@ -36,6 +40,10 @@
 #       * Exercises cross-pool/cross-shape evacuation and controlled I9
 #         (SucceededWithoutRestore / RestoreFailedColdStart) fallback across
 #         multi-replica stateful pods, asserting 100% Ready convergence within SLO (T).
+#         With --restore-placement (#14), cordoning every source-shape node leaves no
+#         compatible node, so on a multi-shape pool the job concludes
+#         SucceededWithoutRestore (NoCompatibleNode) before any restore. The run still
+#         passes, but it doesn't exercise a cross-shape restore or the I9 fallback.
 #   - T3-S4 : Multi-Wave Sequential Rolling Node Drain Soak & I5 Resource Leak Audit
 #       * Executes back-to-back sequential node drain waves (Wave 1 -> Wave 2) on a
 #         multi-replica stateful deployment, verifying cumulative state survival across
@@ -78,7 +86,8 @@ Options:
   --slo-gate-hold-p95 <dur>         Max p95 scheduling gate hold duration (default: 60s)
   --slo-downtime-p95 <dur>          Max p95 serving blackout duration (default: 60s)
   --slo-e2e-p95 <dur>               Max p95 end-to-end migration duration (default: 180s)
-  --require-cross-shape             Assert src_type != dst_type in T3-S1/T3-S3 (requires multi-shape pool)
+  --require-cross-shape             Assert src_type != dst_type in T3-S1/T3-S3 (requires multi-shape pool,
+                                    and a controller without --restore-placement)
   --allow-simulated-s3              Run T3-S3 on a single-shape pool as an explicit simulated exit-128 fallback
                                     test (otherwise T3-S3 logs SKIPPED when <2 gVisor shapes exist)
   --self-test                       Run offline end-to-end self-test of scalesim, pmprofiler
