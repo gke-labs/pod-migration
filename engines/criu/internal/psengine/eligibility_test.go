@@ -58,6 +58,37 @@ func eligibilityObjects(t *testing.T) []client.Object {
 	}
 }
 
+// eligibilityPod, replaceNode and withoutStorageConfig find fixture objects
+// by kind and name, so the subtests don't depend on eligibilityObjects' order.
+func eligibilityPod(objs []client.Object) *corev1.Pod {
+	for _, o := range objs {
+		if p, ok := o.(*corev1.Pod); ok {
+			return p
+		}
+	}
+	panic("eligibilityObjects has no pod")
+}
+
+func replaceNode(objs []client.Object, node *corev1.Node) []client.Object {
+	for i, o := range objs {
+		if _, ok := o.(*corev1.Node); ok && o.GetName() == node.Name {
+			objs[i] = node
+		}
+	}
+	return objs
+}
+
+func withoutStorageConfig(objs []client.Object) []client.Object {
+	var out []client.Object
+	for _, o := range objs {
+		if u, ok := o.(*unstructured.Unstructured); ok && u.GetKind() == contract.GVKStorageConfig.Kind {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
 func requirePendingWorkOrder(t *testing.T, c client.Client) {
 	t.Helper()
 	ps := getSnapshot(t, c, cancelSnapshot)
@@ -194,15 +225,14 @@ func TestPSMTFirstPassOutcomesUnchanged(t *testing.T) {
 	}{
 		"pod not opted in": {
 			mutate: func(objs []client.Object) []client.Object {
-				delete(objs[2].(*corev1.Pod).Labels, contract.LabelEnabled)
+				delete(eligibilityPod(objs).Labels, contract.LabelEnabled)
 				return objs
 			},
 			wantReason: contract.ReasonRefused, wantMsg: "not opted in",
 		},
 		"node not criu-ready": {
 			mutate: func(objs []client.Object) []client.Object {
-				objs[3] = criuNode("node-a", false)
-				return objs
+				return replaceNode(objs, criuNode("node-a", false))
 			},
 			wantReason: contract.ReasonRefused, wantMsg: "not criu-ready",
 		},
@@ -217,7 +247,7 @@ func TestPSMTFirstPassOutcomesUnchanged(t *testing.T) {
 		},
 		"storage config missing": {
 			mutate: func(objs []client.Object) []client.Object {
-				return append(objs[:0:0], objs[1:]...)
+				return withoutStorageConfig(objs)
 			},
 			wantReason: contract.ReasonFailed, wantMsg: "resolving storage",
 		},
@@ -271,7 +301,7 @@ func TestPSMTFirstPassOutcomesUnchanged(t *testing.T) {
 // (the source was never touched), not turned into Failed.
 func TestPSMTRetryKeepsRefusalOnBucketlessWorkOrder(t *testing.T) {
 	objs := eligibilityObjects(t)
-	delete(objs[2].(*corev1.Pod).Labels, contract.LabelEnabled)
+	delete(eligibilityPod(objs).Labels, contract.LabelEnabled)
 	failOnce := true
 	c := newClientWithInterceptor(t, interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
@@ -290,4 +320,28 @@ func TestPSMTRetryKeepsRefusalOnBucketlessWorkOrder(t *testing.T) {
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != contract.ReasonRefused {
 		t.Fatalf("want the retried Checkpoint=False/Refused, got %+v", cond)
 	}
+}
+
+// A trigger recreated over a cancel request takes the running work order back
+// as Pending, even when eligibility would now fail: the order was judged
+// when it was created, and the agent may still be working it.
+func TestRecreatedTriggerRevokesCancelWithoutRejudging(t *testing.T) {
+	c := newClient(t, eligibilityObjects(t)...)
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	deleteTrigger(t, c, true)
+	requireCancelRequested(t, c)
+
+	pod := &corev1.Pod{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-0"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	delete(pod.Labels, contract.LabelEnabled)
+	if err := c.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), psmtFor("web-0")); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	requirePendingWorkOrder(t, c)
 }

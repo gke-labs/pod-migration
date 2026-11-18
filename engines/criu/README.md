@@ -66,8 +66,9 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      `status.snapshotCreated.name`. It decides eligibility once, when it
      creates the work order: an ineligible pod's order gets no bucket and is
      marked `Refused` (or `Failed` if storage can't be resolved). An order
-     with a bucket belongs to the node agent, and the controller's later
-     passes don't re-check eligibility or write an outcome onto it (#218).
+     with a bucket belongs to the node agent: the controller's later passes
+     don't re-check eligibility, and write only the non-terminal `Pending`
+     (or, once the trigger is deleted, `CancelRequested`) onto it (#218).
    - Serves `/psengine-restore-inject` to speculatively inject the `holder`
      initContainer and command wrapper into gated replacement pods at `CREATE`.
 2. **`cmd/agent` (privileged node DaemonSet):**
