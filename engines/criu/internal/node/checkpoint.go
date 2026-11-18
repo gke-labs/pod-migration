@@ -110,8 +110,7 @@ func (k *kubeletCheckpoint) checkpoint(ctx context.Context, ns, pod, container s
 	res := &checkpointResult{DurationMs: time.Since(start).Milliseconds(), HTTPStatus: resp.StatusCode}
 	if resp.StatusCode != http.StatusOK {
 		bodyStr := string(body)
-		if strings.Contains(bodyStr, "criu binary not found in shim path or system PATH") ||
-			strings.Contains(bodyStr, "CheckCriu") {
+		if strings.Contains(bodyStr, "criu binary not found in shim path or system PATH") {
 			return res, fmt.Errorf("%w (kubelet HTTP %d: %s)", ErrContainerdCachedCRIU, resp.StatusCode, truncate(bodyStr, 300))
 		}
 		err := fmt.Errorf("kubelet checkpoint HTTP %d: %s", resp.StatusCode, truncate(bodyStr, 300))

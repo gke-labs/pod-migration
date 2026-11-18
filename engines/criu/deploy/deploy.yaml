@@ -56,10 +56,21 @@ metadata:
     pod-migrate.io/component: psengine
 rules:
   - apiGroups: ["podsnapshot.gke.io"]
-    resources: ["podsnapshotstorageconfigs", "podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
+    resources:
+      [
+        "podsnapshotstorageconfigs",
+        "podsnapshotpolicies",
+        "podsnapshotmanualtriggers",
+        "podsnapshots",
+      ]
     verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["podsnapshot.gke.io"]
-    resources: ["podsnapshotpolicies/status", "podsnapshotmanualtriggers/status", "podsnapshots/status"]
+    resources:
+      [
+        "podsnapshotpolicies/status",
+        "podsnapshotmanualtriggers/status",
+        "podsnapshots/status",
+      ]
     verbs: ["get", "update", "patch"]
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]

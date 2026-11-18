@@ -282,4 +282,25 @@ func TestKubeletCheckpoint_DetectsContainerdCachedCRIUFailure(t *testing.T) {
 	if !errors.Is(err, ErrContainerdCachedCRIU) {
 		t.Fatalf("expected ErrContainerdCachedCRIU, got: %v", err)
 	}
+
+	// Verify that arbitrary errors mentioning CheckCriu without the verified string are not classified as ErrContainerdCachedCRIU.
+	srvOther := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"message":"internal error in CheckCriu helper: connection reset"}`))
+	}))
+	defer srvOther.Close()
+
+	kcOther := &kubeletCheckpoint{
+		TokenPath: tokenFile,
+		Endpoint:  srvOther.URL,
+		Client:    srvOther.Client(),
+	}
+
+	_, errOther := kcOther.checkpoint(context.Background(), "default", "pod-1", "container-1")
+	if errOther == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(errOther, ErrContainerdCachedCRIU) {
+		t.Fatalf("did not expect ErrContainerdCachedCRIU for generic error, got: %v", errOther)
+	}
 }

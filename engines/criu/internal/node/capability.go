@@ -35,6 +35,15 @@ const (
 	NodeAnnotationCRIUReady = "pod-migrate.io/criu-ready"
 	// NodeAnnotationCRIUVersion records the installed CRIU binary version on the node.
 	NodeAnnotationCRIUVersion = "pod-migrate.io/criu-version"
+	// NodeAnnotationCRIUReason records why the node is unready for CRIU operations.
+	NodeAnnotationCRIUReason = "pod-migrate.io/criu-reason"
+	// NodeAnnotationCRIURemediation records actionable remediation instructions for operators.
+	NodeAnnotationCRIURemediation = "pod-migrate.io/criu-remediation"
+
+	// ReasonContainerdCachedCRIU indicates containerd cached a failed CRIU lookup.
+	ReasonContainerdCachedCRIU = "containerd cached failed CRIU lookup; restart containerd to clear"
+	// RemediationRestartContainerd provides actionable guidance to clear ReasonContainerdCachedCRIU.
+	RemediationRestartContainerd = "restart containerd (systemctl restart containerd)"
 
 	// imageBundleDir is where the agent image carries the self-contained CRIU
 	// bundle (built by build/agent/Dockerfile from a criu >= 3.19 distro).
@@ -111,8 +120,8 @@ func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, st
 	return strings.Contains(raw, "Looks good"), raw
 }
 
-// annotateNode publishes the node's CRIU capability verdict and version.
-func annotateNode(ctx context.Context, c client.Client, nodeName, version string, ready bool) error {
+// annotateNode publishes the node's CRIU capability verdict, version, and optional reason/remediation.
+func annotateNode(ctx context.Context, c client.Client, nodeName, version, reason, remediation string, ready bool) error {
 	var node corev1.Node
 	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
 		return err
@@ -122,7 +131,20 @@ func annotateNode(ctx context.Context, c client.Client, nodeName, version string
 		node.Annotations = map[string]string{}
 	}
 	node.Annotations[NodeAnnotationCRIUReady] = fmt.Sprintf("%t", ready)
-	node.Annotations[NodeAnnotationCRIUVersion] = version
+	if version != "" {
+		node.Annotations[NodeAnnotationCRIUVersion] = version
+	}
+	if ready {
+		delete(node.Annotations, NodeAnnotationCRIUReason)
+		delete(node.Annotations, NodeAnnotationCRIURemediation)
+	} else {
+		if reason != "" {
+			node.Annotations[NodeAnnotationCRIUReason] = reason
+		}
+		if remediation != "" {
+			node.Annotations[NodeAnnotationCRIURemediation] = remediation
+		}
+	}
 	return c.Patch(ctx, &node, patch)
 }
 

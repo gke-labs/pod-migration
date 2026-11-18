@@ -25,6 +25,10 @@ import (
 
 	"context"
 	"fmt"
+	"os"
+	"sync"
+	"syscall"
+	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +44,18 @@ type Node struct {
 
 	Kubelet  *kubeletCheckpoint
 	Restorer *restorer
+
+	SocketPath string
+
+	mu                 sync.Mutex
+	ready              bool
+	version            string
+	lastSocketInode    uint64
+	unreadyReason      string
+	unreadyRemediation string
+
+	statSocketFn func(string) (uint64, error)
+	bootstrapFn  func(context.Context) error
 }
 
 // NewNode wires the node worker against containerd and the local kubelet
@@ -51,23 +67,44 @@ func NewNode(c client.Client, nodeName string) (*Node, error) {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
 	return &Node{
-		Client:   c,
-		NodeName: nodeName,
-		Kubelet:  newKubeletCheckpoint(),
-		Restorer: newRestorer(cc),
+		Client:       c,
+		NodeName:     nodeName,
+		Kubelet:      newKubeletCheckpoint(),
+		Restorer:     newRestorer(cc),
+		SocketPath:   "/run/containerd/containerd.sock",
+		statSocketFn: getSocketInode,
 	}, nil
+}
+
+func getSocketInode(path string) (uint64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("unexpected FileInfo.Sys() type %T", fi.Sys())
+	}
+	return stat.Ino, nil
 }
 
 // Bootstrap installs the CRIU bundle, verifies it against the host kernel, and
 // annotates the node with its capability verdict.
 func (n *Node) Bootstrap(ctx context.Context) error {
+	if n.bootstrapFn != nil {
+		return n.bootstrapFn(ctx)
+	}
+	return n.bootstrapInternal(ctx)
+}
+
+func (n *Node) bootstrapInternal(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	var nodeObj corev1.Node
 	if err := n.Client.Get(ctx, types.NamespacedName{Name: n.NodeName}, &nodeObj); err != nil {
 		return err
 	}
 	if err := CheckContainerdVersion(nodeObj.Status.NodeInfo.ContainerRuntimeVersion); err != nil {
-		_ = annotateNode(ctx, n.Client, n.NodeName, "", false)
+		_ = annotateNode(ctx, n.Client, n.NodeName, "", "unsupported containerd version: "+err.Error(), "upgrade containerd", false)
 		return err
 	}
 	version, err := installCRIUBundle()
@@ -76,7 +113,101 @@ func (n *Node) Bootstrap(ctx context.Context) error {
 	}
 	ok, raw := verifyCRIU(ctx, n.Restorer.execHost)
 	log.Info("criu capability", "version", version, "checkAll", ok, "raw", truncate(raw, 200))
-	return annotateNode(ctx, n.Client, n.NodeName, version, ok)
+
+	n.mu.Lock()
+	n.version = version
+	n.ready = ok
+	if n.statSocketFn != nil && n.SocketPath != "" {
+		if ino, err := n.statSocketFn(n.SocketPath); err == nil {
+			n.lastSocketInode = ino
+		}
+	}
+	n.mu.Unlock()
+
+	var reason, remediation string
+	if !ok {
+		reason = "criu check --all failed"
+		remediation = "check host kernel support for CRIU"
+	}
+	return annotateNode(ctx, n.Client, n.NodeName, version, reason, remediation, ok)
+}
+
+// DemoteNode marks the node unready with reason and remediation, preserving existing version.
+func (n *Node) DemoteNode(ctx context.Context, reason, remediation string) error {
+	n.mu.Lock()
+	n.ready = false
+	n.unreadyReason = reason
+	n.unreadyRemediation = remediation
+	if n.statSocketFn != nil && n.SocketPath != "" {
+		if ino, err := n.statSocketFn(n.SocketPath); err == nil {
+			n.lastSocketInode = ino
+		}
+	}
+	ver := n.version
+	n.mu.Unlock()
+
+	return annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false)
+}
+
+// IsReady returns whether the node is currently considered CRIU-ready.
+func (n *Node) IsReady() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.ready
+}
+
+// ProbeReadiness checks whether conditions have changed to restore node readiness.
+// If the node is currently unready, it checks whether containerd was restarted
+// (new socket inode). If a new socket inode is detected, it re-runs Bootstrap
+// to re-verify CRIU and restore node readiness.
+func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
+	n.mu.Lock()
+	isReady := n.ready
+	lastIno := n.lastSocketInode
+	statFn := n.statSocketFn
+	sockPath := n.SocketPath
+	n.mu.Unlock()
+
+	if isReady {
+		return true, nil
+	}
+
+	if statFn == nil || sockPath == "" {
+		return false, nil
+	}
+
+	currIno, err := statFn(sockPath)
+	if err != nil {
+		// Socket may be temporarily missing/unreachable during containerd restart
+		return false, nil
+	}
+
+	if currIno != 0 && currIno != lastIno {
+		logf.FromContext(ctx).Info("containerd restart detected, re-probing CRIU readiness",
+			"oldSocketInode", lastIno, "newSocketInode", currIno)
+		if err := n.Bootstrap(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// RunProbeLoop runs periodic readiness probes while ctx is active.
+func (n *Node) RunProbeLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := n.ProbeReadiness(ctx); err != nil {
+				logf.FromContext(ctx).Error(err, "readiness re-probe failed", "node", n.NodeName)
+			}
+		}
+	}
 }
 
 func joinNotes(notes []string) string {
