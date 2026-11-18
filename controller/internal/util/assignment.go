@@ -33,21 +33,22 @@ import (
 )
 
 const (
-	LabelParentName              = "pod-migration.gke.io/parent-name"
-	LabelParentKind              = "pod-migration.gke.io/parent-kind"
-	LabelParentUID               = "pod-migration.gke.io/parent-uid"
-	LabelPodTemplateHash         = "pod-migration.gke.io/pod-template-hash"
-	LabelControllerRevisionHash  = appsv1.ControllerRevisionHashLabelKey
-	LabelJobCompletionIndex      = batchv1.JobCompletionIndexAnnotation
-	LabelOriginPodName           = "pod-migration.gke.io/origin-pod-name"
-	AnnotationAssignedPMJ        = "pod-migration.gke.io/assigned-pmj"
-	AnnotationColdStartBypassJob = "pod-migration.gke.io/cold-start-bypass-job"
-	AnnotationRestoreCompleted   = "pod-migration.gke.io/restore-completed"
-	AnnotationMismatchSince      = "pod-migration.gke.io/mismatch-since"
-	AnnotationPDBEvictionTimeout = "pod-migration.gke.io/pdb-eviction-timeout"
-	AnnotationPodSnapshotPolicy  = "pod-migration.gke.io/pod-snapshot-policy"
-	AnnotationReplicaIdentityKey = "pod-migration.gke.io/replica-identity"
-	LabelReplicaKey              = "pod-migration.gke.io/replica-key"
+	LabelParentName                  = "pod-migration.gke.io/parent-name"
+	LabelParentKind                  = "pod-migration.gke.io/parent-kind"
+	LabelParentUID                   = "pod-migration.gke.io/parent-uid"
+	LabelPodTemplateHash             = "pod-migration.gke.io/pod-template-hash"
+	LabelControllerRevisionHash      = appsv1.ControllerRevisionHashLabelKey
+	LabelJobCompletionIndex          = batchv1.JobCompletionIndexAnnotation
+	LabelOriginPodName               = "pod-migration.gke.io/origin-pod-name"
+	AnnotationAssignedPMJ            = "pod-migration.gke.io/assigned-pmj"
+	AnnotationColdStartBypassJob     = "pod-migration.gke.io/cold-start-bypass-job"
+	AnnotationRestoreCompleted       = "pod-migration.gke.io/restore-completed"
+	AnnotationMismatchSince          = "pod-migration.gke.io/mismatch-since"
+	AnnotationPDBEvictionTimeout     = "pod-migration.gke.io/pdb-eviction-timeout"
+	AnnotationPodSnapshotPolicy      = "pod-migration.gke.io/pod-snapshot-policy"
+	AnnotationPreserveReadinessDelay = "pod-migration.gke.io/preserve-readiness-delay"
+	AnnotationReplicaIdentityKey     = "pod-migration.gke.io/replica-identity"
+	LabelReplicaKey                  = "pod-migration.gke.io/replica-key"
 
 	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
 	// in their assigned-pmj annotation.  Registered at manager startup via

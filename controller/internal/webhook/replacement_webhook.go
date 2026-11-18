@@ -35,7 +35,10 @@ import (
 type PodGateInjector struct {
 	Client    client.Client
 	APIReader client.Reader
-	decoder   admission.Decoder
+	// PreserveReadinessDelay disables clearing readinessProbe.initialDelaySeconds
+	// on gated restore-candidate replacement pods (#141).
+	PreserveReadinessDelay bool
+	decoder                admission.Decoder
 }
 
 // Handle inspects pod creations and injects the pod-migration-gate scheduling gate.
@@ -179,6 +182,12 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		pod.Annotations[util.AnnotationAssignedPMJ] = assignedPMJ
 	}
 
+	if !a.PreserveReadinessDelay && pod.Annotations[util.AnnotationPreserveReadinessDelay] != "true" {
+		if n := clearReadinessInitialDelay(pod); n > 0 {
+			logger.Info("Cleared readinessProbe.initialDelaySeconds on restore-candidate replacement pod", "containers", n)
+		}
+	}
+
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
 		logger.Error(err, "Failed to marshal modified pod")
@@ -188,23 +197,52 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 }
 
+// clearReadinessInitialDelay sets readinessProbe.initialDelaySeconds to 0 on
+// containers and restartable init containers (native sidecars) that configure
+// a positive readiness initial delay. Liveness and startup probes are never
+// modified because they can kill a slow cold-start fallback (#141).
+func clearReadinessInitialDelay(pod *corev1.Pod) int {
+	cleared := 0
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		if c.ReadinessProbe != nil && c.ReadinessProbe.InitialDelaySeconds > 0 {
+			c.ReadinessProbe.InitialDelaySeconds = 0
+			cleared++
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways &&
+			c.ReadinessProbe != nil && c.ReadinessProbe.InitialDelaySeconds > 0 {
+			c.ReadinessProbe.InitialDelaySeconds = 0
+			cleared++
+		}
+	}
+	return cleared
+}
+
 // InjectDecoder injects the decoder.
 func (a *PodGateInjector) InjectDecoder(d admission.Decoder) error {
 	a.decoder = d
 	return nil
 }
 
+func newPodGateInjector(cl client.Client, apiReader client.Reader, shortenReadinessDelay bool, dec admission.Decoder) *PodGateInjector {
+	return &PodGateInjector{
+		Client:                 cl,
+		APIReader:              apiReader,
+		PreserveReadinessDelay: !shortenReadinessDelay,
+		decoder:                dec,
+	}
+}
+
 // SetupReplacementWebhookWithManager registers the mutating webhook on the manager.
-func SetupReplacementWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader) error {
+func SetupReplacementWebhookWithManager(mgr ctrl.Manager, apiReader client.Reader, shortenReadinessDelay bool) error {
 	dec := admission.NewDecoder(mgr.GetScheme())
 	mgr.GetWebhookServer().Register(
 		"/mutate-v1-pod-scheduling-gate",
 		&admission.Webhook{
-			Handler: &PodGateInjector{
-				Client:    mgr.GetClient(),
-				APIReader: apiReader,
-				decoder:   dec,
-			},
+			Handler: newPodGateInjector(mgr.GetClient(), apiReader, shortenReadinessDelay, dec),
 		},
 	)
 	return nil

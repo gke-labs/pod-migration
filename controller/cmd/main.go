@@ -79,21 +79,22 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr          string
-		probeAddr            string
-		enableLeaderElection bool
-		clientGoQPS          float64
-		clientGoBurst        int
-		maxConcurrent        int
-		migrationTimeout     time.Duration
-		invariantModeRaw     string
-		spotPreemptionBudget int64
-		runtimeClassesRaw    string
-		fenceCap             time.Duration
-		fenceLateStopWatch   time.Duration
-		runtimeClassEngines  string
-		restoreStabilization time.Duration
-		showVersion          bool
+		metricsAddr           string
+		probeAddr             string
+		enableLeaderElection  bool
+		clientGoQPS           float64
+		clientGoBurst         int
+		maxConcurrent         int
+		migrationTimeout      time.Duration
+		invariantModeRaw      string
+		spotPreemptionBudget  int64
+		runtimeClassesRaw     string
+		fenceCap              time.Duration
+		fenceLateStopWatch    time.Duration
+		runtimeClassEngines   string
+		restoreStabilization  time.Duration
+		shortenReadinessDelay bool
+		showVersion           bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "")
@@ -109,6 +110,7 @@ func main() {
 	flag.DurationVar(&fenceLateStopWatch, "fence-late-stop-watch", controller.DefaultFenceLateStopWatch, "How long the controller watches a source that a failed migration returned to service, to fence and evict it again if the snapshot engine stops it anyway")
 	flag.StringVar(&runtimeClassEngines, "runtime-class-engines", "", "Comma-separated class=engine routes that pick the snapshot engine for the pods of each migratable runtime class, e.g. gvisor="+engine.GKEPodSnapshotsName+" ("+eligibility.DefaultRuntimeClassToken+" matches pods without a runtimeClassName). Unset routes every --migratable-runtime-classes class to the default engine, "+engine.GKEPodSnapshotsName+". A PodMigration overrides routes for its namespace with the "+engine.AnnotationRuntimeClassEngines+" annotation.")
 	flag.DurationVar(&restoreStabilization, "restore-stabilization-window", controller.DefaultRestoreStabilizationWindow, fmt.Sprintf("How long a replacement pod must stay Ready without a container restart before a restore that its snapshot engine only inferred concludes as RestoreInferred; 0 concludes as soon as the pod is Ready. A restore the engine confirms (RestoreVerified) doesn't wait. At most %s.", controller.MaxRestoreStabilizationWindow))
+	flag.BoolVar(&shortenReadinessDelay, "shorten-restored-readiness-delay", true, "Clear readinessProbe.initialDelaySeconds on gated restore-candidate replacement pods unless annotated with "+util.AnnotationPreserveReadinessDelay+"=true; liveness and startup probes are never changed")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -149,7 +151,8 @@ func main() {
 		"platform", ver.Platform,
 		"invariantMode", invariantMode,
 		"migratableRuntimeClasses", runtimeClassPolicy.String(),
-		"restoreStabilizationWindow", restoreStabilization)
+		"restoreStabilizationWindow", restoreStabilization,
+		"shortenRestoredReadinessDelay", shortenReadinessDelay)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -308,7 +311,7 @@ func main() {
 		setupLog.Error(err, "unable to register eviction webhook")
 		os.Exit(1)
 	}
-	if err := pmwebhook.SetupReplacementWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
+	if err := pmwebhook.SetupReplacementWebhookWithManager(mgr, mgr.GetAPIReader(), shortenReadinessDelay); err != nil {
 		setupLog.Error(err, "unable to register replacement mutating webhook")
 		os.Exit(1)
 	}
