@@ -797,8 +797,9 @@ func TestPreStopCheckDoesNotRetryHopelessErrors(t *testing.T) {
 			cancel()
 			return errors.New("apiserver unavailable")
 		})
-		if len(ops.stopped) != 0 || reader.calls != 2 {
-			t.Fatalf("want one attempt (plus finish's read) and no stop: reads %d, events %v", reader.calls, ops.events)
+		// A done parent is a shutdown: no finish, so no read for it either.
+		if len(ops.stopped) != 0 || reader.calls != 1 {
+			t.Fatalf("want one attempt and no stop: reads %d, events %v", reader.calls, ops.events)
 		}
 	})
 }
@@ -926,5 +927,126 @@ func TestPSMTRetryFailsBucketlessWorkOrder(t *testing.T) {
 				t.Fatalf("the work order must not be changed after creation, got bucket %q", b)
 			}
 		})
+	}
+}
+
+// bucketlessWorkOrder is a PodSnapshot the engine controller created for a
+// refusal or a storage failure, before it recorded that outcome.
+func bucketlessWorkOrder() *unstructured.Unstructured {
+	ps := workOrderSnapshot(cancelSnapshot)
+	unstructured.RemoveNestedField(ps.Object, "spec", "bucket")
+	unstructured.RemoveNestedField(ps.Object, "spec", "path")
+	_ = unstructured.SetNestedField(ps.Object, cancelTrigger, "spec", specTriggerName)
+	return ps
+}
+
+// A trigger deleted before the engine controller recorded its refusal or
+// storage failure leaves a bucketless PodSnapshot. No node agent will ever
+// act on it, so a CancelRequested would never be confirmed, and the
+// orchestrator would keep the fence on a source that was never touched. The
+// engine controller records Cancelled itself, also over a request an earlier
+// pass already wrote.
+func TestCancelWorkOrdersConfirmsBucketlessOrder(t *testing.T) {
+	for name, requested := range map[string]bool{"no request yet": false, "request already written": true} {
+		t.Run(name, func(t *testing.T) {
+			ps := bucketlessWorkOrder()
+			if requested {
+				if err := contract.SetCondition(ps, metav1.Condition{Type: contract.CondCheckpoint, Status: metav1.ConditionUnknown, Reason: contract.ReasonCancelRequested}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c := newClient(t, ps)
+			reconcilePSMT(t, c, nil, cancelTrigger) // the trigger is gone
+			cond := requireCancelled(t, c)
+			if !strings.Contains(cond.Message, "not touched") {
+				t.Fatalf("the cancel message must say the source was not touched, got %q", cond.Message)
+			}
+			if reqs := podSnapshotToTrigger(context.Background(), getSnapshot(t, c, cancelSnapshot)); len(reqs) != 0 {
+				t.Fatalf("a confirmed cancel must not enqueue its trigger: %v", reqs)
+			}
+		})
+	}
+	t.Run("the watch re-enqueues a stuck request", func(t *testing.T) {
+		ps := bucketlessWorkOrder()
+		if err := contract.SetCondition(ps, metav1.Condition{Type: contract.CondCheckpoint, Status: metav1.ConditionUnknown, Reason: contract.ReasonCancelRequested}); err != nil {
+			t.Fatal(err)
+		}
+		if reqs := podSnapshotToTrigger(context.Background(), ps); len(reqs) != 1 {
+			t.Fatalf("a bucketless order with an unconfirmable request must enqueue its trigger, got %v", reqs)
+		}
+	})
+}
+
+// A PodSnapshot deleted between the List and the status write is no longer
+// a work order to cancel.
+func TestCancelWorkOrdersIgnoresVanishedSnapshot(t *testing.T) {
+	ps := workOrderSnapshot(cancelSnapshot)
+	_ = unstructured.SetNestedField(ps.Object, cancelTrigger, "spec", specTriggerName)
+	c := newClientWithInterceptor(t, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == contract.GVKPodSnapshot.Kind {
+				return apierrors.NewNotFound(schema.GroupResource{Group: contract.Group, Resource: "podsnapshots"}, key.Name)
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	}, ps)
+	if _, err := (&PSMTReconciler{Client: c}).Reconcile(context.Background(),
+		ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: cancelTrigger}}); err != nil {
+		t.Fatalf("a vanished PodSnapshot must not fail the cancel: %v", err)
+	}
+}
+
+// The engine controller writes a PodSnapshot's status only when its
+// conditions change, and counts an outcome only when it wrote it: the PSMT
+// is re-enqueued by its own status write and by the PodSnapshot watch.
+func TestPSMTWritesAndCountsOutcomesOnce(t *testing.T) {
+	writes := 0
+	c := newClientWithInterceptor(t, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == contract.GVKPodSnapshot.Kind {
+				writes++
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}, workOrderSnapshot(cancelSnapshot))
+	r := &PSMTReconciler{Client: c}
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if err := r.setSnapshotPending(ctx, "default", cancelSnapshot, "awaiting node agent on node-a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if writes != 1 {
+		t.Fatalf("an unchanged Pending must not be written again: %d writes", writes)
+	}
+
+	before := outcomeCount(contract.ReasonRefused)
+	for i := 0; i < 2; i++ {
+		if err := r.setSnapshotTerminal(ctx, "default", cancelSnapshot, contract.ReasonRefused, "policy"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := outcomeCount(contract.ReasonRefused) - before; got != 1 {
+		t.Fatalf("Refused counted %v times for one outcome", got)
+	}
+	if writes != 2 {
+		t.Fatalf("want one more write for the outcome, got %d writes", writes)
+	}
+}
+
+// The agent's context ending (shutdown) is not a pipeline outcome: nothing is
+// written, and the next agent picks the work order up again.
+func TestAgentShutdownWritesNoOutcome(t *testing.T) {
+	c := cancelFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	store := &failingStore{memStore: newMemStore(), failSubstr: "checkpoint.tar"}
+	store.onFail = cancel
+	_, _ = (&NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour}).
+		Reconcile(ctx, ctrl.Request{NamespacedName: cancelSnapshotKey})
+	if ps := getSnapshot(t, c, cancelSnapshot); hasOutcome(ps) {
+		t.Fatalf("an outcome was written on shutdown: %+v", contract.Conditions(ps))
 	}
 }

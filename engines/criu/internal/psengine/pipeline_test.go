@@ -136,10 +136,14 @@ func (m *memStore) Delete(_ context.Context, bucket, object string) error {
 type failingStore struct {
 	*memStore
 	failSubstr string
+	onFail     func() // runs before the failure is returned
 }
 
 func (f *failingStore) Put(ctx context.Context, bucket, object string, r io.Reader) (*ObjectInfo, error) {
 	if strings.Contains(object, f.failSubstr) {
+		if f.onFail != nil {
+			f.onFail()
+		}
 		return nil, errors.New("gcs put: HTTP 503 backend unavailable")
 	}
 	return f.memStore.Put(ctx, bucket, object, r)

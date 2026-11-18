@@ -196,7 +196,7 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, r.setSnapshotTerminal(ctx, req.Namespace, snapshotName, contract.ReasonFailed,
 			fmt.Sprintf("resolving storage: %v", storageErr))
 	}
-	if b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket"); b == "" {
+	if !hasBucket(ps) {
 		// An earlier pass withheld the bucket (refused, or no storage then)
 		// and failed to record that outcome. Node agents ignore a work order
 		// without a bucket, so it would sit Pending until the job's deadline.
@@ -295,37 +295,67 @@ func (r *PSMTReconciler) storageFor(ctx context.Context, psp *unstructured.Unstr
 	return contract.GCSLocation(pssc)
 }
 
+// setSnapshotTerminal records a terminal outcome, counting it only when it
+// was written (the PSMT is re-enqueued by its own writes and by the
+// PodSnapshot watch).
 func (r *PSMTReconciler) setSnapshotTerminal(ctx context.Context, namespace, name, reason, msg string) error {
-	checkpointOutcomes.WithLabelValues(reason).Inc()
-	return r.patchSnapshotConditions(ctx, namespace, name,
+	wrote, err := r.patchSnapshotConditions(ctx, namespace, name,
 		metav1.Condition{Type: contract.CondCheckpoint, Status: metav1.ConditionFalse, Reason: reason, Message: msg},
 		metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionFalse, Reason: reason, Message: msg},
 	)
+	if err == nil && wrote {
+		checkpointOutcomes.WithLabelValues(reason).Inc()
+	}
+	return err
 }
 
 func (r *PSMTReconciler) setSnapshotPending(ctx context.Context, namespace, name, msg string) error {
-	return r.patchSnapshotConditions(ctx, namespace, name,
+	_, err := r.patchSnapshotConditions(ctx, namespace, name,
 		metav1.Condition{Type: contract.CondCheckpoint, Status: metav1.ConditionUnknown, Reason: contract.ReasonPending, Message: msg},
 	)
+	return err
 }
 
-func (r *PSMTReconciler) patchSnapshotConditions(ctx context.Context, namespace, name string, conds ...metav1.Condition) error {
+// patchSnapshotConditions sets conds on the PodSnapshot and reports whether
+// it wrote them. It writes nothing when the conditions wouldn't change.
+func (r *PSMTReconciler) patchSnapshotConditions(ctx context.Context, namespace, name string, conds ...metav1.Condition) (bool, error) {
 	ps := contract.New(contract.GVKPodSnapshot)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, ps); err != nil {
-		return err
+		return false, err
 	}
 	// Never regress a snapshot the node agent already progressed: Ready
 	// (upload verified), terminal reasons and a timed-out checkpoint outrank
 	// the controller half.
 	if hasOutcome(ps) {
-		return nil
+		return false, nil
 	}
+	before := contract.Conditions(ps)
 	for _, c := range conds {
 		if err := contract.SetCondition(ps, c); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return r.Status().Update(ctx, ps)
+	if conditionsEqual(before, contract.Conditions(ps)) {
+		return false, nil
+	}
+	if err := r.Status().Update(ctx, ps); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// hasBucket: the work order can be handed to a node agent. The engine
+// controller withholds the bucket for a refusal or a storage failure, and
+// agents ignore an order without one.
+func hasBucket(ps *unstructured.Unstructured) bool {
+	b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket")
+	return b != ""
+}
+
+// awaitingCancel: a cancel was requested that a node agent can still
+// confirm. A bucketless order's request can't be confirmed by any agent.
+func awaitingCancel(ps *unstructured.Unstructured) bool {
+	return cancelRequested(ps) && hasBucket(ps)
 }
 
 // specTriggerName is the PodSnapshot spec field naming the PSMT the work
@@ -346,6 +376,12 @@ func snapshotTrigger(ps *unstructured.Unstructured) string {
 // agent still honours a deleted PodSnapshot). If a trigger with the same name
 // is created again before the agent acts, its reconcile replaces the request
 // with Pending and the work order carries on for the new trigger.
+//
+// A work order without a bucket (the trigger was deleted before this
+// controller recorded its refusal or storage failure) never reaches an agent,
+// so nothing would confirm a request. The source was never touched, so this
+// controller records Cancelled itself, also over a request already written.
+// A PodSnapshot deleted since the List is skipped.
 func (r *PSMTReconciler) cancelWorkOrders(ctx context.Context, trigger types.NamespacedName) error {
 	list := contract.NewList(contract.GVKPodSnapshot)
 	if err := r.List(ctx, list, client.InNamespace(trigger.Namespace),
@@ -354,14 +390,22 @@ func (r *PSMTReconciler) cancelWorkOrders(ctx context.Context, trigger types.Nam
 	}
 	for i := range list.Items {
 		ps := &list.Items[i]
-		if snapshotTrigger(ps) != trigger.Name || hasOutcome(ps) || cancelRequested(ps) {
+		if snapshotTrigger(ps) != trigger.Name || hasOutcome(ps) || awaitingCancel(ps) {
 			continue
 		}
-		log.FromContext(ctx).Info("trigger deleted; asking the node agent to cancel its work order", "snapshot", ps.GetName())
-		if err := r.patchSnapshotConditions(ctx, trigger.Namespace, ps.GetName(), metav1.Condition{
-			Type: contract.CondCheckpoint, Status: metav1.ConditionUnknown, Reason: contract.ReasonCancelRequested,
-			Message: fmt.Sprintf("trigger %s was deleted; waiting for the node agent to confirm the cancel", trigger.Name),
-		}); err != nil {
+		var err error
+		if !hasBucket(ps) {
+			log.FromContext(ctx).Info("trigger deleted before its work order was handed to a node agent; cancelling it", "snapshot", ps.GetName())
+			err = r.setSnapshotTerminal(ctx, trigger.Namespace, ps.GetName(), contract.ReasonCancelled,
+				fmt.Sprintf("trigger %s was deleted before the work order was handed to a node agent; the source container was not touched", trigger.Name))
+		} else {
+			log.FromContext(ctx).Info("trigger deleted; asking the node agent to cancel its work order", "snapshot", ps.GetName())
+			_, err = r.patchSnapshotConditions(ctx, trigger.Namespace, ps.GetName(), metav1.Condition{
+				Type: contract.CondCheckpoint, Status: metav1.ConditionUnknown, Reason: contract.ReasonCancelRequested,
+				Message: fmt.Sprintf("trigger %s was deleted; waiting for the node agent to confirm the cancel", trigger.Name),
+			})
+		}
+		if client.IgnoreNotFound(err) != nil {
 			return err
 		}
 	}
@@ -377,7 +421,7 @@ func podSnapshotToTrigger(_ context.Context, obj client.Object) []reconcile.Requ
 		return nil
 	}
 	trigger := snapshotTrigger(ps)
-	if trigger == "" || hasOutcome(ps) || cancelRequested(ps) {
+	if trigger == "" || hasOutcome(ps) || awaitingCancel(ps) {
 		return nil
 	}
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: ps.GetNamespace(), Name: trigger}}}

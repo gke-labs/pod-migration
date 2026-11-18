@@ -277,7 +277,7 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if hasOutcome(ps) {
 		return ctrl.Result{}, nil
 	}
-	if b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket"); b == "" {
+	if !hasBucket(ps) {
 		// No bucket means no work order: the controller half withheld it for
 		// a refusal or a storage failure, and records that outcome itself.
 		// Writing Failed here (from every node's agent) would pre-empt its
@@ -319,6 +319,12 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		"dest", fmt.Sprintf("gs://%s/%s", spec.Bucket, ArchivePrefix(spec.Path, ps.GetName())))
 
 	if err := r.run(ctx, req.NamespacedName, spec); err != nil {
+		if ctx.Err() != nil {
+			// The agent is shutting down: not an outcome. The work order
+			// stays open, and the next agent picks it up.
+			logger.Info("agent shutting down; checkpoint pipeline abandoned without an outcome", "detail", err.Error())
+			return ctrl.Result{}, ctx.Err()
+		}
 		if errors.Is(err, errFinished) {
 			logger.Info("the PodSnapshot got an outcome elsewhere; source container not stopped", "detail", err.Error())
 			return ctrl.Result{}, nil
@@ -347,8 +353,13 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	// which aborts an in-flight upload. The checkpoint call and the stop run
 	// on parent (see the file comment).
 	ctx, cancel := context.WithCancelCause(parent)
-	defer cancel(nil)
 	pollerDone := make(chan struct{})
+	// On every return, end the poller and wait for it, so it never reads the
+	// work order after the pipeline has returned.
+	defer func() {
+		cancel(nil)
+		<-pollerDone
+	}()
 	go func() {
 		defer close(pollerDone)
 		r.pollForCancel(ctx, cancel, key)
