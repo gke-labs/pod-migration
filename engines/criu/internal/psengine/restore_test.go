@@ -70,7 +70,7 @@ func TestInjectHolderRewiresGatedPod(t *testing.T) {
 		t.Fatalf("seed initContainer missing: %+v", pod.Spec.InitContainers)
 	}
 	app := pod.Spec.Containers[0]
-	wantCmd := []string{"/pmhold/holder", "wrap", "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"}
+	wantCmd := []string{"/pmhold/holder", "wrap", "--ps-name-annotation=" + contract.AnnotationPSName, "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"}
 	if strings.Join(app.Command, " ") != strings.Join(wantCmd, " ") {
 		t.Fatalf("wrapped command: %v", app.Command)
 	}
@@ -132,6 +132,30 @@ func TestInjectHolderSkips(t *testing.T) {
 		pod.Spec.HostNetwork = true
 		if ok, reason := InjectHolder(pod, "img"); ok || !strings.Contains(reason, "hostNetwork") {
 			t.Fatalf("expected hostNetwork refusal, got ok=%v reason=%q", ok, reason)
+		}
+	})
+	t.Run("non-runc runtimeClassName (gvisor)", func(t *testing.T) {
+		pod := gatedReplacementPod()
+		rc := "gvisor"
+		pod.Spec.RuntimeClassName = &rc
+		if ok, reason := InjectHolder(pod, "img"); ok || !strings.Contains(reason, "runtimeClassName") {
+			t.Fatalf("expected gvisor runtimeClassName refusal, got ok=%v reason=%q", ok, reason)
+		}
+	})
+	t.Run("explicit runc runtimeClassName is injected", func(t *testing.T) {
+		pod := gatedReplacementPod()
+		rc := "runc"
+		pod.Spec.RuntimeClassName = &rc
+		if ok, reason := InjectHolder(pod, "img"); !ok {
+			t.Fatalf("expected runc pod injection, got skip: %s", reason)
+		}
+	})
+	t.Run("sidecar initContainer", func(t *testing.T) {
+		pod := gatedReplacementPod()
+		always := corev1.ContainerRestartPolicyAlways
+		pod.Spec.InitContainers = []corev1.Container{{Name: "mesh", RestartPolicy: &always}}
+		if ok, reason := InjectHolder(pod, "img"); ok || !strings.Contains(reason, "sidecar") {
+			t.Fatalf("expected sidecar initContainer refusal, got ok=%v reason=%q", ok, reason)
 		}
 	})
 }
@@ -545,6 +569,48 @@ func TestNodeRestoreAcceptsSucceededPhaseWhenBoundToThisPod(t *testing.T) {
 	}
 }
 
+// TestDeployCRDsUseDefaultGroup pins deploy/crds.yaml to contract.DefaultGroup
+// (#135), so reverting the manifest to podsnapshot.gke.io fails the suite.
+func TestDeployCRDsUseDefaultGroup(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "crds.yaml"))
+	if err != nil {
+		t.Fatalf("read crds.yaml: %v", err)
+	}
+	type crd struct {
+		Kind     string `json:"kind"`
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Spec struct {
+			Group string `json:"group"`
+		} `json:"spec"`
+	}
+	seen := 0
+	for _, doc := range strings.Split(string(raw), "\n---") {
+		doc = strings.TrimSpace(doc)
+		if doc == "" {
+			continue
+		}
+		var c crd
+		if err := k8syaml.Unmarshal([]byte(doc), &c); err != nil {
+			t.Fatalf("unmarshal crds.yaml document: %v", err)
+		}
+		if c.Kind != "CustomResourceDefinition" {
+			continue
+		}
+		seen++
+		if c.Spec.Group != contract.DefaultGroup {
+			t.Errorf("CRD %s has spec.group %q, want %q", c.Metadata.Name, c.Spec.Group, contract.DefaultGroup)
+		}
+		if !strings.HasSuffix(c.Metadata.Name, "."+contract.DefaultGroup) {
+			t.Errorf("CRD name %q does not end in .%s", c.Metadata.Name, contract.DefaultGroup)
+		}
+	}
+	if seen != 4 {
+		t.Errorf("crds.yaml defines %d CRDs, want 4", seen)
+	}
+}
+
 func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "deploy.yaml"))
 	if err != nil {
@@ -640,6 +706,9 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	if !hasRule(agentRole, "", "nodes", "get", "patch") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/patch on core/nodes")
 	}
+	if hasRule(agentRole, "", "nodes", "list") || hasRule(agentRole, "", "nodes", "watch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole must not grant list/watch on core/nodes (#227)")
+	}
 	if !hasRule(agentRole, "", "nodes/checkpoint", "create") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing create on core/nodes/checkpoint")
 	}
@@ -649,6 +718,12 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	if !hasRule(controllerRole, contract.GVKStorageConfig.Group, "podsnapshotstorageconfigs", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list/watch on %s/podsnapshotstorageconfigs", contract.GVKStorageConfig.Group)
 	}
+	if !hasRule(controllerRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "get") {
+		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get on %s/podmigrationjobs", contract.GVKPodMigrationJob.Group)
+	}
+	if hasRule(controllerRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "list") || hasRule(controllerRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "watch") {
+		t.Errorf("pod-migrate-psengine-controller ClusterRole must grant only get (not list/watch) on %s/podmigrationjobs", contract.GVKPodMigrationJob.Group)
+	}
 
 	rnBytes, err := os.ReadFile("restore_node.go")
 	if err != nil {
@@ -657,6 +732,15 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	wantMarker := "+kubebuilder:rbac:groups=" + contract.GVKPodMigrationJob.Group + ",resources=podmigrationjobs"
 	if !strings.Contains(string(rnBytes), wantMarker) {
 		t.Fatalf("restore_node.go missing %q marker", wantMarker)
+	}
+
+	rwBytes, err := os.ReadFile("restore_webhook.go")
+	if err != nil {
+		t.Fatalf("read restore_webhook.go: %v", err)
+	}
+	wantWebhookMarker := "+kubebuilder:rbac:groups=" + contract.GVKPodMigrationJob.Group + ",resources=podmigrationjobs,verbs=get"
+	if !strings.Contains(string(rwBytes), wantWebhookMarker) || strings.Contains(string(rwBytes), "resources=podmigrationjobs,verbs=get;list") {
+		t.Fatalf("restore_webhook.go missing narrowed %q marker", wantWebhookMarker)
 	}
 }
 

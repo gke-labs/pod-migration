@@ -380,6 +380,88 @@ func TestPSMTRefusesHostNetwork(t *testing.T) {
 	}
 }
 
+func TestPSMTRefusesNonRuncRuntimeClass(t *testing.T) {
+	pod := sourcePod("web-0", 1, "node-a")
+	gvisor := "gvisor"
+	pod.Spec.RuntimeClassName = &gvisor
+	c := newClient(t,
+		pssc("pssc-x", "bkt", ""),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		pod,
+		criuNode("node-a", true),
+		psmtFor("web-0"),
+	)
+	cp := &fakeCheckpointer{}
+	reconcilePSMT(t, c, cp, "psmt-web-0-deadbeef")
+
+	if len(cp.got) != 0 {
+		t.Fatal("gvisor pod must not be checkpointed by CRIU")
+	}
+	ps := getSnapshot(t, c, contract.PodSnapshotName("web-0", "deadbeef-0000-1111"))
+	if hasBucket(ps) {
+		t.Fatal("refused snapshot must withhold bucket from work order")
+	}
+	cond := condition(ps, contract.CondCheckpoint)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != contract.ReasonRefused {
+		t.Fatalf("want Checkpoint=False/Refused, got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "gvisor") {
+		t.Fatalf("expected gvisor in refusal message, got: %s", cond.Message)
+	}
+}
+
+func TestPSMTRefusesSidecarInitContainer(t *testing.T) {
+	t.Run("restartPolicy Always sidecar is refused", func(t *testing.T) {
+		pod := sourcePod("web-0", 1, "node-a")
+		always := corev1.ContainerRestartPolicyAlways
+		pod.Spec.InitContainers = []corev1.Container{{Name: "mesh-proxy", RestartPolicy: &always}}
+		c := newClient(t,
+			pssc("pssc-x", "bkt", ""),
+			readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+			pod,
+			criuNode("node-a", true),
+			psmtFor("web-0"),
+		)
+		cp := &fakeCheckpointer{}
+		reconcilePSMT(t, c, cp, "psmt-web-0-deadbeef")
+
+		if len(cp.got) != 0 {
+			t.Fatal("pod with sidecar initContainer must not be checkpointed")
+		}
+		ps := getSnapshot(t, c, contract.PodSnapshotName("web-0", "deadbeef-0000-1111"))
+		if hasBucket(ps) {
+			t.Fatal("refused snapshot must withhold bucket from work order")
+		}
+		cond := condition(ps, contract.CondCheckpoint)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != contract.ReasonRefused {
+			t.Fatalf("want Checkpoint=False/Refused, got %+v", cond)
+		}
+		if !strings.Contains(cond.Message, "sidecar") {
+			t.Fatalf("expected sidecar in refusal message, got: %s", cond.Message)
+		}
+	})
+
+	t.Run("one-shot initContainer and explicit runc runtimeClassName remain eligible", func(t *testing.T) {
+		pod := sourcePod("web-0", 1, "node-a")
+		runcRC := "runc"
+		pod.Spec.RuntimeClassName = &runcRC
+		pod.Spec.InitContainers = []corev1.Container{{Name: "db-migrate"}}
+		c := newClient(t,
+			pssc("pssc-x", "bkt", "snaps"),
+			readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+			pod,
+			criuNode("node-a", true),
+			psmtFor("web-0"),
+		)
+		cp := &fakeCheckpointer{}
+		reconcilePSMT(t, c, cp, "psmt-web-0-deadbeef")
+
+		if len(cp.got) != 1 {
+			t.Fatalf("expected 1 checkpoint call for one-shot initContainer + runc pod, got %d", len(cp.got))
+		}
+	})
+}
+
 func TestPSMTRefusesNonReadyNode(t *testing.T) {
 	c := newClient(t,
 		pssc("pssc-x", "bkt", ""),
@@ -477,13 +559,6 @@ func TestPSMTIgnoresPodsWithoutEnginePolicy(t *testing.T) {
 }
 
 func TestVerifyCRDOwnershipClobbered(t *testing.T) {
-	crd := &unstructured.Unstructured{}
-	crd.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
-	crd.SetName("podsnapshots.podsnapshot.gke.io")
-	crd.SetLabels(map[string]string{
-		ComponentLabel:                    ComponentLabelValue,
-		"addonmanager.kubernetes.io/mode": "EnsureExists",
-	})
 	var objs []runtime.Object
 	for _, n := range contract.CRDNames(contract.Group) {
 		cc := &unstructured.Unstructured{}

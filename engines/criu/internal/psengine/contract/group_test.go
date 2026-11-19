@@ -52,22 +52,24 @@ func assertGroup(t *testing.T, group string) {
 	}
 }
 
-// Without SetGroup, the engine serves the GKE Pod Snapshots group, as
-// before #135.
+// Without SetGroup, the engine serves its dedicated CRIU API group (#135).
 func TestDefaultGroup(t *testing.T) {
+	if CRIUGroup != "criu.podmigration.gke.io" {
+		t.Fatalf("CRIUGroup = %q, want criu.podmigration.gke.io", CRIUGroup)
+	}
 	if GKEPodSnapshotsGroup != "podsnapshot.gke.io" {
 		t.Fatalf("GKEPodSnapshotsGroup = %q, want podsnapshot.gke.io", GKEPodSnapshotsGroup)
 	}
-	if DefaultGroup != GKEPodSnapshotsGroup {
-		t.Fatalf("DefaultGroup = %q, want %q", DefaultGroup, GKEPodSnapshotsGroup)
+	if DefaultGroup != CRIUGroup {
+		t.Fatalf("DefaultGroup = %q, want %q", DefaultGroup, CRIUGroup)
 	}
 	assertGroup(t, DefaultGroup)
 
 	want := []string{
-		"podsnapshotstorageconfigs.podsnapshot.gke.io",
-		"podsnapshotpolicies.podsnapshot.gke.io",
-		"podsnapshotmanualtriggers.podsnapshot.gke.io",
-		"podsnapshots.podsnapshot.gke.io",
+		"podsnapshotstorageconfigs.criu.podmigration.gke.io",
+		"podsnapshotpolicies.criu.podmigration.gke.io",
+		"podsnapshotmanualtriggers.criu.podmigration.gke.io",
+		"podsnapshots.criu.podmigration.gke.io",
 	}
 	if got := CRDNames(DefaultGroup); !slices.Equal(got, want) {
 		t.Fatalf("CRDNames(%q) = %v, want %v", DefaultGroup, got, want)
@@ -83,7 +85,7 @@ func TestSetGroup(t *testing.T) {
 		}
 		assertGroup(t, DefaultGroup)
 	})
-	const group = "criu.podmigration.gke.io"
+	const group = GKEPodSnapshotsGroup
 	if err := SetGroup(group); err != nil {
 		t.Fatalf("SetGroup(%q): %v", group, err)
 	}
@@ -108,7 +110,7 @@ func TestSetGroupRejectsInvalidGroups(t *testing.T) {
 	t.Cleanup(func() { _ = SetGroup(DefaultGroup) })
 	// Start each case from a group other than the default, so that falling
 	// back to the default on error fails the test.
-	const serving = "criu.podmigration.gke.io"
+	const serving = GKEPodSnapshotsGroup
 	for name, group := range map[string]string{
 		"empty":                        "",
 		"no dot":                       "criu",

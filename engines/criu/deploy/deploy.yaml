@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# WARNING: EXPERIMENTAL — FOR ADDON-OFF TEST CLUSTERS ONLY (#129).
-# See https://github.com/gke-labs/pod-migration/issues/129 for the security
-# hardening and follow-up tracker: checkpoint archives in GCS do not yet carry
+# WARNING: EXPERIMENTAL — FOR NON-PRODUCTION TEST CLUSTERS ONLY (#129, #244).
+# See https://github.com/gke-labs/pod-migration/issues/129 and #244 for the
+# security hardening tracker: checkpoint archives in GCS do not yet carry
 # cryptographic provenance (R2) and the hostNetwork agent uses the node's
-# default GCE service account (R5), so anyone who can write to the checkpoint
-# GCS bucket can get root on a restoring node until R2 and R5 land. The agent
-# holds cluster-wide pods (update/patch) and nodes (patch/checkpoint) RBAC, and
-# a residual dual-start window exists if holder fallback precedes restore. Never
-# deploy to production or addon-enabled clusters.
+# GCE service account (R5), so anyone who can write to the checkpoint GCS bucket
+# can get root on a restoring node until R2 and R5 land. The agent holds
+# cluster-wide pods (update/patch) and nodes (patch/checkpoint) RBAC, and a
+# residual dual-start window exists if holder fallback precedes restore. Never
+# deploy to production clusters.
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,12 +55,15 @@ metadata:
   labels:
     pod-migrate.io/component: psengine
 rules:
-  - apiGroups: ["podsnapshot.gke.io"]
+  - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshotstorageconfigs", "podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
     verbs: ["get", "list", "watch", "create"]
-  - apiGroups: ["podsnapshot.gke.io"]
+  - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshotpolicies/status", "podsnapshotmanualtriggers/status", "podsnapshots/status"]
     verbs: ["get", "update", "patch"]
+  - apiGroups: ["podmigration.gke.io"]
+    resources: ["podmigrationjobs"]
+    verbs: ["get"]
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get"]
@@ -99,15 +102,15 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "patch"]
-  - apiGroups: ["podsnapshot.gke.io"]
+  - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshots"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["podsnapshot.gke.io"]
+  - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshots/status"]
     verbs: ["get", "update", "patch"]
   # A live get of the work order's trigger before the checkpoint and before
   # committing: a deleted trigger cancels the work order (C9, #106).
-  - apiGroups: ["podsnapshot.gke.io"]
+  - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshotmanualtriggers"]
     verbs: ["get"]
   - apiGroups: ["podmigration.gke.io"]
@@ -248,6 +251,22 @@ spec:
       serviceAccountName: pod-migrate-agent
       hostNetwork: true
       hostPID: true
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+                  - key: sandbox.gke.io/runtime
+                    operator: NotIn
+                    values: ["gvisor"]
+                  # COS mounts /usr/local read-only until #109 moves the CRIU
+                  # install path onto /home/kubernetes/bin.
+                  - key: cloud.google.com/gke-os-distribution
+                    operator: NotIn
+                    values: ["cos"]
       tolerations:
         - operator: Exists
       containers:
@@ -375,6 +394,14 @@ webhooks:
     objectSelector:
       matchLabels:
         pod-migration.gke.io/enabled: "true"
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - pod-migration-system
+            - pod-migration-criu-system
     clientConfig:
       service:
         name: pod-migrate-psengine-webhook

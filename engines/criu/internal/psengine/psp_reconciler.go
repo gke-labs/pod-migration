@@ -52,9 +52,9 @@ type PSPReconciler struct {
 	Probe StorageProber
 }
 
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotpolicies/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
 
 func (r *PSPReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("psp", req.NamespacedName)
