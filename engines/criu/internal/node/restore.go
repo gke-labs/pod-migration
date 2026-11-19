@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -50,7 +51,7 @@ const (
 // restorer drives the sandbox-sibling container restore.
 type restorer struct {
 	cclient *containerd.Client
-	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p).
+	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p -C -c).
 	// Swappable in tests.
 	execHost         func(ctx context.Context, env []string, name string, args ...string) (string, error)
 	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
@@ -60,22 +61,32 @@ type restorer struct {
 	readProcCgroupFn func(pid int) ([]byte, error)
 	pmRootDir        string
 	criuConfDirPath  string
+	nsenterBin       string
 }
 
 func newRestorer(c *containerd.Client) *restorer {
-	return &restorer{cclient: c, execHost: nsenterExec}
+	r := &restorer{cclient: c}
+	r.execHost = r.nsenterExec
+	return r
 }
 
-// nsenterExec executes cmd in the host mount+pid namespaces (agent has
-// hostPID, so target pid 1 is the host init). Output goes through a file, not
-// pipes: `runc restore --detach` leaves the restored process holding the
-// inherited stderr, so CombinedOutput would block forever after a successful
-// restore. With *os.File stdio, Wait returns on runc exit.
-func nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
+// nsenterExec executes cmd in the host mount, pid, and cgroup namespaces and
+// joins PID 1's cgroup (agent has hostPID, so target pid 1 is the host init).
+// Entering host cgroup (-C -c) ensures commands like runc restore run outside
+// the agent's cgroup and place restored containers under the target pod slice.
+// Output goes through a file, not pipes: `runc restore --detach` leaves the
+// restored process holding the inherited stderr, so CombinedOutput would block
+// forever after a successful restore. With *os.File stdio, Wait returns on
+// runc exit.
+func (r *restorer) nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	full := append([]string{"-t", "1", "-m", "-p", "--", name}, args...)
-	cmd := exec.CommandContext(cctx, "nsenter", full...)
+	bin := "nsenter"
+	if r != nil && r.nsenterBin != "" {
+		bin = r.nsenterBin
+	}
+	full := append([]string{"-t", "1", "-m", "-p", "-C", "-c", "--", name}, args...)
+	cmd := exec.CommandContext(cctx, bin, full...)
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.CreateTemp("", "pm-exec-*")
 	if err != nil {
@@ -92,13 +103,21 @@ func nsenterExec(ctx context.Context, env []string, name string, args ...string)
 	return string(b), runErr
 }
 
+func nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
+	return (&restorer{}).nsenterExec(ctx, env, name, args...)
+}
+
 func (r *restorer) execRestore(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
+	bin := "nsenter"
+	if r != nil && r.nsenterBin != "" {
+		bin = r.nsenterBin
+	}
 	// runc restore holds inherited stderr, so we redirect to a file.
 	// We keep this file so it acts as a container-stdout log for the restored process.
-	full := append([]string{"-t", "1", "-m", "-p", "--", name}, args...)
-	cmd := exec.CommandContext(cctx, "nsenter", full...)
+	full := append([]string{"-t", "1", "-m", "-p", "-C", "-c", "--", name}, args...)
+	cmd := exec.CommandContext(cctx, bin, full...)
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -495,10 +514,11 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 		return AdaptParams{}, "", fmt.Errorf("target holder container has no image name; refusing to fall back to archive image")
 	}
 	srcSandboxID := in.SrcSpec.Annotations["io.kubernetes.cri.sandbox-id"]
+	cgroupsPath := path.Clean("/" + podSlice + "/" + id)
 	return AdaptParams{
 		RootfsPath:      rootfsPath,
 		HolderPid:       holder.Pid,
-		CgroupsPath:     podSlice + "/" + id,
+		CgroupsPath:     cgroupsPath,
 		SourcePodUID:    in.SourcePodUID,
 		TargetPodUID:    in.TargetPodUID,
 		SourceSandboxID: srcSandboxID,

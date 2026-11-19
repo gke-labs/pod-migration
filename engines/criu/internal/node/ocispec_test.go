@@ -96,7 +96,7 @@ func params() AdaptParams {
 	return AdaptParams{
 		RootfsPath:      "/var/lib/pod-migrate/bundles/pm-mig1/rootfs",
 		HolderPid:       2222,
-		CgroupsPath:     "kubepods.slice/kubepods-pod-tgt.slice/pm-mig1",
+		CgroupsPath:     "/kubepods.slice/kubepods-pod-tgt.slice/pm-mig1",
 		SourcePodUID:    "src-uid",
 		TargetPodUID:    "tgt-uid",
 		SourceSandboxID: "srcsandbox111",
@@ -144,7 +144,7 @@ func TestAdaptSpecRemapsMountsAndCgroup(t *testing.T) {
 	if s.Mounts[0].Source != "/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes/tgtsandbox222/etc-hosts" {
 		t.Errorf("etc-hosts remap = %s", s.Mounts[0].Source)
 	}
-	if s.Linux.CgroupsPath != "kubepods.slice/kubepods-pod-tgt.slice/pm-mig1" {
+	if s.Linux.CgroupsPath != "/kubepods.slice/kubepods-pod-tgt.slice/pm-mig1" {
 		t.Errorf("cgroupsPath = %s", s.Linux.CgroupsPath)
 	}
 	if s.Root.Path != "/var/lib/pod-migrate/bundles/pm-mig1/rootfs" {
@@ -222,7 +222,7 @@ func TestPodSliceFromProcCgroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice"
+	want := "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice"
 	if got != want {
 		t.Errorf("pod slice = %q, want %q", got, want)
 	}
@@ -231,6 +231,9 @@ func TestPodSliceFromProcCgroup(t *testing.T) {
 func TestPodSliceFromProcCgroupRejectsRootAndV1(t *testing.T) {
 	if _, err := PodSliceFromProcCgroup("0::/\n"); err == nil {
 		t.Error("root cgroup accepted")
+	}
+	if _, err := PodSliceFromProcCgroup("0::/holder.scope\n"); err == nil {
+		t.Error("direct child of root cgroup accepted")
 	}
 	if _, err := PodSliceFromProcCgroup("12:cpuset:/kubepods/x\n"); err == nil {
 		t.Error("cgroup v1-only content accepted")

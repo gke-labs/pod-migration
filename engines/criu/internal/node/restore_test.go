@@ -17,6 +17,10 @@ package node
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -24,6 +28,16 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
+
+func init() {
+	if os.Getenv("GO_WANT_CGROUP_NSENTER_HELPER_PROCESS") == "1" {
+		args := os.Args[1:]
+		if p := os.Getenv("CGROUP_HELPER_ARGS_OUT"); p != "" {
+			_ = os.WriteFile(p, []byte(strings.Join(args, " ")), 0o644)
+		}
+		os.Exit(0)
+	}
+}
 
 type fakeContainer struct {
 	containerd.Container
@@ -161,5 +175,125 @@ func TestFindContainer_PidZeroContinuation(t *testing.T) {
 	}
 	if ref.Pid != 2002 {
 		t.Fatalf("findContainer returned Pid %d, want 2002", ref.Pid)
+	}
+}
+
+func TestBuildAdaptParams_ProducesAbsoluteCgroupsPath(t *testing.T) {
+	in := restoreInputs{
+		MigrationName: "mig-123",
+		SrcSpec: &specs.Spec{
+			Annotations: map[string]string{
+				"io.kubernetes.cri.sandbox-id": "src-sb",
+			},
+		},
+	}
+	holder := &containerRef{
+		Pid:       3456,
+		SandboxID: "tgt-sb",
+		ImageName: "registry.example.com/app:v1",
+		Spec:      sampleTargetSpec(),
+	}
+
+	testCases := []struct {
+		name     string
+		podSlice string
+		want     string
+	}{
+		{
+			name:     "already absolute pod slice",
+			podSlice: "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice",
+			want:     "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/pm-mig-123",
+		},
+		{
+			name:     "relative pod slice normalized to absolute",
+			podSlice: "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice",
+			want:     "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/pm-mig-123",
+		},
+		{
+			name:     "messy path cleaned to absolute",
+			podSlice: "///kubepods.slice//kubepods-pod123.slice/..//kubepods-pod123.slice",
+			want:     "/kubepods.slice/kubepods-pod123.slice/pm-mig-123",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			params, img, err := buildAdaptParams(in, holder, "/rootfs", tc.podSlice, "pm-mig-123", "/anon", nil)
+			if err != nil {
+				t.Fatalf("buildAdaptParams failed: %v", err)
+			}
+			if img != "registry.example.com/app:v1" {
+				t.Errorf("imageName = %q, want registry.example.com/app:v1", img)
+			}
+			if params.CgroupsPath != tc.want {
+				t.Errorf("CgroupsPath = %q, want %q", params.CgroupsPath, tc.want)
+			}
+			if !strings.HasPrefix(params.CgroupsPath, "/") {
+				t.Errorf("CgroupsPath must be absolute, got %q", params.CgroupsPath)
+			}
+		})
+	}
+}
+
+func TestExecRestore_EntersHostCgroupNamespace(t *testing.T) {
+	tmpDir := t.TempDir()
+	argsOut := filepath.Join(tmpDir, "args.txt")
+	helperScript := filepath.Join(tmpDir, "mock-nsenter.sh")
+	script := fmt.Sprintf("#!/bin/sh\nexport GO_WANT_CGROUP_NSENTER_HELPER_PROCESS=1\nexport CGROUP_HELPER_ARGS_OUT=%q\nexec %q \"$@\"\n", argsOut, os.Args[0])
+	if err := os.WriteFile(helperScript, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &restorer{nsenterBin: helperScript}
+	logPath := filepath.Join(tmpDir, "runc.log")
+	ctx := context.Background()
+	_, err := r.execRestore(ctx, nil, logPath, "runc", "restore", "--bundle", "/bundle")
+	if err != nil {
+		t.Fatalf("execRestore failed: %v", err)
+	}
+
+	b, err := os.ReadFile(argsOut)
+	if err != nil {
+		t.Fatalf("failed to read recorded args: %v", err)
+	}
+	recorded := string(b)
+	for _, flag := range []string{"-t 1", "-m", "-p", "-C", "-c"} {
+		if !strings.Contains(recorded, flag) {
+			t.Errorf("execRestore missing flag %q; got args: %s", flag, recorded)
+		}
+	}
+	if !strings.Contains(recorded, "-- runc restore --bundle /bundle") {
+		t.Errorf("execRestore missing command payload; got args: %s", recorded)
+	}
+}
+
+func TestNsenterExec_EntersHostCgroupNamespace(t *testing.T) {
+	tmpDir := t.TempDir()
+	argsOut := filepath.Join(tmpDir, "args.txt")
+	helperScript := filepath.Join(tmpDir, "mock-nsenter.sh")
+	script := fmt.Sprintf("#!/bin/sh\nexport GO_WANT_CGROUP_NSENTER_HELPER_PROCESS=1\nexport CGROUP_HELPER_ARGS_OUT=%q\nexec %q \"$@\"\n", argsOut, os.Args[0])
+	if err := os.WriteFile(helperScript, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &restorer{nsenterBin: helperScript}
+	ctx := context.Background()
+	_, err := r.nsenterExec(ctx, nil, "runc", "--root", "/run/runc", "delete", "-f", "pm-test")
+	if err != nil {
+		t.Fatalf("nsenterExec failed: %v", err)
+	}
+
+	b, err := os.ReadFile(argsOut)
+	if err != nil {
+		t.Fatalf("failed to read recorded args: %v", err)
+	}
+	recorded := string(b)
+	for _, flag := range []string{"-t 1", "-m", "-p", "-C", "-c"} {
+		if !strings.Contains(recorded, flag) {
+			t.Errorf("nsenterExec missing flag %q; got args: %s", flag, recorded)
+		}
+	}
+	if !strings.Contains(recorded, "-- runc --root /run/runc delete -f pm-test") {
+		t.Errorf("nsenterExec missing command payload; got args: %s", recorded)
 	}
 }
