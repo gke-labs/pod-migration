@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/errdefs"
+	"github.com/moby/sys/mountinfo"
 	"github.com/opencontainers/image-spec/identity"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -58,11 +60,30 @@ type restorer struct {
 	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
 	findContainerFn  func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error)
 	listContainersFn func(ctx context.Context) ([]containerd.Container, error)
-	prepareRootfsFn  func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error)
+	prepareRootfsFn  func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (string, error)
+	unmountTreeFn    func(string) error
+	removeSnapshotFn func(context.Context, string) error
+	deleteLeaseFn    func(context.Context, string) error
+	runcDeleteFn     func(context.Context, string) error
+	listLeasesFn     func(context.Context) ([]leases.Lease, error)
 	readProcCgroupFn func(pid int) ([]byte, error)
 	pmRootDir        string
 	criuConfDirPath  string
 	nsenterBin       string
+}
+
+func (r *restorer) rootDir() string {
+	if r != nil && r.pmRootDir != "" {
+		return r.pmRootDir
+	}
+	return pmRoot
+}
+
+func (r *restorer) unmount(target string) error {
+	if r != nil && r.unmountTreeFn != nil {
+		return r.unmountTreeFn(target)
+	}
+	return unmountTree(target)
 }
 
 func newRestorer(c *containerd.Client) *restorer {
@@ -238,7 +259,8 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 
 // prepareRootfs makes a fresh writable snapshot of the app image and applies
 // the checkpoint's rootfs-diff on top. Returns the mounted rootfs path.
-func (r *restorer) prepareRootfs(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error) {
+// Labels are attached to the containerd lease to bind it to the target pod UID.
+func (r *restorer) prepareRootfs(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (string, error) {
 	img, err := r.cclient.GetImage(ctx, imageName)
 	if err != nil {
 		return "", fmt.Errorf("get image %s: %w", imageName, err)
@@ -254,7 +276,11 @@ func (r *restorer) prepareRootfs(ctx context.Context, imageName, key, bundleDir,
 	// Create a lease to protect the snapshot from containerd GC.
 	lm := r.cclient.LeasesService()
 	_ = lm.Delete(ctx, leases.Lease{ID: "lease-" + key})
-	lease, err := lm.Create(ctx, leases.WithID("lease-"+key))
+	leaseOpts := []leases.Opt{leases.WithID("lease-" + key)}
+	if len(labels) > 0 {
+		leaseOpts = append(leaseOpts, leases.WithLabels(labels))
+	}
+	lease, err := lm.Create(ctx, leaseOpts...)
 	if err != nil {
 		return "", fmt.Errorf("create containerd lease: %w", err)
 	}
@@ -369,19 +395,12 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		return out, err
 	}
 
-	rootDir := pmRoot
-	if r.pmRootDir != "" {
-		rootDir = r.pmRootDir
-	}
 	id := "pm-" + in.MigrationName
-	bundleDir := filepath.Join(rootDir, "bundles", id)
+	bundleDir := filepath.Join(r.rootDir(), "bundles", id)
 
-	// Clean up any leftover runc container from a previous failed restore
-	// attempt.
-	if delOut, delErr := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id); delErr != nil {
-		out.Notes = append(out.Notes, fmt.Sprintf("stale-container pre-delete failed (restore will likely conflict): %s: %s",
-			delErr, truncate(delOut, 200)))
-	}
+	// Clean up any leftover runc container, mounts, snapshot, and lease from a
+	// previous failed attempt (or M0 finding C double restore) before preparing a new rootfs.
+	r.cleanup(ctx, in.MigrationName, "", "", false)
 
 	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
 		return out, err
@@ -402,11 +421,28 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	if r.prepareRootfsFn != nil {
 		prepFn = r.prepareRootfsFn
 	}
-	rootfs, err := prepFn(ctx, imgName, id, bundleDir, filepath.Join(in.CheckpointDir, "rootfs-diff.tar"))
+	leaseLabels := map[string]string{
+		"pod-migrate.io/pod-uid":        in.TargetPodUID,
+		"pod-migrate.io/migration-name": in.MigrationName,
+		"pod-migrate.io/pod-namespace":  in.PodNamespace,
+		"pod-migrate.io/pod-name":       in.TargetPod,
+	}
+	rootfs, err := prepFn(ctx, imgName, id, bundleDir, filepath.Join(in.CheckpointDir, "rootfs-diff.tar"), leaseLabels)
 	if err != nil {
 		return out, err
 	}
 	adaptParams.RootfsPath = rootfs
+
+	// Failure teardown: if any subsequent step fails, clean up the bundle, container,
+	// mounts, snapshot, and lease so failed/abandoned restores do not leak resources.
+	cleanupOnErr := true
+	defer func() {
+		if cleanupOnErr {
+			if cleanNotes := r.cleanup(ctx, in.MigrationName, "", "", false); len(cleanNotes) > 0 {
+				out.Notes = append(out.Notes, cleanNotes...)
+			}
+		}
+	}()
 
 	spec := *in.SrcSpec // shallow copy; AdaptSpec rewrites in place
 	notes, err := AdaptSpec(&spec, adaptParams)
@@ -481,9 +517,9 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 			break
 		}
 		// Preserve the full evidence per variant.
-		saveFailureArtifact(id, fmt.Sprintf("variant%d-runc.out", vi), lastOut)
+		r.saveFailureArtifact(id, fmt.Sprintf("variant%d-runc.out", vi), lastOut)
 		if lg, err2 := os.ReadFile(filepath.Join(bundleDir, "restore.log")); err2 == nil {
-			saveFailureArtifact(id, fmt.Sprintf("variant%d-restore.log", vi), string(lg))
+			r.saveFailureArtifact(id, fmt.Sprintf("variant%d-restore.log", vi), string(lg))
 		}
 		out.Notes = append(out.Notes, fmt.Sprintf("variant %d failed: %s", vi, truncate(criuErrorLines(lastOut), 500)))
 		if !strings.Contains(lastOut, "cgroup") {
@@ -501,11 +537,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		if sig == "" {
 			sig = truncate(lastOut, 800)
 		}
-		// Failure teardown: clean up the bundle and unmount the prepared rootfs
-		// overlay so abandoned restores don't leak mounts on the host node.
-		if notes := r.cleanup(ctx, in.MigrationName, "", "", false); len(notes) > 0 {
-			out.Notes = append(out.Notes, notes...)
-		}
+		// Failure teardown is handled by defer above.
 		return out, fmt.Errorf("runc restore failed: %w: %s", lastErr, truncate(sig, 1200))
 	}
 
@@ -523,6 +555,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 			out.TimeNsDistinct = &d
 		}
 	}
+	cleanupOnErr = false
 	return out, nil
 }
 
@@ -562,27 +595,62 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 	}, holder.ImageName, nil
 }
 
-// cleanup tears down restore artifacts. keepContainer=true leaves the restored
-// process + rootfs alive and only GCs checkpoint material.
+// cleanup tears down restore artifacts in deterministic order:
+// 1. Delete runc container (terminates app process)
+// 2. Unmount all mounts under bundleDir (rootfs overlay, cgroup yard, etc.)
+// 3. Remove containerd snapshot
+// 4. Delete containerd lease
+// 5. Remove bundle directory
+// keepContainer=true leaves the restored process + rootfs alive and only GCs checkpoint material.
 func (r *restorer) cleanup(ctx context.Context, migrationName, checkpointDir, tarPath string, keepContainer bool) []string {
 	var notes []string
 	id := "pm-" + migrationName
-	bundleDir := filepath.Join(pmRoot, "bundles", id)
+	bundleDir := filepath.Join(r.rootDir(), "bundles", id)
 	if !keepContainer {
-		if out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id); err != nil {
-			notes = append(notes, "runc delete: "+truncate(out, 200))
-		}
-		if err := unmountAll(filepath.Join(bundleDir, "rootfs")); err != nil {
-			notes = append(notes, "unmount rootfs: "+err.Error())
+		// 1. Delete runc container
+		if r.runcDeleteFn != nil {
+			if err := r.runcDeleteFn(ctx, id); err != nil {
+				notes = append(notes, "runc delete: "+err.Error())
+			}
 		} else {
-			if err := r.cclient.SnapshotService("overlayfs").Remove(ctx, id); err != nil {
+			if out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id); err != nil {
+				notes = append(notes, "runc delete: "+truncate(out, 200))
+			}
+		}
+
+		// 2. Unmount all mounts under bundleDir (deepest first)
+		if err := r.unmount(bundleDir); err != nil {
+			notes = append(notes, "unmount bundle: "+err.Error())
+		}
+
+		// 3. Remove containerd snapshot
+		if r.removeSnapshotFn != nil {
+			if err := r.removeSnapshotFn(ctx, id); err != nil && !errdefs.IsNotFound(err) {
 				notes = append(notes, "snapshot remove: "+err.Error())
 			}
-			lm := r.cclient.LeasesService()
-			if err := lm.Delete(ctx, leases.Lease{ID: "lease-" + id}); err != nil {
-				notes = append(notes, "lease remove: "+err.Error())
+		} else if r.cclient != nil {
+			if sn := r.cclient.SnapshotService("overlayfs"); sn != nil {
+				if err := sn.Remove(ctx, id); err != nil && !errdefs.IsNotFound(err) {
+					notes = append(notes, "snapshot remove: "+err.Error())
+				}
 			}
 		}
+
+		// 4. Delete containerd lease
+		leaseID := "lease-" + id
+		if r.deleteLeaseFn != nil {
+			if err := r.deleteLeaseFn(ctx, leaseID); err != nil && !errdefs.IsNotFound(err) {
+				notes = append(notes, "lease remove: "+err.Error())
+			}
+		} else if r.cclient != nil {
+			if lm := r.cclient.LeasesService(); lm != nil {
+				if err := lm.Delete(ctx, leases.Lease{ID: leaseID}); err != nil && !errdefs.IsNotFound(err) {
+					notes = append(notes, "lease remove: "+err.Error())
+				}
+			}
+		}
+
+		// 5. Remove bundle directory
 		if err := os.RemoveAll(bundleDir); err != nil {
 			notes = append(notes, "rm bundle: "+err.Error())
 		}
@@ -598,6 +666,100 @@ func (r *restorer) cleanup(ctx context.Context, migrationName, checkpointDir, ta
 		}
 	}
 	return notes
+}
+
+// Cleanup performs complete teardown of restore artifacts for the named migration.
+func (r *restorer) Cleanup(ctx context.Context, migrationName string) error {
+	notes := r.cleanup(ctx, migrationName, "", "", false)
+	var errNotes []string
+	for _, n := range notes {
+		if strings.Contains(n, ":") && !strings.Contains(n, "not found") {
+			errNotes = append(errNotes, n)
+		}
+	}
+	if len(errNotes) > 0 {
+		return fmt.Errorf("cleanup errors: %s", strings.Join(errNotes, "; "))
+	}
+	return nil
+}
+
+// SweepOrphans searches for orphaned restore artifacts (containerd leases, bundle
+// directories, and runc containers) whose associated target pod or snapshot no longer exists
+// on this node, and tears them down.
+func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapshots map[string]bool) ([]string, error) {
+	var swept []string
+	seenMigrations := make(map[string]bool)
+
+	// 1. Inspect containerd leases
+	var leasesList []leases.Lease
+	if r.listLeasesFn != nil {
+		var err error
+		leasesList, err = r.listLeasesFn(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list containerd leases: %w", err)
+		}
+	} else if r.cclient != nil {
+		lm := r.cclient.LeasesService()
+		if lm != nil {
+			var err error
+			leasesList, err = lm.List(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("list containerd leases: %w", err)
+			}
+		}
+	}
+	for _, l := range leasesList {
+		if !strings.HasPrefix(l.ID, "lease-pm-") {
+			continue
+		}
+		migName := strings.TrimPrefix(l.ID, "lease-pm-")
+		podUID := l.Labels["pod-migrate.io/pod-uid"]
+		snapName := l.Labels["pod-migrate.io/snapshot-name"]
+		isOrphan := false
+		if podUID != "" {
+			if !livingPodUIDs[podUID] {
+				isOrphan = true
+			}
+		} else if snapName != "" {
+			if !livingSnapshots[snapName] {
+				isOrphan = true
+			}
+		} else if strings.HasPrefix(migName, "psengine-") {
+			snap := strings.TrimPrefix(migName, "psengine-")
+			if !livingSnapshots[snap] {
+				isOrphan = true
+			}
+		}
+		if isOrphan {
+			r.cleanup(ctx, migName, "", "", false)
+			seenMigrations[migName] = true
+			swept = append(swept, migName)
+		}
+	}
+
+	// 2. Inspect bundles directory
+	bundleRoot := filepath.Join(r.rootDir(), "bundles")
+	if entries, err := os.ReadDir(bundleRoot); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), "pm-") {
+				continue
+			}
+			migName := strings.TrimPrefix(e.Name(), "pm-")
+			if seenMigrations[migName] {
+				continue
+			}
+			if strings.HasPrefix(migName, "psengine-") {
+				snap := strings.TrimPrefix(migName, "psengine-")
+				if !livingSnapshots[snap] {
+					r.cleanup(ctx, migName, "", "", false)
+					seenMigrations[migName] = true
+					swept = append(swept, migName)
+				}
+			}
+		}
+	}
+
+	return swept, nil
 }
 
 // projectedVolumeRewrites pairs source-pod kubelet paths whose names are NOT
@@ -666,8 +828,8 @@ func projectedVolumeRewrites(srcSpec *specs.Spec, targetPodUID string) [][2]stri
 
 // saveFailureArtifact keeps restore failure evidence under
 // /var/lib/pod-migrate/failed/<id>/ (bounded: overwritten per migration id).
-func saveFailureArtifact(id, name, content string) {
-	dir := filepath.Join(pmRoot, "failed", id)
+func (r *restorer) saveFailureArtifact(id, name, content string) {
+	dir := filepath.Join(r.rootDir(), "failed", id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
@@ -679,6 +841,40 @@ func unmountAll(target string) error {
 		return nil
 	}
 	return mount.UnmountAll(target, 0)
+}
+
+// unmountTree unmounts all mountpoints located under root (including root itself),
+// deepest path first, handling nested and stacked mounts (e.g. rootfs overlay,
+// anonymous volumes, and CRIU cgroup-yard mounts).
+func unmountTree(root string) error {
+	if root == "" {
+		return nil
+	}
+	cleanRoot := filepath.Clean(root)
+	if _, err := os.Stat(cleanRoot); os.IsNotExist(err) {
+		return nil
+	}
+	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(cleanRoot))
+	if err != nil {
+		return unmountAll(cleanRoot)
+	}
+	// Sort descending by Mountpoint length so deepest submounts are unmounted first.
+	sort.Slice(mounts, func(i, j int) bool {
+		return len(mounts[i].Mountpoint) > len(mounts[j].Mountpoint)
+	})
+	var errs []error
+	for _, m := range mounts {
+		if err := mount.UnmountAll(m.Mountpoint, 0); err != nil {
+			errs = append(errs, fmt.Errorf("unmount %s: %w", m.Mountpoint, err))
+		}
+	}
+	if err := unmountAll(cleanRoot); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 // criuErrorLines extracts criu/runc error lines from noisy combined output.

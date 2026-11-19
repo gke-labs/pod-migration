@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,10 +32,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	k8syaml "sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
@@ -130,9 +133,11 @@ func TestInjectHolderSkips(t *testing.T) {
 // --- node restore reconciler ---------------------------------------------------
 
 type fakeRestoreOps struct {
-	restored  []RestoreInputs
-	failIt    bool
-	extracted []string
+	restored    []RestoreInputs
+	cleaned     []RestoreInputs
+	failIt      bool
+	failCleanup bool
+	extracted   []string
 }
 
 func (f *fakeRestoreOps) Extract(tarPath, dstDir string) error {
@@ -146,6 +151,14 @@ func (f *fakeRestoreOps) Restore(_ context.Context, in RestoreInputs) (int, int6
 	}
 	f.restored = append(f.restored, in)
 	return 4242, 250, nil
+}
+
+func (f *fakeRestoreOps) Cleanup(_ context.Context, in RestoreInputs) error {
+	if f.failCleanup {
+		return errors.New("injected cleanup failure")
+	}
+	f.cleaned = append(f.cleaned, in)
+	return nil
 }
 
 // readySnapshotWithArchive stages a Ready PodSnapshot + a consistent archive
@@ -216,6 +229,42 @@ func TestNodeRestoreHappyPath(t *testing.T) {
 	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusRestored {
 		t.Fatalf("restore status: %q", got.Annotations[contract.AnnotationRestoreStatus])
 	}
+	if !controllerutil.ContainsFinalizer(got, contract.FinalizerRestoreCleanup) {
+		t.Fatalf("expected finalizer %q on successfully restored pod", contract.FinalizerRestoreCleanup)
+	}
+}
+
+func TestNodeRestore_TearsDownAndRemovesFinalizerOnPodDeletion(t *testing.T) {
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	pod.Annotations[contract.AnnotationRestoreStatus] = contract.RestoreStatusRestored
+	controllerutil.AddFinalizer(pod, contract.FinalizerRestoreCleanup)
+	now := metav1.Now()
+	pod.DeletionTimestamp = &now
+
+	c := newClient(t, pod)
+	ops := &fakeRestoreOps{}
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	if len(ops.cleaned) != 1 {
+		t.Fatalf("expected 1 cleanup call, got %d", len(ops.cleaned))
+	}
+	if ops.cleaned[0].SnapshotName != "ps-web-0-deadbeef" || ops.cleaned[0].TargetPod != "web-1" {
+		t.Errorf("cleanup inputs: %+v", ops.cleaned[0])
+	}
+
+	got := &corev1.Pod{}
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
+	if err == nil {
+		if controllerutil.ContainsFinalizer(got, contract.FinalizerRestoreCleanup) {
+			t.Errorf("finalizer %q was not removed after teardown", contract.FinalizerRestoreCleanup)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected error getting pod after teardown: %v", err)
+	}
 }
 
 func TestNodeRestoreFailureStampsFailed(t *testing.T) {
@@ -234,6 +283,9 @@ func TestNodeRestoreFailureStampsFailed(t *testing.T) {
 	// failed -> holder wrapper falls through to cold start
 	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
 		t.Fatalf("restore status: %q", got.Annotations[contract.AnnotationRestoreStatus])
+	}
+	if controllerutil.ContainsFinalizer(got, contract.FinalizerRestoreCleanup) {
+		t.Errorf("finalizer %q should not be added on failed restore", contract.FinalizerRestoreCleanup)
 	}
 }
 

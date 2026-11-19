@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,7 +41,8 @@ import (
 // capability probe.
 type Node struct {
 	client.Client
-	NodeName string
+	APIReader client.Reader
+	NodeName  string
 
 	Kubelet  *kubeletCheckpoint
 	Restorer *restorer
@@ -215,6 +217,46 @@ func (n *Node) RunProbeLoop(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}
+}
+
+// SweepOrphanRestores lists pods on this node from the API reader and cleans up
+// any leftover CRIU restore containers, mounts, snapshots, or leases whose pods
+// are gone or terminating.
+func (n *Node) SweepOrphanRestores(ctx context.Context) error {
+	var podList corev1.PodList
+	reader := n.APIReader
+	if reader == nil {
+		reader = n.Client
+	}
+	if reader == nil {
+		return nil
+	}
+	if err := reader.List(ctx, &podList); err != nil {
+		return fmt.Errorf("list pods on node %s: %w", n.NodeName, err)
+	}
+	livingUIDs := make(map[string]bool)
+	livingSnaps := make(map[string]bool)
+	for _, p := range podList.Items {
+		if p.Spec.NodeName != n.NodeName && n.NodeName != "" {
+			continue
+		}
+		if p.DeletionTimestamp == nil {
+			livingUIDs[string(p.UID)] = true
+			for k, v := range p.Annotations {
+				if strings.HasSuffix(k, "/ps-name") && v != "" {
+					livingSnaps[v] = true
+				}
+			}
+		}
+	}
+	if n.Restorer == nil {
+		return nil
+	}
+	swept, err := n.Restorer.SweepOrphans(ctx, livingUIDs, livingSnaps)
+	if len(swept) > 0 {
+		logf.FromContext(ctx).Info("swept orphan restore artifacts", "count", len(swept), "migrations", swept)
+	}
+	return err
 }
 
 func joinNotes(notes []string) string {

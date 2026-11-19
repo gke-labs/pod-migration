@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
@@ -66,6 +67,9 @@ type RestoreOps interface {
 	// Restore performs the sandbox-sibling runc restore into the target
 	// pod's namespaces (the holder keeps the sandbox alive).
 	Restore(ctx context.Context, in RestoreInputs) (pid int, durMs int64, err error)
+	// Cleanup tears down all restore artifacts (container, mounts, snapshot, lease, bundle)
+	// when the restored pod is deleted.
+	Cleanup(ctx context.Context, in RestoreInputs) error
 }
 
 // NodeRestoreReconciler watches pods on its node and executes restores.
@@ -103,6 +107,35 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if pod.Spec.NodeName != r.NodeName {
 		return ctrl.Result{}, nil
 	}
+
+	// 1. Pod deletion teardown: when a restored pod is deleted, tear down the sibling
+	// container, mounts, snapshot, and lease before removing the finalizer.
+	if pod.DeletionTimestamp != nil {
+		if controllerutil.ContainsFinalizer(pod, contract.FinalizerRestoreCleanup) {
+			logger.Info("terminating restored pod; tearing down sibling restore artifacts", "pod", pod.Name)
+			psName := pod.Annotations[contract.AnnotationPSName]
+			container := ""
+			if len(pod.Spec.Containers) > 0 {
+				container = pod.Spec.Containers[0].Name
+			}
+			if err := r.Ops.Cleanup(ctx, RestoreInputs{
+				SnapshotName:  psName,
+				PodNamespace:  pod.Namespace,
+				TargetPod:     pod.Name,
+				ContainerName: container,
+				TargetPodUID:  string(pod.UID),
+			}); err != nil {
+				return ctrl.Result{}, fmt.Errorf("cleanup restore artifacts for %s: %w", pod.Name, err)
+			}
+			controllerutil.RemoveFinalizer(pod, contract.FinalizerRestoreCleanup)
+			if err := r.Update(ctx, pod); err != nil {
+				return ctrl.Result{}, err
+			}
+			logger.Info("cleaned up restore artifacts and removed finalizer", "pod", pod.Name)
+		}
+		return ctrl.Result{}, nil
+	}
+
 	psName := pod.Annotations[contract.AnnotationPSName]
 	if psName == "" || pod.Annotations[AnnotationInjected] != "true" {
 		return ctrl.Result{}, nil // not a restore order for this engine
@@ -138,6 +171,9 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		latest.Annotations = map[string]string{}
 	}
 	latest.Annotations[contract.AnnotationRestoreStatus] = status
+	if status == contract.RestoreStatusRestored {
+		controllerutil.AddFinalizer(latest, contract.FinalizerRestoreCleanup)
+	}
 	if uerr := r.Update(ctx, latest); uerr != nil {
 		return ctrl.Result{}, uerr
 	}

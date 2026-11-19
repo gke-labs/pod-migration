@@ -26,6 +26,7 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -538,5 +539,330 @@ func TestAdaptSpec_RejectsRelativeCgroupsPath(t *testing.T) {
 	p.CgroupsPath = "relative.slice/pm-mig1" // missing leading slash
 	if _, err := AdaptSpec(s, p); err == nil {
 		t.Error("AdaptSpec accepted relative CgroupsPath without leading slash")
+	}
+}
+
+func TestCleanup_OrderAndTeardown(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-test-cleanup"
+	bundleDir := filepath.Join(tmpDir, "bundles", id)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			calls = append(calls, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			calls = append(calls, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			calls = append(calls, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			calls = append(calls, "lease-delete:"+lid)
+			return nil
+		},
+	}
+
+	notes := r.cleanup(context.Background(), "test-cleanup", "", "", false)
+	if len(notes) > 0 {
+		t.Fatalf("unexpected cleanup notes: %v", notes)
+	}
+
+	wantOrder := []string{
+		"runc-delete:" + id,
+		"unmount:" + bundleDir,
+		"snapshot-remove:" + id,
+		"lease-delete:lease-" + id,
+	}
+	if len(calls) != len(wantOrder) {
+		t.Fatalf("calls = %v, want %v", calls, wantOrder)
+	}
+	for i := range wantOrder {
+		if calls[i] != wantOrder[i] {
+			t.Errorf("step %d = %q, want %q", i, calls[i], wantOrder[i])
+		}
+	}
+
+	// Bundle directory should be removed.
+	if _, err := os.Stat(bundleDir); !os.IsNotExist(err) {
+		t.Errorf("bundle directory still exists after cleanup: %v", err)
+	}
+}
+
+func TestRestore_DoubleRestoreTeardownBeforePrepareRootfs(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-double-restore"
+	bundleDir := filepath.Join(tmpDir, "bundles", id)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	criuConf := filepath.Join(tmpDir, "criu")
+	if err := os.MkdirAll(criuConf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(criuConf, "runc.conf"), []byte("file-validation buildid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	r := &restorer{
+		pmRootDir:       tmpDir,
+		criuConfDirPath: criuConf,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      sampleTargetSpec(),
+				ImageName: "redis:7",
+			}, nil
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-pod123.slice/c1.scope\n"), nil
+		},
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			events = append(events, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			events = append(events, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			events = append(events, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			events = append(events, "lease-delete:"+lid)
+			return nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bDir, diffTar string, labels map[string]string) (string, error) {
+			events = append(events, "prepare-rootfs:"+key)
+			if labels["pod-migrate.io/pod-uid"] != "pod-uid-456" {
+				t.Errorf("expected pod-uid label, got %v", labels)
+			}
+			rf := filepath.Join(bDir, "rootfs")
+			_ = os.MkdirAll(rf, 0o755)
+			return rf, nil
+		},
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "Version: 3.19", nil
+		},
+		execRestoreFn: func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
+			for i := 0; i < len(args)-1; i++ {
+				if args[i] == "--pid-file" {
+					_ = os.WriteFile(args[i+1], []byte("5678\n"), 0o644)
+				}
+			}
+			events = append(events, "exec-restore")
+			return "", nil
+		},
+	}
+
+	in := restoreInputs{
+		MigrationName: "double-restore",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  "pod-uid-456",
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec:       sampleSpec(),
+	}
+
+	out, err := r.restore(context.Background(), in)
+	if err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	if out.Pid != 5678 {
+		t.Errorf("pid = %d, want 5678", out.Pid)
+	}
+
+	// Verify that teardown events occurred BEFORE prepare-rootfs
+	foundPrep := false
+	for _, ev := range events {
+		if ev == "prepare-rootfs:"+id {
+			foundPrep = true
+			break
+		}
+		if !strings.HasPrefix(ev, "runc-delete:") && !strings.HasPrefix(ev, "unmount:") &&
+			!strings.HasPrefix(ev, "snapshot-remove:") && !strings.HasPrefix(ev, "lease-delete:") {
+			t.Errorf("unexpected pre-restore event: %q", ev)
+		}
+	}
+	if !foundPrep {
+		t.Fatal("prepare-rootfs event not found")
+	}
+}
+
+func TestRestore_FailureTeardownCleansContainerMountsSnapshot(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-fail-restore"
+
+	var cleaned []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      &specs.Spec{Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "sb1"}},
+				ImageName: "redis:7",
+			}, nil
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-pod123.slice/c1.scope\n"), nil
+		},
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			cleaned = append(cleaned, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			cleaned = append(cleaned, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bDir, diffTar string, labels map[string]string) (string, error) {
+			rf := filepath.Join(bDir, "rootfs")
+			_ = os.MkdirAll(rf, 0o755)
+			return rf, nil
+		},
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "Version: 3.19", nil
+		},
+		execRestoreFn: func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
+			return "Error: failed to restore memory pages", errors.New("runc exit status 1")
+		},
+	}
+
+	in := restoreInputs{
+		MigrationName: "fail-restore",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  "pod-uid-456",
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec: &specs.Spec{
+			Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "src-sb"},
+		},
+	}
+
+	_, err := r.restore(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected restore to fail, got nil")
+	}
+
+	// Verify that teardown ran on restore failure
+	hasRuncDel := false
+	hasUnmount := false
+	hasSnapRem := false
+	hasLeaseDel := false
+	for _, cl := range cleaned {
+		if cl == "runc-delete:"+id {
+			hasRuncDel = true
+		}
+		if cl == "unmount:"+filepath.Join(tmpDir, "bundles", id) {
+			hasUnmount = true
+		}
+		if cl == "snapshot-remove:"+id {
+			hasSnapRem = true
+		}
+		if cl == "lease-delete:lease-"+id {
+			hasLeaseDel = true
+		}
+	}
+	if !hasRuncDel || !hasUnmount || !hasSnapRem || !hasLeaseDel {
+		t.Fatalf("missing failure teardown actions; cleaned = %v", cleaned)
+	}
+}
+
+func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Stage an orphaned bundle dir
+	bundleOrphan := filepath.Join(tmpDir, "bundles", "pm-psengine-orphan-snap")
+	if err := os.MkdirAll(bundleOrphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stage a living bundle dir
+	bundleLiving := filepath.Join(tmpDir, "bundles", "pm-psengine-living-snap")
+	if err := os.MkdirAll(bundleLiving, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var cleaned []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			cleaned = append(cleaned, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			cleaned = append(cleaned, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+		listLeasesFn: func(ctx context.Context) ([]leases.Lease, error) {
+			return []leases.Lease{
+				{
+					ID: "lease-pm-psengine-orphan-lease",
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "dead-pod-uid",
+					},
+				},
+				{
+					ID: "lease-pm-psengine-living-lease",
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "live-pod-uid",
+					},
+				},
+			}, nil
+		},
+	}
+
+	livingUIDs := map[string]bool{"live-pod-uid": true}
+	livingSnaps := map[string]bool{"living-snap": true}
+
+	swept, err := r.SweepOrphans(context.Background(), livingUIDs, livingSnaps)
+	if err != nil {
+		t.Fatalf("SweepOrphans failed: %v", err)
+	}
+
+	// Should sweep orphan-lease and orphan-snap, but NOT living-lease or living-snap
+	sweptSet := make(map[string]bool)
+	for _, s := range swept {
+		sweptSet[s] = true
+	}
+	if !sweptSet["psengine-orphan-lease"] {
+		t.Errorf("orphan lease was not swept; swept = %v", swept)
+	}
+	if !sweptSet["psengine-orphan-snap"] {
+		t.Errorf("orphan bundle was not swept; swept = %v", swept)
+	}
+	if sweptSet["psengine-living-lease"] {
+		t.Errorf("living lease was incorrectly swept; swept = %v", swept)
+	}
+	if sweptSet["psengine-living-snap"] {
+		t.Errorf("living bundle was incorrectly swept; swept = %v", swept)
 	}
 }

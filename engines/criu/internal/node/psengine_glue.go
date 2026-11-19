@@ -207,6 +207,19 @@ func (r *Node) PSEngineRestore(ctx context.Context, in PSEngineRestoreInputs) (i
 	return out.Pid, out.DurationMs, nil
 }
 
+// PSEngineCleanup tears down restore artifacts for the given snapshot name.
+func (r *Node) PSEngineCleanup(ctx context.Context, snapshotName string) error {
+	migrationName := "psengine-" + snapshotName
+	if r.Restorer == nil {
+		return nil
+	}
+	notes := r.Restorer.cleanup(ctx, migrationName, "", "", false)
+	if len(notes) > 0 {
+		logf.FromContext(ctx).Info("restore cleanup notes", "migration", migrationName, "notes", notes)
+	}
+	return nil
+}
+
 // PSEngineCPUFamily reports the node's CPU model for the archive manifest
 // (restore-side compatibility guard). Empty when unknown — absent, never
 // invented.

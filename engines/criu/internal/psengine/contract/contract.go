@@ -125,6 +125,11 @@ const (
 	AnnotationRestoreStatus = "pod-migrate.io/psengine-restore"
 	RestoreStatusRestored   = "restored"
 	RestoreStatusFailed     = "failed"
+
+	// FinalizerRestoreCleanup is attached to restored replacement pods by the
+	// CRIU node agent so that pod deletion triggers teardown of the sibling runc
+	// container, mounts, snapshot, and lease.
+	FinalizerRestoreCleanup = "pod-migrate.io/criu-restore-cleanup"
 )
 
 // The engine's API group and what follows from it. They hold DefaultGroup
