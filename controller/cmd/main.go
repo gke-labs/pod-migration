@@ -79,23 +79,24 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr          string
-		probeAddr            string
-		enableLeaderElection bool
-		clientGoQPS          float64
-		clientGoBurst        int
-		maxConcurrent        int
-		migrationTimeout     time.Duration
-		invariantModeRaw     string
-		spotPreemptionBudget int64
-		runtimeClassesRaw    string
-		fenceCap             time.Duration
-		fenceLateStopWatch   time.Duration
-		runtimeClassEngines  string
-		criuAPIGroup         string
-		restoreStabilization time.Duration
-		restorePlacement     bool
-		showVersion          bool
+		metricsAddr           string
+		probeAddr             string
+		enableLeaderElection  bool
+		clientGoQPS           float64
+		clientGoBurst         int
+		maxConcurrent         int
+		migrationTimeout      time.Duration
+		invariantModeRaw      string
+		spotPreemptionBudget  int64
+		runtimeClassesRaw     string
+		fenceCap              time.Duration
+		fenceLateStopWatch    time.Duration
+		runtimeClassEngines   string
+		criuAPIGroup          string
+		restoreStabilization  time.Duration
+		restorePlacement      bool
+		shortenReadinessDelay bool
+		showVersion           bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "")
@@ -113,6 +114,7 @@ func main() {
 	flag.StringVar(&criuAPIGroup, "criu-api-group", engine.DefaultCRIUAPIGroup, "Kubernetes API group of the CRIU snapshot engine's CRDs and <group>/ps-name restore annotation (e.g. "+engine.CRIUAPIGroup+"); defaults to "+engine.DefaultCRIUAPIGroup+" for backwards compatibility.")
 	flag.DurationVar(&restoreStabilization, "restore-stabilization-window", controller.DefaultRestoreStabilizationWindow, fmt.Sprintf("How long a replacement pod must stay Ready without a container restart before a restore that its snapshot engine only inferred concludes as RestoreInferred; 0 concludes as soon as the pod is Ready. A restore the engine confirms (RestoreVerified) doesn't wait. At most %s.", controller.MaxRestoreStabilizationWindow))
 	flag.BoolVar(&restorePlacement, "restore-placement", false, "Experimental: place a replacement pod that restores a snapshot on a node its snapshot engine can restore on: the engine's node constraints (for GKE Pod Snapshots, the source node's machine type, if the job recorded it) go into the pod's required node affinity when its scheduling gate is released. If no Ready node that the pod's node selector, node affinity and tolerations allow (a cordoned node counts only if the pod tolerates it) meets them, the pod starts cold instead, and the job concludes SucceededWithoutRestore with reason "+controller.ReasonNoCompatibleNode+". The check decides once, when the gate is due for release, without waiting for a node to become Ready or be added, and a gated pod doesn't make the cluster autoscaler add one. It doesn't look at resources, volume zones, host ports, or pod affinity and topology spread, and nothing recovers a pod that passes it but stays Pending: once its job has concluded, delete the pod so that its controller recreates it without the constraints. This check is interim, until the controller can recreate a replacement that isn't scheduled by a deadline.")
+	flag.BoolVar(&shortenReadinessDelay, "shorten-restored-readiness-delay", true, "Clear readinessProbe.initialDelaySeconds on gated restore-candidate replacement pods unless annotated with "+util.AnnotationPreserveReadinessDelay+"=true; liveness and startup probes are never changed")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -166,7 +168,8 @@ func main() {
 		"migratableRuntimeClasses", runtimeClassPolicy.String(),
 		"criuAPIGroup", criuAPIGroup,
 		"restoreStabilizationWindow", restoreStabilization,
-		"restorePlacement", restorePlacement)
+		"restorePlacement", restorePlacement,
+		"shortenRestoredReadinessDelay", shortenReadinessDelay)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -339,7 +342,7 @@ func main() {
 		setupLog.Error(err, "unable to register eviction webhook")
 		os.Exit(1)
 	}
-	if err := pmwebhook.SetupReplacementWebhookWithManager(mgr, mgr.GetAPIReader(), engines); err != nil {
+	if err := pmwebhook.SetupReplacementWebhookWithManager(mgr, mgr.GetAPIReader(), shortenReadinessDelay, engines); err != nil {
 		setupLog.Error(err, "unable to register replacement mutating webhook")
 		os.Exit(1)
 	}

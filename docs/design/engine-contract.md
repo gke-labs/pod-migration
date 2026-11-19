@@ -394,4 +394,4 @@ Step 6 keeps a `Stopped` engine's source fenced after a failure unless the check
 3. **A positive signal for GKE Pod Snapshots.** Is there a condition or annotation we can read? If not, it stays on the inferred path.
 4. **Engine selection flags.** One flag (`--runtime-class-engines=gvisor=gke-pod-snapshots,@default=criu`), or one flag per engine?
 5. **Recording the engine.** An annotation for good, or a typed `status.engine` field later?
-6. **KEP-5823 restore orders.** The KEP checks that a `spec.restoreFrom` pod's spec equals the checkpointed pod's spec, but our replacement webhook adds a scheduling gate and annotations. Are the two compatible?
+6. **KEP-5823 restore orders.** The KEP checks that a `spec.restoreFrom` pod's spec equals the checkpointed pod's spec, but our replacement webhook adds a scheduling gate and annotations, and clears `readinessProbe.initialDelaySeconds` (#141). Are the two compatible?
