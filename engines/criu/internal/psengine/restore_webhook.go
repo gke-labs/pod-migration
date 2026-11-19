@@ -107,6 +107,9 @@ func injectHolder(pod *corev1.Pod, holderImage, psNameAnnotation string) (bool, 
 	if pod.Annotations[AnnotationInjected] == "true" {
 		return false, "already injected"
 	}
+	if pod.Spec.HostNetwork {
+		return false, "hostNetwork pods unsupported by criu engine"
+	}
 	if len(pod.Spec.Containers) != 1 {
 		return false, "multi-container pod: outside criu engine v1 scope"
 	}

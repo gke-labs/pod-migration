@@ -59,9 +59,10 @@ COPY internal/ internal/
 COPY cmd/ cmd/
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /agent ./cmd/agent
 
-# Runtime: needs nsenter (util-linux) to exec host runc in host namespaces.
+# Runtime: needs nsenter (util-linux) to exec host runc in host namespaces and
+# iptables to flush CRIU network-lock rules on restore failure (#126).
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends util-linux ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends util-linux ca-certificates iptables && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /licenses && dpkg-query -W -f='${Package} ${Version}\n' | sort -u > /licenses/runtime-package-versions.txt
 COPY --from=criu /bundle /opt/criu-bundle
 COPY --from=build /agent /agent
