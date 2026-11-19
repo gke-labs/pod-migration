@@ -33,6 +33,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -976,15 +977,15 @@ func TestRealProcInspection(t *testing.T) {
 		}
 	}()
 
-	pid, err := getSocketPeerPID(sockPath)
+	insp := NewDefaultContainerdInspector(nil)
+
+	pid, err := insp.GetPID(sockPath)
 	if err != nil {
-		t.Fatalf("getSocketPeerPID: %v", err)
+		t.Fatalf("insp.GetPID: %v", err)
 	}
 	if pid != os.Getpid() {
 		t.Fatalf("expected pid %d, got %d", os.Getpid(), pid)
 	}
-
-	insp := NewDefaultContainerdInspector(nil)
 	env, err := insp.ReadEnviron(os.Getpid())
 	if err != nil {
 		t.Fatalf("ReadEnviron(%d): %v", os.Getpid(), err)
@@ -1028,6 +1029,114 @@ func TestRealProcInspection(t *testing.T) {
 	}
 	if len(cmdlineRaw) == 0 {
 		t.Fatal("expected non-empty cmdline from ReadFileInProcRoot")
+	}
+}
+
+func TestDefaultContainerdInspector_ProductionWiring(t *testing.T) {
+	fakeRoot := t.TempDir()
+
+	// Create an isolated criu binary only inside fakeRoot
+	isolatedDir := filepath.Join(fakeRoot, "isolated", "bin")
+	if err := os.MkdirAll(isolatedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	criuFile := filepath.Join(isolatedDir, "criu")
+	if err := os.WriteFile(criuFile, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that /isolated/bin/criu does NOT exist on the host/agent filesystem
+	if _, err := os.Stat("/isolated/bin/criu"); err == nil {
+		t.Skip("host collision: /isolated/bin/criu exists on host filesystem")
+	}
+
+	var execHostCalls int32
+	fakeExecHost := func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+		atomic.AddInt32(&execHostCalls, 1)
+		if name != "/isolated/bin/criu" {
+			t.Fatalf("expected execHost on /isolated/bin/criu, got %q", name)
+		}
+		return "Version: 4.0", nil
+	}
+
+	insp := NewDefaultContainerdInspector(fakeExecHost)
+	insp.ProcRootFormat = fakeRoot
+
+	// 1. StatContainerdFile: verify it resolves through fakeRoot, NOT host os.Stat
+	fi, err := insp.StatContainerdFile(1234, "/isolated/bin/criu")
+	if err != nil {
+		t.Fatalf("StatContainerdFile failed resolving in procRoot: %v", err)
+	}
+	if fi.Mode()&0o111 == 0 {
+		t.Fatalf("expected executable file, got mode %v", fi.Mode())
+	}
+
+	// Host os.Stat on the same path fails
+	if _, err := os.Stat("/isolated/bin/criu"); err == nil {
+		t.Fatal("expected host os.Stat on /isolated/bin/criu to fail")
+	}
+
+	// 2. ReadConfig: verify reading config through fakeRoot
+	configDir := filepath.Join(fakeRoot, "etc", "containerd")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configFile := filepath.Join(configDir, "config.toml")
+	configContent := `
+version = 2
+[plugins."io.containerd.grpc.v1.cri"]
+  enable_criu = false
+`
+	if err := os.WriteFile(configFile, []byte(configContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := insp.ReadConfig(1234)
+	if err != nil {
+		t.Fatalf("ReadConfig: %v", err)
+	}
+	if !bytes.Equal(cfg, []byte(configContent)) {
+		t.Fatalf("ReadConfig got %q, want %q", string(cfg), configContent)
+	}
+
+	// 3. ReadConfig fail closed on unreadable file (chmod 0000)
+	if err := os.Chmod(configFile, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(configFile, 0o644)
+
+	if _, err := insp.ReadConfig(1234); err == nil {
+		t.Fatal("expected ReadConfig to fail closed on unreadable file, got nil error")
+	}
+
+	_ = os.Chmod(configFile, 0o644)
+
+	// 4. Test CheckContainerdReadiness end-to-end with the production inspector wired to fakeRoot
+	validConfig := `
+version = 2
+[plugins."io.containerd.grpc.v1.cri"]
+  enable_criu = true
+`
+	if err := os.WriteFile(configFile, []byte(validConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	insp.GetPID = func(sockPath string) (int, error) {
+		return 1234, nil
+	}
+	insp.ReadEnviron = func(pid int) ([]string, error) {
+		return []string{"PATH=/isolated/bin"}, nil
+	}
+
+	ok, reason, remediation, err := CheckContainerdReadiness(context.Background(), insp, "/test.sock")
+	if err != nil {
+		t.Fatalf("CheckContainerdReadiness error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected CheckContainerdReadiness ok=true, got ok=false (reason=%q, rem=%q)", reason, remediation)
+	}
+	if atomic.LoadInt32(&execHostCalls) != 1 {
+		t.Fatalf("expected execHostCalls == 1, got %d", atomic.LoadInt32(&execHostCalls))
 	}
 }
 
@@ -1311,6 +1420,142 @@ version = 2
 		}
 		if atomic.LoadInt32(installCalls) != 1 {
 			t.Fatalf("expected installCalls to remain 1 after recovery, got %d", atomic.LoadInt32(installCalls))
+		}
+		if atomic.LoadInt32(&checkCalls) != 1 {
+			t.Fatalf("expected checkCalls to remain 1 after recovery, got %d", atomic.LoadInt32(&checkCalls))
+		}
+	})
+
+	t.Run("cheap retry publishes pending unready verdict before taking transient retry branch preventing stale criu-ready=true", func(t *testing.T) {
+		var failDial atomic.Bool
+		failDial.Store(true)
+
+		var failPatch atomic.Bool
+		failPatch.Store(true)
+
+		env := &fakeContainerdEnv{
+			pid: 1001,
+			environ: []string{
+				"PATH=/usr/local/sbin",
+			},
+			files: map[string]fs.FileMode{
+				"/usr/local/sbin/criu": 0o755,
+			},
+			criuVersionOut: "Version: 4.0",
+		}
+		insp := env.toInspector()
+		insp.GetPID = func(sockPath string) (int, error) {
+			if failDial.Load() {
+				return 0, errors.New("socket temporarily disconnected during containerd restart")
+			}
+			return 1001, nil
+		}
+
+		// Initial node carrying criu-ready=true from a previous agent
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-node",
+				Annotations: map[string]string{
+					NodeAnnotationCRIUReady: "true",
+				},
+			},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{
+					ContainerRuntimeVersion: "containerd://2.2.7",
+				},
+			},
+		}
+		baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+		patchClient := &hookPatchClient{
+			Client: baseClient,
+			onPatch: func(call int32, obj client.Object) error {
+				if failPatch.Load() {
+					return errors.New("simulated API server 503 on unready PATCH")
+				}
+				return nil
+			},
+		}
+
+		var installCalls int32
+		var checkCalls int32
+		nd := &Node{
+			Client:     patchClient,
+			NodeName:   "test-node",
+			SocketPath: "/run/containerd/containerd.sock",
+			statSocketFn: func(string) (uint64, error) {
+				return 12345, nil
+			},
+			installBundleFn: func() (string, error) {
+				atomic.AddInt32(&installCalls, 1)
+				return "4.0", nil
+			},
+			Inspector: insp,
+			execHostFn: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+				atomic.AddInt32(&checkCalls, 1)
+				return "Looks good.", nil
+			},
+		}
+
+		// Tick 1: Bootstrap hits transient dial error AND unready PATCH fails once
+		err := nd.Bootstrap(ctx)
+		if err == nil {
+			t.Fatal("expected Bootstrap error")
+		}
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false")
+		}
+
+		// The API server still has criu-ready: "true" because the first PATCH failed
+		var cur corev1.Node
+		if err := nd.Client.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "true" {
+			t.Fatalf("expected initial annotation to remain true, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+
+		// Clear PATCH failure so subsequent patch succeeds
+		failPatch.Store(false)
+
+		// Ticks 2..7: Dial is STILL failing transiently.
+		// ProbeReadiness MUST publish the pending unready verdict before taking the cheap-retry branch!
+		for tick := 2; tick <= 7; tick++ {
+			ready, err := nd.ProbeReadiness(ctx)
+			if ready || err == nil {
+				t.Fatalf("tick %d: expected ProbeReadiness to return false with dial error, got ready=%v err=%v", tick, ready, err)
+			}
+			// Verify that the unready annotation was published to the API server!
+			if err := nd.Client.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+				t.Fatalf("tick %d get node: %v", tick, err)
+			}
+			if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+				t.Fatalf("tick %d: expected criu-ready to be updated to false, got %q (stale ready bug!)", tick, cur.Annotations[NodeAnnotationCRIUReady])
+			}
+			if atomic.LoadInt32(&installCalls) != 1 {
+				t.Fatalf("tick %d: expected installCalls to remain 1, got %d", tick, atomic.LoadInt32(&installCalls))
+			}
+			if atomic.LoadInt32(&checkCalls) != 1 {
+				t.Fatalf("tick %d: expected checkCalls to remain 1, got %d", tick, atomic.LoadInt32(&checkCalls))
+			}
+		}
+
+		// Tick 8: containerd starts up, dial succeeds
+		failDial.Store(false)
+		ready, err := nd.ProbeReadiness(ctx)
+		if err != nil || !ready {
+			t.Fatalf("tick 8: expected ProbeReadiness recovery, got ready=%v err=%v", ready, err)
+		}
+		if !nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == true after recovery")
+		}
+		if err := nd.Client.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "true" {
+			t.Errorf("expected criu-ready: true, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+		if atomic.LoadInt32(&installCalls) != 1 {
+			t.Fatalf("expected installCalls to remain 1 after recovery, got %d", atomic.LoadInt32(&installCalls))
 		}
 		if atomic.LoadInt32(&checkCalls) != 1 {
 			t.Fatalf("expected checkCalls to remain 1 after recovery, got %d", atomic.LoadInt32(&checkCalls))

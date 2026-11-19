@@ -63,6 +63,10 @@ type ContainerdReadinessInspector struct {
 	ReadConfig         func(pid int) ([]byte, error)
 	StatContainerdFile func(pid int, path string) (os.FileInfo, error)
 	GetCRIUVersion     func(ctx context.Context, criuPath string) (string, error)
+
+	// ProcRootFormat specifies the root directory path format for a PID.
+	// If empty, defaults to "/proc/%d/root".
+	ProcRootFormat string
 }
 
 // resolvePathInRoot walks targetPath segment-by-segment inside root, correctly following symlinks
@@ -254,11 +258,11 @@ func NewDefaultContainerdInspector(execHost func(context.Context, []string, stri
 		return parseCmdline(raw), nil
 	}
 	insp.ReadConfig = func(pid int) ([]byte, error) {
-		procRoot := fmt.Sprintf("/proc/%d/root", pid)
+		procRoot := insp.procRoot(pid)
 		return readContainerdConfig(procRoot, pid, insp.ReadCmdline)
 	}
 	insp.StatContainerdFile = func(pid int, path string) (os.FileInfo, error) {
-		return StatFileInProcRoot(pid, path)
+		return StatFileInRoot(insp.procRoot(pid), path)
 	}
 	insp.GetCRIUVersion = func(ctx context.Context, criuPath string) (string, error) {
 		if execHost == nil {
@@ -271,6 +275,16 @@ func NewDefaultContainerdInspector(execHost func(context.Context, []string, stri
 		return out, nil
 	}
 	return insp
+}
+
+func (insp *ContainerdReadinessInspector) procRoot(pid int) string {
+	if insp != nil && insp.ProcRootFormat != "" {
+		if strings.Contains(insp.ProcRootFormat, "%d") {
+			return fmt.Sprintf(insp.ProcRootFormat, pid)
+		}
+		return insp.ProcRootFormat
+	}
+	return fmt.Sprintf("/proc/%d/root", pid)
 }
 
 // parseContainerdConfig extracts enable_criu and shimPath from containerd's config.toml using TOML decoding.

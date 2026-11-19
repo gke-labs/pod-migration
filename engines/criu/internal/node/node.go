@@ -474,11 +474,13 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 
 	currIno, ok := n.statCurrentSocket()
 	if ok && currIno != 0 && currIno != lastIno {
-		if pv != nil && pv.ino == currIno {
+		if pv != nil && (pv.ino == currIno || (pv.ino == 0 && transientRetry && currIno == transIno)) {
 			if err := n.publish(ctx, *pv); err != nil {
 				return false, err
 			}
-			return n.IsReady(), nil
+			if pv.ready || (!transientRetry || currIno != transIno) {
+				return n.IsReady(), nil
+			}
 		}
 		if transientRetry && currIno == transIno {
 			// Containerd socket is unchanged after a transient readiness error.
