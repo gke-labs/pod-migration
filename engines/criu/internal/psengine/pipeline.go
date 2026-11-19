@@ -422,6 +422,10 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				logger.Error(getErr, "failed to read live PodSnapshot on errFinished; retrying in 2s")
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
+			if !contract.IsSourceFrozen(ps) {
+				logger.Info("PodSnapshot source was never frozen; skipping unfreeze and thaw record on errFinished")
+				return ctrl.Result{}, nil
+			}
 			if contract.IsSnapshotReady(ps) || checkpointTimedOut(ps) {
 				logger.Info("PodSnapshot is Ready or TimedOut; source container kept frozen for eviction")
 				return ctrl.Result{}, nil

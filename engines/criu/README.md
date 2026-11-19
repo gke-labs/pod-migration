@@ -183,14 +183,48 @@ they start cold instead of being restored; also delete the
   webhook would also rewrite the gVisor pods the addon restores.
 - **Linux kernel & runtime:** Nodes running `containerd` 2.x + `runc` with
   kubelet `ContainerCheckpoint` enabled and a kernel passing `criu check`.
+- **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
+  `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
+  bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable
+  range (`>= 2.1.0, < 2.2.7` or `>= 2.3.0, < 2.3.4`) are demoted with
+  `pod-migrate.io/criu-ready: false` to protect against GHSA-p7v4-vr35-mj6f
+  (CVE-2026-95837, unauthenticated restore-on-create privilege escalation).
 - **Workload scope (v1):**
   - Single-container `runc` pods (`len(pod.Spec.Containers) == 1`).
   - Explicit `command` in the pod spec (required so the `holder` wrapper can
     fall through to a cold start if restore fails).
+  - Non-host-network pods (`hostNetwork: false`). Refusal of pods declaring
+    `hostNetwork: true` across all CRIU boundaries is pending in #229.
   - Homogeneous CPU family between source and target nodes.
   - Single migration per pod instance: migrating an already-restored CRIU pod
     or holder-injected replacement is refused so the orchestrator falls back
     to a clean cold start without checkpointing the holder wrapper ([#121](https://github.com/gke-labs/pod-migration/issues/121)).
+
+## What Installing the Engine Changes on a Node
+
+When `pod-migrate-agent` starts on a node, it applies the following modifications:
+
+| Modification            | Host Location                       | Description                                                                                                                                                      |
+| ----------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **CRIU Bundle**         | `/var/lib/pod-migrate/criu-bundle/` | Directory containing self-contained `criu.bin`, bundled shared libraries, dynamic linker, and `VERSION` file.                                                    |
+| **CRIU System Wrapper** | `/usr/local/sbin/criu`              | Executable wrapper script that launches CRIU via the bundled dynamic linker.                                                                                     |
+| **Runc Configuration**  | `/etc/criu/runc.conf`               | CRIU global configuration specifying `tcp-close`, `skip-in-flight`, `file-validation buildid`, and `file-locks`.                                                 |
+| **Node Annotations**    | Kubernetes `Node` metadata          | Annotated with `pod-migrate.io/criu-ready` (`true` or `false`) and `pod-migrate.io/criu-version`. Stale reason/remediation annotations are cleared on promotion. |
+| **Socket Watching**     | `/run/containerd/containerd.sock`   | Monitored for inode changes to detect containerd daemon restarts and re-probe readiness.                                                                         |
+
+## Storage Security & Bucket IAM Guidance
+
+Because CRIU checkpoint archives contain complete, unencrypted process address spaces (including in-memory tokens, TLS keys, and credentials), storage backends must be secured with the same rigor as Kubernetes Secrets:
+
+1. **Workload Identity hostNetwork Limitation & Node SA Exposure:** The node agent runs with `hostNetwork: true` to communicate with the local kubelet and manage network namespaces. On GKE, **Workload Identity does not apply to `hostNetwork: true` pods** (they bypass metadata-server token redirection and inherit the underlying node's GCE service account). Consequently, isolating bucket access from cluster workloads is not achievable today if workloads share nodes with the default node service account. Until R5 ([#129](https://github.com/gke-labs/pod-migration/issues/129)) lands (dedicated secret-mounted or sidecar credentials), run CRIU node pools under a dedicated GSA, isolated from untrusted workloads.
+2. **Least Privilege Bucket IAM:**
+   - Source node agents: `roles/storage.objectCreator`, `roles/storage.objectViewer`
+   - Target node agents: `roles/storage.objectViewer`
+   - Avoid Default Compute Engine SA: Do **not** use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`).
+3. **CMEK Encryption:** Configure Cloud KMS Customer-Managed Encryption Keys (CMEK) on the checkpoint bucket.
+4. **Lifecycle Retention:** Apply GCS Object Lifecycle Management rules to automatically delete checkpoint archives after **1 to 7 days**, preventing cold archives from lingering.
+
+For full threat analysis, blast radius documentation, and restore path verification details, see [Threat Model and Security Guidance for the CRIU Engine](../../docs/threat-model-criu.md) and [SECURITY.md](../../SECURITY.md).
 
 ## Building & Testing
 
