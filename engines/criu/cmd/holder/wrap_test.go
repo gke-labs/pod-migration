@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -129,31 +130,45 @@ func TestDecideActionWaitsForTheNamedAnnotation(t *testing.T) {
 func TestParseWrapArgs(t *testing.T) {
 	const key = "criu.podmigration.gke.io/ps-name"
 	for _, tc := range []struct {
-		name     string
-		args     []string
-		wantFile string
-		wantKey  string
-		wantOrig []string
-		wantErr  bool
+		name      string
+		args      []string
+		wantFile  string
+		wantKey   string
+		wantGrace time.Duration
+		wantOrig  []string
+		wantErr   bool
 	}{
 		{
-			name:     "no flag: the default key",
+			name:     "no flag: the default key and default grace period",
 			args:     []string{"/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"},
-			wantFile: "/pminfo/annotations", wantKey: annPSName,
+			wantFile: "/pminfo/annotations", wantKey: annPSName, wantGrace: defaultGracePeriod,
 			wantOrig: []string{"redis-server", "--appendonly", "yes"},
 		},
 		{
 			name:     "named key",
 			args:     []string{"--ps-name-annotation=" + key, "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"},
-			wantFile: "/pminfo/annotations", wantKey: key,
+			wantFile: "/pminfo/annotations", wantKey: key, wantGrace: defaultGracePeriod,
 			wantOrig: []string{"redis-server", "--appendonly", "yes"},
 		},
 		{
 			name:     "named key, single dash",
 			args:     []string{"-ps-name-annotation", key, "/pminfo/annotations", "--", "redis-server"},
-			wantFile: "/pminfo/annotations", wantKey: key,
+			wantFile: "/pminfo/annotations", wantKey: key, wantGrace: defaultGracePeriod,
 			wantOrig: []string{"redis-server"},
 		},
+		{
+			name:     "custom grace period",
+			args:     []string{"--grace-period=45s", "/pminfo/annotations", "--", "redis-server"},
+			wantFile: "/pminfo/annotations", wantKey: annPSName, wantGrace: 45 * time.Second,
+			wantOrig: []string{"redis-server"},
+		},
+		{
+			name:     "named key and custom grace period",
+			args:     []string{"--ps-name-annotation=" + key, "--grace-period=1m", "/pminfo/annotations", "--", "redis-server"},
+			wantFile: "/pminfo/annotations", wantKey: key, wantGrace: time.Minute,
+			wantOrig: []string{"redis-server"},
+		},
+		{name: "negative grace period", args: []string{"--grace-period=-5s", "/pminfo/annotations", "--", "redis-server"}, wantErr: true},
 		{name: "no separator", args: []string{"/pminfo/annotations", "redis-server"}, wantErr: true},
 		{name: "no separator, longer command", args: []string{"/pminfo/annotations", "redis-server", "--appendonly", "yes"}, wantErr: true},
 		{name: "no command", args: []string{"/pminfo/annotations", "--"}, wantErr: true},
@@ -161,20 +176,127 @@ func TestParseWrapArgs(t *testing.T) {
 		{name: "unknown flag", args: []string{"--bogus", "/pminfo/annotations", "--", "redis-server"}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			file, key, orig, err := parseWrapArgs(tc.args)
+			file, key, grace, orig, err := parseWrapArgs(tc.args)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("parseWrapArgs(%q) = %q, %q, %q, want an error", tc.args, file, key, orig)
+					t.Fatalf("parseWrapArgs(%q) = %q, %q, %v, %q, want an error", tc.args, file, key, grace, orig)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("parseWrapArgs(%q): %v", tc.args, err)
 			}
-			if file != tc.wantFile || key != tc.wantKey || !slices.Equal(orig, tc.wantOrig) {
-				t.Fatalf("parseWrapArgs(%q) = %q, %q, %q, want %q, %q, %q", tc.args, file, key, orig, tc.wantFile, tc.wantKey, tc.wantOrig)
+			if file != tc.wantFile || key != tc.wantKey || grace != tc.wantGrace || !slices.Equal(orig, tc.wantOrig) {
+				t.Fatalf("parseWrapArgs(%q) = %q, %q, %v, %q, want %q, %q, %v, %q", tc.args, file, key, grace, orig, tc.wantFile, tc.wantKey, tc.wantGrace, tc.wantOrig)
 			}
 		})
+	}
+}
+
+func TestWaitGracefulTermination_ImmediateExitOnSIGINT(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGINT
+	done := make(chan struct{})
+	go func() {
+		waitGracefulTermination(ch, 5*time.Second)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// expected fast return
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination did not exit immediately on SIGINT")
+	}
+}
+
+func TestWaitGracefulTermination_ImmediateExitOnZeroGracePeriod(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGTERM
+	done := make(chan struct{})
+	go func() {
+		waitGracefulTermination(ch, 0)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// expected fast return
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination did not exit immediately on gracePeriod <= 0")
+	}
+}
+
+func TestWaitGracefulTermination_WaitsForSecondSignal(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGTERM
+	done := make(chan struct{})
+	go func() {
+		waitGracefulTermination(ch, 5*time.Second)
+		close(done)
+	}()
+
+	// Confirm it is waiting and did NOT exit immediately
+	select {
+	case <-done:
+		t.Fatal("waitGracefulTermination exited prematurely before second signal or timeout")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Send second signal (simulating node agent signaling sibling container exit)
+	ch <- syscall.SIGINT
+
+	select {
+	case <-done:
+		// exited upon receiving second signal
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination did not exit on second signal")
+	}
+}
+
+func TestWaitGracefulTermination_WaitsForSecondSIGTERM(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGTERM
+	done := make(chan struct{})
+	go func() {
+		waitGracefulTermination(ch, 5*time.Second)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("waitGracefulTermination exited prematurely before second signal or timeout")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Send second SIGTERM
+	ch <- syscall.SIGTERM
+
+	select {
+	case <-done:
+		// exited upon receiving second signal
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination did not exit on second SIGTERM")
+	}
+}
+
+func TestWaitGracefulTermination_ExpiresAfterGracePeriod(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGTERM
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		waitGracefulTermination(ch, 50*time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
+			t.Fatalf("waitGracefulTermination returned too early: %v", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination timed out without honoring grace period")
 	}
 }
 

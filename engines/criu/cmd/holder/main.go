@@ -37,8 +37,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
-	"syscall"
 )
 
 func main() {
@@ -53,9 +51,7 @@ func main() {
 		runWrap(os.Args[2:])
 		return
 	}
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
-	<-ch
+	waitGracefulTermination(nil, defaultGracePeriod)
 }
 
 func seedSelf(dst string) error {

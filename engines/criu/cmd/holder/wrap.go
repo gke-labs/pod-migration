@@ -50,6 +50,7 @@ const (
 	// falling through to a cold start (fail-open: availability beats warm
 	// state).
 	defaultRestoreWait = 90 * time.Second
+	defaultGracePeriod = 30 * time.Second
 	pollInterval       = 100 * time.Millisecond
 )
 
@@ -130,31 +131,35 @@ func readAnnotationsFile(path string) map[string]string {
 }
 
 // wrapUsage is the wrap mode's command line.
-const wrapUsage = "usage: holder wrap [--ps-name-annotation=<key>] <annotations-file> -- <cmd> [args...]"
+const wrapUsage = "usage: holder wrap [--ps-name-annotation=<key>] [--grace-period=<duration>] <annotations-file> -- <cmd> [args...]"
 
 // parseWrapArgs parses the wrap mode's arguments,
-// [--ps-name-annotation=<key>] <annotations-file> -- <cmd> [args...], and
+// [--ps-name-annotation=<key>] [--grace-period=<duration>] <annotations-file> -- <cmd> [args...], and
 // returns the annotations file, the restore-order annotation (annPSName
-// unless the flag names another) and the original command.
-func parseWrapArgs(args []string) (annFile, psNameAnnotation string, orig []string, err error) {
+// unless the flag names another), the termination grace period, and the original command.
+func parseWrapArgs(args []string) (annFile, psNameAnnotation string, gracePeriod time.Duration, orig []string, err error) {
 	fs := flag.NewFlagSet("wrap", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	key := fs.String("ps-name-annotation", annPSName, "restore-order annotation to wait for")
+	gp := fs.Duration("grace-period", defaultGracePeriod, "grace period to wait for sibling container to exit on SIGTERM")
 	if err := fs.Parse(args); err != nil {
-		return "", "", nil, err
+		return "", "", 0, nil, err
 	}
 	rest := fs.Args()
 	if len(rest) < 3 || rest[1] != "--" {
-		return "", "", nil, errors.New("want an annotations file, then --, then the command")
+		return "", "", 0, nil, errors.New("want an annotations file, then --, then the command")
 	}
 	if *key == "" {
-		return "", "", nil, errors.New("--ps-name-annotation is empty")
+		return "", "", 0, nil, errors.New("--ps-name-annotation is empty")
 	}
-	return rest[0], *key, rest[2:], nil
+	if *gp < 0 {
+		return "", "", 0, nil, errors.New("--grace-period cannot be negative")
+	}
+	return rest[0], *key, *gp, rest[2:], nil
 }
 
 func runWrap(args []string) {
-	annFile, psNameAnnotation, orig, err := parseWrapArgs(args)
+	annFile, psNameAnnotation, gracePeriod, orig, err := parseWrapArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "holder wrap: %v\n%s\n", err, wrapUsage)
 		os.Exit(2)
@@ -164,9 +169,7 @@ func runWrap(args []string) {
 	fmt.Fprintf(os.Stderr, "holder wrap: %s\n", reason)
 
 	if outcome == outcomeHold {
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
-		<-ch
+		waitGracefulTermination(nil, gracePeriod)
 		return
 	}
 	bin, err := exec.LookPath(orig[0])
@@ -177,5 +180,55 @@ func runWrap(args []string) {
 	if err := syscall.Exec(bin, orig, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "holder wrap: exec %s: %v\n", bin, err)
 		os.Exit(126)
+	}
+}
+
+// waitGracefulTermination holds the pod sandbox alive until the restored
+// sibling container finishes exiting, or until the grace period expires.
+//
+// When kubelet deletes a pod, it delivers SIGTERM to this holder container.
+// If the holder exits immediately, kubelet marks all containers in the pod as
+// terminated, tears down the pod sandbox (network/IPC namespaces), and issues
+// orphaned-cgroup cleanup (SIGKILL), prematurely killing the restored sibling
+// container before its grace period elapses (#242, #128).
+//
+// By intercepting SIGTERM, the holder keeps the pod sandbox and cgroups intact
+// so the restored application process receives its termination signal, flushes
+// in-flight requests or state, and terminates cleanly.
+//
+// Termination order:
+//  1. Initial SIGTERM: enters graceful wait state.
+//  2. Second signal (SIGINT or SIGTERM): sibling container has finished exiting
+//     (signaled by node agent or manual intervention) -> exits immediately (0).
+//  3. Grace period timeout: kubelet's termination grace period reached -> exits (0).
+//
+// An initial SIGINT exits immediately.
+func waitGracefulTermination(sigCh <-chan os.Signal, gracePeriod time.Duration) {
+	if sigCh == nil {
+		ch := make(chan os.Signal, 2)
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+		sigCh = ch
+	}
+	sig, ok := <-sigCh
+	if !ok {
+		return
+	}
+	if sig == syscall.SIGINT || gracePeriod <= 0 {
+		return
+	}
+
+	timer := time.NewTimer(gracePeriod)
+	defer timer.Stop()
+
+	select {
+	case _, ok := <-sigCh:
+		if !ok {
+			return
+		}
+		// Subsequent signal received (sibling exited and signaled, or operator force-stop)
+		return
+	case <-timer.C:
+		// Grace period expired
+		return
 	}
 }

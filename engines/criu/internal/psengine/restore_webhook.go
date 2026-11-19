@@ -246,7 +246,7 @@ func injectHolder(pod *corev1.Pod, holderImage, psNameAnnotation string) (bool, 
 	// The app container starts as the holder wrapper; at runtime it reads
 	// ps-name from the downward-API file and either holds (agent restores a
 	// sibling) or execs the original entrypoint (cold start).
-	app.Command = append(holderWrapCommand(psNameAnnotation), orig...)
+	app.Command = append(holderWrapCommand(psNameAnnotation, pod.Spec.TerminationGracePeriodSeconds), orig...)
 	app.Args = nil
 
 	if pod.Annotations == nil {
@@ -258,11 +258,15 @@ func injectHolder(pod *corev1.Pod, holderImage, psNameAnnotation string) (bool, 
 
 // holderWrapCommand returns the wrapper part of the app command, ending in
 // "--". It names the restore-order annotation only when that isn't the
-// holder's default.
-func holderWrapCommand(psNameAnnotation string) []string {
+// holder's default, and specifies --grace-period when explicitly configured on
+// the pod spec and differing from the default (30s).
+func holderWrapCommand(psNameAnnotation string, gracePeriod *int64) []string {
 	cmd := []string{holdMount + "/holder", "wrap"}
 	if psNameAnnotation != holderDefaultPSNameAnnotation {
 		cmd = append(cmd, "--ps-name-annotation="+psNameAnnotation)
+	}
+	if gracePeriod != nil && *gracePeriod != 30 {
+		cmd = append(cmd, fmt.Sprintf("--grace-period=%ds", *gracePeriod))
 	}
 	return append(cmd, infoMount+"/"+annotationsRel, "--")
 }

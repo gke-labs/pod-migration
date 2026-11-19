@@ -92,6 +92,46 @@ func TestInjectHolderRewiresGatedPod(t *testing.T) {
 	if ok, _ := InjectHolder(pod, "gcr.io/x/holder:v1"); ok {
 		t.Fatal("second injection must be a no-op")
 	}
+
+	// Custom TerminationGracePeriodSeconds is propagated via --grace-period.
+	t.Run("custom termination grace period is propagated", func(t *testing.T) {
+		p := gatedReplacementPod()
+		grace45 := int64(45)
+		p.Spec.TerminationGracePeriodSeconds = &grace45
+		if ok, reason := InjectHolder(p, "gcr.io/x/holder:v1"); !ok {
+			t.Fatalf("expected injection, got skip: %s", reason)
+		}
+		want := []string{"/pmhold/holder", "wrap", "--ps-name-annotation=" + contract.AnnotationPSName, "--grace-period=45s", "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"}
+		if got := p.Spec.Containers[0].Command; strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Fatalf("wrapped command with custom grace period: %v, want %v", got, want)
+		}
+	})
+
+	t.Run("zero termination grace period is propagated", func(t *testing.T) {
+		p := gatedReplacementPod()
+		grace0 := int64(0)
+		p.Spec.TerminationGracePeriodSeconds = &grace0
+		if ok, reason := InjectHolder(p, "gcr.io/x/holder:v1"); !ok {
+			t.Fatalf("expected injection, got skip: %s", reason)
+		}
+		want := []string{"/pmhold/holder", "wrap", "--ps-name-annotation=" + contract.AnnotationPSName, "--grace-period=0s", "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"}
+		if got := p.Spec.Containers[0].Command; strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Fatalf("wrapped command with zero grace period: %v, want %v", got, want)
+		}
+	})
+
+	t.Run("default 30s termination grace period is omitted", func(t *testing.T) {
+		p := gatedReplacementPod()
+		grace30 := int64(30)
+		p.Spec.TerminationGracePeriodSeconds = &grace30
+		if ok, reason := InjectHolder(p, "gcr.io/x/holder:v1"); !ok {
+			t.Fatalf("expected injection, got skip: %s", reason)
+		}
+		want := []string{"/pmhold/holder", "wrap", "--ps-name-annotation=" + contract.AnnotationPSName, "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"}
+		if got := p.Spec.Containers[0].Command; strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Fatalf("wrapped command with 30s grace period: %v, want %v", got, want)
+		}
+	})
 }
 
 func TestInjectHolderSkips(t *testing.T) {
