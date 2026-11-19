@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -236,6 +237,29 @@ func (r *Node) PSEngineIsSiblingRunning(ctx context.Context, snapshotName string
 		return false, nil
 	}
 	return r.Restorer.IsRunning(ctx, migrationName)
+}
+
+// PSEngineSignalHolder sends a signal (e.g. syscall.SIGINT) to the holder container process.
+// Used upon sibling container exit and cleanup completion to wake the holder container early
+// so it does not wait out the full grace period (#242).
+func (r *Node) PSEngineSignalHolder(ctx context.Context, ns, pod, podUID, container string, sig int) error {
+	if r.Restorer == nil {
+		return nil
+	}
+	ref, err := r.Restorer.findContainer(ctx, ns, pod, podUID, container)
+	if err != nil {
+		if errors.Is(err, ErrContainerNotFound) || errdefs.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if ref == nil || ref.Pid <= 0 {
+		return nil
+	}
+	if err := syscall.Kill(ref.Pid, syscall.Signal(sig)); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("signal holder container %d: %w", ref.Pid, err)
+	}
+	return nil
 }
 
 // PSEngineCPUFamily reports the node's CPU model for the archive manifest

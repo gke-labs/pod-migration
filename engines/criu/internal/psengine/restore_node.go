@@ -77,6 +77,8 @@ type RestoreOps interface {
 	Signal(ctx context.Context, in RestoreInputs, sig int) error
 	// IsSiblingRunning returns true if the restored runc container is still running.
 	IsSiblingRunning(ctx context.Context, in RestoreInputs) (bool, error)
+	// SignalHolder sends a signal (e.g. 2 / SIGINT) to the holder container process to wake it early upon cleanup.
+	SignalHolder(ctx context.Context, in RestoreInputs, sig int) error
 }
 
 // NodeRestoreReconciler watches pods on its node and executes restores.
@@ -202,6 +204,10 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		r.signaled.Delete(string(pod.UID))
 		logger.Info("cleaned up restore artifacts on pod deletion", "pod", pod.Name)
+		// Wake the holder container if it is waiting out the grace period:
+		if err := r.Ops.SignalHolder(ctx, in, 2); err != nil {
+			logger.V(1).Info("signaling holder container failed", "pod", pod.Name, "err", err)
+		}
 		return ctrl.Result{}, nil
 	}
 

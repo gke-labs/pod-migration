@@ -174,6 +174,7 @@ type fakeRestoreOps struct {
 	failIt         bool
 	failCleanup    bool
 	extracted      []string
+	holderSignals  []int
 }
 
 func (f *fakeRestoreOps) Extract(tarPath, dstDir string) error {
@@ -209,6 +210,11 @@ func (f *fakeRestoreOps) Signal(_ context.Context, in RestoreInputs, sig int) er
 
 func (f *fakeRestoreOps) IsSiblingRunning(_ context.Context, in RestoreInputs) (bool, error) {
 	return f.siblingRunning, nil
+}
+
+func (f *fakeRestoreOps) SignalHolder(_ context.Context, in RestoreInputs, sig int) error {
+	f.holderSignals = append(f.holderSignals, sig)
+	return nil
 }
 
 // readySnapshotWithArchive stages a Ready PodSnapshot + a consistent archive
@@ -336,6 +342,9 @@ func TestNodeRestore_TearsDownOnPodDeletion(t *testing.T) {
 	if ops.cleaned[0].SnapshotName != "ps-web-0-deadbeef" || ops.cleaned[0].TargetPod != "web-1" {
 		t.Errorf("cleanup inputs: %+v", ops.cleaned[0])
 	}
+	if len(ops.holderSignals) != 1 || ops.holderSignals[0] != 2 {
+		t.Errorf("expected holder to be signaled with SIGINT (2), got %v", ops.holderSignals)
+	}
 }
 
 func TestNodeRestore_TearsDownOnPodDeletion_AfterCompleteRestore(t *testing.T) {
@@ -362,6 +371,9 @@ func TestNodeRestore_TearsDownOnPodDeletion_AfterCompleteRestore(t *testing.T) {
 	}
 	if ops.cleaned[0].SnapshotName != "ps-web-0-deadbeef" || ops.cleaned[0].TargetPod != "web-1" {
 		t.Errorf("cleanup inputs: %+v", ops.cleaned[0])
+	}
+	if len(ops.holderSignals) != 1 || ops.holderSignals[0] != 2 {
+		t.Errorf("expected holder to be signaled with SIGINT (2), got %v", ops.holderSignals)
 	}
 }
 
