@@ -1407,6 +1407,55 @@ func TestNode_SweepOrphanRestores_KeepsLivePodAfterCompleteRestore(t *testing.T)
 	}
 }
 
+func TestNode_SweepOrphanRestores_KeepsLivePodWithAnnotationSnapshotOnly(t *testing.T) {
+	live := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web-2", Namespace: "default", UID: types.UID("live-uid-2"),
+			Annotations: map[string]string{
+				"pod-migrate.io/psengine-snapshot": "snap-b", // only engine-owned AnnotationSnapshot set
+				"pod-migrate.io/psengine-restore":  "restored",
+				"pod-migrate.io/psengine-injected": "true",
+			},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newTestScheme(t)).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
+			return []string{o.(*corev1.Pod).Spec.NodeName}
+		}).WithObjects(live).Build()
+
+	root := t.TempDir()
+	bundle := filepath.Join(root, "bundles", "pm-psengine-snap-b")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(bundle, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	var killed []string
+	r := &restorer{pmRootDir: root}
+	r.listLeasesFn = func(context.Context) ([]leases.Lease, error) {
+		// Legacy or missing pod-uid label on lease; identity resolves via livingSnapshots
+		return []leases.Lease{{
+			ID: "lease-pm-psengine-snap-b", CreatedAt: old,
+		}}, nil
+	}
+	r.runcDeleteFn = func(_ context.Context, id string) error { killed = append(killed, id); return nil }
+	r.deleteLeaseFn = func(context.Context, string) error { return nil }
+	r.unmountTreeFn = func(string) error { return nil }
+	r.removeSnapshotFn = func(context.Context, string) error { return nil }
+
+	nd := &Node{Client: fc, APIReader: fc, NodeName: "node-a", Restorer: r}
+	if err := nd.SweepOrphanRestores(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("sweep tore down a live restored pod with only AnnotationSnapshot: runc delete -f %v", killed)
+	}
+}
+
 func TestNode_SweepOrphanRestores_TreatsTerminalAndFailedRestoresAsDead(t *testing.T) {
 	// Pod 1: Succeeded phase
 	pod1 := &corev1.Pod{
