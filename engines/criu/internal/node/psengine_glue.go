@@ -39,10 +39,14 @@ import (
 // PSEngineCheckpoint drives the kubelet ContainerCheckpoint API and validates
 // the resulting tar.
 func (r *Node) PSEngineCheckpoint(ctx context.Context, ns, pod, container string) (string, error) {
+	preIno, _ := r.statCurrentSocket()
 	res, err := r.Kubelet.checkpoint(ctx, ns, pod, container)
 	if err != nil {
 		if errors.Is(err, ErrContainerdCachedCRIU) {
-			if demoteErr := r.DemoteNode(ctx, ReasonContainerdCachedCRIU, RemediationRestartContainerd); demoteErr != nil {
+			if preIno == 0 {
+				preIno, _ = r.statCurrentSocket()
+			}
+			if demoteErr := r.demoteNodeAtInode(ctx, ReasonContainerdCachedCRIU, RemediationRestartContainerd, preIno); demoteErr != nil {
 				logf.FromContext(ctx).Error(demoteErr, "failed to annotate node unready after containerd cached CRIU failure", "node", r.NodeName)
 			}
 		}

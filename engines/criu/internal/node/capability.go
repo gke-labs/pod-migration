@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -53,6 +54,10 @@ const (
 	// (hostPath mount). The kubelet checkpoint API fails with "criu: executable
 	// file not found in $PATH" unless the wrapper is visible there.
 	hostPathBinDir = "/usr/local/sbin"
+
+	// nodeAPITimeout bounds individual Node GET/PATCH calls so a slow API server
+	// cannot stall PSEngineCheckpoint or RunProbeLoop indefinitely.
+	nodeAPITimeout = 10 * time.Second
 )
 
 // installCRIUBundle copies the bundle from the image onto the node's writable
@@ -93,7 +98,7 @@ func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir str
 	if err := os.MkdirAll(dstConfDir, 0o755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(dstConfDir, "runc.conf"),
+	if err := writeFileAtomic(filepath.Join(dstConfDir, "runc.conf"),
 		[]byte("tcp-close\nskip-in-flight\nfile-validation buildid\nfile-locks\n"), 0o644); err != nil {
 		return "", fmt.Errorf("write criu runc.conf: %w", err)
 	}
@@ -129,8 +134,11 @@ func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, st
 
 // annotateNode publishes the node's CRIU capability verdict, version, and optional reason/remediation.
 func annotateNode(ctx context.Context, c client.Client, nodeName, version, reason, remediation string, ready bool) error {
+	apiCtx, cancel := context.WithTimeout(ctx, nodeAPITimeout)
+	defer cancel()
+
 	var node corev1.Node
-	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+	if err := c.Get(apiCtx, types.NamespacedName{Name: nodeName}, &node); err != nil {
 		return err
 	}
 	patch := client.MergeFrom(node.DeepCopy())
@@ -147,12 +155,16 @@ func annotateNode(ctx context.Context, c client.Client, nodeName, version, reaso
 	} else {
 		if reason != "" {
 			node.Annotations[NodeAnnotationCRIUReason] = reason
+		} else {
+			delete(node.Annotations, NodeAnnotationCRIUReason)
 		}
 		if remediation != "" {
 			node.Annotations[NodeAnnotationCRIURemediation] = remediation
+		} else {
+			delete(node.Annotations, NodeAnnotationCRIURemediation)
 		}
 	}
-	return c.Patch(ctx, &node, patch)
+	return c.Patch(apiCtx, &node, patch)
 }
 
 // copyFile installs src at dst atomically via temp-file + rename so an
