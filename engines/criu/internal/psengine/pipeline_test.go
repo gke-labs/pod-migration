@@ -559,6 +559,33 @@ func (f *failOnNthGetReader) Get(ctx context.Context, key client.ObjectKey, obj 
 	return f.Reader.Get(ctx, key, obj, opts...)
 }
 
+type injectOutcomeOnSnapshotGetReader struct {
+	client.Reader
+	targetKey     types.NamespacedName
+	outcomeReason string
+	snapshotGets  int
+	injectOnGet   int
+}
+
+func (r *injectOutcomeOnSnapshotGetReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := r.Reader.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	if key == r.targetKey {
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "PodSnapshot" {
+			r.snapshotGets++
+			if r.injectOnGet > 0 && r.snapshotGets >= r.injectOnGet && r.outcomeReason != "" {
+				_ = contract.SetCondition(u, metav1.Condition{
+					Type:   contract.CondCheckpoint,
+					Status: metav1.ConditionFalse,
+					Reason: r.outcomeReason,
+				})
+			}
+		}
+	}
+	return nil
+}
+
 // TestPipeline_ErrFinishedLiveGetErrorRequeues pins that if live reading of the
 // PodSnapshot fails during errFinished, Reconcile requeues and does not fail open (does not thaw).
 func TestPipeline_ErrFinishedLiveGetErrorRequeues(t *testing.T) {
@@ -865,23 +892,25 @@ func TestPipeline_StaleCacheDoesNotThawJustCheckpointedReadySource(t *testing.T)
 
 // TestPipeline_OutcomeBeforeRecordSourceFrozenStopsBeforeFreeze pins that if an outcome
 // (e.g. Refused from demoting node) lands before recordSourceFrozen(true), recordSourceFrozen
-// fails closed with errFinished, causing run() to return early without calling Ops.Freeze.
+// fails closed with errFinished, causing run() to return early without calling Ops.Freeze,
+// without calling Ops.Unfreeze, and without writing SourceFrozen condition.
 func TestPipeline_OutcomeBeforeRecordSourceFrozenStopsBeforeFreeze(t *testing.T) {
 	ps := workOrderSnapshot("ps-web-0-deadbeef")
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{t: t}
 	store := newMemStore()
 
-	// Land Refused outcome before Freeze
-	snap := getSnapshot(t, c, "ps-web-0-deadbeef")
-	_ = contract.SetCondition(snap, metav1.Condition{
-		Type:   contract.CondCheckpoint,
-		Status: metav1.ConditionFalse,
-		Reason: contract.ReasonRefused,
-	})
-	_ = c.Status().Update(context.Background(), snap)
+	// Inject Refused on the liveReader Get call inside recordSourceFrozen(true)
+	// (snapshotGet #3: #1 is initial livePS read, #2 is cancelCheck).
+	// Before that, the snapshot has no outcome so Reconcile enters run().
+	reader := &injectOutcomeOnSnapshotGetReader{
+		Reader:        c,
+		targetKey:     types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"},
+		outcomeReason: contract.ReasonRefused,
+		injectOnGet:   3,
+	}
 
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -891,6 +920,18 @@ func TestPipeline_OutcomeBeforeRecordSourceFrozenStopsBeforeFreeze(t *testing.T)
 	}
 	if len(ops.frozen) != 0 {
 		t.Fatalf("Freeze must not be called when snapshot already has outcome before recordSourceFrozen: %v", ops.frozen)
+	}
+	if len(ops.unfrozen) != 0 {
+		t.Fatalf("Unfreeze must not be called when snapshot was never frozen: %v", ops.unfrozen)
+	}
+	finalSnap := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if contract.IsSourceFrozen(finalSnap) {
+		t.Fatal("snapshot must not be marked SourceFrozen=True")
+	}
+	for _, cond := range contract.Conditions(finalSnap) {
+		if cond.Type == contract.CondSourceFrozen {
+			t.Fatalf("snapshot must not carry SourceFrozen condition when never frozen: %v", cond)
+		}
 	}
 }
 
