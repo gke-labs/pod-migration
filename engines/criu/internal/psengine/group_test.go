@@ -22,16 +22,22 @@ package psengine
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
@@ -95,9 +101,6 @@ func TestInjectHolderOnTheGKEPodSnapshotsGroupKeepsTheCommand(t *testing.T) {
 	if got := pod.Spec.Containers[0].Command; !slices.Equal(got, want) {
 		t.Fatalf("wrapped command:\n got %q\nwant %q", got, want)
 	}
-	if contract.AnnotationPSName != holderDefaultPSNameAnnotation {
-		t.Fatalf("by default the engine must use the holder's default restore order: %q != %q", contract.AnnotationPSName, holderDefaultPSNameAnnotation)
-	}
 }
 
 // The preflight checks the CRDs of the engine's own group, so the add-on's
@@ -137,53 +140,197 @@ func TestPreflightChecksTheEnginesGroup(t *testing.T) {
 	})
 }
 
-// The restore webhook wraps every gated replacement pod, so an engine on its
-// own group with the webhook on refuses to start next to the add-on, whose
-// gVisor pods the webhook would rewrite.
-func TestRestoreWebhookScopeRefusesTheAddon(t *testing.T) {
+// With RestoreInjector scoped strictly to CRIU-routed replacement pods (#135),
+// Preflight succeeds on criu.podmigration.gke.io even when the managed GKE Pod
+// Snapshots addon owns podsnapshot.gke.io, and RestoreInjector.Handle leaves
+// gVisor / non-CRIU replacement pods untouched.
+func TestCoexistenceWithGKEPodSnapshotsAddon(t *testing.T) {
 	ctx := context.Background()
+	addonCRDs := crdsOf(contract.GKEPodSnapshotsGroup, addonCRDLabels)
+	ourCRDs := crdsOf(contract.CRIUGroup, ourCRDLabels)
 
-	t.Run("own group next to the add-on: refused", func(t *testing.T) {
-		err := verifyRestoreWebhookScope(ctx, newCRDClient(t, crdsOf(contract.GKEPodSnapshotsGroup, addonCRDLabels)...), ownGroup)
-		if err == nil {
-			t.Fatal("the webhook would rewrite the add-on's pods, so preflight must fail")
+	t.Run("preflight passes when own CRDs sit next to the add-on's", func(t *testing.T) {
+		objs := append(slices.Clone(addonCRDs), ourCRDs...)
+		if err := Preflight(ctx, newCRDClient(t, objs...)); err != nil {
+			t.Fatalf("Preflight on %s next to GKE add-on CRDs failed: %v", contract.Group, err)
 		}
-		for _, want := range []string{
-			"podsnapshotstorageconfigs.podsnapshot.gke.io",
-			"GKE Pod Snapshots addon",
-			"--api-group=" + ownGroup,
-			"--enable-webhooks=false",
-		} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("error %q doesn't contain %q", err, want)
+	})
+
+	t.Run("RestoreInjector.Handle end-to-end scoping, zero-read short-circuit, and nil-reader safety", func(t *testing.T) {
+		dec := admission.NewDecoder(testScheme(t))
+		makeCreateReq := func(t *testing.T, reqNS string, pod *corev1.Pod) admission.Request {
+			t.Helper()
+			raw, err := json.Marshal(pod)
+			if err != nil {
+				t.Fatalf("marshal pod: %v", err)
+			}
+			return admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Namespace: reqNS,
+					Name:      pod.Name,
+					Operation: admissionv1.Create,
+					Object:    runtime.RawExtension{Raw: raw},
+				},
 			}
 		}
-	})
-	t.Run("our label applied over the add-on's CRDs: refused", func(t *testing.T) {
-		clobbered := map[string]string{ComponentLabel: ComponentLabelValue, "addonmanager.kubernetes.io/mode": "Reconcile"}
-		if err := verifyRestoreWebhookScope(ctx, newCRDClient(t, crdsOf(contract.GKEPodSnapshotsGroup, clobbered)...), ownGroup); err == nil {
-			t.Fatal("the add-on's markers mean the add-on is still there, so preflight must fail")
+
+		criuJob := contract.New(contract.GVKPodMigrationJob)
+		criuJob.SetNamespace("tenant-a")
+		criuJob.SetName("pmj-criu")
+		criuJob.SetAnnotations(map[string]string{contract.AnnotationOrchestratorEngine: contract.EngineCRIU})
+
+		otherNSCRIUJob := contract.New(contract.GVKPodMigrationJob)
+		otherNSCRIUJob.SetNamespace("other-ns")
+		otherNSCRIUJob.SetName("pmj-other-ns")
+		otherNSCRIUJob.SetAnnotations(map[string]string{contract.AnnotationOrchestratorEngine: contract.EngineCRIU})
+
+		gkeJob := contract.New(contract.GVKPodMigrationJob)
+		gkeJob.SetNamespace("tenant-a")
+		gkeJob.SetName("pmj-gke")
+		gkeJob.SetAnnotations(map[string]string{contract.AnnotationOrchestratorEngine: "gke-pod-snapshots"})
+
+		legacyUnannotatedJob := contract.New(contract.GVKPodMigrationJob)
+		legacyUnannotatedJob.SetNamespace("tenant-a")
+		legacyUnannotatedJob.SetName("pmj-legacy")
+
+		var pmjReads atomic.Int32
+		c := newClientWithInterceptor(t, interceptor.Funcs{
+			Get: func(ctx context.Context, cli client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if obj.GetObjectKind().GroupVersionKind() == contract.GVKPodMigrationJob {
+					pmjReads.Add(1)
+				}
+				return cli.Get(ctx, key, obj, opts...)
+			},
+		}, criuJob, otherNSCRIUJob, gkeJob, legacyUnannotatedJob)
+		inj := &RestoreInjector{Decoder: dec, HolderImage: "gcr.io/x/holder:v1", Reader: c}
+
+		// 1. CRIU job with pod.Namespace == "" and req.Namespace == "tenant-a": patched.
+		podForCRIU := gatedReplacementPod()
+		podForCRIU.Namespace = ""
+		podForCRIU.Annotations[contract.AnnotationAssignedPMJ] = "pmj-criu"
+		resp := inj.Handle(ctx, makeCreateReq(t, "tenant-a", podForCRIU))
+		if !resp.Allowed || len(resp.Patches) == 0 {
+			t.Fatalf("expected CRIU replacement pod to be allowed and patched, got allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
 		}
-	})
-	t.Run("unlabeled CRDs without add-on markers: refused", func(t *testing.T) {
-		err := verifyRestoreWebhookScope(ctx, newCRDClient(t, crdsOf(contract.GKEPodSnapshotsGroup, nil)...), ownGroup)
-		if err == nil || !strings.Contains(err.Error(), "owner unknown") {
-			t.Fatalf("CRDs this engine didn't install belong to some other provider, so preflight must fail, got %v", err)
+		patchJSON, err := json.Marshal(resp.Patches)
+		if err != nil {
+			t.Fatalf("marshal patches: %v", err)
 		}
-	})
-	t.Run("own group, no add-on: pass", func(t *testing.T) {
-		if err := verifyRestoreWebhookScope(ctx, newCRDClient(t, crdsOf(ownGroup, ourCRDLabels)...), ownGroup); err != nil {
-			t.Fatal(err)
+		for _, wantSubstr := range []string{
+			"--ps-name-annotation=" + contract.AnnotationPSName,
+			seedInitName,
+			"psengine-injected",
+		} {
+			if !strings.Contains(string(patchJSON), wantSubstr) {
+				t.Errorf("patch JSON %s missing %q", string(patchJSON), wantSubstr)
+			}
 		}
-	})
-	t.Run("own group next to this engine's podsnapshot.gke.io CRDs: pass", func(t *testing.T) {
-		if err := verifyRestoreWebhookScope(ctx, newCRDClient(t, crdsOf(contract.GKEPodSnapshotsGroup, ourCRDLabels)...), ownGroup); err != nil {
-			t.Fatal(err)
+		if gotReads := pmjReads.Swap(0); gotReads != 1 {
+			t.Fatalf("expected exactly 1 PMJ GET for CRIU candidate pod, got %d", gotReads)
 		}
-	})
-	t.Run("GKE Pod Snapshots group: left to VerifyCRDOwnership", func(t *testing.T) {
-		if err := verifyRestoreWebhookScope(ctx, newCRDClient(t, crdsOf(contract.GKEPodSnapshotsGroup, addonCRDLabels)...), contract.GKEPodSnapshotsGroup); err != nil {
-			t.Fatal(err)
+
+		// 2. GKE Pod Snapshots job, unannotated job, missing job, and job in another namespace: allowed with 0 patches.
+		for _, tc := range []struct {
+			name        string
+			podNS       string
+			assignedPMJ string
+			wantMsg     string
+		}{
+			{name: "gke-pod-snapshots job", podNS: "", assignedPMJ: "pmj-gke", wantMsg: "gke-pod-snapshots"},
+			{name: "legacy unannotated job", podNS: "", assignedPMJ: "pmj-legacy", wantMsg: "not criu"},
+			{name: "missing job", podNS: "", assignedPMJ: "pmj-missing", wantMsg: "cannot read assigned PodMigrationJob"},
+			{name: "job only in other-ns with empty pod.Namespace", podNS: "", assignedPMJ: "pmj-other-ns", wantMsg: "cannot read assigned PodMigrationJob tenant-a/pmj-other-ns"},
+			{name: "req.Namespace overrides mismatched pod.Namespace", podNS: "other-ns", assignedPMJ: "pmj-other-ns", wantMsg: "cannot read assigned PodMigrationJob tenant-a/pmj-other-ns"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				pmjReads.Store(0)
+				pod := gatedReplacementPod()
+				pod.Namespace = tc.podNS
+				pod.Annotations[contract.AnnotationAssignedPMJ] = tc.assignedPMJ
+				r := inj.Handle(ctx, makeCreateReq(t, "tenant-a", pod))
+				if !r.Allowed || len(r.Patches) != 0 {
+					t.Fatalf("expected Allowed with 0 patches, got allowed=%v patches=%d result=%+v", r.Allowed, len(r.Patches), r.Result)
+				}
+				if r.Result == nil || !strings.Contains(r.Result.Message, tc.wantMsg) {
+					t.Fatalf("result message = %+v, want substring %q", r.Result, tc.wantMsg)
+				}
+				if gotReads := pmjReads.Load(); gotReads != 1 {
+					t.Fatalf("expected 1 PMJ GET, got %d", gotReads)
+				}
+			})
+		}
+
+		// 3. Pure local pod-shape checks short-circuit BEFORE reading PodMigrationJob (0 API reads).
+		gvisorRC := "gvisor"
+		always := corev1.ContainerRestartPolicyAlways
+		for _, tc := range []struct {
+			name   string
+			mutate func(*corev1.Pod)
+		}{
+			{
+				name: "gvisor runtimeClassName",
+				mutate: func(p *corev1.Pod) {
+					p.Spec.RuntimeClassName = &gvisorRC
+				},
+			},
+			{
+				name: "ungated pod",
+				mutate: func(p *corev1.Pod) {
+					p.Spec.SchedulingGates = nil
+				},
+			},
+			{
+				name: "native sidecar initContainer",
+				mutate: func(p *corev1.Pod) {
+					p.Spec.InitContainers = []corev1.Container{{Name: "istio-proxy", RestartPolicy: &always}}
+				},
+			},
+			{
+				name: "hostNetwork pod",
+				mutate: func(p *corev1.Pod) {
+					p.Spec.HostNetwork = true
+				},
+			},
+			{
+				name: "multi-container pod",
+				mutate: func(p *corev1.Pod) {
+					p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: "sidecar", Image: "busybox"})
+				},
+			},
+			{
+				name: "commandless container",
+				mutate: func(p *corev1.Pod) {
+					p.Spec.Containers[0].Command = nil
+				},
+			},
+		} {
+			t.Run("zero-read short-circuit: "+tc.name, func(t *testing.T) {
+				pmjReads.Store(0)
+				pod := gatedReplacementPod()
+				pod.Namespace = ""
+				pod.Annotations[contract.AnnotationAssignedPMJ] = "pmj-criu"
+				tc.mutate(pod)
+				r := inj.Handle(ctx, makeCreateReq(t, "tenant-a", pod))
+				if !r.Allowed || len(r.Patches) != 0 {
+					t.Fatalf("expected Allowed with 0 patches, got allowed=%v patches=%d", r.Allowed, len(r.Patches))
+				}
+				if gotReads := pmjReads.Load(); gotReads != 0 {
+					t.Fatalf("expected 0 PodMigrationJob reads for %s, got %d", tc.name, gotReads)
+				}
+			})
+		}
+
+		// 4. Nil Reader fails safe (skips holder injection with 0 patches instead of injecting unscoped).
+		nilReaderInj := &RestoreInjector{Decoder: dec, HolderImage: "gcr.io/x/holder:v1", Reader: nil}
+		podNilReader := gatedReplacementPod()
+		podNilReader.Namespace = ""
+		podNilReader.Annotations[contract.AnnotationAssignedPMJ] = "pmj-criu"
+		nilResp := nilReaderInj.Handle(ctx, makeCreateReq(t, "tenant-a", podNilReader))
+		if !nilResp.Allowed || len(nilResp.Patches) != 0 {
+			t.Fatalf("expected nil-reader RestoreInjector to fail safe with 0 patches, got allowed=%v patches=%d", nilResp.Allowed, len(nilResp.Patches))
+		}
+		if nilResp.Result == nil || !strings.Contains(nilResp.Result.Message, "restore webhook has no PodMigrationJob reader; skipping holder injection") {
+			t.Fatalf("unexpected nil-reader message: %+v", nilResp.Result)
 		}
 	})
 }
@@ -193,10 +340,11 @@ func TestRestoreWebhookScopeRefusesTheAddon(t *testing.T) {
 // node agent restores pods carrying <group>/ps-name and leaves pods that
 // carry only podsnapshot.gke.io/ps-name alone.
 func TestSetGroupReachesTheWebhookPreflightAndRestore(t *testing.T) {
-	useGroup(t, ownGroup)
+	const customGroup = "custom.podmigration.gke.io"
+	useGroup(t, customGroup)
 	ctx := context.Background()
 	const psName = "ps-web-0-deadbeef"
-	ownKey := contract.RestoreAnnotation(ownGroup)
+	ownKey := contract.RestoreAnnotation(customGroup)
 	gkeKey := contract.RestoreAnnotation(contract.GKEPodSnapshotsGroup)
 
 	t.Run("webhook", func(t *testing.T) {
@@ -212,29 +360,26 @@ func TestSetGroupReachesTheWebhookPreflightAndRestore(t *testing.T) {
 	t.Run("preflight", func(t *testing.T) {
 		addonCRDs := crdsOf(contract.GKEPodSnapshotsGroup, addonCRDLabels)
 		err := VerifyCRDOwnership(ctx, newCRDClient(t, addonCRDs...))
-		if err == nil || !strings.Contains(err.Error(), "podsnapshotstorageconfigs."+ownGroup) {
+		if err == nil || !strings.Contains(err.Error(), "podsnapshotstorageconfigs."+customGroup) {
 			t.Fatalf("preflight must look for the engine's own CRDs, got %v", err)
 		}
-		if err := Preflight(ctx, newCRDClient(t, addonCRDs...), false); err == nil {
-			t.Fatal("with the engine's own CRDs missing, preflight must fail even with the webhook off")
+		if err := Preflight(ctx, newCRDClient(t, addonCRDs...)); err == nil {
+			t.Fatal("with the engine's own CRDs missing, preflight must fail")
 		}
-		objs := append(slices.Clone(addonCRDs), crdsOf(ownGroup, ourCRDLabels)...)
+		objs := append(slices.Clone(addonCRDs), crdsOf(customGroup, ourCRDLabels)...)
 		if err := VerifyCRDOwnership(ctx, newCRDClient(t, objs...)); err != nil {
 			t.Fatalf("own CRDs next to the add-on's: %v", err)
 		}
-		if err := Preflight(ctx, newCRDClient(t, objs...), false); err != nil {
-			t.Fatalf("with the webhook off, the engine can run next to the add-on: %v", err)
-		}
-		if err := Preflight(ctx, newCRDClient(t, objs...), true); err == nil || !strings.Contains(err.Error(), "--enable-webhooks=false") {
-			t.Fatalf("with the webhook on, the engine must still refuse to run next to the add-on, got %v", err)
+		if err := Preflight(ctx, newCRDClient(t, objs...)); err != nil {
+			t.Fatalf("with scoped webhook on %s, the engine coexists next to the add-on: %v", customGroup, err)
 		}
 	})
 
 	restore := func(t *testing.T, pod *corev1.Pod) (*fakeRestoreOps, *corev1.Pod) {
 		t.Helper()
 		ps := workOrderSnapshot(psName)
-		if got := ps.GroupVersionKind().Group; got != ownGroup {
-			t.Fatalf("work order group = %q, want %q", got, ownGroup)
+		if got := ps.GroupVersionKind().Group; got != customGroup {
+			t.Fatalf("work order group = %q, want %q", got, customGroup)
 		}
 		if err := contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded}); err != nil {
 			t.Fatal(err)

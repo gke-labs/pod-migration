@@ -40,13 +40,15 @@ import (
 )
 
 const (
+	// CRIUGroup is the dedicated API group of the CRIU snapshot engine (#135).
+	CRIUGroup = "criu.podmigration.gke.io"
 	// GKEPodSnapshotsGroup is the API group of the managed GKE Pod
 	// Snapshots add-on. An engine serving it can only run where the add-on
 	// is off, because the add-on owns those CRDs.
 	GKEPodSnapshotsGroup = "podsnapshot.gke.io"
 	// DefaultGroup is the API group the engine serves unless SetGroup
-	// picks another.
-	DefaultGroup = GKEPodSnapshotsGroup
+	// picks another (#135).
+	DefaultGroup = CRIUGroup
 	// Version of the snapshot engine API.
 	Version = "v1"
 
@@ -57,6 +59,9 @@ const (
 	// AnnotationAssignedPMJ marks a replacement pod's PMJ assignment
 	// (replacement_webhook.go:179) — the trigger for holder injection.
 	AnnotationAssignedPMJ = "pod-migration.gke.io/assigned-pmj"
+	// AnnotationOrchestratorEngine names, on a PodMigrationJob, the snapshot
+	// engine serving that job (controller/internal/engine/engine.go:54).
+	AnnotationOrchestratorEngine = "pod-migration.gke.io/engine"
 	// LabelEnabled is the workload opt-in (replacement_webhook.go:65).
 	LabelEnabled = "pod-migration.gke.io/enabled"
 	// SchedulingGate holds replacement pods (replacement_webhook.go:171).
@@ -135,10 +140,9 @@ var (
 	Group = DefaultGroup
 
 	// AnnotationPSName is the restore order on a replacement pod, with Group
-	// as its prefix. The orchestrator sets it to the snapshot name
-	// (gke_pod_snapshots.go:243), and to "" for a restore bypass
-	// (gke_pod_snapshots.go:257, replacement_webhook.go:150) — so far only
-	// for DefaultGroup, until it can target another group (#135).
+	// as its prefix. The orchestrator sets it to the snapshot name to order a
+	// restore (criu.go OrderRestore) and to "" for a cold-start bypass
+	// (criu.go OrderColdStartBypass, replacement_webhook.go) (#135).
 	AnnotationPSName = RestoreAnnotation(DefaultGroup)
 
 	// GroupVersionKinds of the four contract CRs, in Group.

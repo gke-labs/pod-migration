@@ -13,12 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# podsnapshot.gke.io CRDs — the snapshot engine contract surface consumed by
-# the gke-labs/pod-migration orchestrator.
-#
-# INSTALL RULE: apply these ONLY on clusters where the managed GKE Pod
-# Snapshots addon is OFF. On addon-enabled clusters the schemas are owned by
-# the managed addon; the CRIU engine must not install or overwrite them there.
+# criu.podmigration.gke.io CRDs — the dedicated snapshot engine contract surface
+# served by engines/criu (#135). Using criu.podmigration.gke.io avoids colliding
+# with the managed GKE Pod Snapshots addon's podsnapshot.gke.io CRDs so both
+# engines can run side by side in the same cluster.
 #
 # Specs are deliberately open (x-kubernetes-preserve-unknown-fields): the
 # orchestrator writes these objects as unstructured resources, and the engine
@@ -26,11 +24,11 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: podsnapshotstorageconfigs.podsnapshot.gke.io
+  name: podsnapshotstorageconfigs.criu.podmigration.gke.io
   labels:
     pod-migrate.io/component: psengine
 spec:
-  group: podsnapshot.gke.io
+  group: criu.podmigration.gke.io
   scope: Cluster
   names:
     kind: PodSnapshotStorageConfig
@@ -61,11 +59,11 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: podsnapshotpolicies.podsnapshot.gke.io
+  name: podsnapshotpolicies.criu.podmigration.gke.io
   labels:
     pod-migrate.io/component: psengine
 spec:
-  group: podsnapshot.gke.io
+  group: criu.podmigration.gke.io
   scope: Namespaced
   names:
     kind: PodSnapshotPolicy
@@ -105,11 +103,11 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: podsnapshotmanualtriggers.podsnapshot.gke.io
+  name: podsnapshotmanualtriggers.criu.podmigration.gke.io
   labels:
     pod-migrate.io/component: psengine
 spec:
-  group: podsnapshot.gke.io
+  group: criu.podmigration.gke.io
   scope: Namespaced
   names:
     kind: PodSnapshotManualTrigger
@@ -148,11 +146,11 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: podsnapshots.podsnapshot.gke.io
+  name: podsnapshots.criu.podmigration.gke.io
   labels:
     pod-migrate.io/component: psengine
 spec:
-  group: podsnapshot.gke.io
+  group: criu.podmigration.gke.io
   scope: Namespaced
   names:
     kind: PodSnapshot
