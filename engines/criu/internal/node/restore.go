@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -53,7 +54,9 @@ type restorer struct {
 	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p).
 	// Swappable in tests.
 	execHost         func(ctx context.Context, env []string, name string, args ...string) (string, error)
-	execNetnsFn      func(ctx context.Context, pid int, name string, args ...string) (string, error)
+	nsenterBin       string
+	openPodNetnsFn   func(holderPid int) (*os.File, error)
+	execNetnsFn      func(ctx context.Context, netns *os.File, name string, args ...string) (string, error)
 	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
 	findContainerFn  func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error)
 	listContainersFn func(ctx context.Context) ([]containerd.Container, error)
@@ -64,7 +67,7 @@ type restorer struct {
 }
 
 func newRestorer(c *containerd.Client) *restorer {
-	return &restorer{cclient: c, execHost: nsenterExec}
+	return &restorer{cclient: c, execHost: nsenterExec, nsenterBin: "nsenter"}
 }
 
 // nsenterExec executes cmd in the host mount+pid namespaces (agent has
@@ -100,6 +103,13 @@ func (r *restorer) execRestore(ctx context.Context, env []string, logPath string
 	// We keep this file so it acts as a container-stdout log for the restored process.
 	full := append([]string{"-t", "1", "-m", "-p", "--", name}, args...)
 	cmd := exec.CommandContext(cctx, "nsenter", full...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -122,29 +132,56 @@ func (r *restorer) rootDir() string {
 	return pmRoot
 }
 
-func (r *restorer) execNetns(ctx context.Context, netns *os.File, pid int, name string, args ...string) (string, error) {
-	if r.execNetnsFn != nil {
-		return r.execNetnsFn(ctx, pid, name, args...)
+// openPodNetns opens the network namespace for the holder container PID.
+// It verifies that the target pod does not share the host network namespace (hostNetwork: true pods
+// are out of scope for sandbox netfilter locking), and opens /proc/<pid>/ns/net.
+// Returns (nil, nil) if holderPid <= 0.
+// If the PID shares the host netns or opening fails, it returns an error and nil *os.File.
+func (r *restorer) openPodNetns(holderPid int) (*os.File, error) {
+	if holderPid <= 0 {
+		return nil, nil
 	}
-	var nsArgs []string
-	var extra []*os.File
-	if netns != nil {
-		nsArgs = append([]string{"--net=/proc/self/fd/3", "--", name}, args...)
-		extra = []*os.File{netns}
-	} else {
-		nsArgs = append([]string{"-t", strconv.Itoa(pid), "-n", "--", name}, args...)
+	if r != nil && r.openPodNetnsFn != nil {
+		return r.openPodNetnsFn(holderPid)
 	}
-	cmd := exec.CommandContext(ctx, "nsenter", nsArgs...)
-	cmd.ExtraFiles = extra
+	// Check if holder PID shares host netns.
+	// The agent runs with hostNetwork: true, so /proc/1/ns/net and /proc/self/ns/net are the host netns.
+	hostNet, err := os.Readlink("/proc/1/ns/net")
+	if err == nil {
+		if podNet, err2 := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", holderPid)); err2 == nil && podNet == hostNet {
+			return nil, fmt.Errorf("target pod PID %d shares host network namespace; skipping netfilter lock cleanup to protect host", holderPid)
+		}
+	}
+	f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", holderPid))
+	if err != nil {
+		return nil, fmt.Errorf("open /proc/%d/ns/net: %w", holderPid, err)
+	}
+	return f, nil
+}
+
+func (r *restorer) execNetns(ctx context.Context, netns *os.File, name string, args ...string) (string, error) {
+	if netns == nil {
+		return "", errors.New("cannot enter netns: netns fd is nil")
+	}
+	if r != nil && r.execNetnsFn != nil {
+		return r.execNetnsFn(ctx, netns, name, args...)
+	}
+	nsenterBin := "nsenter"
+	if r != nil && r.nsenterBin != "" {
+		nsenterBin = r.nsenterBin
+	}
+	nsArgs := append([]string{"--net=/proc/self/fd/3", "--", name}, args...)
+	cmd := exec.CommandContext(ctx, nsenterBin, nsArgs...)
+	cmd.ExtraFiles = []*os.File{netns}
 	b, err := cmd.CombinedOutput()
 	return string(b), err
 }
 
 // cleanNetnsLock removes CRIU network-lock iptables rules from the target pod's
 // network namespace so that a cold fallback start is not left with locked network (#126).
-func (r *restorer) cleanNetnsLock(ctx context.Context, netns *os.File, holderPid int) []string {
-	if netns == nil && holderPid <= 0 {
-		return nil
+func (r *restorer) cleanNetnsLock(ctx context.Context, netns *os.File) []string {
+	if netns == nil {
+		return []string{"cleanNetnsLock skipped: netns fd is nil"}
 	}
 	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
@@ -156,27 +193,32 @@ func (r *restorer) cleanNetnsLock(ctx context.Context, netns *os.File, holderPid
 			notes = append(notes, "cleanNetnsLock timed out after 15s")
 			break
 		}
+		// Probe whether CRIU chain exists first to avoid blind legacy module/table creation on nft hosts.
+		if _, err := r.execNetns(cleanCtx, netns, tool, "-w", "2", "-S", "CRIU"); err != nil {
+			continue
+		}
+
 		cleaned := false
 		// Delete any jumps to CRIU in INPUT and OUTPUT.
 		for _, chain := range []string{"INPUT", "OUTPUT"} {
 			for i := 0; i < 10; i++ {
-				_, err := r.execNetns(cleanCtx, netns, holderPid, tool, "-w", "2", "-D", chain, "-j", "CRIU")
+				_, err := r.execNetns(cleanCtx, netns, tool, "-w", "2", "-D", chain, "-j", "CRIU")
 				if err != nil {
 					break
 				}
 				cleaned = true
 			}
 		}
-		// Flush and delete the CRIU chain if present.
-		flushSucceeded := false
-		if _, err := r.execNetns(cleanCtx, netns, holderPid, tool, "-w", "2", "-F", "CRIU"); err == nil {
+		// Flush and delete the CRIU chain.
+		if out, err := r.execNetns(cleanCtx, netns, tool, "-w", "2", "-F", "CRIU"); err == nil {
 			cleaned = true
-			flushSucceeded = true
+		} else {
+			notes = append(notes, fmt.Sprintf("%s -F CRIU failed: %v (%s)", tool, err, truncate(out, 100)))
 		}
-		if _, err := r.execNetns(cleanCtx, netns, holderPid, tool, "-w", "2", "-X", "CRIU"); err == nil {
+		if out, err := r.execNetns(cleanCtx, netns, tool, "-w", "2", "-X", "CRIU"); err == nil {
 			cleaned = true
-		} else if flushSucceeded {
-			notes = append(notes, fmt.Sprintf("%s -F CRIU succeeded but -X CRIU failed: %v", tool, err))
+		} else {
+			notes = append(notes, fmt.Sprintf("%s -X CRIU failed: %v (%s)", tool, err, truncate(out, 100)))
 		}
 		if cleaned {
 			notes = append(notes, fmt.Sprintf("cleaned CRIU network-lock rules with %s", tool))
@@ -383,8 +425,11 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 
 	var netnsFile *os.File
 	if holder.Pid > 0 {
-		if f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", holder.Pid)); err == nil {
-			netnsFile = f
+		var netnsErr error
+		netnsFile, netnsErr = r.openPodNetns(holder.Pid)
+		if netnsErr != nil {
+			out.Notes = append(out.Notes, fmt.Sprintf("pod netns: %v", netnsErr))
+		} else if netnsFile != nil {
 			defer netnsFile.Close()
 		}
 	}
@@ -413,8 +458,8 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		out.Notes = append(out.Notes, fmt.Sprintf("stale-container pre-delete failed (restore will likely conflict): %s: %s",
 			delErr, truncate(delOut, 200)))
 	}
-	if (holder != nil && holder.Pid > 0) || netnsFile != nil {
-		if netNotes := r.cleanNetnsLock(ctx, netnsFile, holder.Pid); len(netNotes) > 0 {
+	if netnsFile != nil {
+		if netNotes := r.cleanNetnsLock(ctx, netnsFile); len(netNotes) > 0 {
 			out.Notes = append(out.Notes, netNotes...)
 		}
 	}
@@ -526,8 +571,8 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 			break // not cgroup-shaped — the fallback mode cannot help
 		}
 		_, _ = r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id)
-		if (holder != nil && holder.Pid > 0) || netnsFile != nil {
-			if netNotes := r.cleanNetnsLock(ctx, netnsFile, holder.Pid); len(netNotes) > 0 {
+		if netnsFile != nil {
+			if netNotes := r.cleanNetnsLock(ctx, netnsFile); len(netNotes) > 0 {
 				out.Notes = append(out.Notes, netNotes...)
 			}
 		}
@@ -549,12 +594,18 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		}
 		// Clean up any CRIU network-lock iptables rules in the target pod's netns
 		// so that the holder wrapper's cold fallback has network access (#126).
-		if (holder != nil && holder.Pid > 0) || netnsFile != nil {
-			if netNotes := r.cleanNetnsLock(ctx, netnsFile, holder.Pid); len(netNotes) > 0 {
-				out.Notes = append(out.Notes, netNotes...)
+		var netNotes []string
+		if netnsFile != nil {
+			netNotes = r.cleanNetnsLock(ctx, netnsFile)
+			if len(netNotes) > 0 {
+				out.Notes = append(netNotes, out.Notes...)
 			}
 		}
-		return out, fmt.Errorf("runc restore failed: %w: %s", lastErr, truncate(sig, 1200))
+		netSummary := ""
+		if len(netNotes) > 0 {
+			netSummary = " [" + strings.Join(netNotes, "; ") + "]"
+		}
+		return out, fmt.Errorf("runc restore failed%s: %w: %s", netSummary, lastErr, truncate(sig, 800))
 	}
 
 	pidB, err := os.ReadFile(pidFile)
@@ -562,12 +613,18 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		if notes := r.cleanup(ctx, in.MigrationName, "", "", false); len(notes) > 0 {
 			out.Notes = append(out.Notes, notes...)
 		}
-		if (holder != nil && holder.Pid > 0) || netnsFile != nil {
-			if netNotes := r.cleanNetnsLock(ctx, netnsFile, holder.Pid); len(netNotes) > 0 {
-				out.Notes = append(out.Notes, netNotes...)
+		var netNotes []string
+		if netnsFile != nil {
+			netNotes = r.cleanNetnsLock(ctx, netnsFile)
+			if len(netNotes) > 0 {
+				out.Notes = append(netNotes, out.Notes...)
 			}
 		}
-		return out, fmt.Errorf("restored but pid-file missing: %w", err)
+		netSummary := ""
+		if len(netNotes) > 0 {
+			netSummary = " [" + strings.Join(netNotes, "; ") + "]"
+		}
+		return out, fmt.Errorf("restored but pid-file missing%s: %w", netSummary, err)
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(pidB)))
 	out.Pid = pid
