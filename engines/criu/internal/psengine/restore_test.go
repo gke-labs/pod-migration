@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -246,6 +247,38 @@ func TestNodeRestoreFailureStampsFailed(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected a Warning RestoreFailed event on restore failure, got none")
+	}
+}
+
+func TestNodeRestore_CancelledContextDoesNotEmitRestoreFailed(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	c := newClient(t, ps, pod)
+	rec := record.NewFakeRecorder(10)
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{failIt: true},
+		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context to simulate agent shutdown / SIGTERM
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled error, got res=%v, err=%v", res, err)
+	}
+
+	// Verify NO Warning RestoreFailed event was emitted on shutdown
+	select {
+	case ev := <-rec.Events:
+		t.Fatalf("unexpected event emitted on cancelled context: %s", ev)
+	default:
+	}
+
+	// Verify pod annotations were NOT modified to failed
+	got := &corev1.Pod{}
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
+	if got.Annotations[contract.AnnotationRestoreStatus] != "" {
+		t.Fatalf("restore status should not be stamped on shutdown: %q", got.Annotations[contract.AnnotationRestoreStatus])
 	}
 }
 
@@ -574,6 +607,9 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	}
 	if !hasRule(agentRole, "", "nodes/checkpoint", "create") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing create on core/nodes/checkpoint")
+	}
+	if !hasRule(agentRole, "", "events", "create", "patch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing create/patch on core/events")
 	}
 	if !hasRule(controllerRole, contract.GVKStorageConfig.Group, "podsnapshotstorageconfigs", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list/watch on %s/podsnapshotstorageconfigs", contract.GVKStorageConfig.Group)

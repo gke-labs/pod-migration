@@ -115,31 +115,52 @@ func (r *restorer) execRestore(ctx context.Context, env []string, logPath string
 	return string(b), runErr
 }
 
-func (r *restorer) execNetns(ctx context.Context, pid int, name string, args ...string) (string, error) {
+func (r *restorer) rootDir() string {
+	if r != nil && r.pmRootDir != "" {
+		return r.pmRootDir
+	}
+	return pmRoot
+}
+
+func (r *restorer) execNetns(ctx context.Context, netns *os.File, pid int, name string, args ...string) (string, error) {
 	if r.execNetnsFn != nil {
 		return r.execNetnsFn(ctx, pid, name, args...)
 	}
-	full := append([]string{"-t", strconv.Itoa(pid), "-n", "--", name}, args...)
-	return r.execHost(ctx, nil, "nsenter", full...)
+	var nsArgs []string
+	var extra []*os.File
+	if netns != nil {
+		nsArgs = append([]string{"--net=/proc/self/fd/3", "--", name}, args...)
+		extra = []*os.File{netns}
+	} else {
+		nsArgs = append([]string{"-t", strconv.Itoa(pid), "-n", "--", name}, args...)
+	}
+	cmd := exec.CommandContext(ctx, "nsenter", nsArgs...)
+	cmd.ExtraFiles = extra
+	b, err := cmd.CombinedOutput()
+	return string(b), err
 }
 
 // cleanNetnsLock removes CRIU network-lock iptables rules from the target pod's
 // network namespace so that a cold fallback start is not left with locked network (#126).
-func (r *restorer) cleanNetnsLock(ctx context.Context, holderPid int) []string {
-	if holderPid <= 0 {
+func (r *restorer) cleanNetnsLock(ctx context.Context, netns *os.File, holderPid int) []string {
+	if netns == nil && holderPid <= 0 {
 		return nil
 	}
-	cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
 
 	var notes []string
 	tools := []string{"iptables", "ip6tables", "iptables-legacy", "ip6tables-legacy"}
 	for _, tool := range tools {
+		if cleanCtx.Err() != nil {
+			notes = append(notes, "cleanNetnsLock timed out after 15s")
+			break
+		}
 		cleaned := false
 		// Delete any jumps to CRIU in INPUT and OUTPUT.
 		for _, chain := range []string{"INPUT", "OUTPUT"} {
 			for i := 0; i < 10; i++ {
-				_, err := r.execNetns(cleanCtx, holderPid, tool, "-w", "2", "-D", chain, "-j", "CRIU")
+				_, err := r.execNetns(cleanCtx, netns, holderPid, tool, "-w", "2", "-D", chain, "-j", "CRIU")
 				if err != nil {
 					break
 				}
@@ -147,11 +168,15 @@ func (r *restorer) cleanNetnsLock(ctx context.Context, holderPid int) []string {
 			}
 		}
 		// Flush and delete the CRIU chain if present.
-		if _, err := r.execNetns(cleanCtx, holderPid, tool, "-w", "2", "-F", "CRIU"); err == nil {
+		flushSucceeded := false
+		if _, err := r.execNetns(cleanCtx, netns, holderPid, tool, "-w", "2", "-F", "CRIU"); err == nil {
 			cleaned = true
+			flushSucceeded = true
 		}
-		if _, err := r.execNetns(cleanCtx, holderPid, tool, "-w", "2", "-X", "CRIU"); err == nil {
+		if _, err := r.execNetns(cleanCtx, netns, holderPid, tool, "-w", "2", "-X", "CRIU"); err == nil {
 			cleaned = true
+		} else if flushSucceeded {
+			notes = append(notes, fmt.Sprintf("%s -F CRIU succeeded but -X CRIU failed: %v", tool, err))
 		}
 		if cleaned {
 			notes = append(notes, fmt.Sprintf("cleaned CRIU network-lock rules with %s", tool))
@@ -356,6 +381,14 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		time.Sleep(250 * time.Millisecond)
 	}
 
+	var netnsFile *os.File
+	if holder.Pid > 0 {
+		if f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", holder.Pid)); err == nil {
+			netnsFile = f
+			defer netnsFile.Close()
+		}
+	}
+
 	// Pod cgroup slice of the target, from the holder's own cgroup.
 	readCg := func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)) }
 	if r.readProcCgroupFn != nil {
@@ -370,10 +403,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		return out, err
 	}
 
-	rootDir := pmRoot
-	if r.pmRootDir != "" {
-		rootDir = r.pmRootDir
-	}
+	rootDir := r.rootDir()
 	id := "pm-" + in.MigrationName
 	bundleDir := filepath.Join(rootDir, "bundles", id)
 
@@ -383,8 +413,8 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		out.Notes = append(out.Notes, fmt.Sprintf("stale-container pre-delete failed (restore will likely conflict): %s: %s",
 			delErr, truncate(delOut, 200)))
 	}
-	if holder != nil && holder.Pid > 0 {
-		if netNotes := r.cleanNetnsLock(ctx, holder.Pid); len(netNotes) > 0 {
+	if (holder != nil && holder.Pid > 0) || netnsFile != nil {
+		if netNotes := r.cleanNetnsLock(ctx, netnsFile, holder.Pid); len(netNotes) > 0 {
 			out.Notes = append(out.Notes, netNotes...)
 		}
 	}
@@ -487,15 +517,20 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 			break
 		}
 		// Preserve the full evidence per variant.
-		saveFailureArtifact(id, fmt.Sprintf("variant%d-runc.out", vi), lastOut)
+		r.saveFailureArtifact(id, fmt.Sprintf("variant%d-runc.out", vi), lastOut)
 		if lg, err2 := os.ReadFile(filepath.Join(bundleDir, "restore.log")); err2 == nil {
-			saveFailureArtifact(id, fmt.Sprintf("variant%d-restore.log", vi), string(lg))
+			r.saveFailureArtifact(id, fmt.Sprintf("variant%d-restore.log", vi), string(lg))
 		}
 		out.Notes = append(out.Notes, fmt.Sprintf("variant %d failed: %s", vi, truncate(criuErrorLines(lastOut), 500)))
 		if !strings.Contains(lastOut, "cgroup") {
 			break // not cgroup-shaped — the fallback mode cannot help
 		}
 		_, _ = r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id)
+		if (holder != nil && holder.Pid > 0) || netnsFile != nil {
+			if netNotes := r.cleanNetnsLock(ctx, netnsFile, holder.Pid); len(netNotes) > 0 {
+				out.Notes = append(out.Notes, netNotes...)
+			}
+		}
 	}
 	if lastErr != nil {
 		sig := criuErrorLines(lastOut)
@@ -514,8 +549,8 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		}
 		// Clean up any CRIU network-lock iptables rules in the target pod's netns
 		// so that the holder wrapper's cold fallback has network access (#126).
-		if holder != nil && holder.Pid > 0 {
-			if netNotes := r.cleanNetnsLock(ctx, holder.Pid); len(netNotes) > 0 {
+		if (holder != nil && holder.Pid > 0) || netnsFile != nil {
+			if netNotes := r.cleanNetnsLock(ctx, netnsFile, holder.Pid); len(netNotes) > 0 {
 				out.Notes = append(out.Notes, netNotes...)
 			}
 		}
@@ -524,8 +559,11 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 
 	pidB, err := os.ReadFile(pidFile)
 	if err != nil {
-		if holder != nil && holder.Pid > 0 {
-			if netNotes := r.cleanNetnsLock(ctx, holder.Pid); len(netNotes) > 0 {
+		if notes := r.cleanup(ctx, in.MigrationName, "", "", false); len(notes) > 0 {
+			out.Notes = append(out.Notes, notes...)
+		}
+		if (holder != nil && holder.Pid > 0) || netnsFile != nil {
+			if netNotes := r.cleanNetnsLock(ctx, netnsFile, holder.Pid); len(netNotes) > 0 {
 				out.Notes = append(out.Notes, netNotes...)
 			}
 		}
@@ -577,7 +615,7 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 func (r *restorer) cleanup(ctx context.Context, migrationName, checkpointDir, tarPath string, keepContainer bool) []string {
 	var notes []string
 	id := "pm-" + migrationName
-	bundleDir := filepath.Join(pmRoot, "bundles", id)
+	bundleDir := filepath.Join(r.rootDir(), "bundles", id)
 	if !keepContainer {
 		if out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id); err != nil {
 			notes = append(notes, "runc delete: "+truncate(out, 200))
@@ -675,9 +713,9 @@ func projectedVolumeRewrites(srcSpec *specs.Spec, targetPodUID string) [][2]stri
 }
 
 // saveFailureArtifact keeps restore failure evidence under
-// /var/lib/pod-migrate/failed/<id>/ (bounded: overwritten per migration id).
-func saveFailureArtifact(id, name, content string) {
-	dir := filepath.Join(pmRoot, "failed", id)
+// <rootDir>/failed/<id>/ (bounded: overwritten per migration id).
+func (r *restorer) saveFailureArtifact(id, name, content string) {
+	dir := filepath.Join(r.rootDir(), "failed", id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}

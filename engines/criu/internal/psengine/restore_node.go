@@ -126,10 +126,17 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	err := r.restore(ctx, pod, psName)
 	status := contract.RestoreStatusRestored
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctrl.Result{}, ctx.Err()
+		}
 		logger.Error(err, "psengine restore failed; holder will cold-start")
 		status = contract.RestoreStatusFailed
 		if r.Recorder != nil {
-			r.Recorder.Event(pod, corev1.EventTypeWarning, "RestoreFailed", fmt.Sprintf("psengine restore failed; falling back to a cold start: %v", err))
+			msg := fmt.Sprintf("psengine restore failed; falling back to a cold start: %v", err)
+			if len(msg) > 950 {
+				msg = msg[:947] + "..."
+			}
+			r.Recorder.Event(pod, corev1.EventTypeWarning, "RestoreFailed", msg)
 		}
 	} else {
 		logger.Info("psengine restore complete", "snapshot", psName)
