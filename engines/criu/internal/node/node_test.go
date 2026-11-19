@@ -74,9 +74,6 @@ func TestNode_DemoteAndRecoverOnContainerdRestart(t *testing.T) {
 		nd.mu.Lock()
 		nd.ready = true
 		nd.version = "v3.19"
-		if ino, err := nd.statSocketFn(nd.SocketPath); err == nil {
-			nd.lastSocketInode = ino
-		}
 		nd.mu.Unlock()
 		return annotateNode(ctx, nd.Client, nd.NodeName, "v3.19", "", "", true)
 	}
@@ -298,5 +295,158 @@ func TestPSEngineCheckpoint_DemoteErrorLogged(t *testing.T) {
 	_, err := nd.PSEngineCheckpoint(ctx, "default", "pod-1", "container-1")
 	if err == nil || !errors.Is(err, ErrContainerdCachedCRIU) {
 		t.Fatalf("expected ErrContainerdCachedCRIU, got: %v", err)
+	}
+}
+
+func TestNode_FailedBootstrapDoesNotReprobeWithoutRestart(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+	bootstrapCount := 0
+	nd := &Node{
+		Client:     c,
+		NodeName:   "test-node",
+		SocketPath: "/run/containerd/containerd.sock",
+		statSocketFn: func(string) (uint64, error) {
+			return 4242, nil // constant socket inode
+		},
+	}
+	nd.bootstrapFn = func(ctx context.Context) error {
+		bootstrapCount++
+		return errors.New("simulated bootstrap failure")
+	}
+
+	// 1. Initial bootstrap fails
+	if err := nd.Bootstrap(ctx); err == nil {
+		t.Fatal("expected bootstrap error, got nil")
+	}
+	if bootstrapCount != 1 {
+		t.Fatalf("expected 1 bootstrap call, got %d", bootstrapCount)
+	}
+
+	// 2. Probing 5 times with unchanged socket inode must NOT re-run Bootstrap
+	for i := 1; i <= 5; i++ {
+		ready, err := nd.ProbeReadiness(ctx)
+		if err != nil {
+			t.Fatalf("probe %d: unexpected error: %v", i, err)
+		}
+		if ready {
+			t.Fatalf("probe %d: expected ready=false", i)
+		}
+	}
+
+	if bootstrapCount != 1 {
+		t.Fatalf("expected bootstrap count to remain 1, got %d", bootstrapCount)
+	}
+}
+
+func TestNode_UnsupportedContainerdVersionDoesNotReprobeWithoutRestart(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	// containerd 1.6 is unsupported
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+		},
+		Status: corev1.NodeStatus{
+			NodeInfo: corev1.NodeSystemInfo{
+				ContainerRuntimeVersion: "containerd://1.6.28",
+			},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+	nd := &Node{
+		Client:     c,
+		NodeName:   "test-node",
+		SocketPath: "/run/containerd/containerd.sock",
+		statSocketFn: func(string) (uint64, error) {
+			return 5555, nil
+		},
+	}
+
+	// Initial bootstrap fails with unsupported containerd version
+	if err := nd.Bootstrap(ctx); err == nil {
+		t.Fatal("expected unsupported containerd version error, got nil")
+	}
+	if nd.IsReady() {
+		t.Fatal("expected nd.IsReady() == false")
+	}
+
+	// Inode was recorded before the early return!
+	nd.mu.Lock()
+	ino := nd.lastSocketInode
+	nd.mu.Unlock()
+	if ino != 5555 {
+		t.Fatalf("expected lastSocketInode=5555, got %d", ino)
+	}
+
+	// Subsequent probes must not re-probe
+	for i := 1; i <= 5; i++ {
+		ready, err := nd.ProbeReadiness(ctx)
+		if err != nil {
+			t.Fatalf("probe %d: unexpected error: %v", i, err)
+		}
+		if ready {
+			t.Fatalf("probe %d: expected ready=false", i)
+		}
+	}
+}
+
+func TestNode_ProbeReadinessReturnsFalseWhenVerifyCRIUFalse(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+	currentInode := uint64(100)
+	nd := &Node{
+		Client:     c,
+		NodeName:   "test-node",
+		SocketPath: "/run/containerd/containerd.sock",
+		statSocketFn: func(string) (uint64, error) {
+			return currentInode, nil
+		},
+	}
+
+	// Bootstrap marks node unready (verifyCRIU was false)
+	nd.bootstrapFn = func(ctx context.Context) error {
+		nd.mu.Lock()
+		nd.ready = false
+		nd.mu.Unlock()
+		return nil
+	}
+
+	if err := nd.Bootstrap(ctx); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if nd.IsReady() {
+		t.Fatal("expected nd.IsReady() == false")
+	}
+
+	// Simulate containerd restart: new inode
+	currentInode = 200
+
+	// ProbeReadiness triggers re-bootstrap, but CRIU is not verified ok.
+	// It must return ready=false, not true!
+	ready, err := nd.ProbeReadiness(ctx)
+	if err != nil {
+		t.Fatalf("ProbeReadiness: %v", err)
+	}
+	if ready {
+		t.Fatal("expected ProbeReadiness to return false when verifyCRIU was false")
 	}
 }

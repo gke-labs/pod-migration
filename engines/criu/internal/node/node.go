@@ -91,10 +91,25 @@ func getSocketInode(path string) (uint64, error) {
 // Bootstrap installs the CRIU bundle, verifies it against the host kernel, and
 // annotates the node with its capability verdict.
 func (n *Node) Bootstrap(ctx context.Context) error {
+	n.recordSocketInode()
 	if n.bootstrapFn != nil {
 		return n.bootstrapFn(ctx)
 	}
 	return n.bootstrapInternal(ctx)
+}
+
+func (n *Node) recordSocketInode() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.recordSocketInodeLocked()
+}
+
+func (n *Node) recordSocketInodeLocked() {
+	if n.statSocketFn != nil && n.SocketPath != "" {
+		if ino, err := n.statSocketFn(n.SocketPath); err == nil {
+			n.lastSocketInode = ino
+		}
+	}
 }
 
 func (n *Node) bootstrapInternal(ctx context.Context) error {
@@ -117,11 +132,7 @@ func (n *Node) bootstrapInternal(ctx context.Context) error {
 	n.mu.Lock()
 	n.version = version
 	n.ready = ok
-	if n.statSocketFn != nil && n.SocketPath != "" {
-		if ino, err := n.statSocketFn(n.SocketPath); err == nil {
-			n.lastSocketInode = ino
-		}
-	}
+	n.recordSocketInodeLocked()
 	n.mu.Unlock()
 
 	var reason, remediation string
@@ -138,11 +149,7 @@ func (n *Node) DemoteNode(ctx context.Context, reason, remediation string) error
 	n.ready = false
 	n.unreadyReason = reason
 	n.unreadyRemediation = remediation
-	if n.statSocketFn != nil && n.SocketPath != "" {
-		if ino, err := n.statSocketFn(n.SocketPath); err == nil {
-			n.lastSocketInode = ino
-		}
-	}
+	n.recordSocketInodeLocked()
 	ver := n.version
 	n.mu.Unlock()
 
@@ -188,7 +195,7 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 		if err := n.Bootstrap(ctx); err != nil {
 			return false, err
 		}
-		return true, nil
+		return n.IsReady(), nil
 	}
 
 	return false, nil
