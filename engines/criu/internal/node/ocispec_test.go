@@ -396,6 +396,12 @@ func TestRestoreEndToEndEnforcesTargetSpec(t *testing.T) {
 			}
 			return "", nil
 		},
+		openPodNetnsFn: func(holderPid int) (*os.File, error) {
+			return nil, nil
+		},
+		execNetnsFn: func(ctx context.Context, netns *os.File, name string, args ...string) (string, error) {
+			return "", nil
+		},
 	}
 
 	// 1. Archive attempts privilege escalation (UID 0, CAP_SYS_ADMIN, hooks,

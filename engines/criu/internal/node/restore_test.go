@@ -191,7 +191,8 @@ func init() {
 				os.Exit(5)
 			}
 		}
-		if len(args) < 2 || args[0] != "--net=/proc/self/fd/3" || args[1] != "--" {
+		if len(args) < 6 || args[0] != "--net=/proc/self/fd/3" || args[1] != "--" ||
+			args[2] != "iptables" || args[3] != "-w" || args[4] != "2" || args[5] != "-S" {
 			fmt.Fprintf(os.Stderr, "unexpected netns helper args: %v\n", args)
 			os.Exit(6)
 		}
@@ -203,6 +204,7 @@ func init() {
 func TestCleanNetnsLock(t *testing.T) {
 	ctx := context.Background()
 	var executed [][]string
+	deleteCounts := make(map[string]int)
 	r := &restorer{
 		execNetnsFn: func(ctx context.Context, netns *os.File, name string, args ...string) (string, error) {
 			if netns == nil {
@@ -210,6 +212,15 @@ func TestCleanNetnsLock(t *testing.T) {
 			}
 			call := append([]string{name}, args...)
 			executed = append(executed, call)
+			// For -D rules, succeed on first attempt per tool+chain and fail on second,
+			// exercising the 1-rule delete + break path.
+			if len(args) >= 4 && args[2] == "-D" {
+				key := fmt.Sprintf("%s:%s", name, args[3])
+				deleteCounts[key]++
+				if deleteCounts[key] > 1 {
+					return "iptables: No chain/target/match by that name.", errors.New("exit status 1")
+				}
+			}
 			return "", nil
 		},
 	}
@@ -451,20 +462,20 @@ func TestExecNetns_DirectNsenterInvocation(t *testing.T) {
 }
 
 func TestOpenPodNetns_HostNetworkPodRefused(t *testing.T) {
-	r := &restorer{}
-	hostNet, err1 := os.Readlink("/proc/1/ns/net")
-	selfNet, err2 := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", os.Getpid()))
-	if err1 == nil && err2 == nil && hostNet == selfNet {
-		f, err := r.openPodNetns(os.Getpid())
-		if err == nil || f != nil {
-			t.Fatalf("expected openPodNetns to refuse host network PID, got f=%v err=%v", f, err)
-		}
-		if !strings.Contains(err.Error(), "shares host network namespace") {
-			t.Fatalf("expected host netns warning error, got %v", err)
-		}
+	selfPath := fmt.Sprintf("/proc/%d/ns/net", os.Getpid())
+	r := &restorer{
+		hostNetnsPath: selfPath,
 	}
+	f, err := r.openPodNetns(os.Getpid())
+	if err == nil || f != nil {
+		t.Fatalf("expected openPodNetns to refuse host network PID, got f=%v err=%v", f, err)
+	}
+	if !strings.Contains(err.Error(), "shares host network namespace") {
+		t.Fatalf("expected host netns refusal error, got %v", err)
+	}
+
 	// Non-existent PID returns open error
-	f, err := r.openPodNetns(99999999)
+	f, err = r.openPodNetns(99999999)
 	if err == nil || f != nil {
 		t.Fatalf("expected error on non-existent PID, got f=%v err=%v", f, err)
 	}
@@ -472,6 +483,69 @@ func TestOpenPodNetns_HostNetworkPodRefused(t *testing.T) {
 	f, err = r.openPodNetns(0)
 	if err != nil || f != nil {
 		t.Fatalf("expected nil, nil on PID 0, got f=%v err=%v", f, err)
+	}
+}
+
+func TestRestore_OpenPodNetnsErrorAbortsBeforeExecRestore(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "etc-criu")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "runc.conf"), []byte("file-validation buildid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	chkDir := filepath.Join(tmpDir, "chk")
+	if err := os.MkdirAll(filepath.Join(chkDir, "checkpoint"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	holderSpec := sampleTargetSpec()
+	var execRestoreCalled bool
+	r := &restorer{
+		pmRootDir:       tmpDir,
+		criuConfDirPath: confDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "holder-ctr-1",
+				SandboxID: "tgtsandbox222",
+				Pid:       5555,
+				Spec:      holderSpec,
+				ImageName: "gcr.io/trusted/app:v1",
+			}, nil
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice/cri-containerd-holder.scope\n"), nil
+		},
+		openPodNetnsFn: func(holderPid int) (*os.File, error) {
+			return nil, errors.New("target pod PID shares host network namespace; refusing restore to protect host")
+		},
+		execRestoreFn: func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
+			execRestoreCalled = true
+			return "", nil
+		},
+	}
+
+	srcSpec := sampleSpec()
+	_, err := r.restore(ctx, restoreInputs{
+		MigrationName: "mig-netns-err",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		ContainerName: "app",
+		SourcePodUID:  "src-uid",
+		TargetPodUID:  "tgt-uid",
+		CheckpointDir: chkDir,
+		SrcSpec:       srcSpec,
+	})
+	if err == nil {
+		t.Fatal("expected restore to abort with error when openPodNetns fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "open pod netns") {
+		t.Fatalf("expected 'open pod netns' in error, got: %v", err)
+	}
+	if execRestoreCalled {
+		t.Fatal("execRestore must not be called when openPodNetns fails")
 	}
 }
 

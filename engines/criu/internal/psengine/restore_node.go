@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -131,17 +132,10 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		logger.Error(err, "psengine restore failed; holder will cold-start")
 		status = contract.RestoreStatusFailed
-		if r.Recorder != nil {
-			msg := fmt.Sprintf("psengine restore failed; falling back to a cold start: %v", err)
-			if len(msg) > 950 {
-				msg = msg[:947] + "..."
-			}
-			r.Recorder.Event(pod, corev1.EventTypeWarning, "RestoreFailed", msg)
-		}
 	} else {
 		logger.Info("psengine restore complete", "snapshot", psName)
 	}
-	restoreOutcomes.WithLabelValues(status).Inc()
+
 	// Stamp the outcome — the holder wrapper reads it via the downward API.
 	latest := &corev1.Pod{}
 	if gerr := r.Get(ctx, req.NamespacedName, latest); gerr != nil {
@@ -154,10 +148,26 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if uerr := r.Update(ctx, latest); uerr != nil {
 		return ctrl.Result{}, uerr
 	}
+
+	restoreOutcomes.WithLabelValues(status).Inc()
+	if status == contract.RestoreStatusFailed && r.Recorder != nil {
+		msg := fmt.Sprintf("psengine restore failed; falling back to a cold start: %v", err)
+		if len(msg) > 950 {
+			cut := 947
+			for cut > 0 && !utf8.RuneStart(msg[cut]) {
+				cut--
+			}
+			msg = msg[:cut] + "..."
+		}
+		r.Recorder.Event(pod, corev1.EventTypeWarning, "RestoreFailed", msg)
+	}
 	return ctrl.Result{}, nil
 }
 
 func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, psName string) error {
+	if pod.Spec.HostNetwork {
+		return fmt.Errorf("pod %s has hostNetwork=true; unsupported by criu engine", pod.Name)
+	}
 	// Resolve the PodSnapshot work order (bucket/path/source identity).
 	ps := contract.New(contract.GVKPodSnapshot)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: psName}, ps); err != nil {

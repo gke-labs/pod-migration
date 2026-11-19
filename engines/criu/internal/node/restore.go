@@ -64,10 +64,16 @@ type restorer struct {
 	readProcCgroupFn func(pid int) ([]byte, error)
 	pmRootDir        string
 	criuConfDirPath  string
+	hostNetnsPath    string
 }
 
 func newRestorer(c *containerd.Client) *restorer {
-	return &restorer{cclient: c, execHost: nsenterExec, nsenterBin: "nsenter"}
+	return &restorer{
+		cclient:       c,
+		execHost:      nsenterExec,
+		nsenterBin:    "nsenter",
+		hostNetnsPath: "/proc/1/ns/net",
+	}
 }
 
 // nsenterExec executes cmd in the host mount+pid namespaces (agent has
@@ -106,7 +112,9 @@ func (r *restorer) execRestore(ctx context.Context, env []string, logPath string
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil && cmd.Process.Pid > 0 {
-			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return err
+			}
 		}
 		return nil
 	}
@@ -144,17 +152,28 @@ func (r *restorer) openPodNetns(holderPid int) (*os.File, error) {
 	if r != nil && r.openPodNetnsFn != nil {
 		return r.openPodNetnsFn(holderPid)
 	}
-	// Check if holder PID shares host netns.
-	// The agent runs with hostNetwork: true, so /proc/1/ns/net and /proc/self/ns/net are the host netns.
-	hostNet, err := os.Readlink("/proc/1/ns/net")
-	if err == nil {
-		if podNet, err2 := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", holderPid)); err2 == nil && podNet == hostNet {
-			return nil, fmt.Errorf("target pod PID %d shares host network namespace; skipping netfilter lock cleanup to protect host", holderPid)
-		}
-	}
 	f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", holderPid))
 	if err != nil {
 		return nil, fmt.Errorf("open /proc/%d/ns/net: %w", holderPid, err)
+	}
+
+	hostPath := "/proc/1/ns/net"
+	if r != nil && r.hostNetnsPath != "" {
+		hostPath = r.hostNetnsPath
+	}
+	hostFi, err := os.Stat(hostPath)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat host network namespace %s: %w", hostPath, err)
+	}
+	podFi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat pod network namespace: %w", err)
+	}
+	if os.SameFile(hostFi, podFi) {
+		f.Close()
+		return nil, fmt.Errorf("target pod PID %d shares host network namespace; refusing restore to protect host", holderPid)
 	}
 	return f, nil
 }
@@ -428,8 +447,9 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		var netnsErr error
 		netnsFile, netnsErr = r.openPodNetns(holder.Pid)
 		if netnsErr != nil {
-			out.Notes = append(out.Notes, fmt.Sprintf("pod netns: %v", netnsErr))
-		} else if netnsFile != nil {
+			return out, fmt.Errorf("open pod netns: %w", netnsErr)
+		}
+		if netnsFile != nil {
 			defer netnsFile.Close()
 		}
 	}
@@ -567,8 +587,8 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 			r.saveFailureArtifact(id, fmt.Sprintf("variant%d-restore.log", vi), string(lg))
 		}
 		out.Notes = append(out.Notes, fmt.Sprintf("variant %d failed: %s", vi, truncate(criuErrorLines(lastOut), 500)))
-		if !strings.Contains(lastOut, "cgroup") {
-			break // not cgroup-shaped — the fallback mode cannot help
+		if vi == len(variants)-1 || ctx.Err() != nil || !strings.Contains(lastOut, "cgroup") {
+			break // not cgroup-shaped or final variant — cannot retry
 		}
 		_, _ = r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id)
 		if netnsFile != nil {

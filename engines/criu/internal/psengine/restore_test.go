@@ -127,6 +127,13 @@ func TestInjectHolderSkips(t *testing.T) {
 			t.Fatal("multi-container pod is outside v1 scope")
 		}
 	})
+	t.Run("hostNetwork", func(t *testing.T) {
+		pod := gatedReplacementPod()
+		pod.Spec.HostNetwork = true
+		if ok, reason := InjectHolder(pod, "img"); ok || !strings.Contains(reason, "hostNetwork") {
+			t.Fatalf("expected hostNetwork refusal, got ok=%v reason=%q", ok, reason)
+		}
+	})
 }
 
 // --- node restore reconciler ---------------------------------------------------
@@ -279,6 +286,34 @@ func TestNodeRestore_CancelledContextDoesNotEmitRestoreFailed(t *testing.T) {
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
 	if got.Annotations[contract.AnnotationRestoreStatus] != "" {
 		t.Fatalf("restore status should not be stamped on shutdown: %q", got.Annotations[contract.AnnotationRestoreStatus])
+	}
+}
+
+func TestNodeRestore_RefusesHostNetworkPod(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	pod.Spec.HostNetwork = true
+	c := newClient(t, ps, pod)
+	rec := record.NewFakeRecorder(10)
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{},
+		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	got := &corev1.Pod{}
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
+	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
+		t.Fatalf("restore status: %q, want %s", got.Annotations[contract.AnnotationRestoreStatus], contract.RestoreStatusFailed)
+	}
+	select {
+	case ev := <-rec.Events:
+		if !strings.Contains(ev, "Warning RestoreFailed") || !strings.Contains(ev, "hostNetwork") {
+			t.Fatalf("recorded event = %q, want Warning RestoreFailed with hostNetwork", ev)
+		}
+	default:
+		t.Fatal("expected a Warning RestoreFailed event on hostNetwork refusal, got none")
 	}
 }
 
