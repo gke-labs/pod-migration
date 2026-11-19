@@ -16,10 +16,14 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -129,31 +133,45 @@ func TestDecideActionWaitsForTheNamedAnnotation(t *testing.T) {
 func TestParseWrapArgs(t *testing.T) {
 	const key = "criu.podmigration.gke.io/ps-name"
 	for _, tc := range []struct {
-		name     string
-		args     []string
-		wantFile string
-		wantKey  string
-		wantOrig []string
-		wantErr  bool
+		name      string
+		args      []string
+		wantFile  string
+		wantKey   string
+		wantGrace time.Duration
+		wantOrig  []string
+		wantErr   bool
 	}{
 		{
-			name:     "no flag: the default key",
+			name:     "no flag: the default key and default grace period",
 			args:     []string{"/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"},
-			wantFile: "/pminfo/annotations", wantKey: annPSName,
+			wantFile: "/pminfo/annotations", wantKey: annPSName, wantGrace: defaultGracePeriod,
 			wantOrig: []string{"redis-server", "--appendonly", "yes"},
 		},
 		{
 			name:     "named key",
 			args:     []string{"--ps-name-annotation=" + key, "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"},
-			wantFile: "/pminfo/annotations", wantKey: key,
+			wantFile: "/pminfo/annotations", wantKey: key, wantGrace: defaultGracePeriod,
 			wantOrig: []string{"redis-server", "--appendonly", "yes"},
 		},
 		{
 			name:     "named key, single dash",
 			args:     []string{"-ps-name-annotation", key, "/pminfo/annotations", "--", "redis-server"},
-			wantFile: "/pminfo/annotations", wantKey: key,
+			wantFile: "/pminfo/annotations", wantKey: key, wantGrace: defaultGracePeriod,
 			wantOrig: []string{"redis-server"},
 		},
+		{
+			name:     "custom grace period",
+			args:     []string{"--grace-period=45s", "/pminfo/annotations", "--", "redis-server"},
+			wantFile: "/pminfo/annotations", wantKey: annPSName, wantGrace: 45 * time.Second,
+			wantOrig: []string{"redis-server"},
+		},
+		{
+			name:     "named key and custom grace period",
+			args:     []string{"--ps-name-annotation=" + key, "--grace-period=1m", "/pminfo/annotations", "--", "redis-server"},
+			wantFile: "/pminfo/annotations", wantKey: key, wantGrace: time.Minute,
+			wantOrig: []string{"redis-server"},
+		},
+		{name: "negative grace period", args: []string{"--grace-period=-5s", "/pminfo/annotations", "--", "redis-server"}, wantErr: true},
 		{name: "no separator", args: []string{"/pminfo/annotations", "redis-server"}, wantErr: true},
 		{name: "no separator, longer command", args: []string{"/pminfo/annotations", "redis-server", "--appendonly", "yes"}, wantErr: true},
 		{name: "no command", args: []string{"/pminfo/annotations", "--"}, wantErr: true},
@@ -161,20 +179,127 @@ func TestParseWrapArgs(t *testing.T) {
 		{name: "unknown flag", args: []string{"--bogus", "/pminfo/annotations", "--", "redis-server"}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			file, key, orig, err := parseWrapArgs(tc.args)
+			file, key, grace, orig, err := parseWrapArgs(tc.args)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("parseWrapArgs(%q) = %q, %q, %q, want an error", tc.args, file, key, orig)
+					t.Fatalf("parseWrapArgs(%q) = %q, %q, %v, %q, want an error", tc.args, file, key, grace, orig)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("parseWrapArgs(%q): %v", tc.args, err)
 			}
-			if file != tc.wantFile || key != tc.wantKey || !slices.Equal(orig, tc.wantOrig) {
-				t.Fatalf("parseWrapArgs(%q) = %q, %q, %q, want %q, %q, %q", tc.args, file, key, orig, tc.wantFile, tc.wantKey, tc.wantOrig)
+			if file != tc.wantFile || key != tc.wantKey || grace != tc.wantGrace || !slices.Equal(orig, tc.wantOrig) {
+				t.Fatalf("parseWrapArgs(%q) = %q, %q, %v, %q, want %q, %q, %v, %q", tc.args, file, key, grace, orig, tc.wantFile, tc.wantKey, tc.wantGrace, tc.wantOrig)
 			}
 		})
+	}
+}
+
+func TestWaitGracefulTermination_ImmediateExitOnSIGINT(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGINT
+	done := make(chan struct{})
+	go func() {
+		waitGracefulTermination(ch, 5*time.Second)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// expected fast return
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination did not exit immediately on SIGINT")
+	}
+}
+
+func TestWaitGracefulTermination_ImmediateExitOnZeroGracePeriod(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGTERM
+	done := make(chan struct{})
+	go func() {
+		waitGracefulTermination(ch, 0)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// expected fast return
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination did not exit immediately on gracePeriod <= 0")
+	}
+}
+
+func TestWaitGracefulTermination_WaitsForSecondSignal(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGTERM
+	done := make(chan struct{})
+	go func() {
+		waitGracefulTermination(ch, 5*time.Second)
+		close(done)
+	}()
+
+	// Confirm it is waiting and did NOT exit immediately
+	select {
+	case <-done:
+		t.Fatal("waitGracefulTermination exited prematurely before second signal or timeout")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Send second signal (simulating node agent signaling sibling container exit)
+	ch <- syscall.SIGINT
+
+	select {
+	case <-done:
+		// exited upon receiving second signal
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination did not exit on second signal")
+	}
+}
+
+func TestWaitGracefulTermination_WaitsForSecondSIGTERM(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGTERM
+	done := make(chan struct{})
+	go func() {
+		waitGracefulTermination(ch, 5*time.Second)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("waitGracefulTermination exited prematurely before second signal or timeout")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Send second SIGTERM
+	ch <- syscall.SIGTERM
+
+	select {
+	case <-done:
+		// exited upon receiving second signal
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination did not exit on second SIGTERM")
+	}
+}
+
+func TestWaitGracefulTermination_ExpiresAfterGracePeriod(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	ch <- syscall.SIGTERM
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		waitGracefulTermination(ch, 50*time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
+			t.Fatalf("waitGracefulTermination returned too early: %v", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waitGracefulTermination timed out without honoring grace period")
 	}
 }
 
@@ -183,5 +308,179 @@ func TestParseWrapArgs(t *testing.T) {
 func TestDefaultPSNameAnnotationIsTheGKEPodSnapshotsKey(t *testing.T) {
 	if want := contract.RestoreAnnotation(contract.GKEPodSnapshotsGroup); annPSName != want {
 		t.Fatalf("holder default restore order %q, want %q", annPSName, want)
+	}
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	args := os.Args
+	for i, arg := range args {
+		if arg == "--" {
+			args = args[i+1:]
+			break
+		}
+	}
+	runWrap(args)
+	os.Exit(0)
+}
+
+func TestRunWrap_HoldWaitsForSIGTERM_Subprocess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess test in short mode")
+	}
+	annFile := filepath.Join(t.TempDir(), "annotations")
+	content := fmt.Sprintf("%s=%q\n%s=%q\n", annPSName, "snap-test", annRestoreStatus, statusRestored)
+	if err := os.WriteFile(annFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "--grace-period=5s", annFile, "--", "echo", "done")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(stderrPipe)
+	enteredHold := make(chan bool, 1)
+	go func() {
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), "holding sandbox") {
+				enteredHold <- true
+				return
+			}
+		}
+		enteredHold <- false
+	}()
+
+	select {
+	case ok := <-enteredHold:
+		if !ok {
+			_ = cmd.Process.Kill()
+			t.Fatal("subprocess failed to enter hold mode")
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for subprocess to enter hold mode")
+	}
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- cmd.Wait()
+	}()
+
+	// 1. Verify subprocess did not exit immediately upon entering outcomeHold
+	// (pins that runWrap's hold path does not skip waitGracefulTermination).
+	select {
+	case err := <-waitErr:
+		t.Fatalf("runWrap exited prematurely without waiting: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// 2. Deliver real SIGTERM (simulating kubelet pod deletion).
+	// If waitGracefulTermination only registered SIGINT (and not SIGTERM),
+	// the unhandled SIGTERM would kill the process with signal: terminated.
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("failed to send SIGTERM: %v", err)
+	}
+
+	// Verify subprocess does NOT exit immediately upon receiving first SIGTERM:
+	select {
+	case err := <-waitErr:
+		t.Fatalf("runWrap exited prematurely immediately after first SIGTERM: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// 3. Deliver second signal (SIGINT, simulating wake-up from node agent).
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("failed to send SIGINT: %v", err)
+	}
+
+	// Verify subprocess exits cleanly with code 0:
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("runWrap did not exit cleanly (code 0) after second signal: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for runWrap to exit after second signal")
+	}
+}
+
+func TestRunWrap_HoldWaitsForSIGTERM_GracePeriodTimeout_Subprocess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess test in short mode")
+	}
+	annFile := filepath.Join(t.TempDir(), "annotations")
+	content := fmt.Sprintf("%s=%q\n%s=%q\n", annPSName, "snap-test", annRestoreStatus, statusRestored)
+	if err := os.WriteFile(annFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "--grace-period=150ms", annFile, "--", "echo", "done")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(stderrPipe)
+	enteredHold := make(chan bool, 1)
+	go func() {
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), "holding sandbox") {
+				enteredHold <- true
+				return
+			}
+		}
+		enteredHold <- false
+	}()
+
+	select {
+	case ok := <-enteredHold:
+		if !ok {
+			_ = cmd.Process.Kill()
+			t.Fatal("subprocess failed to enter hold mode")
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for subprocess to enter hold mode")
+	}
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- cmd.Wait()
+	}()
+
+	// Verify subprocess does not exit immediately upon entering outcomeHold:
+	select {
+	case err := <-waitErr:
+		t.Fatalf("runWrap exited prematurely without waiting: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Deliver real SIGTERM:
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("failed to send SIGTERM: %v", err)
+	}
+
+	// Do NOT send second signal; verify it exits cleanly (code 0) after grace period timeout (~150ms):
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("runWrap failed to exit cleanly on grace period timeout: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for runWrap to exit on grace period timeout")
 	}
 }
