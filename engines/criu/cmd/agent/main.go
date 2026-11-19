@@ -144,12 +144,16 @@ func (a *nodeOpsAdapter) Checkpoint(ctx context.Context, ns, pod, container stri
 	return a.n.PSEngineCheckpoint(ctx, ns, pod, container)
 }
 
-func (a *nodeOpsAdapter) SourceInfo(ctx context.Context, ns, pod, container string) ([]byte, string, error) {
-	return a.n.PSEngineSourceInfo(ctx, ns, pod, container)
+func (a *nodeOpsAdapter) SourceInfo(ctx context.Context, ns, pod, podUID, container string) ([]byte, string, error) {
+	return a.n.PSEngineSourceInfo(ctx, ns, pod, podUID, container)
 }
 
-func (a *nodeOpsAdapter) StopContainer(ctx context.Context, ns, pod, container string) error {
-	return a.n.PSEngineStopContainer(ctx, ns, pod, container)
+func (a *nodeOpsAdapter) Freeze(ctx context.Context, ns, pod, podUID, container string) error {
+	return a.n.PSEngineFreezeContainer(ctx, ns, pod, podUID, container)
+}
+
+func (a *nodeOpsAdapter) Unfreeze(ctx context.Context, ns, pod, podUID, container string) error {
+	return a.n.PSEngineUnfreezeContainer(ctx, ns, pod, podUID, container)
 }
 
 func (a *nodeOpsAdapter) Extract(tarPath, dstDir string) error {

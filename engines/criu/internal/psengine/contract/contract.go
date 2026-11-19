@@ -95,7 +95,7 @@ const (
 	// cancel (C9, #106). Not terminal: the orchestrator keeps waiting.
 	ReasonCancelRequested = "CancelRequested"
 	// ReasonCancelled = the node agent abandoned the work order after its
-	// trigger was deleted, and did not stop the source (C9, #106). Terminal;
+	// trigger was deleted, and thawed the source (C9, #106, #148). Terminal;
 	// written only once the agent's work has stopped. The orchestrator
 	// treats it like Failed.
 	ReasonCancelled = "Cancelled"
@@ -108,6 +108,15 @@ const (
 	// may be frozen. Must not be "DeadlineExceeded", which the orchestrator
 	// treats as a terminal failure.
 	ReasonCheckpointTimedOut = "CheckpointTimedOut"
+
+	// CondSourceFrozen indicates whether the source container was frozen by
+	// the node agent before checkpointing (C4, #146, #148).
+	CondSourceFrozen = "SourceFrozen"
+	ReasonFrozen     = "Frozen"
+	ReasonThawed     = "Thawed"
+
+	// FencingMode declares the engine's fencing mode (C4, #146, #148).
+	FencingMode = "Frozen"
 
 	// AnnotationRestoreStatus is engine-internal: the node agent stamps it on
 	// the replacement pod so the holder wrapper — which only sees the
@@ -369,4 +378,28 @@ func IsSnapshotReady(ps *unstructured.Unstructured) bool {
 		}
 	}
 	return false
+}
+
+// IsSourceFrozen reports whether ps has condition SourceFrozen=True.
+func IsSourceFrozen(ps *unstructured.Unstructured) bool {
+	for _, c := range Conditions(ps) {
+		if c.Type == CondSourceFrozen && c.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSourceFrozen sets or clears the SourceFrozen condition on ps.
+func SetSourceFrozen(ps *unstructured.Unstructured, frozen bool, reason, msg string) error {
+	status := metav1.ConditionFalse
+	if frozen {
+		status = metav1.ConditionTrue
+	}
+	return SetCondition(ps, metav1.Condition{
+		Type:    CondSourceFrozen,
+		Status:  status,
+		Reason:  reason,
+		Message: msg,
+	})
 }

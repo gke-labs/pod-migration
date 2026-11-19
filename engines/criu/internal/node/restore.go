@@ -18,6 +18,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -122,22 +123,29 @@ type containerRef struct {
 	ImageName string
 }
 
+func (r *restorer) listContainers(ctx context.Context) ([]containerd.Container, error) {
+	if r.listContainersFn != nil {
+		return r.listContainersFn(ctx)
+	}
+	if r.cclient == nil {
+		return nil, fmt.Errorf("containerd client not initialized")
+	}
+	return r.cclient.Containers(ctx)
+}
+
+// ErrContainerNotFound is returned by findContainer when no container matches the target pod/container labels.
+var ErrContainerNotFound = errors.New("container not found in containerd")
+
 // findContainer locates the CRI container for pod/container by containerd
 // labels (namespace k8s.io is set on the client). When podUID is non-empty,
 // containers from earlier pods with the same name are skipped. If multiple
 // containers match (e.g. a stopped attempt with Pid == 0 alongside a running
 // one), prefers a container with a live task Pid.
 func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
-	listFn := func(ctx context.Context) ([]containerd.Container, error) {
-		if r.cclient == nil {
-			return nil, fmt.Errorf("containerd client not initialized")
-		}
-		return r.cclient.Containers(ctx)
+	if r.findContainerFn != nil {
+		return r.findContainerFn(ctx, podNS, podName, podUID, containerName)
 	}
-	if r.listContainersFn != nil {
-		listFn = r.listContainersFn
-	}
-	cs, err := listFn(ctx)
+	cs, err := r.listContainers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd list: %w", err)
 	}
@@ -179,7 +187,7 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 	if fallback != nil {
 		return fallback, nil
 	}
-	return nil, fmt.Errorf("container %s/%s/%s (uid=%s) not found in containerd", podNS, podName, containerName, podUID)
+	return nil, fmt.Errorf("container %s/%s/%s (uid=%s): %w", podNS, podName, containerName, podUID, ErrContainerNotFound)
 }
 
 // prepareRootfs makes a fresh writable snapshot of the app image and applies

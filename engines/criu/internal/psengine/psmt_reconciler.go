@@ -43,8 +43,8 @@ const NodeReadyLabel = "pod-migrate.io/criu-ready"
 
 // CheckpointRequest is the engine's order to the node agent: kubelet
 // ContainerCheckpoint -> upload to gs://Bucket/Path/SnapshotName/ (verified)
-// -> stop the container (postCheckpoint: stop semantics — the kubelet API
-// does not stop; the orchestrator's flow requires it).
+// -> freeze the container (preCheckpoint: freeze semantics — the kubelet API
+// does not freeze; the orchestrator's flow requires it).
 type CheckpointRequest struct {
 	Namespace    string
 	PodName      string
