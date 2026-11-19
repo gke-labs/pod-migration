@@ -300,7 +300,7 @@ Add the label `pod-migration.gke.io/enabled: "true"` to your workload Pod templa
 
 The eviction webhook only migrates Pods whose runtime class is listed in the controller flag `--migratable-runtime-classes` (default `gvisor`; the token `@default` matches Pods that set no `runtimeClassName`). Only list a class that your installed snapshot engine supports: GKE Pod Snapshots supports `gvisor`.
 
-A snapshot engine serves each migratable runtime class. By default, the controller registers only GKE Pod Snapshots (`gke-pod-snapshots`, using `podsnapshot.gke.io`), which serves every class in `--migratable-runtime-classes`. When `--criu-api-group` is set (for example `--criu-api-group=criu.podmigration.gke.io`, pre-authorized in RBAC alongside `podsnapshot.gke.io`) or `--runtime-class-engines` routes a class to `criu` (for example `--runtime-class-engines=gvisor=gke-pod-snapshots,@default=criu`), the controller also registers the experimental CRIU engine (`criu`) bound to `--criu-api-group` and `<group>/ps-name`. A `PodMigration` overrides routes for its namespace with the `pod-migration.gke.io/runtime-class-engines` annotation, in the same syntax; its `EngineRoutesValid` condition reports whether the annotation is valid. A Pod whose class no engine serves is evicted without a migration. The engine picked for a Pod is recorded on its `PodMigrationJob` (annotation `pod-migration.gke.io/engine`) and serves the job to the end; a job that names an engine the controller doesn't have fails with reason `EngineNotRegistered`.
+A snapshot engine serves each migratable runtime class. By default, the controller registers only GKE Pod Snapshots (`gke-pod-snapshots`, using `podsnapshot.gke.io`), which serves every class in `--migratable-runtime-classes`. When `--runtime-class-engines` routes a class to `criu` (for example `--migratable-runtime-classes=gvisor,@default` and `--runtime-class-engines=gvisor=gke-pod-snapshots,@default=criu`) or `--criu-api-group` is set, the controller also registers the experimental CRIU engine (`criu`), defaulting to `criu.podmigration.gke.io` (`criu.podmigration.gke.io/ps-name`) so both engines coexist in the same cluster without CRD collisions. A `PodMigration` overrides routes for its namespace with the `pod-migration.gke.io/runtime-class-engines` annotation, in the same syntax; its `EngineRoutesValid` condition reports whether the annotation is valid. A Pod whose class no engine serves is evicted without a migration. The engine picked for a Pod is recorded on its `PodMigrationJob` (annotation `pod-migration.gke.io/engine`) and serves the job to the end; a job that names an engine the controller doesn't have fails with reason `EngineNotRegistered`.
 
 An engine that does not fence the source Pod after checkpointing (`FencingNone` or unset) leaves the source running alongside the replacement until evicted. To migrate a Pod using an unfenced engine, the Pod must explicitly opt in with the annotation `pod-migration.gke.io/allow-unfenced: "true"`. Without this annotation, the eviction webhook and preemption controller refuse live migration, record a `Warning MigrationSkippedUnfencedEngine` event on the Pod, and fall back to cold eviction.
 
@@ -436,9 +436,9 @@ kubectl patch podmigration <name> -n <namespace> --type=json -p='[{"op": "remove
 
 ### Bypassing GKE Validating Admission Policy for Snapshot Cleanup
 
-GKE enforces a ValidatingAdmissionPolicy (`gke-pod-snapshot-validating-admission-policy`) that prevents manual edits to `podsnapshots` by anyone other than the GKE snapshot controller and agent. This blocks users from manually removing finalizers from stuck `podsnapshots` (e.g. when GCS upload fails or during test resets).
+GKE enforces a ValidatingAdmissionPolicy (`gke-pod-snapshot-validating-admission-policy`) that prevents manual edits to `podsnapshots.podsnapshot.gke.io` by anyone other than the GKE snapshot controller and agent. This blocks users from manually removing finalizers from stuck `podsnapshots.podsnapshot.gke.io` (e.g. when GCS upload fails or during test resets).
 
-To override this check and perform cleanup:
+To override this check and perform cleanup (qualifying the `podsnapshot.gke.io` group explicitly so dual-engine clusters do not hit `podsnapshots.criu.podmigration.gke.io`):
 1. **Disable the validation actions temporarily by patching the binding to "Audit" instead of "Deny":**
    ```bash
    kubectl patch validatingadmissionpolicybinding gke-pod-snapshot-vap-binding \
@@ -446,8 +446,8 @@ To override this check and perform cleanup:
    ```
 2. **Remove finalizers and delete the stuck snapshots:**
    ```bash
-   kubectl get podsnapshots -o json | jq -r '.items[].metadata.name' | xargs -I {} kubectl patch podsnapshot {} --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]' || true
-   kubectl delete podsnapshots --all --timeout=15s
+   kubectl get podsnapshots.podsnapshot.gke.io -o json | jq -r '.items[].metadata.name' | xargs -I {} kubectl patch podsnapshots.podsnapshot.gke.io {} --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]' || true
+   kubectl delete podsnapshots.podsnapshot.gke.io --all --timeout=15s
    ```
 3. **Restore the validation actions back to "Deny, Audit":**
    ```bash

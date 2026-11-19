@@ -93,7 +93,7 @@ func WithAPIReader(r client.Reader) GKEOption {
 
 // WithCRIUAPIGroup registers the CRIU snapshot engine in NewDefaultRegistry,
 // bound to group (#135). When group is empty, DefaultCRIUAPIGroup
-// (podsnapshot.gke.io) is used. Without this option, NewDefaultRegistry
+// (criu.podmigration.gke.io) is used. Without this option, NewDefaultRegistry
 // registers only GKE Pod Snapshots so default installs remain unchanged.
 func WithCRIUAPIGroup(group string) GKEOption {
 	return func(e *GKEPodSnapshots) {

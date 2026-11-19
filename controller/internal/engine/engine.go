@@ -69,10 +69,8 @@ const (
 	// DefaultAPIGroup is the API group of the managed GKE Pod Snapshots add-on.
 	DefaultAPIGroup = snapshot.DefaultAPIGroup
 
-	// DefaultCRIUAPIGroup is the default API group of the CRIU snapshot engine.
-	// Step 2 of #135 keeps podsnapshot.gke.io as the default so existing
-	// installs see no behavior change until Step 3 flips the default to CRIUAPIGroup.
-	DefaultCRIUAPIGroup = snapshot.DefaultAPIGroup
+	// DefaultCRIUAPIGroup is the default API group of the CRIU snapshot engine (#135).
+	DefaultCRIUAPIGroup = snapshot.CRIUAPIGroup
 
 	// CRIUAPIGroup is the dedicated API group of the CRIU snapshot engine (#135).
 	CRIUAPIGroup = snapshot.CRIUAPIGroup

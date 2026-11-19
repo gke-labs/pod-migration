@@ -79,10 +79,10 @@ type PSMTReconciler struct {
 	Checkpointer Checkpointer // nil in production (CR handoff to the node agent)
 }
 
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotmanualtriggers/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods;nodes,verbs=get;list;watch
 
 func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -234,8 +234,17 @@ func (r *PSMTReconciler) refusalReason(ctx context.Context, pod *corev1.Pod) str
 	if pod.Labels[contract.LabelEnabled] != "true" {
 		return "pod is not opted in (pod-migration.gke.io/enabled != true)"
 	}
+	if ok, rc := isSupportedCRIURuntimeClass(pod.Spec.RuntimeClassName); !ok {
+		return fmt.Sprintf("runtimeClassName %q unsupported by criu engine v1", rc)
+	}
 	if pod.Spec.HostNetwork {
 		return "hostNetwork pods unsupported by criu engine"
+	}
+	for i := range pod.Spec.InitContainers {
+		ic := &pod.Spec.InitContainers[i]
+		if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			return "sidecar initContainers unsupported by criu engine v1"
+		}
 	}
 	if len(pod.Spec.Containers) != 1 {
 		return "multi-container pods unsupported by criu engine v1"
