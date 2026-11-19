@@ -21,10 +21,12 @@ import (
 	"os"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -72,11 +74,7 @@ func main() {
 	cfg := ctrl.GetConfigOrDie()
 	cfg.QPS = float32(kubeAPIQPS)
 	cfg.Burst = kubeAPIBurst
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: "0"},
-		HealthProbeBindAddress: probeAddr,
-	})
+	mgr, err := ctrl.NewManager(cfg, agentManagerOptions(probeAddr))
 	if err != nil {
 		log.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -133,6 +131,23 @@ func main() {
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "agent exited")
 		os.Exit(1)
+	}
+}
+
+// agentManagerOptions builds the controller-runtime manager options for the
+// node agent. ClusterRole/pod-migrate-psengine-agent intentionally grants only
+// get and patch on core/nodes (no list/watch), so *corev1.Node reads bypass
+// the informer cache and talk directly to the API server.
+func agentManagerOptions(probeAddr string) ctrl.Options {
+	return ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: probeAddr,
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{&corev1.Node{}},
+			},
+		},
 	}
 }
 

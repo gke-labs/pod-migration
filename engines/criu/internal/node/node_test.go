@@ -22,14 +22,17 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 func newTestScheme(t *testing.T) *runtime.Scheme {
@@ -258,8 +261,20 @@ func (f *failPatchClient) Patch(ctx context.Context, obj client.Object, patch cl
 	return errors.New("simulated patch failure")
 }
 
+type errSink struct {
+	errCalls atomic.Int32
+}
+
+func (s *errSink) Init(logr.RuntimeInfo)          {}
+func (s *errSink) Enabled(int) bool               { return true }
+func (s *errSink) Info(int, string, ...any)       {}
+func (s *errSink) WithValues(...any) logr.LogSink { return s }
+func (s *errSink) WithName(string) logr.LogSink   { return s }
+func (s *errSink) Error(error, string, ...any)    { s.errCalls.Add(1) }
+
 func TestPSEngineCheckpoint_DemoteErrorLogged(t *testing.T) {
-	ctx := context.Background()
+	sink := &errSink{}
+	ctx := logf.IntoContext(context.Background(), logr.New(sink))
 	scheme := newTestScheme(t)
 
 	nodeObj := &corev1.Node{
@@ -291,59 +306,316 @@ func TestPSEngineCheckpoint_DemoteErrorLogged(t *testing.T) {
 		},
 	}
 
-	// Should not panic, and returns ErrContainerdCachedCRIU
+	// Should not panic, logs the demotion patch failure, and returns ErrContainerdCachedCRIU.
 	_, err := nd.PSEngineCheckpoint(ctx, "default", "pod-1", "container-1")
 	if err == nil || !errors.Is(err, ErrContainerdCachedCRIU) {
 		t.Fatalf("expected ErrContainerdCachedCRIU, got: %v", err)
 	}
+	if sink.errCalls.Load() != 1 {
+		t.Fatalf("expected demotion patch error to be logged once, got %d", sink.errCalls.Load())
+	}
 }
 
-func TestNode_FailedBootstrapDoesNotReprobeWithoutRestart(t *testing.T) {
+func TestPSEngineCheckpoint_Ordinary500DoesNotDemoteNode(t *testing.T) {
 	ctx := context.Background()
 	scheme := newTestScheme(t)
 
 	nodeObj := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-node",
+			Annotations: map[string]string{
+				NodeAnnotationCRIUReady:   "true",
+				NodeAnnotationCRIUVersion: "v3.19",
+			},
 		},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
 
-	bootstrapCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"message":"checkpoint failed: container not running"}`))
+	}))
+	defer srv.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("fake-token"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+
 	nd := &Node{
-		Client:     c,
-		NodeName:   "test-node",
-		SocketPath: "/run/containerd/containerd.sock",
-		statSocketFn: func(string) (uint64, error) {
-			return 4242, nil // constant socket inode
+		Client:   c,
+		NodeName: "test-node",
+		version:  "v3.19",
+		ready:    true,
+		Kubelet: &kubeletCheckpoint{
+			TokenPath: tokenFile,
+			Endpoint:  srv.URL,
+			Client:    srv.Client(),
 		},
 	}
-	nd.bootstrapFn = func(ctx context.Context) error {
-		bootstrapCount++
-		return errors.New("simulated bootstrap failure")
-	}
 
-	// 1. Initial bootstrap fails
-	if err := nd.Bootstrap(ctx); err == nil {
-		t.Fatal("expected bootstrap error, got nil")
+	if _, err := nd.PSEngineCheckpoint(ctx, "default", "pod-1", "container-1"); err == nil {
+		t.Fatal("expected checkpoint error, got nil")
 	}
-	if bootstrapCount != 1 {
-		t.Fatalf("expected 1 bootstrap call, got %d", bootstrapCount)
+	if !nd.IsReady() {
+		t.Fatal("ordinary kubelet 500 must leave nd.IsReady() == true")
 	}
+	var cur corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if cur.Annotations[NodeAnnotationCRIUReady] != "true" {
+		t.Fatalf("expected criu-ready=true preserved, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+	}
+}
 
-	// 2. Probing 5 times with unchanged socket inode must NOT re-run Bootstrap
-	for i := 1; i <= 5; i++ {
+type flakyNodeClient struct {
+	client.Client
+	getCalls   atomic.Int32
+	patchCalls atomic.Int32
+	failGets   int32
+	failPatch  int32
+}
+
+func (f *flakyNodeClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if n := f.getCalls.Add(1); n <= f.failGets {
+		return errors.New("transient node get timeout")
+	}
+	return f.Client.Get(ctx, key, obj, opts...)
+}
+
+func (f *flakyNodeClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if n := f.patchCalls.Add(1); n <= f.failPatch {
+		return errors.New("transient node patch 503")
+	}
+	return f.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	t.Run("bundle install failure marks node false once and stays quiet", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "test-node",
+				Annotations: map[string]string{NodeAnnotationCRIUReady: "true"},
+			},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+		fc := &flakyNodeClient{Client: base}
+
+		installCalls := 0
+		nd := &Node{
+			Client:     fc,
+			NodeName:   "test-node",
+			SocketPath: "/run/containerd/containerd.sock",
+			statSocketFn: func(string) (uint64, error) {
+				return 4242, nil
+			},
+			installBundleFn: func() (string, error) {
+				installCalls++
+				return "", errors.New("disk full")
+			},
+		}
+
+		if err := nd.Bootstrap(ctx); err == nil {
+			t.Fatal("expected install error, got nil")
+		}
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false")
+		}
+
+		var cur corev1.Node
+		if err := base.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+			t.Fatalf("expected stale criu-ready=true cleared to false, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+		getsAfterBootstrap := fc.getCalls.Load()
+		patchesAfterBootstrap := fc.patchCalls.Load()
+
+		for i := 1; i <= 5; i++ {
+			ready, err := nd.ProbeReadiness(ctx)
+			if err != nil {
+				t.Fatalf("probe %d: unexpected error: %v", i, err)
+			}
+			if ready {
+				t.Fatalf("probe %d: expected ready=false", i)
+			}
+		}
+		if installCalls != 1 {
+			t.Fatalf("expected 1 bundle install call across 5 ticks, got %d", installCalls)
+		}
+		if fc.getCalls.Load() != getsAfterBootstrap || fc.patchCalls.Load() != patchesAfterBootstrap {
+			t.Fatalf("expected 0 extra API calls across 5 ticks, got extra gets=%d patches=%d",
+				fc.getCalls.Load()-getsAfterBootstrap, fc.patchCalls.Load()-patchesAfterBootstrap)
+		}
+	})
+}
+
+func TestNode_TransientAPIErrorsRetryAndConvergeWithoutContainerdRestart(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	t.Run("transient GET error on recovery retries on next tick", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+		fc := &flakyNodeClient{Client: base, failGets: 1}
+
+		nd := &Node{
+			Client:          fc,
+			NodeName:        "test-node",
+			SocketPath:      "/run/containerd/containerd.sock",
+			statSocketFn:    func(string) (uint64, error) { return 7777, nil },
+			installBundleFn: func() (string, error) { return "v3.19", nil },
+			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+				return "Looks good.\n", nil
+			},
+		}
+
+		if err := nd.Bootstrap(ctx); err == nil {
+			t.Fatal("expected initial transient GET error")
+		}
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false after failed GET")
+		}
+
+		// Without restarting containerd (same inode 7777), the next ProbeReadiness tick retries and recovers!
 		ready, err := nd.ProbeReadiness(ctx)
 		if err != nil {
-			t.Fatalf("probe %d: unexpected error: %v", i, err)
+			t.Fatalf("ProbeReadiness retry failed: %v", err)
 		}
-		if ready {
-			t.Fatalf("probe %d: expected ready=false", i)
+		if !ready || !nd.IsReady() {
+			t.Fatal("expected node to recover to ready=true on retry tick")
 		}
+	})
+
+	t.Run("transient PATCH error after verifyCRIU passes leaves ready=false and retries cleanly", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "test-node",
+				Annotations: map[string]string{NodeAnnotationCRIUReady: "false"},
+			},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+		fc := &flakyNodeClient{Client: base, failPatch: 1}
+
+		nd := &Node{
+			Client:          fc,
+			NodeName:        "test-node",
+			SocketPath:      "/run/containerd/containerd.sock",
+			lastSocketInode: 1000, // old pre-restart inode
+			statSocketFn:    func(string) (uint64, error) { return 2000, nil },
+			installBundleFn: func() (string, error) { return "v3.19", nil },
+			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+				return "Looks good.\n", nil
+			},
+		}
+
+		// First post-restart probe hits transient PATCH 503.
+		ready, err := nd.ProbeReadiness(ctx)
+		if err == nil {
+			t.Fatal("expected transient PATCH error")
+		}
+		if ready || nd.IsReady() {
+			t.Fatal("expected ready=false when annotateNode PATCH fails")
+		}
+
+		// Second tick (still inode 2000) must NOT exit early at if isReady; it retries and writes criu-ready=true.
+		ready, err = nd.ProbeReadiness(ctx)
+		if err != nil {
+			t.Fatalf("second ProbeReadiness failed: %v", err)
+		}
+		if !ready || !nd.IsReady() {
+			t.Fatal("expected ready=true on second ProbeReadiness tick")
+		}
+		var cur corev1.Node
+		if err := base.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "true" {
+			t.Fatalf("expected criu-ready=true on API server, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+	})
+}
+
+func TestNode_DemotePatchFailureRetriedAndPoisonedInodeBlocked(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+			Annotations: map[string]string{
+				NodeAnnotationCRIUReady:   "true",
+				NodeAnnotationCRIUVersion: "v3.19",
+			},
+		},
+		Status: corev1.NodeStatus{
+			NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+	fc := &flakyNodeClient{Client: base, failPatch: 1}
+
+	currentIno := uint64(9001)
+	nd := &Node{
+		Client:          fc,
+		NodeName:        "test-node",
+		SocketPath:      "/run/containerd/containerd.sock",
+		ready:           true,
+		version:         "v3.19",
+		lastSocketInode: 8000, // containerd restarted while ready, then got poisoned on 9001
+		statSocketFn:    func(string) (uint64, error) { return currentIno, nil },
+		installBundleFn: func() (string, error) { return "v3.19", nil },
+		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+			return "Looks good.\n", nil
+		},
 	}
 
-	if bootstrapCount != 1 {
-		t.Fatalf("expected bootstrap count to remain 1, got %d", bootstrapCount)
+	// DemoteNode fails its first PATCH transiently.
+	if err := nd.DemoteNode(ctx, ReasonContainerdCachedCRIU, RemediationRestartContainerd); err == nil {
+		t.Fatal("expected initial DemoteNode PATCH error")
+	}
+	if nd.IsReady() {
+		t.Fatal("expected nd.IsReady() == false immediately in memory")
+	}
+
+	// Next ProbeReadiness tick retries the pending demotion PATCH and does NOT re-promote poisoned inode 9001.
+	ready, err := nd.ProbeReadiness(ctx)
+	if err != nil {
+		t.Fatalf("ProbeReadiness demotion retry failed: %v", err)
+	}
+	if ready || nd.IsReady() {
+		t.Fatal("poisoned inode 9001 must remain unready")
+	}
+	var cur corev1.Node
+	if err := base.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+		t.Fatalf("expected criu-ready=false persisted on retry, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+	}
+
+	// Even a direct Bootstrap call on poisoned inode 9001 must not overwrite criu-ready back to true.
+	if err := nd.Bootstrap(ctx); !errors.Is(err, ErrContainerdCachedCRIU) {
+		t.Fatalf("expected ErrContainerdCachedCRIU on poisoned inode, got %v", err)
+	}
+	if nd.IsReady() {
+		t.Fatal("poisoned inode must not become ready before containerd restarts")
 	}
 }
 
