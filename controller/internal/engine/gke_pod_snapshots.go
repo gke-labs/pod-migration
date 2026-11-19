@@ -65,8 +65,9 @@ type GKEPodSnapshots struct {
 	provider *snapshot.GKEProvider
 	// events reads the events that VerifyRestore inspects, from the API
 	// server rather than the cache.
-	events    client.Reader
-	criuGroup string
+	events       client.Reader
+	registerCRIU bool
+	criuGroup    string
 }
 
 var (
@@ -90,11 +91,13 @@ func WithAPIReader(r client.Reader) GKEOption {
 	}
 }
 
-// WithCRIUAPIGroup sets the Kubernetes API group of the CRIU snapshot engine
-// registered by NewDefaultRegistry (#135). When unset or empty, NewDefaultRegistry
-// uses DefaultCRIUAPIGroup (podsnapshot.gke.io).
+// WithCRIUAPIGroup registers the CRIU snapshot engine in NewDefaultRegistry,
+// bound to group (#135). When group is empty, DefaultCRIUAPIGroup
+// (podsnapshot.gke.io) is used. Without this option, NewDefaultRegistry
+// registers only GKE Pod Snapshots so default installs remain unchanged.
 func WithCRIUAPIGroup(group string) GKEOption {
 	return func(e *GKEPodSnapshots) {
+		e.registerCRIU = true
 		e.criuGroup = group
 	}
 }
@@ -115,28 +118,30 @@ func NewGKEPodSnapshots(c client.Client, scheme *runtime.Scheme, opts ...GKEOpti
 }
 
 // NewDefaultRegistry returns the registry of a stock deployment: GKE Pod
-// Snapshots (registered as the default engine) and CRIU (bound to the group
-// configured by WithCRIUAPIGroup, defaulting to DefaultCRIUAPIGroup). Unless
-// SetRoutes overrides the cluster routes, GKE Pod Snapshots serves every
-// runtime class that runtimeClasses allows (RoutesFromAllowList).
-// runtimeClasses is the operator allow-list (--migratable-runtime-classes);
-// nil means gVisor only. opts configure the engines.
+// Snapshots (registered as the default engine), plus CRIU only when requested
+// via WithCRIUAPIGroup. Unless SetRoutes overrides the cluster routes, GKE Pod
+// Snapshots serves every runtime class that runtimeClasses allows
+// (RoutesFromAllowList). runtimeClasses is the operator allow-list
+// (--migratable-runtime-classes); nil means gVisor only. opts configure the
+// engines.
 func NewDefaultRegistry(c client.Client, scheme *runtime.Scheme, runtimeClasses *eligibility.RuntimeClassPolicy, opts ...GKEOption) (*Registry, error) {
 	r := NewRegistry(GKEPodSnapshotsName)
 	gke := NewGKEPodSnapshots(c, scheme, opts...)
 	if err := r.Register(gke); err != nil {
 		return nil, err
 	}
-	criuGroup := gke.criuGroup
-	if criuGroup == "" {
-		criuGroup = DefaultCRIUAPIGroup
-	}
-	criu, err := NewCRIU(c, scheme, criuGroup)
-	if err != nil {
-		return nil, err
-	}
-	if err := r.Register(criu); err != nil {
-		return nil, err
+	if gke.registerCRIU {
+		criuGroup := gke.criuGroup
+		if criuGroup == "" {
+			criuGroup = DefaultCRIUAPIGroup
+		}
+		criu, err := NewCRIU(c, scheme, criuGroup)
+		if err != nil {
+			return nil, err
+		}
+		if err := r.Register(criu); err != nil {
+			return nil, err
+		}
 	}
 	if err := r.SetRoutes(RoutesFromAllowList(runtimeClasses, GKEPodSnapshotsName)); err != nil {
 		return nil, err

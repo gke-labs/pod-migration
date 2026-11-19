@@ -154,11 +154,10 @@ annotated with `<group>/ps-name`, and the restore webhook passes that key to
 default, `podsnapshot.gke.io/ps-name`.
 
 The default group is `podsnapshot.gke.io`, the GKE Pod Snapshots addon's
-group. The `pod-migration-controller` registers the `criu` engine with a
-matching `--criu-api-group` flag (also defaulting to `podsnapshot.gke.io`, and
-granting RBAC for `criu.podmigration.gke.io` out of the box), so when a runtime
-class is routed to `criu` via `--runtime-class-engines` or
-`pod-migration.gke.io/runtime-class-engines`, the controller reconciles CRIU
+group. When `--criu-api-group` is set on `pod-migration-controller` (defaulting
+to `podsnapshot.gke.io`, with RBAC for `criu.podmigration.gke.io` pre-granted)
+or `--runtime-class-engines` routes a runtime class to `criu`, the controller
+registers the `criu` engine and reconciles CRIU
 storage configs, policies, triggers, snapshots, and `<group>/ps-name` restore
 orders in `--criu-api-group`. However, `engines/criu`'s restore webhook still
 rewires every gated single-container replacement pod with an explicit command,

@@ -17,6 +17,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -303,6 +304,27 @@ func TestCRIU_RestoreOrdersAndVerifyRestore(t *testing.T) {
 
 func TestRegistry_SideBySideGroupsAndRestoreAnnotations(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+
+	// Stock default registry (without WithCRIUAPIGroup) registers ONLY gke-pod-snapshots,
+	// so a PodMigration annotated runc=criu gets ErrEngineNotRegistered as on main.
+	stockReg, err := NewDefaultRegistry(cl, testScheme(), nil)
+	if err != nil {
+		t.Fatalf("NewDefaultRegistry stock: %v", err)
+	}
+	if got := stockReg.Names(); !reflect.DeepEqual(got, []string{GKEPodSnapshotsName}) {
+		t.Fatalf("stock Names() = %v, want [%s]", got, GKEPodSnapshotsName)
+	}
+	pmAnnotatedCRIU := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "pm",
+			Annotations: map[string]string{AnnotationRuntimeClassEngines: "runc=criu"},
+		},
+	}
+	if _, err := stockReg.ValidatePodMigrationRoutes(pmAnnotatedCRIU); !errors.Is(err, ErrEngineNotRegistered) {
+		t.Fatalf("stock ValidatePodMigrationRoutes(runc=criu) = %v, want ErrEngineNotRegistered", err)
+	}
+
 	policy := mustParsePolicy(t, "gvisor,@default,runc")
 	reg, err := NewDefaultRegistry(cl, testScheme(), policy, WithCRIUAPIGroup(CRIUAPIGroup))
 	if err != nil {
@@ -323,6 +345,14 @@ func TestRegistry_SideBySideGroupsAndRestoreAnnotations(t *testing.T) {
 	wantAnns := []string{DefaultAPIGroup + "/ps-name", CRIUAPIGroup + "/ps-name"}
 	if got := reg.RestoreAnnotations(); !reflect.DeepEqual(got, wantAnns) {
 		t.Errorf("RestoreAnnotations() = %v, want %v", got, wantAnns)
+	}
+
+	// EnginesForAllowed respects --migratable-runtime-classes: when only gvisor is allowed,
+	// a runc=criu route does not render CRIU namespace resources.
+	gvisorOnlyAllow := mustParsePolicy(t, "gvisor")
+	allowedEngines := reg.EnginesForAllowed(pmAnnotatedCRIU, gvisorOnlyAllow)
+	if len(allowedEngines) != 1 || allowedEngines[0].Name() != GKEPodSnapshotsName {
+		t.Fatalf("EnginesForAllowed(gvisor-only) = %v, want [gke-pod-snapshots]", allowedEngines)
 	}
 
 	gvisorEng, ok := reg.ForPod(podWithRuntimeClass("gvisor"), nil)

@@ -65,3 +65,26 @@ func TestMainExitsNonZeroOnInvalidCRIUAPIGroupFlag(t *testing.T) {
 		t.Errorf("expected startup error mentioning --criu-api-group, got: %s", string(out))
 	}
 }
+
+func TestShouldRegisterCRIU(t *testing.T) {
+	gvisorOnly, err := engine.ParseRoutes("gvisor=gke-pod-snapshots")
+	if err != nil {
+		t.Fatalf("ParseRoutes: %v", err)
+	}
+	withCRIU, err := engine.ParseRoutes("gvisor=gke-pod-snapshots,@default=criu")
+	if err != nil {
+		t.Fatalf("ParseRoutes: %v", err)
+	}
+	if shouldRegisterCRIU(false, nil) {
+		t.Error("shouldRegisterCRIU(false, nil) = true, want false on stock default install")
+	}
+	if shouldRegisterCRIU(false, gvisorOnly) {
+		t.Error("shouldRegisterCRIU(false, gvisorOnly) = true, want false when routes do not name criu")
+	}
+	if !shouldRegisterCRIU(true, nil) {
+		t.Error("shouldRegisterCRIU(true, nil) = false, want true when --criu-api-group is explicitly set")
+	}
+	if !shouldRegisterCRIU(false, withCRIU) {
+		t.Error("shouldRegisterCRIU(false, withCRIU) = false, want true when --runtime-class-engines names criu")
+	}
+}

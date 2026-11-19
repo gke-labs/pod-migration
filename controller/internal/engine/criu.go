@@ -179,9 +179,12 @@ func (e *CRIU) Snapshots() snapshot.Provider { return e.provider }
 // signatures, and gVisor signatures must not run on runc pods (C7, #132).
 func (*CRIU) RestoreFailures() []restore.Engine { return nil }
 
-// Guarantees implements Engine: CRIU stops the source container after archive
-// upload (postCheckpoint: stop), and does not guarantee at-most-once restore on
-// its own without controller completion (#152).
+// Guarantees implements Engine: the CRIU engine freezes the source container
+// before checkpointing (#148), while the controller conservatively declares
+// FencingStopped (keeping the endpoint fence and cold-evicting on failure past
+// checkpoint) until the controller-side SourceFrozen handling in #148 lands.
+// CRIU does not guarantee at-most-once restore on its own without controller
+// completion (#152).
 func (*CRIU) Guarantees() Guarantees {
 	return Guarantees{Fencing: FencingStopped, RestoreOnce: false}
 }

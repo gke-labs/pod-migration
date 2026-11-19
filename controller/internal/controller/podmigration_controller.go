@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
@@ -110,6 +111,10 @@ type PodMigrationReconciler struct {
 	// class there. Optional: nil selects GKE Pod Snapshots for gVisor pods,
 	// built from Client and Scheme. Overridden in tests.
 	Engines *engine.Registry
+
+	// RuntimeClassPolicy restricts rendered namespace resources to engines
+	// serving runtime classes allowed by --migratable-runtime-classes when set.
+	RuntimeClassPolicy *eligibility.RuntimeClassPolicy
 }
 
 // engines returns the registry that serves the reconciler: Engines, or the
@@ -351,7 +356,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// The status changes below are written with patchStatus, against this copy.
 	before := config.Status.DeepCopy()
 	setEngineRoutesCondition(config, registry)
-	engines := registry.EnginesFor(config)
+	engines := registry.EnginesForAllowed(config, r.RuntimeClassPolicy)
 	if len(engines) == 0 {
 		// EnginesFor falls back to the default engine, so that isn't
 		// registered.

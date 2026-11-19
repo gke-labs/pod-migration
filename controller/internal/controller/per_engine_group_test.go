@@ -697,3 +697,266 @@ func TestEvaluateInvariantsAndSnapshotMapper_PeerGroupIsolation(t *testing.T) {
 		t.Fatalf("mapSnapshotToPMJ(criuSnap) = %v, want %v", reqs, want)
 	}
 }
+
+func TestPodGateReconciler_GVisorRoutedToCRIUStampsGKEColdStartBypass(t *testing.T) {
+	ctx := context.Background()
+	scheme := perEngineGroupTestScheme(t)
+	const ns = "default"
+	gvisorClass := "gvisor"
+	gkeKey := engine.RestoreAnnotation(engine.DefaultAPIGroup)
+	criuKey := engine.RestoreAnnotation(engine.CRIUAPIGroup)
+
+	allowPolicy, err := eligibility.ParseRuntimeClassPolicy("gvisor")
+	if err != nil {
+		t.Fatalf("ParseRuntimeClassPolicy: %v", err)
+	}
+
+	t.Run("restore release on gvisor=criu stamps both CRIU snapshotRef and GKE empty bypass", func(t *testing.T) {
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   ns,
+				Name:        "pmj-gvisor-criu-restore",
+				Annotations: map[string]string{engine.AnnotationEngine: engine.CRIUName},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "src-pod"},
+				TargetPodUID: "src-uid",
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase:       pmv1alpha1.PodMigrationJobPhaseRestoring,
+				SnapshotRef: "ps-criu-snap-1",
+			},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   ns,
+				Name:        "repl-pod-restore",
+				UID:         "repl-uid-1",
+				Labels:      map[string]string{"pod-migration.gke.io/enabled": "true"},
+				Annotations: map[string]string{util.AnnotationAssignedPMJ: job.Name},
+			},
+			Spec: corev1.PodSpec{
+				RuntimeClassName: &gvisorClass,
+				SchedulingGates:  []corev1.PodSchedulingGate{{Name: MigrationGateName}},
+				Containers:       []corev1.Container{{Name: "app"}},
+			},
+		}
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+			WithObjects(job, pod).
+			Build()
+		reg, err := engine.NewDefaultRegistry(cl, scheme, allowPolicy, engine.WithCRIUAPIGroup(engine.CRIUAPIGroup))
+		if err != nil {
+			t.Fatalf("NewDefaultRegistry: %v", err)
+		}
+		routes, _ := engine.ParseRoutes("gvisor=criu")
+		if err := reg.SetRoutes(routes); err != nil {
+			t.Fatalf("SetRoutes: %v", err)
+		}
+
+		rec := &PodGateReconciler{Client: cl, APIReader: cl, Scheme: scheme, Engines: reg}
+		if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(pod)}); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		var got corev1.Pod
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(pod), &got); err != nil {
+			t.Fatalf("Get pod: %v", err)
+		}
+		if got.Annotations[criuKey] != "ps-criu-snap-1" {
+			t.Errorf("%s = %q, want ps-criu-snap-1", criuKey, got.Annotations[criuKey])
+		}
+		if v, ok := got.Annotations[gkeKey]; !ok || v != "" {
+			t.Errorf("%s = %q (ok=%t), want explicit empty GKE cold-start bypass", gkeKey, v, ok)
+		}
+	})
+
+	t.Run("cold-start bypass on gvisor=criu and speculatively CRIU-injected gVisor job stamps both empty keys", func(t *testing.T) {
+		failedCRIUJob := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   ns,
+				Name:        "pmj-gvisor-criu-failed",
+				Annotations: map[string]string{engine.AnnotationEngine: engine.CRIUName},
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseFailed,
+			},
+		}
+		podRoutedCRIU := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   ns,
+				Name:        "repl-pod-bypass-criu",
+				UID:         "repl-uid-2",
+				Labels:      map[string]string{"pod-migration.gke.io/enabled": "true"},
+				Annotations: map[string]string{util.AnnotationAssignedPMJ: failedCRIUJob.Name},
+			},
+			Spec: corev1.PodSpec{
+				RuntimeClassName: &gvisorClass,
+				SchedulingGates:  []corev1.PodSchedulingGate{{Name: MigrationGateName}},
+				Containers:       []corev1.Container{{Name: "app"}},
+			},
+		}
+
+		failedGKEJob := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   ns,
+				Name:        "pmj-gvisor-gke-failed",
+				Annotations: map[string]string{engine.AnnotationEngine: engine.GKEPodSnapshotsName},
+			},
+			Status: pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseFailed,
+			},
+		}
+		podSpeculativelyInjected := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "repl-pod-speculative-criu",
+				UID:       "repl-uid-3",
+				Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+				Annotations: map[string]string{
+					util.AnnotationAssignedPMJ:    failedGKEJob.Name,
+					engine.CRIUInjectedAnnotation: "true",
+				},
+			},
+			Spec: corev1.PodSpec{
+				RuntimeClassName: &gvisorClass,
+				SchedulingGates:  []corev1.PodSchedulingGate{{Name: MigrationGateName}},
+				Containers:       []corev1.Container{{Name: "app"}},
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+			WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+			WithObjects(failedCRIUJob, podRoutedCRIU, failedGKEJob, podSpeculativelyInjected).
+			Build()
+
+		// Case 1: gvisor=criu routed job fails -> both criuKey="" and gkeKey="" must be stamped.
+		regCRIU, err := engine.NewDefaultRegistry(cl, scheme, allowPolicy, engine.WithCRIUAPIGroup(engine.CRIUAPIGroup))
+		if err != nil {
+			t.Fatalf("NewDefaultRegistry: %v", err)
+		}
+		routesCRIU, _ := engine.ParseRoutes("gvisor=criu")
+		_ = regCRIU.SetRoutes(routesCRIU)
+		recCRIU := &PodGateReconciler{Client: cl, APIReader: cl, Scheme: scheme, Engines: regCRIU}
+		if _, err := recCRIU.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(podRoutedCRIU)}); err != nil {
+			t.Fatalf("Reconcile(podRoutedCRIU): %v", err)
+		}
+		var gotRouted corev1.Pod
+		_ = cl.Get(ctx, client.ObjectKeyFromObject(podRoutedCRIU), &gotRouted)
+		if v, ok := gotRouted.Annotations[criuKey]; !ok || v != "" {
+			t.Errorf("podRoutedCRIU %s = %q (ok=%t), want empty bypass", criuKey, v, ok)
+		}
+		if v, ok := gotRouted.Annotations[gkeKey]; !ok || v != "" {
+			t.Errorf("podRoutedCRIU %s = %q (ok=%t), want empty GKE bypass", gkeKey, v, ok)
+		}
+
+		// Case 2: gvisor=gke-pod-snapshots job fails on a pod carrying psengine-injected=true ->
+		// releaseWithColdStartBypass must ALSO stamp criuKey="" via the CRIUInjectedAnnotation branch.
+		regGKE, err := engine.NewDefaultRegistry(cl, scheme, allowPolicy, engine.WithCRIUAPIGroup(engine.CRIUAPIGroup))
+		if err != nil {
+			t.Fatalf("NewDefaultRegistry: %v", err)
+		}
+		recGKE := &PodGateReconciler{Client: cl, APIReader: cl, Scheme: scheme, Engines: regGKE}
+		if _, err := recGKE.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(podSpeculativelyInjected)}); err != nil {
+			t.Fatalf("Reconcile(podSpeculativelyInjected): %v", err)
+		}
+		var gotSpec corev1.Pod
+		_ = cl.Get(ctx, client.ObjectKeyFromObject(podSpeculativelyInjected), &gotSpec)
+		if v, ok := gotSpec.Annotations[gkeKey]; !ok || v != "" {
+			t.Errorf("podSpeculativelyInjected %s = %q (ok=%t), want empty GKE bypass", gkeKey, v, ok)
+		}
+		if v, ok := gotSpec.Annotations[criuKey]; !ok || v != "" {
+			t.Errorf("podSpeculativelyInjected %s = %q (ok=%t), want empty CRIU bypass", criuKey, v, ok)
+		}
+	})
+}
+
+func TestFindLatestReadyManualStopPSP_AllowsUserPSPLabeledGKEAndExcludesCRIU(t *testing.T) {
+	ctx := context.Background()
+	scheme := perEngineGroupTestScheme(t)
+	const ns = "default"
+
+	makePSP := func(name, engineLabel string) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(snapshot.PolicyGVK(engine.DefaultAPIGroup))
+		u.SetNamespace(ns)
+		u.SetName(name)
+		if engineLabel != "" {
+			u.SetLabels(map[string]string{util.LabelSnapshotEngine: engineLabel})
+		}
+		u.Object["spec"] = map[string]interface{}{
+			"selector":      map[string]interface{}{"matchLabels": map[string]interface{}{"app": "demo"}},
+			"triggerConfig": map[string]interface{}{"type": "manual", "postCheckpoint": "stop"},
+		}
+		u.Object["status"] = map[string]interface{}{
+			"conditions": []interface{}{map[string]interface{}{"type": "Ready", "status": "True"}},
+		}
+		return u
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			makePSP("psp-user-gke-labeled", engine.GKEPodSnapshotsName),
+			makePSP("psp-criu-labeled", engine.CRIUName),
+		).
+		Build()
+
+	got, err := util.FindLatestReadyManualStopPSP(ctx, cl, ns, map[string]string{"app": "demo"})
+	if err != nil || got == nil {
+		t.Fatalf("FindLatestReadyManualStopPSP = %v, %v; want psp-user-gke-labeled", got, err)
+	}
+	if got.GetName() != "psp-user-gke-labeled" {
+		t.Errorf("FindLatestReadyManualStopPSP picked %q, want psp-user-gke-labeled", got.GetName())
+	}
+}
+
+func TestPodMigrationReconciler_SkipsUnallowedRuntimeClassesAtRenderTime(t *testing.T) {
+	ctx := context.Background()
+	scheme := perEngineGroupTestScheme(t)
+	const ns = "default"
+
+	gvisorOnly, err := eligibility.ParseRuntimeClassPolicy("gvisor")
+	if err != nil {
+		t.Fatalf("ParseRuntimeClassPolicy: %v", err)
+	}
+	pm := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   ns,
+			Name:        "pm",
+			UID:         "pm-uid-1",
+			Annotations: map[string]string{engine.AnnotationRuntimeClassEngines: "runc=criu"},
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://test-bucket/snaps"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		WithObjects(pm).
+		Build()
+
+	reg, err := engine.NewDefaultRegistry(cl, scheme, gvisorOnly, engine.WithCRIUAPIGroup(engine.CRIUAPIGroup))
+	if err != nil {
+		t.Fatalf("NewDefaultRegistry: %v", err)
+	}
+	rec := &PodMigrationReconciler{
+		Client:             cl,
+		Scheme:             scheme,
+		Engines:            reg,
+		RuntimeClassPolicy: gvisorOnly,
+	}
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(pm)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	criuPSP := &unstructured.Unstructured{}
+	criuPSP.SetGroupVersionKind(snapshot.PolicyGVK(engine.CRIUAPIGroup))
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: engine.CRIUPodSnapshotPolicyName("pm")}, criuPSP); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected CRIU PSP not rendered when runc is excluded by --migratable-runtime-classes=gvisor, got err=%v", err)
+	}
+}

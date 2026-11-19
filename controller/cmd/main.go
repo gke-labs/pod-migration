@@ -117,6 +117,12 @@ func main() {
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	var criuGroupFlagSet bool
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "criu-api-group" {
+			criuGroupFlagSet = true
+		}
+	})
 
 	if showVersion {
 		fmt.Println(version.Get().String())
@@ -240,14 +246,22 @@ func main() {
 	invariantEngine := invariants.NewEngine(invariantMode, eventRecorder)
 
 	// Snapshot engines, shared by every reconciler and the eviction/replacement
-	// webhooks. GKE Pod Snapshots is the default engine, and CRIU is registered
-	// with --criu-api-group. Unless --runtime-class-engines routes runtime
-	// classes to engines, GKE Pod Snapshots serves every class of the
-	// --migratable-runtime-classes allow-list.
-	engines, err := engine.NewDefaultRegistry(mgr.GetClient(), mgr.GetScheme(), runtimeClassPolicy,
+	// webhooks. GKE Pod Snapshots is the default engine; CRIU is registered only
+	// when explicitly requested (--criu-api-group set or --runtime-class-engines
+	// routes a class to criu), keeping stock GKE-only installs unchanged.
+	registerCRIU := shouldRegisterCRIU(criuGroupFlagSet, runtimeClassRoutes)
+	if registerCRIU && criuAPIGroup != engine.DefaultCRIUAPIGroup && criuAPIGroup != engine.CRIUAPIGroup {
+		setupLog.Info("WARNING: custom --criu-api-group is not covered by shipped ClusterRole RBAC; add get/list/watch/create/update/patch/delete rules for that group in pod-migration-controller-role",
+			"criuAPIGroup", criuAPIGroup)
+	}
+	registryOpts := []engine.GKEOption{
 		// The restore verifier reads the replacement's events, which aren't cached.
 		engine.WithAPIReader(mgr.GetAPIReader()),
-		engine.WithCRIUAPIGroup(criuAPIGroup))
+	}
+	if registerCRIU {
+		registryOpts = append(registryOpts, engine.WithCRIUAPIGroup(criuAPIGroup))
+	}
+	engines, err := engine.NewDefaultRegistry(mgr.GetClient(), mgr.GetScheme(), runtimeClassPolicy, registryOpts...)
 	if err != nil {
 		setupLog.Error(err, "unable to build the snapshot engine registry")
 		os.Exit(1)
@@ -261,11 +275,12 @@ func main() {
 	logEngineRoutes(engines, runtimeClassPolicy, len(runtimeClassRoutes) == 0)
 
 	if err := (&controller.PodMigrationReconciler{
-		Client:          mgr.GetClient(),
-		Scheme:          mgr.GetScheme(),
-		Recorder:        eventRecorder,
-		InvariantEngine: invariantEngine,
-		Engines:         engines,
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		Recorder:           eventRecorder,
+		InvariantEngine:    invariantEngine,
+		Engines:            engines,
+		RuntimeClassPolicy: runtimeClassPolicy,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")
 		os.Exit(1)
@@ -371,15 +386,19 @@ func main() {
 	}
 }
 
+func validateCRIUAPIGroup(group string) error {
+	return engine.ValidateAPIGroup(group)
+}
+
+func shouldRegisterCRIU(criuGroupFlagSet bool, routes engine.Routes) bool {
+	return criuGroupFlagSet || routes.NamesEngine(engine.CRIUName)
+}
+
 // logEngineRoutes logs the snapshot engines and the routes from runtime
 // classes to engines, which come from the allow-list when fromAllowList is
 // set. When --runtime-class-engines sets them, it also reports the
 // allow-listed classes that no route serves, and the routes for classes the
 // allow-list doesn't migrate.
-func validateCRIUAPIGroup(group string) error {
-	return engine.ValidateAPIGroup(group)
-}
-
 func logEngineRoutes(engines *engine.Registry, policy *eligibility.RuntimeClassPolicy, fromAllowList bool) {
 	routes := engines.Routes()
 	setupLog.Info("Snapshot engines",

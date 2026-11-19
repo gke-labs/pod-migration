@@ -265,7 +265,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		return admission.Allowed(fmt.Sprintf("No snapshot engine serves runtime class %s, skipping migration", runtimeClass))
 	}
 	var sourceNode *corev1.Node
-	if pod.Spec.NodeName != "" {
+	if _, isGKE := eng.(*engine.GKEPodSnapshots); !isGKE && pod.Spec.NodeName != "" {
 		n := &corev1.Node{}
 		if err := a.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, n); err == nil {
 			sourceNode = n

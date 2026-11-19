@@ -38,11 +38,6 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
-// psNameAnnotation is the GKE Pod Snapshots restore annotation. When the agent
-// creates a pod's sandbox, a snapshot name in it means "restore from that
-// snapshot", and an empty value means "start cold".
-const psNameAnnotation = "podsnapshot.gke.io/ps-name"
-
 // transientReadyFailureSuppressionWindow bounds how long a Ready=False (Failed)
 // condition is suppressed while a constituent sub-condition (Checkpoint or
 // StorageReplicated) still reports an in-progress reason (#75, #95).

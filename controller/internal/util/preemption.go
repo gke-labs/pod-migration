@@ -195,10 +195,10 @@ const LabelSnapshotEngine = "pod-migrate.io/engine"
 
 // FindLatestReadyManualStopPSP finds the latest ready manual PodSnapshotPolicy in the
 // podsnapshot.gke.io group matching the pod's labels (excluding policies explicitly labeled
-// for another engine via pod-migrate.io/engine), and verifies that its postCheckpoint
+// for the CRIU engine via pod-migrate.io/engine=criu), and verifies that its postCheckpoint
 // behavior is set to "stop".
 func FindLatestReadyManualStopPSP(ctx context.Context, c client.Reader, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {
-	return FindLatestReadyManualStopPSPInGroup(ctx, c, "podsnapshot.gke.io", namespace, podLabels, map[string]string{LabelSnapshotEngine: ""})
+	return findLatestReadyManualStopPSP(ctx, c, "podsnapshot.gke.io", namespace, podLabels, nil, "criu")
 }
 
 // FindLatestReadyManualStopPSPInGroup finds the latest ready manual PodSnapshotPolicy in
@@ -212,6 +212,18 @@ func FindLatestReadyManualStopPSPInGroup(
 	namespace string,
 	podLabels map[string]string,
 	requiredPolicyLabels map[string]string,
+) (*unstructured.Unstructured, error) {
+	return findLatestReadyManualStopPSP(ctx, c, group, namespace, podLabels, requiredPolicyLabels, "")
+}
+
+func findLatestReadyManualStopPSP(
+	ctx context.Context,
+	c client.Reader,
+	group string,
+	namespace string,
+	podLabels map[string]string,
+	requiredPolicyLabels map[string]string,
+	excludedEngine string,
 ) (*unstructured.Unstructured, error) {
 	if group == "" {
 		group = "podsnapshot.gke.io"
@@ -235,6 +247,10 @@ func FindLatestReadyManualStopPSPInGroup(
 
 	for i := range pspList.Items {
 		psp := &pspList.Items[i]
+
+		if excludedEngine != "" && psp.GetLabels()[LabelSnapshotEngine] == excludedEngine {
+			continue
+		}
 
 		if len(requiredPolicyLabels) > 0 {
 			pspLabels := psp.GetLabels()
