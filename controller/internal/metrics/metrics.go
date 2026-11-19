@@ -54,7 +54,8 @@ var (
 	// (budget_timeout: timed out waiting in Pending for the PodDisruptionBudget, with nothing checkpointed;
 	// engine_not_registered: the job names a snapshot engine that the controller doesn't register;
 	// restore_lost: a restored replacement's container restarted before the restore was verified;
-	// deleted: an active job was deleted before migration completed)
+	// deleted: an active job was deleted before migration completed;
+	// succeeded_without_restore includes NoCompatibleNode and PlacementTimeout, #14)
 	OutcomesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_outcomes_total",
 		Help: "Total number of completed pod migration jobs by outcome.",
@@ -63,9 +64,13 @@ var (
 	// RestoreVerdictsTotal counts restore verdicts on replacement pods (C6),
 	// by engine and verdict, so a restore the engine confirmed can be told
 	// apart from one that was inferred.
-	// Verdicts: confirmed | inferred | cold_start | failed | lost | timeout | no_compatible_node
-	// (no_compatible_node: no node could take the replacement under the
-	// engine's placement constraints, so it started cold, #14)
+	// Verdicts: confirmed | inferred | cold_start | failed | lost | timeout | no_compatible_node | placement_timeout
+	// (no_compatible_node: only for a job that an earlier version of the pod
+	// gate held, with placement on, because no node met the engine's
+	// placement constraints; its replacement started cold;
+	// placement_timeout: the replacement released with those constraints
+	// wasn't scheduled in time, so it was deleted for its owner to recreate,
+	// to start cold; #14)
 	RestoreVerdictsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_restore_verdicts_total",
 		Help: "Total number of restore verdicts on replacement pods, by engine and verdict.",
@@ -258,6 +263,13 @@ func OutcomeFor(phase pmv1alpha1.PodMigrationJobPhase, reason string) string {
 	case pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore:
 		if reason == "RestoreLost" {
 			return "restore_lost"
+		}
+		// No node took the restore under the snapshot engine's placement
+		// constraints (#14). PlacementTimeout says "timeout", but it's about
+		// placement, like NoCompatibleNode, not a restore that ran out of
+		// time.
+		if reason == "NoCompatibleNode" || reason == "PlacementTimeout" {
+			return "succeeded_without_restore"
 		}
 		if strings.Contains(strings.ToLower(reason), "timeout") {
 			return "timeout"
