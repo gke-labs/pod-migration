@@ -60,13 +60,13 @@ type Node struct {
 	demoteSeq          uint64
 	demoteInode        uint64
 	pendingDemote      bool
+	pendingVerdict     *nodeVerdict
 	unreadyReason      string
 	unreadyRemediation string
 
 	statSocketFn    func(string) (uint64, error)
 	installBundleFn func() (string, error)
 	execHostFn      func(context.Context, []string, string, ...string) (string, error)
-	bootstrapFn     func(context.Context) error
 }
 
 // NewNode wires the node worker against containerd and the local kubelet
@@ -103,33 +103,18 @@ func getSocketInode(path string) (uint64, error) {
 }
 
 // Bootstrap installs the CRIU bundle, verifies it against the host kernel, and
-// annotates the node with its capability verdict. In-memory state and
-// lastSocketInode are committed only once the Node annotation is persisted, so
-// deterministic host failures stay quiet while transient API errors retry on
-// the next ProbeReadiness tick.
+// annotates the node with its capability verdict. If the final Node annotation
+// write fails, the computed verdict is buffered in pendingVerdict so subsequent
+// ProbeReadiness ticks retry only the annotation write without re-installing
+// the bundle or re-running `criu check --all`.
 func (n *Node) Bootstrap(ctx context.Context) error {
+	startIno, _ := n.statCurrentSocket()
 	n.mu.Lock()
 	startDemoteSeq := n.demoteSeq
-	n.mu.Unlock()
-	startIno, _ := n.statCurrentSocket()
-	if n.bootstrapFn != nil {
-		if err := n.bootstrapFn(ctx); err != nil {
-			return err
-		}
-		currIno, hasCurr := n.statCurrentSocket()
-		n.mu.Lock()
-		if n.demoteSeq == startDemoteSeq && (!hasCurr || currIno == 0 || startIno == 0 || currIno == startIno) {
-			if startIno != 0 {
-				n.lastSocketInode = startIno
-			}
-			if n.ready {
-				n.poisonedInode = 0
-				n.pendingDemote = false
-			}
-		}
-		n.mu.Unlock()
-		return nil
+	if startIno != 0 && n.pendingVerdict != nil && n.pendingVerdict.ino != startIno {
+		n.pendingVerdict = nil
 	}
+	n.mu.Unlock()
 	return n.bootstrapInternal(ctx, startIno, startDemoteSeq)
 }
 
@@ -176,6 +161,11 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 
 	currIno, hasCurr := n.statCurrentSocket()
 	if v.ino != 0 && hasCurr && currIno != 0 && currIno != v.ino {
+		n.mu.Lock()
+		if n.pendingVerdict != nil && n.pendingVerdict.ino == v.ino {
+			n.pendingVerdict = nil
+		}
+		n.mu.Unlock()
 		return fmt.Errorf("containerd socket inode changed during bootstrap (%d -> %d); deferring to next probe", v.ino, currIno)
 	}
 
@@ -198,12 +188,38 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 	}
 
 	if err := annotateNode(ctx, n.Client, n.NodeName, v.version, v.reason, v.remediation, v.ready); err != nil {
+		postCurrIno, hasPostCurr := n.statCurrentSocket()
+		n.mu.Lock()
+		if v.version != "" {
+			n.version = v.version
+		}
+		demoted := concurrentDemote || (n.demoteSeq != prePatchDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, postCurrIno, hasPostCurr))
+		sameSocket := !hasPostCurr || postCurrIno == 0 || v.ino == 0 || postCurrIno == v.ino
+		if demoted {
+			n.pendingVerdict = nil
+			if v.ino != 0 && n.demoteInode == 0 && sameSocket {
+				n.lastSocketInode = v.ino
+			}
+		} else if sameSocket {
+			if v.ino != 0 {
+				n.lastSocketInode = v.ino
+			}
+			vc := v
+			n.pendingVerdict = &vc
+		} else if n.pendingVerdict != nil && n.pendingVerdict.ino == v.ino {
+			n.pendingVerdict = nil
+		}
+		n.mu.Unlock()
+		if poisoned {
+			return errors.Join(ErrContainerdCachedCRIU, err)
+		}
 		return err
 	}
 
 	postCurrIno, hasPostCurr := n.statCurrentSocket()
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.pendingVerdict = nil
 	if v.version != "" {
 		n.version = v.version
 	}
@@ -326,6 +342,7 @@ func (n *Node) demoteNodeAtInode(ctx context.Context, reason, remediation string
 	seq := n.demoteSeq
 	n.demoteInode = ino
 	n.pendingDemote = true
+	n.pendingVerdict = nil
 	if ino != 0 {
 		n.lastSocketInode = ino
 		if reason == ReasonContainerdCachedCRIU {
@@ -406,6 +423,21 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 			}
 			n.mu.Unlock()
 		}
+		return false, nil
+	}
+
+	n.mu.Lock()
+	var pv *nodeVerdict
+	if !n.ready && !n.pendingDemote && n.pendingVerdict != nil {
+		vc := *n.pendingVerdict
+		pv = &vc
+	}
+	n.mu.Unlock()
+	if pv != nil {
+		if err := n.publish(ctx, *pv); err != nil {
+			return false, err
+		}
+		return n.IsReady(), nil
 	}
 
 	return false, nil

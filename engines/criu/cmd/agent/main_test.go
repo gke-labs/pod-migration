@@ -86,15 +86,20 @@ func TestAgentManagerOptions_DisablesNodeInformerUnderGetPatchRBAC(t *testing.T)
 		t.Fatalf("NewManager: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	mgrErr := make(chan error, 1)
 	go func() {
 		mgrErr <- mgr.Start(ctx)
 	}()
 	defer func() {
 		cancel()
-		if err := <-mgrErr; err != nil && err != context.Canceled {
-			t.Errorf("mgr.Start returned unexpected error: %v", err)
+		select {
+		case err := <-mgrErr:
+			if err != nil && err != context.Canceled {
+				t.Errorf("mgr.Start returned unexpected error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Errorf("mgr.Start did not exit within 2s after context cancel")
 		}
 	}()
 
