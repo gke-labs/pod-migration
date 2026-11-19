@@ -32,7 +32,6 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
 func TestAgentManagerOptions_DisablesNodeInformerUnderGetPatchRBAC(t *testing.T) {
@@ -81,8 +80,6 @@ func TestAgentManagerOptions_DisablesNodeInformerUnderGetPatchRBAC(t *testing.T)
 		m.Add(corev1.SchemeGroupVersion.WithKind("Node"), meta.RESTScopeRoot)
 		return m, nil
 	}
-	// Ensure NewClient isn't overridden so we test controller-runtime's real cache-bypass wiring.
-	_ = apiutil.GVKForObject
 
 	mgr, err := ctrl.NewManager(&rest.Config{Host: srv.URL}, opts)
 	if err != nil {
@@ -90,9 +87,14 @@ func TestAgentManagerOptions_DisablesNodeInformerUnderGetPatchRBAC(t *testing.T)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	mgrDone := make(chan struct{})
 	go func() {
+		defer close(mgrDone)
 		_ = mgr.Start(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-mgrDone
 	}()
 
 	var n corev1.Node

@@ -148,9 +148,13 @@ func annotateNode(ctx context.Context, c client.Client, nodeName, version, reaso
 	} else {
 		if reason != "" {
 			node.Annotations[NodeAnnotationCRIUReason] = reason
+		} else {
+			delete(node.Annotations, NodeAnnotationCRIUReason)
 		}
 		if remediation != "" {
 			node.Annotations[NodeAnnotationCRIURemediation] = remediation
+		} else {
+			delete(node.Annotations, NodeAnnotationCRIURemediation)
 		}
 	}
 	return c.Patch(apiCtx, &node, patch)

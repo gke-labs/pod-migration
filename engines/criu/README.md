@@ -80,7 +80,7 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      while the node is unready; once containerd restarts, the agent detects the
      new socket inode, re-runs `Bootstrap` (`criu check` against the host kernel),
      and restores `pod-migrate.io/criu-ready: true` (verifying containerd's own
-     `PATH` lookup remains tracked in `#130`).
+     `PATH` lookup remains tracked in [#130](https://github.com/gke-labs/pod-migration/issues/130)).
    - Reconciles `PodSnapshot` work orders scheduled on its node
      (`psengine.NodeSnapshotReconciler`): drives the kubelet
      `ContainerCheckpoint` API, captures the source container's OCI spec,

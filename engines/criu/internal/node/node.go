@@ -48,11 +48,16 @@ type Node struct {
 
 	SocketPath string
 
+	// annotateMu serializes Node annotation GET/PATCH calls so concurrent
+	// Bootstrap and DemoteNode writes never land out of order on the API server.
+	annotateMu sync.Mutex
+
 	mu                 sync.Mutex
 	ready              bool
 	version            string
 	lastSocketInode    uint64
 	poisonedInode      uint64
+	demoteSeq          uint64
 	pendingDemote      bool
 	unreadyReason      string
 	unreadyRemediation string
@@ -103,22 +108,27 @@ func getSocketInode(path string) (uint64, error) {
 // the next ProbeReadiness tick.
 func (n *Node) Bootstrap(ctx context.Context) error {
 	startIno, _ := n.statCurrentSocket()
+	n.mu.Lock()
+	startDemoteSeq := n.demoteSeq
+	n.mu.Unlock()
 	if n.bootstrapFn != nil {
 		if err := n.bootstrapFn(ctx); err != nil {
 			return err
 		}
 		n.mu.Lock()
-		if startIno != 0 {
-			n.lastSocketInode = startIno
-		}
-		if n.ready {
-			n.poisonedInode = 0
-			n.pendingDemote = false
+		if n.demoteSeq == startDemoteSeq {
+			if startIno != 0 {
+				n.lastSocketInode = startIno
+			}
+			if n.ready {
+				n.poisonedInode = 0
+				n.pendingDemote = false
+			}
 		}
 		n.mu.Unlock()
 		return nil
 	}
-	return n.bootstrapInternal(ctx, startIno)
+	return n.bootstrapInternal(ctx, startIno, startDemoteSeq)
 }
 
 func (n *Node) statCurrentSocket() (uint64, bool) {
@@ -146,29 +156,41 @@ func (n *Node) isPoisonedInode(ino uint64) bool {
 }
 
 type nodeVerdict struct {
-	ready       bool
-	version     string
-	reason      string
-	remediation string
-	ino         uint64
+	ready          bool
+	version        string
+	reason         string
+	remediation    string
+	ino            uint64
+	startDemoteSeq uint64
 }
 
 func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
-	poisoned := v.ready && n.isPoisonedInode(v.ino)
+	n.annotateMu.Lock()
+	defer n.annotateMu.Unlock()
+
+	n.mu.Lock()
+	poisoned := v.ready && v.ino != 0 && v.ino == n.poisonedInode
+	concurrentDemote := v.ready && n.demoteSeq != v.startDemoteSeq && (v.ino == 0 || v.ino == n.lastSocketInode)
+	demoteReason := n.unreadyReason
+	demoteRemediation := n.unreadyRemediation
+	n.mu.Unlock()
+
 	if poisoned {
 		v.ready = false
 		v.reason = ReasonContainerdCachedCRIU
 		v.remediation = RemediationRestartContainerd
+	} else if concurrentDemote {
+		v.ready = false
+		v.reason = demoteReason
+		v.remediation = demoteRemediation
 	}
+
 	if err := annotateNode(ctx, n.Client, n.NodeName, v.version, v.reason, v.remediation, v.ready); err != nil {
 		return err
 	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	// Re-check under the lock in case DemoteNode ran concurrently with annotateNode.
-	if v.ready && v.ino != 0 && v.ino == n.poisonedInode {
-		return ErrContainerdCachedCRIU
-	}
 	n.ready = v.ready
 	if v.version != "" {
 		n.version = v.version
@@ -191,7 +213,7 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 	return nil
 }
 
-func (n *Node) bootstrapInternal(ctx context.Context, startIno uint64) error {
+func (n *Node) bootstrapInternal(ctx context.Context, startIno, startDemoteSeq uint64) error {
 	log := logf.FromContext(ctx)
 
 	getCtx, cancel := context.WithTimeout(ctx, nodeAPITimeout)
@@ -203,10 +225,11 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno uint64) error {
 	}
 	if err := CheckContainerdVersion(nodeObj.Status.NodeInfo.ContainerRuntimeVersion); err != nil {
 		pubErr := n.publish(ctx, nodeVerdict{
-			ready:       false,
-			reason:      "unsupported containerd version: " + err.Error(),
-			remediation: "upgrade containerd",
-			ino:         startIno,
+			ready:          false,
+			reason:         "unsupported containerd version: " + err.Error(),
+			remediation:    "upgrade containerd",
+			ino:            startIno,
+			startDemoteSeq: startDemoteSeq,
 		})
 		return errors.Join(err, pubErr)
 	}
@@ -217,20 +240,22 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno uint64) error {
 	version, err := installFn()
 	if err != nil {
 		pubErr := n.publish(ctx, nodeVerdict{
-			ready:       false,
-			reason:      "criu bundle install failed: " + err.Error(),
-			remediation: "check node disk space and writable host paths",
-			ino:         startIno,
+			ready:          false,
+			reason:         "criu bundle install failed: " + err.Error(),
+			remediation:    "check node disk space and writable host paths",
+			ino:            startIno,
+			startDemoteSeq: startDemoteSeq,
 		})
 		return errors.Join(err, pubErr)
 	}
 	if n.isPoisonedInode(startIno) {
 		pubErr := n.publish(ctx, nodeVerdict{
-			ready:       false,
-			version:     version,
-			reason:      ReasonContainerdCachedCRIU,
-			remediation: RemediationRestartContainerd,
-			ino:         startIno,
+			ready:          false,
+			version:        version,
+			reason:         ReasonContainerdCachedCRIU,
+			remediation:    RemediationRestartContainerd,
+			ino:            startIno,
+			startDemoteSeq: startDemoteSeq,
 		})
 		return errors.Join(ErrContainerdCachedCRIU, pubErr)
 	}
@@ -250,11 +275,12 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno uint64) error {
 		remediation = "check host kernel support for CRIU"
 	}
 	return n.publish(ctx, nodeVerdict{
-		ready:       ok,
-		version:     version,
-		reason:      reason,
-		remediation: remediation,
-		ino:         startIno,
+		ready:          ok,
+		version:        version,
+		reason:         reason,
+		remediation:    remediation,
+		ino:            startIno,
+		startDemoteSeq: startDemoteSeq,
 	})
 }
 
@@ -269,6 +295,8 @@ func (n *Node) demoteNodeAtInode(ctx context.Context, reason, remediation string
 	n.ready = false
 	n.unreadyReason = reason
 	n.unreadyRemediation = remediation
+	n.demoteSeq++
+	seq := n.demoteSeq
 	n.pendingDemote = true
 	if ino != 0 {
 		n.lastSocketInode = ino
@@ -279,11 +307,13 @@ func (n *Node) demoteNodeAtInode(ctx context.Context, reason, remediation string
 	ver := n.version
 	n.mu.Unlock()
 
+	n.annotateMu.Lock()
+	defer n.annotateMu.Unlock()
 	if err := annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false); err != nil {
 		return err
 	}
 	n.mu.Lock()
-	if !n.ready {
+	if !n.ready && n.demoteSeq == seq {
 		n.pendingDemote = false
 	}
 	n.mu.Unlock()
@@ -306,6 +336,7 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 	isReady := n.ready
 	lastIno := n.lastSocketInode
 	pendingDemote := n.pendingDemote
+	seq := n.demoteSeq
 	ver := n.version
 	reason := n.unreadyReason
 	remediation := n.unreadyRemediation
@@ -326,14 +357,21 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 	}
 
 	if pendingDemote {
-		if err := annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false); err != nil {
-			return false, err
-		}
+		n.annotateMu.Lock()
+		defer n.annotateMu.Unlock()
 		n.mu.Lock()
-		if !n.ready {
-			n.pendingDemote = false
-		}
+		stillPending := !n.ready && n.pendingDemote && n.demoteSeq == seq
 		n.mu.Unlock()
+		if stillPending {
+			if err := annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false); err != nil {
+				return false, err
+			}
+			n.mu.Lock()
+			if !n.ready && n.demoteSeq == seq {
+				n.pendingDemote = false
+			}
+			n.mu.Unlock()
+		}
 	}
 
 	return false, nil

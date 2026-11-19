@@ -619,6 +619,65 @@ func TestNode_DemotePatchFailureRetriedAndPoisonedInodeBlocked(t *testing.T) {
 	}
 }
 
+func TestNode_ConcurrentBootstrapCannotOverwriteDemotion(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		Status: corev1.NodeStatus{
+			NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+	execStarted := make(chan struct{})
+	allowExecFinish := make(chan struct{})
+
+	var nd *Node
+	nd = &Node{
+		Client:          c,
+		NodeName:        "test-node",
+		SocketPath:      "/run/containerd/containerd.sock",
+		statSocketFn:    func(string) (uint64, error) { return 3030, nil },
+		installBundleFn: func() (string, error) { return "v3.19", nil },
+		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+			close(execStarted)
+			<-allowExecFinish
+			return "Looks good.\n", nil
+		},
+	}
+
+	bootDone := make(chan error, 1)
+	go func() {
+		bootDone <- nd.Bootstrap(ctx)
+	}()
+
+	<-execStarted
+	// DemoteNode runs while Bootstrap is in flight on the same socket inode.
+	if err := nd.DemoteNode(ctx, "custom-demotion", ""); err != nil {
+		t.Fatalf("DemoteNode: %v", err)
+	}
+	close(allowExecFinish)
+
+	if err := <-bootDone; err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if nd.IsReady() {
+		t.Fatal("concurrent DemoteNode must not be overwritten back to ready=true")
+	}
+	var cur corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+		t.Fatalf("expected criu-ready=false on API server, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+	}
+	if _, exists := cur.Annotations[NodeAnnotationCRIURemediation]; exists {
+		t.Fatalf("expected empty remediation deleted, got %q", cur.Annotations[NodeAnnotationCRIURemediation])
+	}
+}
+
 func TestNode_UnsupportedContainerdVersionDoesNotReprobeWithoutRestart(t *testing.T) {
 	ctx := context.Background()
 	scheme := newTestScheme(t)
