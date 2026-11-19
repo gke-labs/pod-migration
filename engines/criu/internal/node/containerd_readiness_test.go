@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"os"
@@ -1062,6 +1063,37 @@ func TestDefaultContainerdInspector_ProductionWiring(t *testing.T) {
 	insp := NewDefaultContainerdInspector(fakeExecHost)
 	insp.ProcRootFormat = fakeRoot
 
+	// On Linux, test the real production insp.GetPID by serving a live test unix socket.
+	// On non-Linux, mock GetPID.
+	sockPath := "/test.sock"
+	if runtime.GOOS == "linux" {
+		sockPath = filepath.Join(fakeRoot, "test.sock")
+		l, err := net.Listen("unix", sockPath)
+		if err != nil {
+			t.Fatalf("listen unix: %v", err)
+		}
+		defer l.Close()
+		go func() {
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+			}
+		}()
+	} else {
+		insp.GetPID = func(sockPath string) (int, error) {
+			return 1234, nil
+		}
+	}
+	insp.ReadEnviron = func(pid int) ([]string, error) {
+		if runtime.GOOS == "linux" && pid != os.Getpid() {
+			return nil, fmt.Errorf("ReadEnviron expected pid %d, got %d", os.Getpid(), pid)
+		}
+		return []string{"PATH=/isolated/bin"}, nil
+	}
+
 	// 1. StatContainerdFile: verify it resolves through fakeRoot, NOT host os.Stat
 	fi, err := insp.StatContainerdFile(1234, "/isolated/bin/criu")
 	if err != nil {
@@ -1112,6 +1144,18 @@ version = 2
 	_ = os.Chmod(configFile, 0o644)
 
 	// 4. Test CheckContainerdReadiness end-to-end with the production inspector wired to fakeRoot
+	// 4a. Assert verdict when fakeRoot has enable_criu = false:
+	// If production inspector reads "/" instead of procRoot, it falls back to host fs / defaults,
+	// returning ok=true and failing this sabotage check.
+	ok, reason, _, err := CheckContainerdReadiness(context.Background(), insp, sockPath)
+	if err != nil {
+		t.Fatalf("CheckContainerdReadiness (disabled): %v", err)
+	}
+	if ok || reason != ReasonCRIUDisabledByConfig {
+		t.Fatalf("expected CheckContainerdReadiness ok=false, reason=%q; got ok=%v, reason=%q", ReasonCRIUDisabledByConfig, ok, reason)
+	}
+
+	// 4b. Update fakeRoot config to enable_criu = true and assert ok=true
 	validConfig := `
 version = 2
 [plugins."io.containerd.grpc.v1.cri"]
@@ -1121,14 +1165,7 @@ version = 2
 		t.Fatal(err)
 	}
 
-	insp.GetPID = func(sockPath string) (int, error) {
-		return 1234, nil
-	}
-	insp.ReadEnviron = func(pid int) ([]string, error) {
-		return []string{"PATH=/isolated/bin"}, nil
-	}
-
-	ok, reason, remediation, err := CheckContainerdReadiness(context.Background(), insp, "/test.sock")
+	ok, reason, remediation, err := CheckContainerdReadiness(context.Background(), insp, sockPath)
 	if err != nil {
 		t.Fatalf("CheckContainerdReadiness error: %v", err)
 	}
@@ -1137,6 +1174,38 @@ version = 2
 	}
 	if atomic.LoadInt32(&execHostCalls) != 1 {
 		t.Fatalf("expected execHostCalls == 1, got %d", atomic.LoadInt32(&execHostCalls))
+	}
+}
+
+func TestDefaultContainerdInspector_GetPID(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping linux /proc tests on non-linux OS")
+	}
+
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "test.sock")
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer l.Close()
+
+	go func() {
+		conn, err := l.Accept()
+		if err == nil {
+			defer conn.Close()
+			buf := make([]byte, 1)
+			_, _ = conn.Read(buf)
+		}
+	}()
+
+	insp := NewDefaultContainerdInspector(nil)
+	pid, err := insp.GetPID(sockPath)
+	if err != nil {
+		t.Fatalf("insp.GetPID: %v", err)
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("expected pid %d, got %d", os.Getpid(), pid)
 	}
 }
 
