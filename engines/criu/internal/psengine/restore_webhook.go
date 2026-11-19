@@ -246,7 +246,7 @@ func injectHolder(pod *corev1.Pod, holderImage, psNameAnnotation string) (bool, 
 	// The app container starts as the holder wrapper; at runtime it reads
 	// ps-name from the downward-API file and either holds (agent restores a
 	// sibling) or execs the original entrypoint (cold start).
-	app.Command = append(holderWrapCommand(psNameAnnotation), orig...)
+	app.Command = append(holderWrapCommand(psNameAnnotation, pod.Spec.TerminationGracePeriodSeconds), orig...)
 	app.Args = nil
 
 	if pod.Annotations == nil {
@@ -256,13 +256,29 @@ func injectHolder(pod *corev1.Pod, holderImage, psNameAnnotation string) (bool, 
 	return true, "injected"
 }
 
+// maxGracePeriodSeconds bounds the termination grace period passed to the holder
+// wrapper (24 hours). Flag parsing in flag.Duration parses nanoseconds into int64,
+// so absurdly large grace periods (e.g. >= 10,000,000,000s) allowed by the Kubernetes
+// API would otherwise overflow time.Duration and fail holder container startup.
+const maxGracePeriodSeconds = 86400 // 24 hours
+
 // holderWrapCommand returns the wrapper part of the app command, ending in
 // "--". It names the restore-order annotation only when that isn't the
-// holder's default.
-func holderWrapCommand(psNameAnnotation string) []string {
+// holder's default, and specifies --grace-period when explicitly configured on
+// the pod spec and differing from the default (30s).
+func holderWrapCommand(psNameAnnotation string, gracePeriod *int64) []string {
 	cmd := []string{holdMount + "/holder", "wrap"}
 	if psNameAnnotation != holderDefaultPSNameAnnotation {
 		cmd = append(cmd, "--ps-name-annotation="+psNameAnnotation)
+	}
+	if gracePeriod != nil && *gracePeriod != 30 {
+		gp := *gracePeriod
+		if gp > maxGracePeriodSeconds {
+			gp = maxGracePeriodSeconds
+		} else if gp < 0 {
+			gp = 0
+		}
+		cmd = append(cmd, fmt.Sprintf("--grace-period=%ds", gp))
 	}
 	return append(cmd, infoMount+"/"+annotationsRel, "--")
 }
