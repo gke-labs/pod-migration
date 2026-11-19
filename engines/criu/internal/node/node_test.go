@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/leases"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -449,4 +450,120 @@ func TestNode_ProbeReadinessReturnsFalseWhenVerifyCRIUFalse(t *testing.T) {
 	if ready {
 		t.Fatal("expected ProbeReadiness to return false when verifyCRIU was false")
 	}
+}
+
+func TestNode_SweepOrphanRestores_FiltersOtherNodesAndTerminatingPods(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	now := metav1.Now()
+	// Pod 1: on node-a, living
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-living",
+			Namespace: "default",
+			UID:       types.UID("living-uid"),
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "living-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+		},
+	}
+	// Pod 2: on node-b (other node), living
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-other-node",
+			Namespace: "default",
+			UID:       types.UID("other-node-uid"),
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "other-node-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-b",
+		},
+	}
+	// Pod 3: on node-a, terminating
+	pod3 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pod-terminating",
+			Namespace:         "default",
+			UID:               types.UID("terminating-uid"),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"test.io/keep"},
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "terminating-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod1, pod2, pod3).Build()
+
+	var gotLivingUIDs map[string]bool
+	var gotLivingSnaps map[string]bool
+
+	r := &restorer{
+		pmRootDir: t.TempDir(),
+	}
+	// Stub listLeasesFn to return empty
+	r.listLeasesFn = func(ctx context.Context) ([]leases.Lease, error) {
+		return nil, nil
+	}
+
+	nd := &Node{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		NodeName:  "node-a",
+		Restorer:  r,
+	}
+
+	// Intercept SweepOrphans via a custom wrapper or inspect after
+	// Since SweepOrphans is called with livingUIDs and livingSnaps, we can test it directly:
+	r.listLeasesFn = func(ctx context.Context) ([]leases.Lease, error) {
+		// Just capture or verify via lease behavior
+		return []leases.Lease{
+			{ID: "lease-pm-living", Labels: map[string]string{"pod-migrate.io/pod-uid": "living-uid"}},
+			{ID: "lease-pm-other-node", Labels: map[string]string{"pod-migrate.io/pod-uid": "other-node-uid"}},
+			{ID: "lease-pm-terminating", Labels: map[string]string{"pod-migrate.io/pod-uid": "terminating-uid"}},
+		}, nil
+	}
+
+	var swept []string
+	r.deleteLeaseFn = func(ctx context.Context, lid string) error {
+		swept = append(swept, lid)
+		return nil
+	}
+	r.unmountTreeFn = func(dir string) error { return nil }
+	r.removeSnapshotFn = func(ctx context.Context, key string) error { return nil }
+	r.runcDeleteFn = func(ctx context.Context, cid string) error { return nil }
+
+	if err := nd.SweepOrphanRestores(ctx); err != nil {
+		t.Fatalf("SweepOrphanRestores: %v", err)
+	}
+
+	sweptSet := make(map[string]bool)
+	for _, s := range swept {
+		sweptSet[s] = true
+	}
+
+	// lease-pm-living belongs to living pod on node-a -> must NOT be swept
+	if sweptSet["lease-pm-living"] {
+		t.Errorf("living pod on node-a was swept")
+	}
+	// lease-pm-other-node belongs to pod on node-b -> must be swept as orphan on node-a
+	if !sweptSet["lease-pm-other-node"] {
+		t.Errorf("pod on other node was not swept")
+	}
+	// lease-pm-terminating belongs to terminating pod -> must be swept as orphan
+	if !sweptSet["lease-pm-terminating"] {
+		t.Errorf("terminating pod was not swept")
+	}
+
+	_ = gotLivingUIDs
+	_ = gotLivingSnaps
 }

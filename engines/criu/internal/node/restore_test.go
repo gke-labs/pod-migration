@@ -571,7 +571,10 @@ func TestCleanup_OrderAndTeardown(t *testing.T) {
 		},
 	}
 
-	notes := r.cleanup(context.Background(), "test-cleanup", "", "", false)
+	notes, err := r.cleanup(context.Background(), "test-cleanup", "", "", false)
+	if err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
 	if len(notes) > 0 {
 		t.Fatalf("unexpected cleanup notes: %v", notes)
 	}
@@ -594,6 +597,110 @@ func TestCleanup_OrderAndTeardown(t *testing.T) {
 	// Bundle directory should be removed.
 	if _, err := os.Stat(bundleDir); !os.IsNotExist(err) {
 		t.Errorf("bundle directory still exists after cleanup: %v", err)
+	}
+}
+
+func TestCleanup_StopsOnFirstFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-test-fail-order"
+	bundleDir := filepath.Join(tmpDir, "bundles", id)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. runc delete failure must stop immediately and NOT unmount or delete snapshot/lease
+	unmounted := false
+	snapRemoved := false
+	leaseDeleted := false
+	r1 := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			return errors.New("runc delete in D-state")
+		},
+		unmountTreeFn: func(dir string) error {
+			unmounted = true
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			snapRemoved = true
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			leaseDeleted = true
+			return nil
+		},
+	}
+	err := r1.Cleanup(context.Background(), "test-fail-order")
+	if err == nil {
+		t.Fatal("expected cleanup to return error on runc delete failure, got nil")
+	}
+	if unmounted || snapRemoved || leaseDeleted {
+		t.Fatalf("subsequent steps executed after runc delete failed: unmounted=%v, snapRemoved=%v, leaseDeleted=%v",
+			unmounted, snapRemoved, leaseDeleted)
+	}
+
+	// 2. unmount failure must stop immediately and NOT remove snapshot or lease
+	snapRemoved2 := false
+	leaseDeleted2 := false
+	r2 := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			return errors.New("mount busy")
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			snapRemoved2 = true
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			leaseDeleted2 = true
+			return nil
+		},
+	}
+	err2 := r2.Cleanup(context.Background(), "test-fail-order")
+	if err2 == nil {
+		t.Fatal("expected cleanup to return error on unmount failure, got nil")
+	}
+	if snapRemoved2 || leaseDeleted2 {
+		t.Fatalf("subsequent steps executed after unmount failed: snapRemoved=%v, leaseDeleted=%v",
+			snapRemoved2, leaseDeleted2)
+	}
+}
+
+func TestCleanup_RealRuncDeleteAndKillArgv(t *testing.T) {
+	var executedCommands [][]string
+	r := &restorer{
+		pmRootDir: t.TempDir(),
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			executedCommands = append(executedCommands, append([]string{name}, args...))
+			return "", nil
+		},
+	}
+
+	// Test Cleanup argv
+	if err := r.Cleanup(context.Background(), "test-cmd"); err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+	if len(executedCommands) != 1 {
+		t.Fatalf("expected 1 execHost call, got %d", len(executedCommands))
+	}
+	wantDel := []string{"runc", "--root", "/run/pod-migrate/runc", "delete", "-f", "pm-test-cmd"}
+	if strings.Join(executedCommands[0], " ") != strings.Join(wantDel, " ") {
+		t.Errorf("runc delete argv = %v, want %v", executedCommands[0], wantDel)
+	}
+
+	// Test Signal argv
+	if err := r.Signal(context.Background(), "test-cmd", 15); err != nil {
+		t.Fatalf("signal failed: %v", err)
+	}
+	if len(executedCommands) != 2 {
+		t.Fatalf("expected 2 execHost calls, got %d", len(executedCommands))
+	}
+	wantKill := []string{"runc", "--root", "/run/pod-migrate/runc", "kill", "pm-test-cmd", "15"}
+	if strings.Join(executedCommands[1], " ") != strings.Join(wantKill, " ") {
+		t.Errorf("runc kill argv = %v, want %v", executedCommands[1], wantKill)
 	}
 }
 
@@ -836,6 +943,26 @@ func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
 						"pod-migrate.io/pod-uid": "live-pod-uid",
 					},
 				},
+				// Lease without lease-pm- prefix must be ignored (unpinned check)
+				{
+					ID: "lease-other-service-dead",
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "dead-pod-uid",
+					},
+				},
+				// Lease with snapshot-name label
+				{
+					ID: "lease-pm-psengine-snap-orphan",
+					Labels: map[string]string{
+						"pod-migrate.io/snapshot-name": "dead-snap",
+					},
+				},
+				{
+					ID: "lease-pm-psengine-snap-living",
+					Labels: map[string]string{
+						"pod-migrate.io/snapshot-name": "living-snap",
+					},
+				},
 			}, nil
 		},
 	}
@@ -848,7 +975,7 @@ func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
 		t.Fatalf("SweepOrphans failed: %v", err)
 	}
 
-	// Should sweep orphan-lease and orphan-snap, but NOT living-lease or living-snap
+	// Should sweep orphan-lease, orphan-snap, and snap-orphan, but NOT living-lease, living-snap, snap-living, or other-service
 	sweptSet := make(map[string]bool)
 	for _, s := range swept {
 		sweptSet[s] = true
@@ -859,10 +986,155 @@ func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
 	if !sweptSet["psengine-orphan-snap"] {
 		t.Errorf("orphan bundle was not swept; swept = %v", swept)
 	}
+	if !sweptSet["psengine-snap-orphan"] {
+		t.Errorf("snapshot-name orphan lease was not swept; swept = %v", swept)
+	}
 	if sweptSet["psengine-living-lease"] {
 		t.Errorf("living lease was incorrectly swept; swept = %v", swept)
 	}
 	if sweptSet["psengine-living-snap"] {
 		t.Errorf("living bundle was incorrectly swept; swept = %v", swept)
+	}
+	if sweptSet["psengine-snap-living"] {
+		t.Errorf("living snapshot-name lease was incorrectly swept; swept = %v", swept)
+	}
+	if sweptSet["other-service-dead"] {
+		t.Errorf("non-pm lease was incorrectly swept; swept = %v", swept)
+	}
+}
+
+func TestSweepOrphans_SkipsInflightRestores(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Stage an orphaned bundle dir for an in-flight migration
+	bundleInflight := filepath.Join(tmpDir, "bundles", "pm-psengine-inflight-mig")
+	if err := os.MkdirAll(bundleInflight, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var cleaned []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			cleaned = append(cleaned, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			cleaned = append(cleaned, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+		listLeasesFn: func(ctx context.Context) ([]leases.Lease, error) {
+			return []leases.Lease{
+				{
+					ID: "lease-pm-psengine-inflight-mig",
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "inflight-pod-uid",
+					},
+				},
+			}, nil
+		},
+	}
+
+	// Mark in flight
+	r.markInflight("psengine-inflight-mig", "pm-psengine-inflight-mig", "inflight-pod-uid")
+
+	// Neither pod UID nor snapshot is in living sets (simulating restore starting before pod is visible or during sweep)
+	livingUIDs := map[string]bool{}
+	livingSnaps := map[string]bool{}
+
+	swept, err := r.SweepOrphans(context.Background(), livingUIDs, livingSnaps)
+	if err != nil {
+		t.Fatalf("SweepOrphans failed: %v", err)
+	}
+
+	if len(swept) > 0 {
+		t.Fatalf("in-flight restore was swept! swept = %v", swept)
+	}
+	if len(cleaned) > 0 {
+		t.Fatalf("cleanup called on in-flight restore! cleaned = %v", cleaned)
+	}
+}
+
+func TestRestore_FailureInsidePrepareRootfsCleansUp(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-fail-prep"
+
+	var cleaned []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      &specs.Spec{Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "sb1"}},
+				ImageName: "redis:7",
+			}, nil
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-pod123.slice/c1.scope\n"), nil
+		},
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			cleaned = append(cleaned, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			cleaned = append(cleaned, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bDir, diffTar string, labels map[string]string) (string, error) {
+			return "", errors.New("containerd prepare snapshot failed: OOM")
+		},
+	}
+
+	in := restoreInputs{
+		MigrationName: "fail-prep",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  "pod-uid-456",
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec: &specs.Spec{
+			Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "src-sb"},
+		},
+	}
+
+	_, err := r.restore(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected restore to fail when prepareRootfs fails, got nil")
+	}
+
+	// Verify that teardown ran on restore failure during prepareRootfs
+	hasUnmount := false
+	hasSnapRem := false
+	hasLeaseDel := false
+	for _, cl := range cleaned {
+		if cl == "unmount:"+filepath.Join(tmpDir, "bundles", id) {
+			hasUnmount = true
+		}
+		if cl == "snapshot-remove:"+id {
+			hasSnapRem = true
+		}
+		if cl == "lease-delete:lease-"+id {
+			hasLeaseDel = true
+		}
+	}
+	if !hasUnmount || !hasSnapRem || !hasLeaseDel {
+		t.Fatalf("missing failure teardown actions when prepFn fails; cleaned = %v", cleaned)
 	}
 }

@@ -213,11 +213,16 @@ func (r *Node) PSEngineCleanup(ctx context.Context, snapshotName string) error {
 	if r.Restorer == nil {
 		return nil
 	}
-	notes := r.Restorer.cleanup(ctx, migrationName, "", "", false)
-	if len(notes) > 0 {
-		logf.FromContext(ctx).Info("restore cleanup notes", "migration", migrationName, "notes", notes)
+	return r.Restorer.Cleanup(ctx, migrationName)
+}
+
+// PSEngineSignal sends a signal (e.g. 15 / SIGTERM) to the restored runc container.
+func (r *Node) PSEngineSignal(ctx context.Context, snapshotName string, sig int) error {
+	migrationName := "psengine-" + snapshotName
+	if r.Restorer == nil {
+		return nil
 	}
-	return nil
+	return r.Restorer.Signal(ctx, migrationName, sig)
 }
 
 // PSEngineCPUFamily reports the node's CPU model for the archive manifest

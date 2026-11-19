@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -65,11 +66,44 @@ type restorer struct {
 	removeSnapshotFn func(context.Context, string) error
 	deleteLeaseFn    func(context.Context, string) error
 	runcDeleteFn     func(context.Context, string) error
+	runcSignalFn     func(context.Context, string, int) error
 	listLeasesFn     func(context.Context) ([]leases.Lease, error)
 	readProcCgroupFn func(pid int) ([]byte, error)
 	pmRootDir        string
 	criuConfDirPath  string
 	nsenterBin       string
+
+	inflight sync.Map
+}
+
+func (r *restorer) markInflight(keys ...string) {
+	if r == nil {
+		return
+	}
+	for _, k := range keys {
+		if k != "" {
+			r.inflight.Store(k, true)
+		}
+	}
+}
+
+func (r *restorer) unmarkInflight(keys ...string) {
+	if r == nil {
+		return
+	}
+	for _, k := range keys {
+		if k != "" {
+			r.inflight.Delete(k)
+		}
+	}
+}
+
+func (r *restorer) isInflight(key string) bool {
+	if r == nil || key == "" {
+		return false
+	}
+	_, ok := r.inflight.Load(key)
+	return ok
 }
 
 func (r *restorer) rootDir() string {
@@ -260,7 +294,7 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 // prepareRootfs makes a fresh writable snapshot of the app image and applies
 // the checkpoint's rootfs-diff on top. Returns the mounted rootfs path.
 // Labels are attached to the containerd lease to bind it to the target pod UID.
-func (r *restorer) prepareRootfs(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (string, error) {
+func (r *restorer) prepareRootfs(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (rootfs string, retErr error) {
 	img, err := r.cclient.GetImage(ctx, imageName)
 	if err != nil {
 		return "", fmt.Errorf("get image %s: %w", imageName, err)
@@ -284,19 +318,36 @@ func (r *restorer) prepareRootfs(ctx context.Context, imageName, key, bundleDir,
 	if err != nil {
 		return "", fmt.Errorf("create containerd lease: %w", err)
 	}
+	leaseCreated := true
 	ctx = leases.WithLease(ctx, lease.ID)
+
+	defer func() {
+		if retErr != nil {
+			if rootfs != "" {
+				_ = r.unmount(rootfs)
+			}
+			if sn != nil {
+				_ = sn.Remove(ctx, key)
+			}
+			if leaseCreated && lm != nil {
+				_ = lm.Delete(ctx, leases.Lease{ID: "lease-" + key})
+			}
+			_ = os.RemoveAll(bundleDir)
+		}
+	}()
 
 	mounts, err := sn.Prepare(ctx, key, parent)
 	if err != nil {
 		return "", fmt.Errorf("snapshot prepare: %w", err)
 	}
-	rootfs := filepath.Join(bundleDir, "rootfs")
-	if err := os.MkdirAll(rootfs, 0o755); err != nil {
+	targetRootfs := filepath.Join(bundleDir, "rootfs")
+	if err := os.MkdirAll(targetRootfs, 0o755); err != nil {
 		return "", err
 	}
-	if err := mount.All(mounts, rootfs); err != nil {
+	if err := mount.All(mounts, targetRootfs); err != nil {
 		return "", fmt.Errorf("mount rootfs: %w", err)
 	}
+	rootfs = targetRootfs
 	if _, err := os.Stat(rootfsDiffTar); err == nil {
 		f, err := os.Open(rootfsDiffTar)
 		if err != nil {
@@ -398,9 +449,28 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	id := "pm-" + in.MigrationName
 	bundleDir := filepath.Join(r.rootDir(), "bundles", id)
 
+	// In-flight tracking: mark this migration and pod as active so the orphan sweep
+	// does not race and tear down an in-progress restore.
+	r.markInflight(in.MigrationName, id, in.TargetPodUID)
+	defer r.unmarkInflight(in.MigrationName, id, in.TargetPodUID)
+
 	// Clean up any leftover runc container, mounts, snapshot, and lease from a
 	// previous failed attempt (or M0 finding C double restore) before preparing a new rootfs.
-	r.cleanup(ctx, in.MigrationName, "", "", false)
+	cleanNotes, _ := r.cleanup(ctx, in.MigrationName, "", "", false)
+	if len(cleanNotes) > 0 {
+		out.Notes = append(out.Notes, cleanNotes...)
+	}
+
+	// Failure teardown: if any subsequent step fails, clean up the bundle, container,
+	// mounts, snapshot, and lease so failed/abandoned restores do not leak resources.
+	cleanupOnErr := true
+	defer func() {
+		if cleanupOnErr {
+			if failureCleanNotes, _ := r.cleanup(ctx, in.MigrationName, "", "", false); len(failureCleanNotes) > 0 {
+				out.Notes = append(out.Notes, failureCleanNotes...)
+			}
+		}
+	}()
 
 	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
 		return out, err
@@ -421,9 +491,11 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	if r.prepareRootfsFn != nil {
 		prepFn = r.prepareRootfsFn
 	}
+	snapName := strings.TrimPrefix(in.MigrationName, "psengine-")
 	leaseLabels := map[string]string{
 		"pod-migrate.io/pod-uid":        in.TargetPodUID,
 		"pod-migrate.io/migration-name": in.MigrationName,
+		"pod-migrate.io/snapshot-name":  snapName,
 		"pod-migrate.io/pod-namespace":  in.PodNamespace,
 		"pod-migrate.io/pod-name":       in.TargetPod,
 	}
@@ -432,17 +504,6 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		return out, err
 	}
 	adaptParams.RootfsPath = rootfs
-
-	// Failure teardown: if any subsequent step fails, clean up the bundle, container,
-	// mounts, snapshot, and lease so failed/abandoned restores do not leak resources.
-	cleanupOnErr := true
-	defer func() {
-		if cleanupOnErr {
-			if cleanNotes := r.cleanup(ctx, in.MigrationName, "", "", false); len(cleanNotes) > 0 {
-				out.Notes = append(out.Notes, cleanNotes...)
-			}
-		}
-	}()
 
 	spec := *in.SrcSpec // shallow copy; AdaptSpec rewrites in place
 	notes, err := AdaptSpec(&spec, adaptParams)
@@ -601,37 +662,42 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 // 3. Remove containerd snapshot
 // 4. Delete containerd lease
 // 5. Remove bundle directory
+//
+// If any step fails, cleanup stops immediately and returns the error so caller
+// can retry and resources are not partially deleted while live processes still run.
 // keepContainer=true leaves the restored process + rootfs alive and only GCs checkpoint material.
-func (r *restorer) cleanup(ctx context.Context, migrationName, checkpointDir, tarPath string, keepContainer bool) []string {
+func (r *restorer) cleanup(ctx context.Context, migrationName, checkpointDir, tarPath string, keepContainer bool) ([]string, error) {
 	var notes []string
 	id := "pm-" + migrationName
 	bundleDir := filepath.Join(r.rootDir(), "bundles", id)
 	if !keepContainer {
 		// 1. Delete runc container
 		if r.runcDeleteFn != nil {
-			if err := r.runcDeleteFn(ctx, id); err != nil {
-				notes = append(notes, "runc delete: "+err.Error())
+			if err := r.runcDeleteFn(ctx, id); err != nil && !errdefs.IsNotFound(err) {
+				return notes, fmt.Errorf("runc delete: %w", err)
 			}
 		} else {
 			if out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id); err != nil {
-				notes = append(notes, "runc delete: "+truncate(out, 200))
+				if !strings.Contains(out, "does not exist") && !strings.Contains(out, "no such container") {
+					return notes, fmt.Errorf("runc delete: %s", truncate(out, 200))
+				}
 			}
 		}
 
 		// 2. Unmount all mounts under bundleDir (deepest first)
 		if err := r.unmount(bundleDir); err != nil {
-			notes = append(notes, "unmount bundle: "+err.Error())
+			return notes, fmt.Errorf("unmount bundle: %w", err)
 		}
 
 		// 3. Remove containerd snapshot
 		if r.removeSnapshotFn != nil {
 			if err := r.removeSnapshotFn(ctx, id); err != nil && !errdefs.IsNotFound(err) {
-				notes = append(notes, "snapshot remove: "+err.Error())
+				return notes, fmt.Errorf("snapshot remove: %w", err)
 			}
 		} else if r.cclient != nil {
 			if sn := r.cclient.SnapshotService("overlayfs"); sn != nil {
 				if err := sn.Remove(ctx, id); err != nil && !errdefs.IsNotFound(err) {
-					notes = append(notes, "snapshot remove: "+err.Error())
+					return notes, fmt.Errorf("snapshot remove: %w", err)
 				}
 			}
 		}
@@ -640,45 +706,53 @@ func (r *restorer) cleanup(ctx context.Context, migrationName, checkpointDir, ta
 		leaseID := "lease-" + id
 		if r.deleteLeaseFn != nil {
 			if err := r.deleteLeaseFn(ctx, leaseID); err != nil && !errdefs.IsNotFound(err) {
-				notes = append(notes, "lease remove: "+err.Error())
+				return notes, fmt.Errorf("lease remove: %w", err)
 			}
 		} else if r.cclient != nil {
 			if lm := r.cclient.LeasesService(); lm != nil {
 				if err := lm.Delete(ctx, leases.Lease{ID: leaseID}); err != nil && !errdefs.IsNotFound(err) {
-					notes = append(notes, "lease remove: "+err.Error())
+					return notes, fmt.Errorf("lease remove: %w", err)
 				}
 			}
 		}
 
 		// 5. Remove bundle directory
 		if err := os.RemoveAll(bundleDir); err != nil {
-			notes = append(notes, "rm bundle: "+err.Error())
+			return notes, fmt.Errorf("rm bundle: %w", err)
 		}
 	}
 	if checkpointDir != "" {
 		if err := os.RemoveAll(checkpointDir); err != nil {
-			notes = append(notes, "rm checkpoint dir: "+err.Error())
+			return notes, fmt.Errorf("rm checkpoint dir: %w", err)
 		}
 	}
 	if tarPath != "" {
 		if err := os.Remove(tarPath); err != nil && !os.IsNotExist(err) {
-			notes = append(notes, "rm tar: "+err.Error())
+			return notes, fmt.Errorf("rm tar: %w", err)
 		}
 	}
-	return notes
+	return notes, nil
 }
 
 // Cleanup performs complete teardown of restore artifacts for the named migration.
 func (r *restorer) Cleanup(ctx context.Context, migrationName string) error {
-	notes := r.cleanup(ctx, migrationName, "", "", false)
-	var errNotes []string
-	for _, n := range notes {
-		if strings.Contains(n, ":") && !strings.Contains(n, "not found") {
-			errNotes = append(errNotes, n)
-		}
+	_, err := r.cleanup(ctx, migrationName, "", "", false)
+	return err
+}
+
+// Signal sends a signal (e.g. 15 / SIGTERM) to the restored runc container.
+func (r *restorer) Signal(ctx context.Context, migrationName string, sig int) error {
+	id := "pm-" + migrationName
+	if r.runcSignalFn != nil {
+		return r.runcSignalFn(ctx, id, sig)
 	}
-	if len(errNotes) > 0 {
-		return fmt.Errorf("cleanup errors: %s", strings.Join(errNotes, "; "))
+	sigStr := strconv.Itoa(sig)
+	out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "kill", id, sigStr)
+	if err != nil {
+		if strings.Contains(out, "does not exist") || strings.Contains(out, "not running") || strings.Contains(out, "no such container") {
+			return nil
+		}
+		return fmt.Errorf("runc kill: %s", truncate(out, 200))
 	}
 	return nil
 }
@@ -715,6 +789,12 @@ func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapsh
 		migName := strings.TrimPrefix(l.ID, "lease-pm-")
 		podUID := l.Labels["pod-migrate.io/pod-uid"]
 		snapName := l.Labels["pod-migrate.io/snapshot-name"]
+
+		// Never sweep a restore that is currently in flight.
+		if r.isInflight(migName) || r.isInflight("pm-"+migName) || (podUID != "" && r.isInflight(podUID)) {
+			continue
+		}
+
 		isOrphan := false
 		if podUID != "" {
 			if !livingPodUIDs[podUID] {
@@ -731,9 +811,10 @@ func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapsh
 			}
 		}
 		if isOrphan {
-			r.cleanup(ctx, migName, "", "", false)
-			seenMigrations[migName] = true
-			swept = append(swept, migName)
+			if _, err := r.cleanup(ctx, migName, "", "", false); err == nil {
+				seenMigrations[migName] = true
+				swept = append(swept, migName)
+			}
 		}
 	}
 
@@ -745,15 +826,16 @@ func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapsh
 				continue
 			}
 			migName := strings.TrimPrefix(e.Name(), "pm-")
-			if seenMigrations[migName] {
+			if seenMigrations[migName] || r.isInflight(migName) || r.isInflight("pm-"+migName) {
 				continue
 			}
 			if strings.HasPrefix(migName, "psengine-") {
 				snap := strings.TrimPrefix(migName, "psengine-")
 				if !livingSnapshots[snap] {
-					r.cleanup(ctx, migName, "", "", false)
-					seenMigrations[migName] = true
-					swept = append(swept, migName)
+					if _, err := r.cleanup(ctx, migName, "", "", false); err == nil {
+						seenMigrations[migName] = true
+						swept = append(swept, migName)
+					}
 				}
 			}
 		}

@@ -215,6 +215,9 @@ func (n *Node) RunProbeLoop(ctx context.Context, interval time.Duration) {
 			if _, err := n.ProbeReadiness(ctx); err != nil {
 				logf.FromContext(ctx).Error(err, "readiness re-probe failed", "node", n.NodeName)
 			}
+			if err := n.SweepOrphanRestores(ctx); err != nil {
+				logf.FromContext(ctx).Error(err, "periodic orphan restore sweep failed", "node", n.NodeName)
+			}
 		}
 	}
 }

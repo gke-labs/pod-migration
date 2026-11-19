@@ -87,6 +87,7 @@ func main() {
 		log.Error(err, "unable to init node worker")
 		os.Exit(1)
 	}
+	nd.APIReader = mgr.GetAPIReader()
 
 	// Run CRIU bundle installation + node capability annotation once the cache starts,
 	// run orphan restore sweep, and run a background probe loop to recover node readiness when containerd restarts.
@@ -173,4 +174,8 @@ func (a *nodeOpsAdapter) Restore(ctx context.Context, in psengine.RestoreInputs)
 
 func (a *nodeOpsAdapter) Cleanup(ctx context.Context, in psengine.RestoreInputs) error {
 	return a.n.PSEngineCleanup(ctx, in.SnapshotName)
+}
+
+func (a *nodeOpsAdapter) Signal(ctx context.Context, in psengine.RestoreInputs, sig int) error {
+	return a.n.PSEngineSignal(ctx, in.SnapshotName, sig)
 }
