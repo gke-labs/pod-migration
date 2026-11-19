@@ -69,6 +69,37 @@ rules:
   - list
   - watch
 - apiGroups:
+  - criu.podmigration.gke.io
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshotmanualtriggers
+  - podsnapshotpolicies
+  - podsnapshotstorageconfigs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - criu.podmigration.gke.io
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshots
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - criu.podmigration.gke.io
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshots/status
+  verbs:
+  - get
+- apiGroups:
   - podmigration.gke.io
   resources:
   - podmigrationjobs
@@ -97,34 +128,6 @@ rules:
   - get
   - patch
   - update
-- apiGroups:
-  - podsnapshot.gke.io
-  resources:
-  - podsnapshotmanualtriggers
-  - podsnapshotpolicies
-  - podsnapshotstorageconfigs
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - podsnapshot.gke.io
-  resources:
-  - podsnapshots
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - podsnapshot.gke.io
-  resources:
-  - podsnapshots/status
-  verbs:
-  - get
 - apiGroups:
   - policy
   resources:
