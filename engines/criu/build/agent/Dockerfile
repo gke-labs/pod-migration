@@ -33,7 +33,7 @@ RUN set -eux; \
     cp -L /lib64/ld-linux-x86-64.so.2 /bundle/ 2>/dev/null || cp -L /lib/ld-linux-x86-64.so.2 /bundle/; \
     cp -L /usr/share/doc/criu/copyright /bundle/licenses/criu.copyright; \
     for f in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do \
-      dpkg -S "$(realpath "$f")" 2>/dev/null || true; \
+      dpkg -S "$(realpath "$f")" 2>/dev/null || echo "WARNING: dpkg -S failed for $f" >&2; \
     done | cut -d: -f1 | sort -u | while read -r pkg; do \
       if [ -f "/usr/share/doc/$pkg/copyright" ]; then \
         cp -L "/usr/share/doc/$pkg/copyright" "/bundle/licenses/$pkg.copyright"; \
@@ -42,7 +42,7 @@ RUN set -eux; \
     { \
       dpkg-query -W -f='${Package} ${Version}\n' criu; \
       for f in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do \
-        dpkg -S "$(realpath "$f")" 2>/dev/null || true; \
+        dpkg -S "$(realpath "$f")" 2>/dev/null || echo "WARNING: dpkg -S failed for $f" >&2; \
       done | cut -d: -f1 | sort -u | while read -r pkg; do \
         dpkg-query -W -f='${Package} ${Version}\n' "$pkg"; \
       done; \
@@ -62,7 +62,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /agent ./cmd
 # Runtime: needs nsenter (util-linux) to exec host runc in host namespaces.
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends util-linux ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /licenses && dpkg-query -W -f='${Package} ${Version}\n' util-linux bsdutils coreutils bash base-files > /licenses/runtime-package-versions.txt
+RUN mkdir -p /licenses && dpkg-query -W -f='${Package} ${Version}\n' | sort -u > /licenses/runtime-package-versions.txt
 COPY --from=criu /bundle /opt/criu-bundle
 COPY --from=build /agent /agent
 ENTRYPOINT ["/agent"]

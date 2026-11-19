@@ -97,4 +97,69 @@ if "${TARGET_SCRIPT}" --invalid-flag >/dev/null 2>&1; then
   exit 1
 fi
 
+# 6. Test --internal-fetch-distro executes exact pkg=ver apt-get calls
+MOCK_BIN_DIR="${TMP_TEST_DIR}/mock-bin"
+mkdir -p "${MOCK_BIN_DIR}"
+MOCK_LOG="${TMP_TEST_DIR}/mock_apt.log"
+
+cat <<EOF > "${MOCK_BIN_DIR}/apt-get"
+#!/usr/bin/env bash
+echo "apt-get \$*" >> "${MOCK_LOG}"
+exit 0
+EOF
+chmod +x "${MOCK_BIN_DIR}/apt-get"
+
+TWO_PKG_MANIFEST="${TMP_TEST_DIR}/two_pkgs.txt"
+cat <<'EOF' > "${TWO_PKG_MANIFEST}"
+criu 4.0-2
+libnl-3-200 3.7.0-0.3+b1
+EOF
+
+MOCK_OUT_DIR="${TMP_TEST_DIR}/mock_out"
+mkdir -p "${MOCK_OUT_DIR}"
+
+PATH="${MOCK_BIN_DIR}:${PATH}" "${TARGET_SCRIPT}" \
+  --internal-fetch-distro debian \
+  --manifest "${TWO_PKG_MANIFEST}" \
+  --out-dir "${MOCK_OUT_DIR}"
+
+if ! grep -q "apt-get source -d criu=4.0-2" "${MOCK_LOG}"; then
+  echo "FAIL: expected 'apt-get source -d criu=4.0-2' in log: $(cat "${MOCK_LOG}")" >&2
+  exit 1
+fi
+if ! grep -q "apt-get source -d libnl-3-200=3.7.0-0.3+b1" "${MOCK_LOG}"; then
+  echo "FAIL: expected 'apt-get source -d libnl-3-200=3.7.0-0.3+b1' in log: $(cat "${MOCK_LOG}")" >&2
+  exit 1
+fi
+
+# 7. Test snapshot fallback is invoked when apt-get source fails, and fails cleanly when package is missing
+MOCK_FAIL_BIN="${TMP_TEST_DIR}/mock-fail-bin"
+mkdir -p "${MOCK_FAIL_BIN}"
+MOCK_FAIL_LOG="${TMP_TEST_DIR}/mock_fail_apt.log"
+
+cat <<EOF > "${MOCK_FAIL_BIN}/apt-get"
+#!/usr/bin/env bash
+echo "apt-get \$*" >> "${MOCK_FAIL_LOG}"
+exit 1
+EOF
+chmod +x "${MOCK_FAIL_BIN}/apt-get"
+
+MOCK_FAIL_MANIFEST="${TMP_TEST_DIR}/missing_pkg.txt"
+cat <<'EOF' > "${MOCK_FAIL_MANIFEST}"
+nonexistent-pkg 999.0.0
+EOF
+
+if PATH="${MOCK_FAIL_BIN}:${PATH}" "${TARGET_SCRIPT}" \
+  --internal-fetch-distro debian \
+  --manifest "${MOCK_FAIL_MANIFEST}" \
+  --out-dir "${MOCK_OUT_DIR}" >/dev/null 2>&1; then
+  echo "FAIL: expected fetch to fail when both apt-get and snapshot fail" >&2
+  exit 1
+fi
+
+if ! grep -q "apt-get source -d nonexistent-pkg=999.0.0" "${MOCK_FAIL_LOG}"; then
+  echo "FAIL: expected apt-get call before fallback" >&2
+  exit 1
+fi
+
 echo "PASS: all package_gpl_sources tests passed."

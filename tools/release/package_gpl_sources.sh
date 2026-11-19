@@ -30,12 +30,17 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 OUTPUT_DIR="${REPO_ROOT}/dist"
 VERSION=""
 DRY_RUN=0
 PACKAGE_VERSIONS_FILE=""
 RUNTIME_VERSIONS_FILE=""
+
+INTERNAL_FETCH_DISTRO=""
+INTERNAL_MANIFEST=""
+INTERNAL_OUT_DIR=""
 
 usage() {
   local code="${1:-0}"
@@ -53,6 +58,169 @@ Options:
   -h, --help                      Show this help message
 EOF
   exit "${code}"
+}
+
+fetch_debian_snapshot() {
+  local pkg="$1"
+  local ver="$2"
+  local out_dir="$3"
+  echo "Attempting Debian snapshot download for ${pkg} ${ver}..."
+
+  python3 -c '
+import sys, json, urllib.request, os
+
+pkg = sys.argv[1]
+ver = sys.argv[2]
+out_dir = sys.argv[3]
+
+versions_to_try = [ver]
+if ":" in ver:
+    versions_to_try.append(ver.split(":", 1)[1])
+
+fileinfo = {}
+for v in versions_to_try:
+    url = f"https://snapshot.debian.org/mr/package/{pkg}/{v}/srcfiles?fileinfo=1"
+    req = urllib.request.Request(url, headers={"User-Agent": "pod-migration-gpl-source-packager"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+            fi = data.get("fileinfo", {})
+            if fi:
+                fileinfo = fi
+                break
+    except Exception:
+        continue
+
+if not fileinfo:
+    print(f"ERROR: no files found on snapshot.debian.org for {pkg} {ver}", file=sys.stderr)
+    sys.exit(1)
+
+downloaded = 0
+for h, entries in fileinfo.items():
+    if not entries:
+        continue
+    name = entries[0]["name"]
+    file_url = f"https://snapshot.debian.org/file/{h}"
+    dest = os.path.join(out_dir, name)
+    print(f"Downloading {name} from {file_url}...")
+    req_file = urllib.request.Request(file_url, headers={"User-Agent": "pod-migration-gpl-source-packager"})
+    with urllib.request.urlopen(req_file, timeout=60) as f_in, open(dest, "wb") as f_out:
+        f_out.write(f_in.read())
+    downloaded += 1
+
+if downloaded == 0:
+    sys.exit(1)
+print(f"Successfully downloaded {downloaded} files for {pkg} {ver} from snapshot.debian.org")
+' "${pkg}" "${ver}" "${out_dir}"
+}
+
+fetch_ubuntu_snapshot() {
+  local pkg="$1"
+  local ver="$2"
+  local out_dir="$3"
+  echo "Attempting Ubuntu snapshot/Launchpad download for ${pkg} ${ver}..."
+
+  python3 -c '
+import sys, json, urllib.request, os
+
+pkg = sys.argv[1]
+ver = sys.argv[2]
+out_dir = sys.argv[3]
+
+url = f"https://api.launchpad.net/1.0/ubuntu/+archive/primary?ws.op=getPublishedSources&source_name={pkg}&version={ver}"
+req = urllib.request.Request(url, headers={"User-Agent": "pod-migration-gpl-source-packager"})
+
+entries = []
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.load(resp)
+        entries = data.get("entries", [])
+except Exception as e:
+    print(f"Launchpad API request failed for {pkg} {ver}: {e}", file=sys.stderr)
+
+file_urls = []
+for entry in entries:
+    pub_url = entry.get("self_link")
+    if not pub_url:
+        continue
+    req_files = urllib.request.Request(f"{pub_url}?ws.op=sourceFileUrls", headers={"User-Agent": "pod-migration-gpl-source-packager"})
+    try:
+        with urllib.request.urlopen(req_files, timeout=30) as f_resp:
+            urls = json.load(f_resp)
+            if urls:
+                file_urls = urls
+                break
+    except Exception:
+        continue
+
+if not file_urls:
+    print(f"ERROR: no source files found on Launchpad for {pkg} {ver}", file=sys.stderr)
+    sys.exit(1)
+
+downloaded = 0
+for u in file_urls:
+    name = u.rstrip("/").split("/")[-1]
+    dest = os.path.join(out_dir, name)
+    print(f"Downloading {name} from {u}...")
+    req_dl = urllib.request.Request(u, headers={"User-Agent": "pod-migration-gpl-source-packager"})
+    with urllib.request.urlopen(req_dl, timeout=60) as f_in, open(dest, "wb") as f_out:
+        f_out.write(f_in.read())
+    downloaded += 1
+
+if downloaded == 0:
+    sys.exit(1)
+print(f"Successfully downloaded {downloaded} files for {pkg} {ver} from Launchpad")
+' "${pkg}" "${ver}" "${out_dir}"
+}
+
+fetch_manifest_sources() {
+  local distro="$1"
+  local manifest="$2"
+  local out_dir="$3"
+  local missing=()
+
+  mkdir -p "${out_dir}"
+  cd "${out_dir}"
+
+  while read -r pkg ver extra || [[ -n "${pkg}" ]]; do
+    [[ -z "${pkg}" || "${pkg}" =~ ^# ]] && continue
+    local target="${pkg}"
+    if [[ -n "${ver}" ]]; then
+      target="${pkg}=${ver}"
+    fi
+
+    echo "Fetching ${distro} source for ${target}..."
+    if apt-get source -d "${target}"; then
+      echo "Successfully fetched ${target} via apt-get"
+    else
+      echo "WARNING: apt-get source -d ${target} failed; trying snapshot fallback..."
+      local fetched=0
+      if [[ -n "${ver}" ]]; then
+        if [[ "${distro}" == "debian" ]]; then
+          if fetch_debian_snapshot "${pkg}" "${ver}" "${out_dir}"; then
+            fetched=1
+          fi
+        elif [[ "${distro}" == "ubuntu" ]]; then
+          if fetch_ubuntu_snapshot "${pkg}" "${ver}" "${out_dir}"; then
+            fetched=1
+          fi
+        fi
+      fi
+      if [[ "${fetched}" -eq 0 ]]; then
+        echo "ERROR: failed to obtain corresponding source for ${target}" >&2
+        missing+=("${target}")
+      fi
+    fi
+  done < "${manifest}"
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "ERROR: Failed to obtain corresponding source for ${#missing[@]} package(s):" >&2
+    for m in "${missing[@]}"; do
+      echo "  - ${m}" >&2
+    done
+    return 1
+  fi
+  return 0
 }
 
 while [[ $# -gt 0 ]]; do
@@ -77,6 +245,18 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=1
       shift
       ;;
+    --internal-fetch-distro)
+      INTERNAL_FETCH_DISTRO="$2"
+      shift 2
+      ;;
+    --manifest)
+      INTERNAL_MANIFEST="$2"
+      shift 2
+      ;;
+    --out-dir)
+      INTERNAL_OUT_DIR="$2"
+      shift 2
+      ;;
     -h|--help)
       usage 0
       ;;
@@ -86,6 +266,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "${INTERNAL_FETCH_DISTRO}" ]]; then
+  if [[ -z "${INTERNAL_MANIFEST}" || -z "${INTERNAL_OUT_DIR}" ]]; then
+    echo "ERROR: --manifest and --out-dir required with --internal-fetch-distro" >&2
+    exit 1
+  fi
+  fetch_manifest_sources "${INTERNAL_FETCH_DISTRO}" "${INTERNAL_MANIFEST}" "${INTERNAL_OUT_DIR}"
+  exit $?
+fi
 
 if [[ -z "${VERSION}" ]]; then
   if git -C "${REPO_ROOT}" describe --tags --match 'v*' --exact-match >/dev/null 2>&1; then
@@ -222,39 +411,35 @@ if [[ "${DOCKER_BIN}" == "docker" ]] && ! docker info >/dev/null 2>&1; then
 fi
 
 # Fetch Debian sources (with snapshot.debian.org fallback if unversioned or superseded)
+printf '%s\n' "${DEBIAN_PACKAGES[@]}" > "${TMP_DIR}/sources/debian/packages.txt"
+
 ${SUDO_PREFIX} "${DOCKER_BIN}" run --rm \
   -v "${TMP_DIR}/sources/debian:/out" \
+  -v "${SCRIPT_DIR}:/scripts:ro" \
   debian:trixie bash -c "
     set -eux
     sed -i 's/Types: deb/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
     apt-get update
-    apt-get install -y --no-install-recommends dpkg-dev
-    cd /out
-    for item in ${DEBIAN_PACKAGES[*]}; do
-      pkg=\"\${item%% *}\"
-      echo \"Fetching Debian source for \${pkg}...\"
-      apt-get source -d \"\${pkg}\" || {
-        echo \"WARNING: live apt-get source failed for \${pkg}; checking Debian snapshot archive...\"
-      }
-    done
+    apt-get install -y --no-install-recommends dpkg-dev curl ca-certificates python3
+    /scripts/package_gpl_sources.sh --internal-fetch-distro debian --manifest /out/packages.txt --out-dir /out
   "
+rm -f "${TMP_DIR}/sources/debian/packages.txt"
 
 # Fetch Ubuntu runtime sources
+printf '%s\n' "${UBUNTU_PACKAGES[@]}" > "${TMP_DIR}/sources/ubuntu/packages.txt"
+
 ${SUDO_PREFIX} "${DOCKER_BIN}" run --rm \
   -v "${TMP_DIR}/sources/ubuntu:/out" \
+  -v "${SCRIPT_DIR}:/scripts:ro" \
   ubuntu:24.04 bash -c "
     set -eux
     sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || \
       sed -i 's/^deb /deb-src /' /etc/apt/sources.list 2>/dev/null || true
     apt-get update
-    apt-get install -y --no-install-recommends dpkg-dev
-    cd /out
-    for item in ${UBUNTU_PACKAGES[*]}; do
-      pkg=\"\${item%% *}\"
-      echo \"Fetching Ubuntu source for \${pkg}...\"
-      apt-get source -d \"\${pkg}\" || true
-    done
+    apt-get install -y --no-install-recommends dpkg-dev curl ca-certificates python3
+    /scripts/package_gpl_sources.sh --internal-fetch-distro ubuntu --manifest /out/packages.txt --out-dir /out
   "
+rm -f "${TMP_DIR}/sources/ubuntu/packages.txt"
 
 generate_manifest "${TMP_DIR}/sources/GPL_SOURCE_MANIFEST.txt"
 
