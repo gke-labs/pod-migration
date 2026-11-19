@@ -65,9 +65,11 @@ func TestPSEngineFreezeContainer_PausesTaskAndIdempotent(t *testing.T) {
 		id:   "c-paused",
 		task: taskPaused,
 	}
+	var observedFreezeUID string
 	nodePaused := &Node{
 		Restorer: &restorer{
 			findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+				observedFreezeUID = podUID
 				return &containerRef{ID: "c-paused", Pid: 1234}, nil
 			},
 			listContainersFn: func(ctx context.Context) ([]containerd.Container, error) {
@@ -75,8 +77,11 @@ func TestPSEngineFreezeContainer_PausesTaskAndIdempotent(t *testing.T) {
 			},
 		},
 	}
-	if err := nodePaused.PSEngineFreezeContainer(ctx, "ns", "pod", "ctr"); err != nil {
+	if err := nodePaused.PSEngineFreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr"); err != nil {
 		t.Fatalf("unexpected error on already paused task: %v", err)
+	}
+	if observedFreezeUID != "pod-uid-42" {
+		t.Fatalf("expected podUID 'pod-uid-42', got %q", observedFreezeUID)
 	}
 	if taskPaused.pauseCalled {
 		t.Fatal("pause must not be called when task is already paused")
@@ -98,7 +103,7 @@ func TestPSEngineFreezeContainer_PausesTaskAndIdempotent(t *testing.T) {
 			},
 		},
 	}
-	if err := nodeRunning.PSEngineFreezeContainer(ctx, "ns", "pod", "ctr"); err != nil {
+	if err := nodeRunning.PSEngineFreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr"); err != nil {
 		t.Fatalf("unexpected error on running task: %v", err)
 	}
 	if !taskRunning.pauseCalled {
@@ -117,7 +122,7 @@ func TestPSEngineUnfreezeContainer_ContainerdUnreachableReturnsError(t *testing.
 			},
 		},
 	}
-	err := nodeUnreachable.PSEngineUnfreezeContainer(ctx, "ns", "pod", "ctr")
+	err := nodeUnreachable.PSEngineUnfreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr")
 	if err == nil {
 		t.Fatal("expected error when containerd is unreachable, got nil")
 	}
@@ -134,7 +139,7 @@ func TestPSEngineUnfreezeContainer_NotFoundReturnsNil(t *testing.T) {
 			},
 		},
 	}
-	if err := nodeNotFound.PSEngineUnfreezeContainer(ctx, "ns", "pod", "ctr"); err != nil {
+	if err := nodeNotFound.PSEngineUnfreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr"); err != nil {
 		t.Fatalf("expected nil when container not found, got: %v", err)
 	}
 
@@ -146,7 +151,7 @@ func TestPSEngineUnfreezeContainer_NotFoundReturnsNil(t *testing.T) {
 			},
 		},
 	}
-	if err := nodeErrdefsNotFound.PSEngineUnfreezeContainer(ctx, "ns", "pod", "ctr"); err != nil {
+	if err := nodeErrdefsNotFound.PSEngineUnfreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr"); err != nil {
 		t.Fatalf("expected nil when container is errdefs.ErrNotFound, got: %v", err)
 	}
 }
@@ -167,7 +172,7 @@ func TestPSEngineUnfreezeContainer_TaskStatusRunningOrStoppedReturnsNil(t *testi
 			},
 		},
 	}
-	if err := nodeRunning.PSEngineUnfreezeContainer(ctx, "ns", "pod", "ctr"); err != nil {
+	if err := nodeRunning.PSEngineUnfreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if taskRunning.resumeCalled {
@@ -187,7 +192,7 @@ func TestPSEngineUnfreezeContainer_TaskStatusRunningOrStoppedReturnsNil(t *testi
 			},
 		},
 	}
-	if err := nodeStopped.PSEngineUnfreezeContainer(ctx, "ns", "pod", "ctr"); err != nil {
+	if err := nodeStopped.PSEngineUnfreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if taskStopped.resumeCalled {
@@ -203,9 +208,11 @@ func TestPSEngineUnfreezeContainer_PausedTaskResumesWithBoundedContext(t *testin
 
 	taskPaused := &fakeGlueTask{pid: 200, status: containerd.Paused}
 	cPaused := &fakeContainer{id: "c-paused", task: taskPaused}
+	var observedUnfreezeUID string
 	nodePaused := &Node{
 		Restorer: &restorer{
 			findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+				observedUnfreezeUID = podUID
 				return &containerRef{ID: "c-paused", Pid: 200}, nil
 			},
 			listContainersFn: func(ctx context.Context) ([]containerd.Container, error) {
@@ -215,8 +222,11 @@ func TestPSEngineUnfreezeContainer_PausedTaskResumesWithBoundedContext(t *testin
 	}
 
 	before := time.Now()
-	if err := nodePaused.PSEngineUnfreezeContainer(canceledCtx, "ns", "pod", "ctr"); err != nil {
+	if err := nodePaused.PSEngineUnfreezeContainer(canceledCtx, "ns", "pod", "pod-uid-42", "ctr"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if observedUnfreezeUID != "pod-uid-42" {
+		t.Fatalf("expected podUID 'pod-uid-42', got %q", observedUnfreezeUID)
 	}
 	if !taskPaused.resumeCalled {
 		t.Fatal("resume must be called when task is paused")
@@ -245,7 +255,7 @@ func TestPSEngineUnfreezeContainer_TaskLookupErrors(t *testing.T) {
 			},
 		},
 	}
-	if err := nodeTaskNotFound.PSEngineUnfreezeContainer(ctx, "ns", "pod", "ctr"); err != nil {
+	if err := nodeTaskNotFound.PSEngineUnfreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr"); err != nil {
 		t.Fatalf("expected nil when task is ErrNotFound, got: %v", err)
 	}
 
@@ -261,7 +271,7 @@ func TestPSEngineUnfreezeContainer_TaskLookupErrors(t *testing.T) {
 			},
 		},
 	}
-	if err := nodeTaskErr.PSEngineUnfreezeContainer(ctx, "ns", "pod", "ctr"); err == nil {
+	if err := nodeTaskErr.PSEngineUnfreezeContainer(ctx, "ns", "pod", "pod-uid-42", "ctr"); err == nil {
 		t.Fatal("expected error on non-notfound task lookup error, got nil")
 	}
 }

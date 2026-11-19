@@ -31,6 +31,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
@@ -44,8 +46,9 @@ type fakeNodeOps struct {
 	unfreezeErr   error
 	stopped       []string
 	frozen        []string
-	unfrozen      []string
-	events        []string
+	unfrozen     []string
+	unfrozenUIDs []string
+	events       []string
 	t             *testing.T
 
 	beforeFreeze func()
@@ -91,7 +94,7 @@ func (f *fakeNodeOps) Checkpoint(ctx context.Context, ns, pod, container string)
 	return p, nil
 }
 
-func (f *fakeNodeOps) Freeze(_ context.Context, ns, pod, container string) error {
+func (f *fakeNodeOps) Freeze(_ context.Context, ns, pod, podUID, container string) error {
 	if f.beforeFreeze != nil {
 		f.beforeFreeze()
 	}
@@ -100,9 +103,10 @@ func (f *fakeNodeOps) Freeze(_ context.Context, ns, pod, container string) error
 	return f.freezeErr
 }
 
-func (f *fakeNodeOps) Unfreeze(_ context.Context, ns, pod, container string) error {
+func (f *fakeNodeOps) Unfreeze(_ context.Context, ns, pod, podUID, container string) error {
 	f.events = append(f.events, "unfreeze")
 	f.unfrozen = append(f.unfrozen, ns+"/"+pod+"/"+container)
+	f.unfrozenUIDs = append(f.unfrozenUIDs, podUID)
 	return f.unfreezeErr
 }
 
@@ -114,7 +118,7 @@ func (f *fakeNodeOps) AfterCommit() {
 	f.stopped = append(f.stopped, "committed")
 }
 
-func (f *fakeNodeOps) SourceInfo(_ context.Context, ns, pod, container string) ([]byte, string, error) {
+func (f *fakeNodeOps) SourceInfo(_ context.Context, ns, pod, podUID, container string) ([]byte, string, error) {
 	f.events = append(f.events, "sourceinfo")
 	return []byte(`{"ociVersion":"1.1.0"}`), "docker.io/library/redis:7", nil
 }
@@ -354,6 +358,29 @@ func TestPipeline_FailedThawLeavesSourceFrozenAndRetries(t *testing.T) {
 	if cond != nil && cond.Reason == contract.ReasonFailed {
 		t.Fatalf("checkpoint must not settle with ReasonFailed when thaw failed, got %+v", cond)
 	}
+
+	// Retry pass: unfreeze succeeds. The retry must ONLY thaw the container and settle,
+	// NOT re-run the checkpoint pipeline (no re-freeze, no re-checkpoint) (#148).
+	ops.unfreezeErr = nil
+	ops.events = nil
+	res2, err2 := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err2 != nil {
+		t.Fatalf("unexpected error on retry: %v", err2)
+	}
+	if res2.RequeueAfter != 0 {
+		t.Fatalf("unexpected requeue on successful retry: %v", res2)
+	}
+	if len(ops.events) != 1 || ops.events[0] != "unfreeze" {
+		t.Fatalf("failed-thaw retry must only unfreeze, never re-run checkpoint pipeline: events=%v", ops.events)
+	}
+	gotAfterRetry := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if contract.IsSourceFrozen(gotAfterRetry) {
+		t.Fatal("successful thaw on retry must clear SourceFrozen")
+	}
+	condAfterRetry := condition(gotAfterRetry, contract.CondCheckpoint)
+	if condAfterRetry == nil || condAfterRetry.Reason != contract.ReasonFailed {
+		t.Fatalf("want Failed outcome after retry thaw, got %+v", condAfterRetry)
+	}
 }
 
 // TestPipeline_FailedFreezeThawsSource pins that if Freeze fails, Unfreeze is
@@ -438,5 +465,332 @@ func TestPipeline_ErrFinishedThawsSourceIfNotReady(t *testing.T) {
 	got := getSnapshot(t, c, "ps-web-0-deadbeef")
 	if contract.IsSourceFrozen(got) {
 		t.Fatal("SourceFrozen must be cleared to false when thawed on errFinished")
+	}
+}
+
+// TestPipeline_ErrFinishedFailedThawRetriesAndThaws pins that if an outcome was written
+// elsewhere (e.g. Refused) and Unfreeze fails, SourceFrozen remains True, Reconcile
+// requeues, and the retry pass thaws without re-running checkpointing (#148).
+func TestPipeline_ErrFinishedFailedThawRetriesAndThaws(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{
+		tarContent:  "TARBYTES",
+		unfreezeErr: errors.New("containerd unfreeze failed"),
+		t:           t,
+	}
+	store := newMemStore()
+
+	// Controller writes Refused outcome mid-pipeline after freeze.
+	ops.afterCheckpoint = func() {
+		snap := getSnapshot(t, c, "ps-web-0-deadbeef")
+		_ = contract.SetCondition(snap, metav1.Condition{
+			Type:    contract.CondCheckpoint,
+			Status:  metav1.ConditionFalse,
+			Reason:  contract.ReasonRefused,
+			Message: "node demoted mid-run",
+		})
+		_ = c.Status().Update(context.Background(), snap)
+	}
+
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err == nil {
+		t.Fatal("expected error on failed unfreeze for errFinished, got nil")
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatal("expected requeue on failed unfreeze for errFinished")
+	}
+
+	got := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("SourceFrozen must remain True when thaw fails on errFinished")
+	}
+
+	// Retry pass: unfreeze succeeds.
+	ops.unfreezeErr = nil
+	ops.events = nil
+	res2, err2 := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err2 != nil {
+		t.Fatalf("unexpected error on retry pass: %v", err2)
+	}
+	if res2.RequeueAfter != 0 {
+		t.Fatalf("unexpected requeue on successful retry: %v", res2)
+	}
+	if len(ops.events) != 1 || ops.events[0] != "unfreeze" {
+		t.Fatalf("retry pass on errFinished must only unfreeze, got events: %v", ops.events)
+	}
+	got2 := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if contract.IsSourceFrozen(got2) {
+		t.Fatal("SourceFrozen must be cleared to false after successful thaw on retry")
+	}
+	cond2 := condition(got2, contract.CondCheckpoint)
+	if cond2 == nil || cond2.Reason != contract.ReasonRefused {
+		t.Fatalf("existing Refused outcome must be preserved, got %+v", cond2)
+	}
+}
+
+type failOnNthGetReader struct {
+	client.Reader
+	calls      int
+	failOnCall int
+}
+
+func (f *failOnNthGetReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	f.calls++
+	if f.failOnCall > 0 && f.calls == f.failOnCall {
+		return errors.New("apiserver unavailable on live get")
+	}
+	return f.Reader.Get(ctx, key, obj, opts...)
+}
+
+// TestPipeline_ErrFinishedLiveGetErrorRequeues pins that if live reading of the
+// PodSnapshot fails during errFinished, Reconcile requeues and does not fail open (does not thaw).
+func TestPipeline_ErrFinishedLiveGetErrorRequeues(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	store := newMemStore()
+
+	reader := &failOnNthGetReader{Reader: c}
+	ops.afterCheckpoint = func() {
+		snap := getSnapshot(t, c, "ps-web-0-deadbeef")
+		_ = contract.SetCondition(snap, metav1.Condition{
+			Type:   contract.CondCheckpoint,
+			Status: metav1.ConditionFalse,
+			Reason: contract.ReasonRefused,
+		})
+		_ = c.Status().Update(context.Background(), snap)
+		// Next read is pre-commit cancelCheck (must succeed to return errFinished).
+		// The read after that is liveReader().Get in errFinished handling: make it fail.
+		reader.failOnCall = reader.calls + 2
+	}
+
+	r := &NodeSnapshotReconciler{Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err == nil {
+		t.Fatal("expected error on failing live read during errFinished, got nil")
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatal("expected requeue on failing live read")
+	}
+	if len(ops.unfrozen) != 0 {
+		t.Fatal("live read error on errFinished must not fail open (must not thaw)")
+	}
+}
+
+// TestPipeline_ErrFinishedReadySnapshotKeptFrozen pins that if errFinished reveals
+// the snapshot is Ready=True, the source is kept frozen for eviction and Unfreeze is not called.
+func TestPipeline_ErrFinishedReadySnapshotKeptFrozen(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	store := newMemStore()
+
+	// Controller or another worker committed Ready mid-run
+	ops.afterCheckpoint = func() {
+		snap := getSnapshot(t, c, "ps-web-0-deadbeef")
+		_ = contract.SetCondition(snap, metav1.Condition{
+			Type:   contract.CondReady,
+			Status: metav1.ConditionTrue,
+			Reason: contract.ReasonSucceeded,
+		})
+		_ = c.Status().Update(context.Background(), snap)
+	}
+
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops.unfrozen) != 0 {
+		t.Fatal("Ready snapshot on errFinished must NOT be unfrozen")
+	}
+	got := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("Ready snapshot must remain SourceFrozen=True")
+	}
+}
+
+// TestPipeline_FailedFreezeFailedThawLeavesSourceFrozenAndRequeues pins that if
+// Freeze fails and Unfreeze also fails, SourceFrozen stays True, Reconcile requeues,
+// and the subsequent retry thaws without re-attempting Freeze.
+func TestPipeline_FailedFreezeFailedThawLeavesSourceFrozenAndRequeues(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{
+		freezeErr:   errors.New("containerd pause failed"),
+		unfreezeErr: errors.New("containerd unfreeze failed"),
+		t:           t,
+	}
+	store := newMemStore()
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err == nil {
+		t.Fatal("expected error on failed unfreeze after failed freeze, got nil")
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatal("expected requeue on failed unfreeze after failed freeze")
+	}
+	got := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("SourceFrozen must remain True when thaw fails after failed freeze")
+	}
+
+	// Retry pass: unfreeze succeeds.
+	ops.unfreezeErr = nil
+	ops.events = nil
+	res2, err2 := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err2 != nil {
+		t.Fatalf("unexpected error on retry pass: %v", err2)
+	}
+	if res2.RequeueAfter != 0 {
+		t.Fatalf("unexpected requeue on successful retry: %v", res2)
+	}
+	if len(ops.events) != 1 || ops.events[0] != "unfreeze" {
+		t.Fatalf("retry after failed freeze must only unfreeze, got events: %v", ops.events)
+	}
+	got2 := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if contract.IsSourceFrozen(got2) {
+		t.Fatal("successful thaw on retry must clear SourceFrozen")
+	}
+	cond2 := condition(got2, contract.CondCheckpoint)
+	if cond2 == nil || cond2.Reason != contract.ReasonFailed {
+		t.Fatalf("want Failed outcome, got %+v", cond2)
+	}
+}
+
+// TestPipeline_ThawedSourceClearsSourceFrozenWithExistingOutcome pins that if an outcome
+// was already written (e.g. Refused) while SourceFrozen=True, thawing clears SourceFrozen
+// without overwriting the outcome (fixes Point 5).
+func TestPipeline_ThawedSourceClearsSourceFrozenWithExistingOutcome(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetSourceFrozen(ps, true, contract.ReasonFrozen, "source frozen")
+	_ = contract.SetCondition(ps, metav1.Condition{
+		Type:   contract.CondCheckpoint,
+		Status: metav1.ConditionFalse,
+		Reason: contract.ReasonRefused,
+	})
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{t: t}
+	store := newMemStore()
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops.unfrozen) != 1 {
+		t.Fatalf("expected 1 unfreeze, got: %v", ops.unfrozen)
+	}
+	got := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if contract.IsSourceFrozen(got) {
+		t.Fatal("SourceFrozen must be cleared to false after thaw")
+	}
+	cond := condition(got, contract.CondCheckpoint)
+	if cond == nil || cond.Reason != contract.ReasonRefused {
+		t.Fatalf("existing Refused outcome must be preserved, got %+v", cond)
+	}
+}
+
+// TestPipeline_FailedThawOnCancelLeavesSourceFrozenAndRequeues pins that if cancel
+// occurs and Unfreeze fails, SourceFrozen stays True, Reconcile requeues, and the outcome
+// is not settled as Cancelled until thaw succeeds.
+func TestPipeline_FailedThawOnCancelLeavesSourceFrozenAndRequeues(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetSourceFrozen(ps, true, contract.ReasonFrozen, "source frozen before cancel")
+	_ = contract.SetCondition(ps, metav1.Condition{
+		Type:   contract.CondCheckpoint,
+		Status: metav1.ConditionUnknown,
+		Reason: contract.ReasonCancelRequested,
+	})
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{
+		unfreezeErr: errors.New("containerd unfreeze failed"),
+		t:           t,
+	}
+	store := newMemStore()
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err == nil {
+		t.Fatal("expected error on failed unfreeze during cancel, got nil")
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatal("expected requeue on failed unfreeze during cancel")
+	}
+	got := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("failed unfreeze on cancel must leave SourceFrozen=True")
+	}
+	cond := condition(got, contract.CondCheckpoint)
+	if cond != nil && cond.Reason == contract.ReasonCancelled {
+		t.Fatal("checkpoint must not settle as Cancelled while thaw is failing")
+	}
+
+	// Retry pass: unfreeze succeeds
+	ops.unfreezeErr = nil
+	ops.events = nil
+	res2, err2 := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err2 != nil {
+		t.Fatalf("unexpected error on retry: %v", err2)
+	}
+	if res2.RequeueAfter != 0 {
+		t.Fatalf("unexpected requeue: %v", res2)
+	}
+	if len(ops.events) != 1 || ops.events[0] != "unfreeze" {
+		t.Fatalf("retry on cancel must only unfreeze, got events: %v", ops.events)
+	}
+	got2 := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if contract.IsSourceFrozen(got2) {
+		t.Fatal("SourceFrozen must be cleared to false on successful cancel thaw")
+	}
+	cond2 := condition(got2, contract.CondCheckpoint)
+	if cond2 == nil || cond2.Reason != contract.ReasonCancelled {
+		t.Fatalf("want Cancelled outcome, got %+v", cond2)
+	}
+}
+
+// TestPipeline_ThawPassesSourcePodUID pins that Unfreeze receives the exact
+// spec.SourcePodUID on leftover thaw, cancel, and failure paths.
+func TestPipeline_ThawPassesSourcePodUID(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = unstructured.SetNestedField(ps.Object, "uid-source-pod-12345", "spec", "sourcePodUID")
+	_ = contract.SetSourceFrozen(ps, true, contract.ReasonFrozen, "source frozen")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{t: t}
+	store := newMemStore()
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops.unfrozenUIDs) != 1 || ops.unfrozenUIDs[0] != "uid-source-pod-12345" {
+		t.Fatalf("Unfreeze must be called with sourcePodUID 'uid-source-pod-12345', got %v", ops.unfrozenUIDs)
+	}
+}
+
+type fakeManagerWithAdd struct {
+	ctrl.Manager
+	added  []manager.Runnable
+	addErr error
+}
+
+func (m *fakeManagerWithAdd) Add(r manager.Runnable) error {
+	m.added = append(m.added, r)
+	return m.addErr
+}
+
+// TestSetupWithManagerRegistersStartupSweep pins that SetupWithManager registers
+// the startup sweep Runnable with the manager.
+func TestSetupWithManagerRegistersStartupSweep(t *testing.T) {
+	r := &NodeSnapshotReconciler{NodeName: "node-a"}
+	mgr := &fakeManagerWithAdd{addErr: errors.New("registration failed")}
+	err := r.SetupWithManager(mgr)
+	if err == nil || !strings.Contains(err.Error(), "registration failed") {
+		t.Fatalf("expected error from mgr.Add, got: %v", err)
+	}
+	if len(mgr.added) != 1 {
+		t.Fatalf("expected 1 runnable added to manager, got %d", len(mgr.added))
 	}
 }

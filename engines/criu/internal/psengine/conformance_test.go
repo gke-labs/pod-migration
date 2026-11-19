@@ -421,7 +421,16 @@ func TestConformanceStartupSweepThawsUnreadySnapshots(t *testing.T) {
 	_ = unstructured.SetNestedField(psOtherNode.Object, "node-b", "spec", "nodeName")
 	_ = contract.SetSourceFrozen(psOtherNode, true, contract.ReasonFrozen, "source frozen")
 
-	c := newClient(t, psFailed, psCancelled, psInProgress, psReady, psOtherNode)
+	// 6. Snapshot with CheckpointTimedOut: must NOT be thawed (keeps fence for eviction per C9)
+	psTimedOut := workOrderSnapshot("ps-timed-out")
+	_ = contract.SetSourceFrozen(psTimedOut, true, contract.ReasonFrozen, "source frozen")
+	_ = contract.SetCondition(psTimedOut, metav1.Condition{
+		Type:   contract.CondCheckpoint,
+		Status: metav1.ConditionUnknown,
+		Reason: contract.ReasonCheckpointTimedOut,
+	})
+
+	c := newClient(t, psFailed, psCancelled, psInProgress, psReady, psOtherNode, psTimedOut)
 	ops := &fakeNodeOps{t: t}
 	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
 
@@ -447,10 +456,84 @@ func TestConformanceStartupSweepThawsUnreadySnapshots(t *testing.T) {
 		t.Fatal("Ready snapshot must remain SourceFrozen=True after startup sweep")
 	}
 
+	// Verify ps-timed-out still has SourceFrozen=True
+	timedOutSnap := getSnapshot(t, c, "ps-timed-out")
+	if !contract.IsSourceFrozen(timedOutSnap) {
+		t.Fatal("CheckpointTimedOut snapshot must remain SourceFrozen=True after startup sweep")
+	}
+
 	// Verify ps-other-node still has SourceFrozen=True
 	otherSnap := getSnapshot(t, c, "ps-other-node")
 	if !contract.IsSourceFrozen(otherSnap) {
 		t.Fatal("other node snapshot must not be touched by startup sweep")
+	}
+}
+
+// TestConformanceSweepSkipsInflightCheckpoint verifies that if a normal Reconcile
+// is currently in-flight for a snapshot, SweepFrozenSources does not race it and
+// does not thaw the source container mid-checkpoint (#106, #148).
+func TestConformanceSweepSkipsInflightCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	ps := workOrderSnapshot("ps-busy")
+	_ = contract.SetSourceFrozen(ps, true, contract.ReasonFrozen, "source frozen")
+
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{t: t}
+	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
+
+	// Simulate an active in-flight checkpoint reconcile for ps-busy
+	key := types.NamespacedName{Namespace: "default", Name: "ps-busy"}
+	nr.inflight.Store(key.String(), true)
+
+	if err := nr.SweepFrozenSources(ctx); err != nil {
+		t.Fatalf("SweepFrozenSources failed: %v", err)
+	}
+
+	if len(ops.unfrozen) != 0 {
+		t.Fatalf("startup sweep must not thaw a snapshot that is currently in-flight: unfrozen=%v", ops.unfrozen)
+	}
+	got := getSnapshot(t, c, "ps-busy")
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("in-flight snapshot must remain SourceFrozen=True")
+	}
+}
+
+// TestConformanceCheckpointTimedOutKeepsSourceFrozen verifies that snapshots with
+// CheckpointTimedOut are kept frozen by both the startup sweep and Reconcile (clause C9).
+func TestConformanceCheckpointTimedOutKeepsSourceFrozen(t *testing.T) {
+	ctx := context.Background()
+	ps := workOrderSnapshot("ps-timed-out")
+	_ = contract.SetSourceFrozen(ps, true, contract.ReasonFrozen, "source frozen")
+	_ = contract.SetCondition(ps, metav1.Condition{
+		Type:   contract.CondCheckpoint,
+		Status: metav1.ConditionUnknown,
+		Reason: contract.ReasonCheckpointTimedOut,
+	})
+
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{t: t}
+	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
+
+	// 1. Sweep skips CheckpointTimedOut
+	if err := nr.SweepFrozenSources(ctx); err != nil {
+		t.Fatalf("SweepFrozenSources failed: %v", err)
+	}
+	if len(ops.unfrozen) != 0 {
+		t.Fatalf("startup sweep must not thaw CheckpointTimedOut snapshot: unfrozen=%v", ops.unfrozen)
+	}
+
+	// 2. Reconcile skips CheckpointTimedOut
+	key := types.NamespacedName{Namespace: "default", Name: "ps-timed-out"}
+	if _, err := nr.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if len(ops.unfrozen) != 0 {
+		t.Fatalf("Reconcile must not thaw CheckpointTimedOut snapshot: unfrozen=%v", ops.unfrozen)
+	}
+
+	got := getSnapshot(t, c, "ps-timed-out")
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("CheckpointTimedOut snapshot must remain SourceFrozen=True")
 	}
 }
 

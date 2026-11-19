@@ -57,8 +57,8 @@ func (r *Node) PSEngineCheckpoint(ctx context.Context, ns, pod, container string
 // PSEngineSourceInfo captures the source container's OCI runtime spec and
 // image name — they travel with the archive (the restore node has no source
 // container to inspect).
-func (r *Node) PSEngineSourceInfo(ctx context.Context, ns, pod, container string) ([]byte, string, error) {
-	ref, err := r.Restorer.findContainer(ctx, ns, pod, "", container)
+func (r *Node) PSEngineSourceInfo(ctx context.Context, ns, pod, podUID, container string) ([]byte, string, error) {
+	ref, err := r.Restorer.findContainer(ctx, ns, pod, podUID, container)
 	if err != nil {
 		return nil, "", err
 	}
@@ -74,8 +74,8 @@ func (r *Node) PSEngineSourceInfo(ctx context.Context, ns, pod, container string
 
 // PSEngineFreezeContainer freezes (pauses) the source container task via
 // containerd before the checkpoint (C4 Frozen fencing mode, #148).
-func (r *Node) PSEngineFreezeContainer(ctx context.Context, ns, pod, container string) error {
-	ref, err := r.Restorer.findContainer(ctx, ns, pod, "", container)
+func (r *Node) PSEngineFreezeContainer(ctx context.Context, ns, pod, podUID, container string) error {
+	ref, err := r.Restorer.findContainer(ctx, ns, pod, podUID, container)
 	if err != nil {
 		return err
 	}
@@ -106,8 +106,8 @@ func (r *Node) PSEngineFreezeContainer(ctx context.Context, ns, pod, container s
 // PSEngineUnfreezeContainer thaws (resumes) the source container task via
 // containerd. Resume uses a fresh context, not caller ctx, so caller
 // cancellation or deadlines never leave the task frozen (#106, #148).
-func (r *Node) PSEngineUnfreezeContainer(ctx context.Context, ns, pod, container string) error {
-	ref, err := r.Restorer.findContainer(ctx, ns, pod, "", container)
+func (r *Node) PSEngineUnfreezeContainer(ctx context.Context, ns, pod, podUID, container string) error {
+	ref, err := r.Restorer.findContainer(ctx, ns, pod, podUID, container)
 	if err != nil {
 		if errors.Is(err, ErrContainerNotFound) || errdefs.IsNotFound(err) {
 			// If the container is already gone, it doesn't need to be unfrozen.
