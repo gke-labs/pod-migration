@@ -273,6 +273,7 @@ spec:
               mountPropagation: Bidirectional
             - name: containerd-run
               mountPath: /run/containerd
+              mountPropagation: HostToContainer
             - name: containerd-state
               mountPath: /var/lib/containerd
             - name: kubelet-checkpoints
