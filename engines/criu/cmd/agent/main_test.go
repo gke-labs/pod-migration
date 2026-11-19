@@ -87,15 +87,20 @@ func TestAgentManagerOptions_DisablesNodeInformerUnderGetPatchRBAC(t *testing.T)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	mgrDone := make(chan struct{})
+	mgrErr := make(chan error, 1)
 	go func() {
-		defer close(mgrDone)
-		_ = mgr.Start(ctx)
+		mgrErr <- mgr.Start(ctx)
 	}()
 	defer func() {
 		cancel()
-		<-mgrDone
+		if err := <-mgrErr; err != nil && err != context.Canceled {
+			t.Errorf("mgr.Start returned unexpected error: %v", err)
+		}
 	}()
+
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		t.Fatal("WaitForCacheSync failed")
+	}
 
 	var n corev1.Node
 	if err := mgr.GetClient().Get(ctx, types.NamespacedName{Name: "test-node"}, &n); err != nil {

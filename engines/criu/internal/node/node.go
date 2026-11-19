@@ -58,6 +58,7 @@ type Node struct {
 	lastSocketInode    uint64
 	poisonedInode      uint64
 	demoteSeq          uint64
+	demoteInode        uint64
 	pendingDemote      bool
 	unreadyReason      string
 	unreadyRemediation string
@@ -107,16 +108,17 @@ func getSocketInode(path string) (uint64, error) {
 // deterministic host failures stay quiet while transient API errors retry on
 // the next ProbeReadiness tick.
 func (n *Node) Bootstrap(ctx context.Context) error {
-	startIno, _ := n.statCurrentSocket()
 	n.mu.Lock()
 	startDemoteSeq := n.demoteSeq
 	n.mu.Unlock()
+	startIno, _ := n.statCurrentSocket()
 	if n.bootstrapFn != nil {
 		if err := n.bootstrapFn(ctx); err != nil {
 			return err
 		}
+		currIno, hasCurr := n.statCurrentSocket()
 		n.mu.Lock()
-		if n.demoteSeq == startDemoteSeq {
+		if n.demoteSeq == startDemoteSeq && (!hasCurr || currIno == 0 || startIno == 0 || currIno == startIno) {
 			if startIno != 0 {
 				n.lastSocketInode = startIno
 			}
@@ -164,15 +166,25 @@ type nodeVerdict struct {
 	startDemoteSeq uint64
 }
 
+func isStaleDemote(bootIno, demoteIno, currIno uint64, hasCurr bool) bool {
+	return bootIno != 0 && demoteIno != 0 && demoteIno != bootIno && hasCurr && currIno == bootIno
+}
+
 func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 	n.annotateMu.Lock()
 	defer n.annotateMu.Unlock()
 
+	currIno, hasCurr := n.statCurrentSocket()
+	if v.ino != 0 && hasCurr && currIno != 0 && currIno != v.ino {
+		return fmt.Errorf("containerd socket inode changed during bootstrap (%d -> %d); deferring to next probe", v.ino, currIno)
+	}
+
 	n.mu.Lock()
 	poisoned := v.ready && v.ino != 0 && v.ino == n.poisonedInode
-	concurrentDemote := v.ready && n.demoteSeq != v.startDemoteSeq && (v.ino == 0 || v.ino == n.lastSocketInode)
+	concurrentDemote := v.ready && n.demoteSeq != v.startDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, currIno, hasCurr)
 	demoteReason := n.unreadyReason
 	demoteRemediation := n.unreadyRemediation
+	prePatchDemoteSeq := n.demoteSeq
 	n.mu.Unlock()
 
 	if poisoned {
@@ -189,13 +201,23 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 		return err
 	}
 
+	postCurrIno, hasPostCurr := n.statCurrentSocket()
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.ready = v.ready
 	if v.version != "" {
 		n.version = v.version
 	}
-	if v.ino != 0 {
+	if n.demoteSeq != prePatchDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, postCurrIno, hasPostCurr) {
+		if v.ino != 0 && n.lastSocketInode == 0 {
+			n.lastSocketInode = v.ino
+		}
+		if v.ino != 0 && v.ino == n.poisonedInode {
+			return ErrContainerdCachedCRIU
+		}
+		return nil
+	}
+	n.ready = v.ready
+	if v.ino != 0 && (!hasPostCurr || postCurrIno == 0 || postCurrIno == v.ino) {
 		n.lastSocketInode = v.ino
 	}
 	if v.ready {
@@ -242,7 +264,7 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno, startDemoteSeq u
 		pubErr := n.publish(ctx, nodeVerdict{
 			ready:          false,
 			reason:         "criu bundle install failed: " + err.Error(),
-			remediation:    "check node disk space and writable host paths",
+			remediation:    "check node disk space and writable host paths, then restart pod-migrate-agent",
 			ino:            startIno,
 			startDemoteSeq: startDemoteSeq,
 		})
@@ -291,12 +313,18 @@ func (n *Node) DemoteNode(ctx context.Context, reason, remediation string) error
 }
 
 func (n *Node) demoteNodeAtInode(ctx context.Context, reason, remediation string, ino uint64) error {
+	currIno, hasCurr := n.statCurrentSocket()
 	n.mu.Lock()
+	if ino != 0 && hasCurr && currIno != 0 && currIno != ino && n.ready && n.lastSocketInode == currIno {
+		n.mu.Unlock()
+		return nil
+	}
 	n.ready = false
 	n.unreadyReason = reason
 	n.unreadyRemediation = remediation
 	n.demoteSeq++
 	seq := n.demoteSeq
+	n.demoteInode = ino
 	n.pendingDemote = true
 	if ino != 0 {
 		n.lastSocketInode = ino
@@ -304,11 +332,17 @@ func (n *Node) demoteNodeAtInode(ctx context.Context, reason, remediation string
 			n.poisonedInode = ino
 		}
 	}
-	ver := n.version
 	n.mu.Unlock()
 
 	n.annotateMu.Lock()
 	defer n.annotateMu.Unlock()
+	n.mu.Lock()
+	if n.ready || n.demoteSeq != seq {
+		n.mu.Unlock()
+		return nil
+	}
+	ver := n.version
+	n.mu.Unlock()
 	if err := annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false); err != nil {
 		return err
 	}
@@ -361,6 +395,9 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 		defer n.annotateMu.Unlock()
 		n.mu.Lock()
 		stillPending := !n.ready && n.pendingDemote && n.demoteSeq == seq
+		ver = n.version
+		reason = n.unreadyReason
+		remediation = n.unreadyRemediation
 		n.mu.Unlock()
 		if stillPending {
 			if err := annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false); err != nil {

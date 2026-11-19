@@ -456,6 +456,53 @@ func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
 				fc.getCalls.Load()-getsAfterBootstrap, fc.patchCalls.Load()-patchesAfterBootstrap)
 		}
 	})
+
+	t.Run("verifyCRIU false marks node false once and stays quiet", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+		fc := &flakyNodeClient{Client: base}
+
+		execCalls := 0
+		nd := &Node{
+			Client:          fc,
+			NodeName:        "test-node",
+			SocketPath:      "/run/containerd/containerd.sock",
+			statSocketFn:    func(string) (uint64, error) { return 4343, nil },
+			installBundleFn: func() (string, error) { return "v3.19", nil },
+			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+				execCalls++
+				return "Error: kernel lacks CONFIG_CHECKPOINT_RESTORE\n", nil
+			},
+		}
+
+		if err := nd.Bootstrap(ctx); err != nil {
+			t.Fatalf("Bootstrap with verifyCRIU=false should return nil after annotating false: %v", err)
+		}
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false")
+		}
+		getsAfterBootstrap := fc.getCalls.Load()
+		patchesAfterBootstrap := fc.patchCalls.Load()
+
+		for i := 1; i <= 5; i++ {
+			ready, err := nd.ProbeReadiness(ctx)
+			if err != nil {
+				t.Fatalf("probe %d: unexpected error: %v", i, err)
+			}
+			if ready {
+				t.Fatalf("probe %d: expected ready=false", i)
+			}
+		}
+		if execCalls != 1 || fc.getCalls.Load() != getsAfterBootstrap || fc.patchCalls.Load() != patchesAfterBootstrap {
+			t.Fatalf("expected 0 extra exec/API calls across 5 ticks, got exec=%d extraGets=%d extraPatches=%d",
+				execCalls, fc.getCalls.Load()-getsAfterBootstrap, fc.patchCalls.Load()-patchesAfterBootstrap)
+		}
+	})
 }
 
 func TestNode_TransientAPIErrorsRetryAndConvergeWithoutContainerdRestart(t *testing.T) {
@@ -579,7 +626,7 @@ func TestNode_DemotePatchFailureRetriedAndPoisonedInodeBlocked(t *testing.T) {
 		ready:           true,
 		version:         "v3.19",
 		lastSocketInode: 8000, // containerd restarted while ready, then got poisoned on 9001
-		statSocketFn:    func(string) (uint64, error) { return currentIno, nil },
+		statSocketFn:    func(string) (uint64, error) { return atomic.LoadUint64(&currentIno), nil },
 		installBundleFn: func() (string, error) { return "v3.19", nil },
 		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
 			return "Looks good.\n", nil
@@ -616,6 +663,16 @@ func TestNode_DemotePatchFailureRetriedAndPoisonedInodeBlocked(t *testing.T) {
 	}
 	if nd.IsReady() {
 		t.Fatal("poisoned inode must not become ready before containerd restarts")
+	}
+
+	// Once containerd restarts onto a fresh inode (9002), ProbeReadiness recovers cleanly.
+	atomic.StoreUint64(&currentIno, 9002)
+	ready, err = nd.ProbeReadiness(ctx)
+	if err != nil {
+		t.Fatalf("ProbeReadiness after containerd restart to 9002 failed: %v", err)
+	}
+	if !ready || !nd.IsReady() {
+		t.Fatal("expected node to recover to ready=true after containerd restart to 9002")
 	}
 }
 
@@ -676,6 +733,245 @@ func TestNode_ConcurrentBootstrapCannotOverwriteDemotion(t *testing.T) {
 	if _, exists := cur.Annotations[NodeAnnotationCRIURemediation]; exists {
 		t.Fatalf("expected empty remediation deleted, got %q", cur.Annotations[NodeAnnotationCRIURemediation])
 	}
+}
+
+type hookPatchClient struct {
+	client.Client
+	onPatch func(call int32, obj client.Object) error
+	calls   atomic.Int32
+}
+
+func (h *hookPatchClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	c := h.calls.Add(1)
+	if h.onPatch != nil {
+		if err := h.onPatch(c, obj); err != nil {
+			return err
+		}
+	}
+	return h.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestNode_MidAnnotateNodeDemotePreservesUnreadyAndRetries(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		Status: corev1.NodeStatus{
+			NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+	patchEntered := make(chan struct{})
+	allowPatchFinish := make(chan struct{})
+	demoteQueued := make(chan struct{})
+
+	var nd *Node
+	demoteErrCh := make(chan error, 1)
+
+	hc := &hookPatchClient{
+		Client: base,
+		onPatch: func(call int32, _ client.Object) error {
+			switch call {
+			case 1:
+				// Bootstrap's publish(ready=true) is mid-Patch while DemoteNode arrives!
+				close(patchEntered)
+				<-allowPatchFinish
+				return nil
+			case 2:
+				// DemoteNode's first PATCH fails transiently to verify pendingDemote survives publish!
+				return errors.New("simulated transient demote patch error")
+			default:
+				return nil
+			}
+		},
+	}
+
+	nd = &Node{
+		Client:          hc,
+		NodeName:        "test-node",
+		SocketPath:      "/run/containerd/containerd.sock",
+		statSocketFn:    func(string) (uint64, error) { return 5050, nil },
+		installBundleFn: func() (string, error) { return "v3.19", nil },
+		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+			return "Looks good.\n", nil
+		},
+	}
+
+	bootErrCh := make(chan error, 1)
+	go func() {
+		bootErrCh <- nd.Bootstrap(ctx)
+	}()
+
+	<-patchEntered
+	go func() {
+		close(demoteQueued)
+		demoteErrCh <- nd.DemoteNode(ctx, ReasonContainerdCachedCRIU, RemediationRestartContainerd)
+	}()
+	<-demoteQueued
+	// Give DemoteNode a moment to update n.mu state and block on annotateMu.
+	for nd.IsReady() {
+	}
+	// Wait until demoteSeq increments under n.mu before releasing publish's Patch.
+	for {
+		nd.mu.Lock()
+		seq := nd.demoteSeq
+		nd.mu.Unlock()
+		if seq == 1 {
+			break
+		}
+	}
+	close(allowPatchFinish)
+
+	if err := <-bootErrCh; !errors.Is(err, ErrContainerdCachedCRIU) {
+		t.Fatalf("expected Bootstrap to return ErrContainerdCachedCRIU on mid-patch demotion, got %v", err)
+	}
+	if err := <-demoteErrCh; err == nil {
+		t.Fatal("expected simulated transient demote patch error on call 2")
+	}
+	if nd.IsReady() {
+		t.Fatal("nd.IsReady() must remain false when DemoteNode ran during publish's annotateNode")
+	}
+
+	// Next ProbeReadiness tick retries the failed pendingDemote PATCH and writes criu-ready=false!
+	ready, err := nd.ProbeReadiness(ctx)
+	if err != nil {
+		t.Fatalf("ProbeReadiness retry failed: %v", err)
+	}
+	if ready || nd.IsReady() {
+		t.Fatal("expected node to remain unready on poisoned inode 5050")
+	}
+	var cur corev1.Node
+	if err := base.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+		t.Fatalf("expected criu-ready=false repaired on API server, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+	}
+	if cur.Annotations[NodeAnnotationCRIUVersion] != "v3.19" {
+		t.Fatalf("expected criu-version=v3.19 preserved on demotion, got %q", cur.Annotations[NodeAnnotationCRIUVersion])
+	}
+}
+
+func TestNode_CrossRestartDemotionAndZeroInodeDemotionNotClobbered(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	t.Run("containerd restarts 100->200 during Bootstrap and 200 is demoted", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+		var currIno atomic.Uint64
+		currIno.Store(100)
+
+		execStarted := make(chan struct{})
+		allowExecFinish := make(chan struct{})
+
+		nd := &Node{
+			Client:          c,
+			NodeName:        "test-node",
+			SocketPath:      "/run/containerd/containerd.sock",
+			statSocketFn:    func(string) (uint64, error) { return currIno.Load(), nil },
+			installBundleFn: func() (string, error) { return "v3.19", nil },
+			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+				close(execStarted)
+				<-allowExecFinish
+				return "Looks good.\n", nil
+			},
+		}
+
+		bootDone := make(chan error, 1)
+		go func() {
+			bootDone <- nd.Bootstrap(ctx)
+		}()
+
+		<-execStarted
+		// containerd restarts to inode 200, and a checkpoint on 200 gets poisoned!
+		currIno.Store(200)
+		if err := nd.DemoteNode(ctx, ReasonContainerdCachedCRIU, RemediationRestartContainerd); err != nil {
+			t.Fatalf("DemoteNode(200): %v", err)
+		}
+		close(allowExecFinish)
+
+		if err := <-bootDone; err == nil {
+			t.Fatal("expected stale Bootstrap(100) to abort when socket moved to 200")
+		}
+		if nd.IsReady() {
+			t.Fatal("stale Bootstrap(100) must not promote poisoned inode 200")
+		}
+		var cur corev1.Node
+		if err := c.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+			t.Fatalf("expected criu-ready=false preserved for poisoned 200, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+	})
+
+	t.Run("DemoteNode with ino==0 concurrent with Bootstrap(v.ino!=0)", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+		var failStat atomic.Bool
+		execStarted := make(chan struct{})
+		allowExecFinish := make(chan struct{})
+
+		nd := &Node{
+			Client:     c,
+			NodeName:   "test-node",
+			SocketPath: "/run/containerd/containerd.sock",
+			statSocketFn: func(string) (uint64, error) {
+				if failStat.Load() {
+					return 0, errors.New("socket temporarily unavailable")
+				}
+				return 6060, nil
+			},
+			installBundleFn: func() (string, error) { return "v3.19", nil },
+			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+				close(execStarted)
+				<-allowExecFinish
+				return "Looks good.\n", nil
+			},
+		}
+
+		bootDone := make(chan error, 1)
+		go func() {
+			bootDone <- nd.Bootstrap(ctx)
+		}()
+
+		<-execStarted
+		failStat.Store(true)
+		if err := nd.DemoteNode(ctx, "manual-demote", "investigate"); err != nil {
+			t.Fatalf("DemoteNode(ino=0): %v", err)
+		}
+		failStat.Store(false)
+		close(allowExecFinish)
+
+		if err := <-bootDone; err != nil {
+			t.Fatalf("Bootstrap: %v", err)
+		}
+		if nd.IsReady() {
+			t.Fatal("DemoteNode with ino==0 must not be overwritten by concurrent Bootstrap")
+		}
+		var cur corev1.Node
+		if err := c.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+			t.Fatalf("expected criu-ready=false on API server, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+	})
 }
 
 func TestNode_UnsupportedContainerdVersionDoesNotReprobeWithoutRestart(t *testing.T) {
