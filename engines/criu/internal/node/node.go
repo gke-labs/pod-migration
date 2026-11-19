@@ -22,6 +22,7 @@ package node
 import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 
 	"context"
 	"fmt"
@@ -40,12 +41,14 @@ import (
 // capability probe.
 type Node struct {
 	client.Client
-	NodeName string
+	APIReader client.Reader
+	NodeName  string
 
 	Kubelet  *kubeletCheckpoint
 	Restorer *restorer
 
 	SocketPath string
+	Inspector  *ContainerdReadinessInspector
 
 	mu                 sync.Mutex
 	ready              bool
@@ -114,12 +117,18 @@ func (n *Node) recordSocketInodeLocked() {
 
 func (n *Node) bootstrapInternal(ctx context.Context) error {
 	log := logf.FromContext(ctx)
+	r := n.APIReader
+	if r == nil {
+		r = n.Client
+	}
 	var nodeObj corev1.Node
-	if err := n.Client.Get(ctx, types.NamespacedName{Name: n.NodeName}, &nodeObj); err != nil {
+	if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return true }, func() error {
+		return r.Get(ctx, types.NamespacedName{Name: n.NodeName}, &nodeObj)
+	}); err != nil {
 		return err
 	}
 	if err := CheckContainerdVersion(nodeObj.Status.NodeInfo.ContainerRuntimeVersion); err != nil {
-		_ = annotateNode(ctx, n.Client, n.NodeName, "", "unsupported containerd version: "+err.Error(), "upgrade containerd", false)
+		_ = annotateNode(ctx, n.Client, n.APIReader, n.NodeName, "", "unsupported containerd version: "+err.Error(), "upgrade containerd", false)
 		return err
 	}
 	version, err := installCRIUBundle()
@@ -129,18 +138,41 @@ func (n *Node) bootstrapInternal(ctx context.Context) error {
 	ok, raw := verifyCRIU(ctx, n.Restorer.execHost)
 	log.Info("criu capability", "version", version, "checkAll", ok, "raw", truncate(raw, 200))
 
+	var reason, remediation string
+	if !ok {
+		reason = "criu check --all failed"
+		remediation = "check host kernel support for CRIU"
+	} else {
+		// Kernel check passed; verify containerd readiness so an unready containerd
+		// is never sent a checkpoint that would poison its lookup cache (#130).
+		insp := n.Inspector
+		if insp == nil {
+			var execHost func(context.Context, []string, string, ...string) (string, error)
+			if n.Restorer != nil {
+				execHost = n.Restorer.execHost
+			}
+			insp = NewDefaultContainerdInspector(execHost)
+		}
+		cOk, cReason, cRemediation, cErr := CheckContainerdReadiness(insp, n.SocketPath)
+		if cErr != nil {
+			log.Error(cErr, "containerd readiness check error")
+			ok = false
+			reason = "containerd readiness probe error: " + cErr.Error()
+			remediation = "verify containerd is running and accessible"
+		} else if !cOk {
+			ok = false
+			reason = cReason
+			remediation = cRemediation
+		}
+	}
+
 	n.mu.Lock()
 	n.version = version
 	n.ready = ok
 	n.recordSocketInodeLocked()
 	n.mu.Unlock()
 
-	var reason, remediation string
-	if !ok {
-		reason = "criu check --all failed"
-		remediation = "check host kernel support for CRIU"
-	}
-	return annotateNode(ctx, n.Client, n.NodeName, version, reason, remediation, ok)
+	return annotateNode(ctx, n.Client, n.APIReader, n.NodeName, version, reason, remediation, ok)
 }
 
 // DemoteNode marks the node unready with reason and remediation, preserving existing version.
@@ -153,7 +185,7 @@ func (n *Node) DemoteNode(ctx context.Context, reason, remediation string) error
 	ver := n.version
 	n.mu.Unlock()
 
-	return annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false)
+	return annotateNode(ctx, n.Client, n.APIReader, n.NodeName, ver, reason, remediation, false)
 }
 
 // IsReady returns whether the node is currently considered CRIU-ready.

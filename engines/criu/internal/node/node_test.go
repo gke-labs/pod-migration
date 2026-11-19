@@ -75,7 +75,7 @@ func TestNode_DemoteAndRecoverOnContainerdRestart(t *testing.T) {
 		nd.ready = true
 		nd.version = "v3.19"
 		nd.mu.Unlock()
-		return annotateNode(ctx, nd.Client, nd.NodeName, "v3.19", "", "", true)
+		return annotateNode(ctx, nd.Client, nil, nd.NodeName, "v3.19", "", "", true)
 	}
 
 	// 1. Initial bootstrap

@@ -87,6 +87,7 @@ func main() {
 		log.Error(err, "unable to init node worker")
 		os.Exit(1)
 	}
+	nd.APIReader = mgr.GetAPIReader()
 
 	// Run CRIU bundle installation + node capability annotation once the cache starts,
 	// and run a background probe loop to recover node readiness when containerd restarts.
