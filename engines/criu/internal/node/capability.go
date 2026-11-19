@@ -91,7 +91,7 @@ func installCRIUBundle() (version string, err error) {
 	if err := os.MkdirAll(criuConfDir, 0o755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(criuConfDir, "runc.conf"),
+	if err := writeFileAtomic(filepath.Join(criuConfDir, "runc.conf"),
 		[]byte("tcp-close\nskip-in-flight\nfile-validation buildid\nfile-locks\n"), 0o644); err != nil {
 		return "", fmt.Errorf("write criu runc.conf: %w", err)
 	}

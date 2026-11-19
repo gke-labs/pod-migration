@@ -193,20 +193,28 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 		if v.version != "" {
 			n.version = v.version
 		}
-		demoted := concurrentDemote || (n.demoteSeq != prePatchDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, postCurrIno, hasPostCurr))
-		sameSocket := !hasPostCurr || postCurrIno == 0 || v.ino == 0 || postCurrIno == v.ino
-		if demoted {
+		socketMoved := hasPostCurr && postCurrIno != 0 && v.ino != 0 && postCurrIno != v.ino
+		midPatchDemote := n.demoteSeq != prePatchDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, postCurrIno, hasPostCurr)
+		if socketMoved {
 			n.pendingVerdict = nil
-			if v.ino != 0 && n.demoteInode == 0 && sameSocket {
-				n.lastSocketInode = v.ino
+		} else if midPatchDemote {
+			if n.demoteInode != 0 {
+				n.pendingVerdict = nil
+			} else if ctx.Err() == nil && v.ino != 0 {
+				cp := v
+				cp.ready = false
+				cp.reason = n.unreadyReason
+				cp.remediation = n.unreadyRemediation
+				cp.startDemoteSeq = n.demoteSeq
+				n.pendingVerdict = &cp
 			}
-		} else if sameSocket {
-			if v.ino != 0 {
-				n.lastSocketInode = v.ino
+		} else if ctx.Err() == nil && (!concurrentDemote || n.demoteInode == 0) {
+			cp := v
+			if concurrentDemote {
+				cp.startDemoteSeq = prePatchDemoteSeq
 			}
-			vc := v
-			n.pendingVerdict = &vc
-		} else if n.pendingVerdict != nil && n.pendingVerdict.ino == v.ino {
+			n.pendingVerdict = &cp
+		} else if concurrentDemote && n.demoteInode != 0 {
 			n.pendingVerdict = nil
 		}
 		n.mu.Unlock()
@@ -305,6 +313,9 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno, startDemoteSeq u
 		return fmt.Errorf("host command runner is not configured")
 	}
 	ok, raw := verifyCRIU(ctx, execFn)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	log.Info("criu capability", "version", version, "checkAll", ok, "raw", truncate(raw, 200))
 
 	var reason, remediation string
@@ -342,12 +353,17 @@ func (n *Node) demoteNodeAtInode(ctx context.Context, reason, remediation string
 	seq := n.demoteSeq
 	n.demoteInode = ino
 	n.pendingDemote = true
-	n.pendingVerdict = nil
 	if ino != 0 {
+		n.pendingVerdict = nil
 		n.lastSocketInode = ino
 		if reason == ReasonContainerdCachedCRIU {
 			n.poisonedInode = ino
 		}
+	} else if n.pendingVerdict != nil {
+		n.pendingVerdict.ready = false
+		n.pendingVerdict.reason = reason
+		n.pendingVerdict.remediation = remediation
+		n.pendingVerdict.startDemoteSeq = seq
 	}
 	n.mu.Unlock()
 
@@ -388,6 +404,11 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 	lastIno := n.lastSocketInode
 	pendingDemote := n.pendingDemote
 	seq := n.demoteSeq
+	var pv *nodeVerdict
+	if n.pendingVerdict != nil {
+		vc := *n.pendingVerdict
+		pv = &vc
+	}
 	n.mu.Unlock()
 
 	if isReady {
@@ -396,6 +417,12 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 
 	currIno, ok := n.statCurrentSocket()
 	if ok && currIno != 0 && currIno != lastIno {
+		if pv != nil && pv.ino == currIno {
+			if err := n.publish(ctx, *pv); err != nil {
+				return false, err
+			}
+			return n.IsReady(), nil
+		}
 		logf.FromContext(ctx).Info("containerd restart or uncommitted bootstrap detected, probing CRIU readiness",
 			"oldSocketInode", lastIno, "newSocketInode", currIno)
 		if err := n.Bootstrap(ctx); err != nil {
@@ -426,14 +453,7 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	n.mu.Lock()
-	var pv *nodeVerdict
-	if !n.ready && !n.pendingDemote && n.pendingVerdict != nil {
-		vc := *n.pendingVerdict
-		pv = &vc
-	}
-	n.mu.Unlock()
-	if pv != nil {
+	if pv != nil && (!ok || currIno == 0 || pv.ino == currIno) {
 		if err := n.publish(ctx, *pv); err != nil {
 			return false, err
 		}

@@ -1658,3 +1658,130 @@ func TestPSEngineCheckpoint_SamplesSocketInodeBeforeKubeletCall(t *testing.T) {
 		t.Fatal("expected fresh post-checkpoint inode 7002 to recover to ready=true")
 	}
 }
+
+func TestNode_CancelledBootstrapDoesNotCacheSyntheticVerdict(t *testing.T) {
+	scheme := newTestScheme(t)
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		Status: corev1.NodeStatus{
+			NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	execCalls := 0
+	nd := &Node{
+		Client:          c,
+		NodeName:        "test-node",
+		SocketPath:      "/run/containerd/containerd.sock",
+		statSocketFn:    func(string) (uint64, error) { return 8181, nil },
+		installBundleFn: func() (string, error) { return "v3.19", nil },
+		execHostFn: func(ctx context.Context, _ []string, _ string, _ ...string) (string, error) {
+			execCalls++
+			if execCalls == 1 {
+				cancel()
+				return "", ctx.Err()
+			}
+			return "Looks good.\n", nil
+		},
+	}
+
+	if err := nd.Bootstrap(cancelCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from cancelled Bootstrap, got %v", err)
+	}
+	nd.mu.Lock()
+	pv := nd.pendingVerdict
+	nd.mu.Unlock()
+	if pv != nil {
+		t.Fatalf("cancelled Bootstrap must not cache synthetic pendingVerdict: %+v", pv)
+	}
+
+	ready, err := nd.ProbeReadiness(context.Background())
+	if err != nil || !ready || !nd.IsReady() {
+		t.Fatalf("expected clean ProbeReadiness recovery after cancelled Bootstrap, got ready=%v err=%v", ready, err)
+	}
+}
+
+func TestNode_StalePreRestartPendingDemoteDoesNotBlockNewInodePendingVerdict(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		Status: corev1.NodeStatus{
+			NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+	// Fail Patch #1 (DemoteNode on 1000) and Patch #2 (Bootstrap on 2000); Patch #3 succeeds.
+	fc := &flakyNodeClient{Client: base, failPatch: 2}
+
+	var currentIno atomic.Uint64
+	currentIno.Store(1000)
+	installCalls := 0
+	execCalls := 0
+	nd := &Node{
+		Client:          fc,
+		NodeName:        "test-node",
+		SocketPath:      "/run/containerd/containerd.sock",
+		ready:           true,
+		version:         "v3.19",
+		lastSocketInode: 1000,
+		statSocketFn:    func(string) (uint64, error) { return currentIno.Load(), nil },
+		installBundleFn: func() (string, error) {
+			installCalls++
+			return "v3.19", nil
+		},
+		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+			execCalls++
+			return "Looks good.\n", nil
+		},
+	}
+
+	if err := nd.DemoteNode(ctx, ReasonContainerdCachedCRIU, RemediationRestartContainerd); err == nil {
+		t.Fatal("expected Patch #1 failure on DemoteNode(1000)")
+	}
+	// containerd restarts onto fresh inode 2000 while pendingDemote from 1000 is still true.
+	currentIno.Store(2000)
+	if ready, err := nd.ProbeReadiness(ctx); err == nil || ready {
+		t.Fatalf("expected Patch #2 failure on Bootstrap(2000), got ready=%v err=%v", ready, err)
+	}
+	// Next tick on 2000 must publish 2000's buffered ready=true verdict without re-running install/exec
+	// and without writing 1000's stale pendingDemote!
+	ready, err := nd.ProbeReadiness(ctx)
+	if err != nil || !ready || !nd.IsReady() {
+		t.Fatalf("expected 2000 pendingVerdict to converge to ready=true, got ready=%v err=%v", ready, err)
+	}
+	if installCalls != 1 || execCalls != 1 {
+		t.Fatalf("expected 1 install and 1 exec on 2000, got install=%d exec=%d", installCalls, execCalls)
+	}
+}
+
+func TestAnnotateNode_DeletesEmptyReasonWhenUnready(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+	nodeObj := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+			Annotations: map[string]string{
+				NodeAnnotationCRIUReason:      "stale-reason",
+				NodeAnnotationCRIURemediation: "stale-remediation",
+			},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+	if err := annotateNode(ctx, c, "test-node", "v3.19", "", "new-remediation", false); err != nil {
+		t.Fatalf("annotateNode: %v", err)
+	}
+	var cur corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if _, exists := cur.Annotations[NodeAnnotationCRIUReason]; exists {
+		t.Fatalf("expected empty criu-reason deleted on unready update, got %q", cur.Annotations[NodeAnnotationCRIUReason])
+	}
+	if got := cur.Annotations[NodeAnnotationCRIURemediation]; got != "new-remediation" {
+		t.Fatalf("expected criu-remediation=new-remediation, got %q", got)
+	}
+}
