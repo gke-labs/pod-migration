@@ -40,6 +40,8 @@ type fakeNodeOps struct {
 	// checkpointErr, when set, is returned by Checkpoint (after afterCheckpoint).
 	checkpointErr error
 	stopped       []string
+	frozen        []string
+	unfrozen      []string
 	events        []string
 	t             *testing.T
 
@@ -83,6 +85,26 @@ func (f *fakeNodeOps) Checkpoint(ctx context.Context, ns, pod, container string)
 		return "", err
 	}
 	return p, nil
+}
+
+func (f *fakeNodeOps) Freeze(_ context.Context, ns, pod, container string) error {
+	f.events = append(f.events, "freeze")
+	f.frozen = append(f.frozen, ns+"/"+pod+"/"+container)
+	return nil
+}
+
+func (f *fakeNodeOps) Unfreeze(_ context.Context, ns, pod, container string) error {
+	f.events = append(f.events, "unfreeze")
+	f.unfrozen = append(f.unfrozen, ns+"/"+pod+"/"+container)
+	return nil
+}
+
+func (f *fakeNodeOps) AfterCommit() {
+	if f.beforeStop != nil {
+		f.beforeStop()
+	}
+	f.events = append(f.events, "commit")
+	f.stopped = append(f.stopped, "committed")
 }
 
 func (f *fakeNodeOps) SourceInfo(_ context.Context, ns, pod, container string) ([]byte, string, error) {
@@ -182,15 +204,21 @@ func TestNodePipelineHappyPath(t *testing.T) {
 		t.Fatal("tar content mismatch")
 	}
 
-	// Stop AFTER upload (event order), exactly once.
-	if got := strings.Join(ops.events, ","); got != "checkpoint,sourceinfo,stop" {
+	// Freeze BEFORE checkpoint, keep frozen (no unfreeze), exactly once.
+	if got := strings.Join(ops.events, ","); got != "freeze,checkpoint,sourceinfo,commit" {
 		t.Fatalf("event order: %s", got)
+	}
+	if len(ops.frozen) != 1 || len(ops.unfrozen) != 0 {
+		t.Fatalf("fencing state: frozen=%v unfrozen=%v", ops.frozen, ops.unfrozen)
 	}
 
 	// PodSnapshot Ready — the condition shape the orchestrator polls.
 	got := getSnapshot(t, c, "ps-web-0-deadbeef")
 	if !contract.IsSnapshotReady(got) {
 		t.Fatalf("snapshot not ready: %+v", contract.Conditions(got))
+	}
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("successful snapshot must record SourceFrozen=True")
 	}
 }
 
@@ -204,8 +232,8 @@ func TestNodePipelineFailureLeavesSourceRunning(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
 	}
-	if len(ops.stopped) != 0 {
-		t.Fatal("failed checkpoint must NOT stop the container (source keeps serving)")
+	if len(ops.unfrozen) != 1 {
+		t.Fatalf("failed checkpoint must thaw the container (source keeps serving): unfrozen=%v", ops.unfrozen)
 	}
 	got := getSnapshot(t, c, "ps-web-0-deadbeef")
 	if contract.IsSnapshotReady(got) {
@@ -230,8 +258,8 @@ func TestNodePipelineUploadFailureLeavesSourceRunning(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
 	}
-	if len(ops.stopped) != 0 {
-		t.Fatal("upload failure must NOT stop the container")
+	if len(ops.unfrozen) != 1 {
+		t.Fatalf("upload failure must thaw the container: unfrozen=%v", ops.unfrozen)
 	}
 	got := getSnapshot(t, c, "ps-web-0-deadbeef")
 	if contract.IsSnapshotReady(got) {

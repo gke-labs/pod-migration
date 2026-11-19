@@ -145,6 +145,14 @@ func (a *nodeOpsAdapter) SourceInfo(ctx context.Context, ns, pod, container stri
 	return a.n.PSEngineSourceInfo(ctx, ns, pod, container)
 }
 
+func (a *nodeOpsAdapter) Freeze(ctx context.Context, ns, pod, container string) error {
+	return a.n.PSEngineFreezeContainer(ctx, ns, pod, container)
+}
+
+func (a *nodeOpsAdapter) Unfreeze(ctx context.Context, ns, pod, container string) error {
+	return a.n.PSEngineUnfreezeContainer(ctx, ns, pod, container)
+}
+
 func (a *nodeOpsAdapter) StopContainer(ctx context.Context, ns, pod, container string) error {
 	return a.n.PSEngineStopContainer(ctx, ns, pod, container)
 }

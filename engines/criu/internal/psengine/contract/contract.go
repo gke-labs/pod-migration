@@ -109,6 +109,15 @@ const (
 	// treats as a terminal failure.
 	ReasonCheckpointTimedOut = "CheckpointTimedOut"
 
+	// CondSourceFrozen indicates whether the source container was frozen by
+	// the node agent before checkpointing (C4, #146, #148).
+	CondSourceFrozen = "SourceFrozen"
+	ReasonFrozen     = "Frozen"
+	ReasonThawed     = "Thawed"
+
+	// FencingMode declares the engine's fencing mode (C4, #146, #148).
+	FencingMode = "Frozen"
+
 	// AnnotationRestoreStatus is engine-internal: the node agent stamps it on
 	// the replacement pod so the holder wrapper — which only sees the
 	// downward-API annotations file — learns the restore outcome (hold vs
@@ -369,4 +378,28 @@ func IsSnapshotReady(ps *unstructured.Unstructured) bool {
 		}
 	}
 	return false
+}
+
+// IsSourceFrozen reports whether ps has condition SourceFrozen=True.
+func IsSourceFrozen(ps *unstructured.Unstructured) bool {
+	for _, c := range Conditions(ps) {
+		if c.Type == CondSourceFrozen && c.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSourceFrozen sets or clears the SourceFrozen condition on ps.
+func SetSourceFrozen(ps *unstructured.Unstructured, frozen bool, reason, msg string) error {
+	status := metav1.ConditionFalse
+	if frozen {
+		status = metav1.ConditionTrue
+	}
+	return SetCondition(ps, metav1.Condition{
+		Type:    CondSourceFrozen,
+		Status:  status,
+		Reason:  reason,
+		Message: msg,
+	})
 }

@@ -175,8 +175,11 @@ func TestConformanceFullHandshake(t *testing.T) {
 	if !orchestratorSeesSnapshotReady(ps) {
 		t.Fatalf("PMJ readiness predicate rejects our Ready snapshot: %+v", contract.Conditions(ps))
 	}
-	if len(ops.stopped) != 1 {
-		t.Fatal("postCheckpoint:stop not honored")
+	if len(ops.frozen) != 1 || len(ops.unfrozen) != 0 {
+		t.Fatalf("fencing:frozen not honored: frozen=%v unfrozen=%v", ops.frozen, ops.unfrozen)
+	}
+	if !contract.IsSourceFrozen(ps) {
+		t.Fatal("ready snapshot must record SourceFrozen=True")
 	}
 
 	// Phase 4 — the pod gate controller stamps ps-name on the replacement
@@ -313,6 +316,67 @@ func TestPreflightCRDOwnership(t *testing.T) {
 }
 
 func strReader(b []byte) io.Reader { return strings.NewReader(string(b)) }
+
+// TestConformanceInjectedUploadFailureThawsSource verifies the C4 fencing acceptance
+// invariant (#148): an injected upload failure leaves the source thawed and serving.
+func TestConformanceInjectedUploadFailureThawsSource(t *testing.T) {
+	ctx := context.Background()
+	ps := workOrderSnapshot("ps-upload-fail")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	store := &failingStore{memStore: newMemStore(), failSubstr: "checkpoint.tar"}
+	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CPUFamily: "fam-A"}
+
+	if _, err := nr.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-upload-fail"}}); err != nil {
+		t.Fatal(err)
+	}
+	// The source was frozen before checkpoint and thawed on upload failure.
+	if len(ops.frozen) != 1 || len(ops.unfrozen) != 1 {
+		t.Fatalf("expected 1 freeze and 1 unfreeze on upload failure: frozen=%v unfrozen=%v", ops.frozen, ops.unfrozen)
+	}
+	got := getSnapshot(t, c, "ps-upload-fail")
+	if contract.IsSnapshotReady(got) {
+		t.Fatal("failed snapshot must not be ready")
+	}
+	cond := condition(got, contract.CondCheckpoint)
+	if cond == nil || cond.Reason != contract.ReasonFailed {
+		t.Fatalf("want Failed outcome, got %+v", cond)
+	}
+	if contract.IsSourceFrozen(got) {
+		t.Fatal("failed snapshot must not record source as frozen")
+	}
+}
+
+// TestConformanceRestartAfterFreezeThawsOnCancel verifies that if the agent restarts
+// after freezing a source container, and the work order is cancelled, the restarted
+// agent inspects the SourceFrozen record and thaws the source container before
+// reporting Cancelled (#148).
+func TestConformanceRestartAfterFreezeThawsOnCancel(t *testing.T) {
+	ctx := context.Background()
+	ps := workOrderSnapshot("ps-restart-cancel")
+	_ = unstructured.SetNestedField(ps.Object, "psmt-web-0", "spec", "triggerName")
+	// Simulate the recorded SourceFrozen condition from before the agent restart.
+	_ = contract.SetSourceFrozen(ps, true, contract.ReasonFrozen, "source frozen before restart")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
+
+	// Trigger is absent in client, so cancelCheck reports workOrderCancelled.
+	if _, err := nr.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-restart-cancel"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops.unfrozen) != 1 {
+		t.Fatalf("restarted agent must thaw source on cancel: unfrozen=%v", ops.unfrozen)
+	}
+	got := getSnapshot(t, c, "ps-restart-cancel")
+	cond := condition(got, contract.CondCheckpoint)
+	if cond == nil || cond.Reason != contract.ReasonCancelled {
+		t.Fatalf("want Cancelled outcome, got %+v", cond)
+	}
+	if contract.IsSourceFrozen(got) {
+		t.Fatal("cancelled snapshot must not record source as frozen")
+	}
+}
 
 // newCRDClient builds a fake client that knows the apiextensions CRD kind as
 // unstructured (preflight reads CRDs unstructured).

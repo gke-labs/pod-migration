@@ -9,6 +9,7 @@
 > managed GKE Pod Snapshots addon enabled.
 >
 > **What remains unverified until [#129](https://github.com/gke-labs/pod-migration/issues/129) lands:**
+>
 > - **Archive provenance (`R2`) & dedicated GCS credentials (`R5`):** Checkpoint
 >   archives in GCS (`manifest.json`, `spec.json`, `checkpoint.tar`) are SHA-256
 >   and MD5 integrity-checked against accidental corruption, and restore binds
@@ -73,11 +74,18 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      `nsenter`, and stamps `pod-migrate.io/criu-ready` and
      `pod-migrate.io/criu-version` on the `Node`.
    - Reconciles `PodSnapshot` work orders scheduled on its node
-     (`psengine.NodeSnapshotReconciler`): drives the kubelet
-     `ContainerCheckpoint` API, captures the source container's OCI spec,
-     uploads `spec.json`, `checkpoint.tar`, and `manifest.json` to GCS with
-     MD5/size verification, stops the source container via containerd (`SIGKILL`),
-     and marks the `PodSnapshot` `Ready=True`.
+     (`psengine.NodeSnapshotReconciler`): implements the `Frozen` fencing mode
+     (contract clause C4, #148). Pauses (freezes) the source container task via
+     containerd before the checkpoint and records `SourceFrozen=True` on the
+     `PodSnapshot`. Drives the kubelet `ContainerCheckpoint` API, captures the
+     source container's OCI spec, uploads `spec.json`, `checkpoint.tar`, and
+     `manifest.json` to GCS with MD5/size verification, and marks the
+     `PodSnapshot` `Ready=True` while keeping the source container frozen for
+     cold eviction by the controller (eliminating lost acknowledged writes and
+     empty-state restarts). On any failure or cancel path (including after an
+     agent restart), the agent thaws (unfreezes) the source container task via
+     containerd using a fresh bounded context before reporting terminal `Failed`
+     or `Cancelled`, clearing `SourceFrozen` so the workload continues serving.
      If the `PodSnapshotManualTrigger` is deleted first, the engine controller
      sets `Checkpoint=Unknown` with the reason `CancelRequested` (on a work
      order without a bucket, which no agent acts on, it records `Cancelled`

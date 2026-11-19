@@ -76,6 +76,12 @@ type NodeOps interface {
 	// SourceInfo captures the source container's OCI runtime spec + image —
 	// both travel with the archive; the restore node has no source to inspect.
 	SourceInfo(ctx context.Context, ns, pod, container string) (specJSON []byte, imageName string, err error)
+	// Freeze suspends the source container's execution before the checkpoint
+	// (fencing mode Frozen, #148).
+	Freeze(ctx context.Context, ns, pod, container string) error
+	// Unfreeze resumes the source container's execution on failure or cancel
+	// paths (#148).
+	Unfreeze(ctx context.Context, ns, pod, container string) error
 	// StopContainer enforces postCheckpoint:stop after the verified upload
 	// (the kubelet API checkpoints without stopping; the orchestrator's
 	// downstream choreography depends on the stop).
@@ -311,6 +317,12 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	case state == workOrderCancelled:
 		logger.Info("work order cancelled before the pipeline started; not checkpointing", "why", why)
+		if contract.IsSourceFrozen(ps) {
+			logger.Info("source was frozen before cancel/restart; unfreezing source container", "why", why)
+			if unfreezeErr := r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.Container); unfreezeErr != nil {
+				logger.Error(unfreezeErr, "failed to unfreeze source container on restart cancel")
+			}
+		}
 		return ctrl.Result{}, r.finish(ctx, req, contract.ReasonCancelled,
 			fmt.Sprintf("cancelled before the checkpoint started (%s); the source container was not touched", why))
 	}
@@ -321,31 +333,60 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.run(ctx, req.NamespacedName, spec); err != nil {
 		if ctx.Err() != nil {
 			// The agent is shutting down: not an outcome. The work order
-			// stays open, and the next agent picks it up.
-			logger.Info("agent shutting down; checkpoint pipeline abandoned without an outcome", "detail", err.Error())
+			// stays open, and the next agent picks it up. Thaw the source
+			// container so clients aren't hung while the agent restarts (#148).
+			logger.Info("agent shutting down; unfreezing source container", "detail", err.Error())
+			_ = r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.Container)
 			return ctrl.Result{}, ctx.Err()
 		}
 		if errors.Is(err, errFinished) {
-			logger.Info("the PodSnapshot got an outcome elsewhere; source container not stopped", "detail", err.Error())
+			logger.Info("the PodSnapshot got an outcome elsewhere; source container kept frozen", "detail", err.Error())
 			return ctrl.Result{}, nil
 		}
 		if errors.Is(err, errCheckpointTimedOut) {
 			logger.Error(err, "kubelet checkpoint timed out; the source may be frozen")
 			return ctrl.Result{}, r.finish(ctx, req, contract.ReasonCheckpointTimedOut, truncateMsg(err.Error(), 1500))
 		}
+		// On any other failure or cancel path: unfreeze the source container before reporting terminal outcome (#148).
+		logger.Info("checkpoint pipeline failed or cancelled; unfreezing source container", "detail", err.Error())
+		if unfreezeErr := r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.Container); unfreezeErr != nil {
+			logger.Error(unfreezeErr, "failed to unfreeze source container on failure path")
+		}
+
 		if errors.Is(err, errCancelled) {
-			logger.Info("checkpoint pipeline cancelled; source container left running", "detail", err.Error())
+			logger.Info("checkpoint pipeline cancelled; source container not stopped", "detail", err.Error())
 			return ctrl.Result{}, r.finish(ctx, req, contract.ReasonCancelled, truncateMsg(err.Error(), 1500))
 		}
-		logger.Error(err, "checkpoint pipeline failed")
+		logger.Error(err, "checkpoint pipeline failed; source container thawed")
 		return ctrl.Result{}, r.finish(ctx, req, contract.ReasonFailed, truncateMsg(err.Error(), 1500))
 	}
-	return ctrl.Result{}, r.finish(ctx, req, contract.ReasonSucceeded, "archive uploaded + verified; source container stopped")
+	return ctrl.Result{}, r.finish(ctx, req, contract.ReasonSucceeded, "archive uploaded + verified; source container frozen")
 }
 
-// run executes: checkpoint -> hash -> upload spec.json + checkpoint.tar ->
-// manifest.json (last, verified) -> stop container. Any error before the stop
-// leaves the source running, and so does a cancel (errCancelled).
+func (r *NodeSnapshotReconciler) recordSourceFrozen(ctx context.Context, key types.NamespacedName, frozen bool, reason, msg string) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		ps := contract.New(contract.GVKPodSnapshot)
+		if err := r.liveReader().Get(ctx, key, ps); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			if err := r.Get(ctx, key, ps); err != nil {
+				return client.IgnoreNotFound(err)
+			}
+		}
+		if hasOutcome(ps) {
+			return nil
+		}
+		if err := contract.SetSourceFrozen(ps, frozen, reason, msg); err != nil {
+			return err
+		}
+		return r.Status().Update(ctx, ps)
+	})
+}
+
+// run executes: freeze source -> checkpoint -> hash -> upload spec.json +
+// checkpoint.tar -> manifest.json (last, verified) -> commit. Any error
+// before the commit thaws the source container, and so does a cancel.
 func (r *NodeSnapshotReconciler) run(parent context.Context, key types.NamespacedName, spec snapshotSpec) error {
 	snapshot, ns := key.Name, key.Namespace
 
@@ -376,6 +417,17 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 			return fmt.Errorf("%w %s; source container not stopped", errCancelled, stage)
 		}
 		return nil
+	}
+
+	// Freeze the source container before the checkpoint (C4 Frozen fencing mode, #148).
+	// Record what was paused before pausing it, so an agent restart or failure knows to thaw it.
+	if err := r.recordSourceFrozen(parent, key, true, contract.ReasonFrozen, "source container frozen before checkpoint"); err != nil {
+		return fmt.Errorf("record source frozen: %w", err)
+	}
+	if err := r.Ops.Freeze(parent, ns, spec.SourcePod, spec.Container); err != nil {
+		_ = r.Ops.Unfreeze(context.Background(), ns, spec.SourcePod, spec.Container)
+		_ = r.recordSourceFrozen(context.Background(), key, false, contract.ReasonThawed, "freeze failed: "+err.Error())
+		return fmt.Errorf("freeze source container: %w", err)
 	}
 
 	tarPath, err := r.Ops.Checkpoint(parent, ns, spec.SourcePod, spec.Container)
@@ -490,9 +542,9 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 		return fmt.Errorf("%w before the stop; source container not stopped", errFinished)
 	}
 
-	// postCheckpoint: stop — only after the archive is provably durable.
-	if err := r.Ops.StopContainer(parent, ns, spec.SourcePod, spec.Container); err != nil {
-		return fmt.Errorf("archive durable but container stop failed (orchestrator's 30s force-delete will supersede): %w", err)
+	// postCheckpoint: keep source frozen until deleted by eviction (C4, #148).
+	if hook, ok := r.Ops.(interface{ AfterCommit() }); ok {
+		hook.AfterCommit()
 	}
 	return nil
 }
@@ -549,6 +601,11 @@ func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, r
 		}
 		if hasOutcome(ps) {
 			return nil
+		}
+		if reason == contract.ReasonFailed || reason == contract.ReasonCancelled {
+			if contract.IsSourceFrozen(ps) {
+				_ = contract.SetSourceFrozen(ps, false, contract.ReasonThawed, "unfrozen on "+reason)
+			}
 		}
 		for _, c := range conds {
 			if err := contract.SetCondition(ps, c); err != nil {

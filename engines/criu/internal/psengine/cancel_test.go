@@ -381,15 +381,15 @@ func TestCancelInterruptsUpload(t *testing.T) {
 	requireCancelled(t, c)
 }
 
-// (c) The trigger still exists: the normal path is unchanged, the source is
-// stopped after the upload, and the snapshot goes Ready.
+// (c) The trigger still exists: the source is frozen before the checkpoint
+// and kept frozen after the upload, and the snapshot goes Ready.
 func TestCancelNormalPathStillStops(t *testing.T) {
 	c := cancelFixture(t)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := newMemStore()
 	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Millisecond})
 
-	if got := strings.Join(ops.events, ","); got != "checkpoint,sourceinfo,stop" {
+	if got := strings.Join(ops.events, ","); got != "freeze,checkpoint,sourceinfo,commit" {
 		t.Fatalf("event order: %s", got)
 	}
 	if len(store.order) != 3 {
