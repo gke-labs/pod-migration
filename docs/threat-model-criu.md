@@ -34,10 +34,10 @@ The CRIU snapshot engine enables live process checkpoint and restore for `runc` 
 |                                           |                                           |
 |                                           v                                           |
 |   +---------------------------------------+---------------------------------------+   |
-|   | Target Pod Sandbox                    | Cloud Object Storage (GCS)            |   |
-|   |   - holder container (pause sandbox)  |   - Encrypted checkpoint archives     |   |
-|   |   - Sibling restored container (runc) |   - Full process memory & metadata    |   |
-|   +---------------------------------------+---------------------------------------+   |
+| Target Pod Sandbox                    | Cloud Object Storage (GCS)            |
+|   - holder container (pause sandbox)  |   - Raw checkpoint archives (unencrypted) |
+|   - Sibling restored container (runc) |   - Full process memory & metadata    |
++---------------------------------------+---------------------------------------+
 +---------------------------------------------------------------------------------------+
 ```
 
@@ -79,49 +79,57 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
 ### Blast Radius & Mitigations
 
 - **Compromise Impact**: If the `pod-migrate-agent` container is compromised, the attacker achieves root on the host node and access to local containerd sockets.
-- **Cluster RBAC Minimization**: The agent’s ClusterRole (`pod-migrate-psengine-agent`) is strictly scoped:
-  - `nodes/checkpoint` (`create`): Limited to triggering kubelet container checkpoints on its own node.
-  - `nodes` (`get`, `patch`): Limited to publishing readiness and demotion annotations (`pod-migrate.io/criu-ready`, `pod-migrate.io/criu-version`).
-  - `pods` (`get`, `list`, `watch`, `update`, `patch`): Scoped to tracking pod lifecycle and stamping `pod-migrate.io/psengine-restore`.
-  - `podsnapshots` (`get`, `list`, `watch`, `update`, `patch`): Scoped to reconciling assigned checkpoint work orders.
-  - `podsnapshotmanualtriggers` (`get`): Read-only validation of cancellation requests.
-- **Network Ingress**: The agent does not expose any public or cluster-facing TCP/UDP listening ports. All communication is outbound to the Kubernetes API server, cloud storage endpoints, or node-local unix sockets.
+- **Cluster RBAC Scope**: The agent uses a ClusterRole (`pod-migrate-psengine-agent`) granting cluster-wide permissions:
+  - `nodes/checkpoint` (`create`): Triggers kubelet container checkpoints (cluster-wide scope in Kubernetes RBAC).
+  - `nodes` (`get`, `patch`): Publishes readiness and capability annotations (`pod-migrate.io/criu-ready`, `pod-migrate.io/criu-version`).
+  - `pods` (`get`, `list`, `watch`, `update`, `patch`): Tracks replacement pod lifecycle and stamps `pod-migrate.io/psengine-restore`.
+  - `podsnapshots` (`get`, `list`, `watch`) and `podsnapshots/status` (`get`, `update`, `patch`): Read-only work order inspection and status reporting.
+  - `podmigrationjobs` (`get`, `list`, `watch`): Validates active migration job bindings.
+  - `podsnapshotmanualtriggers` (`get`): Verifies cancellation state.
+  - `events` (`create`, `patch`): Emits node restore and failure warning events.
+    _Note on RBAC Breadth_: Because Kubernetes RBAC cannot scope `nodes/checkpoint`, `nodes/patch`, or `pods/update` to the DaemonSet's local node, a compromised agent holds broad cluster-wide write privileges against these resources.
+- **Network Ingress & Health Probes**: The agent listens on host TCP port `:8091` (`hostNetwork: true`) for kubelet liveness (`/healthz`) and readiness (`/readyz`) probes. It does not expose other network services; all other traffic is outbound to the Kubernetes API server, containerd unix sockets, or cloud storage APIs.
 - **Resource Constraints**: Default resource requests (`100m` CPU, `128Mi` memory) and memory limits (`512Mi`) prevent memory exhaustion from runaway agent operations.
 
 ---
 
-## 3. Restore Path Security & Privilege Gain Prevention
+## 3. Restore Path Security & Privilege Boundaries
 
-A central risk in process checkpoint and restore is **unauthorized privilege gain**: restoring an unprivileged container into a higher-privileged configuration, or an archive injecting malicious mounts, devices, or capabilities into a destination host. The CRIU engine enforces strict security invariants (established in [#129](https://github.com/gke-labs/pod-migration/issues/129)):
+A central risk in process checkpoint and restore is **unauthorized privilege gain**: restoring an unprivileged container into a higher-privileged configuration, or an archive injecting malicious mounts, devices, or capabilities into a destination host. Process restoration is governed by strict boundaries (tracked in [#129](https://github.com/gke-labs/pod-migration/issues/129)):
 
-### R1. Authorization & Admission Validation
+### R1. Authorization & Admission Validation (Partial Enforcement; see #233)
 
-- **Controller-Only Orders**: Restore operations are strictly authorized by the controller. The agent restores pods only if they carry an explicit restore order annotation (`<group>/ps-name`) matching an active `PodMigrationJob`.
-- **Anti-Spoofing Webhook**: The mutating admission webhook (`PodGateInjector`) strips any user-supplied restore annotations on pod creation, ensuring user clients cannot bind replacement pods to arbitrary snapshot archives.
+- **Work Order & PMJ Verification**: The node agent restores a pod only after verifying that the target pod carries a restore order annotation (`<group>/ps-name`) matching an authorized work order whose referenced `PodMigrationJob` is either actively `Restoring` or `Succeeded` (warm-retry fallback window).
+- **Partial Admission Boundaries (Known Gap: #233)**: Today, admission-level authorization is **partial**:
+  - The replacement webhook (`PodGateInjector`) only intercepts `CREATE` requests. For Kubeflow and third-party orchestration interop, it intentionally preserves pre-existing, non-empty `podsnapshot.gke.io/ps-name` annotations when no matching PMJ is found, rather than unconditionally stripping them.
+  - Furthermore, post-creation annotation tampering (mutating or injecting restore annotations onto running pods) is not currently blocked at admission time. Issue [#233](https://github.com/gke-labs/pod-migration/issues/233) tracks enforcing strict admission and mutating validation to prevent post-creation annotation tampering and enforce controller-only binding.
 
-### R2. Archive Provenance & Integrity
+### R2. Archive Integrity vs. Provenance (Integrity Only; see #129 R2)
 
-- **Checksum Verification**: Checkpoint archives in GCS (`manifest.json`, `spec.json`, `checkpoint.tar`) are validated against SHA-256 and MD5 hashes before unpacking.
+- **Integrity Against Corruption**: Checkpoint archives in GCS (`manifest.json`, `spec.json`, `checkpoint.tar`) are validated against SHA-256 and MD5 hashes before unpacking.
+- **No Provenance or Signatures Today**: SHA-256 and MD5 checks provide integrity against transmission or storage corruption, **not cryptographic provenance**. Archives are not cryptographically signed or MAC'd; an attacker who can write to the GCS bucket can replace the archive and update the digests.
 - **Archive Size Bounds**: Strict caps prevent denial-of-service via resource exhaustion:
   - Metadata files (`manifest.json`, `spec.json`): Capped at 4 MiB.
   - Archive payload (`checkpoint.tar`): Capped at 8 GiB.
-- **Safe Unpacking**: The filesystem layer (`rootfs-diff.tar`) is applied strictly via containerd's `archive.Apply` into a mounted, isolated snapshot root. Unpacking rejects directory traversal (`..`), path escapes, and tar-slip attempts.
+- **Safe Unpacking**: The filesystem layer (`rootfs-diff.tar`) is applied strictly via containerd's `archive.Apply` into a mounted, isolated snapshot root. Unpacking rejects directory traversal (`..`), path escapes, and tar-slip attempts (regular files and dirs only; sparse files rejected).
 
-### R3. Strict OCI Runtime Spec Inheritance (No Privilege Gain)
+### R3. OCI Spec Adaptation & Privilege Boundaries (Partial — see #129 R2/R5)
 
-CRIU process dumps record process credentials and capabilities. To guarantee that a restored process **never gains privilege** beyond what the Kubernetes scheduler and destination Pod spec authorize:
+When restoring a process, security posture is governed at two layers:
 
-- **Destination Pod Authority**: When `node.AdaptSpec` constructs the OCI runtime bundle for the restored container, all security-relevant fields are copied directly from the kubelet-generated destination container spec:
-  - `Capabilities` (`CapEff`, `CapPrm`, `CapBnd`, `CapInh`, `CapAmb`)
-  - `User` (`UID`, `GID`, `AdditionalGids`)
-  - `NoNewPrivileges`
-  - `Seccomp` profile configuration
-  - `AppArmor` / `SELinux` process labels
-  - `MaskedPaths` and `ReadonlyPaths`
-  - Container device rules (`Devices`)
-  - Linux namespaces (`IPC`, `Network`, `UTS`, `PID`, `Cgroup`)
-- **No Arbitrary Host Mounts**: Archives cannot add host volume mounts or device access. Mounts are restricted to the destination pod's declared volumes and canonical container mounts.
-- **Host Network Refusal**: Pods declaring `hostNetwork: true` are refused at all CRIU boundaries (`PSMTReconciler`, `injectHolder`, and `NodeRestoreReconciler.restore`). This prevents any restored container from manipulating the host network stack or netfilter tables.
+1. **OCI Runtime Spec (`node.AdaptSpec`)**: When `node.AdaptSpec` constructs the OCI runtime bundle (`config.json`) for the restored container, security-relevant fields are copied directly from the kubelet-generated destination container spec:
+   - `Capabilities` (`CapEff`, `CapPrm`, `CapBnd`, `CapInh`, `CapAmb`)
+   - `User` (`UID`, `GID`, `AdditionalGids`)
+   - `NoNewPrivileges`
+   - `Seccomp` profile configuration
+   - `AppArmor` / `SELinux` process labels
+   - `MaskedPaths` and `ReadonlyPaths`
+   - Container device rules (`Devices`)
+   - Linux namespaces (`IPC`, `Network`, `UTS`, `PID`, `Cgroup`)
+   - Volume mounts (restricted to destination pod's declared volumes)
+2. **CRIU Process State Inherent Privileges**: While `AdaptSpec` governs the OCI container spec, CRIU restores process credentials, capabilities, and seccomp state directly from the checkpoint image files (`core-*.img`). Nothing currently compares in-image process credentials against destination constraints. Consequently, as warned in the project banner: **anyone who can write to the checkpoint GCS bucket (including workloads on nodes sharing the default GCE service account) can get root on a restoring node until R2 (provenance/signatures) and R5 (isolated storage credentials) land**.
+
+- **Pending Host Network Refusal (#229)**: Refusal of pods declaring `hostNetwork: true` across all CRIU boundaries (`PSMTReconciler`, `injectHolder`, and `NodeRestoreReconciler.restore`) is implemented in [#229](https://github.com/gke-labs/pod-migration/pull/229) (pending merge).
 
 ### R4. Node Posture & Containerd CVE Defense
 
@@ -131,6 +139,7 @@ Installing `criu` on a node's PATH can interact with container runtime vulnerabi
 - **Enforced Minimums**: The agent inspects `nodeObj.Status.NodeInfo.ContainerRuntimeVersion` at startup (`CheckContainerdVersion`). It refuses to mark the node ready and refuses to install CRIU if containerd is within the vulnerable range:
   - Containerd `>= 2.2.7`, `>= 2.3.4`, or `2.0.x` is strictly required.
   - If an unsupported or vulnerable version is detected, the agent annotates the node with `pod-migrate.io/criu-ready: false`, records the reason, and provides an upgrade remediation message.
+- **Operator Warning on Experimental Restore Flag**: On containerd versions where `enable_experimental_restore_via_create = true` is configured in `/etc/containerd/config.toml`, containerd permits untrusted callers to trigger restore on container creation. Cluster administrators must ensure `enable_experimental_restore_via_create` is disabled (set to `false` or omitted).
 
 ---
 
@@ -146,16 +155,20 @@ When CRIU dumps a container, the resulting archive (`checkpoint.tar`) contains a
 
 **Security Classification**: All checkpoint archives in GCS must be treated with the **same classification as Kubernetes Secrets and cryptographic keys**.
 
-### Cloud Storage IAM Hardening
+### Cloud Storage IAM Hardening & Workload Identity Limitation
 
 To prevent unauthorized access or tampering with checkpoint archives:
 
-1. **Dedicated Service Accounts**: Run the node agent under a dedicated Google Service Account (GSA) with least-privilege bucket access:
+1. **Workload Identity hostNetwork Limitation & Node SA Exposure**:
+   - The node agent runs with `hostNetwork: true` to communicate with the local kubelet and manage network namespaces.
+   - **Workload Identity does not apply to `hostNetwork: true` pods** on GKE (they bypass the GKE metadata server's token interception and receive credentials from the underlying node's GCE service account).
+   - Because the agent uses the node's GCE service account, **"workloads must never get bucket access" is not achievable today on nodes where general workloads share the default node service account**.
+   - Until R5 (#129) lands (dedicated secret-mounted or sidecar storage credentials), clusters deploying the CRIU engine must run CRIU nodes in dedicated node pools using a dedicated GSA, isolated from untrusted workloads.
+2. **Bucket Permissions & Isolation**:
    - Checkpointing nodes require `roles/storage.objectCreator` and `roles/storage.objectViewer`.
    - Restoring nodes require `roles/storage.objectViewer`.
-   - General cluster workloads must **never** be granted read or write permissions to the checkpoint bucket.
-2. **Avoid Default Compute Engine SA**: In GKE, ensure nodes do not use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`), which often carries broad Project Editor permissions.
-3. **Uniform Bucket-Level Access**: Enable Uniform Bucket-Level Access (UBLA) on the checkpoint GCS bucket to prevent ACL-based permission leakage.
+   - Avoid Default Compute Engine SA: In GKE, ensure nodes do not use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`), which often carries broad Project Editor permissions.
+   - Enable Uniform Bucket-Level Access (UBLA) on the checkpoint GCS bucket to prevent ACL-based permission leakage.
 
 ### Encryption & CMEK
 
@@ -204,7 +217,7 @@ The CRIU snapshot engine follows secure container build practices:
 - **Minimal Base Images**:
   - `cmd/engine` (Controller): Built on `gcr.io/distroless/static:nonroot`. Runs as non-root UID `65532:65532`.
   - `cmd/holder` (Sandbox Placeholder): Built `FROM scratch`. Static binary, no shell, no package manager, non-root UID `65532:65532`.
-  - `cmd/agent` (Node Agent): Built from Debian trixie (for CRIU 4.x package build) into an Ubuntu 24.04 minimal runtime with `util-linux` and `ca-certificates`.
+  - `cmd/agent` (Node Agent): Built from Debian trixie (for CRIU 4.x package build) into an Ubuntu 24.04 runtime with `util-linux` and `ca-certificates`.
 - **Reproducible & Trimmed Binaries**: All Go binaries are compiled with:
   ```bash
   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"

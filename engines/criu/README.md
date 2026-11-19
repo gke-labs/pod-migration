@@ -193,8 +193,8 @@ they start cold instead of being restored; also delete the
   - Single-container `runc` pods (`len(pod.Spec.Containers) == 1`).
   - Explicit `command` in the pod spec (required so the `holder` wrapper can
     fall through to a cold start if restore fails).
-  - Non-host-network pods (`hostNetwork: false`). Pods declaring `hostNetwork: true`
-    are refused at all CRIU boundaries.
+  - Non-host-network pods (`hostNetwork: false`). Refusal of pods declaring
+    `hostNetwork: true` across all CRIU boundaries is pending in #229.
   - Homogeneous CPU family between source and target nodes.
 
 ## What Installing the Engine Changes on a Node
@@ -213,11 +213,11 @@ When `pod-migrate-agent` starts on a node, it applies the following modification
 
 Because CRIU checkpoint archives contain complete, unencrypted process address spaces (including in-memory tokens, TLS keys, and credentials), storage backends must be secured with the same rigor as Kubernetes Secrets:
 
-1. **Dedicated Service Account:** Bind the node agent and controller pods to a dedicated Google Service Account (GSA) via Workload Identity. Do **not** use the default Compute Engine service account.
+1. **Workload Identity hostNetwork Limitation & Node SA Exposure:** The node agent runs with `hostNetwork: true` to communicate with the local kubelet and manage network namespaces. On GKE, **Workload Identity does not apply to `hostNetwork: true` pods** (they bypass metadata-server token redirection and inherit the underlying node's GCE service account). Consequently, isolating bucket access from cluster workloads is not achievable today if workloads share nodes with the default node service account. Until R5 ([#129](https://github.com/gke-labs/pod-migration/issues/129)) lands (dedicated secret-mounted or sidecar credentials), run CRIU node pools under a dedicated GSA, isolated from untrusted workloads.
 2. **Least Privilege Bucket IAM:**
    - Source node agents: `roles/storage.objectCreator`, `roles/storage.objectViewer`
    - Target node agents: `roles/storage.objectViewer`
-   - Untrusted workloads: No read or write permissions to the checkpoint bucket.
+   - Avoid Default Compute Engine SA: Do **not** use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`).
 3. **CMEK Encryption:** Configure Cloud KMS Customer-Managed Encryption Keys (CMEK) on the checkpoint bucket.
 4. **Lifecycle Retention:** Apply GCS Object Lifecycle Management rules to automatically delete checkpoint archives after **1 to 7 days**, preventing cold archives from lingering.
 
