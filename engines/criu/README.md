@@ -261,3 +261,10 @@ sed -e "s|<YOUR_CRIU_ENGINE_IMAGE>|${ENGINE_IMG}|g" \
 When creating `PodSnapshotStorageConfig` and `PodSnapshotPolicy` resources for
 this engine, label them with `pod-migrate.io/engine: criu` so `cmd/engine`
 reconciles them.
+
+## Licensing and Source Code Availability
+
+The CRIU snapshot engine is licensed under Apache-2.0. The bundled CRIU binary (`/opt/criu-bundle/criu.bin`) and certain shared libraries are licensed under GPL-2.0 and LGPL-2.1 and invoked strictly as an external subprocess.
+
+- **Image Inventory & Third-Party Notices**: See [docs/third-party-licenses.md](../../docs/third-party-licenses.md).
+- **GPL Source Packaging & Release Process**: See [docs/release-process.md](../../docs/release-process.md) and `tools/release/package_gpl_sources.sh`.

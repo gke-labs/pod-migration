@@ -54,6 +54,9 @@ jobs:
         ALLOW_INVARIANT_COCHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'allow-invariant-cochange') }}
       run: make -C controller test-t5-guardrail
 
+    - name: Run GPL Source Packager Test
+      run: make -C controller test-gpl-source-packager
+
   criu-engine:
     name: Verify & Test CRIU Engine
     runs-on: ubuntu-latest

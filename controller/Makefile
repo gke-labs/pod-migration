@@ -22,7 +22,7 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_GEN_VERSION)
 ENVTEST_K8S_VERSION ?= 1.36.2
 SETUP_ENVTEST_VERSION ?= v0.25.0
 SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest-$(SETUP_ENVTEST_VERSION)
-.PHONY: help generate verify-generate verify-invariant-governance verify-license-headers manifests fmt vet build run envtest test test-t1-invariants test-pmprofiler test-t2-guardrail test-scalesim test-t3-guardrail test-invariant-gen test-t5-guardrail install uninstall deploy undeploy docker-build docker-push controller-gen
+.PHONY: help generate verify-generate verify-invariant-governance verify-license-headers manifests fmt vet build run envtest test test-t1-invariants test-pmprofiler test-t2-guardrail test-scalesim test-t3-guardrail test-invariant-gen test-t5-guardrail test-gpl-source-packager install uninstall deploy undeploy docker-build docker-push controller-gen
 
 VERIFY_ARTIFACTS := api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml
 
@@ -150,6 +150,9 @@ test-invariant-gen: ## Run unit tests for tools/invariant-gen blind-spot detecto
 
 test-t5-guardrail: verify-invariant-governance test-pmprofiler test-invariant-gen ## Run T5 invariant evolution pipeline self-test.
 	../verification-suite/run_guardrail_t5_evolution.sh --self-test
+
+test-gpl-source-packager: ## Run package_gpl_sources self-test.
+	../tools/release/package_gpl_sources_test.sh
 
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.
 	kubectl apply -f config/crd/bases/
