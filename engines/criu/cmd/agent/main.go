@@ -19,6 +19,7 @@ import (
 	"context"
 	"flag"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -87,7 +88,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Run CRIU bundle installation + node capability annotation once the cache starts.
+	// Run CRIU bundle installation + node capability annotation once the cache starts,
+	// and run a background probe loop to recover node readiness when containerd restarts.
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
 			return nil
@@ -95,6 +97,7 @@ func main() {
 		if err := nd.Bootstrap(ctx); err != nil {
 			log.Error(err, "CRIU bootstrap failed (continuing; node remains unready)")
 		}
+		nd.RunProbeLoop(ctx, 10*time.Second)
 		return nil
 	})); err != nil {
 		log.Error(err, "unable to register bootstrap runnable")
