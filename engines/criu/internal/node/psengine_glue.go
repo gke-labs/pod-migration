@@ -28,10 +28,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"syscall"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -61,8 +61,8 @@ func (r *Node) PSEngineCheckpoint(ctx context.Context, ns, pod, container string
 // PSEngineSourceInfo captures the source container's OCI runtime spec and
 // image name — they travel with the archive (the restore node has no source
 // container to inspect).
-func (r *Node) PSEngineSourceInfo(ctx context.Context, ns, pod, container string) ([]byte, string, error) {
-	ref, err := r.Restorer.findContainer(ctx, ns, pod, "", container)
+func (r *Node) PSEngineSourceInfo(ctx context.Context, ns, pod, podUID, container string) ([]byte, string, error) {
+	ref, err := r.Restorer.findContainer(ctx, ns, pod, podUID, container)
 	if err != nil {
 		return nil, "", err
 	}
@@ -76,15 +76,14 @@ func (r *Node) PSEngineSourceInfo(ctx context.Context, ns, pod, container string
 	return specJSON, ref.ImageName, nil
 }
 
-// PSEngineStopContainer enforces postCheckpoint:stop after the verified
-// upload: SIGKILL the container's task via containerd (the kubelet API
-// checkpoints without stopping).
-func (r *Node) PSEngineStopContainer(ctx context.Context, ns, pod, container string) error {
-	ref, err := r.Restorer.findContainer(ctx, ns, pod, "", container)
+// PSEngineFreezeContainer freezes (pauses) the source container task via
+// containerd before the checkpoint (C4 Frozen fencing mode, #148).
+func (r *Node) PSEngineFreezeContainer(ctx context.Context, ns, pod, podUID, container string) error {
+	ref, err := r.Restorer.findContainer(ctx, ns, pod, podUID, container)
 	if err != nil {
 		return err
 	}
-	cs, err := r.Restorer.cclient.Containers(ctx)
+	cs, err := r.Restorer.listContainers(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd list: %w", err)
 	}
@@ -96,23 +95,67 @@ func (r *Node) PSEngineStopContainer(ctx context.Context, ns, pod, container str
 		if err != nil {
 			return fmt.Errorf("task lookup for %s: %w", ref.ID, err)
 		}
-		exitCh, err := task.Wait(ctx)
-		if err != nil {
-			return fmt.Errorf("task wait setup: %w", err)
-		}
-		if err := task.Kill(ctx, syscall.SIGKILL, containerd.WithKillAll); err != nil {
-			return fmt.Errorf("task kill: %w", err)
-		}
-		select {
-		case <-exitCh:
+		st, err := task.Status(ctx)
+		if err == nil && st.Status == containerd.Paused {
 			return nil
-		case <-time.After(15 * time.Second):
-			return fmt.Errorf("container %s did not exit within 15s of SIGKILL", ref.ID)
-		case <-ctx.Done():
-			return ctx.Err()
 		}
+		if err := task.Pause(ctx); err != nil {
+			return fmt.Errorf("task pause: %w", err)
+		}
+		return nil
 	}
 	return fmt.Errorf("container %s not found in containerd", ref.ID)
+}
+
+// PSEngineUnfreezeContainer thaws (resumes) the source container task via
+// containerd. Resume uses a fresh context, not caller ctx, so caller
+// cancellation or deadlines never leave the task frozen (#106, #148).
+func (r *Node) PSEngineUnfreezeContainer(ctx context.Context, ns, pod, podUID, container string) error {
+	// Resume with a fresh, bounded context so a cancelled or timed-out
+	// caller context doesn't fail the resume call (#106, #148).
+	resumeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ref, err := r.Restorer.findContainer(resumeCtx, ns, pod, podUID, container)
+	if err != nil {
+		if errors.Is(err, ErrContainerNotFound) || errdefs.IsNotFound(err) {
+			// If the container is already gone, it doesn't need to be unfrozen.
+			return nil
+		}
+		return fmt.Errorf("find container for unfreeze: %w", err)
+	}
+
+	cs, err := r.Restorer.listContainers(resumeCtx)
+	if err != nil {
+		return fmt.Errorf("containerd list: %w", err)
+	}
+	for _, c := range cs {
+		if c.ID() != ref.ID {
+			continue
+		}
+		task, err := c.Task(resumeCtx, nil)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("task lookup for %s: %w", ref.ID, err)
+		}
+		st, err := task.Status(resumeCtx)
+		if err == nil && (st.Status == containerd.Running || st.Status == containerd.Stopped) {
+			return nil
+		}
+		if err != nil && errdefs.IsNotFound(err) {
+			return nil
+		}
+		if err := task.Resume(resumeCtx); err != nil {
+			if errdefs.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("task resume: %w", err)
+		}
+		return nil
+	}
+	return nil
 }
 
 // PSEngineExtract unpacks a kubelet checkpoint tar with the node worker's safe

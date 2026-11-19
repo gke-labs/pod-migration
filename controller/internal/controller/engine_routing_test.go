@@ -47,17 +47,31 @@ import (
 // routedEngine is a snapshot engine for routing tests: each method returns
 // what the test configured.
 type routedEngine struct {
-	name       string
-	classes    []string
-	verdict    engine.Verdict
-	policy     *engine.PolicyRef
-	policyErr  error
-	provider   snapshot.Provider
-	failures   []restore.Engine
-	guarantees *engine.Guarantees
+	name              string
+	apiGroup          string
+	restoreAnnotation string
+	classes           []string
+	verdict           engine.Verdict
+	policy            *engine.PolicyRef
+	policyErr         error
+	provider          snapshot.Provider
+	failures          []restore.Engine
+	guarantees        *engine.Guarantees
 }
 
-func (e *routedEngine) Name() string             { return e.name }
+func (e *routedEngine) Name() string { return e.name }
+func (e *routedEngine) APIGroup() string {
+	if e.apiGroup != "" {
+		return e.apiGroup
+	}
+	return engine.DefaultAPIGroup
+}
+func (e *routedEngine) RestoreAnnotation() string {
+	if e.restoreAnnotation != "" {
+		return e.restoreAnnotation
+	}
+	return engine.RestoreAnnotation(e.APIGroup())
+}
 func (e *routedEngine) RuntimeClasses() []string { return e.classes }
 func (e *routedEngine) NamespaceResources(*pmv1alpha1.PodMigration) ([]*unstructured.Unstructured, error) {
 	return nil, nil
@@ -80,6 +94,20 @@ const routedRestoreAnnotation = "engine.example.com/restore-from"
 
 // orderingEngine is a routedEngine with restore orders of its own.
 type orderingEngine struct{ routedEngine }
+
+func (e *orderingEngine) APIGroup() string {
+	if e.apiGroup != "" {
+		return e.apiGroup
+	}
+	return "engine.example.com"
+}
+
+func (e *orderingEngine) RestoreAnnotation() string {
+	if e.restoreAnnotation != "" {
+		return e.restoreAnnotation
+	}
+	return routedRestoreAnnotation
+}
 
 func (e *orderingEngine) OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) error {
 	if pod.Annotations == nil {

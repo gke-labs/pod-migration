@@ -64,21 +64,28 @@ const (
 // path (stock GKE ships no CRIU; COS needs a writable location) and installs
 // the wrapper on the host PATH.
 func installCRIUBundle() (version string, err error) {
-	entries, err := os.ReadDir(imageBundleDir)
+	return installCRIUBundleDirs(imageBundleDir, criuBundleDir, criuConfDir, hostPathBinDir)
+}
+
+func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir string) (version string, err error) {
+	entries, err := os.ReadDir(srcBundleDir)
 	if err != nil {
 		return "", fmt.Errorf("agent image carries no criu bundle: %w", err)
 	}
-	if err := os.MkdirAll(criuBundleDir, 0o755); err != nil {
+	if err := os.MkdirAll(dstBundleDir, 0o755); err != nil {
 		return "", err
 	}
 	for _, e := range entries {
-		src := filepath.Join(imageBundleDir, e.Name())
-		dst := filepath.Join(criuBundleDir, e.Name())
+		if e.IsDir() {
+			continue
+		}
+		src := filepath.Join(srcBundleDir, e.Name())
+		dst := filepath.Join(dstBundleDir, e.Name())
 		if err := copyFile(src, dst, 0o755); err != nil {
 			return "", fmt.Errorf("install %s: %w", e.Name(), err)
 		}
 	}
-	v, err := os.ReadFile(filepath.Join(criuBundleDir, "VERSION"))
+	v, err := os.ReadFile(filepath.Join(dstBundleDir, "VERSION"))
 	if err != nil {
 		return "", fmt.Errorf("bundle has no VERSION: %w", err)
 	}
@@ -88,20 +95,20 @@ func installCRIUBundle() (version string, err error) {
 	// reconnect cleanly; file-validation buildid verifies binary identity on
 	// restore. Written at bootstrap because the kubelet checkpoint dump happens
 	// before any agent-driven restore.
-	if err := os.MkdirAll(criuConfDir, 0o755); err != nil {
+	if err := os.MkdirAll(dstConfDir, 0o755); err != nil {
 		return "", err
 	}
-	if err := writeFileAtomic(filepath.Join(criuConfDir, "runc.conf"),
+	if err := writeFileAtomic(filepath.Join(dstConfDir, "runc.conf"),
 		[]byte("tcp-close\nskip-in-flight\nfile-validation buildid\nfile-locks\n"), 0o644); err != nil {
 		return "", fmt.Errorf("write criu runc.conf: %w", err)
 	}
 	// Put the wrapper on the host PATH so containerd/runc (and therefore the
 	// kubelet checkpoint API) can exec it.
-	wrapper, err := os.ReadFile(filepath.Join(criuBundleDir, "criu"))
+	wrapper, err := os.ReadFile(filepath.Join(dstBundleDir, "criu"))
 	if err != nil {
 		return "", err
 	}
-	if err := writeFileAtomic(filepath.Join(hostPathBinDir, "criu"), wrapper, 0o755); err != nil {
+	if err := writeFileAtomic(filepath.Join(dstBinDir, "criu"), wrapper, 0o755); err != nil {
 		return "", fmt.Errorf("install criu wrapper on host PATH: %w", err)
 	}
 

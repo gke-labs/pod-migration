@@ -18,6 +18,7 @@ package psengine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -41,10 +42,10 @@ import (
 // engine only checkpoints there.
 const NodeReadyLabel = "pod-migrate.io/criu-ready"
 
-// CheckpointRequest is the engine's order to the node agent: kubelet
-// ContainerCheckpoint -> upload to gs://Bucket/Path/SnapshotName/ (verified)
-// -> stop the container (postCheckpoint: stop semantics — the kubelet API
-// does not stop; the orchestrator's flow requires it).
+// CheckpointRequest is the engine's order to the node agent: freeze the
+// container -> kubelet ContainerCheckpoint -> upload to
+// gs://Bucket/Path/SnapshotName/ (verified) (preCheckpoint: freeze semantics —
+// the kubelet API does not freeze; the orchestrator's flow requires it).
 type CheckpointRequest struct {
 	Namespace    string
 	PodName      string
@@ -235,6 +236,9 @@ func (r *PSMTReconciler) refusalReason(ctx context.Context, pod *corev1.Pod) str
 	}
 	if len(pod.Spec.Containers) != 1 {
 		return "multi-container pods unsupported by criu engine v1"
+	}
+	if strings.TrimSpace(pod.Annotations[contract.AnnotationRestoreStatus]) == contract.RestoreStatusRestored || pod.Annotations[AnnotationInjected] == "true" {
+		return "re-checkpointing sibling-restored or holder-wrapped pods is unsupported"
 	}
 	if pod.Spec.NodeName == "" {
 		return "pod is not scheduled"
