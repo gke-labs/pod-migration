@@ -674,7 +674,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	// from a previous failed attempt (or M0 finding C double restore) before preparing a new rootfs.
 	cleanNotes, cleanErr := r.cleanup(ctx, in.MigrationName, "", "", false)
 	if cleanErr != nil {
-		logf.FromContext(ctx).Error(cleanErr, "pre-restore cleanup failed", "migration", in.MigrationName)
+		return out, fmt.Errorf("pre-restore cleanup failed: %w", cleanErr)
 	}
 	if len(cleanNotes) > 0 {
 		out.Notes = append(out.Notes, cleanNotes...)
@@ -1042,7 +1042,7 @@ func (r *restorer) IsRunning(ctx context.Context, migrationName string) (bool, e
 }
 
 // SweepOrphans searches for orphaned restore artifacts (containerd leases, bundle
-// directories, and runc containers) whose associated target pod or snapshot no longer exists
+// directories, and mounts) whose associated target pod or snapshot no longer exists
 // on this node, and tears them down.
 func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapshots map[string]bool, sweepStart time.Time) ([]string, error) {
 	if sweepStart.IsZero() {
@@ -1073,12 +1073,16 @@ func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapsh
 		if !strings.HasPrefix(l.ID, "lease-pm-") {
 			continue
 		}
+		migName := strings.TrimPrefix(l.ID, "lease-pm-")
+		// Carry the lease pass's verdict into the bundle pass so bundles belonging
+		// to kept, in-flight, or newer leases are not torn down.
+		seenMigrations[migName] = true
+
 		// A lease created after sweepStart belongs to a restore started after our pod list
 		// was taken; never sweep it as an orphan.
 		if !l.CreatedAt.IsZero() && l.CreatedAt.After(sweepStart) {
 			continue
 		}
-		migName := strings.TrimPrefix(l.ID, "lease-pm-")
 		podUID := l.Labels["pod-migrate.io/pod-uid"]
 		snapName := l.Labels["pod-migrate.io/snapshot-name"]
 
@@ -1104,7 +1108,6 @@ func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapsh
 		}
 		if isOrphan {
 			if _, err := r.cleanup(ctx, migName, "", "", false); err == nil {
-				seenMigrations[migName] = true
 				swept = append(swept, migName)
 			} else {
 				logf.FromContext(ctx).Error(err, "orphan sweep failed to clean lease artifacts", "migration", migName)
@@ -1237,7 +1240,7 @@ func unmountTree(root string) error {
 	}
 	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(cleanRoot))
 	if err != nil {
-		return unmountAll(cleanRoot)
+		return fmt.Errorf("get mounts under %s: %w", cleanRoot, err)
 	}
 	// Sort descending by Mountpoint length so deepest submounts are unmounted first.
 	sort.Slice(mounts, func(i, j int) bool {

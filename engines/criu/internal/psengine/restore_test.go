@@ -145,6 +145,7 @@ type fakeRestoreOps struct {
 	signaled       []RestoreInputs
 	signalSig      int
 	signalCount    int
+	signalErr      error
 	siblingRunning bool
 	failIt         bool
 	failCleanup    bool
@@ -176,6 +177,9 @@ func (f *fakeRestoreOps) Signal(_ context.Context, in RestoreInputs, sig int) er
 	f.signaled = append(f.signaled, in)
 	f.signalSig = sig
 	f.signalCount++
+	if f.signalErr != nil {
+		return f.signalErr
+	}
 	return nil
 }
 
@@ -307,6 +311,84 @@ func TestNodeRestore_TearsDownOnPodDeletion(t *testing.T) {
 	}
 	if ops.cleaned[0].SnapshotName != "ps-web-0-deadbeef" || ops.cleaned[0].TargetPod != "web-1" {
 		t.Errorf("cleanup inputs: %+v", ops.cleaned[0])
+	}
+}
+
+func TestNodeRestore_TearsDownOnPodDeletion_AfterCompleteRestore(t *testing.T) {
+	// A successfully migrated pod has */ps-name cleared to "" by CompleteRestore,
+	// and retains the durable AnnotationSnapshot and/or restore-completed annotation.
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	pod.Annotations[contract.AnnotationPSName] = "" // cleared by CompleteRestore
+	pod.Annotations[contract.AnnotationSnapshot] = "ps-web-0-deadbeef"
+	pod.Annotations["pod-migration.gke.io/restore-completed"] = "ps-web-0-deadbeef"
+	pod.Annotations[contract.AnnotationRestoreStatus] = contract.RestoreStatusRestored
+	now := metav1.Now()
+	pod.DeletionTimestamp = &now
+	pod.Finalizers = []string{"test.io/keep"}
+
+	ops := &fakeRestoreOps{siblingRunning: false}
+	c := newClient(t, pod)
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if len(ops.cleaned) != 1 {
+		t.Fatalf("expected 1 cleanup call for completed restore pod, got %d", len(ops.cleaned))
+	}
+	if ops.cleaned[0].SnapshotName != "ps-web-0-deadbeef" || ops.cleaned[0].TargetPod != "web-1" {
+		t.Errorf("cleanup inputs: %+v", ops.cleaned[0])
+	}
+}
+
+func TestNodeRestore_SignalTransientFailureRetries(t *testing.T) {
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	pod.Annotations[contract.AnnotationRestoreStatus] = contract.RestoreStatusRestored
+	future := metav1.NewTime(time.Now().Add(30 * time.Second))
+	pod.DeletionTimestamp = &future
+	pod.Finalizers = []string{"test.io/keep"}
+	gracePeriod := int64(30)
+	pod.DeletionGracePeriodSeconds = &gracePeriod
+
+	c := newClient(t, pod)
+	ops := &fakeRestoreOps{siblingRunning: true, signalErr: errors.New("transient signal error")}
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+
+	// 1st reconcile: Signal fails
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 1*time.Second {
+		t.Errorf("expected RequeueAfter 1s, got %v", res.RequeueAfter)
+	}
+	if ops.signalCount != 1 {
+		t.Errorf("expected signalCount 1, got %d", ops.signalCount)
+	}
+
+	// 2nd reconcile: transient error clears, Signal should be retried!
+	ops.signalErr = nil
+	res2, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+	if err != nil {
+		t.Fatalf("reconcile 2 failed: %v", err)
+	}
+	if res2.RequeueAfter != 1*time.Second {
+		t.Errorf("expected RequeueAfter 1s, got %v", res2.RequeueAfter)
+	}
+	if ops.signalCount != 2 {
+		t.Errorf("expected signalCount 2 after transient failure retry, got %d", ops.signalCount)
+	}
+
+	// 3rd reconcile: Signal succeeded previously, should NOT re-signal
+	res3, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+	if err != nil {
+		t.Fatalf("reconcile 3 failed: %v", err)
+	}
+	if res3.RequeueAfter != 1*time.Second {
+		t.Errorf("expected RequeueAfter 1s, got %v", res3.RequeueAfter)
+	}
+	if ops.signalCount != 2 {
+		t.Errorf("expected signalCount still 2 after successful signal, got %d", ops.signalCount)
 	}
 }
 

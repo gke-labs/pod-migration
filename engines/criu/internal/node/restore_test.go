@@ -1541,6 +1541,51 @@ func TestRestore_DoubleRestoreTeardownBeforePrepareRootfs(t *testing.T) {
 	}
 }
 
+func TestRestore_PreRestoreCleanupFailureReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-cleanup-err"
+	bundleDir := filepath.Join(tmpDir, "bundles", id)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &restorer{
+		pmRootDir: tmpDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      sampleTargetSpec(),
+				ImageName: "redis:7",
+			}, nil
+		},
+		openPodNetnsFn: func(holderPid int) (*os.File, error) {
+			return os.CreateTemp(t.TempDir(), "netns-holder")
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-pod123.slice/c1.scope\n"), nil
+		},
+		unmountTreeFn: func(dir string) error {
+			return errors.New("unmount device busy")
+		},
+	}
+	in := restoreInputs{
+		MigrationName: "cleanup-err",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  "pod-uid-456",
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec:       sampleSpec(),
+	}
+	_, err := r.restore(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected pre-restore cleanup failure to return error, got nil")
+	}
+	if !strings.Contains(err.Error(), "pre-restore cleanup failed") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 func TestRestore_FailureTeardownCleansContainerMountsSnapshot(t *testing.T) {
 	tmpDir := t.TempDir()
 	id := "pm-fail-restore"
@@ -1643,6 +1688,11 @@ func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
 	// Stage a living bundle dir
 	bundleLiving := filepath.Join(tmpDir, "bundles", "pm-psengine-living-snap")
 	if err := os.MkdirAll(bundleLiving, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stage a living bundle dir matching the living lease (verifies lease verdict carries into bundle pass)
+	bundleLivingLease := filepath.Join(tmpDir, "bundles", "pm-psengine-living-lease")
+	if err := os.MkdirAll(bundleLivingLease, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	// Stage an orphaned bundle dir created after sweepStart (must be skipped)

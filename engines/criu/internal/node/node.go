@@ -33,6 +33,7 @@ import (
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -520,6 +521,13 @@ func (n *Node) SweepOrphanRestores(ctx context.Context) error {
 		if p.Spec.NodeName != n.NodeName && n.NodeName != "" {
 			continue
 		}
+		// Treat terminal pods (Succeeded, Failed) or failed restores as dead.
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if p.Annotations != nil && p.Annotations[contract.AnnotationRestoreStatus] == contract.RestoreStatusFailed {
+			continue
+		}
 		// Count terminating pods as alive until their grace deadline has elapsed.
 		alive := p.DeletionTimestamp == nil
 		if !alive && p.DeletionGracePeriodSeconds != nil && *p.DeletionGracePeriodSeconds > 0 {
@@ -533,6 +541,12 @@ func (n *Node) SweepOrphanRestores(ctx context.Context) error {
 				if strings.HasSuffix(k, "/ps-name") && v != "" {
 					livingSnaps[v] = true
 				}
+			}
+			if snap := p.Annotations[contract.AnnotationSnapshot]; snap != "" {
+				livingSnaps[snap] = true
+			}
+			if snap := p.Annotations["pod-migration.gke.io/restore-completed"]; snap != "" {
+				livingSnaps[snap] = true
 			}
 		}
 	}
