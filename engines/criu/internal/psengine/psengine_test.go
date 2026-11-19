@@ -354,6 +354,32 @@ func TestPSMTRefusesMultiContainer(t *testing.T) {
 	}
 }
 
+func TestPSMTRefusesHostNetwork(t *testing.T) {
+	pod := sourcePod("web-0", 1, "node-a")
+	pod.Spec.HostNetwork = true
+	c := newClient(t,
+		pssc("pssc-x", "bkt", ""),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		pod,
+		criuNode("node-a", true),
+		psmtFor("web-0"),
+	)
+	cp := &fakeCheckpointer{}
+	reconcilePSMT(t, c, cp, "psmt-web-0-deadbeef")
+
+	if len(cp.got) != 0 {
+		t.Fatal("hostNetwork pod must not be checkpointed")
+	}
+	ps := getSnapshot(t, c, contract.PodSnapshotName("web-0", "deadbeef-0000-1111"))
+	cond := condition(ps, contract.CondCheckpoint)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != contract.ReasonRefused {
+		t.Fatalf("want Checkpoint=False/Refused, got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "hostNetwork") {
+		t.Fatalf("expected hostNetwork in refusal message, got: %s", cond.Message)
+	}
+}
+
 func TestPSMTRefusesNonReadyNode(t *testing.T) {
 	c := newClient(t,
 		pssc("pssc-x", "bkt", ""),
@@ -371,6 +397,56 @@ func TestPSMTRefusesNonReadyNode(t *testing.T) {
 	cond := condition(ps, contract.CondCheckpoint)
 	if cond == nil || cond.Reason != contract.ReasonRefused {
 		t.Fatalf("want Refused, got %+v", cond)
+	}
+}
+
+func TestPSMTRefusesAlreadyRestoredPod(t *testing.T) {
+	pod := sourcePod("web-0", 1, "node-a")
+	pod.Annotations = map[string]string{contract.AnnotationRestoreStatus: contract.RestoreStatusRestored}
+	c := newClient(t,
+		pssc("pssc-x", "bkt", ""),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		pod,
+		criuNode("node-a", true),
+		psmtFor("web-0"),
+	)
+	cp := &fakeCheckpointer{}
+	reconcilePSMT(t, c, cp, "psmt-web-0-deadbeef")
+	if len(cp.got) != 0 {
+		t.Fatal("already-restored pod must not be checkpointed")
+	}
+	ps := getSnapshot(t, c, contract.PodSnapshotName("web-0", "deadbeef-0000-1111"))
+	cond := condition(ps, contract.CondCheckpoint)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != contract.ReasonRefused {
+		t.Fatalf("want Checkpoint=False/Refused, got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "sibling-restored") {
+		t.Errorf("expected refusal message to mention sibling-restored, got %q", cond.Message)
+	}
+}
+
+func TestPSMTRefusesHolderInjectedPod(t *testing.T) {
+	pod := sourcePod("web-0", 1, "node-a")
+	pod.Annotations = map[string]string{AnnotationInjected: "true"}
+	c := newClient(t,
+		pssc("pssc-x", "bkt", ""),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		pod,
+		criuNode("node-a", true),
+		psmtFor("web-0"),
+	)
+	cp := &fakeCheckpointer{}
+	reconcilePSMT(t, c, cp, "psmt-web-0-deadbeef")
+	if len(cp.got) != 0 {
+		t.Fatal("holder-injected pod must not be checkpointed")
+	}
+	ps := getSnapshot(t, c, contract.PodSnapshotName("web-0", "deadbeef-0000-1111"))
+	cond := condition(ps, contract.CondCheckpoint)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != contract.ReasonRefused {
+		t.Fatalf("want Checkpoint=False/Refused, got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "holder-wrapped") {
+		t.Errorf("expected refusal message to mention holder-wrapped, got %q", cond.Message)
 	}
 }
 

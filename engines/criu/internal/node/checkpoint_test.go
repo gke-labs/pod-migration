@@ -17,8 +17,12 @@ package node
 
 import (
 	"archive/tar"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -250,5 +254,53 @@ func TestCheckpointTar_ValidExtract(t *testing.T) {
 	}
 	if len(entries) != 4 {
 		t.Fatalf("extractCheckpoint returned %d entries, want 4", len(entries))
+	}
+}
+
+func TestKubeletCheckpoint_DetectsContainerdCachedCRIUFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"message":"checkpoint failed: criu binary not found in shim path or system PATH"}`))
+	}))
+	defer srv.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("fake-token"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+
+	kc := &kubeletCheckpoint{
+		TokenPath: tokenFile,
+		Endpoint:  srv.URL,
+		Client:    srv.Client(),
+	}
+
+	_, err := kc.checkpoint(context.Background(), "default", "pod-1", "container-1")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrContainerdCachedCRIU) {
+		t.Fatalf("expected ErrContainerdCachedCRIU, got: %v", err)
+	}
+
+	// Verify that arbitrary errors mentioning CheckCriu without the verified string are not classified as ErrContainerdCachedCRIU.
+	srvOther := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"message":"internal error in CheckCriu helper: connection reset"}`))
+	}))
+	defer srvOther.Close()
+
+	kcOther := &kubeletCheckpoint{
+		TokenPath: tokenFile,
+		Endpoint:  srvOther.URL,
+		Client:    srvOther.Client(),
+	}
+
+	_, errOther := kcOther.checkpoint(context.Background(), "default", "pod-1", "container-1")
+	if errOther == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(errOther, ErrContainerdCachedCRIU) {
+		t.Fatalf("did not expect ErrContainerdCachedCRIU for generic error, got: %v", errOther)
 	}
 }

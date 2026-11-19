@@ -30,6 +30,10 @@ import (
 	"time"
 )
 
+// ErrContainerdCachedCRIU indicates that containerd ran a CheckpointContainer call before
+// CRIU was discoverable on its PATH and cached the failure in sync.Once.
+var ErrContainerdCachedCRIU = errors.New("containerd cached failed CRIU lookup; restart containerd to clear")
+
 // kubeletCheckpoint drives POST /checkpoint/{ns}/{pod}/{container} on the
 // node-local kubelet (agent runs hostNetwork, so localhost:10250) using the
 // mounted ServiceAccount token (RBAC: nodes/checkpoint create only).
@@ -105,11 +109,15 @@ func (k *kubeletCheckpoint) checkpoint(ctx context.Context, ns, pod, container s
 	body, _ := io.ReadAll(resp.Body)
 	res := &checkpointResult{DurationMs: time.Since(start).Milliseconds(), HTTPStatus: resp.StatusCode}
 	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("kubelet checkpoint HTTP %d: %s", resp.StatusCode, truncate(string(body), 300))
+		bodyStr := string(body)
+		if strings.Contains(bodyStr, "criu binary not found in shim path or system PATH") {
+			return res, fmt.Errorf("%w (kubelet HTTP %d: %s)", ErrContainerdCachedCRIU, resp.StatusCode, truncate(bodyStr, 300))
+		}
+		err := fmt.Errorf("kubelet checkpoint HTTP %d: %s", resp.StatusCode, truncate(bodyStr, 300))
 		// The kubelet reports its CRI deadline as a gRPC DeadlineExceeded
 		// inside a 500.
 		if resp.StatusCode == http.StatusInternalServerError &&
-			(strings.Contains(string(body), "DeadlineExceeded") || strings.Contains(string(body), "context deadline exceeded")) {
+			(strings.Contains(bodyStr, "DeadlineExceeded") || strings.Contains(bodyStr, "context deadline exceeded")) {
 			return res, &checkpointTimeoutError{err}
 		}
 		return res, err

@@ -19,11 +19,14 @@ import (
 	"context"
 	"flag"
 	"os"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -71,11 +74,7 @@ func main() {
 	cfg := ctrl.GetConfigOrDie()
 	cfg.QPS = float32(kubeAPIQPS)
 	cfg.Burst = kubeAPIBurst
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: "0"},
-		HealthProbeBindAddress: probeAddr,
-	})
+	mgr, err := ctrl.NewManager(cfg, agentManagerOptions(probeAddr))
 	if err != nil {
 		log.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -87,7 +86,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Run CRIU bundle installation + node capability annotation once the cache starts.
+	// Run CRIU bundle installation + node capability annotation once the cache starts,
+	// and run a background probe loop to recover node readiness when containerd restarts.
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
 			return nil
@@ -95,6 +95,7 @@ func main() {
 		if err := nd.Bootstrap(ctx); err != nil {
 			log.Error(err, "CRIU bootstrap failed (continuing; node remains unready)")
 		}
+		nd.RunProbeLoop(ctx, 10*time.Second)
 		return nil
 	})); err != nil {
 		log.Error(err, "unable to register bootstrap runnable")
@@ -114,6 +115,7 @@ func main() {
 	if err := (&psengine.NodeRestoreReconciler{
 		Client: mgr.GetClient(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
+		Recorder: mgr.GetEventRecorderFor("psengine-node-restore"),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node restore reconciler")
 		os.Exit(1)
@@ -133,6 +135,23 @@ func main() {
 	}
 }
 
+// agentManagerOptions builds the controller-runtime manager options for the
+// node agent. ClusterRole/pod-migrate-psengine-agent intentionally grants only
+// get and patch on core/nodes (no list/watch), so *corev1.Node reads bypass
+// the informer cache and talk directly to the API server.
+func agentManagerOptions(probeAddr string) ctrl.Options {
+	return ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: probeAddr,
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{&corev1.Node{}},
+			},
+		},
+	}
+}
+
 // nodeOpsAdapter bridges psengine.{NodeOps,RestoreOps} to node.Node's
 // exported PSEngine* methods without introducing a node->psengine import.
 type nodeOpsAdapter struct{ n *node.Node }
@@ -141,12 +160,16 @@ func (a *nodeOpsAdapter) Checkpoint(ctx context.Context, ns, pod, container stri
 	return a.n.PSEngineCheckpoint(ctx, ns, pod, container)
 }
 
-func (a *nodeOpsAdapter) SourceInfo(ctx context.Context, ns, pod, container string) ([]byte, string, error) {
-	return a.n.PSEngineSourceInfo(ctx, ns, pod, container)
+func (a *nodeOpsAdapter) SourceInfo(ctx context.Context, ns, pod, podUID, container string) ([]byte, string, error) {
+	return a.n.PSEngineSourceInfo(ctx, ns, pod, podUID, container)
 }
 
-func (a *nodeOpsAdapter) StopContainer(ctx context.Context, ns, pod, container string) error {
-	return a.n.PSEngineStopContainer(ctx, ns, pod, container)
+func (a *nodeOpsAdapter) Freeze(ctx context.Context, ns, pod, podUID, container string) error {
+	return a.n.PSEngineFreezeContainer(ctx, ns, pod, podUID, container)
+}
+
+func (a *nodeOpsAdapter) Unfreeze(ctx context.Context, ns, pod, podUID, container string) error {
+	return a.n.PSEngineUnfreezeContainer(ctx, ns, pod, podUID, container)
 }
 
 func (a *nodeOpsAdapter) Extract(tarPath, dstDir string) error {

@@ -20,7 +20,7 @@ The controller is implemented as a custom Operator consisting of the following c
 
 ### 1. Webhooks
 - **Eviction Interception Webhook (`/validate-v1-pod-eviction`)**: Handled by `EvictionGate`. Intercepts Pod eviction API calls. If the Pod is opted-in (`pod-migration.gke.io/enabled: "true"`), it denies the eviction request with `429 (Too Many Requests)` to block immediate destruction, and spawns a `PodMigrationJob` (PMJ) CR to orchestrate the migration flow. A replacement Pod that its own migration is still restoring isn't migrated again until that migration concludes: if its new node is also being drained (or for a non-drain eviction), the webhook answers `429` so the evictor retries once restore concludes (#162); if it is a same-name replacement (`StatefulSet`) already off the cordoned origin node and onto an uncordoned node, the webhook answers `404 (Not Found)` so `kubectl drain` on the origin node sees the original Pod is gone and exits cleanly without re-migrating the replacement.
-- **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods, it injects the `gke.io/pod-migration-gate` scheduling gate to hold the pod in a pending state until volume detachment is complete, preventing replica collisions.
+- **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods matched to an active `PodMigrationJob`, it injects the `gke.io/pod-migration-gate` scheduling gate (and scrubs untrusted `<group>/ps-name` restore annotations across registered engines) to hold the pod in a pending state until checkpoint readiness and volume detachment complete, preventing replica collisions; by default (`--shorten-restored-readiness-delay=true`), it also sets `readinessProbe.initialDelaySeconds` to `0` on the replacement's containers and restartable sidecar init containers unless the pod sets `pod-migration.gke.io/preserve-readiness-delay: "true"`, leaving liveness and startup probes untouched (#141). On scale-up pods, it stamps per-engine cold-start bypasses.
 - **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Handled by `PodStatusMutator`. Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
 - **Fence Webhook (`/mutate-v1-pod-fence`)**: Handled by `PodFenceMutator`. Intercepts status updates of Pods labeled `pod-migration.gke.io/fenced: "true"` and holds their `Ready` condition at `False` (reason `PodMigrationFenced`), so a fenced migration source stays out of its Services' endpoints (#131). The other conditions, including `ContainersReady`, keep the kubelet's view. It uses `failurePolicy: Fail`: while the webhook is down, a fenced Pod's status writes are rejected, so it stays NotReady, and it can't finish deleting either, because the kubelet writes a Pod's final status before the Pod is removed. That heals when the webhook is back. Pods without the label never reach it. See [Source fence](#3-source-fence).
 
@@ -66,9 +66,11 @@ Notes:
 - Deleting an active job settles its source fence before removing the `pod-migration.gke.io/source-fence` finalizer (unfencing if the checkpoint never ran, or keeping the fence and evicting if it did). If eviction remains blocked past the unwedge timeout (default 2 minutes), the finalizer is removed to avoid wedging deletion, leaving the source fenced (Warning event `SourceFenceDeleteTimedOut`): release the source by deleting the Pod (so its controller replaces it), or remove the `pod-migration.gke.io/fenced` label if you know its checkpoint never ran. If the controller is down or rolling back to a version without the finalizer handler, unwedge a deleting job with: `kubectl patch podmigrationjob <name> --type=merge -p '{"metadata":{"finalizers":null}}'`.
 - The fence needs RBAC on `pods/status` (`get`, `patch`), which `deploy.yaml` grants.
 
-### 4. Design Docs
+### 4. Design Docs & Security
 - [Snapshot engine contract](docs/design/engine-contract.md): what the controller requires from a snapshot engine (GKE Pod Snapshots today; CRIU and upstream pod checkpoint/restore next).
 - [Safety invariants](docs/invariants.md): the invariants the controller can check after each reconcile (off by default; see `--invariant-mode`).
+- [Threat model & security guidance (CRIU engine)](docs/threat-model-criu.md): threat model, node agent privileges, restore path authorization, containerd posture, and GCS storage guidance.
+- [Security policy](SECURITY.md): vulnerability reporting and disclosure guidelines.
 
 ---
 
@@ -298,7 +300,7 @@ Add the label `pod-migration.gke.io/enabled: "true"` to your workload Pod templa
 
 The eviction webhook only migrates Pods whose runtime class is listed in the controller flag `--migratable-runtime-classes` (default `gvisor`; the token `@default` matches Pods that set no `runtimeClassName`). Only list a class that your installed snapshot engine supports: GKE Pod Snapshots supports `gvisor`.
 
-A snapshot engine serves each migratable runtime class. By default, the default engine, GKE Pod Snapshots (`gke-pod-snapshots`), serves every class in `--migratable-runtime-classes`. The controller flag `--runtime-class-engines` routes classes to engines instead (for example `--runtime-class-engines=gvisor=gke-pod-snapshots`), and a `PodMigration` overrides those routes for its namespace with the `pod-migration.gke.io/runtime-class-engines` annotation, in the same syntax; its `EngineRoutesValid` condition reports whether the annotation is valid. A Pod whose class no engine serves is evicted without a migration. The engine picked for a Pod is recorded on its `PodMigrationJob` (annotation `pod-migration.gke.io/engine`) and serves the job to the end; a job that names an engine the controller doesn't have fails with reason `EngineNotRegistered`.
+A snapshot engine serves each migratable runtime class. By default, the controller registers only GKE Pod Snapshots (`gke-pod-snapshots`, using `podsnapshot.gke.io`), which serves every class in `--migratable-runtime-classes`. When `--criu-api-group` is set (for example `--criu-api-group=criu.podmigration.gke.io`, pre-authorized in RBAC alongside `podsnapshot.gke.io`) or `--runtime-class-engines` routes a class to `criu` (for example `--runtime-class-engines=gvisor=gke-pod-snapshots,@default=criu`), the controller also registers the experimental CRIU engine (`criu`) bound to `--criu-api-group` and `<group>/ps-name`. A `PodMigration` overrides routes for its namespace with the `pod-migration.gke.io/runtime-class-engines` annotation, in the same syntax; its `EngineRoutesValid` condition reports whether the annotation is valid. A Pod whose class no engine serves is evicted without a migration. The engine picked for a Pod is recorded on its `PodMigrationJob` (annotation `pod-migration.gke.io/engine`) and serves the job to the end; a job that names an engine the controller doesn't have fails with reason `EngineNotRegistered`.
 
 An engine that does not fence the source Pod after checkpointing (`FencingNone` or unset) leaves the source running alongside the replacement until evicted. To migrate a Pod using an unfenced engine, the Pod must explicitly opt in with the annotation `pod-migration.gke.io/allow-unfenced: "true"`. Without this annotation, the eviction webhook and preemption controller refuse live migration, record a `Warning MigrationSkippedUnfencedEngine` event on the Pod, and fall back to cold eviction.
 
@@ -324,6 +326,15 @@ spec:
         - name: app
           image: my-app-image:latest
 ```
+
+#### Readiness Probe Initial Delay (#141)
+
+The kubelet treats a restored container as a new container, so a long `readinessProbe.initialDelaySeconds` would delay `Ready` for the full initial delay even when the restored process is serving within seconds. By default (`--shorten-restored-readiness-delay=true`), the replacement webhook sets `readinessProbe.initialDelaySeconds` to `0` on containers and restartable sidecar init containers of gated replacement Pods, while leaving `livenessProbe`, `startupProbe`, and `periodSeconds` untouched so slow cold starts are not restarted.
+
+Because Pod probe specs are immutable after creation, any gated Pod that starts cold keeps `initialDelaySeconds: 0` and joins its Service endpoints as soon as its readiness probe passes (the endpoint fence covers only the source Pod). That applies to Pod gate cold releases (a deleted, failed, snapshot-less, or `NoCompatibleNode` `PodMigrationJob`, or a concurrent-creation tie-break loser released as a normal scale-up Pod), runtime cold fallbacks (`FallbackToColdStart`), and later in-place container restarts after a migration (`#152`). Restore-crash fallbacks delete and recreate the Pod after the job concludes, so the recreated Pod keeps its configured delay.
+
+- **Opt-out:** If a workload's readiness endpoint answers healthy before initialization completes and relies on `initialDelaySeconds` to hold traffic back during a cold start, set the Pod annotation `pod-migration.gke.io/preserve-readiness-delay: "true"` (exact `"true"`) or pass `--shorten-restored-readiness-delay=false` on the controller.
+- **Manifest recommendation:** Where you control the Pod manifest, prefer a short-period `startupProbe` with `readinessProbe.initialDelaySeconds: 0` instead of a long `initialDelaySeconds`, which speeds up both warm restores and cold starts without waiting on a long `periodSeconds` interval.
 
 ### Step 2: Trigger Migration via Eviction
 The controller automatically intercepts standard Kubernetes evictions and orchestrates the stateful migration. You can trigger this manually (e.g. for testing node upgrades) by draining the node the Pod is running on:
@@ -490,4 +501,10 @@ When running in multi-replica HA mode with leader election enabled:
 - Only the **leader replica** reconciles migrations and updates `pod_migration_active` in memory; standby replicas serve `pod_migration_active == 0`.
 - Prometheus scrape jobs should scrape per-pod endpoints and use `max(pod_migration_active)` when querying or alerting on active in-flight migrations across the cluster.
 - For counter and histogram metrics, use `sum(rate(pod_migration_outcomes_total[5m])) by (outcome)` and `sum(rate(pod_migration_phase_duration_seconds_sum[5m])) by (phase) / sum(rate(pod_migration_phase_duration_seconds_count[5m])) by (phase)`.
+
+## 9. Releases & Licensing
+
+- **Release Process**: Step-by-step instructions for building, validating, and publishing official releases are documented in [docs/release-process.md](docs/release-process.md).
+- **Third-Party Licenses & GPL Source Availability**: The complete software inventory of published container images, license disclosures, and instructions for obtaining matching GPL/LGPL source code are documented in [docs/third-party-licenses.md](docs/third-party-licenses.md).
+
 

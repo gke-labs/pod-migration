@@ -18,12 +18,15 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -31,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/image-spec/identity"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -49,9 +53,12 @@ const (
 // restorer drives the sandbox-sibling container restore.
 type restorer struct {
 	cclient *containerd.Client
-	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p).
+	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p -C).
 	// Swappable in tests.
 	execHost         func(ctx context.Context, env []string, name string, args ...string) (string, error)
+	nsenterBin       string
+	openPodNetnsFn   func(holderPid int) (*os.File, error)
+	execNetnsFn      func(ctx context.Context, netns *os.File, name string, args ...string) (string, error)
 	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
 	findContainerFn  func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error)
 	listContainersFn func(ctx context.Context) ([]containerd.Container, error)
@@ -59,22 +66,36 @@ type restorer struct {
 	readProcCgroupFn func(pid int) ([]byte, error)
 	pmRootDir        string
 	criuConfDirPath  string
+	hostNetnsPath    string
 }
 
 func newRestorer(c *containerd.Client) *restorer {
-	return &restorer{cclient: c, execHost: nsenterExec}
+	r := &restorer{
+		cclient:       c,
+		nsenterBin:    "nsenter",
+		hostNetnsPath: "/proc/1/ns/net",
+	}
+	r.execHost = r.nsenterExec
+	return r
 }
 
-// nsenterExec executes cmd in the host mount+pid namespaces (agent has
-// hostPID, so target pid 1 is the host init). Output goes through a file, not
-// pipes: `runc restore --detach` leaves the restored process holding the
-// inherited stderr, so CombinedOutput would block forever after a successful
-// restore. With *os.File stdio, Wait returns on runc exit.
-func nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
+// nsenterExec executes cmd in the host mount, pid, and cgroup namespaces (agent
+// has hostPID, so target pid 1 is the host init). Entering host cgroup
+// namespace (-C) ensures commands like runc restore access the full host cgroup
+// hierarchy and place restored containers under the target pod slice.
+// Output goes through a file, not pipes: `runc restore --detach` leaves the
+// restored process holding the inherited stderr, so CombinedOutput would block
+// forever after a successful restore. With *os.File stdio, Wait returns on
+// runc exit.
+func (r *restorer) nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	full := append([]string{"-t", "1", "-m", "-p", "--", name}, args...)
-	cmd := exec.CommandContext(cctx, "nsenter", full...)
+	bin := "nsenter"
+	if r != nil && r.nsenterBin != "" {
+		bin = r.nsenterBin
+	}
+	full := append([]string{"-t", "1", "-m", "-p", "-C", "--", name}, args...)
+	cmd := exec.CommandContext(cctx, bin, full...)
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.CreateTemp("", "pm-exec-*")
 	if err != nil {
@@ -91,13 +112,47 @@ func nsenterExec(ctx context.Context, env []string, name string, args ...string)
 	return string(b), runErr
 }
 
+// readProcCgroup reads the cgroup v2 membership of a target process from the
+// host cgroup namespace (via r.execHost). It fails closed with no fallback to
+// the agent's private cgroup namespace, preventing ../ path traversal escapes.
+func (r *restorer) readProcCgroup(ctx context.Context, pid int) ([]byte, error) {
+	if r.readProcCgroupFn != nil {
+		return r.readProcCgroupFn(pid)
+	}
+	if r.execHost == nil {
+		return nil, fmt.Errorf("cannot read host cgroup: execHost is nil")
+	}
+	out, err := r.execHost(ctx, nil, "cat", fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return nil, fmt.Errorf("read host cgroup for pid %d: %w", pid, err)
+	}
+	return []byte(out), nil
+}
+
+func nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
+	return (&restorer{}).nsenterExec(ctx, env, name, args...)
+}
+
 func (r *restorer) execRestore(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
+	bin := "nsenter"
+	if r != nil && r.nsenterBin != "" {
+		bin = r.nsenterBin
+	}
 	// runc restore holds inherited stderr, so we redirect to a file.
 	// We keep this file so it acts as a container-stdout log for the restored process.
-	full := append([]string{"-t", "1", "-m", "-p", "--", name}, args...)
-	cmd := exec.CommandContext(cctx, "nsenter", full...)
+	full := append([]string{"-t", "1", "-m", "-p", "-C", "--", name}, args...)
+	cmd := exec.CommandContext(cctx, bin, full...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return err
+			}
+		}
+		return nil
+	}
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -113,6 +168,119 @@ func (r *restorer) execRestore(ctx context.Context, env []string, logPath string
 	return string(b), runErr
 }
 
+func (r *restorer) rootDir() string {
+	if r != nil && r.pmRootDir != "" {
+		return r.pmRootDir
+	}
+	return pmRoot
+}
+
+// openPodNetns opens the network namespace for the holder container PID.
+// It verifies that the target pod does not share the host network namespace (hostNetwork: true pods
+// are out of scope for sandbox netfilter locking), and opens /proc/<pid>/ns/net.
+// Returns (nil, nil) if holderPid <= 0.
+// If the PID shares the host netns or opening fails, it returns an error and nil *os.File.
+func (r *restorer) openPodNetns(holderPid int) (*os.File, error) {
+	if holderPid <= 0 {
+		return nil, nil
+	}
+	if r != nil && r.openPodNetnsFn != nil {
+		return r.openPodNetnsFn(holderPid)
+	}
+	f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", holderPid))
+	if err != nil {
+		return nil, fmt.Errorf("open /proc/%d/ns/net: %w", holderPid, err)
+	}
+
+	hostPath := "/proc/1/ns/net"
+	if r != nil && r.hostNetnsPath != "" {
+		hostPath = r.hostNetnsPath
+	}
+	hostFi, err := os.Stat(hostPath)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat host network namespace %s: %w", hostPath, err)
+	}
+	podFi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat pod network namespace: %w", err)
+	}
+	if os.SameFile(hostFi, podFi) {
+		f.Close()
+		return nil, fmt.Errorf("target pod PID %d shares host network namespace; refusing restore to protect host", holderPid)
+	}
+	return f, nil
+}
+
+func (r *restorer) execNetns(ctx context.Context, netns *os.File, name string, args ...string) (string, error) {
+	if netns == nil {
+		return "", errors.New("cannot enter netns: netns fd is nil")
+	}
+	if r != nil && r.execNetnsFn != nil {
+		return r.execNetnsFn(ctx, netns, name, args...)
+	}
+	nsenterBin := "nsenter"
+	if r != nil && r.nsenterBin != "" {
+		nsenterBin = r.nsenterBin
+	}
+	nsArgs := append([]string{"--net=/proc/self/fd/3", "--", name}, args...)
+	cmd := exec.CommandContext(ctx, nsenterBin, nsArgs...)
+	cmd.ExtraFiles = []*os.File{netns}
+	b, err := cmd.CombinedOutput()
+	return string(b), err
+}
+
+// cleanNetnsLock removes CRIU network-lock iptables rules from the target pod's
+// network namespace so that a cold fallback start is not left with locked network (#126).
+func (r *restorer) cleanNetnsLock(ctx context.Context, netns *os.File) []string {
+	if netns == nil {
+		return []string{"cleanNetnsLock skipped: netns fd is nil"}
+	}
+	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+
+	var notes []string
+	tools := []string{"iptables", "ip6tables", "iptables-legacy", "ip6tables-legacy"}
+	for _, tool := range tools {
+		if cleanCtx.Err() != nil {
+			notes = append(notes, "cleanNetnsLock timed out after 15s")
+			break
+		}
+		// Probe whether CRIU chain exists first to avoid blind legacy module/table creation on nft hosts.
+		if _, err := r.execNetns(cleanCtx, netns, tool, "-w", "2", "-S", "CRIU"); err != nil {
+			continue
+		}
+
+		cleaned := false
+		// Delete any jumps to CRIU in INPUT and OUTPUT.
+		for _, chain := range []string{"INPUT", "OUTPUT"} {
+			for i := 0; i < 10; i++ {
+				_, err := r.execNetns(cleanCtx, netns, tool, "-w", "2", "-D", chain, "-j", "CRIU")
+				if err != nil {
+					break
+				}
+				cleaned = true
+			}
+		}
+		// Flush and delete the CRIU chain.
+		if out, err := r.execNetns(cleanCtx, netns, tool, "-w", "2", "-F", "CRIU"); err == nil {
+			cleaned = true
+		} else {
+			notes = append(notes, fmt.Sprintf("%s -F CRIU failed: %v (%s)", tool, err, truncate(out, 100)))
+		}
+		if out, err := r.execNetns(cleanCtx, netns, tool, "-w", "2", "-X", "CRIU"); err == nil {
+			cleaned = true
+		} else {
+			notes = append(notes, fmt.Sprintf("%s -X CRIU failed: %v (%s)", tool, err, truncate(out, 100)))
+		}
+		if cleaned {
+			notes = append(notes, fmt.Sprintf("cleaned CRIU network-lock rules with %s", tool))
+		}
+	}
+	return notes
+}
+
 // containerRef identifies a CRI container/sandbox pairing in containerd.
 type containerRef struct {
 	ID        string
@@ -122,22 +290,29 @@ type containerRef struct {
 	ImageName string
 }
 
+func (r *restorer) listContainers(ctx context.Context) ([]containerd.Container, error) {
+	if r.listContainersFn != nil {
+		return r.listContainersFn(ctx)
+	}
+	if r.cclient == nil {
+		return nil, fmt.Errorf("containerd client not initialized")
+	}
+	return r.cclient.Containers(ctx)
+}
+
+// ErrContainerNotFound is returned by findContainer when no container matches the target pod/container labels.
+var ErrContainerNotFound = errors.New("container not found in containerd")
+
 // findContainer locates the CRI container for pod/container by containerd
 // labels (namespace k8s.io is set on the client). When podUID is non-empty,
 // containers from earlier pods with the same name are skipped. If multiple
 // containers match (e.g. a stopped attempt with Pid == 0 alongside a running
 // one), prefers a container with a live task Pid.
 func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
-	listFn := func(ctx context.Context) ([]containerd.Container, error) {
-		if r.cclient == nil {
-			return nil, fmt.Errorf("containerd client not initialized")
-		}
-		return r.cclient.Containers(ctx)
+	if r.findContainerFn != nil {
+		return r.findContainerFn(ctx, podNS, podName, podUID, containerName)
 	}
-	if r.listContainersFn != nil {
-		listFn = r.listContainersFn
-	}
-	cs, err := listFn(ctx)
+	cs, err := r.listContainers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd list: %w", err)
 	}
@@ -145,7 +320,10 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 	for _, c := range cs {
 		labels, err := c.Labels(ctx)
 		if err != nil {
-			continue
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("containerd labels for %s: %w", c.ID(), err)
 		}
 		if labels["io.kubernetes.pod.namespace"] != podNS ||
 			labels["io.kubernetes.pod.name"] != podName ||
@@ -159,12 +337,18 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 		ref := &containerRef{ID: c.ID()}
 		spec, err := c.Spec(ctx)
 		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
 			return nil, fmt.Errorf("containerd spec for %s: %w", c.ID(), err)
 		}
 		ref.Spec = spec
 		ref.SandboxID = spec.Annotations["io.kubernetes.cri.sandbox-id"]
 		info, err := c.Info(ctx)
 		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
 			return nil, fmt.Errorf("containerd info for %s: %w", c.ID(), err)
 		}
 		ref.ImageName = info.Image
@@ -179,7 +363,7 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 	if fallback != nil {
 		return fallback, nil
 	}
-	return nil, fmt.Errorf("container %s/%s/%s (uid=%s) not found in containerd", podNS, podName, containerName, podUID)
+	return nil, fmt.Errorf("container %s/%s/%s (uid=%s): %w", podNS, podName, containerName, podUID, ErrContainerNotFound)
 }
 
 // prepareRootfs makes a fresh writable snapshot of the app image and applies
@@ -302,12 +486,23 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		time.Sleep(250 * time.Millisecond)
 	}
 
-	// Pod cgroup slice of the target, from the holder's own cgroup.
-	readCg := func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)) }
-	if r.readProcCgroupFn != nil {
-		readCg = r.readProcCgroupFn
+	var netnsFile *os.File
+	if holder.Pid > 0 {
+		var netnsErr error
+		netnsFile, netnsErr = r.openPodNetns(holder.Pid)
+		if netnsErr != nil {
+			return out, fmt.Errorf("open pod netns: %w", netnsErr)
+		}
+		if netnsFile != nil {
+			defer netnsFile.Close()
+		}
 	}
-	procCg, err := readCg(holder.Pid)
+
+	// Pod cgroup slice of the target, from the holder's own cgroup.
+	// Read within the host cgroup namespace (r.execHost) so the cgroup path is
+	// anchored to the host root and not distorted by the agent's private
+	// cgroup namespace (which emits relative ../ paths under cgroup_namespaces(7)).
+	procCg, err := r.readProcCgroup(ctx, holder.Pid)
 	if err != nil {
 		return out, fmt.Errorf("read holder cgroup: %w", err)
 	}
@@ -316,18 +511,20 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		return out, err
 	}
 
-	rootDir := pmRoot
-	if r.pmRootDir != "" {
-		rootDir = r.pmRootDir
-	}
+	rootDir := r.rootDir()
 	id := "pm-" + in.MigrationName
 	bundleDir := filepath.Join(rootDir, "bundles", id)
 
-	// Clean up any leftover runc container from a previous failed restore
-	// attempt.
+	// Clean up any leftover runc container and stale network locks from a
+	// previous failed restore attempt.
 	if delOut, delErr := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id); delErr != nil {
 		out.Notes = append(out.Notes, fmt.Sprintf("stale-container pre-delete failed (restore will likely conflict): %s: %s",
 			delErr, truncate(delOut, 200)))
+	}
+	if netnsFile != nil {
+		if netNotes := r.cleanNetnsLock(ctx, netnsFile); len(netNotes) > 0 {
+			out.Notes = append(out.Notes, netNotes...)
+		}
 	}
 
 	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
@@ -428,15 +625,20 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 			break
 		}
 		// Preserve the full evidence per variant.
-		saveFailureArtifact(id, fmt.Sprintf("variant%d-runc.out", vi), lastOut)
+		r.saveFailureArtifact(id, fmt.Sprintf("variant%d-runc.out", vi), lastOut)
 		if lg, err2 := os.ReadFile(filepath.Join(bundleDir, "restore.log")); err2 == nil {
-			saveFailureArtifact(id, fmt.Sprintf("variant%d-restore.log", vi), string(lg))
+			r.saveFailureArtifact(id, fmt.Sprintf("variant%d-restore.log", vi), string(lg))
 		}
 		out.Notes = append(out.Notes, fmt.Sprintf("variant %d failed: %s", vi, truncate(criuErrorLines(lastOut), 500)))
-		if !strings.Contains(lastOut, "cgroup") {
-			break // not cgroup-shaped — the fallback mode cannot help
+		if vi == len(variants)-1 || ctx.Err() != nil || !strings.Contains(lastOut, "cgroup") {
+			break // not cgroup-shaped or final variant — cannot retry
 		}
 		_, _ = r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id)
+		if netnsFile != nil {
+			if netNotes := r.cleanNetnsLock(ctx, netnsFile); len(netNotes) > 0 {
+				out.Notes = append(out.Notes, netNotes...)
+			}
+		}
 	}
 	if lastErr != nil {
 		sig := criuErrorLines(lastOut)
@@ -453,12 +655,39 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		if notes := r.cleanup(ctx, in.MigrationName, "", "", false); len(notes) > 0 {
 			out.Notes = append(out.Notes, notes...)
 		}
-		return out, fmt.Errorf("runc restore failed: %w: %s", lastErr, truncate(sig, 1200))
+		// Clean up any CRIU network-lock iptables rules in the target pod's netns
+		// so that the holder wrapper's cold fallback has network access (#126).
+		var netNotes []string
+		if netnsFile != nil {
+			netNotes = r.cleanNetnsLock(ctx, netnsFile)
+			if len(netNotes) > 0 {
+				out.Notes = append(netNotes, out.Notes...)
+			}
+		}
+		netSummary := ""
+		if len(netNotes) > 0 {
+			netSummary = " [" + strings.Join(netNotes, "; ") + "]"
+		}
+		return out, fmt.Errorf("runc restore failed%s: %w: %s", netSummary, lastErr, truncate(sig, 800))
 	}
 
 	pidB, err := os.ReadFile(pidFile)
 	if err != nil {
-		return out, fmt.Errorf("restored but pid-file missing: %w", err)
+		if notes := r.cleanup(ctx, in.MigrationName, "", "", false); len(notes) > 0 {
+			out.Notes = append(out.Notes, notes...)
+		}
+		var netNotes []string
+		if netnsFile != nil {
+			netNotes = r.cleanNetnsLock(ctx, netnsFile)
+			if len(netNotes) > 0 {
+				out.Notes = append(netNotes, out.Notes...)
+			}
+		}
+		netSummary := ""
+		if len(netNotes) > 0 {
+			netSummary = " [" + strings.Join(netNotes, "; ") + "]"
+		}
+		return out, fmt.Errorf("restored but pid-file missing%s: %w", netSummary, err)
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(pidB)))
 	out.Pid = pid
@@ -486,11 +715,19 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 	if holder.ImageName == "" {
 		return AdaptParams{}, "", fmt.Errorf("target holder container has no image name; refusing to fall back to archive image")
 	}
+	if !strings.HasPrefix(podSlice, "/") || strings.Contains(podSlice, "..") {
+		return AdaptParams{}, "", fmt.Errorf("podSlice must be an absolute path without traversal: %q", podSlice)
+	}
+	cleanSlice := path.Clean(podSlice)
+	if cleanSlice == "/" || cleanSlice == "." {
+		return AdaptParams{}, "", fmt.Errorf("podSlice cannot be empty or root cgroup")
+	}
 	srcSandboxID := in.SrcSpec.Annotations["io.kubernetes.cri.sandbox-id"]
+	cgroupsPath := path.Clean(cleanSlice + "/" + id)
 	return AdaptParams{
 		RootfsPath:      rootfsPath,
 		HolderPid:       holder.Pid,
-		CgroupsPath:     podSlice + "/" + id,
+		CgroupsPath:     cgroupsPath,
 		SourcePodUID:    in.SourcePodUID,
 		TargetPodUID:    in.TargetPodUID,
 		SourceSandboxID: srcSandboxID,
@@ -506,14 +743,14 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 func (r *restorer) cleanup(ctx context.Context, migrationName, checkpointDir, tarPath string, keepContainer bool) []string {
 	var notes []string
 	id := "pm-" + migrationName
-	bundleDir := filepath.Join(pmRoot, "bundles", id)
+	bundleDir := filepath.Join(r.rootDir(), "bundles", id)
 	if !keepContainer {
 		if out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id); err != nil {
 			notes = append(notes, "runc delete: "+truncate(out, 200))
 		}
 		if err := unmountAll(filepath.Join(bundleDir, "rootfs")); err != nil {
 			notes = append(notes, "unmount rootfs: "+err.Error())
-		} else {
+		} else if r.cclient != nil {
 			if err := r.cclient.SnapshotService("overlayfs").Remove(ctx, id); err != nil {
 				notes = append(notes, "snapshot remove: "+err.Error())
 			}
@@ -604,9 +841,9 @@ func projectedVolumeRewrites(srcSpec *specs.Spec, targetPodUID string) [][2]stri
 }
 
 // saveFailureArtifact keeps restore failure evidence under
-// /var/lib/pod-migrate/failed/<id>/ (bounded: overwritten per migration id).
-func saveFailureArtifact(id, name, content string) {
-	dir := filepath.Join(pmRoot, "failed", id)
+// <rootDir>/failed/<id>/ (bounded: overwritten per migration id).
+func (r *restorer) saveFailureArtifact(id, name, content string) {
+	dir := filepath.Join(r.rootDir(), "failed", id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}

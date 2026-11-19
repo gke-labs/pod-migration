@@ -200,27 +200,32 @@ func migrationDeadlineAnchor(job *pmv1alpha1.PodMigrationJob) time.Time {
 }
 
 func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, job *pmv1alpha1.PodMigrationJob, timeout time.Duration) bool {
+	_, progressing := r.checkSnapshotProgressing(ctx, job, timeout)
+	return progressing
+}
+
+func (r *PodMigrationJobReconciler) checkSnapshotProgressing(ctx context.Context, job *pmv1alpha1.PodMigrationJob, timeout time.Duration) (*snapshot.Status, bool) {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || job.Status.SnapshotRef == "" {
-		return false
+		return nil, false
 	}
 	if time.Since(migrationDeadlineAnchor(job)) > util.MaxMigrationTimeout {
-		return false
+		return nil, false
 	}
 	podName := job.Spec.PodRef.Name
 	snapStatus, err := r.getSnapshotProvider(job).CheckStatus(ctx, job, podName)
 	if err != nil || snapStatus == nil {
-		return false
+		return nil, false
 	}
 	if snapStatus.Phase == snapshot.PhaseReady {
-		return true
+		return snapStatus, true
 	}
 	if snapStatus.Phase == snapshot.PhaseFailed || snapStatus.Phase == snapshot.PhaseRefused {
-		return false
+		return snapStatus, false
 	}
 	if !snapStatus.LastProgressTime.IsZero() && time.Since(snapStatus.LastProgressTime) < timeout {
-		return true
+		return snapStatus, true
 	}
-	return false
+	return snapStatus, false
 }
 
 func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMigrationJob) bool {
@@ -616,6 +621,35 @@ func (r *PodMigrationJobReconciler) shouldProbeFallbackEvents(key string) bool {
 	return true
 }
 
+// jobAPIGroup returns the snapshot CRD API group of the engine that serves job.
+func (r *PodMigrationJobReconciler) jobAPIGroup(job *pmv1alpha1.PodMigrationJob) string {
+	if r.Engines != nil {
+		if eng, err := r.Engines.ForJob(job); err == nil && eng != nil {
+			if g := strings.TrimSpace(eng.APIGroup()); g != "" {
+				return g
+			}
+		}
+	}
+	if gp, ok := r.SnapshotProvider.(*snapshot.GKEProvider); ok && gp != nil {
+		return gp.APIGroup()
+	}
+	return snapshot.DefaultAPIGroup
+}
+
+// apiGroups returns the deduplicated snapshot CRD API groups across all
+// registered engines (or the configured SnapshotProvider when Engines is nil).
+func (r *PodMigrationJobReconciler) apiGroups() []string {
+	if r.Engines != nil {
+		if groups := r.Engines.APIGroups(); len(groups) > 0 {
+			return groups
+		}
+	}
+	if gp, ok := r.SnapshotProvider.(*snapshot.GKEProvider); ok && gp != nil {
+		return []string{gp.APIGroup()}
+	}
+	return []string{snapshot.DefaultAPIGroup}
+}
+
 // getSnapshotProvider returns the snapshot provider of the engine that serves
 // job, unwrapped, so callers can type-assert optional provider capabilities.
 func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigrationJob) snapshot.Provider {
@@ -632,6 +666,9 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // The source fence (#131) holds the source's Ready condition at False.
@@ -649,6 +686,18 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // against the invariant engine when enabled. It runs only when the reconcile step completed without error.
 // In strict mode, any violation patches a non-terminal PMJ to PhaseFailed, cleans up triggers, and suppresses requeue.
 func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job *pmv1alpha1.PodMigrationJob, res *ctrl.Result, reconcileErr *error) {
+	r.evaluateInvariantsWithSnapshot(ctx, job, nil, res, reconcileErr)
+}
+
+func snapshotProgressFromStatus(st *snapshot.Status) invariants.SnapshotProgress {
+	return invariants.SnapshotProgress{
+		Ready:            st.Phase == snapshot.PhaseReady,
+		Failed:           st.Phase == snapshot.PhaseFailed || st.Phase == snapshot.PhaseRefused,
+		LastProgressTime: st.LastProgressTime,
+	}
+}
+
+func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.Context, job *pmv1alpha1.PodMigrationJob, lastSnapStatus *snapshot.Status, res *ctrl.Result, reconcileErr *error) {
 	if !r.InvariantEngine.Enabled() || job == nil || !job.DeletionTimestamp.IsZero() {
 		return
 	}
@@ -656,6 +705,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		return
 	}
 
+	now := time.Now()
 	var namespacePMJs []pmv1alpha1.PodMigrationJob
 	pmjListFailed := false
 	pmjList := &pmv1alpha1.PodMigrationJobList{}
@@ -685,16 +735,13 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		podListFailed = true
 	}
 
+	primaryGroup := r.jobAPIGroup(job)
 	hasOrphanedTrigger := false
 	snapName := job.Status.SnapshotRef
 	if job.Spec.PodRef.Name != "" {
 		triggerName := util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
 		trigger := &unstructured.Unstructured{}
-		trigger.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshotManualTrigger",
-		})
+		trigger.SetGroupVersionKind(snapshot.ManualTriggerGVK(primaryGroup))
 		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger); err == nil {
 			if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
 				job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed) && trigger.GetDeletionTimestamp() == nil {
@@ -709,15 +756,69 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 	}
 
 	var primarySnapshotConditions []metav1.Condition
+	var primarySnapObj *unstructured.Unstructured
 	if snapName != "" {
 		snapObj := &unstructured.Unstructured{}
-		snapObj.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "podsnapshot.gke.io",
-			Version: "v1",
-			Kind:    "PodSnapshot",
-		})
+		snapObj.SetGroupVersionKind(snapshot.PodSnapshotGVK(primaryGroup))
 		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
+			primarySnapObj = snapObj
 			primarySnapshotConditions = extractUnstructuredConditions(snapObj)
+		}
+	}
+
+	var snapshotProgress map[string]invariants.SnapshotProgress
+	recordSnapshotProgress := func(jobKey string, st *snapshot.Status) {
+		if st == nil {
+			return
+		}
+		if snapshotProgress == nil {
+			snapshotProgress = make(map[string]invariants.SnapshotProgress)
+		}
+		snapshotProgress[jobKey] = snapshotProgressFromStatus(st)
+	}
+	primaryKey := job.Namespace + "/" + job.Name
+	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		if lastSnapStatus != nil {
+			recordSnapshotProgress(primaryKey, lastSnapStatus)
+		} else if primarySnapObj != nil {
+			recordSnapshotProgress(primaryKey, snapshot.CheckPodSnapshotStatus(primarySnapObj, now))
+		}
+	}
+	for i := range namespacePMJs {
+		other := &namespacePMJs[i]
+		otherKey := other.Namespace + "/" + other.Name
+		if otherKey == primaryKey {
+			continue
+		}
+		if other.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || other.Status.SnapshotRef == "" {
+			continue
+		}
+		anchor := migrationDeadlineAnchor(other)
+		if anchor.IsZero() || now.Sub(anchor) <= invariants.EffectiveMigrationTimeout(other) || now.Sub(anchor) > util.MaxMigrationTimeout+30*time.Second {
+			continue
+		}
+		otherSnapObj := &unstructured.Unstructured{}
+		otherSnapObj.SetGroupVersionKind(snapshot.PodSnapshotGVK(r.jobAPIGroup(other)))
+		if err := r.Get(ctx, types.NamespacedName{Namespace: other.Namespace, Name: other.Status.SnapshotRef}, otherSnapObj); err == nil {
+			recordSnapshotProgress(otherKey, snapshot.CheckPodSnapshotStatus(otherSnapObj, now))
+		} else if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			var fallbackProvider snapshot.Provider
+			if r.SnapshotProvider != nil {
+				fallbackProvider = r.SnapshotProvider
+			} else if r.Engines != nil {
+				if eng, engErr := r.Engines.ForJob(other); engErr == nil && eng != nil {
+					if p := eng.Snapshots(); p != nil {
+						if _, isGKE := p.(*snapshot.GKEProvider); !isGKE {
+							fallbackProvider = p
+						}
+					}
+				}
+			}
+			if fallbackProvider != nil {
+				if st, checkErr := fallbackProvider.CheckStatus(ctx, other, other.Spec.PodRef.Name); checkErr == nil && st != nil {
+					recordSnapshotProgress(otherKey, st)
+				}
+			}
 		}
 	}
 
@@ -735,7 +836,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		restoreOrders = r.Engines.InspectRestoreOrder
 	}
 	violations, shouldFailStrict := r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
-		Now:                          time.Now(),
+		Now:                          now,
 		Reconciler:                   "PodMigrationJobReconciler",
 		PrimaryPMJ:                   job,
 		PrimaryPod:                   primaryPod,
@@ -746,6 +847,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 		HasOrphanedTrigger:           hasOrphanedTrigger,
 		RestoreCrashSignatureMatched: restoreCrashMatched,
 		PrimarySnapshotConditions:    primarySnapshotConditions,
+		SnapshotProgress:             snapshotProgress,
 		RestoreOrders:                restoreOrders,
 	})
 	if shouldFailStrict && len(violations) > 0 && !invariants.IsTerminalPhase(job.Status.Phase) {
@@ -838,8 +940,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	var lastSnapStatus *snapshot.Status
 	defer func() {
-		r.evaluateInvariants(ctx, job, &res, &reconcileErr)
+		r.evaluateInvariantsWithSnapshot(ctx, job, lastSnapStatus, &res, &reconcileErr)
 	}()
 
 	podName := job.Spec.PodRef.Name
@@ -880,7 +983,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 		migrationTimeout := r.getMigrationTimeout(job)
 		if time.Since(migrationDeadlineAnchor(job)) > migrationTimeout {
-			if r.isSnapshotProgressing(ctx, job, migrationTimeout) {
+			snapStatus, progressing := r.checkSnapshotProgressing(ctx, job, migrationTimeout)
+			if snapStatus != nil {
+				lastSnapStatus = snapStatus
+			}
+			if progressing {
 				logger.Info("Migration exceeded baseline timeout but snapshot is actively progressing; extending deadline",
 					"job", job.Name, "snapshot", job.Status.SnapshotRef, "timeout", migrationTimeout)
 			} else if r.isEvictionWithinBudget(job) {
@@ -1279,6 +1386,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Error(err, "Failed to check snapshot status")
 			return ctrl.Result{}, err
 		}
+		lastSnapStatus = snapStatus
 
 		switch snapStatus.Phase {
 		case snapshot.PhaseFailed, snapshot.PhaseRefused:
@@ -2349,43 +2457,34 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 		For(&pmv1alpha1.PodMigrationJob{}).
 		WithOptions(options)
 
-	psmtGVK := schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotManualTrigger",
-	}
-	snapGVK := schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshot",
-	}
-
 	restMapper := mgr.GetRESTMapper()
 
-	// Check if PodSnapshotManualTrigger CRD is installed before watching
-	watchPSMT, err := shouldWatchCRD(restMapper, psmtGVK)
-	if err != nil {
-		return err
-	}
-	if !watchPSMT {
-		logger.Info("PodSnapshotManualTrigger CRD not registered; skipping watch and falling back to polling")
-	} else {
-		psmt := &unstructured.Unstructured{}
-		psmt.SetGroupVersionKind(psmtGVK)
-		bldr = bldr.Watches(psmt, handler.EnqueueRequestForOwner(mgr.GetScheme(), restMapper, &pmv1alpha1.PodMigrationJob{}))
-	}
+	for _, group := range r.apiGroups() {
+		psmtGVK := snapshot.ManualTriggerGVK(group)
+		watchPSMT, err := shouldWatchCRD(restMapper, psmtGVK)
+		if err != nil {
+			return err
+		}
+		if !watchPSMT {
+			logger.Info("PodSnapshotManualTrigger CRD not registered; skipping watch and falling back to polling", "apiGroup", group)
+		} else {
+			psmt := &unstructured.Unstructured{}
+			psmt.SetGroupVersionKind(psmtGVK)
+			bldr = bldr.Watches(psmt, handler.EnqueueRequestForOwner(mgr.GetScheme(), restMapper, &pmv1alpha1.PodMigrationJob{}))
+		}
 
-	// Check if PodSnapshot CRD is installed before watching
-	watchSnap, err := shouldWatchCRD(restMapper, snapGVK)
-	if err != nil {
-		return err
-	}
-	if !watchSnap {
-		logger.Info("PodSnapshot CRD not registered; skipping watch and falling back to polling")
-	} else {
-		snap := &unstructured.Unstructured{}
-		snap.SetGroupVersionKind(snapGVK)
-		bldr = bldr.Watches(snap, handler.EnqueueRequestsFromMapFunc(r.mapSnapshotToPMJ))
+		snapGVK := snapshot.PodSnapshotGVK(group)
+		watchSnap, err := shouldWatchCRD(restMapper, snapGVK)
+		if err != nil {
+			return err
+		}
+		if !watchSnap {
+			logger.Info("PodSnapshot CRD not registered; skipping watch and falling back to polling", "apiGroup", group)
+		} else {
+			snap := &unstructured.Unstructured{}
+			snap.SetGroupVersionKind(snapGVK)
+			bldr = bldr.Watches(snap, handler.EnqueueRequestsFromMapFunc(r.mapSnapshotToPMJ))
+		}
 	}
 
 	// Wake the jobs waiting for the disruption budget when a PodDisruptionBudget
@@ -2420,12 +2519,17 @@ func (r *PodMigrationJobReconciler) mapSnapshotToPMJ(ctx context.Context, obj cl
 	if snapName == "" || namespace == "" {
 		return nil
 	}
+	snapGroup := obj.GetObjectKind().GroupVersionKind().Group
 	pmjList := &pmv1alpha1.PodMigrationJobList{}
 	if err := r.List(ctx, pmjList, client.InNamespace(namespace), client.MatchingFields{PMJSnapshotRefIndex: snapName}); err != nil {
 		return nil
 	}
 	var reqs []ctrl.Request
-	for _, job := range pmjList.Items {
+	for i := range pmjList.Items {
+		job := &pmjList.Items[i]
+		if snapGroup != "" && r.jobAPIGroup(job) != snapGroup {
+			continue
+		}
 		reqs = append(reqs, ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: job.Namespace,
