@@ -354,6 +354,32 @@ func TestPSMTRefusesMultiContainer(t *testing.T) {
 	}
 }
 
+func TestPSMTRefusesHostNetwork(t *testing.T) {
+	pod := sourcePod("web-0", 1, "node-a")
+	pod.Spec.HostNetwork = true
+	c := newClient(t,
+		pssc("pssc-x", "bkt", ""),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		pod,
+		criuNode("node-a", true),
+		psmtFor("web-0"),
+	)
+	cp := &fakeCheckpointer{}
+	reconcilePSMT(t, c, cp, "psmt-web-0-deadbeef")
+
+	if len(cp.got) != 0 {
+		t.Fatal("hostNetwork pod must not be checkpointed")
+	}
+	ps := getSnapshot(t, c, contract.PodSnapshotName("web-0", "deadbeef-0000-1111"))
+	cond := condition(ps, contract.CondCheckpoint)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != contract.ReasonRefused {
+		t.Fatalf("want Checkpoint=False/Refused, got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "hostNetwork") {
+		t.Fatalf("expected hostNetwork in refusal message, got: %s", cond.Message)
+	}
+}
+
 func TestPSMTRefusesNonReadyNode(t *testing.T) {
 	c := newClient(t,
 		pssc("pssc-x", "bkt", ""),

@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -41,6 +42,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"k8s.io/client-go/tools/record"
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
@@ -75,6 +78,7 @@ type NodeRestoreReconciler struct {
 	Ops      RestoreOps
 	Store    ObjectStore
 	WorkDir  string // default /var/lib/pod-migrate/psengine
+	Recorder record.EventRecorder
 	// CPUFamily is this node's CPU model; a manifest recorded on a different
 	// family is refused (cross-family restores can crash glibc-heavy apps).
 	// Empty disables the guard (both sides honest-absent).
@@ -123,12 +127,15 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	err := r.restore(ctx, pod, psName)
 	status := contract.RestoreStatusRestored
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctrl.Result{}, ctx.Err()
+		}
 		logger.Error(err, "psengine restore failed; holder will cold-start")
 		status = contract.RestoreStatusFailed
 	} else {
 		logger.Info("psengine restore complete", "snapshot", psName)
 	}
-	restoreOutcomes.WithLabelValues(status).Inc()
+
 	// Stamp the outcome — the holder wrapper reads it via the downward API.
 	latest := &corev1.Pod{}
 	if gerr := r.Get(ctx, req.NamespacedName, latest); gerr != nil {
@@ -141,10 +148,26 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if uerr := r.Update(ctx, latest); uerr != nil {
 		return ctrl.Result{}, uerr
 	}
+
+	restoreOutcomes.WithLabelValues(status).Inc()
+	if status == contract.RestoreStatusFailed && r.Recorder != nil {
+		msg := fmt.Sprintf("psengine restore failed; falling back to a cold start: %v", err)
+		if len(msg) > 950 {
+			cut := 947
+			for cut > 0 && !utf8.RuneStart(msg[cut]) {
+				cut--
+			}
+			msg = msg[:cut] + "..."
+		}
+		r.Recorder.Event(pod, corev1.EventTypeWarning, "RestoreFailed", msg)
+	}
 	return ctrl.Result{}, nil
 }
 
 func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, psName string) error {
+	if pod.Spec.HostNetwork {
+		return fmt.Errorf("pod %s has hostNetwork=true; unsupported by criu engine", pod.Name)
+	}
 	// Resolve the PodSnapshot work order (bucket/path/source identity).
 	ps := contract.New(contract.GVKPodSnapshot)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: psName}, ps); err != nil {

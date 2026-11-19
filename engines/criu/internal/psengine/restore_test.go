@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -34,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	k8syaml "sigs.k8s.io/yaml"
 
@@ -123,6 +125,13 @@ func TestInjectHolderSkips(t *testing.T) {
 		pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: "sidecar"})
 		if ok, _ := InjectHolder(pod, "img"); ok {
 			t.Fatal("multi-container pod is outside v1 scope")
+		}
+	})
+	t.Run("hostNetwork", func(t *testing.T) {
+		pod := gatedReplacementPod()
+		pod.Spec.HostNetwork = true
+		if ok, reason := InjectHolder(pod, "img"); ok || !strings.Contains(reason, "hostNetwork") {
+			t.Fatalf("expected hostNetwork refusal, got ok=%v reason=%q", ok, reason)
 		}
 	})
 }
@@ -223,8 +232,9 @@ func TestNodeRestoreFailureStampsFailed(t *testing.T) {
 	_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
 	pod := replacementPodOnNode("ps-web-0-deadbeef")
 	c := newClient(t, ps, pod)
+	rec := record.NewFakeRecorder(10)
 	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{failIt: true},
-		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir()}
+		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatal(err)
@@ -234,6 +244,76 @@ func TestNodeRestoreFailureStampsFailed(t *testing.T) {
 	// failed -> holder wrapper falls through to cold start
 	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
 		t.Fatalf("restore status: %q", got.Annotations[contract.AnnotationRestoreStatus])
+	}
+
+	// Verify that a Warning RestoreFailed event was recorded for the replacement pod (#126).
+	select {
+	case ev := <-rec.Events:
+		if !strings.Contains(ev, "Warning RestoreFailed") || !strings.Contains(ev, "falling back to a cold start") {
+			t.Fatalf("recorded event = %q, want Warning RestoreFailed with falling back to a cold start", ev)
+		}
+	default:
+		t.Fatal("expected a Warning RestoreFailed event on restore failure, got none")
+	}
+}
+
+func TestNodeRestore_CancelledContextDoesNotEmitRestoreFailed(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	c := newClient(t, ps, pod)
+	rec := record.NewFakeRecorder(10)
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{failIt: true},
+		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context to simulate agent shutdown / SIGTERM
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled error, got res=%v, err=%v", res, err)
+	}
+
+	// Verify NO Warning RestoreFailed event was emitted on shutdown
+	select {
+	case ev := <-rec.Events:
+		t.Fatalf("unexpected event emitted on cancelled context: %s", ev)
+	default:
+	}
+
+	// Verify pod annotations were NOT modified to failed
+	got := &corev1.Pod{}
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
+	if got.Annotations[contract.AnnotationRestoreStatus] != "" {
+		t.Fatalf("restore status should not be stamped on shutdown: %q", got.Annotations[contract.AnnotationRestoreStatus])
+	}
+}
+
+func TestNodeRestore_RefusesHostNetworkPod(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	pod.Spec.HostNetwork = true
+	c := newClient(t, ps, pod)
+	rec := record.NewFakeRecorder(10)
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{},
+		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	got := &corev1.Pod{}
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
+	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
+		t.Fatalf("restore status: %q, want %s", got.Annotations[contract.AnnotationRestoreStatus], contract.RestoreStatusFailed)
+	}
+	select {
+	case ev := <-rec.Events:
+		if !strings.Contains(ev, "Warning RestoreFailed") || !strings.Contains(ev, "hostNetwork") {
+			t.Fatalf("recorded event = %q, want Warning RestoreFailed with hostNetwork", ev)
+		}
+	default:
+		t.Fatal("expected a Warning RestoreFailed event on hostNetwork refusal, got none")
 	}
 }
 
@@ -562,6 +642,9 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	}
 	if !hasRule(agentRole, "", "nodes/checkpoint", "create") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing create on core/nodes/checkpoint")
+	}
+	if !hasRule(agentRole, "", "events", "create", "patch") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing create/patch on core/events")
 	}
 	if !hasRule(controllerRole, contract.GVKStorageConfig.Group, "podsnapshotstorageconfigs", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list/watch on %s/podsnapshotstorageconfigs", contract.GVKStorageConfig.Group)
