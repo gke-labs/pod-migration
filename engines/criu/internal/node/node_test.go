@@ -424,7 +424,7 @@ func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
 			Client:     fc,
 			NodeName:   "test-node",
 			SocketPath: "/run/containerd/containerd.sock",
-		Inspector:  fakeReadyInspector(),
+			Inspector:  fakeReadyInspector(),
 			statSocketFn: func(string) (uint64, error) {
 				return 4242, nil
 			},
@@ -484,7 +484,7 @@ func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
 			Client:          fc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
-		Inspector:       fakeReadyInspector(),
+			Inspector:       fakeReadyInspector(),
 			statSocketFn:    func(string) (uint64, error) { return 4343, nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
 			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -536,7 +536,7 @@ func TestNode_TransientAPIErrorsRetryAndConvergeWithoutContainerdRestart(t *test
 			Client:          fc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
-		Inspector:       fakeReadyInspector(),
+			Inspector:       fakeReadyInspector(),
 			statSocketFn:    func(string) (uint64, error) { return 7777, nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
 			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -578,7 +578,7 @@ func TestNode_TransientAPIErrorsRetryAndConvergeWithoutContainerdRestart(t *test
 			Client:          fc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
-		Inspector:       fakeReadyInspector(),
+			Inspector:       fakeReadyInspector(),
 			lastSocketInode: 1000, // old pre-restart inode
 			statSocketFn:    func(string) (uint64, error) { return 2000, nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
@@ -904,7 +904,7 @@ func TestNode_CrossRestartDemotionAndZeroInodeDemotionNotClobbered(t *testing.T)
 			Client:          c,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
-		Inspector:       fakeReadyInspector(),
+			Inspector:       fakeReadyInspector(),
 			statSocketFn:    func(string) (uint64, error) { return currIno.Load(), nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
 			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -959,7 +959,7 @@ func TestNode_CrossRestartDemotionAndZeroInodeDemotionNotClobbered(t *testing.T)
 			Client:     c,
 			NodeName:   "test-node",
 			SocketPath: "/run/containerd/containerd.sock",
-		Inspector:  fakeReadyInspector(),
+			Inspector:  fakeReadyInspector(),
 			statSocketFn: func(string) (uint64, error) {
 				if failStat.Load() {
 					return 0, errors.New("socket temporarily unavailable")
@@ -1033,7 +1033,7 @@ func TestNode_CrossRestartDemotionAndZeroInodeDemotionNotClobbered(t *testing.T)
 			Client:          hc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
-		Inspector:       fakeReadyInspector(),
+			Inspector:       fakeReadyInspector(),
 			lastSocketInode: 1000, // prior pre-restart socket inode
 			statSocketFn: func(string) (uint64, error) {
 				if failStat.Load() {
@@ -1228,7 +1228,7 @@ func TestNode_PersistentPatchFailureRetriesOnlyAnnotation(t *testing.T) {
 			Client:       fc,
 			NodeName:     "test-node",
 			SocketPath:   "/run/containerd/containerd.sock",
-		Inspector:    fakeReadyInspector(),
+			Inspector:    fakeReadyInspector(),
 			statSocketFn: func(string) (uint64, error) { return 4400, nil },
 			installBundleFn: func() (string, error) {
 				installCalls++
@@ -1313,7 +1313,7 @@ func TestNode_PersistentPatchFailureRetriesOnlyAnnotation(t *testing.T) {
 			Client:       fc,
 			NodeName:     "test-node",
 			SocketPath:   "/run/containerd/containerd.sock",
-		Inspector:    fakeReadyInspector(),
+			Inspector:    fakeReadyInspector(),
 			statSocketFn: func(string) (uint64, error) { return 4500, nil },
 		}
 
@@ -1374,7 +1374,7 @@ func TestNode_PersistentPatchFailureRetriesOnlyAnnotation(t *testing.T) {
 			Client:          fc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
-		Inspector:       fakeReadyInspector(),
+			Inspector:       fakeReadyInspector(),
 			statSocketFn:    func(string) (uint64, error) { return 4600, nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
 			execHostFn: func(context.Context, []string, string, ...string) (string, error) {

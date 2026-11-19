@@ -64,6 +64,9 @@ type Node struct {
 	pendingVerdict     *nodeVerdict
 	unreadyReason      string
 	unreadyRemediation string
+	transientReadiness bool
+	transientIno       uint64
+	transientDemoteSeq uint64
 
 	statSocketFn    func(string) (uint64, error)
 	installBundleFn func() (string, error)
@@ -113,6 +116,8 @@ func (n *Node) Bootstrap(ctx context.Context) error {
 	startIno, _ := n.statCurrentSocket()
 	n.mu.Lock()
 	startDemoteSeq := n.demoteSeq
+	n.transientReadiness = false
+	n.transientIno = 0
 	if startIno != 0 && n.pendingVerdict != nil && n.pendingVerdict.ino != startIno {
 		n.pendingVerdict = nil
 	}
@@ -352,9 +357,20 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno, startDemoteSeq u
 	verdictIno := startIno
 	if transientErr != nil {
 		// Transient lookup error during probe/restart: do NOT commit socket inode.
-		// Passing ino: 0 prevents publish from recording startIno as lastSocketInode,
-		// allowing ProbeReadiness to retry on the next tick.
+		// Passing ino: 0 prevents publish from recording startIno as lastSocketInode.
+		// Mark transientReadiness so subsequent ProbeReadiness ticks retry only the
+		// containerd readiness check cheaply without full Bootstrap (no bundle reinstall).
 		verdictIno = 0
+		n.mu.Lock()
+		n.transientReadiness = true
+		n.transientIno = startIno
+		n.transientDemoteSeq = startDemoteSeq
+		n.mu.Unlock()
+	} else {
+		n.mu.Lock()
+		n.transientReadiness = false
+		n.transientIno = 0
+		n.mu.Unlock()
 	}
 	pubErr := n.publish(ctx, nodeVerdict{
 		ready:          ok,
@@ -393,6 +409,8 @@ func (n *Node) demoteNodeAtInode(ctx context.Context, reason, remediation string
 	if ino != 0 {
 		n.pendingVerdict = nil
 		n.lastSocketInode = ino
+		n.transientReadiness = false
+		n.transientIno = 0
 		if reason == ReasonContainerdCachedCRIU {
 			n.poisonedInode = ino
 		}
@@ -441,6 +459,8 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 	lastIno := n.lastSocketInode
 	pendingDemote := n.pendingDemote
 	seq := n.demoteSeq
+	transientRetry := n.transientReadiness
+	transIno := n.transientIno
 	var pv *nodeVerdict
 	if n.pendingVerdict != nil {
 		vc := *n.pendingVerdict
@@ -460,6 +480,16 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 			}
 			return n.IsReady(), nil
 		}
+		if transientRetry && currIno == transIno {
+			// Containerd socket is unchanged after a transient readiness error.
+			// Retry only the readiness check cheaply without full Bootstrap (no Node GET,
+			// no bundle reinstall, no criu check --all).
+			return n.retryContainerdReadiness(ctx, currIno)
+		}
+		n.mu.Lock()
+		n.transientReadiness = false
+		n.transientIno = 0
+		n.mu.Unlock()
 		logf.FromContext(ctx).Info("containerd restart or uncommitted bootstrap detected, probing CRIU readiness",
 			"oldSocketInode", lastIno, "newSocketInode", currIno)
 		if err := n.Bootstrap(ctx); err != nil {
@@ -498,6 +528,55 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func (n *Node) retryContainerdReadiness(ctx context.Context, ino uint64) (bool, error) {
+	n.mu.Lock()
+	version := n.version
+	startDemoteSeq := n.transientDemoteSeq
+	n.mu.Unlock()
+
+	insp := n.Inspector
+	if insp == nil {
+		execFn := n.execHostFn
+		if execFn == nil && n.Restorer != nil {
+			execFn = n.Restorer.execHost
+		}
+		insp = NewDefaultContainerdInspector(execFn)
+	}
+
+	cOk, cReason, cRemediation, cErr := CheckContainerdReadiness(ctx, insp, n.SocketPath)
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if cErr != nil {
+		// Still transiently failing (e.g. dial error).
+		// Keep transientReadiness active; do not reinstall bundle or re-patch node.
+		return false, cErr
+	}
+
+	n.mu.Lock()
+	n.transientReadiness = false
+	n.transientIno = 0
+	n.mu.Unlock()
+
+	var reason, remediation string
+	if !cOk {
+		reason = cReason
+		remediation = cRemediation
+	}
+
+	if err := n.publish(ctx, nodeVerdict{
+		ready:          cOk,
+		version:        version,
+		reason:         reason,
+		remediation:    remediation,
+		ino:            ino,
+		startDemoteSeq: startDemoteSeq,
+	}); err != nil {
+		return false, err
+	}
+	return n.IsReady(), nil
 }
 
 // RunProbeLoop runs periodic readiness probes while ctx is active.

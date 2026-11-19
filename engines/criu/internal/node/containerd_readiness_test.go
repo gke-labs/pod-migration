@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -193,6 +194,41 @@ version = 2
 		}
 	})
 
+	t.Run("unrelated plugin env without shim manager produces empty path deterministically", func(t *testing.T) {
+		cfg := []byte(`
+version = 2
+[plugins."io.containerd.other.plugin"]
+  env = ["PATH=/should/not/match"]
+`)
+		_, shimPath, err := parseContainerdConfig(cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if shimPath != "" {
+			t.Fatalf("expected empty shimPath when shim.v1.manager is absent, got %q", shimPath)
+		}
+	})
+
+	t.Run("shim manager with no env ignores unrelated plugins with env", func(t *testing.T) {
+		cfg := []byte(`
+version = 2
+[plugins."io.containerd.other.plugin1"]
+  env = ["PATH=/bad/path/1"]
+
+[plugins."io.containerd.shim.v1.manager"]
+
+[plugins."io.containerd.other.plugin2"]
+  env = ["PATH=/bad/path/2"]
+`)
+		_, shimPath, err := parseContainerdConfig(cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if shimPath != "" {
+			t.Fatalf("expected empty shimPath when shim.v1.manager has no env, got %q", shimPath)
+		}
+	})
+
 	t.Run("unrelated plugin env does not override shim manager", func(t *testing.T) {
 		cfg := []byte(`
 version = 2
@@ -220,64 +256,115 @@ version = 2
 	})
 }
 
-func TestReadConfig_CmdlineParsing(t *testing.T) {
-	tests := []struct {
-		name     string
-		args     []string
-		wantPath string
-	}{
-		{name: "-c space path", args: []string{"containerd", "-c", "/etc/containerd/custom.toml"}, wantPath: "/etc/containerd/custom.toml"},
-		{name: "-c=path", args: []string{"containerd", "-c=/etc/containerd/custom.toml"}, wantPath: "/etc/containerd/custom.toml"},
-		{name: "-config space path", args: []string{"containerd", "-config", "/etc/containerd/custom.toml"}, wantPath: "/etc/containerd/custom.toml"},
-		{name: "-config=path", args: []string{"containerd", "-config=/etc/containerd/custom.toml"}, wantPath: "/etc/containerd/custom.toml"},
-		{name: "--config space path", args: []string{"containerd", "--config", "/etc/containerd/custom.toml"}, wantPath: "/etc/containerd/custom.toml"},
-		{name: "--config=path", args: []string{"containerd", "--config=/etc/containerd/custom.toml"}, wantPath: "/etc/containerd/custom.toml"},
+func TestReadContainerdConfig_RealRoot(t *testing.T) {
+	fakeRoot := t.TempDir()
+	defaultConfig := []byte("version = 2\ndefault = true\n")
+	customConfig := []byte("version = 2\ncustom = true\n")
+
+	if err := os.MkdirAll(filepath.Join(fakeRoot, "etc", "containerd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeRoot, "etc", "containerd", "config.toml"), defaultConfig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeRoot, "etc", "containerd", "custom.toml"), customConfig, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tc := range tests {
+	t.Run("default config path when no args", func(t *testing.T) {
+		data, err := readContainerdConfig(fakeRoot, 1001, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(data, defaultConfig) {
+			t.Fatalf("got %q, want %q", string(data), string(defaultConfig))
+		}
+	})
+
+	cmdlineTests := []struct {
+		name string
+		args []string
+	}{
+		{name: "-c custom", args: []string{"containerd", "-c", "/etc/containerd/custom.toml"}},
+		{name: "-c=custom", args: []string{"containerd", "-c=/etc/containerd/custom.toml"}},
+		{name: "-config custom", args: []string{"containerd", "-config", "/etc/containerd/custom.toml"}},
+		{name: "-config=custom", args: []string{"containerd", "-config=/etc/containerd/custom.toml"}},
+		{name: "--config custom", args: []string{"containerd", "--config", "/etc/containerd/custom.toml"}},
+		{name: "--config=custom", args: []string{"containerd", "--config=/etc/containerd/custom.toml"}},
+	}
+	for _, tc := range cmdlineTests {
 		t.Run(tc.name, func(t *testing.T) {
-			insp := NewDefaultContainerdInspector(nil)
-			insp.ReadCmdline = func(pid int) ([]string, error) {
+			data, err := readContainerdConfig(fakeRoot, 1001, func(int) ([]string, error) {
 				return tc.args, nil
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
-			parsedPath := "/etc/containerd/config.toml"
-			args, _ := insp.ReadCmdline(1001)
-			for i := 0; i < len(args); i++ {
-				arg := args[i]
-				if arg == "-c" || arg == "--config" || arg == "-config" {
-					if i+1 < len(args) && len(args[i+1]) > 0 {
-						parsedPath = args[i+1]
-						break
-					}
-				} else if p, ok := strings.CutPrefix(arg, "--config="); ok {
-					parsedPath = p
-					break
-				} else if p, ok := strings.CutPrefix(arg, "-config="); ok {
-					parsedPath = p
-					break
-				} else if p, ok := strings.CutPrefix(arg, "-c="); ok {
-					parsedPath = p
-					break
-				}
-			}
-			if parsedPath != tc.wantPath {
-				t.Fatalf("parsedPath = %q, want %q", parsedPath, tc.wantPath)
+			if !bytes.Equal(data, customConfig) {
+				t.Fatalf("got %q, want %q", string(data), string(customConfig))
 			}
 		})
 	}
 
-	t.Run("cmdline read error fails closed", func(t *testing.T) {
-		insp := NewDefaultContainerdInspector(nil)
-		insp.ReadCmdline = func(pid int) ([]string, error) {
-			return nil, errors.New("cmdline read denied")
-		}
-		_, err := insp.ReadConfig(1001)
+	t.Run("cmdline error fails closed", func(t *testing.T) {
+		_, err := readContainerdConfig(fakeRoot, 1001, func(int) ([]string, error) {
+			return nil, errors.New("denied by proc")
+		})
 		if err == nil {
-			t.Fatal("expected error when ReadCmdline fails")
+			t.Fatal("expected error on cmdline read error")
 		}
-		if !strings.Contains(err.Error(), "cmdline read denied") {
+		if !strings.Contains(err.Error(), "denied by proc") {
 			t.Fatalf("unexpected error: %v", err)
 		}
+	})
+
+	t.Run("absent default config returns nil, nil", func(t *testing.T) {
+		emptyRoot := t.TempDir()
+		data, err := readContainerdConfig(emptyRoot, 1001, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if data != nil {
+			t.Fatalf("expected nil data for absent config, got %q", string(data))
+		}
+	})
+
+	t.Run("unreadable config file fails closed", func(t *testing.T) {
+		unreadableDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(unreadableDir, "etc", "containerd"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		unreadableFile := filepath.Join(unreadableDir, "etc", "containerd", "config.toml")
+		if err := os.WriteFile(unreadableFile, []byte("secret"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readContainerdConfig(unreadableDir, 1001, nil)
+		if err == nil {
+			t.Fatal("expected error for unreadable config file")
+		}
+	})
+
+	t.Run("symlink escape outside root fails closed without reading target", func(t *testing.T) {
+		escapeRoot := t.TempDir()
+		outsideDir := t.TempDir()
+		outsideConfig := filepath.Join(outsideDir, "outside_config.toml")
+		if err := os.WriteFile(outsideConfig, []byte("forbidden-outside-data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.MkdirAll(filepath.Join(escapeRoot, "etc", "containerd"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Symlink pointing to outsideConfig
+		if err := os.Symlink(outsideConfig, filepath.Join(escapeRoot, "etc", "containerd", "config.toml")); err != nil {
+			t.Fatal(err)
+		}
+
+		data, err := readContainerdConfig(escapeRoot, 1001, nil)
+		if string(data) == "forbidden-outside-data" {
+			t.Fatal("readContainerdConfig read outside file via symlink escape!")
+		}
+		_ = err
 	})
 }
 
@@ -359,6 +446,44 @@ func TestResolveCRIUPath(t *testing.T) {
 		}
 		if got != "" {
 			t.Fatalf("expected empty resolution for non-executable file, got %q", got)
+		}
+	})
+
+	t.Run("path lookup requires proc root to succeed", func(t *testing.T) {
+		fakeRoot := t.TempDir()
+		isolatedDir := filepath.Join(fakeRoot, "isolated", "path", "bin")
+		if err := os.MkdirAll(isolatedDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		realCriu := filepath.Join(isolatedDir, "criu")
+		if err := os.WriteFile(realCriu, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		// /isolated/path/bin/criu does NOT exist on the host filesystem
+		if _, err := os.Stat("/isolated/path/bin/criu"); err == nil {
+			t.Skip("host collision: /isolated/path/bin/criu exists on host")
+		}
+
+		// 1. PATH lookup with StatFileInRoot succeeds because it resolves inside fakeRoot
+		statFnRoot := func(path string) (os.FileInfo, error) {
+			return StatFileInRoot(fakeRoot, path)
+		}
+		got, err := resolveCRIUPath("", "/isolated/path/bin", statFnRoot)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "/isolated/path/bin/criu" {
+			t.Fatalf("resolveCRIUPath with proc root stat = %q, want /isolated/path/bin/criu", got)
+		}
+
+		// 2. PATH lookup directly on host fs fails (proving that host fs lookup cannot find it)
+		gotHost, errHost := resolveCRIUPath("", "/isolated/path/bin", os.Stat)
+		if errHost != nil {
+			t.Fatalf("unexpected error: %v", errHost)
+		}
+		if gotHost != "" {
+			t.Fatalf("expected host PATH lookup without proc root to fail, got %q", gotHost)
 		}
 	})
 }
@@ -448,6 +573,57 @@ func TestStatFileInRoot_SymlinkResolution(t *testing.T) {
 		}
 	})
 
+	t.Run("symlink escape target outside root fails to resolve", func(t *testing.T) {
+		outsideDir := t.TempDir()
+		canary := filepath.Join(outsideDir, "secret_outside.txt")
+		if err := os.WriteFile(canary, []byte("super-secret"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Absolute symlink pointing directly to canary on the host filesystem
+		absEscape := filepath.Join(root, "abs_escape")
+		if err := os.Symlink(canary, absEscape); err != nil {
+			t.Fatal(err)
+		}
+		// StatFileInRoot must re-anchor canary to root (root + canary), which does not exist!
+		// It must NOT read outsideDir/secret_outside.txt!
+		if _, err := StatFileInRoot(root, "/abs_escape"); err == nil {
+			t.Fatal("expected StatFileInRoot to fail for absolute symlink targeting file outside root")
+		}
+		if _, err := ReadFileInRoot(root, "/abs_escape"); err == nil {
+			t.Fatal("expected ReadFileInRoot to fail for absolute symlink targeting file outside root")
+		}
+
+		// Relative symlink with enough ".." to escape root
+		relEscape := filepath.Join(root, "rel_escape")
+		relTarget := "../../../../../../../../../.." + canary
+		if err := os.Symlink(relTarget, relEscape); err != nil {
+			t.Fatal(err)
+		}
+		// Clamping .. to root means this can never escape to outsideDir!
+		if _, err := StatFileInRoot(root, "/rel_escape"); err == nil {
+			t.Fatal("expected StatFileInRoot to fail for relative symlink escaping root")
+		}
+		if _, err := ReadFileInRoot(root, "/rel_escape"); err == nil {
+			t.Fatal("expected ReadFileInRoot to fail for relative symlink escaping root")
+		}
+	})
+
+	t.Run("resolvePathInRoot clamps .. at root boundary", func(t *testing.T) {
+		clampedFile := filepath.Join(root, "clamped_file")
+		if err := os.WriteFile(clampedFile, []byte("ok"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := resolvePathInRoot(root, "/../../../../clamped_file")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := clampedFile
+		if resolved != want {
+			t.Fatalf("resolvePathInRoot = %q, want %q", resolved, want)
+		}
+	})
+
 	t.Run("detects symlink loop", func(t *testing.T) {
 		_, err := StatFileInRoot(root, "/loop/a")
 		if err == nil {
@@ -464,6 +640,32 @@ func TestStatFileInRoot_SymlinkResolution(t *testing.T) {
 			t.Fatal("expected error on missing file")
 		}
 	})
+}
+
+func TestReadFileInRoot_Direct(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("configuration data for test")
+	target := filepath.Join(root, "etc", "test.conf")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Symlink to target
+	sym := filepath.Join(root, "link.conf")
+	if err := os.Symlink("/etc/test.conf", sym); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := ReadFileInRoot(root, "/link.conf")
+	if err != nil {
+		t.Fatalf("ReadFileInRoot failed: %v", err)
+	}
+	if !bytes.Equal(data, content) {
+		t.Fatalf("got %q, want %q", string(data), string(content))
+	}
 }
 
 // fakeContainerdEnv sets up an in-memory containerd environment for testing.
@@ -710,17 +912,25 @@ version = 2
 	})
 }
 
-func TestEnvironNULSeparation(t *testing.T) {
-	raw := []byte("PATH=/bin\x00FOO=BAR\x00")
-	parts := bytes.Split(raw, []byte{0})
-	var env []string
-	for _, p := range parts {
-		if len(p) > 0 {
-			env = append(env, string(p))
-		}
+func TestParseEnviron_ExactEntries(t *testing.T) {
+	raw := []byte("PATH=/usr/bin:/bin\x00FOO=BAR=BAZ\x00EMPTY=\x00EQUALS==\x00TRAILING\x00\x00")
+	got := parseEnviron(raw)
+	want := []string{
+		"PATH=/usr/bin:/bin",
+		"FOO=BAR=BAZ",
+		"EMPTY=",
+		"EQUALS==",
+		"TRAILING",
 	}
-	if len(env) != 2 || env[0] != "PATH=/bin" || env[1] != "FOO=BAR" {
-		t.Fatalf("unexpected env parsing: %v", env)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseEnviron() = %#v, want %#v", got, want)
+	}
+
+	rawCmd := []byte("containerd\x00--config\x00/etc/containerd/custom.toml\x00\x00")
+	gotCmd := parseCmdline(rawCmd)
+	wantCmd := []string{"containerd", "--config", "/etc/containerd/custom.toml"}
+	if !reflect.DeepEqual(gotCmd, wantCmd) {
+		t.Fatalf("parseCmdline() = %#v, want %#v", gotCmd, wantCmd)
 	}
 }
 
@@ -783,6 +993,18 @@ func TestRealProcInspection(t *testing.T) {
 		t.Fatal("expected non-empty environ")
 	}
 
+	// Verify exact PATH entry matches os.Getenv("PATH")
+	var foundPath string
+	for _, e := range env {
+		if p, ok := strings.CutPrefix(e, "PATH="); ok {
+			foundPath = p
+			break
+		}
+	}
+	if foundPath == "" || foundPath != os.Getenv("PATH") {
+		t.Fatalf("insp.ReadEnviron did not match os.Getenv(PATH): got %q, want %q", foundPath, os.Getenv("PATH"))
+	}
+
 	cmdline, err := insp.ReadCmdline(os.Getpid())
 	if err != nil {
 		t.Fatalf("ReadCmdline(%d): %v", os.Getpid(), err)
@@ -797,6 +1019,15 @@ func TestRealProcInspection(t *testing.T) {
 	}
 	if fi.Mode().IsRegular() == false && fi.Mode()&fs.ModeSymlink == 0 {
 		t.Fatalf("unexpected file mode: %v", fi.Mode())
+	}
+
+	// Verify ReadFileInProcRoot on real /proc
+	cmdlineRaw, err := ReadFileInProcRoot(os.Getpid(), "/proc/self/cmdline")
+	if err != nil {
+		t.Fatalf("ReadFileInProcRoot failed: %v", err)
+	}
+	if len(cmdlineRaw) == 0 {
+		t.Fatal("expected non-empty cmdline from ReadFileInProcRoot")
 	}
 }
 
@@ -1011,6 +1242,176 @@ version = 2
 		}
 		if cur.Annotations[NodeAnnotationCRIUReady] != "true" {
 			t.Errorf("expected criu-ready: true, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+	})
+
+	t.Run("transient dial retry is cheap: retries readiness check without bundle reinstall or criu check", func(t *testing.T) {
+		var failDial atomic.Bool
+		failDial.Store(true)
+
+		env := &fakeContainerdEnv{
+			pid: 1001,
+			environ: []string{
+				"PATH=/usr/local/sbin",
+			},
+			files: map[string]fs.FileMode{
+				"/usr/local/sbin/criu": 0o755,
+			},
+			criuVersionOut: "Version: 4.0",
+		}
+		insp := env.toInspector()
+		insp.GetPID = func(sockPath string) (int, error) {
+			if failDial.Load() {
+				return 0, errors.New("socket temporarily disconnected during containerd restart")
+			}
+			return 1001, nil
+		}
+
+		nd, _, installCalls := setupNode(env)
+		var checkCalls int32
+		nd.execHostFn = func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			atomic.AddInt32(&checkCalls, 1)
+			return "Looks good.", nil
+		}
+		nd.Inspector = insp
+
+		// Tick 1: Bootstrap hits transient dial error
+		if err := nd.Bootstrap(ctx); err == nil {
+			t.Fatal("expected Bootstrap error on dial failure")
+		}
+		if atomic.LoadInt32(installCalls) != 1 {
+			t.Fatalf("expected installCalls == 1, got %d", atomic.LoadInt32(installCalls))
+		}
+		if atomic.LoadInt32(&checkCalls) != 1 {
+			t.Fatalf("expected checkCalls == 1, got %d", atomic.LoadInt32(&checkCalls))
+		}
+
+		// Ticks 2..7: 6 ProbeReadiness ticks fail dial without re-installing bundle or re-running criu check
+		for tick := 2; tick <= 7; tick++ {
+			ready, err := nd.ProbeReadiness(ctx)
+			if ready || err == nil {
+				t.Fatalf("tick %d: expected ProbeReadiness to fail with dial error, got ready=%v err=%v", tick, ready, err)
+			}
+			if atomic.LoadInt32(installCalls) != 1 {
+				t.Fatalf("tick %d: expected installCalls to remain 1, got %d", tick, atomic.LoadInt32(installCalls))
+			}
+			if atomic.LoadInt32(&checkCalls) != 1 {
+				t.Fatalf("tick %d: expected checkCalls to remain 1, got %d", tick, atomic.LoadInt32(&checkCalls))
+			}
+		}
+
+		// Tick 8: containerd starts up, dial succeeds
+		failDial.Store(false)
+		ready, err := nd.ProbeReadiness(ctx)
+		if err != nil || !ready {
+			t.Fatalf("tick 8: expected ProbeReadiness recovery, got ready=%v err=%v", ready, err)
+		}
+		if !nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == true after recovery")
+		}
+		if atomic.LoadInt32(installCalls) != 1 {
+			t.Fatalf("expected installCalls to remain 1 after recovery, got %d", atomic.LoadInt32(installCalls))
+		}
+		if atomic.LoadInt32(&checkCalls) != 1 {
+			t.Fatalf("expected checkCalls to remain 1 after recovery, got %d", atomic.LoadInt32(&checkCalls))
+		}
+	})
+
+	t.Run("deterministic config error commits socket inode and goes quiet until restart", func(t *testing.T) {
+		env := &fakeContainerdEnv{
+			pid: 1001,
+			environ: []string{
+				"PATH=/usr/local/sbin",
+			},
+			configData: []byte(`this is invalid toml [[[`),
+			files: map[string]fs.FileMode{
+				"/usr/local/sbin/criu": 0o755,
+			},
+			criuVersionOut: "Version: 4.0",
+		}
+		nd, _, installCalls := setupNode(env)
+
+		// Bootstrap completes with deterministic config error: commits inode
+		if err := nd.Bootstrap(ctx); err != nil {
+			t.Fatalf("unexpected Bootstrap error: %v", err)
+		}
+		if nd.IsReady() {
+			t.Fatal("expected unready on config error")
+		}
+		if atomic.LoadInt32(installCalls) != 1 {
+			t.Fatalf("expected installCalls == 1, got %d", atomic.LoadInt32(installCalls))
+		}
+
+		var cur corev1.Node
+		if err := nd.Client.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+			t.Errorf("expected criu-ready: false, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+		if !strings.Contains(cur.Annotations[NodeAnnotationCRIUReason], "containerd config error") {
+			t.Errorf("expected reason with containerd config error, got %q", cur.Annotations[NodeAnnotationCRIUReason])
+		}
+
+		// Subsequent 6 ProbeReadiness ticks on unchanged inode must stay quiet (0 extra installs)
+		for tick := 2; tick <= 7; tick++ {
+			reProbed, err := nd.ProbeReadiness(ctx)
+			if err != nil {
+				t.Fatalf("tick %d: ProbeReadiness error: %v", tick, err)
+			}
+			if reProbed {
+				t.Fatalf("tick %d: expected ProbeReadiness to stay unready", tick)
+			}
+			if atomic.LoadInt32(installCalls) != 1 {
+				t.Fatalf("tick %d: expected installCalls to remain 1, got %d", tick, atomic.LoadInt32(installCalls))
+			}
+		}
+	})
+
+	t.Run("criu --version exec error is transient and retries instead of permanently committing", func(t *testing.T) {
+		var failExec atomic.Bool
+		failExec.Store(true)
+
+		env := &fakeContainerdEnv{
+			pid: 1001,
+			environ: []string{
+				"PATH=/usr/local/sbin",
+			},
+			files: map[string]fs.FileMode{
+				"/usr/local/sbin/criu": 0o755,
+			},
+			criuVersionOut: "Version: 4.0",
+		}
+		insp := env.toInspector()
+		insp.GetCRIUVersion = func(ctx context.Context, criuPath string) (string, error) {
+			if failExec.Load() {
+				return "", errors.New("transient host exec failure")
+			}
+			return "Version: 4.0", nil
+		}
+
+		nd, _, installCalls := setupNode(env)
+		nd.Inspector = insp
+
+		// Bootstrap fails with transient exec error
+		if err := nd.Bootstrap(ctx); err == nil {
+			t.Fatal("expected Bootstrap error on exec failure")
+		}
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false")
+		}
+
+		// Once exec succeeds, ProbeReadiness retries and recovers without containerd restart
+		failExec.Store(false)
+		ready, err := nd.ProbeReadiness(ctx)
+		if err != nil || !ready {
+			t.Fatalf("expected ProbeReadiness recovery on exec success, got ready=%v err=%v", ready, err)
+		}
+		if !nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == true")
+		}
+		if atomic.LoadInt32(installCalls) != 1 {
+			t.Fatalf("expected installCalls to remain 1 after cheap retry, got %d", atomic.LoadInt32(installCalls))
 		}
 	})
 

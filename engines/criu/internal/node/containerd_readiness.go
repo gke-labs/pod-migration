@@ -141,14 +141,89 @@ func StatFileInProcRoot(pid int, targetPath string) (os.FileInfo, error) {
 	return StatFileInRoot(procRoot, targetPath)
 }
 
-// ReadFileInProcRoot reads a file from /proc/<pid>/root, resolving symlinks relative to that root.
-func ReadFileInProcRoot(pid int, targetPath string) ([]byte, error) {
-	procRoot := fmt.Sprintf("/proc/%d/root", pid)
-	resolved, err := resolvePathInRoot(procRoot, targetPath)
+// ReadFileInRoot reads a file starting from root, resolving symlinks inside root.
+func ReadFileInRoot(root, targetPath string) ([]byte, error) {
+	resolved, err := resolvePathInRoot(root, targetPath)
 	if err != nil {
 		return nil, err
 	}
 	return os.ReadFile(resolved)
+}
+
+// ReadFileInProcRoot reads a file from /proc/<pid>/root using ReadFileInRoot.
+func ReadFileInProcRoot(pid int, targetPath string) ([]byte, error) {
+	procRoot := fmt.Sprintf("/proc/%d/root", pid)
+	return ReadFileInRoot(procRoot, targetPath)
+}
+
+// parseEnviron splits a NUL-delimited /proc/<pid>/environ byte slice into key=value strings.
+func parseEnviron(raw []byte) []string {
+	parts := bytes.Split(raw, []byte{0})
+	env := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if len(p) > 0 {
+			env = append(env, string(p))
+		}
+	}
+	return env
+}
+
+// parseCmdline splits a NUL-delimited /proc/<pid>/cmdline byte slice into argument strings.
+func parseCmdline(raw []byte) []string {
+	parts := bytes.Split(raw, []byte{0})
+	args := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if len(p) > 0 {
+			args = append(args, string(p))
+		}
+	}
+	return args
+}
+
+// readContainerdConfig discovers the containerd configuration path via cmdline args or default
+// and reads it through root, failing closed on read errors.
+func readContainerdConfig(root string, pid int, readCmdline func(int) ([]string, error)) ([]byte, error) {
+	configPath := "/etc/containerd/config.toml"
+	if readCmdline != nil {
+		args, err := readCmdline(pid)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				// Fail closed if cmdline cannot be read
+				return nil, fmt.Errorf("read containerd cmdline (pid %d): %w", pid, err)
+			}
+		} else {
+			for i := 0; i < len(args); i++ {
+				arg := args[i]
+				if arg == "-c" || arg == "--config" || arg == "-config" {
+					if i+1 < len(args) && len(args[i+1]) > 0 {
+						configPath = args[i+1]
+						break
+					}
+				} else if p, ok := strings.CutPrefix(arg, "--config="); ok {
+					configPath = p
+					break
+				} else if p, ok := strings.CutPrefix(arg, "-config="); ok {
+					configPath = p
+					break
+				} else if p, ok := strings.CutPrefix(arg, "-c="); ok {
+					configPath = p
+					break
+				}
+			}
+		}
+	}
+
+	// Stat and read through containerd's own mount namespace
+	data, err := ReadFileInRoot(root, configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No custom config; containerd uses built-in defaults
+			return nil, nil
+		}
+		// Fail closed on EACCES or any other read failure
+		return nil, fmt.Errorf("read containerd config %s from host proc: %w", configPath, err)
+	}
+	return data, nil
 }
 
 // NewDefaultContainerdInspector returns the production inspector using Linux host interfaces.
@@ -156,94 +231,31 @@ func NewDefaultContainerdInspector(execHost func(context.Context, []string, stri
 	insp := &ContainerdReadinessInspector{}
 	insp.GetPID = func(sockPath string) (int, error) {
 		pid, err := getSocketPeerPID(sockPath)
-		if err == nil && pid > 1 {
-			return pid, nil
-		}
-		// If pid == 1 (e.g. systemd socket activation) or peer lookup failed,
-		// fallback to reading containerd.pid on the host filesystem.
-		pidData, errPid := os.ReadFile("/run/containerd/containerd.pid")
-		if errPid == nil {
-			if parsed, errParse := strconv.Atoi(strings.TrimSpace(string(pidData))); errParse == nil && parsed > 1 {
-				return parsed, nil
-			}
-		}
 		if err != nil {
 			return 0, err
 		}
-		return 0, fmt.Errorf("could not determine containerd PID from socket (pid=%d) or pidfile", pid)
+		if pid <= 1 {
+			return 0, fmt.Errorf("invalid containerd peer PID %d", pid)
+		}
+		return pid, nil
 	}
 	insp.ReadEnviron = func(pid int) ([]string, error) {
 		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
 		if err != nil {
 			return nil, err
 		}
-		parts := bytes.Split(raw, []byte{0})
-		env := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if len(p) > 0 {
-				env = append(env, string(p))
-			}
-		}
-		return env, nil
+		return parseEnviron(raw), nil
 	}
 	insp.ReadCmdline = func(pid int) ([]string, error) {
 		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 		if err != nil {
 			return nil, err
 		}
-		parts := bytes.Split(raw, []byte{0})
-		args := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if len(p) > 0 {
-				args = append(args, string(p))
-			}
-		}
-		return args, nil
+		return parseCmdline(raw), nil
 	}
 	insp.ReadConfig = func(pid int) ([]byte, error) {
-		configPath := "/etc/containerd/config.toml"
-		// Check cmdline for custom -c or --config argument using ReadCmdline hook
-		readCmdline := insp.ReadCmdline
-		if readCmdline != nil {
-			args, err := readCmdline(pid)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					// Fail closed if cmdline cannot be read
-					return nil, fmt.Errorf("read containerd cmdline (pid %d): %w", pid, err)
-				}
-			} else {
-				for i := 0; i < len(args); i++ {
-					arg := args[i]
-					if arg == "-c" || arg == "--config" || arg == "-config" {
-						if i+1 < len(args) && len(args[i+1]) > 0 {
-							configPath = args[i+1]
-							break
-						}
-					} else if p, ok := strings.CutPrefix(arg, "--config="); ok {
-						configPath = p
-						break
-					} else if p, ok := strings.CutPrefix(arg, "-config="); ok {
-						configPath = p
-						break
-					} else if p, ok := strings.CutPrefix(arg, "-c="); ok {
-						configPath = p
-						break
-					}
-				}
-			}
-		}
-
-		// Stat and read through containerd's own mount namespace (/proc/<pid>/root)
-		data, err := ReadFileInProcRoot(pid, configPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				// No custom config; containerd uses built-in defaults
-				return nil, nil
-			}
-			// Fail closed on EACCES or any other read failure
-			return nil, fmt.Errorf("read containerd config %s from host proc: %w", configPath, err)
-		}
-		return data, nil
+		procRoot := fmt.Sprintf("/proc/%d/root", pid)
+		return readContainerdConfig(procRoot, pid, insp.ReadCmdline)
 	}
 	insp.StatContainerdFile = func(pid int, path string) (os.FileInfo, error) {
 		return StatFileInProcRoot(pid, path)
@@ -420,12 +432,12 @@ func CheckContainerdReadiness(ctx context.Context, inspector *ContainerdReadines
 
 	cfgBytes, err := inspector.ReadConfig(pid)
 	if err != nil {
-		return false, "", "", fmt.Errorf("read containerd config: %w", err)
+		return false, truncate("containerd config error: "+err.Error(), 200), "fix containerd configuration and restart containerd", nil
 	}
 
 	enableCRIU, shimPath, err := parseContainerdConfig(cfgBytes)
 	if err != nil {
-		return false, "", "", fmt.Errorf("parse containerd config: %w", err)
+		return false, truncate("containerd config error: "+err.Error(), 200), "fix containerd configuration and restart containerd", nil
 	}
 	if enableCRIU != nil && !*enableCRIU {
 		return false, ReasonCRIUDisabledByConfig, RemediationEnableCRIUConfig, nil
@@ -445,12 +457,12 @@ func CheckContainerdReadiness(ctx context.Context, inspector *ContainerdReadines
 
 	verStr, err := inspector.GetCRIUVersion(ctx, criuPath)
 	if err != nil {
-		return false, truncate(fmt.Sprintf("failed to retrieve criu version from %s: %v", criuPath, err), 200), "verify CRIU binary functionality", nil
+		return false, "", "", fmt.Errorf("execute criu version (%s): %w", criuPath, err)
 	}
 
 	code, err := parseCRIUVersionCode(verStr)
 	if err != nil {
-		return false, truncate(fmt.Sprintf("failed to parse criu version (%s): %v", strings.TrimSpace(verStr), err), 200), "verify CRIU binary version format", nil
+		return false, truncate(fmt.Sprintf("failed to parse criu version (%s): %v", strings.TrimSpace(verStr), err), 200), "verify CRIU binary version format and restart containerd", nil
 	}
 
 	if code < MinContainerdCRIUVersion {
