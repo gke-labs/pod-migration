@@ -179,3 +179,7 @@ func (a *nodeOpsAdapter) Cleanup(ctx context.Context, in psengine.RestoreInputs)
 func (a *nodeOpsAdapter) Signal(ctx context.Context, in psengine.RestoreInputs, sig int) error {
 	return a.n.PSEngineSignal(ctx, in.SnapshotName, sig)
 }
+
+func (a *nodeOpsAdapter) IsSiblingRunning(ctx context.Context, in psengine.RestoreInputs) (bool, error) {
+	return a.n.PSEngineIsSiblingRunning(ctx, in.SnapshotName)
+}

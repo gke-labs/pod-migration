@@ -47,7 +47,8 @@ type Node struct {
 	Kubelet  *kubeletCheckpoint
 	Restorer *restorer
 
-	SocketPath string
+	SocketPath    string
+	SweepInterval time.Duration // default 5m
 
 	mu                 sync.Mutex
 	ready              bool
@@ -204,9 +205,16 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 }
 
 // RunProbeLoop runs periodic readiness probes while ctx is active.
+// Orphan restore sweeps run on their own longer interval (default 5m).
 func (n *Node) RunProbeLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	sweepInterval := n.SweepInterval
+	if sweepInterval <= 0 {
+		sweepInterval = 5 * time.Minute
+	}
+	sweepTicker := time.NewTicker(sweepInterval)
+	defer sweepTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -215,6 +223,7 @@ func (n *Node) RunProbeLoop(ctx context.Context, interval time.Duration) {
 			if _, err := n.ProbeReadiness(ctx); err != nil {
 				logf.FromContext(ctx).Error(err, "readiness re-probe failed", "node", n.NodeName)
 			}
+		case <-sweepTicker.C:
 			if err := n.SweepOrphanRestores(ctx); err != nil {
 				logf.FromContext(ctx).Error(err, "periodic orphan restore sweep failed", "node", n.NodeName)
 			}
@@ -234,16 +243,29 @@ func (n *Node) SweepOrphanRestores(ctx context.Context) error {
 	if reader == nil {
 		return nil
 	}
-	if err := reader.List(ctx, &podList); err != nil {
+	var listOpts []client.ListOption
+	if n.NodeName != "" {
+		listOpts = append(listOpts, client.MatchingFields{"spec.nodeName": n.NodeName})
+	}
+	if err := reader.List(ctx, &podList, listOpts...); err != nil {
 		return fmt.Errorf("list pods on node %s: %w", n.NodeName, err)
 	}
 	livingUIDs := make(map[string]bool)
 	livingSnaps := make(map[string]bool)
+	now := time.Now()
 	for _, p := range podList.Items {
 		if p.Spec.NodeName != n.NodeName && n.NodeName != "" {
 			continue
 		}
-		if p.DeletionTimestamp == nil {
+		// Count terminating pods as alive until their grace deadline has elapsed.
+		alive := p.DeletionTimestamp == nil
+		if !alive && p.DeletionGracePeriodSeconds != nil {
+			deadline := p.DeletionTimestamp.Time.Add(time.Duration(*p.DeletionGracePeriodSeconds) * time.Second)
+			if now.Before(deadline) {
+				alive = true
+			}
+		}
+		if alive {
 			livingUIDs[string(p.UID)] = true
 			for k, v := range p.Annotations {
 				if strings.HasSuffix(k, "/ps-name") && v != "" {

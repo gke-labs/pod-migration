@@ -132,13 +132,15 @@ func TestInjectHolderSkips(t *testing.T) {
 // --- node restore reconciler ---------------------------------------------------
 
 type fakeRestoreOps struct {
-	restored    []RestoreInputs
-	cleaned     []RestoreInputs
-	signaled    []RestoreInputs
-	signalSig   int
-	failIt      bool
-	failCleanup bool
-	extracted   []string
+	restored       []RestoreInputs
+	cleaned        []RestoreInputs
+	signaled       []RestoreInputs
+	signalSig      int
+	signalCount    int
+	siblingRunning bool
+	failIt         bool
+	failCleanup    bool
+	extracted      []string
 }
 
 func (f *fakeRestoreOps) Extract(tarPath, dstDir string) error {
@@ -165,7 +167,12 @@ func (f *fakeRestoreOps) Cleanup(_ context.Context, in RestoreInputs) error {
 func (f *fakeRestoreOps) Signal(_ context.Context, in RestoreInputs, sig int) error {
 	f.signaled = append(f.signaled, in)
 	f.signalSig = sig
+	f.signalCount++
 	return nil
+}
+
+func (f *fakeRestoreOps) IsSiblingRunning(_ context.Context, in RestoreInputs) (bool, error) {
+	return f.siblingRunning, nil
 }
 
 // readySnapshotWithArchive stages a Ready PodSnapshot + a consistent archive
@@ -239,7 +246,7 @@ func TestNodeRestoreHappyPath(t *testing.T) {
 }
 
 func TestNodeRestore_TearsDownOnPodDeletion(t *testing.T) {
-	// 1. Pod deletion starts, but holder container is still Running and grace period active
+	// 1. Pod deletion starts, sibling container is still running and grace period active
 	pod := replacementPodOnNode("ps-web-0-deadbeef")
 	pod.Annotations[contract.AnnotationRestoreStatus] = contract.RestoreStatusRestored
 	now := metav1.Now()
@@ -247,17 +254,9 @@ func TestNodeRestore_TearsDownOnPodDeletion(t *testing.T) {
 	pod.Finalizers = []string{"test.io/keep"}
 	gracePeriod := int64(30)
 	pod.DeletionGracePeriodSeconds = &gracePeriod
-	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
-		{
-			Name: "app",
-			State: corev1.ContainerState{
-				Running: &corev1.ContainerStateRunning{},
-			},
-		},
-	}
 
 	c := newClient(t, pod)
-	ops := &fakeRestoreOps{}
+	ops := &fakeRestoreOps{siblingRunning: true}
 	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
@@ -270,17 +269,27 @@ func TestNodeRestore_TearsDownOnPodDeletion(t *testing.T) {
 	if ops.signalSig != 15 {
 		t.Errorf("expected SIGTERM (15), got %d", ops.signalSig)
 	}
+	if ops.signalCount != 1 {
+		t.Errorf("expected signalCount 1, got %d", ops.signalCount)
+	}
 	if len(ops.cleaned) != 0 {
-		t.Fatalf("cleanup ran before holder terminated or grace period expired")
+		t.Fatalf("cleanup ran before sibling exited or grace period expired")
 	}
 
-	// 2. Holder container terminated -> teardown proceeds immediately
-	pod.Status.ContainerStatuses[0].State = corev1.ContainerState{
-		Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+	// Reconciling again while still running should NOT re-send SIGTERM
+	res2, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+	if err != nil {
+		t.Fatalf("reconcile 2 failed: %v", err)
 	}
-	if err := c.Status().Update(context.Background(), pod); err != nil {
-		_ = c.Update(context.Background(), pod)
+	if res2.RequeueAfter != 1*time.Second {
+		t.Errorf("expected RequeueAfter 1s, got %v", res2.RequeueAfter)
 	}
+	if ops.signalCount != 1 {
+		t.Errorf("SIGTERM was re-sent on subsequent requeue; expected count 1, got %d", ops.signalCount)
+	}
+
+	// 2. Sibling container exits -> teardown proceeds immediately without waiting for grace period
+	ops.siblingRunning = false
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
@@ -299,17 +308,9 @@ func TestNodeRestore_CleanupFailureRetries(t *testing.T) {
 	now := metav1.Now()
 	pod.DeletionTimestamp = &now
 	pod.Finalizers = []string{"test.io/keep"}
-	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
-		{
-			Name: "app",
-			State: corev1.ContainerState{
-				Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
-			},
-		},
-	}
 
 	c := newClient(t, pod)
-	ops := &fakeRestoreOps{failCleanup: true}
+	ops := &fakeRestoreOps{failCleanup: true, siblingRunning: false}
 	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})

@@ -225,6 +225,15 @@ func (r *Node) PSEngineSignal(ctx context.Context, snapshotName string, sig int)
 	return r.Restorer.Signal(ctx, migrationName, sig)
 }
 
+// PSEngineIsSiblingRunning checks whether the restored container is currently running.
+func (r *Node) PSEngineIsSiblingRunning(ctx context.Context, snapshotName string) (bool, error) {
+	migrationName := "psengine-" + snapshotName
+	if r.Restorer == nil {
+		return false, nil
+	}
+	return r.Restorer.IsRunning(ctx, migrationName)
+}
+
 // PSEngineCPUFamily reports the node's CPU model for the archive manifest
 // (restore-side compatibility guard). Empty when unknown — absent, never
 // invented.

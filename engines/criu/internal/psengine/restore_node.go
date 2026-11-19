@@ -71,6 +71,8 @@ type RestoreOps interface {
 	Cleanup(ctx context.Context, in RestoreInputs) error
 	// Signal sends a signal (e.g. 15 / SIGTERM) to the restored runc container.
 	Signal(ctx context.Context, in RestoreInputs, sig int) error
+	// IsSiblingRunning returns true if the restored runc container is still running.
+	IsSiblingRunning(ctx context.Context, in RestoreInputs) (bool, error)
 }
 
 // NodeRestoreReconciler watches pods on its node and executes restores.
@@ -86,6 +88,7 @@ type NodeRestoreReconciler struct {
 	CPUFamily string
 
 	inflight sync.Map
+	signaled sync.Map
 }
 
 // Note: engines/criu does not run controller-gen; deploy/deploy.yaml is the RBAC source of truth.
@@ -133,19 +136,17 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			TargetPodUID:  string(pod.UID),
 		}
 
-		// Send SIGTERM to the sibling container so it gets graceful termination
-		// alongside the holder container.
-		_ = r.Ops.Signal(ctx, in, 15) // 15 = SIGTERM
+		// Send SIGTERM once to the sibling container so it gets graceful termination.
+		if _, alreadySignaled := r.signaled.LoadOrStore(string(pod.UID), true); !alreadySignaled {
+			_ = r.Ops.Signal(ctx, in, 15) // 15 = SIGTERM
+		}
 
-		// Check if the holder container has exited or if the grace period expired.
-		holderTerminated := false
-		for _, cs := range pod.Status.ContainerStatuses {
-			if cs.Name == container {
-				if cs.State.Terminated != nil {
-					holderTerminated = true
-				}
-				break
-			}
+		// Check if the sibling container has exited or if the grace period expired.
+		siblingRunning := true
+		if isRunning, err := r.Ops.IsSiblingRunning(ctx, in); err == nil {
+			siblingRunning = isRunning
+		} else {
+			logger.V(1).Info("checking sibling running state failed", "pod", pod.Name, "err", err)
 		}
 
 		gracePeriodExpired := false
@@ -158,15 +159,16 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			gracePeriodExpired = true
 		}
 
-		if !holderTerminated && !gracePeriodExpired {
-			// Sibling received SIGTERM; wait for holder to exit or grace period to elapse.
+		if siblingRunning && !gracePeriodExpired {
+			// Sibling received SIGTERM; wait for sibling to exit or grace period to elapse.
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 
-		logger.Info("tearing down restored sibling artifacts after holder exit/grace period", "pod", pod.Name)
+		logger.Info("tearing down restored sibling artifacts after sibling exit/grace period", "pod", pod.Name)
 		if err := r.Ops.Cleanup(ctx, in); err != nil {
 			return ctrl.Result{}, fmt.Errorf("cleanup restore artifacts for %s: %w", pod.Name, err)
 		}
+		r.signaled.Delete(string(pod.UID))
 		logger.Info("cleaned up restore artifacts on pod deletion", "pod", pod.Name)
 		return ctrl.Result{}, nil
 	}
