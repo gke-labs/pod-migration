@@ -18,9 +18,11 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
+	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -554,5 +557,48 @@ func TestPodGateInjector_ShortensReadinessInitialDelay(t *testing.T) {
 			checkProbeDelays("containers.startupProbe", got.Spec.Containers, tt.pod.Spec.Containers, tt.wantStartupDelays, func(c *corev1.Container) *corev1.Probe { return c.StartupProbe })
 			checkProbeDelays("initContainers.readinessProbe", got.Spec.InitContainers, tt.pod.Spec.InitContainers, tt.wantInitReadinessDelay, func(c *corev1.Container) *corev1.Probe { return c.ReadinessProbe })
 		})
+	}
+}
+
+func TestPodGateInjector_LogsNonTruePreserveAnnotation(t *testing.T) {
+	scheme := newReadinessTestScheme()
+	cl := newIndexedClient(scheme, activeBarePMJ("typo-pod", pmv1alpha1.PodMigrationJobPhaseRestoring))
+	handler := newPodGateInjector(cl, fake.NewClientBuilder().WithScheme(scheme).Build(), true, admission.NewDecoder(scheme))
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "typo-pod",
+			Labels:      map[string]string{"pod-migration.gke.io/enabled": "true"},
+			Annotations: map[string]string{util.AnnotationPreserveReadinessDelay: "True"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", ReadinessProbe: httpGetProbe("/readyz", 50, 20)}},
+		},
+	}
+	rawPod, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatalf("marshal pod: %v", err)
+	}
+
+	var logs []string
+	logger := funcr.New(func(prefix, args string) {
+		logs = append(logs, prefix+" "+args)
+	}, funcr.Options{})
+	ctx := log.IntoContext(context.Background(), logger)
+
+	req := admission.Request{}
+	req.Namespace = pod.Namespace
+	req.Name = pod.Name
+	req.Object = runtime.RawExtension{Raw: rawPod}
+
+	resp := handler.Handle(ctx, req)
+	got := applyAdmissionPatches(t, rawPod, resp)
+	if got.Spec.Containers[0].ReadinessProbe.InitialDelaySeconds != 0 {
+		t.Fatalf("initialDelaySeconds = %d, want 0", got.Spec.Containers[0].ReadinessProbe.InitialDelaySeconds)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "Ignoring preserve-readiness-delay annotation") {
+		t.Errorf("expected log warning about non-\"true\" annotation value, got logs:\n%s", joined)
 	}
 }

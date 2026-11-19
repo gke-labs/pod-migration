@@ -298,8 +298,6 @@ A snapshot engine serves each migratable runtime class. By default, the default 
 
 An engine that does not fence the source Pod after checkpointing (`FencingNone` or unset) leaves the source running alongside the replacement until evicted. To migrate a Pod using an unfenced engine, the Pod must explicitly opt in with the annotation `pod-migration.gke.io/allow-unfenced: "true"`. Without this annotation, the eviction webhook and preemption controller refuse live migration, record a `Warning MigrationSkippedUnfencedEngine` event on the Pod, and fall back to cold eviction.
 
-The kubelet treats a restored container as a new container, so a long `readinessProbe.initialDelaySeconds` would delay `Ready` for the full initial delay even when the restored process is serving within seconds (#141). By default (`--shorten-restored-readiness-delay=true`), the replacement webhook sets `readinessProbe.initialDelaySeconds` to `0` on containers and restartable sidecar init containers of gated replacement Pods. `livenessProbe`, `startupProbe`, and `periodSeconds` are never modified so slow cold-start fallbacks are not restarted; because Pod probe specs are immutable after creation, a cold fallback (or a later container restart in place) simply runs failing readiness probes earlier until the container is ready. If a workload's readiness endpoint answers healthy before initialization completes and relies on `initialDelaySeconds` to hold traffic back during a cold start, set the Pod annotation `pod-migration.gke.io/preserve-readiness-delay: "true"` (or set `--shorten-restored-readiness-delay=false` on the controller). Where you control the Pod manifest, prefer a short-period `startupProbe` with `readinessProbe.initialDelaySeconds: 0` instead of a long `initialDelaySeconds`, which speeds up both warm restores and cold starts without waiting on a long `periodSeconds` interval.
-
 Example (Deployment):
 ```yaml
 apiVersion: apps/v1
@@ -322,6 +320,15 @@ spec:
         - name: app
           image: my-app-image:latest
 ```
+
+#### Readiness Probe Initial Delay (#141)
+
+The kubelet treats a restored container as a new container, so a long `readinessProbe.initialDelaySeconds` would delay `Ready` for the full initial delay even when the restored process is serving within seconds. By default (`--shorten-restored-readiness-delay=true`), the replacement webhook sets `readinessProbe.initialDelaySeconds` to `0` on containers and restartable sidecar init containers of gated replacement Pods, while leaving `livenessProbe`, `startupProbe`, and `periodSeconds` untouched so slow cold starts are not restarted.
+
+Because Pod probe specs are immutable after creation, any gated Pod that starts cold keeps `initialDelaySeconds: 0` and joins its Service endpoints as soon as its readiness probe passes (the endpoint fence covers only the source Pod). That applies to Pod gate cold releases (a deleted, failed, or snapshot-less `PodMigrationJob`, or a concurrent-creation tie-break loser released as a normal scale-up Pod), runtime cold fallbacks (`FallbackToColdStart`), and later in-place container restarts after a migration (`#152`). Restore-crash fallbacks delete and recreate the Pod after the job concludes, so the recreated Pod keeps its configured delay.
+
+- **Opt-out:** If a workload's readiness endpoint answers healthy before initialization completes and relies on `initialDelaySeconds` to hold traffic back during a cold start, set the Pod annotation `pod-migration.gke.io/preserve-readiness-delay: "true"` (exact `"true"`) or pass `--shorten-restored-readiness-delay=false` on the controller.
+- **Manifest recommendation:** Where you control the Pod manifest, prefer a short-period `startupProbe` with `readinessProbe.initialDelaySeconds: 0` instead of a long `initialDelaySeconds`, which speeds up both warm restores and cold starts without waiting on a long `periodSeconds` interval.
 
 ### Step 2: Trigger Migration via Eviction
 The controller automatically intercepts standard Kubernetes evictions and orchestrates the stateful migration. You can trigger this manually (e.g. for testing node upgrades) by draining the node the Pod is running on:

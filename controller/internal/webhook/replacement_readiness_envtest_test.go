@@ -26,7 +26,6 @@ import (
 	"time"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -104,7 +103,6 @@ func TestReplacementWebhook_ReadinessDelay_Envtest(t *testing.T) {
 
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
 
 	whOpts := &testEnv.WebhookInstallOptions
@@ -122,21 +120,31 @@ func TestReplacementWebhook_ReadinessDelay_Envtest(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue); err != nil {
+		cancel()
 		t.Fatalf("indexing PMJ parent key: %v", err)
 	}
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue); err != nil {
+		cancel()
 		t.Fatalf("indexing Pod assigned PMJ: %v", err)
 	}
 	if err := SetupReplacementWebhookWithManager(mgr, mgr.GetAPIReader(), true); err != nil {
+		cancel()
 		t.Fatalf("setting up replacement webhook: %v", err)
 	}
 
+	mgrDone := make(chan error, 1)
 	go func() {
-		_ = mgr.Start(ctx)
+		mgrDone <- mgr.Start(ctx)
 	}()
+	// Cleanups run in reverse order: stop the manager before stopping envtest.
+	t.Cleanup(func() {
+		cancel()
+		if err := <-mgrDone; err != nil {
+			t.Errorf("manager: %v", err)
+		}
+	})
 
 	addr := fmt.Sprintf("%s:%d", whOpts.LocalServingHost, whOpts.LocalServingPort)
 	deadline := time.Now().Add(10 * time.Second)
@@ -150,6 +158,12 @@ func TestReplacementWebhook_ReadinessDelay_Envtest(t *testing.T) {
 			t.Fatalf("webhook server at %s did not become ready: %v", addr, dialErr)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+
+	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer syncCancel()
+	if !mgr.GetCache().WaitForCacheSync(syncCtx) {
+		t.Fatal("manager informer caches did not sync in time")
 	}
 
 	admin, err := client.New(cfg, client.Options{Scheme: scheme})

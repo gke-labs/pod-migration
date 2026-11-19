@@ -182,9 +182,16 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		pod.Annotations[util.AnnotationAssignedPMJ] = assignedPMJ
 	}
 
-	if !a.PreserveReadinessDelay && pod.Annotations[util.AnnotationPreserveReadinessDelay] != "true" {
-		if n := clearReadinessInitialDelay(pod); n > 0 {
-			logger.Info("Cleared readinessProbe.initialDelaySeconds on restore-candidate replacement pod", "containers", n)
+	if !a.PreserveReadinessDelay {
+		preserveVal, hasPreserveAnnotation := pod.Annotations[util.AnnotationPreserveReadinessDelay]
+		if preserveVal != "true" {
+			if hasPreserveAnnotation {
+				logger.Info("Ignoring preserve-readiness-delay annotation: value must be \"true\"",
+					"annotation", util.AnnotationPreserveReadinessDelay, "value", preserveVal)
+			}
+			if n := clearReadinessInitialDelay(pod); n > 0 {
+				logger.Info("Cleared readinessProbe.initialDelaySeconds on restore-candidate replacement pod", "containers", n)
+			}
 		}
 	}
 
