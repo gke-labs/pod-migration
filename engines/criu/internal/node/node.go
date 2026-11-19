@@ -208,7 +208,7 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 		n.version = v.version
 	}
 	if n.demoteSeq != prePatchDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, postCurrIno, hasPostCurr) {
-		if v.ino != 0 && n.lastSocketInode == 0 {
+		if v.ino != 0 && n.demoteInode == 0 && (!hasPostCurr || postCurrIno == 0 || postCurrIno == v.ino) {
 			n.lastSocketInode = v.ino
 		}
 		if v.ino != 0 && v.ino == n.poisonedInode {
@@ -217,7 +217,7 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 		return nil
 	}
 	n.ready = v.ready
-	if v.ino != 0 && (!hasPostCurr || postCurrIno == 0 || postCurrIno == v.ino) {
+	if v.ino != 0 && (!concurrentDemote || n.demoteInode == 0 || n.demoteInode == v.ino) && (!hasPostCurr || postCurrIno == 0 || postCurrIno == v.ino) {
 		n.lastSocketInode = v.ino
 	}
 	if v.ready {
@@ -371,9 +371,6 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 	lastIno := n.lastSocketInode
 	pendingDemote := n.pendingDemote
 	seq := n.demoteSeq
-	ver := n.version
-	reason := n.unreadyReason
-	remediation := n.unreadyRemediation
 	n.mu.Unlock()
 
 	if isReady {
@@ -395,9 +392,9 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 		defer n.annotateMu.Unlock()
 		n.mu.Lock()
 		stillPending := !n.ready && n.pendingDemote && n.demoteSeq == seq
-		ver = n.version
-		reason = n.unreadyReason
-		remediation = n.unreadyRemediation
+		ver := n.version
+		reason := n.unreadyReason
+		remediation := n.unreadyRemediation
 		n.mu.Unlock()
 		if stillPending {
 			if err := annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false); err != nil {

@@ -22,21 +22,22 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-func newTestScheme(t *testing.T) *runtime.Scheme {
-	s := runtime.NewScheme()
+func newTestScheme(t *testing.T) *k8sruntime.Scheme {
+	s := k8sruntime.NewScheme()
 	if err := corev1.AddToScheme(s); err != nil {
 		t.Fatalf("AddToScheme: %v", err)
 	}
@@ -681,7 +682,10 @@ func TestNode_ConcurrentBootstrapCannotOverwriteDemotion(t *testing.T) {
 	scheme := newTestScheme(t)
 
 	nodeObj := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-node",
+			Annotations: map[string]string{NodeAnnotationCRIURemediation: "stale-remediation"},
+		},
 		Status: corev1.NodeStatus{
 			NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
 		},
@@ -756,7 +760,10 @@ func TestNode_MidAnnotateNodeDemotePreservesUnreadyAndRetries(t *testing.T) {
 	scheme := newTestScheme(t)
 
 	nodeObj := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-node",
+			Annotations: map[string]string{NodeAnnotationCRIURemediation: "stale-remediation"},
+		},
 		Status: corev1.NodeStatus{
 			NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
 		},
@@ -810,9 +817,6 @@ func TestNode_MidAnnotateNodeDemotePreservesUnreadyAndRetries(t *testing.T) {
 		demoteErrCh <- nd.DemoteNode(ctx, ReasonContainerdCachedCRIU, RemediationRestartContainerd)
 	}()
 	<-demoteQueued
-	// Give DemoteNode a moment to update n.mu state and block on annotateMu.
-	for nd.IsReady() {
-	}
 	// Wait until demoteSeq increments under n.mu before releasing publish's Patch.
 	for {
 		nd.mu.Lock()
@@ -821,6 +825,7 @@ func TestNode_MidAnnotateNodeDemotePreservesUnreadyAndRetries(t *testing.T) {
 		if seq == 1 {
 			break
 		}
+		runtime.Gosched()
 	}
 	close(allowPatchFinish)
 
@@ -970,6 +975,100 @@ func TestNode_CrossRestartDemotionAndZeroInodeDemotionNotClobbered(t *testing.T)
 		}
 		if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
 			t.Fatalf("expected criu-ready=false on API server, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+		ready, err := nd.ProbeReadiness(ctx)
+		if err != nil || ready || nd.IsReady() {
+			t.Fatalf("expected ProbeReadiness to remain unready without re-promoting, got ready=%v err=%v", ready, err)
+		}
+	})
+
+	t.Run("mid-Patch DemoteNode(ino==0) on post-restart Bootstrap updates lastSocketInode", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+
+		patchEntered := make(chan struct{})
+		allowPatchFinish := make(chan struct{})
+		hc := &hookPatchClient{
+			Client: base,
+			onPatch: func(call int32, _ client.Object) error {
+				if call == 1 {
+					close(patchEntered)
+					<-allowPatchFinish
+				}
+				return nil
+			},
+		}
+
+		var failStat atomic.Bool
+		nd := &Node{
+			Client:          hc,
+			NodeName:        "test-node",
+			SocketPath:      "/run/containerd/containerd.sock",
+			lastSocketInode: 1000, // prior pre-restart socket inode
+			statSocketFn: func(string) (uint64, error) {
+				if failStat.Load() {
+					return 0, errors.New("socket temporarily unavailable")
+				}
+				return 6060, nil
+			},
+			installBundleFn: func() (string, error) { return "v3.19", nil },
+			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+				return "Looks good.\n", nil
+			},
+		}
+
+		bootDone := make(chan error, 1)
+		go func() {
+			bootDone <- nd.Bootstrap(ctx)
+		}()
+
+		<-patchEntered
+		failStat.Store(true)
+		demoteDone := make(chan error, 1)
+		go func() {
+			demoteDone <- nd.DemoteNode(ctx, "manual-demote", "investigate")
+		}()
+		for {
+			nd.mu.Lock()
+			seq := nd.demoteSeq
+			nd.mu.Unlock()
+			if seq == 1 {
+				break
+			}
+			runtime.Gosched()
+		}
+		failStat.Store(false)
+		close(allowPatchFinish)
+
+		if err := <-bootDone; err != nil {
+			t.Fatalf("Bootstrap: %v", err)
+		}
+		if err := <-demoteDone; err != nil {
+			t.Fatalf("DemoteNode(ino=0): %v", err)
+		}
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false after mid-Patch DemoteNode(ino=0)")
+		}
+
+		// Subsequent ProbeReadiness tick on unchanged inode 6060 must NOT re-promote the demoted node!
+		ready, err := nd.ProbeReadiness(ctx)
+		if err != nil {
+			t.Fatalf("ProbeReadiness: %v", err)
+		}
+		if ready || nd.IsReady() {
+			t.Fatal("ProbeReadiness must not re-promote demoted node on unchanged socket 6060")
+		}
+		var cur corev1.Node
+		if err := base.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+			t.Fatalf("expected criu-ready=false preserved on API server, got %q", cur.Annotations[NodeAnnotationCRIUReady])
 		}
 	})
 }
