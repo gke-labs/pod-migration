@@ -16,7 +16,10 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -305,5 +308,179 @@ func TestWaitGracefulTermination_ExpiresAfterGracePeriod(t *testing.T) {
 func TestDefaultPSNameAnnotationIsTheGKEPodSnapshotsKey(t *testing.T) {
 	if want := contract.RestoreAnnotation(contract.GKEPodSnapshotsGroup); annPSName != want {
 		t.Fatalf("holder default restore order %q, want %q", annPSName, want)
+	}
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	args := os.Args
+	for i, arg := range args {
+		if arg == "--" {
+			args = args[i+1:]
+			break
+		}
+	}
+	runWrap(args)
+	os.Exit(0)
+}
+
+func TestRunWrap_HoldWaitsForSIGTERM_Subprocess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess test in short mode")
+	}
+	annFile := filepath.Join(t.TempDir(), "annotations")
+	content := fmt.Sprintf("%s=%q\n%s=%q\n", annPSName, "snap-test", annRestoreStatus, statusRestored)
+	if err := os.WriteFile(annFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "--grace-period=5s", annFile, "--", "echo", "done")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(stderrPipe)
+	enteredHold := make(chan bool, 1)
+	go func() {
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), "holding sandbox") {
+				enteredHold <- true
+				return
+			}
+		}
+		enteredHold <- false
+	}()
+
+	select {
+	case ok := <-enteredHold:
+		if !ok {
+			_ = cmd.Process.Kill()
+			t.Fatal("subprocess failed to enter hold mode")
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for subprocess to enter hold mode")
+	}
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- cmd.Wait()
+	}()
+
+	// 1. Verify subprocess did not exit immediately upon entering outcomeHold
+	// (pins that runWrap's hold path does not skip waitGracefulTermination).
+	select {
+	case err := <-waitErr:
+		t.Fatalf("runWrap exited prematurely without waiting: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// 2. Deliver real SIGTERM (simulating kubelet pod deletion).
+	// If waitGracefulTermination only registered SIGINT (and not SIGTERM),
+	// the unhandled SIGTERM would kill the process with signal: terminated.
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("failed to send SIGTERM: %v", err)
+	}
+
+	// Verify subprocess does NOT exit immediately upon receiving first SIGTERM:
+	select {
+	case err := <-waitErr:
+		t.Fatalf("runWrap exited prematurely immediately after first SIGTERM: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// 3. Deliver second signal (SIGINT, simulating wake-up from node agent).
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("failed to send SIGINT: %v", err)
+	}
+
+	// Verify subprocess exits cleanly with code 0:
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("runWrap did not exit cleanly (code 0) after second signal: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for runWrap to exit after second signal")
+	}
+}
+
+func TestRunWrap_HoldWaitsForSIGTERM_GracePeriodTimeout_Subprocess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess test in short mode")
+	}
+	annFile := filepath.Join(t.TempDir(), "annotations")
+	content := fmt.Sprintf("%s=%q\n%s=%q\n", annPSName, "snap-test", annRestoreStatus, statusRestored)
+	if err := os.WriteFile(annFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "--grace-period=150ms", annFile, "--", "echo", "done")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(stderrPipe)
+	enteredHold := make(chan bool, 1)
+	go func() {
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), "holding sandbox") {
+				enteredHold <- true
+				return
+			}
+		}
+		enteredHold <- false
+	}()
+
+	select {
+	case ok := <-enteredHold:
+		if !ok {
+			_ = cmd.Process.Kill()
+			t.Fatal("subprocess failed to enter hold mode")
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for subprocess to enter hold mode")
+	}
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- cmd.Wait()
+	}()
+
+	// Verify subprocess does not exit immediately upon entering outcomeHold:
+	select {
+	case err := <-waitErr:
+		t.Fatalf("runWrap exited prematurely without waiting: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Deliver real SIGTERM:
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("failed to send SIGTERM: %v", err)
+	}
+
+	// Do NOT send second signal; verify it exits cleanly (code 0) after grace period timeout (~150ms):
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("runWrap failed to exit cleanly on grace period timeout: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for runWrap to exit on grace period timeout")
 	}
 }

@@ -132,6 +132,32 @@ func TestInjectHolderRewiresGatedPod(t *testing.T) {
 			t.Fatalf("wrapped command with 30s grace period: %v, want %v", got, want)
 		}
 	})
+
+	t.Run("very large termination grace period is clamped", func(t *testing.T) {
+		p := gatedReplacementPod()
+		graceHuge := int64(10000000000)
+		p.Spec.TerminationGracePeriodSeconds = &graceHuge
+		if ok, reason := InjectHolder(p, "gcr.io/x/holder:v1"); !ok {
+			t.Fatalf("expected injection, got skip: %s", reason)
+		}
+		want := []string{"/pmhold/holder", "wrap", "--ps-name-annotation=" + contract.AnnotationPSName, "--grace-period=86400s", "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"}
+		if got := p.Spec.Containers[0].Command; strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Fatalf("wrapped command with huge grace period: %v, want %v", got, want)
+		}
+	})
+
+	t.Run("negative termination grace period is clamped to 0s", func(t *testing.T) {
+		p := gatedReplacementPod()
+		graceNeg := int64(-10)
+		p.Spec.TerminationGracePeriodSeconds = &graceNeg
+		if ok, reason := InjectHolder(p, "gcr.io/x/holder:v1"); !ok {
+			t.Fatalf("expected injection, got skip: %s", reason)
+		}
+		want := []string{"/pmhold/holder", "wrap", "--ps-name-annotation=" + contract.AnnotationPSName, "--grace-period=0s", "/pminfo/annotations", "--", "redis-server", "--appendonly", "yes"}
+		if got := p.Spec.Containers[0].Command; strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Fatalf("wrapped command with negative grace period: %v, want %v", got, want)
+		}
+	})
 }
 
 func TestInjectHolderSkips(t *testing.T) {
