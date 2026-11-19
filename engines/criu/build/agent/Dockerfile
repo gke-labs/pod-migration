@@ -27,10 +27,26 @@ RUN set -eux; \
     maj=${ver%%.*}; rest=${ver#*.}; min=${rest%%.*}; \
     if [ "$maj" -lt 3 ] || { [ "$maj" -eq 3 ] && [ "$min" -lt 19 ]; }; then \
       echo "criu $ver < 3.19 — refusing (cgroup2 cgns restore quirk)"; exit 1; fi; \
-    mkdir -p /bundle; \
+    mkdir -p /bundle /bundle/licenses; \
     cp /usr/sbin/criu /bundle/criu.bin; \
     for lib in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do cp -L "$lib" /bundle/ || true; done; \
     cp -L /lib64/ld-linux-x86-64.so.2 /bundle/ 2>/dev/null || cp -L /lib/ld-linux-x86-64.so.2 /bundle/; \
+    cp -L /usr/share/doc/criu/copyright /bundle/licenses/criu.copyright; \
+    for f in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do \
+      dpkg -S "$(realpath "$f")" 2>/dev/null || echo "WARNING: dpkg -S failed for $f" >&2; \
+    done | cut -d: -f1 | sort -u | while read -r pkg; do \
+      if [ -f "/usr/share/doc/$pkg/copyright" ]; then \
+        cp -L "/usr/share/doc/$pkg/copyright" "/bundle/licenses/$pkg.copyright"; \
+      fi; \
+    done; \
+    { \
+      dpkg-query -W -f='${Package} ${Version}\n' criu; \
+      for f in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do \
+        dpkg -S "$(realpath "$f")" 2>/dev/null || echo "WARNING: dpkg -S failed for $f" >&2; \
+      done | cut -d: -f1 | sort -u | while read -r pkg; do \
+        dpkg-query -W -f='${Package} ${Version}\n' "$pkg"; \
+      done; \
+    } | sort -u > /bundle/licenses/package-versions.txt; \
     criu --version | head -1 > /bundle/VERSION; \
     printf '#!/bin/sh\nexec /var/lib/pod-migrate/criu-bundle/ld-linux-x86-64.so.2 --library-path /var/lib/pod-migrate/criu-bundle /var/lib/pod-migrate/criu-bundle/criu.bin "$@"\n' > /bundle/criu; \
     chmod +x /bundle/criu; ls -l /bundle; cat /bundle/VERSION
@@ -47,6 +63,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /agent ./cmd
 # iptables to flush CRIU network-lock rules on restore failure (#126).
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends util-linux ca-certificates iptables && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /licenses && dpkg-query -W -f='${Package} ${Version}\n' | sort -u > /licenses/runtime-package-versions.txt
 COPY --from=criu /bundle /opt/criu-bundle
 COPY --from=build /agent /agent
 ENTRYPOINT ["/agent"]

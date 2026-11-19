@@ -493,3 +493,9 @@ When running in multi-replica HA mode with leader election enabled:
 - Prometheus scrape jobs should scrape per-pod endpoints and use `max(pod_migration_active)` when querying or alerting on active in-flight migrations across the cluster.
 - For counter and histogram metrics, use `sum(rate(pod_migration_outcomes_total[5m])) by (outcome)` and `sum(rate(pod_migration_phase_duration_seconds_sum[5m])) by (phase) / sum(rate(pod_migration_phase_duration_seconds_count[5m])) by (phase)`.
 
+## 9. Releases & Licensing
+
+- **Release Process**: Step-by-step instructions for building, validating, and publishing official releases are documented in [docs/release-process.md](docs/release-process.md).
+- **Third-Party Licenses & GPL Source Availability**: The complete software inventory of published container images, license disclosures, and instructions for obtaining matching GPL/LGPL source code are documented in [docs/third-party-licenses.md](docs/third-party-licenses.md).
+
+
