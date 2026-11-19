@@ -21,12 +21,10 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -34,7 +32,6 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	schedulinghelper "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -47,15 +44,15 @@ const (
 	// gate reconciler placed the restore (C8, #14). True with reason
 	// ReasonNodeConstraintsAdded: the replacement was released with the
 	// snapshot engine's node constraints. False with reason
-	// ReasonNoCompatibleNode: no node met them, no ReplicaSet or StatefulSet
-	// would recreate the replacement, and a node could take it without them,
-	// so it's held to start cold.
+	// ReasonNoCompatibleNode: an earlier version of the pod gate held the
+	// replacement to start cold, because no node met them.
 	ConditionRestorePlacement = "RestorePlacement"
-	// ReasonNoCompatibleNode: when the replacement was due for release, no
-	// node met the snapshot engine's placement constraints, no ReplicaSet or
-	// StatefulSet would recreate the replacement, and a node could take it
-	// without them, so the job concludes SucceededWithoutRestore and the
-	// replacement starts cold.
+	// ReasonNoCompatibleNode: an earlier version of the pod gate, with
+	// placement on, found no node that met the snapshot engine's node
+	// constraints when the replacement was due for release, and held it to
+	// start cold. The pod gate doesn't hold replacements any more, but a job
+	// with that record still concludes SucceededWithoutRestore with this
+	// reason, and its replacement starts cold, as recorded.
 	ReasonNoCompatibleNode = "NoCompatibleNode"
 
 	// tolerationComparisonOperators makes the node check match Gt and Lt
@@ -72,17 +69,30 @@ const (
 // that orders the restore: the job's engine, or GKE Pod Snapshots without a
 // registry, as for the restore order. An engine without the
 // PlacementAdvisor capability states none, and so does every engine while
-// RestorePlacement is off. Constraints that aren't valid node label
-// requirements are dropped too: the API server would reject the update that
-// adds them, so the release, retried as is, would keep failing, or the
-// scheduler could never match them. None are added either when pod's own
-// node selector, or every term of its required node affinity, already
-// requires them: they'd narrow nothing, and pod is placed by its own pins,
-// as with RestorePlacement off. Like jobRestoreOrderer, it fails when job
-// names an engine that isn't registered: another engine's constraints would
-// place the wrong restore, and the job reconciler fails such a job (#80).
+// RestorePlacement is off.
+//
+// Only a pod that its ReplicaSet or StatefulSet would recreate
+// (recreatedByOwner) gets any: if it can't be scheduled with them, the job
+// reconciler deletes it for that owner to recreate without them. Any other
+// pod, such as a Job's, an operator's, or one without a controller, is
+// placed as with RestorePlacement off: nothing would recreate it without
+// the constraints if it got stuck with them, and the node check can't tell
+// whether a node that meets them will take it, since it doesn't look at
+// resources, for one. Without them it can land on a node of another machine
+// type, where its restore may fail; the restore-crash fallback then handles
+// it, as with placement off.
+//
+// Constraints that aren't valid node label requirements are dropped too:
+// the API server would reject the update that adds them, so the release,
+// retried as is, would keep failing, or the scheduler could never match
+// them. None are added either when pod's own node selector, or every term
+// of its required node affinity, already requires them: they'd narrow
+// nothing, and pod is placed by its own pins, as with RestorePlacement off.
+// Like jobRestoreOrderer, it fails when job names an engine that isn't
+// registered: another engine's constraints would place the wrong restore,
+// and the job reconciler fails such a job (#80).
 func (r *PodGateReconciler) restorePlacement(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) ([]corev1.NodeSelectorRequirement, error) {
-	if !r.RestorePlacement {
+	if !r.RestorePlacement || !recreatedByOwner(pod) {
 		return nil, nil
 	}
 	var eng engine.Engine
@@ -119,8 +129,8 @@ func (r *PodGateReconciler) restorePlacement(ctx context.Context, job *pmv1alpha
 	if !narrows(pod, reqs) {
 		// The pod is pinned to what the restore needs by its own node
 		// selector or affinity, which a pod recreated in its place would
-		// have too. So holding it to start cold, or deleting it at the
-		// placement deadline, couldn't get it scheduled anywhere else.
+		// have too. So deleting it at the placement deadline couldn't get it
+		// scheduled anywhere else.
 		log.FromContext(ctx).Info("The replacement already requires the restore's node constraints, so none are added",
 			"pmj", job.Name, "constraints", describeRequirements(reqs))
 		return nil, nil
@@ -201,18 +211,17 @@ func recreatedByOwner(pod *corev1.Pod) bool {
 
 // releaseUnderWay reports whether pod's release with a restore order has
 // started: the job records the gate as released, or pod has consumed the
-// job. The release then goes ahead without a hold: holding a pod that
-// consumed the job would leave a concluded, consumed job with the pod still
-// gated. A pod that no ReplicaSet or StatefulSet would recreate gets the
-// constraints only if a node meets them then, since an earlier attempt may
-// have released it without them.
+// job. The release then goes ahead as the earlier attempt started it: the
+// constraints are added without a new node check, whatever the job's phase
+// is now.
 func releaseUnderWay(job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) bool {
 	return job.Status.GateReleased || (job.Status.Consumed && job.Status.RestoredPodUID == string(pod.UID))
 }
 
-// noCompatibleNode returns the condition with which the pod gate reconciler
-// recorded on job that no node could restore its checkpoint. It only counts
-// while the job is Restoring, the only phase in which the job reconciler
+// noCompatibleNode returns the condition with which an earlier version of
+// the pod gate reconciler recorded on job that no node could restore its
+// checkpoint, and held the replacement to start cold. It only counts while
+// the job is Restoring, the only phase in which the job reconciler
 // concludes on it, and no replacement has been released with a restore
 // order.
 func noCompatibleNode(job *pmv1alpha1.PodMigrationJob) (*metav1.Condition, bool) {
@@ -249,69 +258,6 @@ func recordRestorePlacement(job *pmv1alpha1.PodMigrationJob, reqs []corev1.NodeS
 		Message:            message,
 		ObservedGeneration: job.Generation,
 	})
-}
-
-// holdForNoCompatibleNode records on job that no node can restore its
-// checkpoint, and leaves pod gated. It's only for a pod that no ReplicaSet
-// or StatefulSet would recreate (recreatedByOwner): one released with the
-// constraints and stuck couldn't be recreated without them. And only when a
-// node can take the pod without them: otherwise starting it cold wouldn't
-// get it running sooner. The job reconciler then concludes the job
-// SucceededWithoutRestore with reason NoCompatibleNode, and the gate is
-// released with the cold-start bypass and without the constraints. The job
-// concludes before the pod starts, so a pod that started cold is never
-// counted as restored (I2).
-//
-// deadConsumer says that job records another pod as its consumer, one that
-// no longer exists and whose gate was never released, so it never restored.
-// The same patch clears that record: the job then concludes unconsumed, and
-// the cold release records pod as the one that fell back. A job that
-// concluded consumed while pod is still gated would be reported by I3 until
-// the release.
-func (r *PodGateReconciler) holdForNoCompatibleNode(ctx context.Context, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, reqs []corev1.NodeSelectorRequirement, deadConsumer bool) (ctrl.Result, error) {
-	message := fmt.Sprintf("No Ready node that pod %s can run on, by its node selector, node affinity and tolerations, meets the restore's node constraints (%s), so the pod starts without the restore",
-		pod.Name, describeRequirements(reqs))
-	// The conditions list is replaced as a whole by a merge patch, so don't
-	// overwrite a concurrent change to it. The resourceVersion check also
-	// keeps a dead consumer's record from being cleared on a stale view.
-	orig := job.DeepCopy()
-	patch := client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
-	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-		Type:               ConditionRestorePlacement,
-		Status:             metav1.ConditionFalse,
-		Reason:             ReasonNoCompatibleNode,
-		Message:            message,
-		ObservedGeneration: job.Generation,
-	})
-	if deadConsumer {
-		job.Status.Consumed = false
-		job.Status.RestoredPodUID = ""
-		job.Status.RestoredPodName = ""
-	}
-	if err := r.Status().Patch(ctx, job, patch); err != nil {
-		// Nothing was written, so the invariant checks after this
-		// reconcile must see the job as it is.
-		*job = *orig
-		if apierrors.IsConflict(err) {
-			// The job changed after it was read, for example it concluded:
-			// decide again on the current job.
-			log.FromContext(ctx).Info("The job changed while recording that no node can restore its checkpoint; requeuing", "pmj", job.Name)
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-		return ctrl.Result{}, err
-	}
-	keysAndValues := []any{"pmj", job.Name, "constraints", describeRequirements(reqs)}
-	if deadConsumer {
-		keysAndValues = append(keysAndValues,
-			"clearedConsumerPodName", orig.Status.RestoredPodName, "clearedConsumerPodUID", orig.Status.RestoredPodUID)
-	}
-	log.FromContext(ctx).Info("No node can restore the checkpoint; holding the replacement until the job concludes without a restore", keysAndValues...)
-	if r.Recorder != nil {
-		r.Recorder.Eventf(pod, corev1.EventTypeWarning, ReasonNoCompatibleNode, "%s", message)
-	}
-	// The PMJ watch enqueues the pod when the job concludes; this is a
-	// backstop.
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 // addRequiredNodeAffinity adds reqs to pod's required node affinity. Its

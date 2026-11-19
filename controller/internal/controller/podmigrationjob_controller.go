@@ -1100,23 +1100,29 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// A placement timeout writes its conclusion before it deletes the
-	// replacement too (C8, #14), so retry a delete that failed here. A pod
-	// left stuck with the constraints might never be scheduled.
+	// A replacement released with the restore's node constraints can still
+	// be waiting after its job concluded (C8, #14). A placement timeout
+	// writes its conclusion before it deletes the replacement, too, so retry
+	// a delete that failed, and look again at a pod that was left alone for
+	// now, for example because the scheduler nominated a node for it. A job
+	// that concluded RestoreTimeout recreates its replacement once the
+	// scheduler reports it unschedulable. Both look again soon until then.
+	// This is best effort: an error is retried on the next look, and must
+	// not hold the rest of this path, such as the source fence and garbage
+	// collection. A pod left stuck with the constraints might never be
+	// scheduled, but a delete that keeps failing, for example because an
+	// admission policy forbids it, mustn't keep the job forever either.
+	var placementRecheck time.Duration
 	if placementTimedOut(job) {
-		if err := r.ensurePlacementTimedOutPodDeleted(ctx, job, nil); err != nil {
+		placementRecheck, err = r.ensurePlacementTimedOutPodDeleted(ctx, job, nil)
+		if err != nil {
 			logger.Error(err, "Failed to complete the placement-timeout pod deletion; will retry", "pod", job.Status.RestoredPodName)
-			return ctrl.Result{}, err
 		}
-	}
-	// A job that concluded RestoreTimeout can still have a replacement
-	// released with the restore's node constraints that isn't scheduled
-	// (C8, #14): recreate it once it's unschedulable, and look again soon
-	// until then. This is best effort: an error is retried on the next look,
-	// and must not hold the rest of this path, such as garbage collection.
-	placementRecheck, err := r.recreateUnplacedAfterRestoreTimeout(ctx, job)
-	if err != nil {
-		logger.Error(err, "Failed to check the replacement released with the restore's node constraints; will retry", "pod", job.Status.RestoredPodName)
+	} else {
+		placementRecheck, err = r.recreateUnplacedAfterRestoreTimeout(ctx, job)
+		if err != nil {
+			logger.Error(err, "Failed to check the replacement released with the restore's node constraints; will retry", "pod", job.Status.RestoredPodName)
+		}
 	}
 
 	// A job that fenced its source and then concluded without a restore still
@@ -1799,12 +1805,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
-		// The pod gate found no node that can restore the checkpoint (C8,
-		// #14) and holds the replacement: conclude without a restore, and
-		// the gate then releases it cold. This comes before the restore
-		// ceiling, which waits for a gated replacement. The patch checks the
-		// resourceVersion, so a stale view can't conclude a job whose
-		// replacement the gate has since released with a restore order.
+		// An earlier version of the pod gate found no node that could
+		// restore the checkpoint (C8, #14) and holds the replacement:
+		// conclude without a restore, as recorded, and the gate then releases
+		// it cold. This comes before the restore ceiling, which waits for a
+		// gated replacement. The patch checks the resourceVersion, so a stale
+		// view can't conclude a job whose replacement the gate has since
+		// released with a restore order.
 		if cond, held := noCompatibleNode(job); held {
 			logger.Info("No node can restore the checkpoint; concluding without a restore", "job", job.Name)
 			orig := job.DeepCopy()

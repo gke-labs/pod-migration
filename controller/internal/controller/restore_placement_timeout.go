@@ -67,9 +67,11 @@ const (
 	// reasonRestoreTimeout is the reason with which the restore ceiling
 	// concludes a job that has no verdict by then.
 	reasonRestoreTimeout = "RestoreTimeout"
-	// placementRecheckInterval is how soon a job that concluded
-	// RestoreTimeout looks again at a replacement, released with the
-	// restore's node constraints, that isn't scheduled yet.
+	// placementRecheckInterval is how soon a concluded job looks again at
+	// its replacement, released with the restore's node constraints, while
+	// that pod isn't scheduled yet: after RestoreTimeout, or after
+	// PlacementTimeout when the pod had a nominated node or another
+	// scheduling gate instead of being deleted, or its delete failed.
 	placementRecheckInterval = 15 * time.Second
 )
 
@@ -260,12 +262,12 @@ func unschedulable(pod *corev1.Pod) bool {
 // a fallback pool that scales from zero. The deadline counts from the
 // release, which can come late, so the ceiling can come first.
 //
-// A pod that no ReplicaSet or StatefulSet would recreate is left alone, and
-// so is one that the scheduler hasn't tried or has nominated a node for.
-// Then the restore ceiling concludes the job RestoreTimeout as before. If a
-// ReplicaSet or StatefulSet would recreate such a pod,
-// recreateUnplacedAfterRestoreTimeout deletes it later, once it's
-// unschedulable.
+// A pod that the scheduler hasn't tried or has nominated a node for is left
+// alone. Then the restore ceiling concludes the job RestoreTimeout as
+// before, and recreateUnplacedAfterRestoreTimeout deletes the pod later,
+// once it's unschedulable. So is a pod that no ReplicaSet or StatefulSet
+// would recreate, which only an earlier version of the pod gate released
+// with the constraints; nothing deletes it.
 //
 // The cache only tells it whether to look: the decision is taken on a live
 // read, since a pod that the cache shows unscheduled may have been scheduled
@@ -424,26 +426,36 @@ func (r *PodMigrationJobReconciler) concludePlacementTimeout(ctx context.Context
 	if r.Recorder != nil {
 		r.Recorder.Eventf(pod, corev1.EventTypeWarning, ReasonPlacementTimeout, "%s", message)
 	}
-	if err := r.ensurePlacementTimedOutPodDeleted(ctx, job, pod); err != nil {
+	// The job has concluded, so a failed delete is retried from the
+	// completion path in Reconcile, like a pod left alone for now.
+	recheck, err := r.ensurePlacementTimedOutPodDeleted(ctx, job, pod)
+	if err != nil {
 		logger.Error(err, "Failed to delete the replacement after the placement deadline; will retry", "pod", pod.Name)
-		return ctrl.Result{}, true, err
 	}
-	return ctrl.Result{}, true, nil
+	return ctrl.Result{RequeueAfter: recheck}, true, nil
 }
 
 // ensurePlacementTimedOutPodDeleted deletes the replacement of a job that
 // concluded PlacementTimeout, idempotently, so that the completion path can
 // retry a delete that failed. It deletes only the instance the job recorded,
-// only while that pod isn't bound to a node, and only if a ReplicaSet or
-// StatefulSet would recreate it. prefetched, if set, is the pod read live;
-// otherwise it reads the pod live itself. The UID and resourceVersion
-// preconditions keep it from deleting a same-named successor, or a pod that
-// was scheduled after the read. A pod that was scheduled after all is kept,
-// with a Warning event on the job, since the job's conclusion says it was
-// deleted; another conflict is retried on a fresh read.
-func (r *PodMigrationJobReconciler) ensurePlacementTimedOutPodDeleted(ctx context.Context, job *pmv1alpha1.PodMigrationJob, prefetched *corev1.Pod) error {
+// only while the scheduler reports it unschedulable (unschedulable), and
+// only if a ReplicaSet or StatefulSet would recreate it. prefetched, if set,
+// is the pod read live; otherwise it reads the pod live itself. The UID and
+// resourceVersion preconditions keep it from deleting a same-named
+// successor, or a pod that changed after the read.
+//
+// A pod bound to a node is kept: the job's conclusion says it was deleted,
+// so when the delete finds it bound, a Warning event on the job says it was
+// kept, once. A pod that has a nominated node, which the scheduler places
+// once it has preempted pods there, or that another scheduling gate holds,
+// is left alone for now, and so is one that changed after the read in
+// another way. The job doesn't watch pods, so it returns how soon to look
+// again: placementRecheckInterval while the pod waits like that, or after
+// an error, and 0 once the pod is gone, deleted, bound, or not the job's to
+// delete.
+func (r *PodMigrationJobReconciler) ensurePlacementTimedOutPodDeleted(ctx context.Context, job *pmv1alpha1.PodMigrationJob, prefetched *corev1.Pod) (time.Duration, error) {
 	if job.Status.RestoredPodName == "" {
-		return nil
+		return 0, nil
 	}
 	key := types.NamespacedName{Namespace: job.Namespace, Name: job.Status.RestoredPodName}
 	pod := prefetched
@@ -451,32 +463,47 @@ func (r *PodMigrationJobReconciler) ensurePlacementTimedOutPodDeleted(ctx contex
 		pod = &corev1.Pod{}
 		if err := r.liveReader().Get(ctx, key, pod); err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil
+				return 0, nil
 			}
-			return fmt.Errorf("failed to live-read replacement pod %s: %w", key.Name, err)
+			return placementRecheckInterval, fmt.Errorf("failed to live-read replacement pod %s: %w", key.Name, err)
 		}
 	}
 	if job.Status.RestoredPodUID != "" && string(pod.UID) != job.Status.RestoredPodUID {
-		return nil
+		return 0, nil
 	}
 	if pod.DeletionTimestamp != nil || pod.Spec.NodeName != "" || !recreatedByOwner(pod) {
-		return nil
+		return 0, nil
+	}
+	if !unschedulable(pod) {
+		// A nominated node can fall through, and another gate can go away,
+		// so the pod may become unschedulable again: look again soon.
+		log.FromContext(ctx).V(1).Info("Replacement past the placement deadline has a nominated node or another scheduling gate; leaving it for now",
+			"job", job.Name, "pod", pod.Name, "nominatedNode", pod.Status.NominatedNodeName)
+		return placementRecheckInterval, nil
 	}
 	uid, resourceVersion := pod.UID, pod.ResourceVersion
 	err := r.Delete(ctx, pod, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion})
 	switch {
 	case err == nil, apierrors.IsNotFound(err):
-		return nil
+		return 0, nil
 	case apierrors.IsConflict(err):
 		current := &corev1.Pod{}
-		if getErr := r.liveReader().Get(ctx, key, current); getErr == nil && current.UID == uid && current.Spec.NodeName != "" {
-			r.eventf(job, corev1.EventTypeWarning, ReasonPlacementTimeout,
-				"Replacement pod %s was scheduled to node %s after all, so it's kept, and it may still restore the checkpoint, although the job concluded without a restore",
-				pod.Name, current.Spec.NodeName)
-			return nil
+		if getErr := r.liveReader().Get(ctx, key, current); getErr == nil && current.UID == uid {
+			switch {
+			case current.Spec.NodeName != "":
+				r.eventf(job, corev1.EventTypeWarning, ReasonPlacementTimeout,
+					"Replacement pod %s was scheduled to node %s after all, so it's kept, and it may still restore the checkpoint, although the job concluded without a restore",
+					pod.Name, current.Spec.NodeName)
+				return 0, nil
+			case current.Status.NominatedNodeName != "":
+				r.eventf(job, corev1.EventTypeWarning, ReasonPlacementTimeout,
+					"Replacement pod %s was nominated to node %s, so it's kept while the scheduler makes room there. It's deleted if it becomes unschedulable again; if it's scheduled, it may still restore the checkpoint, although the job concluded without a restore",
+					pod.Name, current.Status.NominatedNodeName)
+			}
 		}
-		return fmt.Errorf("replacement pod %s changed since it was read; retrying: %w", pod.Name, err)
+		// It changed since the read: look again on a fresh read.
+		return placementRecheckInterval, nil
 	default:
-		return fmt.Errorf("failed to delete replacement pod %s: %w", pod.Name, err)
+		return placementRecheckInterval, fmt.Errorf("failed to delete replacement pod %s: %w", pod.Name, err)
 	}
 }

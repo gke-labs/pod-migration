@@ -109,6 +109,8 @@ type timeoutSetup struct {
 	engines *engine.Registry
 	// deleteErr, if set, fails every delete.
 	deleteErr error
+	// podDeleteErr, if set, fails every pod delete.
+	podDeleteErr error
 }
 
 // reconcileTimeout reconciles the placement job once with the job
@@ -133,6 +135,9 @@ func reconcileTimeout(t *testing.T, job *pmv1alpha1.PodMigrationJob, pod *corev1
 		}
 		if setup.deleteErr != nil {
 			return setup.deleteErr
+		}
+		if _, ok := obj.(*corev1.Pod); ok && setup.podDeleteErr != nil {
+			return setup.podDeleteErr
 		}
 		return c.Delete(ctx, obj, opts...)
 	}
@@ -546,7 +551,7 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("a pod that changed but isn't scheduled when the delete conflicts: retried", func(t *testing.T) {
+	t.Run("a pod that changed but isn't scheduled when the delete conflicts: looked at again soon", func(t *testing.T) {
 		touch := func(ctx context.Context, c client.WithWatch, obj client.Object) {
 			pod := &corev1.Pod{}
 			if err := c.Get(ctx, client.ObjectKeyFromObject(obj), pod); err != nil {
@@ -558,11 +563,59 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 			}
 		}
 		run := reconcileTimeout(t, releasedJob(past), stuckPod(), timeoutSetup{beforeDelete: touch})
-		if run.err == nil {
-			t.Error("Reconcile() error = nil, want the conflict returned so that the completion path retries")
+		if run.err != nil {
+			t.Fatalf("Reconcile() error = %v, want the conflict handled by a requeue", run.err)
 		}
 		if run.job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore || !run.podExists {
 			t.Errorf("phase = %s, pod exists %t; want the job concluded and the pod left for the retry", run.job.Status.Phase, run.podExists)
+		}
+		if run.result.RequeueAfter != placementRecheckInterval {
+			t.Errorf("result = %+v, want a requeue after %s for the retry on a fresh read", run.result, placementRecheckInterval)
+		}
+	})
+
+	t.Run("a pod nominated a node between the read and the delete: kept for now, and the job says so", func(t *testing.T) {
+		// The scheduler is preempting pods on a node that meets the
+		// constraint to make room for it, so it may still restore. A
+		// nominated node can fall through, so the job looks again soon.
+		nominate := func(ctx context.Context, c client.WithWatch, obj client.Object) {
+			pod := &corev1.Pod{}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(obj), pod); err != nil {
+				t.Fatalf("getting the pod: %v", err)
+			}
+			pod.Status.NominatedNodeName = "n2-a"
+			if err := c.Status().Update(ctx, pod); err != nil {
+				t.Fatalf("nominating a node for the pod: %v", err)
+			}
+		}
+		run := reconcileTimeout(t, releasedJob(past), stuckPod(), timeoutSetup{beforeDelete: nominate})
+		if run.err != nil {
+			t.Fatalf("Reconcile() error = %v", run.err)
+		}
+		if !run.podExists || run.pod.Status.NominatedNodeName != "n2-a" {
+			t.Fatalf("pod exists %t, nominated %q; want the nominated pod kept", run.podExists, run.pod.Status.NominatedNodeName)
+		}
+		if run.job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+			t.Errorf("phase = %s, want SucceededWithoutRestore", run.job.Status.Phase)
+		}
+		if run.result.RequeueAfter != placementRecheckInterval {
+			t.Errorf("result = %+v, want a requeue after %s", run.result, placementRecheckInterval)
+		}
+		if !hasEventWith(run.events, "Warning", ReasonPlacementTimeout, "nominated to node n2-a") {
+			t.Errorf("events = %q, want a Warning that the nominated pod is kept for now", run.events)
+		}
+	})
+
+	t.Run("a delete that fails at the deadline is retried soon, without failing the reconcile", func(t *testing.T) {
+		run := reconcileTimeout(t, releasedJob(past), stuckPod(), timeoutSetup{podDeleteErr: apierrors.NewInternalError(errors.New("etcd timeout"))})
+		if run.err != nil {
+			t.Fatalf("Reconcile() error = %v, want it logged and retried", run.err)
+		}
+		if run.job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore || !run.podExists {
+			t.Errorf("phase = %s, pod exists %t; want the job concluded and the pod left for the retry", run.job.Status.Phase, run.podExists)
+		}
+		if run.result.RequeueAfter != placementRecheckInterval {
+			t.Errorf("result = %+v, want a requeue after %s", run.result, placementRecheckInterval)
 		}
 	})
 
@@ -581,25 +634,105 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("the retry leaves a pod that was scheduled, orphaned or replaced since", func(t *testing.T) {
+	// timedOutJob returns the placement job as concluded PlacementTimeout,
+	// completedAgo, changed by mutate.
+	timedOutJob := func(completedAgo time.Duration, mutate ...func(*pmv1alpha1.PodMigrationJob)) *pmv1alpha1.PodMigrationJob {
+		job := releasedJob(past)
+		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+		completed := metav1.NewTime(time.Now().Add(-completedAgo))
+		job.Status.CompletionTime = &completed
+		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{Type: "Restored", Status: metav1.ConditionFalse, Reason: ReasonPlacementTimeout, Message: "timed out"})
+		for _, m := range mutate {
+			m(job)
+		}
+		return job
+	}
+
+	t.Run("the retry leaves a pod that was scheduled, orphaned or replaced since, and doesn't look again", func(t *testing.T) {
+		// A scheduled pod is kept quietly: a Warning that it's kept was
+		// recorded when the delete found it bound, and every later
+		// reconcile until garbage collection would repeat it.
 		for name, pod := range map[string]*corev1.Pod{
 			"scheduled":   stuckPod(func(p *corev1.Pod) { p.Spec.NodeName = "n2-a" }),
 			"orphaned":    stuckPod(func(p *corev1.Pod) { p.OwnerReferences = nil }),
 			"a successor": stuckPod(func(p *corev1.Pod) { p.UID = "successor-uid" }),
 		} {
 			t.Run(name, func(t *testing.T) {
-				job := releasedJob(past)
-				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
-				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{Type: "Restored", Status: metav1.ConditionFalse, Reason: ReasonPlacementTimeout, Message: "timed out"})
-				run := reconcileTimeout(t, job, pod, timeoutSetup{})
+				run := reconcileTimeout(t, timedOutJob(time.Minute), pod, timeoutSetup{})
 				if run.err != nil {
 					t.Fatalf("Reconcile() error = %v", run.err)
 				}
 				if !run.podExists || len(run.deletes) != 0 {
 					t.Errorf("pod exists %t, deletes %d; want the pod kept", run.podExists, len(run.deletes))
 				}
+				if run.result.RequeueAfter <= placementRecheckInterval {
+					t.Errorf("result = %+v, want the usual requeue for garbage collection", run.result)
+				}
+				if len(run.events) != 0 {
+					t.Errorf("events = %q, want none", run.events)
+				}
 			})
 		}
+	})
+
+	t.Run("the retry leaves a pod that the scheduler hasn't found unschedulable, and looks again soon", func(t *testing.T) {
+		// A nominated node is where the scheduler is preempting pods to
+		// make room, and it can fall through. Another scheduling gate can
+		// go away. Either way the pod may become unschedulable again, and
+		// then the retry deletes it.
+		for name, pod := range map[string]*corev1.Pod{
+			"nominated a node": stuckPod(func(p *corev1.Pod) { p.Status.NominatedNodeName = "n2-a" }),
+			"held by another scheduling gate": stuckPod(func(p *corev1.Pod) {
+				p.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "example.com/queue"}}
+				p.Status.Conditions[0].Reason = corev1.PodReasonSchedulingGated
+			}),
+			"not tried": stuckPod(func(p *corev1.Pod) { p.Status.Conditions = nil }),
+		} {
+			t.Run(name, func(t *testing.T) {
+				run := reconcileTimeout(t, timedOutJob(time.Minute), pod, timeoutSetup{})
+				if run.err != nil {
+					t.Fatalf("Reconcile() error = %v", run.err)
+				}
+				if !run.podExists || len(run.deletes) != 0 {
+					t.Errorf("pod exists %t, deletes %d; want the pod kept", run.podExists, len(run.deletes))
+				}
+				if run.result.RequeueAfter != placementRecheckInterval {
+					t.Errorf("result = %+v, want a requeue after %s", run.result, placementRecheckInterval)
+				}
+			})
+		}
+	})
+
+	t.Run("a retry that keeps failing doesn't hold the source fence or garbage collection", func(t *testing.T) {
+		// For example, an admission policy forbids the delete. The job
+		// keeps retrying until it's garbage collected, 30 minutes after it
+		// concluded, but its other cleanup goes ahead.
+		forbidden := apierrors.NewForbidden(corev1.Resource("pods"), placementPodName, errors.New("denied by an admission policy"))
+		withFinalizer := func(j *pmv1alpha1.PodMigrationJob) { j.Finalizers = []string{SourceFenceFinalizer} }
+		t.Run("before garbage collection", func(t *testing.T) {
+			run := reconcileTimeout(t, timedOutJob(time.Minute, withFinalizer), stuckPod(), timeoutSetup{podDeleteErr: forbidden})
+			if run.err != nil {
+				t.Fatalf("Reconcile() error = %v, want it logged and retried", run.err)
+			}
+			if !run.podExists || len(run.deletes) != 1 {
+				t.Errorf("pod exists %t, deletes %d; want one failed delete", run.podExists, len(run.deletes))
+			}
+			if run.result.RequeueAfter != placementRecheckInterval {
+				t.Errorf("result = %+v, want a requeue after %s", run.result, placementRecheckInterval)
+			}
+			if len(run.job.Finalizers) != 0 {
+				t.Errorf("finalizers = %v, want the source fence finalizer removed", run.job.Finalizers)
+			}
+		})
+		t.Run("past garbage collection", func(t *testing.T) {
+			run := reconcileTimeout(t, timedOutJob(31*time.Minute, withFinalizer), stuckPod(), timeoutSetup{podDeleteErr: forbidden})
+			if run.err != nil {
+				t.Fatalf("Reconcile() error = %v", run.err)
+			}
+			if run.jobExists {
+				t.Error("job still exists, want it garbage collected 30 minutes after it concluded")
+			}
+		})
 	})
 }
 
