@@ -235,6 +235,7 @@ func (n *Node) RunProbeLoop(ctx context.Context, interval time.Duration) {
 // any leftover CRIU restore containers, mounts, snapshots, or leases whose pods
 // are gone or terminating.
 func (n *Node) SweepOrphanRestores(ctx context.Context) error {
+	sweepStart := time.Now()
 	var podList corev1.PodList
 	reader := n.APIReader
 	if reader == nil {
@@ -259,9 +260,8 @@ func (n *Node) SweepOrphanRestores(ctx context.Context) error {
 		}
 		// Count terminating pods as alive until their grace deadline has elapsed.
 		alive := p.DeletionTimestamp == nil
-		if !alive && p.DeletionGracePeriodSeconds != nil {
-			deadline := p.DeletionTimestamp.Time.Add(time.Duration(*p.DeletionGracePeriodSeconds) * time.Second)
-			if now.Before(deadline) {
+		if !alive && p.DeletionGracePeriodSeconds != nil && *p.DeletionGracePeriodSeconds > 0 {
+			if now.Before(p.DeletionTimestamp.Time) {
 				alive = true
 			}
 		}
@@ -277,7 +277,7 @@ func (n *Node) SweepOrphanRestores(ctx context.Context) error {
 	if n.Restorer == nil {
 		return nil
 	}
-	swept, err := n.Restorer.SweepOrphans(ctx, livingUIDs, livingSnaps)
+	swept, err := n.Restorer.SweepOrphans(ctx, livingUIDs, livingSnaps, sweepStart)
 	if len(swept) > 0 {
 		logf.FromContext(ctx).Info("swept orphan restore artifacts", "count", len(swept), "migrations", swept)
 	}

@@ -150,9 +150,8 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 
 		gracePeriodExpired := false
-		if pod.DeletionGracePeriodSeconds != nil {
-			deadline := pod.DeletionTimestamp.Time.Add(time.Duration(*pod.DeletionGracePeriodSeconds) * time.Second)
-			if time.Now().After(deadline) {
+		if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds > 0 {
+			if time.Now().After(pod.DeletionTimestamp.Time) {
 				gracePeriodExpired = true
 			}
 		} else {

@@ -457,7 +457,6 @@ func TestNode_SweepOrphanRestores_FiltersOtherNodesAndTerminatingPods(t *testing
 	ctx := context.Background()
 	scheme := newTestScheme(t)
 
-	now := metav1.Now()
 	// Pod 1: on node-a, living
 	pod1 := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -487,13 +486,14 @@ func TestNode_SweepOrphanRestores_FiltersOtherNodesAndTerminatingPods(t *testing
 		},
 	}
 	// Pod 3: on node-a, terminating with grace period active
+	futureTime := metav1.NewTime(time.Now().Add(30 * time.Second))
 	grace30 := int64(30)
 	pod3 := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:                       "pod-terminating",
 			Namespace:                  "default",
 			UID:                        types.UID("terminating-uid"),
-			DeletionTimestamp:          &now,
+			DeletionTimestamp:          &futureTime,
 			DeletionGracePeriodSeconds: &grace30,
 			Finalizers:                 []string{"test.io/keep"},
 			Annotations: map[string]string{
@@ -523,13 +523,30 @@ func TestNode_SweepOrphanRestores_FiltersOtherNodesAndTerminatingPods(t *testing
 			NodeName: "node-a",
 		},
 	}
+	// Pod 5: on node-a, terminating with nil grace period (force delete)
+	pod5 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       "pod-nil-grace",
+			Namespace:                  "default",
+			UID:                        types.UID("nil-grace-uid"),
+			DeletionTimestamp:          &futureTime,
+			DeletionGracePeriodSeconds: nil,
+			Finalizers:                 []string{"test.io/keep"},
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "nil-grace-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+		},
+	}
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
 			return []string{obj.(*corev1.Pod).Spec.NodeName}
 		}).
-		WithObjects(pod1, pod2, pod3, pod4).
+		WithObjects(pod1, pod2, pod3, pod4, pod5).
 		Build()
 
 	var gotLivingUIDs map[string]bool
@@ -559,6 +576,7 @@ func TestNode_SweepOrphanRestores_FiltersOtherNodesAndTerminatingPods(t *testing
 			{ID: "lease-pm-other-node", Labels: map[string]string{"pod-migrate.io/pod-uid": "other-node-uid"}},
 			{ID: "lease-pm-terminating", Labels: map[string]string{"pod-migrate.io/pod-uid": "terminating-uid"}},
 			{ID: "lease-pm-expired", Labels: map[string]string{"pod-migrate.io/pod-uid": "expired-uid"}},
+			{ID: "lease-pm-nil-grace", Labels: map[string]string{"pod-migrate.io/pod-uid": "nil-grace-uid"}},
 		}, nil
 	}
 
@@ -595,6 +613,10 @@ func TestNode_SweepOrphanRestores_FiltersOtherNodesAndTerminatingPods(t *testing
 	// lease-pm-expired belongs to terminating pod whose grace deadline has passed -> must be swept
 	if !sweptSet["lease-pm-expired"] {
 		t.Errorf("expired terminating pod was not swept")
+	}
+	// lease-pm-nil-grace belongs to force-deleted pod with nil grace period -> must be swept
+	if !sweptSet["lease-pm-nil-grace"] {
+		t.Errorf("nil grace period terminating pod was not swept")
 	}
 
 	_ = gotLivingUIDs

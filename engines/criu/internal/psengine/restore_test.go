@@ -249,8 +249,8 @@ func TestNodeRestore_TearsDownOnPodDeletion(t *testing.T) {
 	// 1. Pod deletion starts, sibling container is still running and grace period active
 	pod := replacementPodOnNode("ps-web-0-deadbeef")
 	pod.Annotations[contract.AnnotationRestoreStatus] = contract.RestoreStatusRestored
-	now := metav1.Now()
-	pod.DeletionTimestamp = &now
+	future := metav1.NewTime(time.Now().Add(30 * time.Second))
+	pod.DeletionTimestamp = &future
 	pod.Finalizers = []string{"test.io/keep"}
 	gracePeriod := int64(30)
 	pod.DeletionGracePeriodSeconds = &gracePeriod
@@ -299,6 +299,55 @@ func TestNodeRestore_TearsDownOnPodDeletion(t *testing.T) {
 	}
 	if ops.cleaned[0].SnapshotName != "ps-web-0-deadbeef" || ops.cleaned[0].TargetPod != "web-1" {
 		t.Errorf("cleanup inputs: %+v", ops.cleaned[0])
+	}
+}
+
+func TestNodeRestore_DeadlinePassedTearsDownEvenIfSiblingRunning(t *testing.T) {
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	pod.Annotations[contract.AnnotationRestoreStatus] = contract.RestoreStatusRestored
+	past := metav1.NewTime(time.Now().Add(-5 * time.Second))
+	pod.DeletionTimestamp = &past
+	pod.Finalizers = []string{"test.io/keep"}
+	gracePeriod := int64(30)
+	pod.DeletionGracePeriodSeconds = &gracePeriod
+
+	c := newClient(t, pod)
+	ops := &fakeRestoreOps{siblingRunning: true}
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when deadline expired, got %v", res.RequeueAfter)
+	}
+	if len(ops.cleaned) != 1 {
+		t.Fatalf("expected cleanup to execute when grace deadline expired even though sibling running; got %d calls", len(ops.cleaned))
+	}
+}
+
+func TestNodeRestore_NilOrZeroGracePeriodTearsDownImmediately(t *testing.T) {
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	pod.Annotations[contract.AnnotationRestoreStatus] = contract.RestoreStatusRestored
+	future := metav1.NewTime(time.Now().Add(30 * time.Second))
+	pod.DeletionTimestamp = &future
+	pod.Finalizers = []string{"test.io/keep"}
+	pod.DeletionGracePeriodSeconds = nil // force delete
+
+	c := newClient(t, pod)
+	ops := &fakeRestoreOps{siblingRunning: true}
+	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Errorf("expected no requeue for nil grace period, got %v", res.RequeueAfter)
+	}
+	if len(ops.cleaned) != 1 {
+		t.Fatalf("expected immediate cleanup for nil grace period; got %d calls", len(ops.cleaned))
 	}
 }
 

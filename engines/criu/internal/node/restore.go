@@ -872,8 +872,10 @@ func (r *restorer) IsRunning(ctx context.Context, migrationName string) (bool, e
 // SweepOrphans searches for orphaned restore artifacts (containerd leases, bundle
 // directories, and runc containers) whose associated target pod or snapshot no longer exists
 // on this node, and tears them down.
-func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapshots map[string]bool) ([]string, error) {
-	sweepStart := time.Now()
+func (r *restorer) SweepOrphans(ctx context.Context, livingPodUIDs, livingSnapshots map[string]bool, sweepStart time.Time) ([]string, error) {
+	if sweepStart.IsZero() {
+		sweepStart = time.Now()
+	}
 	var swept []string
 	seenMigrations := make(map[string]bool)
 

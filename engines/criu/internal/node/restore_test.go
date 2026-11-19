@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
@@ -910,6 +911,15 @@ func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
 	if err := os.MkdirAll(bundleLiving, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Stage an orphaned bundle dir created after sweepStart (must be skipped)
+	bundleAfterSweep := filepath.Join(tmpDir, "bundles", "pm-psengine-after-sweep-snap")
+	if err := os.MkdirAll(bundleAfterSweep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	futureTime := time.Now().Add(10 * time.Minute)
+	if err := os.Chtimes(bundleAfterSweep, futureTime, futureTime); err != nil {
+		t.Fatal(err)
+	}
 
 	var cleaned []string
 	deletedLeaseIDs := make(map[string]bool)
@@ -946,6 +956,14 @@ func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
 						"pod-migrate.io/pod-uid": "live-pod-uid",
 					},
 				},
+				// Lease created after sweepStart belongs to a restore started after the sweep began (must be skipped)
+				{
+					ID:        "lease-pm-psengine-after-sweep-lease",
+					CreatedAt: futureTime,
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "dead-pod-uid",
+					},
+				},
 				// Lease without lease-pm- prefix must be ignored (unpinned check)
 				{
 					ID: "lease-other-service-dead",
@@ -973,7 +991,8 @@ func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
 	livingUIDs := map[string]bool{"live-pod-uid": true}
 	livingSnaps := map[string]bool{"living-snap": true}
 
-	swept, err := r.SweepOrphans(context.Background(), livingUIDs, livingSnaps)
+	sweepStart := time.Now()
+	swept, err := r.SweepOrphans(context.Background(), livingUIDs, livingSnaps, sweepStart)
 	if err != nil {
 		t.Fatalf("SweepOrphans failed: %v", err)
 	}
@@ -997,6 +1016,12 @@ func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
 	}
 	if sweptSet["psengine-living-snap"] {
 		t.Errorf("living bundle was incorrectly swept; swept = %v", swept)
+	}
+	if sweptSet["psengine-after-sweep-lease"] || deletedLeaseIDs["lease-pm-psengine-after-sweep-lease"] {
+		t.Errorf("after-sweep lease was incorrectly swept; swept = %v, deleted = %v", swept, deletedLeaseIDs)
+	}
+	if sweptSet["psengine-after-sweep-snap"] {
+		t.Errorf("after-sweep bundle was incorrectly swept; swept = %v", swept)
 	}
 	if sweptSet["psengine-snap-living"] {
 		t.Errorf("living snapshot-name lease was incorrectly swept; swept = %v", swept)
@@ -1053,7 +1078,7 @@ func TestSweepOrphans_SkipsInflightRestores(t *testing.T) {
 	livingUIDs := map[string]bool{}
 	livingSnaps := map[string]bool{}
 
-	swept, err := r.SweepOrphans(context.Background(), livingUIDs, livingSnaps)
+	swept, err := r.SweepOrphans(context.Background(), livingUIDs, livingSnaps, time.Time{})
 	if err != nil {
 		t.Fatalf("SweepOrphans failed: %v", err)
 	}
