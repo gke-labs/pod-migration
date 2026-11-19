@@ -2271,117 +2271,129 @@ func TestPodGateReconciler_Reconcile_StrandedPMJ_StaleCacheHitConfirmedDeletedOn
 }
 
 func TestPodGate_GateReleased_StatusPatchFailure_PodRemainsGated(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = pmv1alpha1.AddToScheme(scheme)
+	for name, patchErr := range map[string]error{
+		"conflict": apierrors.NewConflict(schema.GroupResource{Group: "podmigration.gke.io", Resource: "podmigrationjobs"}, "pmj-patch-failure", errors.New("conflict on status patch")),
+		"internal": apierrors.NewInternalError(errors.New("etcd timeout")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			_ = pmv1alpha1.AddToScheme(scheme)
 
-	namespace := "default"
-	pmjName := "pmj-patch-failure"
+			namespace := "default"
+			pmjName := "pmj-patch-failure"
 
-	candidatePod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      "pod-candidate",
-			UID:       "uid-candidate",
-			Annotations: map[string]string{
-				"pod-migration.gke.io/assigned-pmj": pmjName,
-			},
-		},
-		Spec: corev1.PodSpec{
-			SchedulingGates: []corev1.PodSchedulingGate{
-				{Name: "gke.io/pod-migration-gate"},
-			},
-		},
-	}
-
-	pmj := &pmv1alpha1.PodMigrationJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      pmjName,
-		},
-		Spec: pmv1alpha1.PodMigrationJobSpec{
-			PodRef: corev1.LocalObjectReference{Name: "pod-orig"},
-		},
-		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
-			SnapshotRef:     "snapshot-retry-123",
-			Consumed:        true,
-			GateReleased:    false,
-			RestoredPodUID:  "uid-dead",
-			RestoredPodName: "pod-dead",
-		},
-	}
-
-	baseClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
-		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
-		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(candidatePod, pmj).
-		Build()
-
-	failPatchOnce := true
-	cl := interceptor.NewClient(baseClient, interceptor.Funcs{
-		SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-			if subResourceName == "status" && failPatchOnce {
-				failPatchOnce = false
-				return apierrors.NewConflict(schema.GroupResource{Group: "podmigration.gke.io", Resource: "podmigrationjobs"}, pmjName, errors.New("conflict on status patch"))
+			candidatePod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      "pod-candidate",
+					UID:       "uid-candidate",
+					Annotations: map[string]string{
+						"pod-migration.gke.io/assigned-pmj": pmjName,
+					},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: "gke.io/pod-migration-gate"},
+					},
+				},
 			}
-			return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
-		},
-	})
 
-	r := &PodGateReconciler{
-		Client: cl,
-		Scheme: scheme,
-	}
+			pmj := &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      pmjName,
+				},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef: corev1.LocalObjectReference{Name: "pod-orig"},
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:           pmv1alpha1.PodMigrationJobPhaseRestoring,
+					SnapshotRef:     "snapshot-retry-123",
+					Consumed:        true,
+					GateReleased:    false,
+					RestoredPodUID:  "uid-dead",
+					RestoredPodName: "pod-dead",
+				},
+			}
 
-	ctx := context.Background()
-	req := reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: namespace,
-			Name:      "pod-candidate",
-		},
-	}
+			baseClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+				WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
+				WithObjects(candidatePod, pmj).
+				Build()
 
-	// 1. First reconcile: status patch fails. Reconcile must return the error and fail closed:
-	// the candidate pod MUST still be gated so it cannot restore.
-	_, err := r.Reconcile(ctx, req)
-	if err == nil {
-		t.Fatalf("expected error on status patch failure, got nil")
-	}
+			failPatchOnce := true
+			cl := interceptor.NewClient(baseClient, interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					if subResourceName == "status" && failPatchOnce {
+						failPatchOnce = false
+						return patchErr
+					}
+					return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+				},
+			})
 
-	podCheck := &corev1.Pod{}
-	if err := baseClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "pod-candidate"}, podCheck); err != nil {
-		t.Fatalf("failed to fetch candidate pod: %v", err)
-	}
-	if !podHasMigrationGate(podCheck) {
-		t.Fatalf("fail-closed violation: expected candidate pod to retain scheduling gate when status patch fails, but gate was removed")
-	}
+			r := &PodGateReconciler{
+				Client: cl,
+				Scheme: scheme,
+			}
 
-	// 2. Second reconcile (retry): patch succeeds.
-	res, err := r.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("unexpected error on retry reconcile: %v", err)
-	}
-	if res.Requeue || res.RequeueAfter != 0 {
-		t.Errorf("expected empty reconcile.Result after successful retry, got %+v", res)
-	}
+			ctx := context.Background()
+			req := reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: namespace,
+					Name:      "pod-candidate",
+				},
+			}
 
-	// Verify GateReleased was persisted and candidate pod is now un-gated
-	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
-	if err := baseClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ); err != nil {
-		t.Fatalf("failed to fetch updated PMJ: %v", err)
-	}
-	if !updatedPMJ.Status.GateReleased {
-		t.Errorf("expected GateReleased == true after retry, got false")
-	}
+			// 1. First reconcile: status patch fails. Reconcile must fail closed: the candidate pod
+			// MUST still be gated so it cannot restore. A conflict, which a retry on a stale view
+			// can expect, is requeued without an error; another failure returns the error.
+			firstRes, err := r.Reconcile(ctx, req)
+			if apierrors.IsConflict(patchErr) {
+				if err != nil || firstRes.RequeueAfter <= 0 {
+					t.Fatalf("Reconcile() = %+v, %v after a conflict on the status patch; want a requeue without an error", firstRes, err)
+				}
+			} else if err == nil {
+				t.Fatalf("expected error on status patch failure, got nil")
+			}
 
-	if err := baseClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "pod-candidate"}, podCheck); err != nil {
-		t.Fatalf("failed to fetch candidate pod: %v", err)
-	}
-	if podHasMigrationGate(podCheck) {
-		t.Errorf("expected candidate pod to have scheduling gate removed after successful reconcile, but gate is still present")
+			podCheck := &corev1.Pod{}
+			if err := baseClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "pod-candidate"}, podCheck); err != nil {
+				t.Fatalf("failed to fetch candidate pod: %v", err)
+			}
+			if !podHasMigrationGate(podCheck) {
+				t.Fatalf("fail-closed violation: expected candidate pod to retain scheduling gate when status patch fails, but gate was removed")
+			}
+
+			// 2. Second reconcile (retry): patch succeeds.
+			res, err := r.Reconcile(ctx, req)
+			if err != nil {
+				t.Fatalf("unexpected error on retry reconcile: %v", err)
+			}
+			if res.Requeue || res.RequeueAfter != 0 {
+				t.Errorf("expected empty reconcile.Result after successful retry, got %+v", res)
+			}
+
+			// Verify GateReleased was persisted and candidate pod is now un-gated
+			updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+			if err := baseClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pmjName}, updatedPMJ); err != nil {
+				t.Fatalf("failed to fetch updated PMJ: %v", err)
+			}
+			if !updatedPMJ.Status.GateReleased {
+				t.Errorf("expected GateReleased == true after retry, got false")
+			}
+
+			if err := baseClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "pod-candidate"}, podCheck); err != nil {
+				t.Fatalf("failed to fetch candidate pod: %v", err)
+			}
+			if podHasMigrationGate(podCheck) {
+				t.Errorf("expected candidate pod to have scheduling gate removed after successful reconcile, but gate is still present")
+			}
+		})
 	}
 }
 
