@@ -499,7 +499,7 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 	trigger.SetNamespace(job.Namespace)
 
 	err := p.client.Delete(ctx, trigger)
-	if err != nil && !apierrors.IsNotFound(err) {
+	if err != nil && !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 		logger.Error(err, "Failed to delete trigger")
 		return err
 	}

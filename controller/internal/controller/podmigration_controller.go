@@ -524,7 +524,7 @@ func (r *PodMigrationReconciler) deleteOwnedResource(ctx context.Context, render
 			"kind", rendered.GetKind(), "name", rendered.GetName(), "expectedUID", ownerUID, "actualUID", owner)
 		return nil
 	}
-	if err := r.Delete(ctx, live); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.Delete(ctx, live); err != nil && !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 		return fmt.Errorf("failed to delete %s %s: %w", rendered.GetKind(), rendered.GetName(), err)
 	}
 	return nil
@@ -544,7 +544,7 @@ func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, nam
 	})
 	pssc.SetName(psscName)
 	if err := r.Get(ctx, types.NamespacedName{Name: psscName}, pssc); err != nil {
-		if !apierrors.IsNotFound(err) {
+		if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 			return fmt.Errorf("failed to get PodSnapshotStorageConfig %s: %w", psscName, err)
 		}
 	} else {
@@ -554,7 +554,7 @@ func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, nam
 			log.FromContext(ctx).Info("Skipping PSSC deletion: owner-uid does not match (recreated by another PodMigration)",
 				"pssc", psscName, "expectedUID", expectedOwnerUID, "actualUID", psscLabels[OwnerUIDLabelKey])
 		} else {
-			if err := r.Delete(ctx, pssc); err != nil && !apierrors.IsNotFound(err) {
+			if err := r.Delete(ctx, pssc); err != nil && !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 				return fmt.Errorf("failed to delete PodSnapshotStorageConfig %s: %w", psscName, err)
 			}
 		}
@@ -570,7 +570,7 @@ func (r *PodMigrationReconciler) deleteStorageResources(ctx context.Context, nam
 	})
 	pspManual.SetName(pspManualName)
 	pspManual.SetNamespace(namespace)
-	if err := r.Delete(ctx, pspManual); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.Delete(ctx, pspManual); err != nil && !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 		return fmt.Errorf("failed to delete PodSnapshotPolicy %s: %w", pspManualName, err)
 	}
 

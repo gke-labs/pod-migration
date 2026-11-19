@@ -71,6 +71,7 @@ func handlerBudget(ctx context.Context) time.Duration {
 	return defaultHandlerBudget
 }
 
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
@@ -268,6 +269,9 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		n := &corev1.Node{}
 		if err := a.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, n); err == nil {
 			sourceNode = n
+		} else if !apierrors.IsNotFound(err) {
+			logger.Error(err, "Failed to read the pod's source node", "node", pod.Spec.NodeName)
+			return denied429("transient error reading the pod's source node, retrying")
 		}
 	}
 	if verdict := eng.Eligible(pod, sourceNode); !verdict.OK {

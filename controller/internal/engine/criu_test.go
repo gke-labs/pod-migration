@@ -94,17 +94,25 @@ func TestCRIU_Eligible(t *testing.T) {
 
 	singlePod := &corev1.Pod{
 		Spec: corev1.PodSpec{
+			NodeName:       readyNode.Name,
 			InitContainers: []corev1.Container{{Name: "init-once"}},
 			Containers:     []corev1.Container{{Name: "app"}},
 		},
 	}
+	unscheduledPod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app"}},
+		},
+	}
 	multiPod := &corev1.Pod{
 		Spec: corev1.PodSpec{
+			NodeName:   readyNode.Name,
 			Containers: []corev1.Container{{Name: "app"}, {Name: "sidecar"}},
 		},
 	}
 	nativeSidecarPod := &corev1.Pod{
 		Spec: corev1.PodSpec{
+			NodeName:       readyNode.Name,
 			InitContainers: []corev1.Container{{Name: "istio-proxy", RestartPolicy: &always}},
 			Containers:     []corev1.Container{{Name: "app"}},
 		},
@@ -116,8 +124,11 @@ func TestCRIU_Eligible(t *testing.T) {
 	if v := e.Eligible(singlePod, readyNode); !v.OK {
 		t.Errorf("Eligible(singlePod, readyNode) = %+v, want OK", v)
 	}
-	if v := e.Eligible(singlePod, nil); !v.OK {
-		t.Errorf("Eligible(singlePod, nil) = %+v, want OK", v)
+	if v := e.Eligible(singlePod, nil); v.OK {
+		t.Errorf("Eligible(singlePod with NodeName, nil node) = %+v, want refused (fail-closed)", v)
+	}
+	if v := e.Eligible(unscheduledPod, nil); v.OK {
+		t.Errorf("Eligible(unscheduledPod, nil node) = %+v, want refused (fail-closed)", v)
 	}
 	if v := e.Eligible(singlePod, unreadyNode); v.OK {
 		t.Errorf("Eligible(singlePod, unreadyNode) = %+v, want refused", v)
@@ -272,12 +283,21 @@ func TestCRIU_RestoreOrdersAndVerifyRestore(t *testing.T) {
 		t.Fatalf("VerifyRestore(failed) = %+v, %v; want ColdStart", failed, err)
 	}
 
-	// Uninjected + Ready -> ColdStart.
+	// Uninjected + Ready -> ColdStart (even if psengine-restore=restored was spoofed!).
 	uninjected, err := e.VerifyRestore(context.Background(), job, &corev1.Pod{
 		Status: corev1.PodStatus{Conditions: readyCond},
 	})
 	if err != nil || uninjected.Outcome != ColdStart {
 		t.Fatalf("VerifyRestore(uninjected+ready) = %+v, %v; want ColdStart", uninjected, err)
+	}
+	spoofedRestoredWithoutInjected, err := e.VerifyRestore(context.Background(), job, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			CRIURestoreStatusAnnotation: CRIURestoreStatusRestored,
+		}},
+		Status: corev1.PodStatus{Conditions: readyCond},
+	})
+	if err != nil || spoofedRestoredWithoutInjected.Outcome != ColdStart || spoofedRestoredWithoutInjected.Confirmed {
+		t.Fatalf("VerifyRestore(psengine-restore=restored without psengine-injected=true) = %+v, %v; want unconfirmed ColdStart", spoofedRestoredWithoutInjected, err)
 	}
 }
 

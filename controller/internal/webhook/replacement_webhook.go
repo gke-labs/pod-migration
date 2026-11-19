@@ -42,18 +42,30 @@ const (
 	// mutate <group>/ps-name or pod-migration.gke.io/assigned-pmj on Pod UPDATEs.
 	DefaultControllerUsername = "system:serviceaccount:pod-migration-system:pod-migration-controller"
 
+	// DefaultCRIUNodeAgentUsername is the Kubernetes ServiceAccount identity of
+	// the CRIU node agent DaemonSet in engines/criu/deploy/deploy.yaml. Only this
+	// identity (or the controller) may mutate pod-migrate.io/psengine-restore on
+	// Pod UPDATEs.
+	DefaultCRIUNodeAgentUsername = "system:serviceaccount:pod-migration-criu-system:pod-migrate-agent"
+
+	defaultServiceAccountNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
 	gkeRestoreAnnotationKey = "podsnapshot.gke.io/ps-name"
+	migrationEnabledLabel   = "pod-migration.gke.io/enabled"
+	schedulingGateName      = "gke.io/pod-migration-gate"
 )
 
 // PodGateInjector injects the scheduling gate into replacement pods and
 // protects per-engine restore-order annotations (<group>/ps-name) against
 // untrusted spoofing on Pod CREATE and UPDATE (#135).
 type PodGateInjector struct {
-	Client             client.Client
-	APIReader          client.Reader
-	Engines            *engine.Registry
-	ControllerUsername string
-	decoder            admission.Decoder
+	Client                      client.Client
+	APIReader                   client.Reader
+	Engines                     *engine.Registry
+	ControllerUsername          string
+	CRIUNodeAgentUsername       string
+	serviceAccountNamespacePath string
+	decoder                     admission.Decoder
 }
 
 func (a *PodGateInjector) restoreAnnotations() []string {
@@ -84,19 +96,51 @@ func (a *PodGateInjector) isTrustedController(req admission.Request) bool {
 	if user == "" {
 		return false
 	}
-	expected := strings.TrimSpace(a.ControllerUsername)
-	if expected == "" {
-		expected = DefaultControllerUsername
-	}
-	if user == expected {
-		return true
+	if explicit := strings.TrimSpace(a.ControllerUsername); explicit != "" {
+		return user == explicit
 	}
 	if ns := strings.TrimSpace(os.Getenv("POD_NAMESPACE")); ns != "" {
-		if user == "system:serviceaccount:"+ns+":pod-migration-controller" {
+		return user == "system:serviceaccount:"+ns+":pod-migration-controller"
+	}
+	nsPath := a.serviceAccountNamespacePath
+	if nsPath == "" {
+		nsPath = defaultServiceAccountNamespacePath
+	}
+	if b, err := os.ReadFile(nsPath); err == nil {
+		if ns := strings.TrimSpace(string(b)); ns != "" {
+			return user == "system:serviceaccount:"+ns+":pod-migration-controller"
+		}
+	}
+	return user == DefaultControllerUsername
+}
+
+func (a *PodGateInjector) isTrustedCRIUNodeAgent(req admission.Request) bool {
+	user := strings.TrimSpace(req.UserInfo.Username)
+	if user == "" {
+		return false
+	}
+	expected := strings.TrimSpace(a.CRIUNodeAgentUsername)
+	if expected == "" {
+		expected = strings.TrimSpace(os.Getenv("CRIU_AGENT_SERVICE_ACCOUNT"))
+	}
+	if expected == "" {
+		expected = DefaultCRIUNodeAgentUsername
+	}
+	return user == expected
+}
+
+func hasLifecycleMigrationState(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, gate := range pod.Spec.SchedulingGates {
+		if gate.Name == schedulingGateName {
 			return true
 		}
 	}
-	return false
+	return pod.Annotations[util.AnnotationAssignedPMJ] != "" ||
+		pod.Annotations[engine.CRIUInjectedAnnotation] == "true" ||
+		pod.Annotations[util.AnnotationRestoreCompleted] != ""
 }
 
 // Handle inspects pod CREATE and UPDATE requests, injecting the scheduling gate
@@ -126,9 +170,6 @@ func (a *PodGateInjector) handleUpdate(ctx context.Context, req admission.Reques
 	if pod.Namespace == "" {
 		pod.Namespace = req.Namespace
 	}
-	if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
-		return admission.Allowed("pod not opted in")
-	}
 
 	oldPod := &corev1.Pod{}
 	if len(req.OldObject.Raw) > 0 {
@@ -138,16 +179,18 @@ func (a *PodGateInjector) handleUpdate(ctx context.Context, req admission.Reques
 		}
 	}
 
-	// If a pod is newly opting into pod-migration.gke.io/enabled=true via UPDATE,
-	// scrub any pre-existing untrusted restore annotations so an attacker cannot
-	// set <group>/ps-name while opted out and then label the pod enabled=true.
-	if oldPod.Labels["pod-migration.gke.io/enabled"] != "true" {
-		eng, hasEngine := a.podEngine(ctx, pod)
-		_, isGKEEngine := eng.(*engine.GKEPodSnapshots)
-		preserveGKEPSName := isGKEEngine &&
-			oldPod.Annotations[gkeRestoreAnnotationKey] != "" &&
-			pod.Annotations[gkeRestoreAnnotationKey] == oldPod.Annotations[gkeRestoreAnnotationKey]
+	oldOptedIn := oldPod.Labels[migrationEnabledLabel] == "true"
+	newOptedIn := pod.Labels[migrationEnabledLabel] == "true"
+	if !oldOptedIn && !newOptedIn {
+		return admission.Allowed("pod not opted in")
+	}
 
+	// If a pod is newly opting into pod-migration.gke.io/enabled=true via UPDATE,
+	// always scrub ALL pre-existing restore annotations across every engine (only
+	// Pod CREATE preserves Kubeflow/Sandbox GKE ps-name) so an attacker cannot
+	// plant <group>/ps-name while opted out and then label the pod enabled=true.
+	if !oldOptedIn {
+		eng, hasEngine := a.podEngine(ctx, pod)
 		if pod.Annotations == nil {
 			pod.Annotations = make(map[string]string)
 		}
@@ -157,17 +200,12 @@ func (a *PodGateInjector) handleUpdate(ctx context.Context, req admission.Reques
 		delete(pod.Annotations, engine.CRIUInjectedAnnotation)
 		delete(pod.Annotations, engine.CRIURestoreStatusAnnotation)
 		for _, ann := range a.restoreAnnotations() {
-			if ann == gkeRestoreAnnotationKey && preserveGKEPSName {
-				continue
-			}
 			delete(pod.Annotations, ann)
 		}
-		if !preserveGKEPSName {
-			pod.Annotations[gkeRestoreAnnotationKey] = ""
-			if hasEngine {
-				if orderer, ok := eng.(engine.RestoreOrderer); ok {
-					_ = orderer.OrderColdStartBypass(pod)
-				}
+		pod.Annotations[gkeRestoreAnnotationKey] = ""
+		if hasEngine {
+			if orderer, ok := eng.(engine.RestoreOrderer); ok {
+				_ = orderer.OrderColdStartBypass(pod)
 			}
 		}
 		marshaledPod, err := json.Marshal(pod)
@@ -178,11 +216,28 @@ func (a *PodGateInjector) handleUpdate(ctx context.Context, req admission.Reques
 		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 	}
 
-	// Existing opted-in pod updated by a non-controller identity: lock all
-	// registered engines' <group>/ps-name, assigned-pmj, and psengine-injected
-	// annotations to their stored OldObject values.
-	protectedKeys := append(a.restoreAnnotations(), util.AnnotationAssignedPMJ, engine.CRIUInjectedAnnotation)
+	// oldPod was opted in: enforce protected migration/restore annotations even if
+	// the caller also attempted to drop pod-migration.gke.io/enabled=true in the
+	// same PATCH, and lock enabled=true while migration/injection/restore state is
+	// present so the pod cannot shed objectSelector mid-lifecycle.
 	changed := false
+	if !newOptedIn && hasLifecycleMigrationState(oldPod) {
+		if pod.Labels == nil {
+			pod.Labels = make(map[string]string)
+		}
+		pod.Labels[migrationEnabledLabel] = "true"
+		changed = true
+	}
+
+	protectedKeys := append(
+		a.restoreAnnotations(),
+		util.AnnotationAssignedPMJ,
+		engine.CRIUInjectedAnnotation,
+		util.AnnotationRestoreCompleted,
+	)
+	if !a.isTrustedCRIUNodeAgent(req) {
+		protectedKeys = append(protectedKeys, engine.CRIURestoreStatusAnnotation)
+	}
 	for _, key := range protectedKeys {
 		oldVal, oldOK := oldPod.Annotations[key]
 		newVal, newOK := pod.Annotations[key]
@@ -202,7 +257,7 @@ func (a *PodGateInjector) handleUpdate(ctx context.Context, req admission.Reques
 		return admission.Allowed("restore annotations unchanged")
 	}
 
-	logger.Info("Reverted untrusted mutation to protected migration/restore annotations on Pod UPDATE")
+	logger.Info("Reverted untrusted mutation to protected migration/restore metadata on Pod UPDATE")
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
 		logger.Error(err, "Failed to marshal reverted pod update")

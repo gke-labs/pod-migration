@@ -27,12 +27,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
@@ -155,6 +158,122 @@ func TestPodMigrationReconciler_SideBySideSyncsAndDeletesBothAPIGroups(t *testin
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: engine.CRIUPodSnapshotPolicyName(pm.Name)}, criuPSP); !apierrors.IsNotFound(err) {
 		t.Errorf("expected CRIU PSP deleted, got %v", err)
+	}
+}
+
+func TestPodMigrationReconciler_AddonOffNoMatchOnGKEGroupFinalizesCRIUCleanly(t *testing.T) {
+	ctx := context.Background()
+	scheme := perEngineGroupTestScheme(t)
+	const ns = "default"
+
+	pm := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  ns,
+			Name:       "criu-only-mig",
+			UID:        types.UID("pm-criu-only-uid"),
+			Generation: 1,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://criu-only-bucket/checkpoints"},
+		},
+	}
+
+	noMatchIfGKEGroup := func(obj client.Object) error {
+		gvk := obj.GetObjectKind().GroupVersionKind()
+		if gvk.Group == engine.DefaultAPIGroup {
+			return &meta.NoKindMatchError{
+				GroupKind:        schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind},
+				SearchedVersions: []string{gvk.Version},
+			}
+		}
+		return nil
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pm).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if err := noMatchIfGKEGroup(obj); err != nil {
+					return err
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if err := noMatchIfGKEGroup(obj); err != nil {
+					return err
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	policy, err := eligibility.ParseRuntimeClassPolicy("@default,runc")
+	if err != nil {
+		t.Fatalf("ParseRuntimeClassPolicy: %v", err)
+	}
+	reg, err := engine.NewDefaultRegistry(cl, scheme, policy, engine.WithCRIUAPIGroup(engine.CRIUAPIGroup))
+	if err != nil {
+		t.Fatalf("NewDefaultRegistry: %v", err)
+	}
+	routes, err := engine.ParseRoutes("@default=criu,runc=criu")
+	if err != nil {
+		t.Fatalf("ParseRoutes: %v", err)
+	}
+	if err := reg.SetRoutes(routes); err != nil {
+		t.Fatalf("SetRoutes: %v", err)
+	}
+
+	recorder := record.NewFakeRecorder(16)
+	rec := &PodMigrationReconciler{
+		Client:          cl,
+		Scheme:          scheme,
+		Recorder:        recorder,
+		InvariantEngine: invariants.NewEngine(invariants.ModeStrict, recorder),
+		Engines:         reg,
+	}
+
+	// 1. Sync creates CRIU PSSC + PSP in criu.podmigration.gke.io without touching absent podsnapshot.gke.io CRDs.
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: pm.Name}}); err != nil {
+		t.Fatalf("Reconcile sync on addon-off cluster: %v", err)
+	}
+	criuPSSC := &unstructured.Unstructured{}
+	criuPSSC.SetGroupVersionKind(snapshot.StorageConfigGVK(engine.CRIUAPIGroup))
+	if err := cl.Get(ctx, types.NamespacedName{Name: engine.CRIUPodSnapshotStorageConfigName(ns, pm.Name)}, criuPSSC); err != nil {
+		t.Fatalf("expected CRIU PSSC in %s: %v", engine.CRIUAPIGroup, err)
+	}
+	criuPSP := &unstructured.Unstructured{}
+	criuPSP.SetGroupVersionKind(snapshot.PolicyGVK(engine.CRIUAPIGroup))
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: engine.CRIUPodSnapshotPolicyName(pm.Name)}, criuPSP); err != nil {
+		t.Fatalf("expected CRIU PSP in %s: %v", engine.CRIUAPIGroup, err)
+	}
+
+	// 2. Delete PodMigration: deleteStorageResources must ignore NoKindMatchError on podsnapshot.gke.io,
+	// proceed to deleteEngineResources for criu.podmigration.gke.io, and remove StorageCleanupFinalizer.
+	livePM := &pmv1alpha1.PodMigration{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: pm.Name}, livePM); err != nil {
+		t.Fatalf("Get PodMigration: %v", err)
+	}
+	if err := cl.Delete(ctx, livePM); err != nil {
+		t.Fatalf("Delete PodMigration: %v", err)
+	}
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: pm.Name}}); err != nil {
+		t.Fatalf("Reconcile finalization on addon-off cluster failed: %v", err)
+	}
+
+	if err := cl.Get(ctx, types.NamespacedName{Name: engine.CRIUPodSnapshotStorageConfigName(ns, pm.Name)}, criuPSSC); !apierrors.IsNotFound(err) {
+		t.Errorf("expected CRIU PSSC deleted on finalization, got %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: engine.CRIUPodSnapshotPolicyName(pm.Name)}, criuPSP); !apierrors.IsNotFound(err) {
+		t.Errorf("expected CRIU PSP deleted on finalization, got %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: pm.Name}, livePM); err == nil {
+		if controllerutil.ContainsFinalizer(livePM, StorageCleanupFinalizer) {
+			t.Fatalf("StorageCleanupFinalizer remained stuck on PodMigration: %v", livePM.Finalizers)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected error checking deleted PodMigration: %v", err)
 	}
 }
 

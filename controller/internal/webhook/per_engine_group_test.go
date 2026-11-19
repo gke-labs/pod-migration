@@ -18,7 +18,10 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
 	evanjsonpatch "github.com/evanphx/json-patch/v5"
@@ -32,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -223,6 +227,76 @@ func TestEvictionGate_SideBySideGVisorAndCRIUAPIGroups(t *testing.T) {
 	// 3. @default pod on non-criu-ready node is refused by Eligible(pod, sourceNode) and cold-evicted immediately.
 	if resp := evict(criuUnreadyPod.Name); !resp.Allowed {
 		t.Fatalf("CRIU unready-node eviction should be allowed immediately, got: %+v", resp.Result)
+	}
+
+	// 4. @default pod referencing a missing node (NotFound) fails closed in CRIU.Eligible without spawning a PMJ.
+	missingNodePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      "criu-app-missing-node",
+			UID:       "uid-criu-missing",
+			Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "vanished-node",
+			Containers: []corev1.Container{{Name: "app"}},
+		},
+	}
+	if err := cl.Create(context.Background(), missingNodePod); err != nil {
+		t.Fatalf("Create missingNodePod: %v", err)
+	}
+	if resp := evict(missingNodePod.Name); !resp.Allowed {
+		t.Fatalf("CRIU missing-node eviction should fail closed (allow cold eviction), got: %+v", resp.Result)
+	}
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: util.FormatPMJName(missingNodePod.Name, string(missingNodePod.UID))}, &pmv1alpha1.PodMigrationJob{}); err == nil {
+		t.Fatal("expected no PMJ to be created when CRIU source node is missing")
+	}
+
+	// 5. Transient non-NotFound error reading source Node answers 429 so the evictor retries instead of passing nil.
+	transientNodeErrClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(readyNode, criuMissingOrTransientPod(), criuPSP).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, isNode := obj.(*corev1.Node); isNode {
+					return errors.New("simulated transient node cache read failure")
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	errPolicy, errReg := buildSideBySideRegistry(t, transientNodeErrClient, scheme)
+	errGate := &EvictionGate{
+		Client:      transientNodeErrClient,
+		Eligibility: errPolicy,
+		Engines:     errReg,
+		decoder:     admission.NewDecoder(scheme),
+	}
+	errResp := errGate.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   ns,
+			Name:        "criu-transient-node-err",
+			SubResource: "eviction",
+			Operation:   admissionv1.Create,
+		},
+	})
+	if errResp.Allowed || errResp.Result == nil || errResp.Result.Code != http.StatusTooManyRequests {
+		t.Fatalf("transient Node read error = allowed:%t result:%+v, want 429 retry", errResp.Allowed, errResp.Result)
+	}
+}
+
+func criuMissingOrTransientPod() *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "criu-transient-node-err",
+			UID:       "uid-transient-node",
+			Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-criu-ready",
+			Containers: []corev1.Container{{Name: "app"}},
+		},
 	}
 }
 
@@ -444,26 +518,82 @@ func TestPodGateInjector_ProtectsRestoreAnnotationsAcrossAllEnginesOnCreateAndUp
 		}
 	})
 
-	t.Run("UPDATE newly opting into pod-migration.gke.io/enabled=true scrubs pre-existing spoofed ps-name", func(t *testing.T) {
-		oldOptedOut := &corev1.Pod{
+	t.Run("UPDATE newly opting into pod-migration.gke.io/enabled=true scrubs pre-existing spoofed ps-name on both CRIU and gVisor", func(t *testing.T) {
+		for _, tc := range []struct {
+			name         string
+			runtimeClass *string
+		}{
+			{name: "criu", runtimeClass: nil},
+			{name: "gvisor", runtimeClass: &gvisorClass},
+		} {
+			oldOptedOut := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: ns,
+					Name:      "late-opt-in-" + tc.name,
+					Annotations: map[string]string{
+						criuAnn: "preplanted-criu-snapshot",
+						gkeAnn:  "preplanted-gke-snapshot",
+					},
+				},
+				Spec: corev1.PodSpec{RuntimeClassName: tc.runtimeClass},
+			}
+			newOptedIn := oldOptedOut.DeepCopy()
+			newOptedIn.Labels = map[string]string{"pod-migration.gke.io/enabled": "true"}
+
+			oldRaw, _ := json.Marshal(oldOptedOut)
+			newRaw, _ := json.Marshal(newOptedIn)
+			resp := injector.Handle(context.Background(), admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update,
+					Namespace: ns,
+					Name:      oldOptedOut.Name,
+					UserInfo:  authenticationv1.UserInfo{Username: "system:serviceaccount:default:attacker"},
+					OldObject: runtime.RawExtension{Raw: oldRaw},
+					Object:    runtime.RawExtension{Raw: newRaw},
+				},
+			})
+			if !resp.Allowed {
+				t.Fatalf("%s: unexpected deny: %+v", tc.name, resp.Result)
+			}
+			got := applyAdmissionPatches(t, newRaw, resp)
+			if v, ok := got.Annotations[gkeAnn]; !ok || v != "" {
+				t.Errorf("%s: late opt-in %s = %q (ok=%t), want empty cold-start bypass", tc.name, gkeAnn, v, ok)
+			}
+			if tc.runtimeClass == nil {
+				if v, ok := got.Annotations[criuAnn]; !ok || v != "" {
+					t.Errorf("%s: late opt-in %s = %q (ok=%t), want empty cold-start bypass", tc.name, criuAnn, v, ok)
+				}
+			} else if _, exists := got.Annotations[criuAnn]; exists {
+				t.Errorf("%s: expected %s deleted on late opt-in gVisor pod, got %q", tc.name, criuAnn, got.Annotations[criuAnn])
+			}
+		}
+	})
+
+	t.Run("UPDATE opt-out PATCH cannot smuggle ps-name or shed enabled=true mid-lifecycle", func(t *testing.T) {
+		// Lifecycle-active pod: trying to drop enabled=true AND rewrite ps-name locks BOTH back.
+		oldLifecyclePod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: ns,
-				Name:      "late-opt-in-pod",
+				Name:      "lifecycle-pod",
+				Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
 				Annotations: map[string]string{
-					criuAnn: "preplanted-snapshot",
+					criuAnn:                       "",
+					util.AnnotationAssignedPMJ:    activeCRIUJob.Name,
+					engine.CRIUInjectedAnnotation: "true",
 				},
 			},
 		}
-		newOptedIn := oldOptedOut.DeepCopy()
-		newOptedIn.Labels = map[string]string{"pod-migration.gke.io/enabled": "true"}
+		optOutTamper := oldLifecyclePod.DeepCopy()
+		delete(optOutTamper.Labels, "pod-migration.gke.io/enabled")
+		optOutTamper.Annotations[criuAnn] = "smuggled-via-opt-out"
 
-		oldRaw, _ := json.Marshal(oldOptedOut)
-		newRaw, _ := json.Marshal(newOptedIn)
+		oldRaw, _ := json.Marshal(oldLifecyclePod)
+		newRaw, _ := json.Marshal(optOutTamper)
 		resp := injector.Handle(context.Background(), admission.Request{
 			AdmissionRequest: admissionv1.AdmissionRequest{
 				Operation: admissionv1.Update,
 				Namespace: ns,
-				Name:      oldOptedOut.Name,
+				Name:      oldLifecyclePod.Name,
 				UserInfo:  authenticationv1.UserInfo{Username: "system:serviceaccount:default:attacker"},
 				OldObject: runtime.RawExtension{Raw: oldRaw},
 				Object:    runtime.RawExtension{Raw: newRaw},
@@ -473,8 +603,134 @@ func TestPodGateInjector_ProtectsRestoreAnnotationsAcrossAllEnginesOnCreateAndUp
 			t.Fatalf("unexpected deny: %+v", resp.Result)
 		}
 		got := applyAdmissionPatches(t, newRaw, resp)
+		if got.Labels["pod-migration.gke.io/enabled"] != "true" {
+			t.Errorf("expected enabled=true locked on lifecycle pod, got labels=%v", got.Labels)
+		}
 		if v, ok := got.Annotations[criuAnn]; !ok || v != "" {
-			t.Errorf("late opt-in %s = %q (ok=%t), want empty cold-start bypass", criuAnn, v, ok)
+			t.Errorf("opt-out PATCH smuggled %s = %q (ok=%t), want reverted to \"\"", criuAnn, v, ok)
+		}
+
+		// Plain scale-up pod (no active migration state): may opt out cleanly,
+		// but still cannot smuggle a ps-name edit or strip "" bypass in that PATCH.
+		oldPlainPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   ns,
+				Name:        "plain-scaleup-pod",
+				Labels:      map[string]string{"pod-migration.gke.io/enabled": "true"},
+				Annotations: map[string]string{gkeAnn: "", criuAnn: ""},
+			},
+		}
+		plainOptOut := oldPlainPod.DeepCopy()
+		delete(plainOptOut.Labels, "pod-migration.gke.io/enabled")
+		delete(plainOptOut.Annotations, gkeAnn)
+		plainOptOut.Annotations[criuAnn] = "smuggled-snap"
+
+		oldPlainRaw, _ := json.Marshal(oldPlainPod)
+		newPlainRaw, _ := json.Marshal(plainOptOut)
+		plainResp := injector.Handle(context.Background(), admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				Operation: admissionv1.Update,
+				Namespace: ns,
+				Name:      oldPlainPod.Name,
+				UserInfo:  authenticationv1.UserInfo{Username: "system:serviceaccount:default:attacker"},
+				OldObject: runtime.RawExtension{Raw: oldPlainRaw},
+				Object:    runtime.RawExtension{Raw: newPlainRaw},
+			},
+		})
+		gotPlain := applyAdmissionPatches(t, newPlainRaw, plainResp)
+		if v, ok := gotPlain.Annotations[gkeAnn]; !ok || v != "" {
+			t.Errorf("plain opt-out PATCH stripped %s bypass: got %q (ok=%t)", gkeAnn, v, ok)
+		}
+		if v, ok := gotPlain.Annotations[criuAnn]; !ok || v != "" {
+			t.Errorf("plain opt-out PATCH smuggled %s: got %q (ok=%t)", criuAnn, v, ok)
+		}
+	})
+
+	t.Run("UPDATE protects psengine-restore against untrusted users while allowing CRIU node agent only on psengine-restore", func(t *testing.T) {
+		oldPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "restoring-criu-pod",
+				Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+				Annotations: map[string]string{
+					criuAnn:                       "ps-legit-1",
+					util.AnnotationAssignedPMJ:    activeCRIUJob.Name,
+					engine.CRIUInjectedAnnotation: "true",
+				},
+			},
+		}
+		spoofedOutcome := oldPod.DeepCopy()
+		spoofedOutcome.Annotations[engine.CRIURestoreStatusAnnotation] = engine.CRIURestoreStatusRestored
+
+		oldRaw, _ := json.Marshal(oldPod)
+		spoofRaw, _ := json.Marshal(spoofedOutcome)
+
+		// Untrusted user cannot stamp psengine-restore=restored.
+		untrustedResp := injector.Handle(context.Background(), admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				Operation: admissionv1.Update,
+				Namespace: ns,
+				Name:      oldPod.Name,
+				UserInfo:  authenticationv1.UserInfo{Username: "system:serviceaccount:default:attacker"},
+				OldObject: runtime.RawExtension{Raw: oldRaw},
+				Object:    runtime.RawExtension{Raw: spoofRaw},
+			},
+		})
+		gotUntrusted := applyAdmissionPatches(t, spoofRaw, untrustedResp)
+		if _, exists := gotUntrusted.Annotations[engine.CRIURestoreStatusAnnotation]; exists {
+			t.Errorf("untrusted UPDATE should not be able to stamp %s, got %q",
+				engine.CRIURestoreStatusAnnotation, gotUntrusted.Annotations[engine.CRIURestoreStatusAnnotation])
+		}
+
+		// CRIU node agent SA CAN stamp psengine-restore=restored, but still CANNOT rewrite <group>/ps-name.
+		agentTamper := spoofedOutcome.DeepCopy()
+		agentTamper.Annotations[criuAnn] = "other-snap"
+		agentRaw, _ := json.Marshal(agentTamper)
+		agentResp := injector.Handle(context.Background(), admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				Operation: admissionv1.Update,
+				Namespace: ns,
+				Name:      oldPod.Name,
+				UserInfo:  authenticationv1.UserInfo{Username: DefaultCRIUNodeAgentUsername},
+				OldObject: runtime.RawExtension{Raw: oldRaw},
+				Object:    runtime.RawExtension{Raw: agentRaw},
+			},
+		})
+		gotAgent := applyAdmissionPatches(t, agentRaw, agentResp)
+		if gotAgent.Annotations[engine.CRIURestoreStatusAnnotation] != engine.CRIURestoreStatusRestored {
+			t.Errorf("CRIU node agent %s = %q, want %q",
+				engine.CRIURestoreStatusAnnotation, gotAgent.Annotations[engine.CRIURestoreStatusAnnotation], engine.CRIURestoreStatusRestored)
+		}
+		if gotAgent.Annotations[criuAnn] != "ps-legit-1" {
+			t.Errorf("CRIU node agent must not rewrite %s: got %q, want ps-legit-1", criuAnn, gotAgent.Annotations[criuAnn])
+		}
+	})
+
+	t.Run("isTrustedController falls back to serviceaccount namespace file when POD_NAMESPACE unset", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "")
+		nsFile := filepath.Join(t.TempDir(), "namespace")
+		if err := os.WriteFile(nsFile, []byte("custom-controller-ns\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		customInjector := &PodGateInjector{
+			Client:                      cl,
+			Engines:                     reg,
+			serviceAccountNamespacePath: nsFile,
+			decoder:                     admission.NewDecoder(scheme),
+		}
+		if !customInjector.isTrustedController(admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				UserInfo: authenticationv1.UserInfo{Username: "system:serviceaccount:custom-controller-ns:pod-migration-controller"},
+			},
+		}) {
+			t.Error("expected controller SA from mounted namespace file to be trusted")
+		}
+		if customInjector.isTrustedController(admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				UserInfo: authenticationv1.UserInfo{Username: DefaultControllerUsername},
+			},
+		}) {
+			t.Error("expected default namespace SA not to match when mounted namespace file specifies custom-controller-ns")
 		}
 	})
 }

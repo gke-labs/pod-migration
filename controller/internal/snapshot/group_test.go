@@ -22,12 +22,16 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
@@ -228,5 +232,35 @@ func TestGKEProviderForGroup_UsesConfiguredGroupAndAnnotation(t *testing.T) {
 	}
 	if !cpState.Settled || !cpState.Completed {
 		t.Errorf("CheckpointState = %+v, want {Settled:true Completed:true}", cpState)
+	}
+}
+
+func TestGKEProviderCleanup_IgnoresNoKindMatchError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				return &meta.NoKindMatchError{
+					GroupKind:        schema.GroupKind{Group: CRIUAPIGroup, Kind: KindManualTrigger},
+					SearchedVersions: []string{APIVersion},
+				}
+			},
+		}).
+		Build()
+
+	provider, err := NewGKEProviderForGroup(cl, scheme, CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewGKEProviderForGroup: %v", err)
+	}
+	job := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pmj-1"},
+		Spec:       pmv1alpha1.PodMigrationJobSpec{PodRef: corev1.LocalObjectReference{Name: "app"}, TargetPodUID: "uid12345"},
+	}
+	if err := provider.Cleanup(context.Background(), job, "app"); err != nil {
+		t.Fatalf("Cleanup should treat NoKindMatchError as already deleted, got: %v", err)
 	}
 }

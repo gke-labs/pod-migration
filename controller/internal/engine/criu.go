@@ -122,8 +122,10 @@ func (*CRIU) RuntimeClasses() []string {
 }
 
 // Eligible implements Engine with pure local checks (no API calls): single
-// application container, no native sidecar initContainers, and, when the
-// cached source node is supplied, pod-migrate.io/criu-ready=true.
+// application container, no native sidecar initContainers, and a cached source
+// node verified CRIU-ready (pod-migrate.io/criu-ready=true). If node is nil
+// (unscheduled pod or source node missing from cache), Eligible fails closed so
+// no PodMigrationJob is spawned for an unverified node.
 func (*CRIU) Eligible(pod *corev1.Pod, node *corev1.Node) Verdict {
 	if pod == nil {
 		return Verdict{Reason: "no pod to migrate"}
@@ -137,7 +139,13 @@ func (*CRIU) Eligible(pod *corev1.Pod, node *corev1.Node) Verdict {
 			return Verdict{Reason: "CRIU engine does not support sidecar initContainers (restartPolicy=Always)"}
 		}
 	}
-	if node != nil && node.Annotations[CRIUNodeReadyAnnotation] != "true" {
+	if node == nil {
+		if pod.Spec.NodeName != "" {
+			return Verdict{Reason: fmt.Sprintf("source node %s not found; cannot verify %s=true", pod.Spec.NodeName, CRIUNodeReadyAnnotation)}
+		}
+		return Verdict{Reason: fmt.Sprintf("pod is not scheduled on a CRIU-ready node (missing %s=true)", CRIUNodeReadyAnnotation)}
+	}
+	if node.Annotations[CRIUNodeReadyAnnotation] != "true" {
 		return Verdict{Reason: fmt.Sprintf("source node %s is not CRIU-ready (missing %s=true)", node.Name, CRIUNodeReadyAnnotation)}
 	}
 	return Verdict{OK: true}
@@ -292,29 +300,21 @@ func (e *CRIU) InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string, coldSta
 // VerifyRestore implements RestoreVerifier using the CRIU node agent's positive
 // outcome annotation (pod-migrate.io/psengine-restore):
 //   - "failed": ColdStart verdict immediately;
-//   - "restored" + pod Ready: confirmed Restored verdict (RestoreVerified);
 //   - missing pod-migrate.io/psengine-injected=true + pod Ready: ColdStart
-//     verdict (replacement was not wired by the CRIU restore webhook);
+//     verdict (replacement was not wired by the CRIU restore webhook, even if
+//     psengine-restore=restored is present);
+//   - pod-migrate.io/psengine-injected=true + "restored" + pod Ready: confirmed
+//     Restored verdict (RestoreVerified);
 //   - otherwise: RestoreInProgress.
 func (*CRIU) VerifyRestore(_ context.Context, _ *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (RestoreVerdict, error) {
 	if pod == nil {
 		return RestoreVerdict{}, errors.New("verifying the restore of a nil pod")
 	}
-	switch strings.TrimSpace(pod.Annotations[CRIURestoreStatusAnnotation]) {
-	case CRIURestoreStatusFailed:
+	if strings.TrimSpace(pod.Annotations[CRIURestoreStatusAnnotation]) == CRIURestoreStatusFailed {
 		return RestoreVerdict{
 			Outcome:  ColdStart,
 			Reason:   criuColdStartReason,
 			Evidence: fmt.Sprintf("annotation %s=%s", CRIURestoreStatusAnnotation, CRIURestoreStatusFailed),
-		}, nil
-	case CRIURestoreStatusRestored:
-		if !podReady(pod) {
-			return RestoreVerdict{Outcome: RestoreInProgress}, nil
-		}
-		return RestoreVerdict{
-			Outcome:   Restored,
-			Confirmed: true,
-			Evidence:  fmt.Sprintf("annotation %s=%s", CRIURestoreStatusAnnotation, CRIURestoreStatusRestored),
 		}, nil
 	}
 	if pod.Annotations[CRIUInjectedAnnotation] != "true" {
@@ -325,6 +325,16 @@ func (*CRIU) VerifyRestore(_ context.Context, _ *pmv1alpha1.PodMigrationJob, pod
 			Outcome:  ColdStart,
 			Reason:   criuUninjectedColdStartReason,
 			Evidence: fmt.Sprintf("missing annotation %s=true", CRIUInjectedAnnotation),
+		}, nil
+	}
+	if strings.TrimSpace(pod.Annotations[CRIURestoreStatusAnnotation]) == CRIURestoreStatusRestored {
+		if !podReady(pod) {
+			return RestoreVerdict{Outcome: RestoreInProgress}, nil
+		}
+		return RestoreVerdict{
+			Outcome:   Restored,
+			Confirmed: true,
+			Evidence:  fmt.Sprintf("annotation %s=%s", CRIURestoreStatusAnnotation, CRIURestoreStatusRestored),
 		}, nil
 	}
 	return RestoreVerdict{Outcome: RestoreInProgress}, nil
