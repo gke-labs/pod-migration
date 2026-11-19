@@ -16,8 +16,63 @@
 package node
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+func TestInstallCRIUBundle_SkipsSubdirectories(t *testing.T) {
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	confDir := t.TempDir()
+	binDir := t.TempDir()
+
+	// Populate required bundle files.
+	if err := os.WriteFile(filepath.Join(srcDir, "criu"), []byte("#!/bin/sh\necho criu\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "VERSION"), []byte("3.19\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "libdummy.so"), []byte("dummy-so-content"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a subdirectory inside srcDir (e.g. /bundle/licenses/) containing files.
+	licensesDir := filepath.Join(srcDir, "licenses")
+	if err := os.MkdirAll(licensesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(licensesDir, "criu.copyright"), []byte("GPL-2.0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// installCRIUBundleDirs must skip licenses/ without erroring on copyFile.
+	ver, err := installCRIUBundleDirs(srcDir, dstDir, confDir, binDir)
+	if err != nil {
+		t.Fatalf("installCRIUBundleDirs failed: %v", err)
+	}
+	if ver != "3.19" {
+		t.Errorf("expected version 3.19, got %q", ver)
+	}
+
+	// Verify dstDir contains files and not the skipped directory.
+	if _, err := os.Stat(filepath.Join(dstDir, "criu")); err != nil {
+		t.Errorf("dstDir missing criu wrapper: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "libdummy.so")); err != nil {
+		t.Errorf("dstDir missing libdummy.so: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(confDir, "runc.conf")); err != nil {
+		t.Errorf("confDir missing runc.conf: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(binDir, "criu")); err != nil {
+		t.Errorf("binDir missing wrapper: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "licenses")); !os.IsNotExist(err) {
+		t.Errorf("expected licenses directory to be skipped, but found in dstDir")
+	}
+}
 
 func TestCheckContainerdVersion(t *testing.T) {
 	tests := []struct {

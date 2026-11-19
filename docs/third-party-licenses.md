@@ -69,22 +69,30 @@ The project publishes four container images across its controllers and the CRIU 
 - **Distribution Packages (Ubuntu 24.04 Archive)**:
   - `util-linux` (`nsenter`): `GPL-2.0-or-later`, `LGPL-2.1-or-later`, `BSD-3-Clause`, `Public Domain`
   - `ca-certificates`: `MPL-2.0`, `GPL-2.0-or-later`
-  - `iptables`: `GPL-2.0-only`
+  - `coreutils`, `bash`: `GPL-3.0-or-later`
   - `libc6` (glibc runtime): `LGPL-2.1-or-later`
 - **Bundled Pre-compiled Binaries & Libraries (`/opt/criu-bundle/` from Debian trixie)**:
   - `criu.bin` (version 4.1.x): `GPL-2.0-only` (with Linux syscall exception)
   - `ld-linux-x86-64.so.2` (dynamic linker): `LGPL-2.1-or-later`
   - `libc.so.6`: `LGPL-2.1-or-later`
   - `libnet.so.1`: `BSD-2-Clause` / `GPL-2.0-or-later`
-  - `libnl-3.so.200`: `LGPL-2.1-only`
+  - `libnl-3.so.200`, `libnl-route-3.so.200`: `LGPL-2.1-only`
   - `libprotobuf-c.so.1`: `BSD-2-Clause`
   - `libbsd.so.0`: `BSD-3-Clause`, `BSD-4-Clause`, `MIT`
   - `libcap.so.2`: `BSD-3-Clause`, `GPL-2.0-only`
   - `libgnutls.so.30`: `LGPL-2.1-or-later`
   - `libnftables.so.1`, `libnftnl.so.11`: `GPL-2.0-only`
+  - `libgmp.so.10`: `LGPL-3.0-or-later` / `GPL-2.0-or-later`
+  - `libnettle.so.8`, `libhogweed.so.6`: `LGPL-3.0-or-later` / `GPL-2.0-or-later`
+  - `libtasn1.so.6`: `LGPL-2.1-or-later`
+  - `libunistring.so.5`: `LGPL-3.0-or-later` / `GPL-2.0-or-later`
+  - `libidn2.so.0`: `LGPL-2.1-or-later` / `GPL-2.0-or-later`
+  - `libmnl.so.0`: `LGPL-2.1-or-later`
 - **In-Image License Disclosures**:
   - Distribution packages: `/usr/share/doc/*/copyright`
   - Bundled CRIU and shared libraries: `/opt/criu-bundle/licenses/*.copyright`
+  - Build-time package version manifest: `/opt/criu-bundle/licenses/package-versions.txt`
+  - Runtime base package version manifest: `/licenses/runtime-package-versions.txt`
 
 ---
 
@@ -94,7 +102,7 @@ The CRIU snapshot engine adheres strictly to open-source licensing boundaries:
 
 1. **Subprocess Isolation**: The Go node agent (`cmd/agent`) does not link against CRIU headers, source code, or libraries. CRIU is bundled as an unmodified standalone executable (`/opt/criu-bundle/criu.bin`).
 2. **Standard Interfaces**: The node agent invokes CRIU solely as an external out-of-process subprocess (`exec.Command`) through `runc restore` or via `nsenter` in host namespaces.
-3. **Distribution Compliance**: Because the agent image redistributes pre-compiled GPL-2.0 (`criu`, `iptables`, `nftables`) and LGPL-2.1 (`glibc`, `libnl-3`, `gnutls`) binaries, matching machine-readable source code is made available for each published release per GPL-2.0 Section 3.
+3. **Distribution Compliance**: Because the agent image redistributes pre-compiled GPL-2.0 (`criu`, `nftables`) and LGPL-2.1 (`glibc`, `libnl-3`, `gnutls`) binaries, matching machine-readable source code is made available for each published release per GPL-2.0 Section 3.
 
 ---
 
@@ -113,22 +121,20 @@ In compliance with the GNU General Public License Version 2.0 (GPL-2.0) and GNU 
   - Project Home: [https://netfilter.org/projects/nftables/](https://netfilter.org/projects/nftables/)
 - **GNU C Library (glibc)**:
   - Project Home: [https://www.gnu.org/software/libc/](https://www.gnu.org/software/libc/)
+- **util-linux**:
+  - Project Home: [https://github.com/util-linux/util-linux](https://github.com/util-linux/util-linux)
 
 ### 4.2 Distribution Package Source Repositories
 
-The bundled binaries are built directly from Debian trixie distribution packages. Matching Debian source packages (including patches, `.dsc`, and `.orig.tar.xz` files) are permanently available from the Debian archive:
+The bundled binaries are built from Debian trixie distribution packages, while runtime utilities derive from Ubuntu 24.04:
 
-- `http://deb.debian.org/debian/pool/main/c/criu/`
-- `http://deb.debian.org/debian/pool/main/g/glibc/`
-- `http://deb.debian.org/debian/pool/main/libn/libnet/`
-- `http://deb.debian.org/debian/pool/main/libn/libnl3/`
-- `http://deb.debian.org/debian/pool/main/n/nftables/`
-- `http://deb.debian.org/debian/pool/main/libn/libnftnl/`
-- `http://deb.debian.org/debian/pool/main/g/gnutls28/`
-- `http://deb.debian.org/debian/pool/main/libc/libcap2/`
-- `http://deb.debian.org/debian/pool/main/libb/libbsd/`
+- **Debian Trixie Archive**: `http://deb.debian.org/debian/pool/`
+- **Ubuntu 24.04 Archive**: `http://archive.ubuntu.com/ubuntu/pool/`
 
-To fetch the exact matching source package using standard Debian utilities:
+_Note on package archival_: Live distribution pools periodically drop superseded package versions when minor updates are published. For superseded Debian package versions, exact matching source archives (`.dsc`, `.orig.tar.xz`, and `.debian.tar.xz`) are permanently archived and downloadable from the Debian Snapshot service:
+`https://snapshot.debian.org/`
+
+To fetch the matching Debian source package using standard distribution tools:
 
 ```bash
 apt-get source -d criu
@@ -138,4 +144,14 @@ apt-get source -d criu
 
 For each tagged project release publishing container images (e.g. `v0.1.0-alpha`), a complete standalone source code archive (`criu-gpl-source-<version>.tar.gz`) containing the exact upstream source code and distribution patches corresponding to the bundled CRIU binary and libraries is packaged and attached directly to the GitHub Release.
 
-A script (`tools/release/package_gpl_sources.sh`) is provided in this repository to automate the generation and cryptographic checksum verification of this archive.
+A script (`tools/release/package_gpl_sources.sh`) is provided in this repository to automate the generation and cryptographic checksum verification of this archive, supporting build-time package version manifests (`package-versions.txt`).
+
+### 4.4 Written Offer for Source Code
+
+In accordance with Section 3(b) of the GNU General Public License Version 2.0 and Section 4 of the GNU Lesser General Public License Version 2.1, the pod-migration project hereby makes a formal written offer:
+
+> **Written Offer**: Any recipient of binary container images distributed by the pod-migration project may request a machine-readable copy of the corresponding source code for all GPL/LGPL software included in those images, for a period of at least three years from distribution.
+>
+> To request source code under this offer, please open an issue at:
+> https://github.com/gke-labs/pod-migration/issues
+> or contact the project maintainers.

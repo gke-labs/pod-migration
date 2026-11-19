@@ -84,8 +84,8 @@ cd ../..
 Verify that the agent image carries the bundled CRIU license notices:
 
 ```bash
-docker run --rm "${AGENT_IMG}" ls -la /opt/criu-bundle/licenses/
-docker run --rm "${AGENT_IMG}" head -n 15 /opt/criu-bundle/licenses/criu.copyright
+docker run --rm --entrypoint ls "${AGENT_IMG}" -la /opt/criu-bundle/licenses/
+docker run --rm --entrypoint head "${AGENT_IMG}" -n 15 /opt/criu-bundle/licenses/criu.copyright
 ```
 
 ### 4.4 Push Images to Registry
