@@ -183,11 +183,45 @@ they start cold instead of being restored; also delete the
   webhook would also rewrite the gVisor pods the addon restores.
 - **Linux kernel & runtime:** Nodes running `containerd` 2.x + `runc` with
   kubelet `ContainerCheckpoint` enabled and a kernel passing `criu check`.
+- **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
+  `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
+  bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable
+  range (`>= 2.1.0, < 2.2.7` or `>= 2.3.0, < 2.3.4`) are demoted with
+  `pod-migrate.io/criu-ready: false` to protect against GHSA-p7v4-vr35-mj6f
+  (CVE-2026-95837, unauthenticated restore-on-create privilege escalation).
 - **Workload scope (v1):**
   - Single-container `runc` pods (`len(pod.Spec.Containers) == 1`).
   - Explicit `command` in the pod spec (required so the `holder` wrapper can
     fall through to a cold start if restore fails).
+  - Non-host-network pods (`hostNetwork: false`). Pods declaring `hostNetwork: true`
+    are refused at all CRIU boundaries.
   - Homogeneous CPU family between source and target nodes.
+
+## What Installing the Engine Changes on a Node
+
+When `pod-migrate-agent` starts on a node, it applies the following modifications:
+
+| Modification            | Host Location                       | Description                                                                                                                                                      |
+| ----------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **CRIU Bundle**         | `/var/lib/pod-migrate/criu-bundle/` | Directory containing self-contained `criu.bin`, bundled shared libraries, dynamic linker, and `VERSION` file.                                                    |
+| **CRIU System Wrapper** | `/usr/local/sbin/criu`              | Executable wrapper script that launches CRIU via the bundled dynamic linker.                                                                                     |
+| **Runc Configuration**  | `/etc/criu/runc.conf`               | CRIU global configuration specifying `tcp-close`, `skip-in-flight`, `file-validation buildid`, and `file-locks`.                                                 |
+| **Node Annotations**    | Kubernetes `Node` metadata          | Annotated with `pod-migrate.io/criu-ready` (`true` or `false`) and `pod-migrate.io/criu-version`. Stale reason/remediation annotations are cleared on promotion. |
+| **Socket Watching**     | `/run/containerd/containerd.sock`   | Monitored for inode changes to detect containerd daemon restarts and re-probe readiness.                                                                         |
+
+## Storage Security & Bucket IAM Guidance
+
+Because CRIU checkpoint archives contain complete, unencrypted process address spaces (including in-memory tokens, TLS keys, and credentials), storage backends must be secured with the same rigor as Kubernetes Secrets:
+
+1. **Dedicated Service Account:** Bind the node agent and controller pods to a dedicated Google Service Account (GSA) via Workload Identity. Do **not** use the default Compute Engine service account.
+2. **Least Privilege Bucket IAM:**
+   - Source node agents: `roles/storage.objectCreator`, `roles/storage.objectViewer`
+   - Target node agents: `roles/storage.objectViewer`
+   - Untrusted workloads: No read or write permissions to the checkpoint bucket.
+3. **CMEK Encryption:** Configure Cloud KMS Customer-Managed Encryption Keys (CMEK) on the checkpoint bucket.
+4. **Lifecycle Retention:** Apply GCS Object Lifecycle Management rules to automatically delete checkpoint archives after **1 to 7 days**, preventing cold archives from lingering.
+
+For full threat analysis, blast radius documentation, and restore path verification details, see [Threat Model and Security Guidance for the CRIU Engine](../../docs/threat-model-criu.md) and [SECURITY.md](../../SECURITY.md).
 
 ## Building & Testing
 
