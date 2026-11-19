@@ -66,9 +66,11 @@ Notes:
 - Deleting an active job settles its source fence before removing the `pod-migration.gke.io/source-fence` finalizer (unfencing if the checkpoint never ran, or keeping the fence and evicting if it did). If eviction remains blocked past the unwedge timeout (default 2 minutes), the finalizer is removed to avoid wedging deletion, leaving the source fenced (Warning event `SourceFenceDeleteTimedOut`): release the source by deleting the Pod (so its controller replaces it), or remove the `pod-migration.gke.io/fenced` label if you know its checkpoint never ran. If the controller is down or rolling back to a version without the finalizer handler, unwedge a deleting job with: `kubectl patch podmigrationjob <name> --type=merge -p '{"metadata":{"finalizers":null}}'`.
 - The fence needs RBAC on `pods/status` (`get`, `patch`), which `deploy.yaml` grants.
 
-### 4. Design Docs
+### 4. Design Docs & Security
 - [Snapshot engine contract](docs/design/engine-contract.md): what the controller requires from a snapshot engine (GKE Pod Snapshots today; CRIU and upstream pod checkpoint/restore next).
 - [Safety invariants](docs/invariants.md): the invariants the controller can check after each reconcile (off by default; see `--invariant-mode`).
+- [Threat model & security guidance (CRIU engine)](docs/threat-model-criu.md): threat model, node agent privileges, restore path authorization, containerd posture, and GCS storage guidance.
+- [Security policy](SECURITY.md): vulnerability reporting and disclosure guidelines.
 
 ---
 

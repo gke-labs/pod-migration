@@ -33,6 +33,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/image-spec/identity"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -189,7 +190,10 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 	for _, c := range cs {
 		labels, err := c.Labels(ctx)
 		if err != nil {
-			continue
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("containerd labels for %s: %w", c.ID(), err)
 		}
 		if labels["io.kubernetes.pod.namespace"] != podNS ||
 			labels["io.kubernetes.pod.name"] != podName ||
@@ -203,12 +207,18 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 		ref := &containerRef{ID: c.ID()}
 		spec, err := c.Spec(ctx)
 		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
 			return nil, fmt.Errorf("containerd spec for %s: %w", c.ID(), err)
 		}
 		ref.Spec = spec
 		ref.SandboxID = spec.Annotations["io.kubernetes.cri.sandbox-id"]
 		info, err := c.Info(ctx)
 		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
 			return nil, fmt.Errorf("containerd info for %s: %w", c.ID(), err)
 		}
 		ref.ImageName = info.Image
