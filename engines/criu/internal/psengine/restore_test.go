@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	k8syaml "sigs.k8s.io/yaml"
 
@@ -223,8 +224,9 @@ func TestNodeRestoreFailureStampsFailed(t *testing.T) {
 	_ = contract.SetCondition(ps, metav1.Condition{Type: contract.CondReady, Status: metav1.ConditionTrue, Reason: contract.ReasonSucceeded})
 	pod := replacementPodOnNode("ps-web-0-deadbeef")
 	c := newClient(t, ps, pod)
+	rec := record.NewFakeRecorder(10)
 	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{failIt: true},
-		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir()}
+		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatal(err)
@@ -234,6 +236,16 @@ func TestNodeRestoreFailureStampsFailed(t *testing.T) {
 	// failed -> holder wrapper falls through to cold start
 	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
 		t.Fatalf("restore status: %q", got.Annotations[contract.AnnotationRestoreStatus])
+	}
+
+	// Verify that a Warning RestoreFailed event was recorded for the replacement pod (#126).
+	select {
+	case ev := <-rec.Events:
+		if !strings.Contains(ev, "Warning RestoreFailed") || !strings.Contains(ev, "falling back to a cold start") {
+			t.Fatalf("recorded event = %q, want Warning RestoreFailed with falling back to a cold start", ev)
+		}
+	default:
+		t.Fatal("expected a Warning RestoreFailed event on restore failure, got none")
 	}
 }
 

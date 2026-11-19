@@ -117,6 +117,7 @@ func main() {
 	if err := (&psengine.NodeRestoreReconciler{
 		Client: mgr.GetClient(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
+		Recorder: mgr.GetEventRecorderFor("psengine-node-restore"),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node restore reconciler")
 		os.Exit(1)

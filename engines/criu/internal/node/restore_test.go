@@ -17,6 +17,10 @@ package node
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -161,5 +165,207 @@ func TestFindContainer_PidZeroContinuation(t *testing.T) {
 	}
 	if ref.Pid != 2002 {
 		t.Fatalf("findContainer returned Pid %d, want 2002", ref.Pid)
+	}
+}
+
+func TestCleanNetnsLock(t *testing.T) {
+	ctx := context.Background()
+	var executed [][]string
+	r := &restorer{
+		execNetnsFn: func(ctx context.Context, pid int, name string, args ...string) (string, error) {
+			if pid != 1234 {
+				t.Fatalf("execNetns called with pid=%d, want 1234", pid)
+			}
+			call := append([]string{name}, args...)
+			executed = append(executed, call)
+			return "", nil
+		},
+	}
+
+	notes := r.cleanNetnsLock(ctx, 1234)
+	if len(notes) != 4 {
+		t.Fatalf("cleanNetnsLock returned %d notes, want 4 (one per tool): %v", len(notes), notes)
+	}
+
+	for _, tool := range []string{"iptables", "ip6tables", "iptables-legacy", "ip6tables-legacy"} {
+		foundInputDel := false
+		foundOutputDel := false
+		foundFlush := false
+		foundDeleteChain := false
+		for _, call := range executed {
+			if call[0] == tool {
+				cmdStr := strings.Join(call, " ")
+				if strings.Contains(cmdStr, "-D INPUT -j CRIU") {
+					foundInputDel = true
+				}
+				if strings.Contains(cmdStr, "-D OUTPUT -j CRIU") {
+					foundOutputDel = true
+				}
+				if strings.Contains(cmdStr, "-F CRIU") {
+					foundFlush = true
+				}
+				if strings.Contains(cmdStr, "-X CRIU") {
+					foundDeleteChain = true
+				}
+			}
+		}
+		if !foundInputDel || !foundOutputDel || !foundFlush || !foundDeleteChain {
+			t.Errorf("tool %s missing required cleanup commands: inputDel=%v, outputDel=%v, flush=%v, delChain=%v",
+				tool, foundInputDel, foundOutputDel, foundFlush, foundDeleteChain)
+		}
+	}
+}
+
+func TestCleanNetnsLock_ToolNotFoundIgnored(t *testing.T) {
+	ctx := context.Background()
+	r := &restorer{
+		execNetnsFn: func(ctx context.Context, pid int, name string, args ...string) (string, error) {
+			return "executable file not found", errors.New("not found")
+		},
+	}
+
+	notes := r.cleanNetnsLock(ctx, 1234)
+	if len(notes) != 0 {
+		t.Fatalf("cleanNetnsLock returned notes when all tools failed: %v", notes)
+	}
+}
+
+func TestCleanNetnsLock_InvalidPid(t *testing.T) {
+	ctx := context.Background()
+	called := false
+	r := &restorer{
+		execNetnsFn: func(ctx context.Context, pid int, name string, args ...string) (string, error) {
+			called = true
+			return "", nil
+		},
+	}
+
+	if notes := r.cleanNetnsLock(ctx, 0); len(notes) != 0 || called {
+		t.Fatalf("cleanNetnsLock(0) should return nil and not call execNetns; got notes=%v, called=%v", notes, called)
+	}
+	if notes := r.cleanNetnsLock(ctx, -1); len(notes) != 0 || called {
+		t.Fatalf("cleanNetnsLock(-1) should return nil and not call execNetns; got notes=%v, called=%v", notes, called)
+	}
+}
+
+func TestCleanNetnsLock_CancelledContextStillCleans(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context to simulate caller timeout/cancellation
+
+	called := false
+	r := &restorer{
+		execNetnsFn: func(cleanCtx context.Context, pid int, name string, args ...string) (string, error) {
+			if cleanCtx.Err() != nil {
+				t.Fatalf("expected cleanCtx to be uncancelled, got %v", cleanCtx.Err())
+			}
+			called = true
+			return "", nil
+		},
+	}
+
+	notes := r.cleanNetnsLock(ctx, 1234)
+	if !called {
+		t.Fatal("expected execNetns to be called despite cancelled parent context")
+	}
+	if len(notes) != 4 {
+		t.Fatalf("cleanNetnsLock returned %d notes, want 4: %v", len(notes), notes)
+	}
+}
+
+func TestRestore_FailureCleansNetnsLock(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "etc-criu")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "runc.conf"), []byte("file-validation buildid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	chkDir := filepath.Join(tmpDir, "chk")
+	if err := os.MkdirAll(filepath.Join(chkDir, "checkpoint"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	holderSpec := sampleTargetSpec()
+	var netnsCleanedAfterRestore []int
+	var execRestoreCalled bool
+	r := &restorer{
+		pmRootDir:       tmpDir,
+		criuConfDirPath: confDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "holder-ctr-1",
+				SandboxID: "tgtsandbox222",
+				Pid:       5555,
+				Spec:      holderSpec,
+				ImageName: "gcr.io/trusted/app:v1",
+			}, nil
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice/cri-containerd-holder.scope\n"), nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error) {
+			rf := filepath.Join(bundleDir, "rootfs")
+			_ = os.MkdirAll(rf, 0o755)
+			return rf, nil
+		},
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "Version: 3.19", nil
+		},
+		execRestoreFn: func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
+			execRestoreCalled = true
+			// Simulate runc restore failure (e.g. CRIU failed with exit 1).
+			return "runc restore error: criu failed with code 1", errors.New("exit status 1")
+		},
+		execNetnsFn: func(ctx context.Context, pid int, name string, args ...string) (string, error) {
+			if execRestoreCalled {
+				netnsCleanedAfterRestore = append(netnsCleanedAfterRestore, pid)
+			}
+			return "", nil
+		},
+	}
+
+	srcSpec := sampleSpec()
+	out, err := r.restore(ctx, restoreInputs{
+		MigrationName: "mig-netlock-fail",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		ContainerName: "app",
+		SourcePodUID:  "src-uid",
+		TargetPodUID:  "tgt-uid",
+		CheckpointDir: chkDir,
+		SrcSpec:       srcSpec,
+		ImageName:     "gcr.io/trusted/app:v1",
+	})
+	if err == nil {
+		t.Fatal("restore must fail when execRestoreFn returns error")
+	}
+
+	// Verify netns lock cleanup was called on failure for the holder container PID 5555.
+	if len(netnsCleanedAfterRestore) == 0 {
+		t.Fatal("cleanNetnsLock was not called on restore failure")
+	}
+	foundHolderPid := false
+	for _, pid := range netnsCleanedAfterRestore {
+		if pid == 5555 {
+			foundHolderPid = true
+			break
+		}
+	}
+	if !foundHolderPid {
+		t.Fatalf("cleanNetnsLock called on failure for pids %v, want 5555", netnsCleanedAfterRestore)
+	}
+
+	// Verify notes reflect netns cleanup.
+	foundNote := false
+	for _, note := range out.Notes {
+		if strings.Contains(note, "cleaned CRIU network-lock rules") {
+			foundNote = true
+			break
+		}
+	}
+	if !foundNote {
+		t.Fatalf("expected note about cleaning CRIU network-lock rules in out.Notes: %v", out.Notes)
 	}
 }

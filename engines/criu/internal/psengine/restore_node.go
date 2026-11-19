@@ -42,6 +42,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"k8s.io/client-go/tools/record"
+
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
 
@@ -75,6 +77,7 @@ type NodeRestoreReconciler struct {
 	Ops      RestoreOps
 	Store    ObjectStore
 	WorkDir  string // default /var/lib/pod-migrate/psengine
+	Recorder record.EventRecorder
 	// CPUFamily is this node's CPU model; a manifest recorded on a different
 	// family is refused (cross-family restores can crash glibc-heavy apps).
 	// Empty disables the guard (both sides honest-absent).
@@ -125,6 +128,9 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err != nil {
 		logger.Error(err, "psengine restore failed; holder will cold-start")
 		status = contract.RestoreStatusFailed
+		if r.Recorder != nil {
+			r.Recorder.Event(pod, corev1.EventTypeWarning, "RestoreFailed", fmt.Sprintf("psengine restore failed; falling back to a cold start: %v", err))
+		}
 	} else {
 		logger.Info("psengine restore complete", "snapshot", psName)
 	}
