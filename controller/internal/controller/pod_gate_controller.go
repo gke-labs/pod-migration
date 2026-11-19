@@ -419,6 +419,19 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			logger.Error(err, "Failed to order the restore", "pmj", correctedPMJ)
 			return ctrl.Result{}, err
 		}
+		// If the CRIU restore webhook speculatively wrapped a replacement pod whose
+		// job is served by another engine on a distinct API group, stamp CRIU's
+		// explicit cold-start bypass so the holder wrapper does not wait out its
+		// assign window if the primary engine falls back to cold start (#135).
+		if pod.Annotations[engine.CRIUInjectedAnnotation] == "true" && r.Engines != nil {
+			jobEng, _ := r.Engines.ForJob(job)
+			criuEng, hasCRIU := r.Engines.Get(engine.CRIUName)
+			if hasCRIU && criuEng != nil && (jobEng == nil || criuEng.RestoreAnnotation() != jobEng.RestoreAnnotation()) {
+				if criuOrderer, ok := criuEng.(engine.RestoreOrderer); ok {
+					_ = criuOrderer.OrderColdStartBypass(pod)
+				}
+			}
+		}
 		logger.Info("Injected target snapshot ref to pod annotations", "snapshot", job.Status.SnapshotRef)
 
 		// Mark PMJ as consumed by this replacement pod to prevent stale resurrection
@@ -578,6 +591,13 @@ func (r *PodGateReconciler) releaseWithColdStartBypass(ctx context.Context, pod 
 	// The bypass is ordered through the engine that serves the pod. It can
 	// only fail for a nil pod.
 	_ = r.podRestoreOrderer(ctx, pod).OrderColdStartBypass(pod)
+	if pod.Annotations[engine.CRIUInjectedAnnotation] == "true" && r.Engines != nil {
+		if criuEng, ok := r.Engines.Get(engine.CRIUName); ok && criuEng != nil {
+			if criuOrderer, ok := criuEng.(engine.RestoreOrderer); ok {
+				_ = criuOrderer.OrderColdStartBypass(pod)
+			}
+		}
+	}
 	r.removeGate(pod)
 }
 

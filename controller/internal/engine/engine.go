@@ -65,10 +65,43 @@ const (
 	AnnotationAllowUnfenced = "pod-migration.gke.io/allow-unfenced"
 )
 
+const (
+	// DefaultAPIGroup is the API group of the managed GKE Pod Snapshots add-on.
+	DefaultAPIGroup = snapshot.DefaultAPIGroup
+
+	// DefaultCRIUAPIGroup is the default API group of the CRIU snapshot engine.
+	// Step 2 of #135 keeps podsnapshot.gke.io as the default so existing
+	// installs see no behavior change until Step 3 flips the default to CRIUAPIGroup.
+	DefaultCRIUAPIGroup = snapshot.DefaultAPIGroup
+
+	// CRIUAPIGroup is the dedicated API group of the CRIU snapshot engine (#135).
+	CRIUAPIGroup = snapshot.CRIUAPIGroup
+)
+
+// ValidateAPIGroup checks that group is a valid Kubernetes CRD API group for
+// the four snapshot contract CRs (DNS-1123 subdomain containing a dot, with
+// every <plural>.<group> CRD name <= 253 characters).
+func ValidateAPIGroup(group string) error {
+	return snapshot.ValidateGroup(group)
+}
+
+// RestoreAnnotation returns the restore-order annotation key (<group>/ps-name)
+// for an engine serving group.
+func RestoreAnnotation(group string) string {
+	return snapshot.RestoreAnnotation(group)
+}
+
 // Engine is one checkpoint/restore engine.
 type Engine interface {
 	// Name is the registry key, and the name recorded on a job (C1).
 	Name() string
+
+	// APIGroup is the Kubernetes API group of the engine's snapshot CRDs (C1, #135).
+	APIGroup() string
+
+	// RestoreAnnotation is the pod annotation key (<group>/ps-name) that orders
+	// a checkpoint restore or cold-start bypass for this engine (C5, #135).
+	RestoreAnnotation() string
 
 	// RuntimeClasses lists the runtime classes the engine serves (C1).
 	// eligibility.DefaultRuntimeClassToken stands for pods without a

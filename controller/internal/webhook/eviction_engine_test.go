@@ -42,12 +42,14 @@ import (
 // evictionTestEngine is a snapshot engine whose eligibility verdict and
 // policy are whatever the test configured.
 type evictionTestEngine struct {
-	name       string // "" is eviction-test-engine
-	classes    []string
-	verdict    engine.Verdict
-	policy     *engine.PolicyRef
-	policyErr  error
-	guarantees *engine.Guarantees
+	name              string // "" is eviction-test-engine
+	apiGroup          string
+	restoreAnnotation string
+	classes           []string
+	verdict           engine.Verdict
+	policy            *engine.PolicyRef
+	policyErr         error
+	guarantees        *engine.Guarantees
 }
 
 func (e *evictionTestEngine) Name() string {
@@ -55,6 +57,18 @@ func (e *evictionTestEngine) Name() string {
 		return "eviction-test-engine"
 	}
 	return e.name
+}
+func (e *evictionTestEngine) APIGroup() string {
+	if e.apiGroup != "" {
+		return e.apiGroup
+	}
+	return engine.DefaultAPIGroup
+}
+func (e *evictionTestEngine) RestoreAnnotation() string {
+	if e.restoreAnnotation != "" {
+		return e.restoreAnnotation
+	}
+	return engine.RestoreAnnotation(e.APIGroup())
 }
 func (e *evictionTestEngine) RuntimeClasses() []string { return e.classes }
 func (e *evictionTestEngine) NamespaceResources(*pmv1alpha1.PodMigration) ([]*unstructured.Unstructured, error) {

@@ -154,23 +154,33 @@ annotated with `<group>/ps-name`, and the restore webhook passes that key to
 default, `podsnapshot.gke.io/ps-name`.
 
 The default group is `podsnapshot.gke.io`, the GKE Pod Snapshots addon's
-group. Another group doesn't yet change where the engine can run: the
-pod-migration controller still uses only `podsnapshot.gke.io` objects and the
-`podsnapshot.gke.io/ps-name` restore order, and the restore webhook rewires
-every gated replacement pod, including gVisor pods that the addon restores.
-So on another group with the webhook on, the engine refuses to start if the
-addon's CRDs are present. Keep the default, on addon-off clusters only, until
-the controller can target the engine's group
-([#135](https://github.com/gke-labs/pod-migration/issues/135)).
-To test another group, change it in `deploy/crds.yaml` (each CRD's name and
+group. The `pod-migration-controller` registers the `criu` engine with a
+matching `--criu-api-group` flag (also defaulting to `podsnapshot.gke.io`, and
+granting RBAC for `criu.podmigration.gke.io` out of the box), so when a runtime
+class is routed to `criu` via `--runtime-class-engines` or
+`pod-migration.gke.io/runtime-class-engines`, the controller reconciles CRIU
+storage configs, policies, triggers, snapshots, and `<group>/ps-name` restore
+orders in `--criu-api-group`. However, `engines/criu`'s restore webhook still
+rewires every gated single-container replacement pod with an explicit command,
+including gVisor pods that the addon restores. So on another group with the
+webhook on, `engines/criu`'s preflight still refuses to start if the addon's
+CRDs are present until the remaining webhook scoping and default flip in
+[#135](https://github.com/gke-labs/pod-migration/issues/135) land.
+To run on another group (such as `criu.podmigration.gke.io`) on an addon-off
+cluster, change the group in `deploy/crds.yaml` (each CRD's name and
 `spec.group`) and in the `deploy/deploy.yaml` RBAC rules of both the engine
 and the agent (the agent's rules include `get` on `podsnapshotmanualtriggers`),
-pass the same `--api-group` to both binaries, and use a holder image from this
-release or later (older holders reject `--ps-name-annotation`). Change the
-group only when no migrations are in flight, and roll the engine and the agent
-together: each wrapped replacement pod has its restore key built into its
-command. With `--enable-webhooks=false`, replacement pods aren't wrapped, so
-they start cold instead of being restored; also delete the
+pass the same group to `cmd/engine` (`--api-group`), `cmd/agent`
+(`--api-group`), and `pod-migration-controller` (`--criu-api-group`), route the
+target runtime class to `criu` (for example
+`--migratable-runtime-classes=gvisor,@default` and
+`--runtime-class-engines=gvisor=gke-pod-snapshots,@default=criu`), and use a
+holder image from this release or later (older holders reject
+`--ps-name-annotation`). Change the group only when no migrations are in flight,
+and roll the controller, the engine, and the agent together: each wrapped
+replacement pod has its restore key built into its command. With
+`--enable-webhooks=false`, replacement pods aren't wrapped, so they start cold
+instead of being restored; also delete the
 `pod-migrate-psengine-restore-inject` MutatingWebhookConfiguration then.
 
 ## Node & Cluster Requirements

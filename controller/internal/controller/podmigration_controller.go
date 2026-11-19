@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -42,6 +43,7 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -64,12 +66,20 @@ const (
 	managedObjectTerminatingRequeue = 5 * time.Second
 )
 
-// managedObjectGVKs are the kinds of the policy and storage objects that the
-// reconciler syncs and watches: those GKE Pod Snapshots renders. An engine
-// with its own API group (#135) adds its kinds here.
-var managedObjectGVKs = []schema.GroupVersionKind{
-	{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshotStorageConfig"},
-	{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshotPolicy"},
+// managedObjectGVKsForGroups returns the policy and storage GroupVersionKinds
+// across all registered snapshot engine API groups (#135).
+func managedObjectGVKsForGroups(groups []string) []schema.GroupVersionKind {
+	seen := []string{}
+	for _, g := range append([]string{snapshot.DefaultAPIGroup}, groups...) {
+		if g != "" && !slices.Contains(seen, g) {
+			seen = append(seen, g)
+		}
+	}
+	gvks := make([]schema.GroupVersionKind, 0, 2*len(seen))
+	for _, g := range seen {
+		gvks = append(gvks, snapshot.StorageConfigGVK(g), snapshot.PolicyGVK(g))
+	}
+	return gvks
 }
 
 const (
@@ -160,6 +170,8 @@ func (r *PodMigrationReconciler) evaluateInvariants(ctx context.Context, config 
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch;create;update;patch;delete
 
 func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reconcileErr error) {
 	logger := log.FromContext(ctx)
@@ -468,11 +480,12 @@ func (r *PodMigrationReconciler) deleteNamespaceResources(ctx context.Context, c
 // An object labeled as rendered for another PodMigration (OwnerUIDLabel) is
 // kept.
 func (r *PodMigrationReconciler) deleteEngineResources(ctx context.Context, config *pmv1alpha1.PodMigration) error {
-	if r.Engines == nil {
+	registry, err := r.engines()
+	if err != nil || registry == nil {
 		return nil
 	}
-	for _, name := range r.Engines.Names() {
-		eng, ok := r.Engines.Get(name)
+	for _, name := range registry.Names() {
+		eng, ok := registry.Get(name)
 		if !ok {
 			continue
 		}
@@ -596,12 +609,16 @@ func isPMJOwnedByPodMigration(pmj *pmv1alpha1.PodMigrationJob, config *pmv1alpha
 }
 
 func (r *PodMigrationReconciler) renderedPolicyNames(config *pmv1alpha1.PodMigration) []string {
-	if r.Engines == nil || config == nil {
+	if config == nil {
+		return nil
+	}
+	registry, err := r.engines()
+	if err != nil || registry == nil {
 		return nil
 	}
 	var names []string
-	for _, engName := range r.Engines.Names() {
-		eng, ok := r.Engines.Get(engName)
+	for _, engName := range registry.Names() {
+		eng, ok := registry.Get(engName)
 		if !ok {
 			continue
 		}
@@ -809,13 +826,17 @@ func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&pmv1alpha1.PodMigration{}).
 		Watches(&pmv1alpha1.PodMigration{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNamespacePeers))
 
-	for _, gvk := range managedObjectGVKs {
+	var groups []string
+	if registry, err := r.engines(); err == nil && registry != nil {
+		groups = registry.APIGroups()
+	}
+	for _, gvk := range managedObjectGVKsForGroups(groups) {
 		watch, err := shouldWatchCRD(mgr.GetRESTMapper(), gvk)
 		if err != nil {
 			return err
 		}
 		if !watch {
-			logger.Info(gvk.Kind + " CRD not registered; not watching it")
+			logger.Info(gvk.Kind+" CRD not registered; not watching it", "apiGroup", gvk.Group)
 			continue
 		}
 		obj := &unstructured.Unstructured{}

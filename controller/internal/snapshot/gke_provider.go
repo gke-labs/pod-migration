@@ -28,7 +28,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,11 +54,35 @@ const transientReadyFailureSuppressionWindow = 60 * time.Second
 type GKEProvider struct {
 	client client.Client
 	scheme *runtime.Scheme
+	group  string
 	now    func() time.Time
 }
 
 func NewGKEProvider(c client.Client, s *runtime.Scheme) *GKEProvider {
-	return &GKEProvider{client: c, scheme: s}
+	return &GKEProvider{client: c, scheme: s, group: DefaultAPIGroup}
+}
+
+// NewGKEProviderForGroup returns a GKEProvider bound to the four snapshot
+// contract CRs in group and the matching <group>/ps-name restore annotation (#135).
+func NewGKEProviderForGroup(c client.Client, s *runtime.Scheme, group string) (*GKEProvider, error) {
+	if err := ValidateGroup(group); err != nil {
+		return nil, err
+	}
+	return &GKEProvider{client: c, scheme: s, group: group}, nil
+}
+
+// APIGroup returns the API group of the snapshot CRs this provider reads and writes.
+func (p *GKEProvider) APIGroup() string {
+	if p == nil || p.group == "" {
+		return DefaultAPIGroup
+	}
+	return p.group
+}
+
+// RestoreAnnotation returns the restore-order annotation key (<group>/ps-name)
+// this provider stamps for cold-start bypass and restore completion.
+func (p *GKEProvider) RestoreAnnotation() string {
+	return RestoreAnnotation(p.APIGroup())
 }
 
 func (p *GKEProvider) nowFunc() time.Time {
@@ -74,11 +97,7 @@ func (p *GKEProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigr
 	logger := log.FromContext(ctx).WithValues("trigger", triggerName)
 
 	trigger := &unstructured.Unstructured{}
-	trigger.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotManualTrigger",
-	})
+	trigger.SetGroupVersionKind(ManualTriggerGVK(p.APIGroup()))
 	trigger.SetName(triggerName)
 	trigger.SetNamespace(job.Namespace)
 	trigger.Object["spec"] = map[string]interface{}{
@@ -164,8 +183,9 @@ func (p *GKEProvider) ensureSourceColdStartBypass(ctx context.Context, job *pmv1
 // replaced under the same name is never patched. gone reports that the pod no
 // longer exists.
 func (p *GKEProvider) setColdStartBypass(ctx context.Context, namespace, podName, uid, bypassingJob string) (gone bool, err error) {
+	restoreAnn := p.RestoreAnnotation()
 	annotations := map[string]interface{}{
-		psNameAnnotation: "",
+		restoreAnn: "",
 	}
 	if bypassingJob != "" {
 		annotations[util.AnnotationColdStartBypassJob] = bypassingJob
@@ -185,7 +205,7 @@ func (p *GKEProvider) setColdStartBypass(ctx context.Context, namespace, podName
 		if apierrors.IsNotFound(err) {
 			return true, nil
 		}
-		return false, fmt.Errorf("patching %s on pod %s/%s: %w", psNameAnnotation, namespace, podName, err)
+		return false, fmt.Errorf("patching %s on pod %s/%s: %w", restoreAnn, namespace, podName, err)
 	}
 	return false, nil
 }
@@ -195,11 +215,7 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	logger := log.FromContext(ctx).WithValues("trigger", triggerName)
 
 	trigger := &unstructured.Unstructured{}
-	trigger.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotManualTrigger",
-	})
+	trigger.SetGroupVersionKind(ManualTriggerGVK(p.APIGroup()))
 	err := p.client.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -250,11 +266,7 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	}
 
 	targetSnapshot := &unstructured.Unstructured{}
-	targetSnapshot.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshot",
-	})
+	targetSnapshot.SetGroupVersionKind(PodSnapshotGVK(p.APIGroup()))
 	err = p.client.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapshotName}, targetSnapshot)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -482,11 +494,7 @@ func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJ
 
 	logger.Info("Deleting manual trigger", "trigger", triggerName)
 	trigger := &unstructured.Unstructured{}
-	trigger.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
-		Version: "v1",
-		Kind:    "PodSnapshotManualTrigger",
-	})
+	trigger.SetGroupVersionKind(ManualTriggerGVK(p.APIGroup()))
 	trigger.SetName(triggerName)
 	trigger.SetNamespace(job.Namespace)
 
@@ -524,7 +532,7 @@ func (p *GKEProvider) CheckpointState(ctx context.Context, job *pmv1alpha1.PodMi
 	}
 
 	trigger := &unstructured.Unstructured{}
-	trigger.SetGroupVersionKind(schema.GroupVersionKind{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshotManualTrigger"})
+	trigger.SetGroupVersionKind(ManualTriggerGVK(p.APIGroup()))
 	err := p.client.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger)
 	switch {
 	case err == nil:
@@ -537,7 +545,7 @@ func (p *GKEProvider) CheckpointState(ctx context.Context, job *pmv1alpha1.PodMi
 		return CheckpointState{}, fmt.Errorf("reading trigger %s: %w", triggerName, err)
 	}
 
-	snapshotGVK := schema.GroupVersionKind{Group: "podsnapshot.gke.io", Version: "v1", Kind: "PodSnapshot"}
+	snapshotGVK := PodSnapshotGVK(p.APIGroup())
 	snapshots := map[string]*unstructured.Unstructured{}
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(snapshotGVK.GroupVersion().WithKind("PodSnapshotList"))
