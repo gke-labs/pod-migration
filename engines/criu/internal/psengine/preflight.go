@@ -16,14 +16,14 @@
 package psengine
 
 // Addon-detection preflight: the CRIU engine must never contend with another
-// provider for the contract CRDs of its API group (contract.Group) — on the
-// default group, the managed GKE Pod Snapshots addon. The CRDs must exist and
-// carry our component label (installed from engines/criu/deploy/crds.yaml). A
-// foreign (unlabeled) CRD means the addon — or another provider — owns the
-// group: refuse to start rather than double-execute PSMTs. On another group,
-// the restore webhook still can't tell the addon's pods from ours, so with
-// webhooks on the engine also refuses to start next to the addon
-// (VerifyRestoreWebhookScope).
+// provider for the contract CRDs of its API group (contract.Group). On its
+// dedicated default group (criu.podmigration.gke.io), the engine coexists
+// cleanly alongside the managed GKE Pod Snapshots addon (podsnapshot.gke.io),
+// because CRDs, triggers, restore annotations, and RestoreInjector webhook
+// mutations are scoped strictly to CRIU-routed replacement pods (#135). The
+// contract CRDs of contract.Group must exist and carry our component label
+// (installed from engines/criu/deploy/crds.yaml); a foreign (unlabeled) CRD
+// means another provider owns that group, so the engine refuses to start.
 
 import (
 	"context"
@@ -45,24 +45,17 @@ const (
 	ComponentLabelValue = "psengine"
 )
 
-// Preflight runs the engine's startup checks: VerifyCRDOwnership, then, when
-// the restore webhook is on, VerifyRestoreWebhookScope. cmd/engine runs it
-// before the manager starts, because the manager starts the webhook server
-// ahead of leader-elected runnables.
-func Preflight(ctx context.Context, c client.Reader, webhooks bool) error {
-	if err := VerifyCRDOwnership(ctx, c); err != nil {
-		return err
-	}
-	if webhooks {
-		return VerifyRestoreWebhookScope(ctx, c)
-	}
-	return nil
+// Preflight runs the engine's startup checks (VerifyCRDOwnership) for
+// contract.Group. cmd/engine runs it before the manager starts, because the
+// manager starts the webhook server ahead of leader-elected runnables.
+func Preflight(ctx context.Context, c client.Reader) error {
+	return VerifyCRDOwnership(ctx, c)
 }
 
 // VerifyCRDOwnership fails when the contract CRDs of the engine's API group
 // are missing (apply engines/criu/deploy/crds.yaml first) or foreign-owned
-// (on the GKE Pod Snapshots group, an addon-enabled cluster — this engine
-// must not run there).
+// (for example, when --api-group=podsnapshot.gke.io is passed on an
+// addon-enabled cluster — this engine must not share that group with the addon).
 func VerifyCRDOwnership(ctx context.Context, c client.Reader) error {
 	return verifyCRDOwnership(ctx, c, contract.Group)
 }
@@ -79,49 +72,12 @@ func verifyCRDOwnership(ctx context.Context, c client.Reader, group string) erro
 		if crd.GetLabels()[ComponentLabel] != ComponentLabelValue {
 			return fmt.Errorf("preflight: CRD %s exists but is not ours (missing %s=%s)%s — "+
 				"refusing to start psengine: two engines double-executing PodSnapshotManualTriggers would corrupt migrations. "+
-				"Either disable the other owner and apply engines/criu/deploy/crds.yaml, "+
-				"or run psengine on an addon-off cluster",
-				name, ComponentLabel, ComponentLabelValue, describeForeignOwner(crd))
+				"Either use the dedicated %s API group, or disable the other owner",
+				name, ComponentLabel, ComponentLabelValue, describeForeignOwner(crd), contract.CRIUGroup)
 		}
 		if ownerDesc := describeForeignOwner(crd); ownerDesc != ownerUnknown {
 			return fmt.Errorf("preflight: CRD %s has our component label but also carries foreign markers (%s) — it appears engines/criu/deploy/crds.yaml was applied over an existing GKE Pod Snapshots addon CRD! Refusing to start.", name, ownerDesc)
 		}
-	}
-	return nil
-}
-
-// VerifyRestoreWebhookScope fails when the engine serves an API group other
-// than the GKE Pod Snapshots group with its restore webhook on, and another
-// provider (on GKE, the Pod Snapshots addon) owns CRDs in the GKE Pod
-// Snapshots group. The webhook rewires every gated replacement pod, so it
-// would also rewrite the gVisor pods that the addon restores. The check stays
-// until the webhook takes only this engine's pods (#135). On the GKE Pod
-// Snapshots group itself, VerifyCRDOwnership already refuses foreign CRDs.
-func VerifyRestoreWebhookScope(ctx context.Context, c client.Reader) error {
-	return verifyRestoreWebhookScope(ctx, c, contract.Group)
-}
-
-func verifyRestoreWebhookScope(ctx context.Context, c client.Reader, group string) error {
-	if group == contract.GKEPodSnapshotsGroup {
-		return nil
-	}
-	for _, name := range contract.CRDNames(contract.GKEPodSnapshotsGroup) {
-		crd, err := getCRD(ctx, c, name)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("preflight: reading CRD %s: %w", name, err)
-		}
-		if crd.GetLabels()[ComponentLabel] == ComponentLabelValue && describeForeignOwner(crd) == ownerUnknown {
-			continue // installed by this engine, so no other provider restores through it
-		}
-		return fmt.Errorf("preflight: CRD %s belongs to another snapshot provider%s, and the restore webhook "+
-			"would also rewrite the replacement pods that provider restores — refusing to start psengine on "+
-			"--api-group=%s with webhooks on. Run it on a cluster without that provider, or with "+
-			"--enable-webhooks=false (replacement pods then start cold instead of being restored), until the "+
-			"webhook takes only this engine's pods",
-			name, describeForeignOwner(crd), group)
 	}
 	return nil
 }

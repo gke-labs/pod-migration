@@ -71,6 +71,11 @@ type Checkpointer interface {
 // and answers status.snapshotCreated.name — the one field the orchestrator
 // polls at 1s (podmigrationjob_controller.go:247).
 //
+// Eligibility is decided once, when the work order is created. Once a work
+// order carries a bucket, the node agent owns its outcome: later passes don't
+// re-run the eligibility checks, so they can't write Refused or Failed onto a
+// running checkpoint (#218).
+//
 // Refusals are terminal PodSnapshot conditions (reason=Refused), never
 // silence, so the orchestrator can transition cleanly and fall open to cold
 // eviction.
@@ -79,10 +84,10 @@ type PSMTReconciler struct {
 	Checkpointer Checkpointer // nil in production (CR handoff to the node agent)
 }
 
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotmanualtriggers/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods;nodes,verbs=get;list;watch
 
 func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -133,13 +138,29 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	snapshotName := contract.PodSnapshotName(pod.Name, string(pod.UID))
-	refusal := r.refusalReason(ctx, pod)
-	bucket, path, storageErr := r.storageFor(ctx, psp)
+	ps := contract.New(contract.GVKPodSnapshot)
+	err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: snapshotName}, ps)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	// Eligibility is decided once, when the work order is created (#218). A
+	// work order with a bucket was judged eligible and may already be running
+	// on the node agent, which owns its outcome from here. Later passes (the
+	// 30 s requeue, the PodSnapshot watch) don't re-judge it: a transient
+	// node or storage-config read error, or a pod or node that changed since,
+	// must not write Refused or Failed onto a checkpoint in progress. They
+	// only answer the trigger and keep the Pending wait honest.
+	judged := err == nil && hasBucket(ps)
+
+	var refusal, bucket, path string
+	var storageErr error
+	if !judged {
+		refusal = r.refusalReason(ctx, pod)
+		bucket, path, storageErr = r.storageFor(ctx, psp)
+	}
 
 	// 1. Materialize the PodSnapshot (idempotent by deterministic name). Its
 	// spec is the complete work order for the node agent.
-	ps := contract.New(contract.GVKPodSnapshot)
-	err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: snapshotName}, ps)
 	if apierrors.IsNotFound(err) {
 		ps = contract.New(contract.GVKPodSnapshot)
 		ps.SetName(snapshotName)
@@ -171,11 +192,14 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			spec["bucket"], spec["path"] = bucket, path
 		}
 		ps.Object["spec"] = spec
-		if err := r.Create(ctx, ps); err != nil && !apierrors.IsAlreadyExists(err) {
+		if err := r.Create(ctx, ps); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// Another writer created the work order since the Get. This
+				// pass's verdict didn't see it; judge again from a fresh read.
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
 			return ctrl.Result{}, err
 		}
-	} else if err != nil {
-		return ctrl.Result{}, err
 	}
 
 	// 2. Answer the orchestrator: status.snapshotCreated.name.
@@ -212,7 +236,7 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		if err := r.Checkpointer.Checkpoint(ctx, CheckpointRequest{
 			Namespace: pod.Namespace, PodName: pod.Name, PodUID: string(pod.UID),
 			Container: pod.Spec.Containers[0].Name, NodeName: pod.Spec.NodeName,
-			SnapshotName: snapshotName, Bucket: bucket, Path: path,
+			SnapshotName: snapshotName, Bucket: workOrderString(ps, "bucket"), Path: workOrderString(ps, "path"),
 		}); err != nil {
 			return ctrl.Result{}, r.setSnapshotTerminal(ctx, req.Namespace, snapshotName, contract.ReasonFailed, err.Error())
 		}
@@ -234,8 +258,17 @@ func (r *PSMTReconciler) refusalReason(ctx context.Context, pod *corev1.Pod) str
 	if pod.Labels[contract.LabelEnabled] != "true" {
 		return "pod is not opted in (pod-migration.gke.io/enabled != true)"
 	}
+	if ok, rc := isSupportedCRIURuntimeClass(pod.Spec.RuntimeClassName); !ok {
+		return fmt.Sprintf("runtimeClassName %q unsupported by criu engine v1", rc)
+	}
 	if pod.Spec.HostNetwork {
 		return "hostNetwork pods unsupported by criu engine"
+	}
+	for i := range pod.Spec.InitContainers {
+		ic := &pod.Spec.InitContainers[i]
+		if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			return "sidecar initContainers unsupported by criu engine v1"
+		}
 	}
 	if len(pod.Spec.Containers) != 1 {
 		return "multi-container pods unsupported by criu engine v1"
@@ -353,10 +386,15 @@ func (r *PSMTReconciler) patchSnapshotConditions(ctx context.Context, namespace,
 
 // hasBucket: the work order can be handed to a node agent. The engine
 // controller withholds the bucket for a refusal or a storage failure, and
-// agents ignore an order without one.
+// agents ignore an order without one. A bucket also means the trigger was
+// judged eligible, once, when the order was created (#218).
 func hasBucket(ps *unstructured.Unstructured) bool {
-	b, _, _ := unstructured.NestedString(ps.Object, "spec", "bucket")
-	return b != ""
+	return workOrderString(ps, "bucket") != ""
+}
+
+func workOrderString(ps *unstructured.Unstructured, field string) string {
+	v, _, _ := unstructured.NestedString(ps.Object, "spec", field)
+	return v
 }
 
 // awaitingCancel: a cancel was requested that a node agent can still

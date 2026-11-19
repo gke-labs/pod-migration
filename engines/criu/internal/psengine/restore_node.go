@@ -99,8 +99,8 @@ type NodeRestoreReconciler struct {
 // Note: engines/criu does not run controller-gen; deploy/deploy.yaml is the RBAC source of truth.
 // These kubebuilder markers document contract GVKs and are guarded by TestDeployManifestRBACMatchesContractGVKs.
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;patch
 // +kubebuilder:rbac:groups="",resources=nodes/checkpoint,verbs=create

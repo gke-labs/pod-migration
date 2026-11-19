@@ -106,14 +106,13 @@ func main() {
 	}
 
 	// Preflight: refuse to start if the contract CRDs of --api-group are
-	// missing or owned by another provider (such as the managed GKE Pod
-	// Snapshots addon, on its podsnapshot.gke.io group), or if the restore
-	// webhook would rewrite pods that such a provider restores. It runs
-	// before the manager starts: the manager starts the webhook server ahead
-	// of leader-elected runnables, so a check run as a runnable would let the
-	// webhook serve first.
+	// missing or owned by another provider (such as when --api-group is set to
+	// podsnapshot.gke.io on a cluster where the managed GKE Pod Snapshots addon
+	// owns those CRDs). It runs before the manager starts: the manager starts
+	// the webhook server ahead of leader-elected runnables, so a check run as a
+	// runnable would let the webhook serve first.
 	preflightCtx, cancelPreflight := context.WithTimeout(context.Background(), preflightTimeout)
-	err = psengine.Preflight(preflightCtx, mgr.GetAPIReader(), enableWebhooks)
+	err = psengine.Preflight(preflightCtx, mgr.GetAPIReader())
 	cancelPreflight()
 	if err != nil {
 		log.Error(err, "psengine preflight failed")
@@ -139,7 +138,11 @@ func main() {
 		dec := admission.NewDecoder(mgr.GetScheme())
 		ws := mgr.GetWebhookServer()
 		ws.Register("/psengine-restore-inject", &webhook.Admission{
-			Handler: &psengine.RestoreInjector{Decoder: dec, HolderImage: holderImage},
+			Handler: &psengine.RestoreInjector{
+				Decoder:     dec,
+				HolderImage: holderImage,
+				Reader:      mgr.GetAPIReader(),
+			},
 		})
 		log.Info("registered /psengine-restore-inject webhook", "certDir", webhookCertDir, "holderImage", holderImage)
 	}

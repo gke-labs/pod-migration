@@ -45,8 +45,8 @@ func TestCRIU_IdentityAndGroupValidation(t *testing.T) {
 	if got := defEngine.APIGroup(); got != DefaultCRIUAPIGroup {
 		t.Errorf("APIGroup() = %q, want %q", got, DefaultCRIUAPIGroup)
 	}
-	if got := defEngine.RestoreAnnotation(); got != "podsnapshot.gke.io/ps-name" {
-		t.Errorf("RestoreAnnotation() = %q, want podsnapshot.gke.io/ps-name", got)
+	if got := defEngine.RestoreAnnotation(); got != "criu.podmigration.gke.io/ps-name" {
+		t.Errorf("RestoreAnnotation() = %q, want criu.podmigration.gke.io/ps-name", got)
 	}
 	if got := defEngine.RuntimeClasses(); !reflect.DeepEqual(got, []string{eligibility.DefaultRuntimeClassToken, "runc"}) {
 		t.Errorf("RuntimeClasses() = %v, want [@default runc]", got)
@@ -58,15 +58,16 @@ func TestCRIU_IdentityAndGroupValidation(t *testing.T) {
 		t.Errorf("Guarantees() = %+v, want %+v", got, want)
 	}
 
-	custom, err := NewCRIU(cl, testScheme(), CRIUAPIGroup)
+	legacyGroup := DefaultAPIGroup
+	custom, err := NewCRIU(cl, testScheme(), legacyGroup)
 	if err != nil {
-		t.Fatalf("NewCRIU(%q): %v", CRIUAPIGroup, err)
+		t.Fatalf("NewCRIU(%q): %v", legacyGroup, err)
 	}
-	if got := custom.APIGroup(); got != CRIUAPIGroup {
-		t.Errorf("APIGroup() = %q, want %q", got, CRIUAPIGroup)
+	if got := custom.APIGroup(); got != legacyGroup {
+		t.Errorf("APIGroup() = %q, want %q", got, legacyGroup)
 	}
-	if got := custom.RestoreAnnotation(); got != CRIUAPIGroup+"/ps-name" {
-		t.Errorf("RestoreAnnotation() = %q, want %s/ps-name", got, CRIUAPIGroup)
+	if got := custom.RestoreAnnotation(); got != legacyGroup+"/ps-name" {
+		t.Errorf("RestoreAnnotation() = %q, want %s/ps-name", got, legacyGroup)
 	}
 
 	if _, err := NewCRIU(cl, testScheme(), "invalid_group"); err == nil {

@@ -88,6 +88,11 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
   - `podsnapshotmanualtriggers` (`get`): Verifies cancellation state.
   - `events` (`create`, `patch`): Emits node restore and failure warning events.
     _Note on RBAC Breadth_: Because Kubernetes RBAC cannot scope `nodes/checkpoint`, `nodes/patch`, or `pods/update` to the DaemonSet's local node, a compromised agent holds broad cluster-wide write privileges against these resources.
+- **Engine Controller RBAC Scope (`pod-migrate-psengine-controller`)**: The cluster-level `cmd/engine` controller and `/psengine-restore-inject` webhook run as non-root (`65532:65532`) with narrower RBAC:
+  - `podmigrationjobs` (`get` in `podmigration.gke.io`): Single live API `GET` in `RestoreInjector.Handle` (after in-memory pod-shape filtering) to confirm `pod-migration.gke.io/engine: criu` on the assigned `PodMigrationJob` before injecting the holder wrapper (`list`/`watch` are not granted).
+  - `customresourcedefinitions` (`get` in `apiextensions.k8s.io`): Startup `VerifyCRDOwnership` preflight check for the configured `--api-group`.
+  - `podsnapshotstorageconfigs`, `podsnapshotpolicies`, `podsnapshotmanualtriggers`, `podsnapshots` (`get`, `list`, `watch`, `create`) and `*/status` (`get`, `update`, `patch`) in `criu.podmigration.gke.io` (by default, #135).
+  - `pods`, `nodes` (`get`, `list`, `watch`) and `events` (`create`, `patch`).
 - **Network Ingress & Health Probes**: The agent listens on host TCP port `:8091` (`hostNetwork: true`) for kubelet liveness (`/healthz`) and readiness (`/readyz`) probes. It does not expose other network services; all other traffic is outbound to the Kubernetes API server, containerd unix sockets, or cloud storage APIs.
 - **Resource Constraints**: Default resource requests (`100m` CPU, `128Mi` memory) and memory limits (`512Mi`) prevent memory exhaustion from runaway agent operations.
 
@@ -99,7 +104,7 @@ A central risk in process checkpoint and restore is **unauthorized privilege gai
 
 ### R1. Authorization & Admission Validation (Partial Enforcement; see #233)
 
-- **Work Order & PMJ Verification**: The node agent restores a pod only after verifying that the target pod carries a restore order annotation (`<group>/ps-name`) matching an authorized work order whose referenced `PodMigrationJob` is either actively `Restoring` or `Succeeded` (warm-retry fallback window).
+- **Work Order & PMJ Verification**: At `CREATE`, `/psengine-restore-inject` (`RestoreInjector`) injects the holder wrapper only into gated single-container `runc`/default pods (outside `kube-system`, `pod-migration-system`, and `pod-migration-criu-system`) whose assigned `PodMigrationJob` (`get` on `podmigrationjobs`) carries `pod-migration.gke.io/engine: criu` (#135). At restore time, the node agent restores a pod only after verifying that the target pod carries a restore order annotation (`<group>/ps-name`) matching an authorized work order whose referenced `PodMigrationJob` is either actively `Restoring` or `Succeeded` (warm-retry fallback window).
 - **Partial Admission Boundaries (Known Gap: #233)**: Today, admission-level authorization is **partial**:
   - The replacement webhook (`PodGateInjector`) only intercepts `CREATE` requests. For Kubeflow and third-party orchestration interop, it intentionally preserves pre-existing, non-empty `podsnapshot.gke.io/ps-name` annotations when no matching PMJ is found, rather than unconditionally stripping them.
   - Furthermore, post-creation annotation tampering (mutating or injecting restore annotations onto running pods) is not currently blocked at admission time. Issue [#233](https://github.com/gke-labs/pod-migration/issues/233) tracks enforcing strict admission and mutating validation to prevent post-creation annotation tampering and enforce controller-only binding.
