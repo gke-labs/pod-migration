@@ -71,8 +71,11 @@ func handlerBudget(ctx context.Context) time.Duration {
 	return defaultHandlerBudget
 }
 
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotstorageconfigs,verbs=get;list;watch
 // EvictionGate handles eviction requests and creates PodMigrationJobs.
 type EvictionGate struct {
 	Client                  client.Client
@@ -261,7 +264,17 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		logger.Info("No snapshot engine serves the pod's runtime class, allowing eviction immediately", "runtimeClass", runtimeClass)
 		return admission.Allowed(fmt.Sprintf("No snapshot engine serves runtime class %s, skipping migration", runtimeClass))
 	}
-	if verdict := eng.Eligible(pod, nil); !verdict.OK {
+	var sourceNode *corev1.Node
+	if _, isGKE := eng.(*engine.GKEPodSnapshots); !isGKE && pod.Spec.NodeName != "" {
+		n := &corev1.Node{}
+		if err := a.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, n); err == nil {
+			sourceNode = n
+		} else if !apierrors.IsNotFound(err) {
+			logger.Error(err, "Failed to read the pod's source node", "node", pod.Spec.NodeName)
+			return denied429("transient error reading the pod's source node, retrying")
+		}
+	}
+	if verdict := eng.Eligible(pod, sourceNode); !verdict.OK {
 		logger.Info("Snapshot engine can't migrate the pod, allowing eviction immediately",
 			"engine", eng.Name(), "runtimeClass", eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName), "reason", verdict.Reason)
 		return admission.Allowed(verdict.Reason)

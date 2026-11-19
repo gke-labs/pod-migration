@@ -67,15 +67,17 @@ func (p *GKEProvider) CompleteRestore(ctx context.Context, job *pmv1alpha1.PodMi
 		return nil
 	}
 
+	restoreAnn := p.RestoreAnnotation()
+
 	// Idempotent retry: already patched with the cold-start bypass and matching marker.
-	if snapRef != "" && current.Annotations[psNameAnnotation] == "" && current.Annotations[util.AnnotationRestoreCompleted] == snapRef {
+	if snapRef != "" && current.Annotations[restoreAnn] == "" && current.Annotations[util.AnnotationRestoreCompleted] == snapRef {
 		return nil
 	}
 
 	// If ps-name isn't exactly SnapshotRef (including missing ps-name, ps-name="",
 	// foreign snapshot, or snapRef=""), write nothing and return nil. The job
 	// concludes, and I2 evaluates whether this pod was legitimately warm-restored (#152).
-	if snapRef == "" || current.Annotations[psNameAnnotation] != snapRef {
+	if snapRef == "" || current.Annotations[restoreAnn] != snapRef {
 		return nil
 	}
 
@@ -101,9 +103,10 @@ func (p *GKEProvider) CompleteRestore(ctx context.Context, job *pmv1alpha1.PodMi
 // uid and resourceVersion are sent as preconditions, so a pod replaced under the same
 // name or concurrently modified is rejected. gone reports that the pod no longer exists.
 func (p *GKEProvider) setRestoreCompleted(ctx context.Context, namespace, podName, uid, resourceVersion, snapshotRef string) (gone bool, err error) {
+	restoreAnn := p.RestoreAnnotation()
 	meta := map[string]interface{}{
 		"annotations": map[string]interface{}{
-			psNameAnnotation:                "",
+			restoreAnn:                      "",
 			util.AnnotationRestoreCompleted: snapshotRef,
 		},
 	}
@@ -122,7 +125,7 @@ func (p *GKEProvider) setRestoreCompleted(ctx context.Context, namespace, podNam
 		if apierrors.IsNotFound(err) {
 			return true, nil
 		}
-		return false, fmt.Errorf("patching %s and %s on pod %s/%s: %w", psNameAnnotation, util.AnnotationRestoreCompleted, namespace, podName, err)
+		return false, fmt.Errorf("patching %s and %s on pod %s/%s: %w", restoreAnn, util.AnnotationRestoreCompleted, namespace, podName, err)
 	}
 	return false, nil
 }
