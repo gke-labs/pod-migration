@@ -703,10 +703,10 @@ func (s *scriptedReader) Get(ctx context.Context, key client.ObjectKey, obj clie
 // the waits, so the retry tests run quickly.
 func fastPreStopBackoff(t *testing.T) {
 	t.Helper()
-	saved, savedTimeout := preStopCheckBackoff, preStopCheckTimeout
-	preStopCheckBackoff.Duration = time.Millisecond
-	preStopCheckTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { preStopCheckBackoff, preStopCheckTimeout = saved, savedTimeout })
+	saved, savedTimeout := preCommitCheckBackoff, preCommitCheckTimeout
+	preCommitCheckBackoff.Duration = time.Millisecond
+	preCommitCheckTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { preCommitCheckBackoff, preCommitCheckTimeout = saved, savedTimeout })
 }
 
 func runWithPreStopReader(t *testing.T, ctx context.Context, onGet func(context.Context, int) error) (client.Client, *fakeNodeOps, *scriptedReader) {
@@ -720,20 +720,20 @@ func runWithPreStopReader(t *testing.T, ctx context.Context, onGet func(context.
 	return c, ops, reader
 }
 
-// The pre-stop budget rides out a few seconds of API server trouble before
+// The pre-commit budget rides out a few seconds of API server trouble before
 // it fails closed, and bounds each attempt.
-func TestPreStopCheckBudget(t *testing.T) {
+func TestPreCommitCheckBudget(t *testing.T) {
 	var total time.Duration
-	d := preStopCheckBackoff.Duration
-	for i := 1; i < preStopCheckBackoff.Steps; i++ {
+	d := preCommitCheckBackoff.Duration
+	for i := 1; i < preCommitCheckBackoff.Steps; i++ {
 		total += d
-		d = time.Duration(float64(d) * preStopCheckBackoff.Factor)
+		d = time.Duration(float64(d) * preCommitCheckBackoff.Factor)
 	}
 	if total < 3*time.Second || total > 4*time.Second {
-		t.Fatalf("pre-stop retry waits %v in total, want 3-4s", total)
+		t.Fatalf("pre-commit retry waits %v in total, want 3-4s", total)
 	}
-	if preStopCheckTimeout <= 0 || preStopCheckTimeout > 3*time.Second {
-		t.Fatalf("per-attempt timeout %v, want a bound of a few seconds", preStopCheckTimeout)
+	if preCommitCheckTimeout <= 0 || preCommitCheckTimeout > 3*time.Second {
+		t.Fatalf("per-attempt timeout %v, want a bound of a few seconds", preCommitCheckTimeout)
 	}
 }
 

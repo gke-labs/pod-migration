@@ -378,6 +378,82 @@ func TestConformanceRestartAfterFreezeThawsOnCancel(t *testing.T) {
 	}
 }
 
+// TestConformanceStartupSweepThawsUnreadySnapshots verifies that on startup,
+// the agent sweeps PodSnapshots targeting its node that have SourceFrozen=True,
+// thawing those that are not Ready (e.g. Failed, Cancelled, or unfinished),
+// while leaving Ready snapshots frozen for eviction (#106, #148).
+func TestConformanceStartupSweepThawsUnreadySnapshots(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Snapshot with Failed outcome and SourceFrozen=True (e.g. agent crashed before thawing)
+	psFailed := workOrderSnapshot("ps-failed")
+	_ = contract.SetSourceFrozen(psFailed, true, contract.ReasonFrozen, "source frozen")
+	_ = contract.SetCondition(psFailed, metav1.Condition{
+		Type:   contract.CondCheckpoint,
+		Status: metav1.ConditionFalse,
+		Reason: contract.ReasonFailed,
+	})
+
+	// 2. Snapshot with Cancelled outcome and SourceFrozen=True
+	psCancelled := workOrderSnapshot("ps-cancelled")
+	_ = contract.SetSourceFrozen(psCancelled, true, contract.ReasonFrozen, "source frozen")
+	_ = contract.SetCondition(psCancelled, metav1.Condition{
+		Type:   contract.CondCheckpoint,
+		Status: metav1.ConditionFalse,
+		Reason: contract.ReasonCancelled,
+	})
+
+	// 3. Snapshot with no outcome yet (interrupted mid-pipeline) and SourceFrozen=True
+	psInProgress := workOrderSnapshot("ps-in-progress")
+	_ = contract.SetSourceFrozen(psInProgress, true, contract.ReasonFrozen, "source frozen")
+
+	// 4. Snapshot with Ready=True and SourceFrozen=True: must NOT be thawed (kept frozen for eviction)
+	psReady := workOrderSnapshot("ps-ready")
+	_ = contract.SetSourceFrozen(psReady, true, contract.ReasonFrozen, "source frozen")
+	_ = contract.SetCondition(psReady, metav1.Condition{
+		Type:   contract.CondReady,
+		Status: metav1.ConditionTrue,
+		Reason: contract.ReasonSucceeded,
+	})
+
+	// 5. Snapshot on a different node: must NOT be touched
+	psOtherNode := workOrderSnapshot("ps-other-node")
+	_ = unstructured.SetNestedField(psOtherNode.Object, "node-b", "spec", "nodeName")
+	_ = contract.SetSourceFrozen(psOtherNode, true, contract.ReasonFrozen, "source frozen")
+
+	c := newClient(t, psFailed, psCancelled, psInProgress, psReady, psOtherNode)
+	ops := &fakeNodeOps{t: t}
+	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
+
+	if err := nr.SweepFrozenSources(ctx); err != nil {
+		t.Fatalf("SweepFrozenSources failed: %v", err)
+	}
+
+	if len(ops.unfrozen) != 3 {
+		t.Fatalf("expected 3 unready snapshots to be unfrozen, got %d: %v", len(ops.unfrozen), ops.unfrozen)
+	}
+
+	// Verify ps-failed, ps-cancelled, and ps-in-progress now have SourceFrozen=False
+	for _, name := range []string{"ps-failed", "ps-cancelled", "ps-in-progress"} {
+		snap := getSnapshot(t, c, name)
+		if contract.IsSourceFrozen(snap) {
+			t.Fatalf("snapshot %s must have SourceFrozen=False after startup sweep", name)
+		}
+	}
+
+	// Verify ps-ready still has SourceFrozen=True
+	readySnap := getSnapshot(t, c, "ps-ready")
+	if !contract.IsSourceFrozen(readySnap) {
+		t.Fatal("Ready snapshot must remain SourceFrozen=True after startup sweep")
+	}
+
+	// Verify ps-other-node still has SourceFrozen=True
+	otherSnap := getSnapshot(t, c, "ps-other-node")
+	if !contract.IsSourceFrozen(otherSnap) {
+		t.Fatal("other node snapshot must not be touched by startup sweep")
+	}
+}
+
 // newCRDClient builds a fake client that knows the apiextensions CRD kind as
 // unstructured (preflight reads CRDs unstructured).
 func newCRDClient(t *testing.T, objs ...client.Object) client.Client {

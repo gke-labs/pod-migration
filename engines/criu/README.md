@@ -88,18 +88,20 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      `manifest.json` to GCS with MD5/size verification, and marks the
      `PodSnapshot` `Ready=True` while keeping the source container frozen for
      cold eviction by the controller (eliminating lost acknowledged writes and
-     empty-state restarts). On any failure or cancel path (including after an
-     agent restart), the agent thaws (unfreezes) the source container task via
-     containerd using a fresh bounded context before reporting terminal `Failed`
-     or `Cancelled`, clearing `SourceFrozen` so the workload continues serving.
-     If the `PodSnapshotManualTrigger` is deleted first, the engine controller
+     empty-state restarts). On any failure or cancel path, the agent thaws
+     (unfreezes) the source container task via containerd using a fresh bounded
+     context before reporting terminal `Failed` or `Cancelled`, clearing
+     `SourceFrozen` so the workload continues serving. On startup, the agent
+     sweeps `PodSnapshot`s on its node with `SourceFrozen=True` and thaws any
+     that are not `Ready` (resuming tasks left paused if an agent crashed or
+     restarted). If the `PodSnapshotManualTrigger` is deleted first, the engine controller
      sets `Checkpoint=Unknown` with the reason `CancelRequested` (on a work
      order without a bucket, which no agent acts on, it records `Cancelled`
      itself), and the agent
-     also reads the trigger itself before the checkpoint and right before the
-     stop. A cancelled agent starts nothing new. It waits for an in-flight
+     also reads the trigger itself before the checkpoint and right before
+     committing. A cancelled agent starts nothing new. It waits for an in-flight
      kubelet checkpoint to return, because cancelling the call doesn't end the
-     freeze. It aborts uploads and doesn't stop the source container. It then
+     freeze. It aborts uploads and thaws the source container. It then
      marks `Checkpoint` and `Ready` `False` with the reason `Cancelled`
      (contract clause C9, #106). The agent needs `get` on
      `podsnapshotmanualtriggers` for this. If the dump outlasts the

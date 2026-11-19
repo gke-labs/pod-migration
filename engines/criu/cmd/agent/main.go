@@ -156,10 +156,6 @@ func (a *nodeOpsAdapter) Unfreeze(ctx context.Context, ns, pod, container string
 	return a.n.PSEngineUnfreezeContainer(ctx, ns, pod, container)
 }
 
-func (a *nodeOpsAdapter) StopContainer(ctx context.Context, ns, pod, container string) error {
-	return a.n.PSEngineStopContainer(ctx, ns, pod, container)
-}
-
 func (a *nodeOpsAdapter) Extract(tarPath, dstDir string) error {
 	return a.n.PSEngineExtract(tarPath, dstDir)
 }

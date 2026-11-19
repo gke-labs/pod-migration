@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -39,15 +40,18 @@ type fakeNodeOps struct {
 	failDump   bool
 	// checkpointErr, when set, is returned by Checkpoint (after afterCheckpoint).
 	checkpointErr error
+	freezeErr     error
+	unfreezeErr   error
 	stopped       []string
 	frozen        []string
 	unfrozen      []string
 	events        []string
 	t             *testing.T
 
+	beforeFreeze func()
 	// afterCheckpoint runs once the checkpoint is taken, before it returns.
 	afterCheckpoint func()
-	// beforeStop runs when StopContainer is called, before the stop.
+	// beforeStop runs when AfterCommit is called.
 	beforeStop func()
 	// blockCheckpoint, when set, is closed once the checkpoint starts; the
 	// call then blocks until releaseCheckpoint is closed or its context is
@@ -88,15 +92,18 @@ func (f *fakeNodeOps) Checkpoint(ctx context.Context, ns, pod, container string)
 }
 
 func (f *fakeNodeOps) Freeze(_ context.Context, ns, pod, container string) error {
+	if f.beforeFreeze != nil {
+		f.beforeFreeze()
+	}
 	f.events = append(f.events, "freeze")
 	f.frozen = append(f.frozen, ns+"/"+pod+"/"+container)
-	return nil
+	return f.freezeErr
 }
 
 func (f *fakeNodeOps) Unfreeze(_ context.Context, ns, pod, container string) error {
 	f.events = append(f.events, "unfreeze")
 	f.unfrozen = append(f.unfrozen, ns+"/"+pod+"/"+container)
-	return nil
+	return f.unfreezeErr
 }
 
 func (f *fakeNodeOps) AfterCommit() {
@@ -110,15 +117,6 @@ func (f *fakeNodeOps) AfterCommit() {
 func (f *fakeNodeOps) SourceInfo(_ context.Context, ns, pod, container string) ([]byte, string, error) {
 	f.events = append(f.events, "sourceinfo")
 	return []byte(`{"ociVersion":"1.1.0"}`), "docker.io/library/redis:7", nil
-}
-
-func (f *fakeNodeOps) StopContainer(_ context.Context, ns, pod, container string) error {
-	if f.beforeStop != nil {
-		f.beforeStop()
-	}
-	f.events = append(f.events, "stop")
-	f.stopped = append(f.stopped, ns+"/"+pod+"/"+container)
-	return nil
 }
 
 // memStore is an in-memory ObjectStore recording write order.
@@ -297,4 +295,148 @@ func TestNodePipelineIgnoresOtherNodesAndForeignSnapshots(t *testing.T) {
 func md5b64(data []byte) string {
 	sum := md5.Sum(data) //nolint:gosec
 	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// TestPipeline_RecordSourceFrozenBeforePause pins that SourceFrozen=True is
+// written to the API server BEFORE containerd task pause is executed (#148).
+func TestPipeline_RecordSourceFrozenBeforePause(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	store := newMemStore()
+
+	pauseObservedFrozen := false
+	ops.beforeFreeze = func() {
+		// When Freeze is called, SourceFrozen=True must ALREADY be recorded on the CR.
+		current := getSnapshot(t, c, "ps-web-0-deadbeef")
+		if contract.IsSourceFrozen(current) {
+			pauseObservedFrozen = true
+		}
+	}
+
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !pauseObservedFrozen {
+		t.Fatal("SourceFrozen=True must be recorded on the snapshot BEFORE task Pause is invoked")
+	}
+}
+
+// TestPipeline_FailedThawLeavesSourceFrozenAndRetries pins that if Unfreeze
+// returns an error on pipeline failure, the outcome is NOT settled as Failed,
+// SourceFrozen remains True, and Reconcile returns an error so it retries (#148).
+func TestPipeline_FailedThawLeavesSourceFrozenAndRetries(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{
+		failDump:    true,
+		unfreezeErr: errors.New("containerd unfreeze connection error"),
+		t:           t,
+	}
+	store := newMemStore()
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err == nil {
+		t.Fatal("expected error on failed unfreeze, got nil")
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatal("expected requeue on failed unfreeze")
+	}
+
+	got := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("failed unfreeze must leave SourceFrozen=True so controller keeps fence")
+	}
+	// Checkpoint condition must NOT be settled as Failed when unfreeze failed.
+	cond := condition(got, contract.CondCheckpoint)
+	if cond != nil && cond.Reason == contract.ReasonFailed {
+		t.Fatalf("checkpoint must not settle with ReasonFailed when thaw failed, got %+v", cond)
+	}
+}
+
+// TestPipeline_FailedFreezeThawsSource pins that if Freeze fails, Unfreeze is
+// called to clean up any partial state (#148).
+func TestPipeline_FailedFreezeThawsSource(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{
+		freezeErr: errors.New("containerd pause failed"),
+		t:         t,
+	}
+	store := newMemStore()
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops.unfrozen) == 0 {
+		t.Fatal("failed freeze must attempt to unfreeze container")
+	}
+	got := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if contract.IsSourceFrozen(got) {
+		t.Fatal("failed freeze with successful unfreeze must clear SourceFrozen")
+	}
+	cond := condition(got, contract.CondCheckpoint)
+	if cond == nil || cond.Reason != contract.ReasonFailed {
+		t.Fatalf("want Failed outcome, got %+v", cond)
+	}
+}
+
+// TestPipeline_ShutdownCallsUnfreeze pins that agent shutdown (context cancelled)
+// thaws the source container so clients aren't hung while the agent restarts (#148).
+func TestPipeline_ShutdownCallsUnfreeze(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ctx, cancel := context.WithCancel(context.Background())
+	ops := &fakeNodeOps{
+		checkpointErr: context.Canceled,
+		t:             t,
+	}
+	cancel()
+	store := newMemStore()
+
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+	if len(ops.unfrozen) == 0 {
+		t.Fatal("agent shutdown must call Unfreeze on source container")
+	}
+}
+
+// TestPipeline_ErrFinishedThawsSourceIfNotReady pins that if an outcome is
+// written by someone else (e.g. Refused/Failed) mid-pipeline, the agent thaws
+// the frozen source container instead of abandoning it frozen (#148).
+func TestPipeline_ErrFinishedThawsSourceIfNotReady(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
+	store := newMemStore()
+
+	// Simulate someone writing Refused outcome mid-pipeline after freeze.
+	ops.afterCheckpoint = func() {
+		snap := getSnapshot(t, c, "ps-web-0-deadbeef")
+		_ = contract.SetCondition(snap, metav1.Condition{
+			Type:    contract.CondCheckpoint,
+			Status:  metav1.ConditionFalse,
+			Reason:  contract.ReasonRefused,
+			Message: "node demoted mid-run",
+		})
+		_ = c.Status().Update(context.Background(), snap)
+	}
+
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops.unfrozen) != 1 {
+		t.Fatalf("errFinished on unready snapshot must thaw source: unfrozen=%v", ops.unfrozen)
+	}
+	got := getSnapshot(t, c, "ps-web-0-deadbeef")
+	if contract.IsSourceFrozen(got) {
+		t.Fatal("SourceFrozen must be cleared to false when thawed on errFinished")
+	}
 }
