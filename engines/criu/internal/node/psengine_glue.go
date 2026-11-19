@@ -24,6 +24,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -32,6 +33,7 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // PSEngineCheckpoint drives the kubelet ContainerCheckpoint API and validates
@@ -39,6 +41,11 @@ import (
 func (r *Node) PSEngineCheckpoint(ctx context.Context, ns, pod, container string) (string, error) {
 	res, err := r.Kubelet.checkpoint(ctx, ns, pod, container)
 	if err != nil {
+		if errors.Is(err, ErrContainerdCachedCRIU) {
+			if demoteErr := r.DemoteNode(ctx, ReasonContainerdCachedCRIU, RemediationRestartContainerd); demoteErr != nil {
+				logf.FromContext(ctx).Error(demoteErr, "failed to annotate node unready after containerd cached CRIU failure", "node", r.NodeName)
+			}
+		}
 		return "", err
 	}
 	if err := validateCheckpointTarFile(res.TarPath); err != nil {

@@ -73,6 +73,12 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
      `nsenter`, and stamps `pod-migrate.io/criu-ready` and
      `pod-migrate.io/criu-version` on the `Node`.
+     If containerd cached a failed CRIU lookup (e.g. before criu was on its PATH),
+     the agent marks the node `pod-migrate.io/criu-ready: false` with reason and
+     remediation annotations (`pod-migrate.io/criu-reason` and `pod-migrate.io/criu-remediation`).
+     The agent mounts `/run/containerd` and continuously probes containerd's socket;
+     once containerd restarts, the agent automatically detects the new socket inode,
+     re-runs readiness verification, and restores `pod-migrate.io/criu-ready: true`.
    - Reconciles `PodSnapshot` work orders scheduled on its node
      (`psengine.NodeSnapshotReconciler`): implements the `Frozen` fencing mode
      (contract clause C4, #148). Pauses (freezes) the source container task via
