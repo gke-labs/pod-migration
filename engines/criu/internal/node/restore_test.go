@@ -17,6 +17,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -41,23 +43,26 @@ func init() {
 
 type fakeContainer struct {
 	containerd.Container
-	id      string
-	labels  map[string]string
-	spec    *specs.Spec
-	info    containers.Container
-	task    containerd.Task
-	taskErr error
+	id        string
+	labels    map[string]string
+	labelsErr error
+	spec      *specs.Spec
+	specErr   error
+	info      containers.Container
+	infoErr   error
+	task      containerd.Task
+	taskErr   error
 }
 
 func (f *fakeContainer) ID() string { return f.id }
 func (f *fakeContainer) Labels(context.Context) (map[string]string, error) {
-	return f.labels, nil
+	return f.labels, f.labelsErr
 }
 func (f *fakeContainer) Spec(context.Context) (*specs.Spec, error) {
-	return f.spec, nil
+	return f.spec, f.specErr
 }
 func (f *fakeContainer) Info(context.Context, ...containerd.InfoOpts) (containers.Container, error) {
-	return f.info, nil
+	return f.info, f.infoErr
 }
 func (f *fakeContainer) Task(context.Context, cio.Attach) (containerd.Task, error) {
 	return f.task, f.taskErr
@@ -175,6 +180,132 @@ func TestFindContainer_PidZeroContinuation(t *testing.T) {
 	}
 	if ref.Pid != 2002 {
 		t.Fatalf("findContainer returned Pid %d, want 2002", ref.Pid)
+	}
+}
+
+func TestFindContainer_SkipsNotFoundAcrossLabelsSpecInfo(t *testing.T) {
+	spec := &specs.Spec{
+		Annotations: map[string]string{
+			"io.kubernetes.cri.sandbox-id": "sb-123",
+		},
+	}
+	info := containers.Container{Image: "test-image:v1"}
+
+	targetLabels := map[string]string{
+		"io.kubernetes.pod.namespace":  "test-ns",
+		"io.kubernetes.pod.name":       "test-pod",
+		"io.kubernetes.container.name": "app",
+		"io.cri-containerd.kind":       "container",
+		"io.kubernetes.pod.uid":        "target-uid-222",
+	}
+
+	cLabelsNotFound := &fakeContainer{
+		id:        "c-labels-not-found",
+		labelsErr: errdefs.ErrNotFound,
+	}
+	cSpecNotFound := &fakeContainer{
+		id:      "c-spec-not-found",
+		labels:  targetLabels,
+		specErr: errdefs.ErrNotFound,
+	}
+	cInfoNotFound := &fakeContainer{
+		id:      "c-info-not-found",
+		labels:  targetLabels,
+		spec:    spec,
+		infoErr: errdefs.ErrNotFound,
+	}
+	cTarget := &fakeContainer{
+		id:     "c-target",
+		labels: targetLabels,
+		spec:   spec,
+		info:   info,
+		task:   &fakeTask{pid: 3003},
+	}
+
+	r := &restorer{
+		listContainersFn: func(ctx context.Context) ([]containerd.Container, error) {
+			return []containerd.Container{cLabelsNotFound, cSpecNotFound, cInfoNotFound, cTarget}, nil
+		},
+	}
+
+	ref, err := r.findContainer(context.Background(), "test-ns", "test-pod", "target-uid-222", "app")
+	if err != nil {
+		t.Fatalf("findContainer failed: %v", err)
+	}
+	if ref.ID != "c-target" {
+		t.Fatalf("findContainer returned ID %q, want c-target", ref.ID)
+	}
+	if ref.Pid != 3003 {
+		t.Fatalf("findContainer returned Pid %d, want 3003", ref.Pid)
+	}
+}
+
+func TestFindContainer_PropagatesRPCErrorAcrossLabelsSpecInfo(t *testing.T) {
+	spec := &specs.Spec{
+		Annotations: map[string]string{
+			"io.kubernetes.cri.sandbox-id": "sb-123",
+		},
+	}
+	targetLabels := map[string]string{
+		"io.kubernetes.pod.namespace":  "test-ns",
+		"io.kubernetes.pod.name":       "test-pod",
+		"io.kubernetes.container.name": "app",
+		"io.cri-containerd.kind":       "container",
+		"io.kubernetes.pod.uid":        "target-uid-222",
+	}
+
+	tests := []struct {
+		name       string
+		container  *fakeContainer
+		wantErrSub string
+	}{
+		{
+			name: "labels transport error propagates",
+			container: &fakeContainer{
+				id:        "c-labels-err",
+				labelsErr: errors.New("daemon transport disconnected"),
+			},
+			wantErrSub: "containerd labels for c-labels-err: daemon transport disconnected",
+		},
+		{
+			name: "spec rpc error propagates",
+			container: &fakeContainer{
+				id:      "c-spec-err",
+				labels:  targetLabels,
+				specErr: errors.New("rpc timeout getting spec"),
+			},
+			wantErrSub: "containerd spec for c-spec-err: rpc timeout getting spec",
+		},
+		{
+			name: "info rpc error propagates",
+			container: &fakeContainer{
+				id:      "c-info-err",
+				labels:  targetLabels,
+				spec:    spec,
+				infoErr: errors.New("rpc internal error getting info"),
+			},
+			wantErrSub: "containerd info for c-info-err: rpc internal error getting info",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &restorer{
+				listContainersFn: func(ctx context.Context) ([]containerd.Container, error) {
+					return []containerd.Container{tt.container}, nil
+				},
+			}
+			_, err := r.findContainer(context.Background(), "test-ns", "test-pod", "target-uid-222", "app")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErrSub, err)
+			}
+			if errors.Is(err, ErrContainerNotFound) {
+				t.Fatalf("rpc transport error must not be masked as ErrContainerNotFound: %v", err)
+			}
+		})
 	}
 }
 
