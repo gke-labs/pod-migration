@@ -22,7 +22,6 @@ package node
 import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 
 	"context"
 	"fmt"
@@ -41,8 +40,7 @@ import (
 // capability probe.
 type Node struct {
 	client.Client
-	APIReader client.Reader
-	NodeName  string
+	NodeName string
 
 	Kubelet  *kubeletCheckpoint
 	Restorer *restorer
@@ -57,8 +55,9 @@ type Node struct {
 	unreadyReason      string
 	unreadyRemediation string
 
-	statSocketFn func(string) (uint64, error)
-	bootstrapFn  func(context.Context) error
+	statSocketFn    func(string) (uint64, error)
+	installBundleFn func() (string, error)
+	bootstrapFn     func(context.Context) error
 }
 
 // NewNode wires the node worker against containerd and the local kubelet
@@ -69,13 +68,16 @@ func NewNode(c client.Client, nodeName string) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
+	r := newRestorer(cc)
 	return &Node{
-		Client:       c,
-		NodeName:     nodeName,
-		Kubelet:      newKubeletCheckpoint(),
-		Restorer:     newRestorer(cc),
-		SocketPath:   "/run/containerd/containerd.sock",
-		statSocketFn: getSocketInode,
+		Client:          c,
+		NodeName:        nodeName,
+		Kubelet:         newKubeletCheckpoint(),
+		Restorer:        r,
+		SocketPath:      "/run/containerd/containerd.sock",
+		statSocketFn:    getSocketInode,
+		installBundleFn: installCRIUBundle,
+		Inspector:       NewDefaultContainerdInspector(r.execHost),
 	}, nil
 }
 
@@ -117,21 +119,19 @@ func (n *Node) recordSocketInodeLocked() {
 
 func (n *Node) bootstrapInternal(ctx context.Context) error {
 	log := logf.FromContext(ctx)
-	r := n.APIReader
-	if r == nil {
-		r = n.Client
-	}
 	var nodeObj corev1.Node
-	if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return true }, func() error {
-		return r.Get(ctx, types.NamespacedName{Name: n.NodeName}, &nodeObj)
-	}); err != nil {
+	if err := n.Client.Get(ctx, types.NamespacedName{Name: n.NodeName}, &nodeObj); err != nil {
 		return err
 	}
 	if err := CheckContainerdVersion(nodeObj.Status.NodeInfo.ContainerRuntimeVersion); err != nil {
-		_ = annotateNode(ctx, n.Client, n.APIReader, n.NodeName, "", "unsupported containerd version: "+err.Error(), "upgrade containerd", false)
+		_ = annotateNode(ctx, n.Client, n.NodeName, "", "unsupported containerd version: "+err.Error(), "upgrade containerd", false)
 		return err
 	}
-	version, err := installCRIUBundle()
+	installFn := n.installBundleFn
+	if installFn == nil {
+		installFn = installCRIUBundle
+	}
+	version, err := installFn()
 	if err != nil {
 		return err
 	}
@@ -139,9 +139,11 @@ func (n *Node) bootstrapInternal(ctx context.Context) error {
 	log.Info("criu capability", "version", version, "checkAll", ok, "raw", truncate(raw, 200))
 
 	var reason, remediation string
+	var deterministicFailure bool
 	if !ok {
 		reason = "criu check --all failed"
 		remediation = "check host kernel support for CRIU"
+		deterministicFailure = true
 	} else {
 		// Kernel check passed; verify containerd readiness so an unready containerd
 		// is never sent a checkpoint that would poison its lookup cache (#130).
@@ -169,10 +171,17 @@ func (n *Node) bootstrapInternal(ctx context.Context) error {
 	n.mu.Lock()
 	n.version = version
 	n.ready = ok
-	n.recordSocketInodeLocked()
+	if ok || deterministicFailure {
+		n.recordSocketInodeLocked()
+	} else {
+		// Readiness check failure or transient error: do NOT commit socket inode.
+		// Leaving lastSocketInode uncommitted allows ProbeReadiness to re-probe
+		// without requiring a containerd restart.
+		n.lastSocketInode = 0
+	}
 	n.mu.Unlock()
 
-	return annotateNode(ctx, n.Client, n.APIReader, n.NodeName, version, reason, remediation, ok)
+	return annotateNode(ctx, n.Client, n.NodeName, version, reason, remediation, ok)
 }
 
 // DemoteNode marks the node unready with reason and remediation, preserving existing version.
@@ -185,7 +194,7 @@ func (n *Node) DemoteNode(ctx context.Context, reason, remediation string) error
 	ver := n.version
 	n.mu.Unlock()
 
-	return annotateNode(ctx, n.Client, n.APIReader, n.NodeName, ver, reason, remediation, false)
+	return annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false)
 }
 
 // IsReady returns whether the node is currently considered CRIU-ready.
@@ -197,8 +206,8 @@ func (n *Node) IsReady() bool {
 
 // ProbeReadiness checks whether conditions have changed to restore node readiness.
 // If the node is currently unready, it checks whether containerd was restarted
-// (new socket inode). If a new socket inode is detected, it re-runs Bootstrap
-// to re-verify CRIU and restore node readiness.
+// (new socket inode) or whether an earlier readiness check failed without poisoning
+// containerd (lastSocketInode == 0), re-running Bootstrap to re-evaluate CRIU.
 func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 	n.mu.Lock()
 	isReady := n.ready
@@ -221,8 +230,8 @@ func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	if currIno != 0 && currIno != lastIno {
-		logf.FromContext(ctx).Info("containerd restart detected, re-probing CRIU readiness",
+	if currIno != 0 && (lastIno == 0 || currIno != lastIno) {
+		logf.FromContext(ctx).Info("containerd restart or readiness re-probe triggered",
 			"oldSocketInode", lastIno, "newSocketInode", currIno)
 		if err := n.Bootstrap(ctx); err != nil {
 			return false, err

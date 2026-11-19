@@ -16,6 +16,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -81,7 +82,10 @@ func TestParseCRIUVersionCode(t *testing.T) {
 
 func TestParseContainerdConfig(t *testing.T) {
 	t.Run("default empty config", func(t *testing.T) {
-		enableCRIU, shimPath := parseContainerdConfig(nil)
+		enableCRIU, shimPath, err := parseContainerdConfig(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if enableCRIU != nil {
 			t.Errorf("expected enableCRIU nil, got %v", *enableCRIU)
 		}
@@ -90,64 +94,89 @@ func TestParseContainerdConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("enable_criu = false top-level", func(t *testing.T) {
+	t.Run("enable_criu = false inside cri v1 plugin", func(t *testing.T) {
 		cfg := []byte(`
 version = 2
-enable_criu = false
+[plugins."io.containerd.grpc.v1.cri"]
+  enable_criu = false
 `)
-		enableCRIU, _ := parseContainerdConfig(cfg)
+		enableCRIU, _, err := parseContainerdConfig(cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if enableCRIU == nil || *enableCRIU != false {
 			t.Fatalf("expected enableCRIU == false, got %v", enableCRIU)
 		}
 	})
 
-	t.Run("enable_criu = true inside runtime plugin", func(t *testing.T) {
+	t.Run("enable_criu = false inside cri v2 runtime plugin", func(t *testing.T) {
 		cfg := []byte(`
 version = 2
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-  enable_criu = true
+[plugins."io.containerd.cri.v1.runtime"]
+  enable_criu = false
 `)
-		enableCRIU, _ := parseContainerdConfig(cfg)
-		if enableCRIU == nil || *enableCRIU != true {
-			t.Fatalf("expected enableCRIU == true, got %v", enableCRIU)
+		enableCRIU, _, err := parseContainerdConfig(cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if enableCRIU == nil || *enableCRIU != false {
+			t.Fatalf("expected enableCRIU == false, got %v", enableCRIU)
 		}
 	})
 
-	t.Run("commented enable_criu ignored", func(t *testing.T) {
+	t.Run("enable_criu = true inside cri plugin", func(t *testing.T) {
 		cfg := []byte(`
-# enable_criu = false
 version = 2
+[plugins."io.containerd.grpc.v1.cri"]
+  enable_criu = true
 `)
-		enableCRIU, _ := parseContainerdConfig(cfg)
-		if enableCRIU != nil {
-			t.Fatalf("expected enableCRIU nil, got %v", *enableCRIU)
+		enableCRIU, _, err := parseContainerdConfig(cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if enableCRIU == nil || *enableCRIU != true {
+			t.Fatalf("expected enableCRIU == true, got %v", enableCRIU)
 		}
 	})
 
 	t.Run("shim manager env path extracted", func(t *testing.T) {
 		cfg := []byte(`
 version = 2
-[plugins."io.containerd.v1.shim"]
+[plugins."io.containerd.shim.v1.manager"]
   env = ["FOO=BAR", "PATH=/opt/containerd/bin:/usr/local/sbin", "BAZ=QUX"]
 `)
-		_, shimPath := parseContainerdConfig(cfg)
+		_, shimPath, err := parseContainerdConfig(cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if shimPath != "/opt/containerd/bin:/usr/local/sbin" {
 			t.Fatalf("unexpected shimPath: %q", shimPath)
 		}
 	})
 
-	t.Run("multiline shim manager env array", func(t *testing.T) {
+	t.Run("unrelated plugin env does not override shim manager", func(t *testing.T) {
 		cfg := []byte(`
-[plugins."io.containerd.runc.v2"]
-  env = [
-    "VAR=1",
-    "PATH=/custom/shim/bin",
-    "OTHER=2"
-  ]
+version = 2
+[plugins."io.containerd.other.plugin"]
+  env = ["PATH=/should/not/match"]
+
+[plugins."io.containerd.shim.v1.manager"]
+  env = ["PATH=/correct/shim/path"]
 `)
-		_, shimPath := parseContainerdConfig(cfg)
-		if shimPath != "/custom/shim/bin" {
+		_, shimPath, err := parseContainerdConfig(cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if shimPath != "/correct/shim/path" {
 			t.Fatalf("unexpected shimPath: %q", shimPath)
+		}
+	})
+
+	t.Run("malformed toml returns error", func(t *testing.T) {
+		cfg := []byte(`this is not toml [ [ invalid`)
+		_, _, err := parseContainerdConfig(cfg)
+		if err == nil {
+			t.Fatal("expected error on malformed toml")
 		}
 	})
 }
@@ -196,13 +225,21 @@ func TestResolveCRIUPath(t *testing.T) {
 		}
 	})
 
-	t.Run("relative dirs in shimPath are ignored", func(t *testing.T) {
-		got, err := resolveCRIUPath("relative/bin", "", statFn)
+	t.Run("relative dirs in shimPath or containerd PATH are skipped", func(t *testing.T) {
+		got, err := resolveCRIUPath("relative/bin:.", "", statFn)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if got != "" {
 			t.Fatalf("expected empty resolution, got %q", got)
+		}
+
+		gotPath, err := resolveCRIUPath("", "relative/bin::.", statFn)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotPath != "" {
+			t.Fatalf("expected empty resolution, got %q", gotPath)
 		}
 	})
 
@@ -213,6 +250,85 @@ func TestResolveCRIUPath(t *testing.T) {
 		}
 		if got != "" {
 			t.Fatalf("expected empty resolution for non-executable file, got %q", got)
+		}
+	})
+}
+
+func TestStatFileInRoot_SymlinkResolution(t *testing.T) {
+	root := t.TempDir()
+
+	optBin := filepath.Join(root, "opt", "criu", "bin")
+	if err := os.MkdirAll(optBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realCriu := filepath.Join(optBin, "criu")
+	if err := os.WriteFile(realCriu, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	usrBin := filepath.Join(root, "usr", "bin")
+	if err := os.MkdirAll(usrBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Absolute symlink inside root pointing to /opt/criu/bin/criu
+	if err := os.Symlink("/opt/criu/bin/criu", filepath.Join(usrBin, "criu")); err != nil {
+		t.Fatal(err)
+	}
+
+	usrLocalBin := filepath.Join(root, "usr", "local", "bin")
+	if err := os.MkdirAll(usrLocalBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Relative symlink: /usr/local/bin/criu -> ../../bin/criu
+	if err := os.Symlink("../../bin/criu", filepath.Join(usrLocalBin, "criu")); err != nil {
+		t.Fatal(err)
+	}
+
+	loopDir := filepath.Join(root, "loop")
+	if err := os.MkdirAll(loopDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/loop/b", filepath.Join(loopDir, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/loop/a", filepath.Join(loopDir, "b")); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("resolves absolute symlink within root", func(t *testing.T) {
+		fi, err := StatFileInRoot(root, "/usr/bin/criu")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if fi.Mode()&0o111 == 0 {
+			t.Fatal("expected executable mode")
+		}
+	})
+
+	t.Run("resolves relative symlink within root", func(t *testing.T) {
+		fi, err := StatFileInRoot(root, "/usr/local/bin/criu")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if fi.Mode()&0o111 == 0 {
+			t.Fatal("expected executable mode")
+		}
+	})
+
+	t.Run("detects symlink loop", func(t *testing.T) {
+		_, err := StatFileInRoot(root, "/loop/a")
+		if err == nil {
+			t.Fatal("expected error on symlink loop")
+		}
+		if !strings.Contains(err.Error(), "too many levels of symbolic links") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("non-existent file returns error", func(t *testing.T) {
+		_, err := StatFileInRoot(root, "/missing/file")
+		if err == nil {
+			t.Fatal("expected error on missing file")
 		}
 	})
 }
@@ -243,7 +359,7 @@ func (f *fakeContainerdEnv) toInspector() *ContainerdReadinessInspector {
 		ReadConfig: func(pid int) ([]byte, error) {
 			return f.configData, nil
 		},
-		StatFile: func(path string) (os.FileInfo, error) {
+		StatContainerdFile: func(pid int, path string) (os.FileInfo, error) {
 			mode, ok := f.files[path]
 			if !ok {
 				return nil, os.ErrNotExist
@@ -305,9 +421,6 @@ func TestCheckContainerdReadiness_FakeContainerd(t *testing.T) {
 	})
 
 	t.Run("COS repro from #130: criu installed only in /home/kubernetes/bin not on containerd PATH", func(t *testing.T) {
-		// On COS, containerd PATH lacks /home/kubernetes/bin.
-		// If CRIU is only installed there, containerd will fail and cache the failure.
-		// CheckContainerdReadiness must reject this to prevent node poisoning!
 		env := &fakeContainerdEnv{
 			pid: 1001,
 			environ: []string{
@@ -337,7 +450,9 @@ func TestCheckContainerdReadiness_FakeContainerd(t *testing.T) {
 				"PATH=/usr/local/sbin:/usr/bin",
 			},
 			configData: []byte(`
-enable_criu = false
+version = 2
+[plugins."io.containerd.grpc.v1.cri"]
+  enable_criu = false
 `),
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
@@ -366,20 +481,22 @@ enable_criu = false
 				"PATH=/usr/bin",
 			},
 			configData: []byte(`
-[plugins."io.containerd.v1.shim"]
+version = 2
+[plugins."io.containerd.shim.v1.manager"]
   env = ["PATH=/opt/containerd/bin"]
 `),
 			files: map[string]fs.FileMode{
 				"/opt/containerd/bin/criu": 0o755,
+				"/usr/bin/criu":            0o755,
 			},
 			criuVersionOut: "Version: 4.0",
 		}
-		ok, _, _, err := CheckContainerdReadiness(env.toInspector(), "/run/containerd/containerd.sock")
+		ok, reason, _, err := CheckContainerdReadiness(env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if !ok {
-			t.Fatal("expected ok=true when shim PATH contains CRIU")
+			t.Fatalf("expected ok=true with shim PATH, got reason=%q", reason)
 		}
 	})
 
@@ -390,7 +507,8 @@ enable_criu = false
 				"PATH=/usr/local/sbin",
 			},
 			configData: []byte(`
-[plugins."io.containerd.v1.shim"]
+version = 2
+[plugins."io.containerd.shim.v1.manager"]
   env = ["PATH=/opt/containerd/bin"]
 `),
 			files: map[string]fs.FileMode{
@@ -419,14 +537,14 @@ enable_criu = false
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 3.15.2\n", // < 3.16.0
+			criuVersionOut: "Version: 3.15.2\n",
 		}
 		ok, reason, remediation, err := CheckContainerdReadiness(env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if ok {
-			t.Fatal("expected ok=false for CRIU version < 3.16.0")
+			t.Fatal("expected ok=false for outdated CRIU version")
 		}
 		if !strings.Contains(reason, "older than minimum supported version 3.16.0") {
 			t.Fatalf("unexpected reason: %q", reason)
@@ -435,6 +553,34 @@ enable_criu = false
 			t.Fatalf("unexpected remediation: %q", remediation)
 		}
 	})
+}
+
+func TestEnvironNULSeparation(t *testing.T) {
+	raw := []byte("PATH=/bin\x00FOO=BAR\x00")
+	parts := bytes.Split(raw, []byte{0})
+	var env []string
+	for _, p := range parts {
+		if len(p) > 0 {
+			env = append(env, string(p))
+		}
+	}
+	if len(env) != 2 || env[0] != "PATH=/bin" || env[1] != "FOO=BAR" {
+		t.Fatalf("unexpected env parsing: %v", env)
+	}
+}
+
+func TestGetCRIUVersion_NoLocalExecFallback(t *testing.T) {
+	insp := NewDefaultContainerdInspector(func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+		return "", errors.New("host exec denied")
+	})
+
+	_, err := insp.GetCRIUVersion("/usr/bin/criu")
+	if err == nil {
+		t.Fatal("expected error when execHost fails")
+	}
+	if !strings.Contains(err.Error(), "host exec denied") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestNode_Bootstrap_WithContainerdReadiness(t *testing.T) {
@@ -456,13 +602,21 @@ func TestNode_Bootstrap_WithContainerdReadiness(t *testing.T) {
 
 		nd := &Node{
 			Client:     c,
-			APIReader:  c,
 			NodeName:   "test-node",
 			SocketPath: "/run/containerd/containerd.sock",
 			statSocketFn: func(string) (uint64, error) {
 				return 12345, nil
 			},
+			installBundleFn: func() (string, error) {
+				return "4.0", nil
+			},
 			Inspector: env.toInspector(),
+			Restorer: &restorer{
+				execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+					// Mock host kernel check passing
+					return "Looks good.", nil
+				},
+			},
 		}
 		return nd, nodeObj
 	}
@@ -473,7 +627,11 @@ func TestNode_Bootstrap_WithContainerdReadiness(t *testing.T) {
 			environ: []string{
 				"PATH=/usr/local/sbin",
 			},
-			configData: []byte("enable_criu = false\n"),
+			configData: []byte(`
+version = 2
+[plugins."io.containerd.grpc.v1.cri"]
+  enable_criu = false
+`),
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
@@ -481,21 +639,13 @@ func TestNode_Bootstrap_WithContainerdReadiness(t *testing.T) {
 		}
 		nd, _ := setupNode(env)
 
-		// Create bundle dir so installCRIUBundle doesn't fail
-		tmpDir := t.TempDir()
-		oldBundle := imageBundleDir
-		defer func() { _ = oldBundle }()
+		// Call real Bootstrap!
+		if err := nd.Bootstrap(ctx); err != nil {
+			t.Fatalf("Bootstrap error: %v", err)
+		}
 
-		// Verify CheckContainerdReadiness directly through node logic
-		cOk, cReason, cRemediation, err := CheckContainerdReadiness(nd.Inspector, nd.SocketPath)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if cOk {
-			t.Fatal("expected cOk == false")
-		}
-		if err := nd.DemoteNode(ctx, cReason, cRemediation); err != nil {
-			t.Fatalf("DemoteNode: %v", err)
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false")
 		}
 
 		var cur corev1.Node
@@ -503,14 +653,120 @@ func TestNode_Bootstrap_WithContainerdReadiness(t *testing.T) {
 			t.Fatalf("get node: %v", err)
 		}
 		if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
-			t.Fatalf("expected criu-ready=false, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+			t.Errorf("expected criu-ready: false, got %q", cur.Annotations[NodeAnnotationCRIUReady])
 		}
 		if cur.Annotations[NodeAnnotationCRIUReason] != ReasonCRIUDisabledByConfig {
-			t.Fatalf("expected reason %q, got %q", ReasonCRIUDisabledByConfig, cur.Annotations[NodeAnnotationCRIUReason])
+			t.Errorf("expected reason %q, got %q", ReasonCRIUDisabledByConfig, cur.Annotations[NodeAnnotationCRIUReason])
 		}
 		if cur.Annotations[NodeAnnotationCRIURemediation] != RemediationEnableCRIUConfig {
-			t.Fatalf("expected remediation %q, got %q", RemediationEnableCRIUConfig, cur.Annotations[NodeAnnotationCRIURemediation])
+			t.Errorf("expected remediation %q, got %q", RemediationEnableCRIUConfig, cur.Annotations[NodeAnnotationCRIURemediation])
 		}
-		_ = tmpDir
+	})
+
+	t.Run("bootstrap marks ready: true when containerd readiness passes", func(t *testing.T) {
+		env := &fakeContainerdEnv{
+			pid: 1001,
+			environ: []string{
+				"PATH=/usr/local/sbin",
+			},
+			files: map[string]fs.FileMode{
+				"/usr/local/sbin/criu": 0o755,
+			},
+			criuVersionOut: "Version: 4.0",
+		}
+		nd, _ := setupNode(env)
+
+		if err := nd.Bootstrap(ctx); err != nil {
+			t.Fatalf("Bootstrap error: %v", err)
+		}
+
+		if !nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == true")
+		}
+
+		var cur corev1.Node
+		if err := nd.Client.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "true" {
+			t.Errorf("expected criu-ready: true, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+		if cur.Annotations[NodeAnnotationCRIUReason] != "" {
+			t.Errorf("expected empty reason, got %q", cur.Annotations[NodeAnnotationCRIUReason])
+		}
+	})
+
+	t.Run("readiness check failure leaves socket inode uncommitted so ProbeReadiness retries without restart", func(t *testing.T) {
+		env := &fakeContainerdEnv{
+			pid: 1001,
+			environ: []string{
+				"PATH=/usr/local/sbin",
+			},
+			// Initially criu is missing from PATH
+			files:          map[string]fs.FileMode{},
+			criuVersionOut: "Version: 4.0",
+		}
+		nd, _ := setupNode(env)
+
+		if err := nd.Bootstrap(ctx); err != nil {
+			t.Fatalf("Bootstrap error: %v", err)
+		}
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false initially")
+		}
+
+		// Now administrator installs criu on PATH without restarting containerd (socket inode unchanged 12345)
+		env.files["/usr/local/sbin/criu"] = 0o755
+
+		// ProbeReadiness should re-probe and transition to ready!
+		ready, err := nd.ProbeReadiness(ctx)
+		if err != nil {
+			t.Fatalf("ProbeReadiness error: %v", err)
+		}
+		if !ready || !nd.IsReady() {
+			t.Fatal("expected ProbeReadiness to restore node readiness without containerd restart")
+		}
+
+		var cur corev1.Node
+		if err := nd.Client.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "true" {
+			t.Errorf("expected criu-ready: true, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+	})
+
+	t.Run("kernel failure commits socket inode and goes quiet until restart", func(t *testing.T) {
+		env := &fakeContainerdEnv{
+			pid: 1001,
+			environ: []string{
+				"PATH=/usr/local/sbin",
+			},
+			files: map[string]fs.FileMode{
+				"/usr/local/sbin/criu": 0o755,
+			},
+			criuVersionOut: "Version: 4.0",
+		}
+		nd, _ := setupNode(env)
+		// Mock host kernel check failing
+		nd.Restorer.execHost = func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "Error (check.c:123): Kernel lacks support", errors.New("check failed")
+		}
+
+		if err := nd.Bootstrap(ctx); err != nil {
+			t.Fatalf("Bootstrap error: %v", err)
+		}
+		if nd.IsReady() {
+			t.Fatal("expected unready on kernel check failure")
+		}
+
+		// ProbeReadiness on unchanged socket inode 12345 must stay quiet (return false, nil without re-running)
+		reProbed, err := nd.ProbeReadiness(ctx)
+		if err != nil {
+			t.Fatalf("ProbeReadiness error: %v", err)
+		}
+		if reProbed {
+			t.Fatal("expected ProbeReadiness to stay unready and quiet")
+		}
 	})
 }

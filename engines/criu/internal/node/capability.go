@@ -27,7 +27,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -129,38 +128,31 @@ func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, st
 }
 
 // annotateNode publishes the node's CRIU capability verdict, version, and optional reason/remediation.
-// It retries on conflict and uses the provided live reader (if any) to bypass the cache.
-func annotateNode(ctx context.Context, c client.Client, reader client.Reader, nodeName, version, reason, remediation string, ready bool) error {
-	r := reader
-	if r == nil {
-		r = c
+func annotateNode(ctx context.Context, c client.Client, nodeName, version, reason, remediation string, ready bool) error {
+	var node corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		return err
 	}
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		var node corev1.Node
-		if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
-			return err
+	patch := client.MergeFrom(node.DeepCopy())
+	if node.Annotations == nil {
+		node.Annotations = map[string]string{}
+	}
+	node.Annotations[NodeAnnotationCRIUReady] = fmt.Sprintf("%t", ready)
+	if version != "" {
+		node.Annotations[NodeAnnotationCRIUVersion] = version
+	}
+	if ready {
+		delete(node.Annotations, NodeAnnotationCRIUReason)
+		delete(node.Annotations, NodeAnnotationCRIURemediation)
+	} else {
+		if reason != "" {
+			node.Annotations[NodeAnnotationCRIUReason] = reason
 		}
-		patch := client.MergeFrom(node.DeepCopy())
-		if node.Annotations == nil {
-			node.Annotations = map[string]string{}
+		if remediation != "" {
+			node.Annotations[NodeAnnotationCRIURemediation] = remediation
 		}
-		node.Annotations[NodeAnnotationCRIUReady] = fmt.Sprintf("%t", ready)
-		if version != "" {
-			node.Annotations[NodeAnnotationCRIUVersion] = version
-		}
-		if ready {
-			delete(node.Annotations, NodeAnnotationCRIUReason)
-			delete(node.Annotations, NodeAnnotationCRIURemediation)
-		} else {
-			if reason != "" {
-				node.Annotations[NodeAnnotationCRIUReason] = reason
-			}
-			if remediation != "" {
-				node.Annotations[NodeAnnotationCRIURemediation] = remediation
-			}
-		}
-		return c.Patch(ctx, &node, patch)
-	})
+	}
+	return c.Patch(ctx, &node, patch)
 }
 
 // copyFile installs src at dst atomically via temp-file + rename so an
