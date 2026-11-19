@@ -703,6 +703,19 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 		}
 	})
 
+	t.Run("a retry whose live read fails looks again soon, without failing the reconcile", func(t *testing.T) {
+		run := reconcileTimeout(t, timedOutJob(time.Minute), stuckPod(), timeoutSetup{apiReader: failingReader{}})
+		if run.err != nil {
+			t.Fatalf("Reconcile() error = %v, want it logged and retried", run.err)
+		}
+		if !run.podExists || len(run.deletes) != 0 {
+			t.Errorf("pod exists %t, deletes %d; want the pod kept for the next look", run.podExists, len(run.deletes))
+		}
+		if run.result.RequeueAfter != placementRecheckInterval {
+			t.Errorf("result = %+v, want a requeue after %s", run.result, placementRecheckInterval)
+		}
+	})
+
 	t.Run("a retry that keeps failing doesn't hold the source fence or garbage collection", func(t *testing.T) {
 		// For example, an admission policy forbids the delete. The job
 		// keeps retrying until it's garbage collected, 30 minutes after it
@@ -783,6 +796,19 @@ func TestPodMigrationJobReconciler_RestoreCeilingStaleView(t *testing.T) {
 // restore's node constraints that isn't scheduled: the scheduler hadn't tried
 // it yet at the restore ceiling, or a node it nominated fell through. Nothing
 // else looks at the pod once the job has concluded.
+// failFirstPodGet returns interceptors that fail the first read of the
+// replacement pod, like a cache that isn't synced yet.
+func failFirstPodGet() interceptor.Funcs {
+	failed := false
+	return interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Pod); ok && key.Name == placementPodName && !failed {
+			failed = true
+			return errors.New("cache not synced")
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}}
+}
+
 func TestPodMigrationJobReconciler_RestoreTimeoutRecheck(t *testing.T) {
 	timedOut := func(mutate ...func(*pmv1alpha1.PodMigrationJob)) *pmv1alpha1.PodMigrationJob {
 		job := releasedJob(DefaultRestorePlacementDeadline + 3*time.Minute)
@@ -876,6 +902,7 @@ func TestPodMigrationJobReconciler_RestoreTimeoutRecheck(t *testing.T) {
 		}
 		for name, setup := range map[string]timeoutSetup{
 			"a live read that fails":       {apiReader: failingReader{}},
+			"a cache read that fails":      {funcs: failFirstPodGet()},
 			"a delete that fails":          {deleteErr: apierrors.NewInternalError(errors.New("etcd timeout"))},
 			"a delete that conflicts":      {deleteErr: conflict},
 			"a pod that changed meanwhile": {beforeDelete: touch},

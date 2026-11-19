@@ -259,10 +259,11 @@ type RestoreVerifier interface {
 // PlacementAdvisor is an optional capability (C8, #14): the engine states
 // the node constraints a replacement pod must meet to restore a job's
 // checkpoint. With --restore-placement (on by default), the pod gate
-// reconciler adds them to the replacement's required node affinity when it
-// releases the gate with a restore order, and the job reconciler asks again
-// at the placement deadline. An engine without it states none, so the
-// replacement can land on any node.
+// reconciler adds them to the required node affinity of a replacement that
+// its ReplicaSet or StatefulSet would recreate, when it releases the gate
+// with a restore order, and the job reconciler asks again at the placement
+// deadline and after a RestoreTimeout conclusion. An engine without it
+// states none, so the replacement can land on any node.
 type PlacementAdvisor interface {
 	// Placement returns the requirements a node must meet, all of them, to
 	// restore job's checkpoint. They're node label requirements: each one
@@ -272,7 +273,8 @@ type PlacementAdvisor interface {
 	// replacement can land on any node. It must not change anything, and
 	// must return the same requirements for a job each time: at the
 	// placement deadline, the job reconciler takes them out of the released
-	// pod to work out how its owner would recreate it. An error must be one
+	// pod to work out how its owner would recreate it, and after a
+	// RestoreTimeout conclusion it checks that the pod still carries them. An error must be one
 	// that a retry can clear: the replacement stays gated until Placement
 	// succeeds, so an engine returns no requirements, not an error, for data
 	// it can't use.

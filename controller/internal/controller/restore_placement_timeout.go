@@ -70,8 +70,8 @@ const (
 	// placementRecheckInterval is how soon a concluded job looks again at
 	// its replacement, released with the restore's node constraints, while
 	// that pod isn't scheduled yet: after RestoreTimeout, or after
-	// PlacementTimeout when the pod had a nominated node or another
-	// scheduling gate instead of being deleted, or its delete failed.
+	// PlacementTimeout when the pod got a nominated node instead of being
+	// deleted, or its delete failed.
 	placementRecheckInterval = 15 * time.Second
 )
 
@@ -154,7 +154,10 @@ func (r *PodMigrationJobReconciler) recreateUnplacedAfterRestoreTimeout(ctx cont
 	key := types.NamespacedName{Namespace: job.Namespace, Name: job.Status.RestoredPodName}
 	cached := &corev1.Pod{}
 	if err := r.Get(ctx, key, cached); err != nil {
-		return 0, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			return 0, nil
+		}
+		return placementRecheckInterval, fmt.Errorf("failed to read replacement pod %s: %w", key.Name, err)
 	}
 	if string(cached.UID) != job.Status.RestoredPodUID || cached.DeletionTimestamp != nil ||
 		cached.Spec.NodeName != "" || !recreatedByOwner(cached) {
@@ -447,9 +450,9 @@ func (r *PodMigrationJobReconciler) concludePlacementTimeout(ctx context.Context
 // A pod bound to a node is kept: the job's conclusion says it was deleted,
 // so when the delete finds it bound, a Warning event on the job says it was
 // kept, once. A pod that has a nominated node, which the scheduler places
-// once it has preempted pods there, or that another scheduling gate holds,
-// is left alone for now, and so is one that changed after the read in
-// another way. The job doesn't watch pods, so it returns how soon to look
+// once it has preempted pods there, is left alone for now, like any pod
+// that the scheduler doesn't report unschedulable, and so is one that
+// changed after the read in another way. The job doesn't watch pods, so it returns how soon to look
 // again: placementRecheckInterval while the pod waits like that, or after
 // an error, and 0 once the pod is gone, deleted, bound, or not the job's to
 // delete.

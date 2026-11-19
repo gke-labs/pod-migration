@@ -211,9 +211,10 @@ func recreatedByOwner(pod *corev1.Pod) bool {
 
 // releaseUnderWay reports whether pod's release with a restore order has
 // started: the job records the gate as released, or pod has consumed the
-// job. The release then goes ahead as the earlier attempt started it: the
-// constraints are added without a new node check, whatever the job's phase
-// is now.
+// job. The release then goes ahead without a new node check, whatever the
+// job's phase is now. restorePlacement is asked again, so the constraints
+// match the first attempt's unless placement was turned on or off in
+// between.
 func releaseUnderWay(job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) bool {
 	return job.Status.GateReleased || (job.Status.Consumed && job.Status.RestoredPodUID == string(pod.UID))
 }
