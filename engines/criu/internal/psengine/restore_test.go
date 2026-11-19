@@ -546,6 +546,11 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	if !hasRule(agentRole, contract.GVKPodSnapshot.Group, "podsnapshots", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/list/watch on %s/podsnapshots", contract.GVKPodSnapshot.Group)
 	}
+	// The agent reads the work order's trigger live before the checkpoint and
+	// before the source stop (C9, #106).
+	if !hasRule(agentRole, contract.GVKManualTrigger.Group, "podsnapshotmanualtriggers", "get") {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get on %s/podsnapshotmanualtriggers", contract.GVKManualTrigger.Group)
+	}
 	if !hasRule(agentRole, contract.GVKPodSnapshot.Group, "podsnapshots/status", "get", "update", "patch") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing get/update/patch on %s/podsnapshots/status", contract.GVKPodSnapshot.Group)
 	}

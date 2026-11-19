@@ -105,6 +105,11 @@ rules:
   - apiGroups: ["podsnapshot.gke.io"]
     resources: ["podsnapshots/status"]
     verbs: ["get", "update", "patch"]
+  # A live get of the work order's trigger before the checkpoint and before
+  # committing: a deleted trigger cancels the work order (C9, #106).
+  - apiGroups: ["podsnapshot.gke.io"]
+    resources: ["podsnapshotmanualtriggers"]
+    verbs: ["get"]
   - apiGroups: ["podmigration.gke.io"]
     resources: ["podmigrationjobs"]
     verbs: ["get", "list", "watch"]
@@ -266,8 +271,8 @@ spec:
             - name: pod-migrate
               mountPath: /var/lib/pod-migrate
               mountPropagation: Bidirectional
-            - name: containerd-sock
-              mountPath: /run/containerd/containerd.sock
+            - name: containerd-run
+              mountPath: /run/containerd
             - name: containerd-state
               mountPath: /var/lib/containerd
             - name: kubelet-checkpoints
@@ -284,10 +289,10 @@ spec:
           hostPath:
             path: /var/lib/pod-migrate
             type: DirectoryOrCreate
-        - name: containerd-sock
+        - name: containerd-run
           hostPath:
-            path: /run/containerd/containerd.sock
-            type: Socket
+            path: /run/containerd
+            type: Directory
         - name: containerd-state
           hostPath:
             path: /var/lib/containerd

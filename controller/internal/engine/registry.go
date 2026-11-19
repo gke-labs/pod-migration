@@ -112,6 +112,49 @@ func (r *Registry) Names() []string {
 	return slices.Clone(r.names)
 }
 
+// APIGroups returns the deduplicated non-empty API groups of the registered
+// engines, in registration order (#135).
+func (r *Registry) APIGroups() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var groups []string
+	for _, name := range r.names {
+		e, ok := r.byName[name]
+		if !ok || e == nil {
+			continue
+		}
+		if g := strings.TrimSpace(e.APIGroup()); g != "" && !slices.Contains(groups, g) {
+			groups = append(groups, g)
+		}
+	}
+	return groups
+}
+
+// RestoreAnnotations returns the deduplicated non-empty restore-order
+// annotation keys (<group>/ps-name) of the registered engines, in registration
+// order (#135).
+func (r *Registry) RestoreAnnotations() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var annotations []string
+	for _, name := range r.names {
+		e, ok := r.byName[name]
+		if !ok || e == nil {
+			continue
+		}
+		if ann := strings.TrimSpace(e.RestoreAnnotation()); ann != "" && !slices.Contains(annotations, ann) {
+			annotations = append(annotations, ann)
+		}
+	}
+	return annotations
+}
+
 // Default returns the default engine. It fails when no engine of that name
 // is registered.
 func (r *Registry) Default() (Engine, error) {
@@ -219,6 +262,12 @@ func (r *Registry) ForPod(pod *corev1.Pod, pm *pmv1alpha1.PodMigration) (Engine,
 // their namespace resources. When ForPod can pick no engine at all, it
 // returns the default engine, or nothing if the default isn't registered.
 func (r *Registry) EnginesFor(pm *pmv1alpha1.PodMigration) []Engine {
+	return r.EnginesForAllowed(pm, nil)
+}
+
+// EnginesForAllowed is like EnginesFor, restricted to runtime classes permitted
+// by allowList when allowList is non-nil (--migratable-runtime-classes).
+func (r *Registry) EnginesForAllowed(pm *pmv1alpha1.PodMigration, allowList *eligibility.RuntimeClassPolicy) []Engine {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	overrides := r.podMigrationRoutesLocked(pm)
@@ -230,6 +279,18 @@ func (r *Registry) EnginesFor(pm *pmv1alpha1.PodMigration) []Engine {
 	}
 	picked := map[string]bool{}
 	for _, class := range classes {
+		if allowList != nil {
+			if class == eligibility.DefaultRuntimeClassToken {
+				if !allowList.Allows(nil) {
+					continue
+				}
+			} else {
+				c := class
+				if !allowList.Allows(&c) {
+					continue
+				}
+			}
+		}
 		if name, ok := r.resolveLocked(class, overrides); ok {
 			picked[name] = true
 		}
@@ -247,6 +308,16 @@ func (r *Registry) EnginesFor(pm *pmv1alpha1.PodMigration) []Engine {
 		}
 	}
 	return out
+}
+
+// NamesEngine reports whether any route in r targets engineName.
+func (r Routes) NamesEngine(engineName string) bool {
+	for _, target := range r {
+		if target == engineName {
+			return true
+		}
+	}
+	return false
 }
 
 // ForJob returns the engine that serves job: the engine that its

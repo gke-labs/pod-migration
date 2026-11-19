@@ -46,6 +46,7 @@ import (
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotpolicies,verbs=get;list;watch
 
 // NodePreemptionReconciler watches Nodes for spot preemption and graceful shutdown signals,
 // selecting opted-in pods and spawning PodMigrationJobs within a node recovery memory budget.

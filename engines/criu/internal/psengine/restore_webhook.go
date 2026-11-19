@@ -46,6 +46,12 @@ const (
 	AnnotationInjected = "pod-migrate.io/psengine-injected"
 )
 
+// holderDefaultPSNameAnnotation is the restore order the holder reads when
+// its wrap command doesn't name one: the key of the GKE Pod Snapshots group,
+// which every holder image understands. The command names the key only when
+// it differs, so on that group the injected command is unchanged.
+var holderDefaultPSNameAnnotation = contract.RestoreAnnotation(contract.GKEPodSnapshotsGroup)
+
 // RestoreInjector mutates gated replacement pods at CREATE: holder-seed
 // initContainer + command wrapper + downward-API annotations volume. Pods it
 // cannot make cold-start-safe (no explicit command) are left untouched —
@@ -76,11 +82,18 @@ func (h *RestoreInjector) Handle(ctx context.Context, req admission.Request) adm
 }
 
 // InjectHolder applies the mutation in place; returns (false, why) when the
-// pod is skipped. Pure function — unit-tested directly.
+// pod is skipped. The wrapper waits for the engine's restore order,
+// contract.AnnotationPSName.
 func InjectHolder(pod *corev1.Pod, holderImage string) (bool, string) {
+	return injectHolder(pod, holderImage, contract.AnnotationPSName)
+}
+
+// injectHolder is InjectHolder with the restore-order annotation as a
+// parameter. Pure function — unit-tested directly.
+func injectHolder(pod *corev1.Pod, holderImage, psNameAnnotation string) (bool, string) {
 	// Only migration replacement candidates: the orchestrator's replacement
 	// webhook injected the gate + assignment in the same admission chain
-	// (replacement_webhook.go:83-91); ours runs after via reinvocation.
+	// (replacement_webhook.go:171-180); ours runs after via reinvocation.
 	gated := false
 	for _, g := range pod.Spec.SchedulingGates {
 		if g.Name == contract.SchedulingGate {
@@ -132,7 +145,7 @@ func InjectHolder(pod *corev1.Pod, holderImage string) (bool, string) {
 	// The app container starts as the holder wrapper; at runtime it reads
 	// ps-name from the downward-API file and either holds (agent restores a
 	// sibling) or execs the original entrypoint (cold start).
-	app.Command = append([]string{holdMount + "/holder", "wrap", infoMount + "/" + annotationsRel, "--"}, orig...)
+	app.Command = append(holderWrapCommand(psNameAnnotation), orig...)
 	app.Args = nil
 
 	if pod.Annotations == nil {
@@ -140,4 +153,15 @@ func InjectHolder(pod *corev1.Pod, holderImage string) (bool, string) {
 	}
 	pod.Annotations[AnnotationInjected] = "true"
 	return true, "injected"
+}
+
+// holderWrapCommand returns the wrapper part of the app command, ending in
+// "--". It names the restore-order annotation only when that isn't the
+// holder's default.
+func holderWrapCommand(psNameAnnotation string) []string {
+	cmd := []string{holdMount + "/holder", "wrap"}
+	if psNameAnnotation != holderDefaultPSNameAnnotation {
+		cmd = append(cmd, "--ps-name-annotation="+psNameAnnotation)
+	}
+	return append(cmd, infoMount+"/"+annotationsRel, "--")
 }

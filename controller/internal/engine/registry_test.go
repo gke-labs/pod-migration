@@ -35,12 +35,26 @@ import (
 
 // fakeEngine is an Engine with a name and runtime classes, and nothing else.
 type fakeEngine struct {
-	name       string
-	classes    []string
-	guarantees *Guarantees
+	name              string
+	apiGroup          string
+	restoreAnnotation string
+	classes           []string
+	guarantees        *Guarantees
 }
 
-func (f *fakeEngine) Name() string             { return f.name }
+func (f *fakeEngine) Name() string { return f.name }
+func (f *fakeEngine) APIGroup() string {
+	if f.apiGroup != "" {
+		return f.apiGroup
+	}
+	return DefaultAPIGroup
+}
+func (f *fakeEngine) RestoreAnnotation() string {
+	if f.restoreAnnotation != "" {
+		return f.restoreAnnotation
+	}
+	return RestoreAnnotation(f.APIGroup())
+}
 func (f *fakeEngine) RuntimeClasses() []string { return f.classes }
 func (f *fakeEngine) NamespaceResources(*pmv1alpha1.PodMigration) ([]*unstructured.Unstructured, error) {
 	return nil, nil

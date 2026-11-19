@@ -65,10 +65,43 @@ const (
 	AnnotationAllowUnfenced = "pod-migration.gke.io/allow-unfenced"
 )
 
+const (
+	// DefaultAPIGroup is the API group of the managed GKE Pod Snapshots add-on.
+	DefaultAPIGroup = snapshot.DefaultAPIGroup
+
+	// DefaultCRIUAPIGroup is the default API group of the CRIU snapshot engine.
+	// Step 2 of #135 keeps podsnapshot.gke.io as the default so existing
+	// installs see no behavior change until Step 3 flips the default to CRIUAPIGroup.
+	DefaultCRIUAPIGroup = snapshot.DefaultAPIGroup
+
+	// CRIUAPIGroup is the dedicated API group of the CRIU snapshot engine (#135).
+	CRIUAPIGroup = snapshot.CRIUAPIGroup
+)
+
+// ValidateAPIGroup checks that group is a valid Kubernetes CRD API group for
+// the four snapshot contract CRs (DNS-1123 subdomain containing a dot, with
+// every <plural>.<group> CRD name <= 253 characters).
+func ValidateAPIGroup(group string) error {
+	return snapshot.ValidateGroup(group)
+}
+
+// RestoreAnnotation returns the restore-order annotation key (<group>/ps-name)
+// for an engine serving group.
+func RestoreAnnotation(group string) string {
+	return snapshot.RestoreAnnotation(group)
+}
+
 // Engine is one checkpoint/restore engine.
 type Engine interface {
 	// Name is the registry key, and the name recorded on a job (C1).
 	Name() string
+
+	// APIGroup is the Kubernetes API group of the engine's snapshot CRDs (C1, #135).
+	APIGroup() string
+
+	// RestoreAnnotation is the pod annotation key (<group>/ps-name) that orders
+	// a checkpoint restore or cold-start bypass for this engine (C5, #135).
+	RestoreAnnotation() string
 
 	// RuntimeClasses lists the runtime classes the engine serves (C1).
 	// eligibility.DefaultRuntimeClassToken stands for pods without a
@@ -223,6 +256,25 @@ type RestoreVerifier interface {
 	// restores into. It must not change anything, and may be called again
 	// until it returns a verdict other than RestoreInProgress.
 	VerifyRestore(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (RestoreVerdict, error)
+}
+
+// PlacementAdvisor is an optional capability (C8, #14): the engine states
+// the node constraints a replacement pod must meet to restore a job's
+// checkpoint. With --restore-placement, the pod gate reconciler adds them to
+// the replacement's required node affinity when it releases the gate with a
+// restore order. An engine without it states none, so the replacement can
+// land on any node.
+type PlacementAdvisor interface {
+	// Placement returns the requirements a node must meet, all of them, to
+	// restore job's checkpoint. They're node label requirements: each one
+	// goes into the replacement's required node affinity as a
+	// matchExpressions entry, and the pod gate reconciler drops them all if
+	// one isn't valid as a label requirement. None means no constraint: the
+	// replacement can land on any node. It must not change anything. An
+	// error must be one that a retry can clear: the replacement stays gated
+	// until Placement succeeds, so an engine returns no requirements, not an
+	// error, for data it can't use.
+	Placement(ctx context.Context, job *pmv1alpha1.PodMigrationJob) ([]corev1.NodeSelectorRequirement, error)
 }
 
 // StorageLocationError reports a PodMigration storage location that an

@@ -18,9 +18,11 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -31,6 +33,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/image-spec/identity"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -49,7 +52,7 @@ const (
 // restorer drives the sandbox-sibling container restore.
 type restorer struct {
 	cclient *containerd.Client
-	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p).
+	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p -C).
 	// Swappable in tests.
 	execHost         func(ctx context.Context, env []string, name string, args ...string) (string, error)
 	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
@@ -59,22 +62,32 @@ type restorer struct {
 	readProcCgroupFn func(pid int) ([]byte, error)
 	pmRootDir        string
 	criuConfDirPath  string
+	nsenterBin       string
 }
 
 func newRestorer(c *containerd.Client) *restorer {
-	return &restorer{cclient: c, execHost: nsenterExec}
+	r := &restorer{cclient: c}
+	r.execHost = r.nsenterExec
+	return r
 }
 
-// nsenterExec executes cmd in the host mount+pid namespaces (agent has
-// hostPID, so target pid 1 is the host init). Output goes through a file, not
-// pipes: `runc restore --detach` leaves the restored process holding the
-// inherited stderr, so CombinedOutput would block forever after a successful
-// restore. With *os.File stdio, Wait returns on runc exit.
-func nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
+// nsenterExec executes cmd in the host mount, pid, and cgroup namespaces (agent
+// has hostPID, so target pid 1 is the host init). Entering host cgroup
+// namespace (-C) ensures commands like runc restore access the full host cgroup
+// hierarchy and place restored containers under the target pod slice.
+// Output goes through a file, not pipes: `runc restore --detach` leaves the
+// restored process holding the inherited stderr, so CombinedOutput would block
+// forever after a successful restore. With *os.File stdio, Wait returns on
+// runc exit.
+func (r *restorer) nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	full := append([]string{"-t", "1", "-m", "-p", "--", name}, args...)
-	cmd := exec.CommandContext(cctx, "nsenter", full...)
+	bin := "nsenter"
+	if r != nil && r.nsenterBin != "" {
+		bin = r.nsenterBin
+	}
+	full := append([]string{"-t", "1", "-m", "-p", "-C", "--", name}, args...)
+	cmd := exec.CommandContext(cctx, bin, full...)
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.CreateTemp("", "pm-exec-*")
 	if err != nil {
@@ -91,13 +104,38 @@ func nsenterExec(ctx context.Context, env []string, name string, args ...string)
 	return string(b), runErr
 }
 
+// readProcCgroup reads the cgroup v2 membership of a target process from the
+// host cgroup namespace (via r.execHost). It fails closed with no fallback to
+// the agent's private cgroup namespace, preventing ../ path traversal escapes.
+func (r *restorer) readProcCgroup(ctx context.Context, pid int) ([]byte, error) {
+	if r.readProcCgroupFn != nil {
+		return r.readProcCgroupFn(pid)
+	}
+	if r.execHost == nil {
+		return nil, fmt.Errorf("cannot read host cgroup: execHost is nil")
+	}
+	out, err := r.execHost(ctx, nil, "cat", fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return nil, fmt.Errorf("read host cgroup for pid %d: %w", pid, err)
+	}
+	return []byte(out), nil
+}
+
+func nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
+	return (&restorer{}).nsenterExec(ctx, env, name, args...)
+}
+
 func (r *restorer) execRestore(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
+	bin := "nsenter"
+	if r != nil && r.nsenterBin != "" {
+		bin = r.nsenterBin
+	}
 	// runc restore holds inherited stderr, so we redirect to a file.
 	// We keep this file so it acts as a container-stdout log for the restored process.
-	full := append([]string{"-t", "1", "-m", "-p", "--", name}, args...)
-	cmd := exec.CommandContext(cctx, "nsenter", full...)
+	full := append([]string{"-t", "1", "-m", "-p", "-C", "--", name}, args...)
+	cmd := exec.CommandContext(cctx, bin, full...)
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -122,22 +160,29 @@ type containerRef struct {
 	ImageName string
 }
 
+func (r *restorer) listContainers(ctx context.Context) ([]containerd.Container, error) {
+	if r.listContainersFn != nil {
+		return r.listContainersFn(ctx)
+	}
+	if r.cclient == nil {
+		return nil, fmt.Errorf("containerd client not initialized")
+	}
+	return r.cclient.Containers(ctx)
+}
+
+// ErrContainerNotFound is returned by findContainer when no container matches the target pod/container labels.
+var ErrContainerNotFound = errors.New("container not found in containerd")
+
 // findContainer locates the CRI container for pod/container by containerd
 // labels (namespace k8s.io is set on the client). When podUID is non-empty,
 // containers from earlier pods with the same name are skipped. If multiple
 // containers match (e.g. a stopped attempt with Pid == 0 alongside a running
 // one), prefers a container with a live task Pid.
 func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
-	listFn := func(ctx context.Context) ([]containerd.Container, error) {
-		if r.cclient == nil {
-			return nil, fmt.Errorf("containerd client not initialized")
-		}
-		return r.cclient.Containers(ctx)
+	if r.findContainerFn != nil {
+		return r.findContainerFn(ctx, podNS, podName, podUID, containerName)
 	}
-	if r.listContainersFn != nil {
-		listFn = r.listContainersFn
-	}
-	cs, err := listFn(ctx)
+	cs, err := r.listContainers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd list: %w", err)
 	}
@@ -145,7 +190,10 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 	for _, c := range cs {
 		labels, err := c.Labels(ctx)
 		if err != nil {
-			continue
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("containerd labels for %s: %w", c.ID(), err)
 		}
 		if labels["io.kubernetes.pod.namespace"] != podNS ||
 			labels["io.kubernetes.pod.name"] != podName ||
@@ -159,12 +207,18 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 		ref := &containerRef{ID: c.ID()}
 		spec, err := c.Spec(ctx)
 		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
 			return nil, fmt.Errorf("containerd spec for %s: %w", c.ID(), err)
 		}
 		ref.Spec = spec
 		ref.SandboxID = spec.Annotations["io.kubernetes.cri.sandbox-id"]
 		info, err := c.Info(ctx)
 		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
 			return nil, fmt.Errorf("containerd info for %s: %w", c.ID(), err)
 		}
 		ref.ImageName = info.Image
@@ -179,7 +233,7 @@ func (r *restorer) findContainer(ctx context.Context, podNS, podName, podUID, co
 	if fallback != nil {
 		return fallback, nil
 	}
-	return nil, fmt.Errorf("container %s/%s/%s (uid=%s) not found in containerd", podNS, podName, containerName, podUID)
+	return nil, fmt.Errorf("container %s/%s/%s (uid=%s): %w", podNS, podName, containerName, podUID, ErrContainerNotFound)
 }
 
 // prepareRootfs makes a fresh writable snapshot of the app image and applies
@@ -303,11 +357,10 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	}
 
 	// Pod cgroup slice of the target, from the holder's own cgroup.
-	readCg := func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)) }
-	if r.readProcCgroupFn != nil {
-		readCg = r.readProcCgroupFn
-	}
-	procCg, err := readCg(holder.Pid)
+	// Read within the host cgroup namespace (r.execHost) so the cgroup path is
+	// anchored to the host root and not distorted by the agent's private
+	// cgroup namespace (which emits relative ../ paths under cgroup_namespaces(7)).
+	procCg, err := r.readProcCgroup(ctx, holder.Pid)
 	if err != nil {
 		return out, fmt.Errorf("read holder cgroup: %w", err)
 	}
@@ -486,11 +539,19 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 	if holder.ImageName == "" {
 		return AdaptParams{}, "", fmt.Errorf("target holder container has no image name; refusing to fall back to archive image")
 	}
+	if !strings.HasPrefix(podSlice, "/") || strings.Contains(podSlice, "..") {
+		return AdaptParams{}, "", fmt.Errorf("podSlice must be an absolute path without traversal: %q", podSlice)
+	}
+	cleanSlice := path.Clean(podSlice)
+	if cleanSlice == "/" || cleanSlice == "." {
+		return AdaptParams{}, "", fmt.Errorf("podSlice cannot be empty or root cgroup")
+	}
 	srcSandboxID := in.SrcSpec.Annotations["io.kubernetes.cri.sandbox-id"]
+	cgroupsPath := path.Clean(cleanSlice + "/" + id)
 	return AdaptParams{
 		RootfsPath:      rootfsPath,
 		HolderPid:       holder.Pid,
-		CgroupsPath:     podSlice + "/" + id,
+		CgroupsPath:     cgroupsPath,
 		SourcePodUID:    in.SourcePodUID,
 		TargetPodUID:    in.TargetPodUID,
 		SourceSandboxID: srcSandboxID,

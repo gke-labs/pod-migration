@@ -66,6 +66,14 @@ type PodGateReconciler struct {
 	// pod gets: the job's engine for a restore, the pod's for a cold start.
 	// Optional: nil selects GKE Pod Snapshots.
 	Engines *engine.Registry
+
+	// RestorePlacement places a restored replacement on a node that can
+	// restore its checkpoint (C8, #14): the job's engine's node constraints
+	// go into the pod's required node affinity when the gate is released
+	// with a restore order. When no node meets them, the job concludes
+	// without a restore and the pod starts cold. Off adds no constraints;
+	// a pod already held because no node met them still starts cold.
+	RestorePlacement bool
 }
 
 // jobRestoreOrderer returns how to order job's restore: through the engine
@@ -151,6 +159,7 @@ func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
@@ -293,8 +302,19 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			return ctrl.Result{}, r.Update(ctx, pod)
 		}
 
+		// No node could restore the checkpoint (C8, #14): wait for the job
+		// to conclude without a restore, which releases the gate cold
+		// (above). The PMJ watch enqueues the pod when it does. A hold only
+		// counts while the job is Restoring, the only phase that concludes
+		// on it.
+		if _, held := noCompatibleNode(job); held {
+			logger.Info("No node can restore the checkpoint; waiting for the job to conclude without a restore", "pmj", correctedPMJ)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
 		logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 
+		adoptStranded := false
 		if job.Status.Consumed && job.Status.RestoredPodUID != string(pod.UID) {
 			// Single-use isolation: a migration that already concluded (Succeeded)
 			// or whose scheduling gate was already released on the consumer pod must
@@ -319,12 +339,50 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 				// Do NOT un-gate this candidate pod with cold-start bypass yet: waiting
 				// costs nothing because the candidate is safely held in Pending by its
 				// scheduling gate. Once the terminating consumer finishes and disappears from
-				// the API server, this candidate will recover and adopt the PMJ snapshot.
+				// the API server, this candidate will recover: it adopts the PMJ snapshot, or,
+				// if the placement check below finds no node, holds and clears the consumer's
+				// record. This comes before the placement check, so that a check can't
+				// conclude the job without a restore while the consumer is going away.
 				logger.Info("Assigned PMJ consumer pod still exists (possibly terminating); requeuing to wait for completion",
 					"consumingPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
+			adoptStranded = true
+		}
 
+		// Place the restore on a node that can restore it (C8, #14). The
+		// constraints go into the update that removes the gate, the only
+		// time Kubernetes lets them be added, and they can't be removed
+		// after it. So before anything is written for the release, check
+		// that some node meets them, and if none does, hold the pod: the
+		// job then concludes without a restore, and the pod starts cold.
+		// The hold also clears the record of a consumer that is gone
+		// (adoptStranded), so the job doesn't conclude consumed while this
+		// pod is still gated. Only a Restoring job is checked, because only
+		// then does the job reconciler conclude a hold; in another phase a
+		// new release gets no constraints, as without placement. A release
+		// that is already under way, this pod's own, isn't checked again,
+		// and the engine isn't asked yet: it gets the constraints below.
+		var placement []corev1.NodeSelectorRequirement
+		underWay := releaseUnderWay(job, pod)
+		if phase == pmv1alpha1.PodMigrationJobPhaseRestoring && !underWay {
+			if placement, err = r.restorePlacement(ctx, job); err != nil {
+				logger.Error(err, "Failed to get the restore's node constraints", "pmj", correctedPMJ)
+				return ctrl.Result{}, err
+			}
+			if len(placement) > 0 {
+				fits, err := r.someNodeFits(ctx, pod, placement)
+				if err != nil {
+					logger.Error(err, "Failed to check the nodes against the restore's node constraints", "pmj", correctedPMJ)
+					return ctrl.Result{}, err
+				}
+				if !fits {
+					return r.holdForNoCompatibleNode(ctx, pod, job, placement, adoptStranded)
+				}
+			}
+		}
+
+		if adoptStranded {
 			logger.Info("Recorded consumer pod no longer exists and gate was never released; recovering stranded PMJ for adoption",
 				"deadConsumerPodUID", job.Status.RestoredPodUID, "currentPodUID", pod.UID, "pmj", correctedPMJ)
 
@@ -351,9 +409,43 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			logger.Error(err, "No engine to order the restore; waiting for the job to fail", "pmj", correctedPMJ)
 			return ctrl.Result{}, err
 		}
+		if underWay {
+			if placement, err = r.restorePlacement(ctx, job); err != nil {
+				logger.Error(err, "Failed to get the restore's node constraints", "pmj", correctedPMJ)
+				return ctrl.Result{}, err
+			}
+		}
 		if err := orderer.OrderRestore(pod, job); err != nil {
 			logger.Error(err, "Failed to order the restore", "pmj", correctedPMJ)
 			return ctrl.Result{}, err
+		}
+		var jobEng engine.Engine
+		if r.Engines != nil {
+			jobEng, _ = r.Engines.ForJob(job)
+		}
+		if isGVisorPod(pod) {
+			gkeRestoreKey := engine.RestoreAnnotation(engine.DefaultAPIGroup)
+			if _, hasGKE := pod.Annotations[gkeRestoreKey]; !hasGKE {
+				if pod.Annotations == nil {
+					pod.Annotations = make(map[string]string)
+				}
+				// Always stamp the GKE cold-start bypass when ordering a restore under a
+				// non-GKE key on a gVisor pod (e.g. gvisor=criu) so GKE never starts with
+				// podsnapshot.gke.io/ps-name absent (#151, #135).
+				pod.Annotations[gkeRestoreKey] = ""
+			}
+		}
+		// If the CRIU restore webhook speculatively wrapped a replacement pod whose
+		// job is served by another engine on a distinct API group, stamp CRIU's
+		// explicit cold-start bypass so the holder wrapper does not wait out its
+		// assign window if the primary engine falls back to cold start (#135).
+		if pod.Annotations[engine.CRIUInjectedAnnotation] == "true" && r.Engines != nil {
+			criuEng, hasCRIU := r.Engines.Get(engine.CRIUName)
+			if hasCRIU && criuEng != nil && (jobEng == nil || criuEng.RestoreAnnotation() != jobEng.RestoreAnnotation()) {
+				if criuOrderer, ok := criuEng.(engine.RestoreOrderer); ok {
+					_ = criuOrderer.OrderColdStartBypass(pod)
+				}
+			}
 		}
 		logger.Info("Injected target snapshot ref to pod annotations", "snapshot", job.Status.SnapshotRef)
 
@@ -373,25 +465,39 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 		// 1. Durable record first: mark GateReleased = true on PMJ status before un-gating the pod.
 		// If this fails, the pod is still gated, fails closed, and cannot restore until retried.
-		// Using Patch avoids cached-Get stale resourceVersion conflicts and avoids clobbering
-		// sibling status fields touched by concurrent reconcilers.
+		// A merge patch with a resourceVersion check fails on any concurrent change instead of
+		// overwriting it. That matters on a retry, where the Consumed write above is skipped: a
+		// stale view must not release this pod with a restore order onto a job that has
+		// concluded since, for example without a restore after another pod's hold.
 		if !job.Status.GateReleased {
-			patch := client.MergeFrom(job.DeepCopy())
+			orig := job.DeepCopy()
+			patch := client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
 			job.Status.GateReleased = true
 			if err := r.Status().Patch(ctx, job, patch); err != nil {
+				// Nothing was written, so keep the job as it was read.
+				*job = *orig
 				logger.Error(err, "Failed to patch GateReleased on PMJ status", "job", job.Name)
 				return ctrl.Result{}, err
 			}
 		}
 
-		// 2. Irreversible step: remove scheduling gate on the candidate pod.
+		// 2. Irreversible step: remove scheduling gate on the candidate pod,
+		// in the same update that adds the restore's node constraints.
+		addRequiredNodeAffinity(pod, placement)
 		r.removeGate(pod)
 		if err := r.Update(ctx, pod); err != nil {
 			return ctrl.Result{}, err
 		}
 
 		if r.Recorder != nil {
-			r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation", MigrationGateName)
+			switch {
+			case len(placement) > 0:
+				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s, injected snapshot restore annotation and required node affinity %s", MigrationGateName, describeRequirements(placement))
+			case r.RestorePlacement:
+				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation, without node constraints", MigrationGateName)
+			default:
+				r.Recorder.Eventf(pod, corev1.EventTypeNormal, "MigrationRestoreReleased", "Removed scheduling gate %s and injected snapshot restore annotation", MigrationGateName)
+			}
 		}
 
 		return ctrl.Result{}, nil
@@ -500,7 +606,24 @@ func (r *PodGateReconciler) releaseWithColdStartBypass(ctx context.Context, pod 
 	// The bypass is ordered through the engine that serves the pod. It can
 	// only fail for a nil pod.
 	_ = r.podRestoreOrderer(ctx, pod).OrderColdStartBypass(pod)
+	if pod.Annotations[engine.CRIUInjectedAnnotation] == "true" && r.Engines != nil {
+		if criuEng, ok := r.Engines.Get(engine.CRIUName); ok && criuEng != nil {
+			if criuOrderer, ok := criuEng.(engine.RestoreOrderer); ok {
+				_ = criuOrderer.OrderColdStartBypass(pod)
+			}
+		}
+	}
+	if isGVisorPod(pod) {
+		gkeRestoreKey := engine.RestoreAnnotation(engine.DefaultAPIGroup)
+		if _, hasGKE := pod.Annotations[gkeRestoreKey]; !hasGKE {
+			pod.Annotations[gkeRestoreKey] = ""
+		}
+	}
 	r.removeGate(pod)
+}
+
+func isGVisorPod(pod *corev1.Pod) bool {
+	return pod != nil && pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName == "gvisor"
 }
 
 func (r *PodGateReconciler) apiReader() client.Reader {

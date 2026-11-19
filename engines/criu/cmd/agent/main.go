@@ -19,6 +19,7 @@ import (
 	"context"
 	"flag"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/gke-labs/pod-migration/engines/criu/internal/node"
 	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine"
+	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
 
 var scheme = runtime.NewScheme()
@@ -41,9 +43,11 @@ func init() {
 
 func main() {
 	var probeAddr string
+	var apiGroup string
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8091", "health probe bind address (hostNetwork)")
+	flag.StringVar(&apiGroup, "api-group", contract.DefaultGroup, "API group of the snapshot engine CRDs; must match the engine controller's --api-group")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 20, "Kubernetes API client QPS limit")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 40, "Kubernetes API client burst limit")
 	opts := zap.Options{Development: true}
@@ -52,6 +56,12 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	log := ctrl.Log.WithName("setup")
+
+	if err := contract.SetGroup(apiGroup); err != nil {
+		log.Error(err, "invalid --api-group")
+		os.Exit(1)
+	}
+	log.Info("serving the snapshot engine API", "group", contract.Group, "restoreAnnotation", contract.AnnotationPSName)
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
@@ -78,7 +88,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Run CRIU bundle installation + node capability annotation once the cache starts.
+	// Run CRIU bundle installation + node capability annotation once the cache starts,
+	// and run a background probe loop to recover node readiness when containerd restarts.
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
 			return nil
@@ -86,6 +97,7 @@ func main() {
 		if err := nd.Bootstrap(ctx); err != nil {
 			log.Error(err, "CRIU bootstrap failed (continuing; node remains unready)")
 		}
+		nd.RunProbeLoop(ctx, 10*time.Second)
 		return nil
 	})); err != nil {
 		log.Error(err, "unable to register bootstrap runnable")
@@ -96,7 +108,7 @@ func main() {
 	ops := &nodeOpsAdapter{n: nd}
 	cpuFam := node.PSEngineCPUFamily()
 	if err := (&psengine.NodeSnapshotReconciler{
-		Client: mgr.GetClient(), NodeName: nodeName,
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node snapshot reconciler")
@@ -132,12 +144,16 @@ func (a *nodeOpsAdapter) Checkpoint(ctx context.Context, ns, pod, container stri
 	return a.n.PSEngineCheckpoint(ctx, ns, pod, container)
 }
 
-func (a *nodeOpsAdapter) SourceInfo(ctx context.Context, ns, pod, container string) ([]byte, string, error) {
-	return a.n.PSEngineSourceInfo(ctx, ns, pod, container)
+func (a *nodeOpsAdapter) SourceInfo(ctx context.Context, ns, pod, podUID, container string) ([]byte, string, error) {
+	return a.n.PSEngineSourceInfo(ctx, ns, pod, podUID, container)
 }
 
-func (a *nodeOpsAdapter) StopContainer(ctx context.Context, ns, pod, container string) error {
-	return a.n.PSEngineStopContainer(ctx, ns, pod, container)
+func (a *nodeOpsAdapter) Freeze(ctx context.Context, ns, pod, podUID, container string) error {
+	return a.n.PSEngineFreezeContainer(ctx, ns, pod, podUID, container)
+}
+
+func (a *nodeOpsAdapter) Unfreeze(ctx context.Context, ns, pod, podUID, container string) error {
+	return a.n.PSEngineUnfreezeContainer(ctx, ns, pod, podUID, container)
 }
 
 func (a *nodeOpsAdapter) Extract(tarPath, dstDir string) error {

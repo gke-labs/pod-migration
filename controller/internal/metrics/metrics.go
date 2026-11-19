@@ -63,7 +63,9 @@ var (
 	// RestoreVerdictsTotal counts restore verdicts on replacement pods (C6),
 	// by engine and verdict, so a restore the engine confirmed can be told
 	// apart from one that was inferred.
-	// Verdicts: confirmed | inferred | cold_start | failed | lost | timeout
+	// Verdicts: confirmed | inferred | cold_start | failed | lost | timeout | no_compatible_node
+	// (no_compatible_node: no node could take the replacement under the
+	// engine's placement constraints, so it started cold, #14)
 	RestoreVerdictsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_restore_verdicts_total",
 		Help: "Total number of restore verdicts on replacement pods, by engine and verdict.",

@@ -23,9 +23,11 @@
 //   - `/holder seed <dst>`: copy this static binary to <dst> and chmod 0755.
 //     Used by the seeded initContainer so the app container can run its own
 //     image while executing `/pmhold/holder` as its entrypoint.
-//   - `/holder wrap <annotations-file> -- <orig-cmd...>`: psengine mode. Wait
-//     briefly for a `podsnapshot.gke.io/ps-name` annotation via the downward
-//     API; if a snapshot is assigned, hold while the node agent restores a
+//   - `/holder wrap [--ps-name-annotation=<key>] <annotations-file> -- <orig-cmd...>`:
+//     psengine mode. Wait briefly for the restore-order annotation via the
+//     downward API (`podsnapshot.gke.io/ps-name`, or the key that
+//     --ps-name-annotation names for an engine on another API group); if a
+//     snapshot is assigned, hold while the node agent restores a
 //     sibling (falling through to cold-start exec if the agent stamps
 //     restore=failed or times out); if no snapshot is assigned, exec the
 //     original command immediately (zero-regression cold start).

@@ -43,10 +43,12 @@ import (
 // renderingEngine is an engine whose NamespaceResources returns fixed
 // objects, or a fixed error.
 type renderingEngine struct {
-	name      string   // "" is rendering-engine
-	classes   []string // nil is @default
-	resources []*unstructured.Unstructured
-	err       error
+	name              string   // "" is rendering-engine
+	apiGroup          string   // "" is engine.DefaultAPIGroup
+	restoreAnnotation string   // "" is <apiGroup>/ps-name
+	classes           []string // nil is @default
+	resources         []*unstructured.Unstructured
+	err               error
 }
 
 func (e *renderingEngine) Name() string {
@@ -54,6 +56,18 @@ func (e *renderingEngine) Name() string {
 		return "rendering-engine"
 	}
 	return e.name
+}
+func (e *renderingEngine) APIGroup() string {
+	if e.apiGroup != "" {
+		return e.apiGroup
+	}
+	return engine.DefaultAPIGroup
+}
+func (e *renderingEngine) RestoreAnnotation() string {
+	if e.restoreAnnotation != "" {
+		return e.restoreAnnotation
+	}
+	return engine.RestoreAnnotation(e.APIGroup())
 }
 func (e *renderingEngine) RuntimeClasses() []string {
 	if e.classes == nil {

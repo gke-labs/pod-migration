@@ -14,8 +14,9 @@
 // limitations under the License.
 
 // Package psengine implements the criu-snapshot-engine: a snapshot engine for
-// the gke-labs/pod-migration orchestrator that answers the podsnapshot.gke.io
-// CR contract with CRIU checkpoints of single-container runc pods.
+// the gke-labs/pod-migration orchestrator that answers the snapshot engine CR
+// contract (in the API group of package contract) with CRIU checkpoints of
+// single-container runc pods.
 package psengine
 
 import (

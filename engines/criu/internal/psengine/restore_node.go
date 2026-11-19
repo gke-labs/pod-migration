@@ -16,8 +16,8 @@
 package psengine
 
 // Node-side restore: when a replacement pod lands on this node carrying a
-// non-empty podsnapshot.gke.io/ps-name annotation (the orchestrator's restore
-// order) and our webhook's holder wiring, the agent pulls the archive from
+// non-empty restore order (contract.AnnotationPSName, <group>/ps-name) and
+// our webhook's holder wiring, the agent pulls the archive from
 // GCS, verifies it against the manifest, and performs the sandbox-sibling runc
 // restore into the holder's namespaces. The outcome is stamped back as an
 // annotation so the holder wrapper can fall through to a cold start on failure.

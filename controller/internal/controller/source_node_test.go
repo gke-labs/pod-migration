@@ -100,6 +100,12 @@ func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 			wantVersion: "v1.37.1-gke.2097000",
 		},
 		{
+			name:        "a node without a kubelet version records the machine type only",
+			node:        node(n2Standard4, ""),
+			podNodeName: nodeName,
+			wantType:    "n2-standard-4",
+		},
+		{
 			name:        "a node that is gone records nothing",
 			podNodeName: nodeName,
 		},

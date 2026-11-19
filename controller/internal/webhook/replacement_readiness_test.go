@@ -52,7 +52,7 @@ func httpGetProbe(path string, initialDelay, period int32) *corev1.Probe {
 	}
 }
 
-func applyAdmissionPatches(t *testing.T, rawPod []byte, resp admission.Response) *corev1.Pod {
+func applyReadinessAdmissionPatches(t *testing.T, rawPod []byte, resp admission.Response) *corev1.Pod {
 	t.Helper()
 	if !resp.Allowed {
 		t.Fatalf("admission denied: %v", resp.Result)
@@ -440,12 +440,13 @@ func TestPodGateInjector_ShortensReadinessInitialDelay(t *testing.T) {
 			wantStartupDelays:   []int32{-1},
 		},
 		{
-			name: "pod already carrying migration scheduling gate is untouched",
+			name: "pod already carrying migration scheduling gate and PMJ assignment is untouched",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Namespace: "default",
-					Name:      "already-gated-pod",
-					Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+					Namespace:   "default",
+					Name:        "already-gated-pod",
+					Labels:      map[string]string{"pod-migration.gke.io/enabled": "true"},
+					Annotations: map[string]string{util.AnnotationAssignedPMJ: util.FormatPMJName("already-gated-pod", "12345678")},
 				},
 				Spec: corev1.PodSpec{
 					SchedulingGates: []corev1.PodSchedulingGate{{Name: "gke.io/pod-migration-gate"}},
@@ -460,6 +461,30 @@ func TestPodGateInjector_ShortensReadinessInitialDelay(t *testing.T) {
 			cacheObjs:           []runtime.Object{activeBarePMJ("already-gated-pod", pmv1alpha1.PodMigrationJobPhaseRestoring)},
 			wantGate:            true,
 			wantReadinessDelays: []int32{50},
+			wantLivenessDelays:  []int32{-1},
+			wantStartupDelays:   []int32{-1},
+		},
+		{
+			name: "pod with pre-supplied scheduling gate but no assigned-pmj is assigned and clears readiness initialDelaySeconds",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "presupplied-gate-pod",
+					Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{{Name: "gke.io/pod-migration-gate"}},
+					Containers: []corev1.Container{
+						{
+							Name:           "app",
+							ReadinessProbe: httpGetProbe("/readyz", 50, 20),
+						},
+					},
+				},
+			},
+			cacheObjs:           []runtime.Object{activeBarePMJ("presupplied-gate-pod", pmv1alpha1.PodMigrationJobPhaseRestoring)},
+			wantGate:            true,
+			wantReadinessDelays: []int32{0},
 			wantLivenessDelays:  []int32{-1},
 			wantStartupDelays:   []int32{-1},
 		},
@@ -507,7 +532,7 @@ func TestPodGateInjector_ShortensReadinessInitialDelay(t *testing.T) {
 			req.Object = runtime.RawExtension{Raw: rawPod}
 
 			resp := handler.Handle(context.Background(), req)
-			got := applyAdmissionPatches(t, rawPod, resp)
+			got := applyReadinessAdmissionPatches(t, rawPod, resp)
 
 			hasGate := false
 			for _, g := range got.Spec.SchedulingGates {
@@ -593,7 +618,7 @@ func TestPodGateInjector_LogsNonTruePreserveAnnotation(t *testing.T) {
 	req.Object = runtime.RawExtension{Raw: rawPod}
 
 	resp := handler.Handle(ctx, req)
-	got := applyAdmissionPatches(t, rawPod, resp)
+	got := applyReadinessAdmissionPatches(t, rawPod, resp)
 	if got.Spec.Containers[0].ReadinessProbe.InitialDelaySeconds != 0 {
 		t.Fatalf("initialDelaySeconds = %d, want 0", got.Spec.Containers[0].ReadinessProbe.InitialDelaySeconds)
 	}

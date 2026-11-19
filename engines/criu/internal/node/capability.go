@@ -35,6 +35,15 @@ const (
 	NodeAnnotationCRIUReady = "pod-migrate.io/criu-ready"
 	// NodeAnnotationCRIUVersion records the installed CRIU binary version on the node.
 	NodeAnnotationCRIUVersion = "pod-migrate.io/criu-version"
+	// NodeAnnotationCRIUReason records why the node is unready for CRIU operations.
+	NodeAnnotationCRIUReason = "pod-migrate.io/criu-reason"
+	// NodeAnnotationCRIURemediation records actionable remediation instructions for operators.
+	NodeAnnotationCRIURemediation = "pod-migrate.io/criu-remediation"
+
+	// ReasonContainerdCachedCRIU indicates containerd cached a failed CRIU lookup.
+	ReasonContainerdCachedCRIU = "containerd cached failed CRIU lookup; restart containerd to clear"
+	// RemediationRestartContainerd provides actionable guidance to clear ReasonContainerdCachedCRIU.
+	RemediationRestartContainerd = "restart containerd (systemctl restart containerd)"
 
 	// imageBundleDir is where the agent image carries the self-contained CRIU
 	// bundle (built by build/agent/Dockerfile from a criu >= 3.19 distro).
@@ -50,21 +59,28 @@ const (
 // path (stock GKE ships no CRIU; COS needs a writable location) and installs
 // the wrapper on the host PATH.
 func installCRIUBundle() (version string, err error) {
-	entries, err := os.ReadDir(imageBundleDir)
+	return installCRIUBundleDirs(imageBundleDir, criuBundleDir, criuConfDir, hostPathBinDir)
+}
+
+func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir string) (version string, err error) {
+	entries, err := os.ReadDir(srcBundleDir)
 	if err != nil {
 		return "", fmt.Errorf("agent image carries no criu bundle: %w", err)
 	}
-	if err := os.MkdirAll(criuBundleDir, 0o755); err != nil {
+	if err := os.MkdirAll(dstBundleDir, 0o755); err != nil {
 		return "", err
 	}
 	for _, e := range entries {
-		src := filepath.Join(imageBundleDir, e.Name())
-		dst := filepath.Join(criuBundleDir, e.Name())
+		if e.IsDir() {
+			continue
+		}
+		src := filepath.Join(srcBundleDir, e.Name())
+		dst := filepath.Join(dstBundleDir, e.Name())
 		if err := copyFile(src, dst, 0o755); err != nil {
 			return "", fmt.Errorf("install %s: %w", e.Name(), err)
 		}
 	}
-	v, err := os.ReadFile(filepath.Join(criuBundleDir, "VERSION"))
+	v, err := os.ReadFile(filepath.Join(dstBundleDir, "VERSION"))
 	if err != nil {
 		return "", fmt.Errorf("bundle has no VERSION: %w", err)
 	}
@@ -74,20 +90,20 @@ func installCRIUBundle() (version string, err error) {
 	// reconnect cleanly; file-validation buildid verifies binary identity on
 	// restore. Written at bootstrap because the kubelet checkpoint dump happens
 	// before any agent-driven restore.
-	if err := os.MkdirAll(criuConfDir, 0o755); err != nil {
+	if err := os.MkdirAll(dstConfDir, 0o755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(criuConfDir, "runc.conf"),
+	if err := os.WriteFile(filepath.Join(dstConfDir, "runc.conf"),
 		[]byte("tcp-close\nskip-in-flight\nfile-validation buildid\nfile-locks\n"), 0o644); err != nil {
 		return "", fmt.Errorf("write criu runc.conf: %w", err)
 	}
 	// Put the wrapper on the host PATH so containerd/runc (and therefore the
 	// kubelet checkpoint API) can exec it.
-	wrapper, err := os.ReadFile(filepath.Join(criuBundleDir, "criu"))
+	wrapper, err := os.ReadFile(filepath.Join(dstBundleDir, "criu"))
 	if err != nil {
 		return "", err
 	}
-	if err := writeFileAtomic(filepath.Join(hostPathBinDir, "criu"), wrapper, 0o755); err != nil {
+	if err := writeFileAtomic(filepath.Join(dstBinDir, "criu"), wrapper, 0o755); err != nil {
 		return "", fmt.Errorf("install criu wrapper on host PATH: %w", err)
 	}
 
@@ -111,8 +127,8 @@ func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, st
 	return strings.Contains(raw, "Looks good"), raw
 }
 
-// annotateNode publishes the node's CRIU capability verdict and version.
-func annotateNode(ctx context.Context, c client.Client, nodeName, version string, ready bool) error {
+// annotateNode publishes the node's CRIU capability verdict, version, and optional reason/remediation.
+func annotateNode(ctx context.Context, c client.Client, nodeName, version, reason, remediation string, ready bool) error {
 	var node corev1.Node
 	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
 		return err
@@ -122,7 +138,20 @@ func annotateNode(ctx context.Context, c client.Client, nodeName, version string
 		node.Annotations = map[string]string{}
 	}
 	node.Annotations[NodeAnnotationCRIUReady] = fmt.Sprintf("%t", ready)
-	node.Annotations[NodeAnnotationCRIUVersion] = version
+	if version != "" {
+		node.Annotations[NodeAnnotationCRIUVersion] = version
+	}
+	if ready {
+		delete(node.Annotations, NodeAnnotationCRIUReason)
+		delete(node.Annotations, NodeAnnotationCRIURemediation)
+	} else {
+		if reason != "" {
+			node.Annotations[NodeAnnotationCRIUReason] = reason
+		}
+		if remediation != "" {
+			node.Annotations[NodeAnnotationCRIURemediation] = remediation
+		}
+	}
 	return c.Patch(ctx, &node, patch)
 }
 

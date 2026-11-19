@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -64,13 +65,16 @@ type GKEPodSnapshots struct {
 	provider *snapshot.GKEProvider
 	// events reads the events that VerifyRestore inspects, from the API
 	// server rather than the cache.
-	events client.Reader
+	events       client.Reader
+	registerCRIU bool
+	criuGroup    string
 }
 
 var (
-	_ Engine          = (*GKEPodSnapshots)(nil)
-	_ RestoreOrderer  = (*GKEPodSnapshots)(nil)
-	_ RestoreVerifier = (*GKEPodSnapshots)(nil)
+	_ Engine           = (*GKEPodSnapshots)(nil)
+	_ RestoreOrderer   = (*GKEPodSnapshots)(nil)
+	_ RestoreVerifier  = (*GKEPodSnapshots)(nil)
+	_ PlacementAdvisor = (*GKEPodSnapshots)(nil)
 )
 
 // GKEOption configures the GKE Pod Snapshots engine.
@@ -84,6 +88,17 @@ func WithAPIReader(r client.Reader) GKEOption {
 		if r != nil {
 			e.events = r
 		}
+	}
+}
+
+// WithCRIUAPIGroup registers the CRIU snapshot engine in NewDefaultRegistry,
+// bound to group (#135). When group is empty, DefaultCRIUAPIGroup
+// (podsnapshot.gke.io) is used. Without this option, NewDefaultRegistry
+// registers only GKE Pod Snapshots so default installs remain unchanged.
+func WithCRIUAPIGroup(group string) GKEOption {
+	return func(e *GKEPodSnapshots) {
+		e.registerCRIU = true
+		e.criuGroup = group
 	}
 }
 
@@ -103,14 +118,30 @@ func NewGKEPodSnapshots(c client.Client, scheme *runtime.Scheme, opts ...GKEOpti
 }
 
 // NewDefaultRegistry returns the registry of a stock deployment: GKE Pod
-// Snapshots, registered as the default engine, serving every runtime class
-// that runtimeClasses allows (RoutesFromAllowList). runtimeClasses is the
-// operator allow-list (--migratable-runtime-classes); nil means gVisor only.
-// opts configure the engine.
+// Snapshots (registered as the default engine), plus CRIU only when requested
+// via WithCRIUAPIGroup. Unless SetRoutes overrides the cluster routes, GKE Pod
+// Snapshots serves every runtime class that runtimeClasses allows
+// (RoutesFromAllowList). runtimeClasses is the operator allow-list
+// (--migratable-runtime-classes); nil means gVisor only. opts configure the
+// engines.
 func NewDefaultRegistry(c client.Client, scheme *runtime.Scheme, runtimeClasses *eligibility.RuntimeClassPolicy, opts ...GKEOption) (*Registry, error) {
 	r := NewRegistry(GKEPodSnapshotsName)
-	if err := r.Register(NewGKEPodSnapshots(c, scheme, opts...)); err != nil {
+	gke := NewGKEPodSnapshots(c, scheme, opts...)
+	if err := r.Register(gke); err != nil {
 		return nil, err
+	}
+	if gke.registerCRIU {
+		criuGroup := gke.criuGroup
+		if criuGroup == "" {
+			criuGroup = DefaultCRIUAPIGroup
+		}
+		criu, err := NewCRIU(c, scheme, criuGroup)
+		if err != nil {
+			return nil, err
+		}
+		if err := r.Register(criu); err != nil {
+			return nil, err
+		}
 	}
 	if err := r.SetRoutes(RoutesFromAllowList(runtimeClasses, GKEPodSnapshotsName)); err != nil {
 		return nil, err
@@ -120,6 +151,12 @@ func NewDefaultRegistry(c client.Client, scheme *runtime.Scheme, runtimeClasses 
 
 // Name implements Engine.
 func (*GKEPodSnapshots) Name() string { return GKEPodSnapshotsName }
+
+// APIGroup implements Engine.
+func (*GKEPodSnapshots) APIGroup() string { return gkeGroup }
+
+// RestoreAnnotation implements Engine.
+func (*GKEPodSnapshots) RestoreAnnotation() string { return gkeRestoreAnnotation }
 
 // RuntimeClasses implements Engine: gVisor.
 func (*GKEPodSnapshots) RuntimeClasses() []string { return []string{gkeRuntimeClass} }
@@ -274,6 +311,35 @@ func (*GKEPodSnapshots) InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string
 		return "", true, true
 	}
 	return trimmed, false, true
+}
+
+// Placement implements PlacementAdvisor. A gVisor checkpoint restored on a
+// node of another machine type can fail restore validation and crash-loop
+// (#14), so the replacement must land on a node of the source node's machine
+// type: the node.kubernetes.io/instance-type label value that the job
+// recorded in status.originNodeInstanceType while it was Pending.
+//
+// An empty value means the machine type is unknown: the source node couldn't
+// be read while the job was Pending, it has no such label, or the job was
+// past Pending when the controller started recording it. Such a job gets no
+// constraint, as before, and so does a value that isn't a valid label value,
+// since no node could carry it.
+//
+// The node's GKE version has to match too, or GKE Pod Snapshots starts the
+// pod cold, but no node label carries it, so it isn't a constraint here.
+func (*GKEPodSnapshots) Placement(_ context.Context, job *pmv1alpha1.PodMigrationJob) ([]corev1.NodeSelectorRequirement, error) {
+	if job == nil {
+		return nil, errors.New("placing a restore needs a job")
+	}
+	instanceType := job.Status.OriginNodeInstanceType
+	if instanceType == "" || len(validation.IsValidLabelValue(instanceType)) > 0 {
+		return nil, nil
+	}
+	return []corev1.NodeSelectorRequirement{{
+		Key:      corev1.LabelInstanceTypeStable,
+		Operator: corev1.NodeSelectorOpIn,
+		Values:   []string{instanceType},
+	}}, nil
 }
 
 // gkeColdStartReason is the Reason of the ColdStart verdict.
