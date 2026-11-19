@@ -51,7 +51,7 @@ const (
 // restorer drives the sandbox-sibling container restore.
 type restorer struct {
 	cclient *containerd.Client
-	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p -C -c).
+	// execHost runs a command in the host namespaces (nsenter -t 1 -m -p -C).
 	// Swappable in tests.
 	execHost         func(ctx context.Context, env []string, name string, args ...string) (string, error)
 	execRestoreFn    func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
@@ -101,6 +101,23 @@ func (r *restorer) nsenterExec(ctx context.Context, env []string, name string, a
 		return string(b), fmt.Errorf("timed out after 120s: %w", cctx.Err())
 	}
 	return string(b), runErr
+}
+
+// readProcCgroup reads the cgroup v2 membership of a target process from the
+// host cgroup namespace (via r.execHost). It fails closed with no fallback to
+// the agent's private cgroup namespace, preventing ../ path traversal escapes.
+func (r *restorer) readProcCgroup(ctx context.Context, pid int) ([]byte, error) {
+	if r.readProcCgroupFn != nil {
+		return r.readProcCgroupFn(pid)
+	}
+	if r.execHost == nil {
+		return nil, fmt.Errorf("cannot read host cgroup: execHost is nil")
+	}
+	out, err := r.execHost(ctx, nil, "cat", fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return nil, fmt.Errorf("read host cgroup for pid %d: %w", pid, err)
+	}
+	return []byte(out), nil
 }
 
 func nsenterExec(ctx context.Context, env []string, name string, args ...string) (string, error) {
@@ -333,18 +350,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	// Read within the host cgroup namespace (r.execHost) so the cgroup path is
 	// anchored to the host root and not distorted by the agent's private
 	// cgroup namespace (which emits relative ../ paths under cgroup_namespaces(7)).
-	readCg := func(pid int) ([]byte, error) {
-		if r.execHost != nil {
-			if out, err := r.execHost(ctx, nil, "cat", fmt.Sprintf("/proc/%d/cgroup", pid)); err == nil {
-				return []byte(out), nil
-			}
-		}
-		return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
-	}
-	if r.readProcCgroupFn != nil {
-		readCg = r.readProcCgroupFn
-	}
-	procCg, err := readCg(holder.Pid)
+	procCg, err := r.readProcCgroup(ctx, holder.Pid)
 	if err != nil {
 		return out, fmt.Errorf("read holder cgroup: %w", err)
 	}
@@ -523,7 +529,10 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 	if holder.ImageName == "" {
 		return AdaptParams{}, "", fmt.Errorf("target holder container has no image name; refusing to fall back to archive image")
 	}
-	cleanSlice := path.Clean("/" + podSlice)
+	if !strings.HasPrefix(podSlice, "/") || strings.Contains(podSlice, "..") {
+		return AdaptParams{}, "", fmt.Errorf("podSlice must be an absolute path without traversal: %q", podSlice)
+	}
+	cleanSlice := path.Clean(podSlice)
 	if cleanSlice == "/" || cleanSlice == "." {
 		return AdaptParams{}, "", fmt.Errorf("podSlice cannot be empty or root cgroup")
 	}

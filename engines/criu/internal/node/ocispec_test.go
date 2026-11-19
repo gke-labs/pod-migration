@@ -229,14 +229,21 @@ func TestPodSliceFromProcCgroup(t *testing.T) {
 }
 
 func TestPodSliceFromProcCgroupRejectsRootAndV1(t *testing.T) {
-	if _, err := PodSliceFromProcCgroup("0::/\n"); err == nil {
-		t.Error("root cgroup accepted")
+	bad := []string{
+		"0::/\n",
+		"0::/holder.scope\n",
+		"12:cpuset:/kubepods/x\n",
+		"0::/../../kubepods.slice/pod.slice/holder.scope\n",
+		"0::../../kubepods.slice/pod.slice/holder.scope\n",
+		"0::kubepods.slice/pod.slice/holder.scope\n",
+		"0::/kubepods.slice/../escaped.scope\n",
+		"0::\n",
+		"",
 	}
-	if _, err := PodSliceFromProcCgroup("0::/holder.scope\n"); err == nil {
-		t.Error("direct child of root cgroup accepted")
-	}
-	if _, err := PodSliceFromProcCgroup("12:cpuset:/kubepods/x\n"); err == nil {
-		t.Error("cgroup v1-only content accepted")
+	for _, in := range bad {
+		if _, err := PodSliceFromProcCgroup(in); err == nil {
+			t.Errorf("expected error for PodSliceFromProcCgroup(%q), got nil", in)
+		}
 	}
 }
 
@@ -508,14 +515,14 @@ func TestBuildAdaptParamsWiresTargetSpecAndRejectsMissingHolderMetadata(t *testi
 	}
 
 	t.Run("missing holder spec rejected", func(t *testing.T) {
-		_, _, err := buildAdaptParams(in, &containerRef{Pid: 2222, ImageName: "redis:7"}, "/rootfs", "slice", "pm-mig1", "/anon", nil)
+		_, _, err := buildAdaptParams(in, &containerRef{Pid: 2222, ImageName: "redis:7"}, "/rootfs", "/kubepods.slice/pod123.slice", "pm-mig1", "/anon", nil)
 		if err == nil || !strings.Contains(err.Error(), "no OCI spec") {
 			t.Fatalf("expected missing OCI spec error, got %v", err)
 		}
 	})
 
 	t.Run("missing holder image rejected instead of falling back to archive image", func(t *testing.T) {
-		_, _, err := buildAdaptParams(in, &containerRef{Pid: 2222, Spec: targetSpec}, "/rootfs", "slice", "pm-mig1", "/anon", nil)
+		_, _, err := buildAdaptParams(in, &containerRef{Pid: 2222, Spec: targetSpec}, "/rootfs", "/kubepods.slice/pod123.slice", "pm-mig1", "/anon", nil)
 		if err == nil || !strings.Contains(err.Error(), "no image name") {
 			t.Fatalf("expected missing image name error, got %v", err)
 		}
@@ -528,7 +535,7 @@ func TestBuildAdaptParamsWiresTargetSpecAndRejectsMissingHolderMetadata(t *testi
 			Spec:      targetSpec,
 			ImageName: "redis:7-alpine",
 		}
-		ap, img, err := buildAdaptParams(in, holder, "/rootfs", "slice", "pm-mig1", "/anon", nil)
+		ap, img, err := buildAdaptParams(in, holder, "/rootfs", "/kubepods.slice/pod123.slice", "pm-mig1", "/anon", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

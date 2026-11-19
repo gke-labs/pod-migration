@@ -333,7 +333,13 @@ func PodSliceFromProcCgroup(procCgroup string) (string, error) {
 		if p == "" || p == "/" {
 			return "", fmt.Errorf("holder is in the root cgroup — cannot derive pod slice")
 		}
-		clean := path.Clean("/" + p)
+		if !strings.HasPrefix(p, "/") {
+			return "", fmt.Errorf("holder cgroup path must be absolute (got %q)", p)
+		}
+		if strings.Contains(p, "..") {
+			return "", fmt.Errorf("holder cgroup path contains traversal segments (got %q)", p)
+		}
+		clean := path.Clean(p)
 		dir := path.Dir(clean)
 		if dir == "/" || dir == "." {
 			return "", fmt.Errorf("holder is directly under root cgroup — cannot derive pod slice")

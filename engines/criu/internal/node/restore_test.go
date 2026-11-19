@@ -205,13 +205,8 @@ func TestBuildAdaptParams_ProducesAbsoluteCgroupsPath(t *testing.T) {
 			want:     "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/pm-mig-123",
 		},
 		{
-			name:     "relative pod slice normalized to absolute",
-			podSlice: "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice",
-			want:     "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/pm-mig-123",
-		},
-		{
-			name:     "messy path cleaned to absolute",
-			podSlice: "///kubepods.slice//kubepods-pod123.slice/..//kubepods-pod123.slice",
+			name:     "nested absolute pod slice",
+			podSlice: "/kubepods.slice/kubepods-pod123.slice",
 			want:     "/kubepods.slice/kubepods-pod123.slice/pm-mig-123",
 		},
 	}
@@ -304,7 +299,7 @@ func TestNsenterExec_EntersHostCgroupNamespace(t *testing.T) {
 	}
 }
 
-func TestBuildAdaptParams_RejectsEmptyOrRootPodSlice(t *testing.T) {
+func TestBuildAdaptParams_RejectsInvalidPodSlice(t *testing.T) {
 	in := restoreInputs{
 		MigrationName: "mig-root",
 		SrcSpec: &specs.Spec{
@@ -318,10 +313,91 @@ func TestBuildAdaptParams_RejectsEmptyOrRootPodSlice(t *testing.T) {
 		Spec:      sampleTargetSpec(),
 	}
 
-	for _, invalid := range []string{"", "/", "///"} {
+	invalidSlices := []string{
+		"",
+		"/",
+		"///",
+		"relative.slice",
+		"relative/pod.slice",
+		"../escape",
+		"/kubepods/../escape",
+		"///kubepods.slice//kubepods-pod123.slice/..//kubepods-pod123.slice",
+	}
+	for _, invalid := range invalidSlices {
 		if _, _, err := buildAdaptParams(in, holder, "/rootfs", invalid, "pm-mig-root", "/anon", nil); err == nil {
 			t.Errorf("buildAdaptParams accepted invalid podSlice %q", invalid)
 		}
+	}
+}
+
+func TestReadProcCgroup_ExecHost(t *testing.T) {
+	var calledName string
+	var calledArgs []string
+	expectedOutput := "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-holder.scope\n"
+
+	r := &restorer{
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			calledName = name
+			calledArgs = args
+			return expectedOutput, nil
+		},
+	}
+
+	ctx := context.Background()
+	out, err := r.readProcCgroup(ctx, 4567)
+	if err != nil {
+		t.Fatalf("readProcCgroup failed: %v", err)
+	}
+	if string(out) != expectedOutput {
+		t.Errorf("readProcCgroup returned %q, want %q", string(out), expectedOutput)
+	}
+	if calledName != "cat" {
+		t.Errorf("execHost command = %q, want cat", calledName)
+	}
+	if len(calledArgs) != 1 || calledArgs[0] != "/proc/4567/cgroup" {
+		t.Errorf("execHost args = %v, want [/proc/4567/cgroup]", calledArgs)
+	}
+}
+
+func TestReadProcCgroup_HostFailureFailsWithoutFallback(t *testing.T) {
+	r := &restorer{
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "", fmt.Errorf("simulated host cat failure")
+		},
+	}
+
+	ctx := context.Background()
+	_, err := r.readProcCgroup(ctx, 4567)
+	if err == nil {
+		t.Fatal("expected error on execHost failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "simulated host cat failure") {
+		t.Errorf("error %q does not contain expected failure reason", err.Error())
+	}
+}
+
+func TestReadProcCgroup_PrivateCgroupnsTraversalViewRejectedByParser(t *testing.T) {
+	// Private cgroupns view emits ../ traversal segments relative to agent cgroup root
+	privateCgroupnsOutput := "0::/../../kubepods-burstable-podT.slice/cri-containerd-H.scope\n"
+
+	r := &restorer{
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return privateCgroupnsOutput, nil
+		},
+	}
+
+	ctx := context.Background()
+	out, err := r.readProcCgroup(ctx, 9999)
+	if err != nil {
+		t.Fatalf("unexpected readProcCgroup error: %v", err)
+	}
+
+	_, parseErr := PodSliceFromProcCgroup(string(out))
+	if parseErr == nil {
+		t.Fatal("PodSliceFromProcCgroup accepted private-cgroupns output with traversal segments")
+	}
+	if !strings.Contains(parseErr.Error(), "traversal") {
+		t.Errorf("parseErr %q does not mention traversal", parseErr.Error())
 	}
 }
 
