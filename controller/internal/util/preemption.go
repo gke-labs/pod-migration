@@ -189,12 +189,48 @@ func CalculatePodMemoryFootprint(pod *corev1.Pod) (int64, bool) {
 	return 0, false
 }
 
-// FindLatestReadyManualStopPSP finds the latest ready manual PodSnapshotPolicy in the namespace
-// matching the labels, and verifies that its postCheckpoint behavior is set to "stop".
+// LabelSnapshotEngine partitions PodSnapshotPolicies between engines when two
+// engines share an API group (e.g. GKE Pod Snapshots and CRIU on podsnapshot.gke.io).
+const LabelSnapshotEngine = "pod-migrate.io/engine"
+
+// FindLatestReadyManualStopPSP finds the latest ready manual PodSnapshotPolicy in the
+// podsnapshot.gke.io group matching the pod's labels (excluding policies explicitly labeled
+// for the CRIU engine via pod-migrate.io/engine=criu), and verifies that its postCheckpoint
+// behavior is set to "stop".
 func FindLatestReadyManualStopPSP(ctx context.Context, c client.Reader, namespace string, podLabels map[string]string) (*unstructured.Unstructured, error) {
+	return findLatestReadyManualStopPSP(ctx, c, "podsnapshot.gke.io", namespace, podLabels, nil, "criu")
+}
+
+// FindLatestReadyManualStopPSPInGroup finds the latest ready manual PodSnapshotPolicy in
+// group/v1 in namespace matching podLabels and requiredPolicyLabels (an empty value in
+// requiredPolicyLabels requires that label to be unset or empty on the policy), and
+// verifies that its postCheckpoint behavior is set to "stop".
+func FindLatestReadyManualStopPSPInGroup(
+	ctx context.Context,
+	c client.Reader,
+	group string,
+	namespace string,
+	podLabels map[string]string,
+	requiredPolicyLabels map[string]string,
+) (*unstructured.Unstructured, error) {
+	return findLatestReadyManualStopPSP(ctx, c, group, namespace, podLabels, requiredPolicyLabels, "")
+}
+
+func findLatestReadyManualStopPSP(
+	ctx context.Context,
+	c client.Reader,
+	group string,
+	namespace string,
+	podLabels map[string]string,
+	requiredPolicyLabels map[string]string,
+	excludedEngine string,
+) (*unstructured.Unstructured, error) {
+	if group == "" {
+		group = "podsnapshot.gke.io"
+	}
 	pspList := &unstructured.UnstructuredList{}
 	pspList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "podsnapshot.gke.io",
+		Group:   group,
 		Version: "v1",
 		Kind:    "PodSnapshotPolicyList",
 	})
@@ -203,7 +239,7 @@ func FindLatestReadyManualStopPSP(ctx context.Context, c client.Reader, namespac
 			// Tolerate missing CRDs (fail-open)
 			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to list PSPs: %w", err)
+		return nil, fmt.Errorf("failed to list PSPs in group %s: %w", group, err)
 	}
 
 	var matchingPSPs []*unstructured.Unstructured
@@ -211,6 +247,24 @@ func FindLatestReadyManualStopPSP(ctx context.Context, c client.Reader, namespac
 
 	for i := range pspList.Items {
 		psp := &pspList.Items[i]
+
+		if excludedEngine != "" && psp.GetLabels()[LabelSnapshotEngine] == excludedEngine {
+			continue
+		}
+
+		if len(requiredPolicyLabels) > 0 {
+			pspLabels := psp.GetLabels()
+			labelMismatch := false
+			for k, want := range requiredPolicyLabels {
+				if pspLabels[k] != want {
+					labelMismatch = true
+					break
+				}
+			}
+			if labelMismatch {
+				continue
+			}
+		}
 
 		// 1. Verify trigger type is manual
 		triggerType, found, err := unstructured.NestedString(psp.Object, "spec", "triggerConfig", "type")

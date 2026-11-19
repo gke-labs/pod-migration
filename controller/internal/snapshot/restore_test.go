@@ -34,6 +34,9 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
+// psNameAnnotation is the GKE Pod Snapshots restore annotation used in tests.
+const psNameAnnotation = "podsnapshot.gke.io/ps-name"
+
 // The replacement in these tests reuses the bypass tests' pod name and UID.
 
 // TestCompleteRestore_SetsColdStartBypass: the replacement's ps-name is

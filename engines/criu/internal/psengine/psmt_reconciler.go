@@ -234,6 +234,9 @@ func (r *PSMTReconciler) refusalReason(ctx context.Context, pod *corev1.Pod) str
 	if pod.Labels[contract.LabelEnabled] != "true" {
 		return "pod is not opted in (pod-migration.gke.io/enabled != true)"
 	}
+	if pod.Spec.HostNetwork {
+		return "hostNetwork pods unsupported by criu engine"
+	}
 	if len(pod.Spec.Containers) != 1 {
 		return "multi-container pods unsupported by criu engine v1"
 	}

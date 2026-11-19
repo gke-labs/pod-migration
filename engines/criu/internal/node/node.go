@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -48,16 +49,25 @@ type Node struct {
 	SocketPath string
 	Inspector  *ContainerdReadinessInspector
 
+	// annotateMu serializes Node annotation GET/PATCH calls so concurrent
+	// Bootstrap and DemoteNode writes never land out of order on the API server.
+	annotateMu sync.Mutex
+
 	mu                 sync.Mutex
 	ready              bool
 	version            string
 	lastSocketInode    uint64
+	poisonedInode      uint64
+	demoteSeq          uint64
+	demoteInode        uint64
+	pendingDemote      bool
+	pendingVerdict     *nodeVerdict
 	unreadyReason      string
 	unreadyRemediation string
 
 	statSocketFn    func(string) (uint64, error)
 	installBundleFn func() (string, error)
-	bootstrapFn     func(context.Context) error
+	execHostFn      func(context.Context, []string, string, ...string) (string, error)
 }
 
 // NewNode wires the node worker against containerd and the local kubelet
@@ -77,6 +87,7 @@ func NewNode(c client.Client, nodeName string) (*Node, error) {
 		SocketPath:      "/run/containerd/containerd.sock",
 		statSocketFn:    getSocketInode,
 		installBundleFn: installCRIUBundle,
+		execHostFn:      r.execHost,
 		Inspector:       NewDefaultContainerdInspector(r.execHost),
 	}, nil
 }
@@ -94,38 +105,181 @@ func getSocketInode(path string) (uint64, error) {
 }
 
 // Bootstrap installs the CRIU bundle, verifies it against the host kernel, and
-// annotates the node with its capability verdict.
+// annotates the node with its capability verdict. If the final Node annotation
+// write fails, the computed verdict is buffered in pendingVerdict so subsequent
+// ProbeReadiness ticks retry only the annotation write without re-installing
+// the bundle or re-running `criu check --all`.
 func (n *Node) Bootstrap(ctx context.Context) error {
-	n.recordSocketInode()
-	if n.bootstrapFn != nil {
-		return n.bootstrapFn(ctx)
+	startIno, _ := n.statCurrentSocket()
+	n.mu.Lock()
+	startDemoteSeq := n.demoteSeq
+	if startIno != 0 && n.pendingVerdict != nil && n.pendingVerdict.ino != startIno {
+		n.pendingVerdict = nil
 	}
-	return n.bootstrapInternal(ctx)
+	n.mu.Unlock()
+	return n.bootstrapInternal(ctx, startIno, startDemoteSeq)
 }
 
-func (n *Node) recordSocketInode() {
+func (n *Node) statCurrentSocket() (uint64, bool) {
+	n.mu.Lock()
+	statFn := n.statSocketFn
+	sockPath := n.SocketPath
+	n.mu.Unlock()
+	if statFn == nil || sockPath == "" {
+		return 0, false
+	}
+	ino, err := statFn(sockPath)
+	if err != nil {
+		return 0, false
+	}
+	return ino, true
+}
+
+func (n *Node) isPoisonedInode(ino uint64) bool {
+	if ino == 0 {
+		return false
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.recordSocketInodeLocked()
+	return ino == n.poisonedInode
 }
 
-func (n *Node) recordSocketInodeLocked() {
-	if n.statSocketFn != nil && n.SocketPath != "" {
-		if ino, err := n.statSocketFn(n.SocketPath); err == nil {
-			n.lastSocketInode = ino
+type nodeVerdict struct {
+	ready          bool
+	version        string
+	reason         string
+	remediation    string
+	ino            uint64
+	startDemoteSeq uint64
+}
+
+func isStaleDemote(bootIno, demoteIno, currIno uint64, hasCurr bool) bool {
+	return bootIno != 0 && demoteIno != 0 && demoteIno != bootIno && hasCurr && currIno == bootIno
+}
+
+func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
+	n.annotateMu.Lock()
+	defer n.annotateMu.Unlock()
+
+	currIno, hasCurr := n.statCurrentSocket()
+	if v.ino != 0 && hasCurr && currIno != 0 && currIno != v.ino {
+		n.mu.Lock()
+		if n.pendingVerdict != nil && n.pendingVerdict.ino == v.ino {
+			n.pendingVerdict = nil
 		}
+		n.mu.Unlock()
+		return fmt.Errorf("containerd socket inode changed during bootstrap (%d -> %d); deferring to next probe", v.ino, currIno)
 	}
+
+	n.mu.Lock()
+	poisoned := v.ready && v.ino != 0 && v.ino == n.poisonedInode
+	concurrentDemote := v.ready && n.demoteSeq != v.startDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, currIno, hasCurr)
+	demoteReason := n.unreadyReason
+	demoteRemediation := n.unreadyRemediation
+	prePatchDemoteSeq := n.demoteSeq
+	n.mu.Unlock()
+
+	if poisoned {
+		v.ready = false
+		v.reason = ReasonContainerdCachedCRIU
+		v.remediation = RemediationRestartContainerd
+	} else if concurrentDemote {
+		v.ready = false
+		v.reason = demoteReason
+		v.remediation = demoteRemediation
+	}
+
+	if err := annotateNode(ctx, n.Client, n.NodeName, v.version, v.reason, v.remediation, v.ready); err != nil {
+		postCurrIno, hasPostCurr := n.statCurrentSocket()
+		n.mu.Lock()
+		if v.version != "" {
+			n.version = v.version
+		}
+		socketMoved := hasPostCurr && postCurrIno != 0 && v.ino != 0 && postCurrIno != v.ino
+		midPatchDemote := n.demoteSeq != prePatchDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, postCurrIno, hasPostCurr)
+		if socketMoved {
+			n.pendingVerdict = nil
+		} else if midPatchDemote {
+			if n.demoteInode != 0 {
+				n.pendingVerdict = nil
+			} else if ctx.Err() == nil && v.ino != 0 {
+				cp := v
+				cp.ready = false
+				cp.reason = n.unreadyReason
+				cp.remediation = n.unreadyRemediation
+				cp.startDemoteSeq = n.demoteSeq
+				n.pendingVerdict = &cp
+			}
+		} else if ctx.Err() == nil && (!concurrentDemote || n.demoteInode == 0) {
+			cp := v
+			if concurrentDemote {
+				cp.startDemoteSeq = prePatchDemoteSeq
+			}
+			n.pendingVerdict = &cp
+		} else if concurrentDemote && n.demoteInode != 0 {
+			n.pendingVerdict = nil
+		}
+		n.mu.Unlock()
+		if poisoned {
+			return errors.Join(ErrContainerdCachedCRIU, err)
+		}
+		return err
+	}
+
+	postCurrIno, hasPostCurr := n.statCurrentSocket()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.pendingVerdict = nil
+	if v.version != "" {
+		n.version = v.version
+	}
+	if n.demoteSeq != prePatchDemoteSeq && !isStaleDemote(v.ino, n.demoteInode, postCurrIno, hasPostCurr) {
+		if v.ino != 0 && n.demoteInode == 0 && (!hasPostCurr || postCurrIno == 0 || postCurrIno == v.ino) {
+			n.lastSocketInode = v.ino
+		}
+		if v.ino != 0 && v.ino == n.poisonedInode {
+			return ErrContainerdCachedCRIU
+		}
+		return nil
+	}
+	n.ready = v.ready
+	if v.ino != 0 && (!concurrentDemote || n.demoteInode == 0 || n.demoteInode == v.ino) && (!hasPostCurr || postCurrIno == 0 || postCurrIno == v.ino) {
+		n.lastSocketInode = v.ino
+	}
+	if v.ready {
+		n.poisonedInode = 0
+		n.unreadyReason = ""
+		n.unreadyRemediation = ""
+	} else {
+		n.unreadyReason = v.reason
+		n.unreadyRemediation = v.remediation
+	}
+	n.pendingDemote = false
+	if poisoned {
+		return ErrContainerdCachedCRIU
+	}
+	return nil
 }
 
-func (n *Node) bootstrapInternal(ctx context.Context) error {
+func (n *Node) bootstrapInternal(ctx context.Context, startIno, startDemoteSeq uint64) error {
 	log := logf.FromContext(ctx)
+
+	getCtx, cancel := context.WithTimeout(ctx, nodeAPITimeout)
 	var nodeObj corev1.Node
-	if err := n.Client.Get(ctx, types.NamespacedName{Name: n.NodeName}, &nodeObj); err != nil {
+	err := n.Client.Get(getCtx, types.NamespacedName{Name: n.NodeName}, &nodeObj)
+	cancel()
+	if err != nil {
 		return err
 	}
 	if err := CheckContainerdVersion(nodeObj.Status.NodeInfo.ContainerRuntimeVersion); err != nil {
-		_ = annotateNode(ctx, n.Client, n.NodeName, "", "unsupported containerd version: "+err.Error(), "upgrade containerd", false)
-		return err
+		pubErr := n.publish(ctx, nodeVerdict{
+			ready:          false,
+			reason:         "unsupported containerd version: " + err.Error(),
+			remediation:    "upgrade containerd",
+			ino:            startIno,
+			startDemoteSeq: startDemoteSeq,
+		})
+		return errors.Join(err, pubErr)
 	}
 	installFn := n.installBundleFn
 	if installFn == nil {
@@ -133,34 +287,61 @@ func (n *Node) bootstrapInternal(ctx context.Context) error {
 	}
 	version, err := installFn()
 	if err != nil {
-		return err
+		pubErr := n.publish(ctx, nodeVerdict{
+			ready:          false,
+			reason:         "criu bundle install failed: " + err.Error(),
+			remediation:    "check node disk space and writable host paths, then restart pod-migrate-agent",
+			ino:            startIno,
+			startDemoteSeq: startDemoteSeq,
+		})
+		return errors.Join(err, pubErr)
 	}
-	ok, raw := verifyCRIU(ctx, n.Restorer.execHost)
+	if n.isPoisonedInode(startIno) {
+		pubErr := n.publish(ctx, nodeVerdict{
+			ready:          false,
+			version:        version,
+			reason:         ReasonContainerdCachedCRIU,
+			remediation:    RemediationRestartContainerd,
+			ino:            startIno,
+			startDemoteSeq: startDemoteSeq,
+		})
+		return errors.Join(ErrContainerdCachedCRIU, pubErr)
+	}
+	execFn := n.execHostFn
+	if execFn == nil && n.Restorer != nil {
+		execFn = n.Restorer.execHost
+	}
+	if execFn == nil {
+		return fmt.Errorf("host command runner is not configured")
+	}
+	ok, raw := verifyCRIU(ctx, execFn)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	log.Info("criu capability", "version", version, "checkAll", ok, "raw", truncate(raw, 200))
 
 	var reason, remediation string
-	var deterministicFailure bool
+	var transientErr error
 	if !ok {
 		reason = "criu check --all failed"
 		remediation = "check host kernel support for CRIU"
-		deterministicFailure = true
 	} else {
 		// Kernel check passed; verify containerd readiness so an unready containerd
 		// is never sent a checkpoint that would poison its lookup cache (#130).
 		insp := n.Inspector
 		if insp == nil {
-			var execHost func(context.Context, []string, string, ...string) (string, error)
-			if n.Restorer != nil {
-				execHost = n.Restorer.execHost
-			}
-			insp = NewDefaultContainerdInspector(execHost)
+			insp = NewDefaultContainerdInspector(execFn)
 		}
-		cOk, cReason, cRemediation, cErr := CheckContainerdReadiness(insp, n.SocketPath)
+		cOk, cReason, cRemediation, cErr := CheckContainerdReadiness(ctx, insp, n.SocketPath)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if cErr != nil {
 			log.Error(cErr, "containerd readiness check error")
 			ok = false
-			reason = "containerd readiness probe error: " + cErr.Error()
+			reason = "containerd readiness probe error: " + truncate(cErr.Error(), 200)
 			remediation = "verify containerd is running and accessible"
+			transientErr = cErr
 		} else if !cOk {
 			ok = false
 			reason = cReason
@@ -168,33 +349,79 @@ func (n *Node) bootstrapInternal(ctx context.Context) error {
 		}
 	}
 
-	n.mu.Lock()
-	n.version = version
-	n.ready = ok
-	if ok || deterministicFailure {
-		n.recordSocketInodeLocked()
-	} else {
-		// Readiness check failure or transient error: do NOT commit socket inode.
-		// Leaving lastSocketInode uncommitted allows ProbeReadiness to re-probe
-		// without requiring a containerd restart.
-		n.lastSocketInode = 0
+	verdictIno := startIno
+	if transientErr != nil {
+		// Transient lookup error during probe/restart: do NOT commit socket inode.
+		// Passing ino: 0 prevents publish from recording startIno as lastSocketInode,
+		// allowing ProbeReadiness to retry on the next tick.
+		verdictIno = 0
 	}
-	n.mu.Unlock()
-
-	return annotateNode(ctx, n.Client, n.NodeName, version, reason, remediation, ok)
+	pubErr := n.publish(ctx, nodeVerdict{
+		ready:          ok,
+		version:        version,
+		reason:         reason,
+		remediation:    remediation,
+		ino:            verdictIno,
+		startDemoteSeq: startDemoteSeq,
+	})
+	if transientErr != nil {
+		return errors.Join(transientErr, pubErr)
+	}
+	return pubErr
 }
 
 // DemoteNode marks the node unready with reason and remediation, preserving existing version.
 func (n *Node) DemoteNode(ctx context.Context, reason, remediation string) error {
+	ino, _ := n.statCurrentSocket()
+	return n.demoteNodeAtInode(ctx, reason, remediation, ino)
+}
+
+func (n *Node) demoteNodeAtInode(ctx context.Context, reason, remediation string, ino uint64) error {
+	currIno, hasCurr := n.statCurrentSocket()
 	n.mu.Lock()
+	if ino != 0 && hasCurr && currIno != 0 && currIno != ino && n.ready && n.lastSocketInode == currIno {
+		n.mu.Unlock()
+		return nil
+	}
 	n.ready = false
 	n.unreadyReason = reason
 	n.unreadyRemediation = remediation
-	n.recordSocketInodeLocked()
-	ver := n.version
+	n.demoteSeq++
+	seq := n.demoteSeq
+	n.demoteInode = ino
+	n.pendingDemote = true
+	if ino != 0 {
+		n.pendingVerdict = nil
+		n.lastSocketInode = ino
+		if reason == ReasonContainerdCachedCRIU {
+			n.poisonedInode = ino
+		}
+	} else if n.pendingVerdict != nil {
+		n.pendingVerdict.ready = false
+		n.pendingVerdict.reason = reason
+		n.pendingVerdict.remediation = remediation
+		n.pendingVerdict.startDemoteSeq = seq
+	}
 	n.mu.Unlock()
 
-	return annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false)
+	n.annotateMu.Lock()
+	defer n.annotateMu.Unlock()
+	n.mu.Lock()
+	if n.ready || n.demoteSeq != seq {
+		n.mu.Unlock()
+		return nil
+	}
+	ver := n.version
+	n.mu.Unlock()
+	if err := annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	if !n.ready && n.demoteSeq == seq {
+		n.pendingDemote = false
+	}
+	n.mu.Unlock()
+	return nil
 }
 
 // IsReady returns whether the node is currently considered CRIU-ready.
@@ -206,34 +433,65 @@ func (n *Node) IsReady() bool {
 
 // ProbeReadiness checks whether conditions have changed to restore node readiness.
 // If the node is currently unready, it checks whether containerd was restarted
-// (new socket inode) or whether an earlier readiness check failed without poisoning
-// containerd (lastSocketInode == 0), re-running Bootstrap to re-evaluate CRIU.
+// (new socket inode) or whether an earlier Bootstrap failed transiently before
+// committing its socket inode, and retries any unwritten demotion annotation.
 func (n *Node) ProbeReadiness(ctx context.Context) (bool, error) {
 	n.mu.Lock()
 	isReady := n.ready
 	lastIno := n.lastSocketInode
-	statFn := n.statSocketFn
-	sockPath := n.SocketPath
+	pendingDemote := n.pendingDemote
+	seq := n.demoteSeq
+	var pv *nodeVerdict
+	if n.pendingVerdict != nil {
+		vc := *n.pendingVerdict
+		pv = &vc
+	}
 	n.mu.Unlock()
 
 	if isReady {
 		return true, nil
 	}
 
-	if statFn == nil || sockPath == "" {
-		return false, nil
-	}
-
-	currIno, err := statFn(sockPath)
-	if err != nil {
-		// Socket may be temporarily missing/unreachable during containerd restart
-		return false, nil
-	}
-
-	if currIno != 0 && (lastIno == 0 || currIno != lastIno) {
-		logf.FromContext(ctx).Info("containerd restart or readiness re-probe triggered",
+	currIno, ok := n.statCurrentSocket()
+	if ok && currIno != 0 && currIno != lastIno {
+		if pv != nil && pv.ino == currIno {
+			if err := n.publish(ctx, *pv); err != nil {
+				return false, err
+			}
+			return n.IsReady(), nil
+		}
+		logf.FromContext(ctx).Info("containerd restart or uncommitted bootstrap detected, probing CRIU readiness",
 			"oldSocketInode", lastIno, "newSocketInode", currIno)
 		if err := n.Bootstrap(ctx); err != nil {
+			return false, err
+		}
+		return n.IsReady(), nil
+	}
+
+	if pendingDemote {
+		n.annotateMu.Lock()
+		defer n.annotateMu.Unlock()
+		n.mu.Lock()
+		stillPending := !n.ready && n.pendingDemote && n.demoteSeq == seq
+		ver := n.version
+		reason := n.unreadyReason
+		remediation := n.unreadyRemediation
+		n.mu.Unlock()
+		if stillPending {
+			if err := annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false); err != nil {
+				return false, err
+			}
+			n.mu.Lock()
+			if !n.ready && n.demoteSeq == seq {
+				n.pendingDemote = false
+			}
+			n.mu.Unlock()
+		}
+		return false, nil
+	}
+
+	if pv != nil && (!ok || currIno == 0 || pv.ino == currIno) {
+		if err := n.publish(ctx, *pv); err != nil {
 			return false, err
 		}
 		return n.IsReady(), nil

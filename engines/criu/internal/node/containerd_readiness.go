@@ -37,18 +37,21 @@ const (
 	// ReasonCRIUDisabledByConfig indicates containerd has enable_criu = false.
 	ReasonCRIUDisabledByConfig = "criu support is disabled in containerd configuration (enable_criu = false)"
 	// RemediationEnableCRIUConfig provides guidance to enable CRIU in containerd config.
-	RemediationEnableCRIUConfig = "enable CRIU in containerd configuration (set enable_criu = true)"
+	RemediationEnableCRIUConfig = "enable CRIU in containerd configuration (set enable_criu = true) and restart containerd"
 
 	// ReasonCRIUNotFoundOnContainerdPath indicates containerd cannot resolve criu on its PATH or shim PATH.
 	ReasonCRIUNotFoundOnContainerdPath = "criu binary not found in containerd PATH or shim PATH"
 	// RemediationInstallCRIUOnContainerdPath provides guidance to make criu resolvable by containerd.
-	RemediationInstallCRIUOnContainerdPath = "install criu wrapper on containerd PATH or configure shim PATH"
+	RemediationInstallCRIUOnContainerdPath = "install criu wrapper on containerd PATH or configure shim PATH, and restart containerd"
+
+	// RemediationUpgradeCRIUVersion provides guidance to update an outdated CRIU binary.
+	RemediationUpgradeCRIUVersion = "upgrade CRIU binary to >= 3.16.0 and restart containerd"
 
 	maxSymlinks = 40
 )
 
 var (
-	criuVersionRegex = regexp.MustCompile(`(\d+)\.(\d+)(?:\.(\d+))?`)
+	criuVersionRegex = regexp.MustCompile(`(?:^|[Vv]ersion:\s*|\s)(\d+)\.(\d+)(?:\.(\d+))?`)
 )
 
 // ContainerdReadinessInspector encapsulates environment queries needed to check
@@ -59,20 +62,21 @@ type ContainerdReadinessInspector struct {
 	ReadCmdline        func(pid int) ([]string, error)
 	ReadConfig         func(pid int) ([]byte, error)
 	StatContainerdFile func(pid int, path string) (os.FileInfo, error)
-	GetCRIUVersion     func(criuPath string) (string, error)
+	GetCRIUVersion     func(ctx context.Context, criuPath string) (string, error)
 }
 
-// StatFileInRoot resolves targetPath starting from root, correctly following symlinks
+// resolvePathInRoot walks targetPath segment-by-segment inside root, correctly following symlinks
 // relative to root rather than the calling process's root. Absolute symlinks (e.g. -> /opt/criu/bin/criu)
 // are re-anchored to root, relative symlinks are resolved against the symlink's directory,
 // and '..' components are clamped so they cannot escape root.
-func StatFileInRoot(root, targetPath string) (os.FileInfo, error) {
+func resolvePathInRoot(root, targetPath string) (string, error) {
+	cleanRoot := filepath.Clean(root)
 	if !filepath.IsAbs(targetPath) {
-		return nil, fmt.Errorf("target path must be absolute: %q", targetPath)
+		return "", fmt.Errorf("target path must be absolute: %q", targetPath)
 	}
 
 	cleanTarget := filepath.Clean(targetPath)
-	curr := root
+	curr := cleanRoot
 	symlinkCount := 0
 
 	parts := strings.Split(strings.TrimPrefix(cleanTarget, "/"), "/")
@@ -84,7 +88,7 @@ func StatFileInRoot(root, targetPath string) (os.FileInfo, error) {
 			continue
 		}
 		if seg == ".." {
-			if curr != root {
+			if curr != cleanRoot {
 				curr = filepath.Dir(curr)
 			}
 			continue
@@ -93,20 +97,20 @@ func StatFileInRoot(root, targetPath string) (os.FileInfo, error) {
 		next := filepath.Join(curr, seg)
 		fi, err := os.Lstat(next)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 
 		if fi.Mode()&os.ModeSymlink != 0 {
 			symlinkCount++
 			if symlinkCount > maxSymlinks {
-				return nil, fmt.Errorf("too many levels of symbolic links while resolving %s in %s", targetPath, root)
+				return "", fmt.Errorf("too many levels of symbolic links while resolving %s in %s", targetPath, cleanRoot)
 			}
 			link, err := os.Readlink(next)
 			if err != nil {
-				return nil, err
+				return "", err
 			}
 			if filepath.IsAbs(link) {
-				curr = root
+				curr = cleanRoot
 				newParts := strings.Split(strings.TrimPrefix(filepath.Clean(link), "/"), "/")
 				parts = append(newParts, parts...)
 			} else {
@@ -119,7 +123,16 @@ func StatFileInRoot(root, targetPath string) (os.FileInfo, error) {
 		curr = next
 	}
 
-	return os.Stat(curr)
+	return curr, nil
+}
+
+// StatFileInRoot resolves targetPath starting from root, following symlinks inside root.
+func StatFileInRoot(root, targetPath string) (os.FileInfo, error) {
+	resolved, err := resolvePathInRoot(root, targetPath)
+	if err != nil {
+		return nil, err
+	}
+	return os.Stat(resolved)
 }
 
 // StatFileInProcRoot resolves targetPath within /proc/<pid>/root using StatFileInRoot.
@@ -131,150 +144,121 @@ func StatFileInProcRoot(pid int, targetPath string) (os.FileInfo, error) {
 // ReadFileInProcRoot reads a file from /proc/<pid>/root, resolving symlinks relative to that root.
 func ReadFileInProcRoot(pid int, targetPath string) ([]byte, error) {
 	procRoot := fmt.Sprintf("/proc/%d/root", pid)
-	if !filepath.IsAbs(targetPath) {
-		return nil, fmt.Errorf("target path must be absolute: %q", targetPath)
+	resolved, err := resolvePathInRoot(procRoot, targetPath)
+	if err != nil {
+		return nil, err
 	}
-	cleanTarget := filepath.Clean(targetPath)
-	curr := procRoot
-	symlinkCount := 0
-	parts := strings.Split(strings.TrimPrefix(cleanTarget, "/"), "/")
-
-	for len(parts) > 0 {
-		seg := parts[0]
-		parts = parts[1:]
-		if seg == "" || seg == "." {
-			continue
-		}
-		if seg == ".." {
-			if curr != procRoot {
-				curr = filepath.Dir(curr)
-			}
-			continue
-		}
-		next := filepath.Join(curr, seg)
-		fi, err := os.Lstat(next)
-		if err != nil {
-			return nil, err
-		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			symlinkCount++
-			if symlinkCount > maxSymlinks {
-				return nil, fmt.Errorf("too many levels of symbolic links while reading %s in %s", targetPath, procRoot)
-			}
-			link, err := os.Readlink(next)
-			if err != nil {
-				return nil, err
-			}
-			if filepath.IsAbs(link) {
-				curr = procRoot
-				newParts := strings.Split(strings.TrimPrefix(filepath.Clean(link), "/"), "/")
-				parts = append(newParts, parts...)
-			} else {
-				newParts := strings.Split(filepath.Clean(link), "/")
-				parts = append(newParts, parts...)
-			}
-			continue
-		}
-		curr = next
-	}
-
-	return os.ReadFile(curr)
+	return os.ReadFile(resolved)
 }
 
 // NewDefaultContainerdInspector returns the production inspector using Linux host interfaces.
 func NewDefaultContainerdInspector(execHost func(context.Context, []string, string, ...string) (string, error)) *ContainerdReadinessInspector {
-	return &ContainerdReadinessInspector{
-		GetPID: func(sockPath string) (int, error) {
-			pid, err := getSocketPeerPID(sockPath)
-			if err == nil && pid > 1 {
-				return pid, nil
+	insp := &ContainerdReadinessInspector{}
+	insp.GetPID = func(sockPath string) (int, error) {
+		pid, err := getSocketPeerPID(sockPath)
+		if err == nil && pid > 1 {
+			return pid, nil
+		}
+		// If pid == 1 (e.g. systemd socket activation) or peer lookup failed,
+		// fallback to reading containerd.pid on the host filesystem.
+		pidData, errPid := os.ReadFile("/run/containerd/containerd.pid")
+		if errPid == nil {
+			if parsed, errParse := strconv.Atoi(strings.TrimSpace(string(pidData))); errParse == nil && parsed > 1 {
+				return parsed, nil
 			}
-			// If pid == 1 (e.g. systemd socket activation) or peer lookup failed,
-			// fallback to reading containerd.pid on the host filesystem.
-			pidData, errPid := os.ReadFile("/run/containerd/containerd.pid")
-			if errPid == nil {
-				if parsed, errParse := strconv.Atoi(strings.TrimSpace(string(pidData))); errParse == nil && parsed > 1 {
-					return parsed, nil
-				}
+		}
+		if err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("could not determine containerd PID from socket (pid=%d) or pidfile", pid)
+	}
+	insp.ReadEnviron = func(pid int) ([]string, error) {
+		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+		if err != nil {
+			return nil, err
+		}
+		parts := bytes.Split(raw, []byte{0})
+		env := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if len(p) > 0 {
+				env = append(env, string(p))
 			}
+		}
+		return env, nil
+	}
+	insp.ReadCmdline = func(pid int) ([]string, error) {
+		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			return nil, err
+		}
+		parts := bytes.Split(raw, []byte{0})
+		args := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if len(p) > 0 {
+				args = append(args, string(p))
+			}
+		}
+		return args, nil
+	}
+	insp.ReadConfig = func(pid int) ([]byte, error) {
+		configPath := "/etc/containerd/config.toml"
+		// Check cmdline for custom -c or --config argument using ReadCmdline hook
+		readCmdline := insp.ReadCmdline
+		if readCmdline != nil {
+			args, err := readCmdline(pid)
 			if err != nil {
-				return 0, err
-			}
-			return 0, fmt.Errorf("could not determine containerd PID from socket (pid=%d) or pidfile", pid)
-		},
-		ReadEnviron: func(pid int) ([]string, error) {
-			raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-			if err != nil {
-				return nil, err
-			}
-			parts := bytes.Split(raw, []byte{0})
-			env := make([]string, 0, len(parts))
-			for _, p := range parts {
-				if len(p) > 0 {
-					env = append(env, string(p))
+				if !os.IsNotExist(err) {
+					// Fail closed if cmdline cannot be read
+					return nil, fmt.Errorf("read containerd cmdline (pid %d): %w", pid, err)
 				}
-			}
-			return env, nil
-		},
-		ReadCmdline: func(pid int) ([]string, error) {
-			raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-			if err != nil {
-				return nil, err
-			}
-			parts := bytes.Split(raw, []byte{0})
-			args := make([]string, 0, len(parts))
-			for _, p := range parts {
-				if len(p) > 0 {
-					args = append(args, string(p))
-				}
-			}
-			return args, nil
-		},
-		ReadConfig: func(pid int) ([]byte, error) {
-			configPath := "/etc/containerd/config.toml"
-			// Check cmdline for custom -c or --config argument
-			if cmdlineRaw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
-				args := bytes.Split(cmdlineRaw, []byte{0})
+			} else {
 				for i := 0; i < len(args); i++ {
-					arg := string(args[i])
-					if arg == "-c" || arg == "--config" {
+					arg := args[i]
+					if arg == "-c" || arg == "--config" || arg == "-config" {
 						if i+1 < len(args) && len(args[i+1]) > 0 {
-							configPath = string(args[i+1])
+							configPath = args[i+1]
 							break
 						}
-					} else if strings.HasPrefix(arg, "--config=") {
-						configPath = strings.TrimPrefix(arg, "--config=")
+					} else if p, ok := strings.CutPrefix(arg, "--config="); ok {
+						configPath = p
+						break
+					} else if p, ok := strings.CutPrefix(arg, "-config="); ok {
+						configPath = p
+						break
+					} else if p, ok := strings.CutPrefix(arg, "-c="); ok {
+						configPath = p
 						break
 					}
 				}
 			}
+		}
 
-			// Stat and read through containerd's own mount namespace (/proc/<pid>/root)
-			data, err := ReadFileInProcRoot(pid, configPath)
-			if err != nil {
-				if os.IsNotExist(err) {
-					// No custom config; containerd uses built-in defaults
-					return nil, nil
-				}
-				// Fail closed on EACCES or any other read failure
-				return nil, fmt.Errorf("read containerd config %s from host proc: %w", configPath, err)
+		// Stat and read through containerd's own mount namespace (/proc/<pid>/root)
+		data, err := ReadFileInProcRoot(pid, configPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// No custom config; containerd uses built-in defaults
+				return nil, nil
 			}
-			return data, nil
-		},
-		StatContainerdFile: func(pid int, path string) (os.FileInfo, error) {
-			return StatFileInProcRoot(pid, path)
-		},
-		GetCRIUVersion: func(criuPath string) (string, error) {
-			if execHost == nil {
-				return "", errors.New("host command executor is not configured")
-			}
-			out, err := execHost(context.Background(), nil, criuPath, "--version")
-			if err != nil {
-				return "", fmt.Errorf("exec host %s --version: %w (%s)", criuPath, err, strings.TrimSpace(out))
-			}
-			return out, nil
-		},
+			// Fail closed on EACCES or any other read failure
+			return nil, fmt.Errorf("read containerd config %s from host proc: %w", configPath, err)
+		}
+		return data, nil
 	}
+	insp.StatContainerdFile = func(pid int, path string) (os.FileInfo, error) {
+		return StatFileInProcRoot(pid, path)
+	}
+	insp.GetCRIUVersion = func(ctx context.Context, criuPath string) (string, error) {
+		if execHost == nil {
+			return "", errors.New("host command executor is not configured")
+		}
+		out, err := execHost(ctx, nil, criuPath, "--version")
+		if err != nil {
+			return "", fmt.Errorf("exec host %s --version: %w (%s)", criuPath, err, strings.TrimSpace(out))
+		}
+		return out, nil
+	}
+	return insp
 }
 
 // parseContainerdConfig extracts enable_criu and shimPath from containerd's config.toml using TOML decoding.
@@ -291,14 +275,15 @@ func parseContainerdConfig(data []byte) (enableCRIU *bool, shimPath string, err 
 		return nil, "", fmt.Errorf("unmarshal containerd toml: %w", err)
 	}
 
+	var foundCRIUs []bool
 	if plugins, ok := root["plugins"].(map[string]any); ok {
 		for key, val := range plugins {
-			// CRI plugins in containerd v1 ("io.containerd.grpc.v1.cri") and v2 ("io.containerd.cri.v1.runtime")
-			if key == "io.containerd.grpc.v1.cri" || key == "io.containerd.cri.v1.runtime" || key == "cri" || strings.Contains(key, "cri") {
+			// CRI plugins in containerd v1 ("io.containerd.grpc.v1.cri") and v2 ("io.containerd.cri.v1.runtime") or "cri"
+			if key == "io.containerd.grpc.v1.cri" || key == "io.containerd.cri.v1.runtime" || key == "cri" {
 				if pluginMap, ok := val.(map[string]any); ok {
 					if ec, exists := pluginMap["enable_criu"]; exists {
 						if b, ok := ec.(bool); ok {
-							enableCRIU = &b
+							foundCRIUs = append(foundCRIUs, b)
 						}
 					}
 				}
@@ -310,7 +295,7 @@ func parseContainerdConfig(data []byte) (enableCRIU *bool, shimPath string, err 
 						if envSlice, ok := envVal.([]any); ok {
 							for i := len(envSlice) - 1; i >= 0; i-- {
 								if envStr, ok := envSlice[i].(string); ok {
-									if path, ok := cutPrefix(envStr, "PATH="); ok {
+									if path, ok := strings.CutPrefix(envStr, "PATH="); ok {
 										shimPath = path
 										break
 									}
@@ -323,14 +308,17 @@ func parseContainerdConfig(data []byte) (enableCRIU *bool, shimPath string, err 
 		}
 	}
 
-	return enableCRIU, shimPath, nil
-}
-
-func cutPrefix(s, prefix string) (string, bool) {
-	if strings.HasPrefix(s, prefix) {
-		return strings.TrimPrefix(s, prefix), true
+	if len(foundCRIUs) > 0 {
+		first := foundCRIUs[0]
+		for _, b := range foundCRIUs[1:] {
+			if b != first {
+				return nil, "", errors.New("conflicting enable_criu settings across containerd CRI plugins")
+			}
+		}
+		enableCRIU = &first
 	}
-	return s, false
+
+	return enableCRIU, shimPath, nil
 }
 
 // resolveCRIUPath implements containerd's resolveCriuPath lookup rules:
@@ -340,7 +328,7 @@ func cutPrefix(s, prefix string) (string, bool) {
 //   - Relative or empty PATH components are skipped (matching containerd / exec.LookPath ErrDot).
 func resolveCRIUPath(shimPath, containerdPATH string, statFn func(string) (os.FileInfo, error)) (string, error) {
 	if statFn == nil {
-		statFn = os.Stat
+		return "", errors.New("statFn is nil")
 	}
 
 	checkDirs := func(pathList string) (string, error) {
@@ -392,9 +380,24 @@ func parseCRIUVersionCode(verStr string) (int, error) {
 // 1. containerd configuration does not disable CRIU (enable_criu != false).
 // 2. containerd can resolve an executable CRIU binary according to its lookup rules (shim PATH or process PATH).
 // 3. the resolved CRIU binary meets the minimum version required by containerd (>= 3.16.0).
-func CheckContainerdReadiness(inspector *ContainerdReadinessInspector, sockPath string) (ok bool, reason, remediation string, err error) {
+func CheckContainerdReadiness(ctx context.Context, inspector *ContainerdReadinessInspector, sockPath string) (ok bool, reason, remediation string, err error) {
 	if inspector == nil {
 		return false, "", "", errors.New("inspector is nil")
+	}
+	if inspector.GetPID == nil {
+		return false, "", "", errors.New("inspector GetPID is nil")
+	}
+	if inspector.ReadEnviron == nil {
+		return false, "", "", errors.New("inspector ReadEnviron is nil")
+	}
+	if inspector.ReadConfig == nil {
+		return false, "", "", errors.New("inspector ReadConfig is nil")
+	}
+	if inspector.StatContainerdFile == nil {
+		return false, "", "", errors.New("inspector StatContainerdFile is nil")
+	}
+	if inspector.GetCRIUVersion == nil {
+		return false, "", "", errors.New("inspector GetCRIUVersion is nil")
 	}
 
 	pid, err := inspector.GetPID(sockPath)
@@ -409,7 +412,7 @@ func CheckContainerdReadiness(inspector *ContainerdReadinessInspector, sockPath 
 
 	containerdPATH := ""
 	for _, e := range env {
-		if path, ok := cutPrefix(e, "PATH="); ok {
+		if path, ok := strings.CutPrefix(e, "PATH="); ok {
 			containerdPATH = path
 			break
 		}
@@ -429,10 +432,7 @@ func CheckContainerdReadiness(inspector *ContainerdReadinessInspector, sockPath 
 	}
 
 	statFn := func(path string) (os.FileInfo, error) {
-		if inspector.StatContainerdFile != nil {
-			return inspector.StatContainerdFile(pid, path)
-		}
-		return os.Stat(path)
+		return inspector.StatContainerdFile(pid, path)
 	}
 
 	criuPath, err := resolveCRIUPath(shimPath, containerdPATH, statFn)
@@ -443,18 +443,18 @@ func CheckContainerdReadiness(inspector *ContainerdReadinessInspector, sockPath 
 		return false, ReasonCRIUNotFoundOnContainerdPath, RemediationInstallCRIUOnContainerdPath, nil
 	}
 
-	verStr, err := inspector.GetCRIUVersion(criuPath)
+	verStr, err := inspector.GetCRIUVersion(ctx, criuPath)
 	if err != nil {
-		return false, fmt.Sprintf("failed to retrieve criu version from %s: %v", criuPath, err), "verify CRIU binary functionality", nil
+		return false, truncate(fmt.Sprintf("failed to retrieve criu version from %s: %v", criuPath, err), 200), "verify CRIU binary functionality", nil
 	}
 
 	code, err := parseCRIUVersionCode(verStr)
 	if err != nil {
-		return false, fmt.Sprintf("failed to parse criu version (%s): %v", strings.TrimSpace(verStr), err), "verify CRIU binary version format", nil
+		return false, truncate(fmt.Sprintf("failed to parse criu version (%s): %v", strings.TrimSpace(verStr), err), 200), "verify CRIU binary version format", nil
 	}
 
 	if code < MinContainerdCRIUVersion {
-		return false, fmt.Sprintf("criu version %s on containerd PATH is older than minimum supported version 3.16.0", strings.TrimSpace(verStr)), "upgrade CRIU binary to >= 3.16.0", nil
+		return false, fmt.Sprintf("criu version %s on containerd PATH is older than minimum supported version 3.16.0", strings.TrimSpace(verStr)), RemediationUpgradeCRIUVersion, nil
 	}
 
 	return true, "", "", nil
