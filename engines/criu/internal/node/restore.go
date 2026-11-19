@@ -70,10 +70,10 @@ func newRestorer(c *containerd.Client) *restorer {
 	return r
 }
 
-// nsenterExec executes cmd in the host mount, pid, and cgroup namespaces and
-// joins PID 1's cgroup (agent has hostPID, so target pid 1 is the host init).
-// Entering host cgroup (-C -c) ensures commands like runc restore run outside
-// the agent's cgroup and place restored containers under the target pod slice.
+// nsenterExec executes cmd in the host mount, pid, and cgroup namespaces (agent
+// has hostPID, so target pid 1 is the host init). Entering host cgroup
+// namespace (-C) ensures commands like runc restore access the full host cgroup
+// hierarchy and place restored containers under the target pod slice.
 // Output goes through a file, not pipes: `runc restore --detach` leaves the
 // restored process holding the inherited stderr, so CombinedOutput would block
 // forever after a successful restore. With *os.File stdio, Wait returns on
@@ -85,7 +85,7 @@ func (r *restorer) nsenterExec(ctx context.Context, env []string, name string, a
 	if r != nil && r.nsenterBin != "" {
 		bin = r.nsenterBin
 	}
-	full := append([]string{"-t", "1", "-m", "-p", "-C", "-c", "--", name}, args...)
+	full := append([]string{"-t", "1", "-m", "-p", "-C", "--", name}, args...)
 	cmd := exec.CommandContext(cctx, bin, full...)
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.CreateTemp("", "pm-exec-*")
@@ -116,7 +116,7 @@ func (r *restorer) execRestore(ctx context.Context, env []string, logPath string
 	}
 	// runc restore holds inherited stderr, so we redirect to a file.
 	// We keep this file so it acts as a container-stdout log for the restored process.
-	full := append([]string{"-t", "1", "-m", "-p", "-C", "-c", "--", name}, args...)
+	full := append([]string{"-t", "1", "-m", "-p", "-C", "--", name}, args...)
 	cmd := exec.CommandContext(cctx, bin, full...)
 	cmd.Env = append(os.Environ(), env...)
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
@@ -330,7 +330,17 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	}
 
 	// Pod cgroup slice of the target, from the holder's own cgroup.
-	readCg := func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)) }
+	// Read within the host cgroup namespace (r.execHost) so the cgroup path is
+	// anchored to the host root and not distorted by the agent's private
+	// cgroup namespace (which emits relative ../ paths under cgroup_namespaces(7)).
+	readCg := func(pid int) ([]byte, error) {
+		if r.execHost != nil {
+			if out, err := r.execHost(ctx, nil, "cat", fmt.Sprintf("/proc/%d/cgroup", pid)); err == nil {
+				return []byte(out), nil
+			}
+		}
+		return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	}
 	if r.readProcCgroupFn != nil {
 		readCg = r.readProcCgroupFn
 	}
@@ -513,8 +523,12 @@ func buildAdaptParams(in restoreInputs, holder *containerRef, rootfsPath, podSli
 	if holder.ImageName == "" {
 		return AdaptParams{}, "", fmt.Errorf("target holder container has no image name; refusing to fall back to archive image")
 	}
+	cleanSlice := path.Clean("/" + podSlice)
+	if cleanSlice == "/" || cleanSlice == "." {
+		return AdaptParams{}, "", fmt.Errorf("podSlice cannot be empty or root cgroup")
+	}
 	srcSandboxID := in.SrcSpec.Annotations["io.kubernetes.cri.sandbox-id"]
-	cgroupsPath := path.Clean("/" + podSlice + "/" + id)
+	cgroupsPath := path.Clean(cleanSlice + "/" + id)
 	return AdaptParams{
 		RootfsPath:      rootfsPath,
 		HolderPid:       holder.Pid,

@@ -257,10 +257,13 @@ func TestExecRestore_EntersHostCgroupNamespace(t *testing.T) {
 		t.Fatalf("failed to read recorded args: %v", err)
 	}
 	recorded := string(b)
-	for _, flag := range []string{"-t 1", "-m", "-p", "-C", "-c"} {
+	for _, flag := range []string{"-t 1", "-m", "-p", "-C"} {
 		if !strings.Contains(recorded, flag) {
 			t.Errorf("execRestore missing flag %q; got args: %s", flag, recorded)
 		}
+	}
+	if strings.Contains(recorded, " -c ") || strings.HasSuffix(recorded, " -c") {
+		t.Errorf("execRestore must not pass -c flag (unsupported on Ubuntu 24.04 util-linux 2.39): %s", recorded)
 	}
 	if !strings.Contains(recorded, "-- runc restore --bundle /bundle") {
 		t.Errorf("execRestore missing command payload; got args: %s", recorded)
@@ -288,12 +291,45 @@ func TestNsenterExec_EntersHostCgroupNamespace(t *testing.T) {
 		t.Fatalf("failed to read recorded args: %v", err)
 	}
 	recorded := string(b)
-	for _, flag := range []string{"-t 1", "-m", "-p", "-C", "-c"} {
+	for _, flag := range []string{"-t 1", "-m", "-p", "-C"} {
 		if !strings.Contains(recorded, flag) {
 			t.Errorf("nsenterExec missing flag %q; got args: %s", flag, recorded)
 		}
 	}
+	if strings.Contains(recorded, " -c ") || strings.HasSuffix(recorded, " -c") {
+		t.Errorf("nsenterExec must not pass -c flag (unsupported on Ubuntu 24.04 util-linux 2.39): %s", recorded)
+	}
 	if !strings.Contains(recorded, "-- runc --root /run/runc delete -f pm-test") {
 		t.Errorf("nsenterExec missing command payload; got args: %s", recorded)
+	}
+}
+
+func TestBuildAdaptParams_RejectsEmptyOrRootPodSlice(t *testing.T) {
+	in := restoreInputs{
+		MigrationName: "mig-root",
+		SrcSpec: &specs.Spec{
+			Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "src-sb"},
+		},
+	}
+	holder := &containerRef{
+		Pid:       1234,
+		SandboxID: "tgt-sb",
+		ImageName: "app:v1",
+		Spec:      sampleTargetSpec(),
+	}
+
+	for _, invalid := range []string{"", "/", "///"} {
+		if _, _, err := buildAdaptParams(in, holder, "/rootfs", invalid, "pm-mig-root", "/anon", nil); err == nil {
+			t.Errorf("buildAdaptParams accepted invalid podSlice %q", invalid)
+		}
+	}
+}
+
+func TestAdaptSpec_RejectsRelativeCgroupsPath(t *testing.T) {
+	s := sampleSpec()
+	p := params()
+	p.CgroupsPath = "relative.slice/pm-mig1" // missing leading slash
+	if _, err := AdaptSpec(s, p); err == nil {
+		t.Error("AdaptSpec accepted relative CgroupsPath without leading slash")
 	}
 }

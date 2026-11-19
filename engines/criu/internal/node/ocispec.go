@@ -166,6 +166,9 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	spec.Linux.Namespaces = out
 	notes = append(notes, fmt.Sprintf("joined sandbox namespaces of pid %d (net/ipc/uts)", p.HolderPid))
 
+	if !strings.HasPrefix(p.CgroupsPath, "/") {
+		return nil, fmt.Errorf("cgroupsPath must be absolute, got %q", p.CgroupsPath)
+	}
 	spec.Linux.CgroupsPath = p.CgroupsPath
 	notes = append(notes, "cgroupsPath="+p.CgroupsPath)
 
