@@ -188,6 +188,9 @@ they start cold instead of being restored; also delete the
   - Explicit `command` in the pod spec (required so the `holder` wrapper can
     fall through to a cold start if restore fails).
   - Homogeneous CPU family between source and target nodes.
+  - Single migration per pod instance: migrating an already-restored CRIU pod
+    or holder-injected replacement is refused so the orchestrator falls back
+    to a clean cold start without checkpointing the holder wrapper ([#121](https://github.com/gke-labs/pod-migration/issues/121)).
 
 ## Building & Testing
 

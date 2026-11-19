@@ -97,7 +97,7 @@ type AdaptParams struct {
 	// HolderPid is the host pid of the target pod's holder container — its
 	// net/ipc/uts namespaces are the target sandbox namespaces.
 	HolderPid int
-	// CgroupsPath is the cgroupfs-relative path for the restored scope,
+	// CgroupsPath is the absolute cgroupfs path for the restored scope,
 	// derived from the holder's /proc/<pid>/cgroup pod slice.
 	CgroupsPath string
 	// SourcePodUID / TargetPodUID remap kubelet-projected mount sources
@@ -166,6 +166,9 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	spec.Linux.Namespaces = out
 	notes = append(notes, fmt.Sprintf("joined sandbox namespaces of pid %d (net/ipc/uts)", p.HolderPid))
 
+	if !strings.HasPrefix(p.CgroupsPath, "/") {
+		return nil, fmt.Errorf("cgroupsPath must be absolute, got %q", p.CgroupsPath)
+	}
 	spec.Linux.CgroupsPath = p.CgroupsPath
 	notes = append(notes, "cgroupsPath="+p.CgroupsPath)
 
@@ -316,7 +319,7 @@ func AdaptSpec(spec *specs.Spec, p AdaptParams) ([]string, error) {
 	return notes, nil
 }
 
-// PodSliceFromProcCgroup derives the cgroupfs-relative path of the pod slice
+// PodSliceFromProcCgroup derives the absolute cgroupfs path of the pod slice
 // from a holder container's /proc/<pid>/cgroup line (cgroup v2: "0::<path>").
 // The holder's own scope (last component) is stripped so the restored scope
 // becomes a sibling under the same pod slice.
@@ -326,11 +329,22 @@ func PodSliceFromProcCgroup(procCgroup string) (string, error) {
 		if !ok {
 			continue
 		}
-		p := strings.TrimPrefix(strings.TrimSpace(rest), "/")
-		if p == "" {
+		p := strings.TrimSpace(rest)
+		if p == "" || p == "/" {
 			return "", fmt.Errorf("holder is in the root cgroup — cannot derive pod slice")
 		}
-		return path.Dir(p), nil
+		if !strings.HasPrefix(p, "/") {
+			return "", fmt.Errorf("holder cgroup path must be absolute (got %q)", p)
+		}
+		if strings.Contains(p, "..") {
+			return "", fmt.Errorf("holder cgroup path contains traversal segments (got %q)", p)
+		}
+		clean := path.Clean(p)
+		dir := path.Dir(clean)
+		if dir == "/" || dir == "." {
+			return "", fmt.Errorf("holder is directly under root cgroup — cannot derive pod slice")
+		}
+		return dir, nil
 	}
 	return "", fmt.Errorf("no cgroup v2 (0::) line in %q", procCgroup)
 }

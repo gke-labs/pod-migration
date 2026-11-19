@@ -205,6 +205,34 @@ func TestConformanceFullHandshake(t *testing.T) {
 	if len(rops.restored) != 1 || rops.restored[0].SourcePodUID != "deadbeef-0000-1111" {
 		t.Fatalf("restore inputs: %+v", rops.restored)
 	}
+
+	// Phase 5 — migrating an already-restored pod (#121) must be refused
+	// by policy so the orchestrator falls back to a clean cold start
+	// instead of checkpointing the holder wrapper.
+	final.Labels = map[string]string{contract.LabelEnabled: "true"}
+	if err := c.Update(ctx, final); err != nil {
+		t.Fatal(err)
+	}
+	psmt2 := contract.New(contract.GVKManualTrigger)
+	psmt2.SetName("psmt-web-1-repeat")
+	psmt2.SetNamespace("default")
+	psmt2.Object["spec"] = map[string]interface{}{"targetPod": "web-1"}
+	if err := c.Create(ctx, psmt2); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePSMT(t, c, nil, "psmt-web-1-repeat")
+	snapName2 := contract.PodSnapshotName("web-1", string(final.UID))
+	ps2 := getSnapshot(t, c, snapName2)
+	cond2 := condition(ps2, contract.CondCheckpoint)
+	if cond2 == nil || cond2.Status != metav1.ConditionFalse || cond2.Reason != contract.ReasonRefused {
+		t.Fatalf("want Checkpoint=False/Refused for already-restored pod, got %+v", cond2)
+	}
+	if hasBucket(ps2) {
+		t.Fatal("refused repeat migration must not have bucket/path work order")
+	}
+	if len(ops.frozen) != 1 {
+		t.Fatalf("refused repeat migration must not invoke node freeze: got %d", len(ops.frozen))
+	}
 }
 
 // TestConformanceCPUFamilyGuard: cross-family archives are refused before

@@ -18,6 +18,7 @@ package psengine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -238,6 +239,9 @@ func (r *PSMTReconciler) refusalReason(ctx context.Context, pod *corev1.Pod) str
 	}
 	if len(pod.Spec.Containers) != 1 {
 		return "multi-container pods unsupported by criu engine v1"
+	}
+	if strings.TrimSpace(pod.Annotations[contract.AnnotationRestoreStatus]) == contract.RestoreStatusRestored || pod.Annotations[AnnotationInjected] == "true" {
+		return "re-checkpointing sibling-restored or holder-wrapped pods is unsupported"
 	}
 	if pod.Spec.NodeName == "" {
 		return "pod is not scheduled"
