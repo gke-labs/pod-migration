@@ -27,10 +27,18 @@ RUN set -eux; \
     maj=${ver%%.*}; rest=${ver#*.}; min=${rest%%.*}; \
     if [ "$maj" -lt 3 ] || { [ "$maj" -eq 3 ] && [ "$min" -lt 19 ]; }; then \
       echo "criu $ver < 3.19 — refusing (cgroup2 cgns restore quirk)"; exit 1; fi; \
-    mkdir -p /bundle; \
+    mkdir -p /bundle /bundle/licenses; \
     cp /usr/sbin/criu /bundle/criu.bin; \
     for lib in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do cp -L "$lib" /bundle/ || true; done; \
     cp -L /lib64/ld-linux-x86-64.so.2 /bundle/ 2>/dev/null || cp -L /lib/ld-linux-x86-64.so.2 /bundle/; \
+    cp -L /usr/share/doc/criu/copyright /bundle/licenses/criu.copyright; \
+    for f in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do \
+      dpkg -S "$(realpath "$f")" 2>/dev/null || true; \
+    done | cut -d: -f1 | sort -u | while read -r pkg; do \
+      if [ -f "/usr/share/doc/$pkg/copyright" ]; then \
+        cp -L "/usr/share/doc/$pkg/copyright" "/bundle/licenses/$pkg.copyright"; \
+      fi; \
+    done; \
     criu --version | head -1 > /bundle/VERSION; \
     printf '#!/bin/sh\nexec /var/lib/pod-migrate/criu-bundle/ld-linux-x86-64.so.2 --library-path /var/lib/pod-migrate/criu-bundle /var/lib/pod-migrate/criu-bundle/criu.bin "$@"\n' > /bundle/criu; \
     chmod +x /bundle/criu; ls -l /bundle; cat /bundle/VERSION
