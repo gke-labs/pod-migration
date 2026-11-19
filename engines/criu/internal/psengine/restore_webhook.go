@@ -136,6 +136,10 @@ func (h *RestoreInjector) verifyAssignedJobEngine(ctx context.Context, namespace
 	}
 	jobEngine := strings.TrimSpace(pmj.GetAnnotations()[contract.AnnotationOrchestratorEngine])
 	if jobEngine != contract.EngineCRIU {
+		// Logged so operators can find why replacement pods cold-start after an
+		// upgrade that kept jobs on another engine (see the README upgrade steps).
+		log.FromContext(ctx).V(1).Info("skipping holder injection: assigned PodMigrationJob is not routed to the CRIU engine",
+			"pmj", key, "jobEngine", jobEngine, "apiGroup", contract.Group)
 		return false, fmt.Sprintf("assigned PodMigrationJob belongs to snapshot engine %q, not %s", jobEngine, contract.EngineCRIU)
 	}
 	return true, ""

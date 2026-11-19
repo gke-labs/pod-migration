@@ -205,22 +205,33 @@ Upgrade in this order:
 1. Let in-flight migrations finish (no `PodMigrationJob` in `Snapshotting`,
    `Evicting` or `Restoring`).
 2. Apply the new `deploy/crds.yaml` (`criu.podmigration.gke.io`).
-3. Add a CRIU route to `pod-migration-controller`, for example
+3. Pause node drains and evictions of CRIU workloads until step 4 finishes.
+   From step 3 on, the controller sends new CRIU work to the new group while
+   the old engine still serves the old one, so a migration that starts in
+   between cold-starts.
+4. Add a CRIU route to `pod-migration-controller`, for example
    `--runtime-class-engines=@default=criu` (or `<class>=criu` for each class
-   CRIU should handle), and keep `--criu-api-group` at its default.
-4. Roll `cmd/engine`, `cmd/agent` and the `holder` image together from the same
-   release, using the new `deploy/deploy.yaml`.
-5. Once no migrations are in flight, delete the old CRIU objects
-   (`PodSnapshotPolicy`, `PodSnapshotStorageConfig`, `PodSnapshotManualTrigger`,
-   `PodSnapshot`) and CRDs in `podsnapshot.gke.io`. Only do this on clusters
-   where the GKE Pod Snapshots add-on is off: with the add-on on, those CRDs
-   belong to it.
+   CRIU should handle), and keep `--criu-api-group` at its default. Then roll
+   `cmd/engine`, `cmd/agent` and the `holder` image together from the same
+   release, using the new `deploy/deploy.yaml`. Resume evictions afterwards.
+5. Once no migrations are in flight, delete the old CRIU CRDs in
+   `podsnapshot.gke.io` (this also removes their objects), then restart
+   `pod-migration-controller`. Deleting only the objects isn't enough: the
+   controller recreates policy and storage objects in every registered engine's
+   group, and once the CRDs are gone its watches on them error until it
+   restarts. Only do this on clusters where the GKE Pod Snapshots add-on is
+   off: with the add-on on, those CRDs belong to it.
+
+If replacement pods still cold-start after the upgrade, check the engine's
+logs: the restore webhook logs each pod it skips because its job isn't routed
+to `criu`. It logs at debug level, which is on by default; if you lowered it,
+pass `--zap-log-level=debug` to `cmd/engine`.
 
 To stay on `podsnapshot.gke.io` instead (add-on-off clusters only), keep that
 group in `deploy/crds.yaml` and `deploy/deploy.yaml`, pass
 `--api-group=podsnapshot.gke.io` to `cmd/engine` and `cmd/agent` and
 `--criu-api-group=podsnapshot.gke.io` to the controller, and still add the
-controller's `criu` route from step 3 and roll the holder from step 4.
+controller's `criu` route and roll the holder as in step 4.
 
 To run on another custom API group, change the group in
 `deploy/crds.yaml` (each CRD's name and `spec.group`) and in the
