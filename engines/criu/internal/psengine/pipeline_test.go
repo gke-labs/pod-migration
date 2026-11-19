@@ -46,9 +46,9 @@ type fakeNodeOps struct {
 	unfreezeErr   error
 	stopped       []string
 	frozen        []string
-	unfrozen     []string
-	unfrozenUIDs []string
-	events       []string
+	unfrozen      []string
+	unfrozenUIDs  []string
+	events        []string
 	t             *testing.T
 
 	beforeFreeze func()
@@ -222,6 +222,21 @@ func TestNodePipelineHappyPath(t *testing.T) {
 	if !contract.IsSourceFrozen(got) {
 		t.Fatal("successful snapshot must record SourceFrozen=True")
 	}
+
+	// A subsequent reconcile of a Ready snapshot must be a no-op (keeps SourceFrozen=True, does not thaw).
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
+		t.Fatal(err)
+	}
+	if gotEv := strings.Join(ops.events, ","); gotEv != "freeze,checkpoint,sourceinfo,commit" {
+		t.Fatalf("subsequent reconcile added events: %s", gotEv)
+	}
+	if len(ops.unfrozen) != 0 {
+		t.Fatalf("subsequent reconcile must not unfreeze Ready snapshot: %v", ops.unfrozen)
+	}
+	got = getSnapshot(t, c, "ps-web-0-deadbeef")
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("subsequent reconcile must preserve SourceFrozen=True")
+	}
 }
 
 func TestNodePipelineFailureLeavesSourceRunning(t *testing.T) {
@@ -342,11 +357,11 @@ func TestPipeline_FailedThawLeavesSourceFrozenAndRetries(t *testing.T) {
 	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
-	if err == nil {
-		t.Fatal("expected error on failed unfreeze, got nil")
+	if err != nil {
+		t.Fatalf("expected nil error on failed unfreeze to preserve fixed 2s requeue, got: %v", err)
 	}
-	if res.RequeueAfter == 0 {
-		t.Fatal("expected requeue on failed unfreeze")
+	if res.RequeueAfter != 2*time.Second {
+		t.Fatalf("expected 2s requeue on failed unfreeze, got %v", res.RequeueAfter)
 	}
 
 	got := getSnapshot(t, c, "ps-web-0-deadbeef")
@@ -495,11 +510,11 @@ func TestPipeline_ErrFinishedFailedThawRetriesAndThaws(t *testing.T) {
 
 	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
-	if err == nil {
-		t.Fatal("expected error on failed unfreeze for errFinished, got nil")
+	if err != nil {
+		t.Fatalf("expected nil error on failed unfreeze for errFinished to preserve 2s requeue, got: %v", err)
 	}
-	if res.RequeueAfter == 0 {
-		t.Fatal("expected requeue on failed unfreeze for errFinished")
+	if res.RequeueAfter != 2*time.Second {
+		t.Fatalf("expected 2s requeue on failed unfreeze for errFinished, got %v", res.RequeueAfter)
 	}
 
 	got := getSnapshot(t, c, "ps-web-0-deadbeef")
@@ -569,11 +584,11 @@ func TestPipeline_ErrFinishedLiveGetErrorRequeues(t *testing.T) {
 	r := &NodeSnapshotReconciler{Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
-	if err == nil {
-		t.Fatal("expected error on failing live read during errFinished, got nil")
+	if err != nil {
+		t.Fatalf("expected nil error on failing live read to preserve 2s requeue, got: %v", err)
 	}
-	if res.RequeueAfter == 0 {
-		t.Fatal("expected requeue on failing live read")
+	if res.RequeueAfter != 2*time.Second {
+		t.Fatalf("expected 2s requeue on failing live read, got %v", res.RequeueAfter)
 	}
 	if len(ops.unfrozen) != 0 {
 		t.Fatal("live read error on errFinished must not fail open (must not thaw)")
@@ -627,11 +642,11 @@ func TestPipeline_FailedFreezeFailedThawLeavesSourceFrozenAndRequeues(t *testing
 	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
-	if err == nil {
-		t.Fatal("expected error on failed unfreeze after failed freeze, got nil")
+	if err != nil {
+		t.Fatalf("expected nil error on failed unfreeze after failed freeze to preserve 2s requeue, got: %v", err)
 	}
-	if res.RequeueAfter == 0 {
-		t.Fatal("expected requeue on failed unfreeze after failed freeze")
+	if res.RequeueAfter != 2*time.Second {
+		t.Fatalf("expected 2s requeue on failed unfreeze after failed freeze, got %v", res.RequeueAfter)
 	}
 	got := getSnapshot(t, c, "ps-web-0-deadbeef")
 	if !contract.IsSourceFrozen(got) {
@@ -713,11 +728,11 @@ func TestPipeline_FailedThawOnCancelLeavesSourceFrozenAndRequeues(t *testing.T) 
 	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
-	if err == nil {
-		t.Fatal("expected error on failed unfreeze during cancel, got nil")
+	if err != nil {
+		t.Fatalf("expected nil error on failed unfreeze during cancel to preserve 2s requeue, got: %v", err)
 	}
-	if res.RequeueAfter == 0 {
-		t.Fatal("expected requeue on failed unfreeze during cancel")
+	if res.RequeueAfter != 2*time.Second {
+		t.Fatalf("expected 2s requeue on failed unfreeze during cancel, got %v", res.RequeueAfter)
 	}
 	got := getSnapshot(t, c, "ps-web-0-deadbeef")
 	if !contract.IsSourceFrozen(got) {
@@ -792,5 +807,125 @@ func TestSetupWithManagerRegistersStartupSweep(t *testing.T) {
 	}
 	if len(mgr.added) != 1 {
 		t.Fatalf("expected 1 runnable added to manager, got %d", len(mgr.added))
+	}
+}
+
+// TestPipeline_StaleCacheDoesNotThawJustCheckpointedReadySource pins that when
+// cached r.Get returns a pre-Ready snapshot with SourceFrozen=True (cache lagging
+// status update), the liveReader re-read under r.inflight discovers Ready=True
+// and skips without unfreezing the source container.
+func TestPipeline_StaleCacheDoesNotThawJustCheckpointedReadySource(t *testing.T) {
+	// Live object in APIReader is Ready=True and SourceFrozen=True
+	liveSnap := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetSourceFrozen(liveSnap, true, contract.ReasonFrozen, "source container frozen")
+	_ = contract.SetCondition(liveSnap, metav1.Condition{
+		Type:   contract.CondReady,
+		Status: metav1.ConditionTrue,
+		Reason: contract.ReasonSucceeded,
+	})
+	liveClient := newClient(t, liveSnap)
+
+	// Cached object has SourceFrozen=True but no Ready condition (lagging cache)
+	staleSnap := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetSourceFrozen(staleSnap, true, contract.ReasonFrozen, "source container frozen")
+
+	cachedClient := &staleSnapshotClient{
+		Client: liveClient,
+		key:    types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"},
+		stale:  staleSnap,
+	}
+	ops := &fakeNodeOps{t: t}
+	store := newMemStore()
+	r := &NodeSnapshotReconciler{
+		Client:    cachedClient,
+		APIReader: liveClient,
+		NodeName:  "node-a",
+		Ops:       ops,
+		Store:     store,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err != nil {
+		t.Fatalf("unexpected error on reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("unexpected requeue: %v", res)
+	}
+	if len(ops.unfrozen) != 0 {
+		t.Fatalf("stale cache must not cause Ready snapshot source to be unfrozen: %v", ops.unfrozen)
+	}
+	got := getSnapshot(t, liveClient, "ps-web-0-deadbeef")
+	if !contract.IsSnapshotReady(got) {
+		t.Fatal("snapshot must remain Ready")
+	}
+	if !contract.IsSourceFrozen(got) {
+		t.Fatal("snapshot must remain SourceFrozen=True")
+	}
+}
+
+// TestPipeline_OutcomeBeforeRecordSourceFrozenStopsBeforeFreeze pins that if an outcome
+// (e.g. Refused from demoting node) lands before recordSourceFrozen(true), recordSourceFrozen
+// fails closed with errFinished, causing run() to return early without calling Ops.Freeze.
+func TestPipeline_OutcomeBeforeRecordSourceFrozenStopsBeforeFreeze(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
+	c := newClient(t, ps)
+	ops := &fakeNodeOps{t: t}
+	store := newMemStore()
+
+	// Land Refused outcome before Freeze
+	snap := getSnapshot(t, c, "ps-web-0-deadbeef")
+	_ = contract.SetCondition(snap, metav1.Condition{
+		Type:   contract.CondCheckpoint,
+		Status: metav1.ConditionFalse,
+		Reason: contract.ReasonRefused,
+	})
+	_ = c.Status().Update(context.Background(), snap)
+
+	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("unexpected requeue: %v", res)
+	}
+	if len(ops.frozen) != 0 {
+		t.Fatalf("Freeze must not be called when snapshot already has outcome before recordSourceFrozen: %v", ops.frozen)
+	}
+}
+
+// TestPipeline_NotFoundOnLiveGetInLeftoverThawsDirectly pins that when cached ps
+// has SourceFrozen=True but liveReader returns NotFound (snapshot was deleted while frozen),
+// Reconcile thaws the source container directly and returns without error.
+func TestPipeline_NotFoundOnLiveGetInLeftoverThawsDirectly(t *testing.T) {
+	cachedSnap := workOrderSnapshot("ps-web-0-deadbeef")
+	_ = contract.SetSourceFrozen(cachedSnap, true, contract.ReasonFrozen, "source container frozen")
+
+	// Empty live client (snapshot does not exist in API server)
+	liveClient := newClient(t)
+	cachedClient := &staleSnapshotClient{
+		Client: liveClient,
+		key:    types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"},
+		stale:  cachedSnap,
+	}
+	ops := &fakeNodeOps{t: t}
+	store := newMemStore()
+	r := &NodeSnapshotReconciler{
+		Client:    cachedClient,
+		APIReader: liveClient,
+		NodeName:  "node-a",
+		Ops:       ops,
+		Store:     store,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("unexpected requeue: %v", res)
+	}
+	if len(ops.unfrozen) != 1 {
+		t.Fatalf("expected 1 unfreeze when snapshot deleted while frozen, got: %v", ops.unfrozen)
 	}
 }

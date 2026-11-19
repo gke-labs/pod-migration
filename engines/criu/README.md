@@ -88,16 +88,24 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      `manifest.json` to GCS with MD5/size verification, and marks the
      `PodSnapshot` `Ready=True` while keeping the source container frozen for
      cold eviction by the controller (eliminating lost acknowledged writes and
-     empty-state restarts). On any failure or cancel path, the agent thaws
+     empty-state restarts). Note: the controller does not read `SourceFrozen` yet
+     (pending under #148); currently the Stopped rule covers it. While frozen
+     through dump, upload, and eviction, liveness probes can fail and trigger container
+     restarts, and eviction waits out the termination grace period since `SIGTERM`
+     is not delivered to a paused task. If a kubelet checkpoint times out,
+     `CheckpointTimedOut` is recorded and the source is not thawed—it stays frozen until
+     eviction (C9). On any failure or cancel path, the agent thaws
      (unfreezes) the source container task via containerd using a fresh bounded
      context before reporting terminal `Failed` or `Cancelled`. If thawing
      succeeds, it clears `SourceFrozen` so the workload continues serving. If thawing
      fails, `SourceFrozen=True` remains recorded and the agent retries thawing
      without re-running the checkpoint, ensuring the controller keeps the fence until
-     the source is verifiably thawed or cold-evicted. On startup, the agent
-     sweeps `PodSnapshot`s on its node with `SourceFrozen=True` and reconciles any
-     that are not `Ready` or `CheckpointTimedOut` (resuming tasks left paused if an agent crashed or
-     restarted, while guarding against racing in-flight work orders). If the `PodSnapshotManualTrigger` is deleted first, the engine controller
+     the source is verifiably thawed or cold-evicted. An agent restart mid-checkpoint
+     now thaws the source and settles that migration as `Failed` rather than re-running it.
+     On startup, the agent sweeps `PodSnapshot`s on its node with `SourceFrozen=True`
+     and reconciles any that are not `Ready` or `CheckpointTimedOut` (resuming tasks left paused
+     if an agent crashed or restarted, while guarding against racing in-flight work orders).
+     If the `PodSnapshotManualTrigger` is deleted first, the engine controller
      sets `Checkpoint=Unknown` with the reason `CancelRequested` (on a work
      order without a bucket, which no agent acts on, it records `Cancelled`
      itself), and the agent

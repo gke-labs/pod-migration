@@ -107,7 +107,12 @@ func (r *Node) PSEngineFreezeContainer(ctx context.Context, ns, pod, podUID, con
 // containerd. Resume uses a fresh context, not caller ctx, so caller
 // cancellation or deadlines never leave the task frozen (#106, #148).
 func (r *Node) PSEngineUnfreezeContainer(ctx context.Context, ns, pod, podUID, container string) error {
-	ref, err := r.Restorer.findContainer(ctx, ns, pod, podUID, container)
+	// Resume with a fresh, bounded context so a cancelled or timed-out
+	// caller context doesn't fail the resume call (#106, #148).
+	resumeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ref, err := r.Restorer.findContainer(resumeCtx, ns, pod, podUID, container)
 	if err != nil {
 		if errors.Is(err, ErrContainerNotFound) || errdefs.IsNotFound(err) {
 			// If the container is already gone, it doesn't need to be unfrozen.
@@ -115,10 +120,6 @@ func (r *Node) PSEngineUnfreezeContainer(ctx context.Context, ns, pod, podUID, c
 		}
 		return fmt.Errorf("find container for unfreeze: %w", err)
 	}
-	// Resume with a fresh, bounded context so a cancelled or timed-out
-	// caller context doesn't fail the resume call (#106, #148).
-	resumeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 
 	cs, err := r.Restorer.listContainers(resumeCtx)
 	if err != nil {

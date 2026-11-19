@@ -25,11 +25,11 @@ package psengine
 // orchestrator deletes it, the controller half asks for a cancel on the
 // PodSnapshot (Checkpoint=Unknown/CancelRequested, psmt_reconciler.go). The
 // agent looks for that request, and with live reads for the trigger itself,
-// before it starts and right before the source stop, the one step it can't
+// before it starts and right before the commit point, the one step it can't
 // undo; cached reads cover the stages in between, and a poller aborts an
 // in-flight upload. Only the agent writes the terminal Cancelled, once its
 // work has actually stopped, so the orchestrator never sees a settled
-// snapshot while the source may still be frozen or about to be stopped.
+// snapshot while the source may still be frozen or about to be committed.
 //
 // The kubelet checkpoint call is not cancelled. Cancelling it doesn't end
 // the freeze: the kubelet cancels, but the dump runs to its end and only then
@@ -144,8 +144,8 @@ type NodeSnapshotReconciler struct {
 	Store     ObjectStore
 	CPUFamily string // from the node agent's capability probe; recorded in the manifest
 	// APIReader reads past the cache: the PodSnapshot and its trigger for the
-	// cancel checks before the pipeline starts and right before the source
-	// stop, and the PodSnapshot in finish. Nil falls back to Client (tests).
+	// cancel checks before the pipeline starts and right before the commit
+	// point, and the PodSnapshot in finish. Nil falls back to Client (tests).
 	APIReader client.Reader
 	// CancelPollInterval is how often an in-flight upload looks for a cancel
 	// (cached read). Zero means defaultCancelPollInterval.
@@ -305,35 +305,71 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	defer r.inflight.Delete(req.String())
 
+	// Re-read live object under inflight lock to avoid acting on a stale cached snapshot.
+	// A queued reconcile triggered by the SourceFrozen=True status update can run immediately
+	// after run() completes while the cache has not yet observed finish(Ready/TimedOut).
+	livePS := contract.New(contract.GVKPodSnapshot)
+	if getErr := r.liveReader().Get(ctx, req.NamespacedName, livePS); getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			// If cached ps had SourceFrozen=True, the snapshot was deleted while frozen:
+			// thaw the source container without recording (#148).
+			if contract.IsSourceFrozen(ps) {
+				logger.Info("PodSnapshot deleted while source was frozen; thawing source container", "pod", spec.SourcePod, "uid", spec.SourcePodUID, "container", spec.Container)
+				if unfreezeErr := r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.SourcePodUID, spec.Container); unfreezeErr != nil {
+					logger.Error(unfreezeErr, "failed to unfreeze source container after PodSnapshot deleted; retrying in 2s")
+					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				}
+			}
+			return ctrl.Result{}, nil
+		}
+		logger.Error(getErr, "failed to read live PodSnapshot under inflight guard; retrying in 2s")
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// Ready snapshots keep their source container frozen for cold eviction.
+	if contract.IsSnapshotReady(livePS) {
+		return ctrl.Result{}, nil
+	}
+	// CheckpointTimedOut snapshots keep the fence for eviction (clause C9).
+	if checkpointTimedOut(livePS) {
+		return ctrl.Result{}, nil
+	}
+
 	// If SourceFrozen is true on a snapshot that is not in flight and not Ready/TimedOut,
 	// it represents leftover frozen state (e.g. from an agent crash/restart, an earlier
 	// failed thaw attempt, or an outcome written mid-run by the controller).
 	// We thaw it, clear SourceFrozen directly, and never re-run the checkpoint pipeline (#148).
-	if contract.IsSourceFrozen(ps) {
+	if contract.IsSourceFrozen(livePS) {
 		logger.Info("found leftover frozen source; thawing source container", "pod", spec.SourcePod, "uid", spec.SourcePodUID, "container", spec.Container)
 		if unfreezeErr := r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.SourcePodUID, spec.Container); unfreezeErr != nil {
-			logger.Error(unfreezeErr, "failed to unfreeze leftover frozen source container; keeping SourceFrozen and retrying")
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, fmt.Errorf("unfreeze source container: %w", unfreezeErr)
+			logger.Error(unfreezeErr, "failed to unfreeze leftover frozen source container; keeping SourceFrozen and retrying in 2s")
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
-		if err := r.recordSourceFrozen(context.Background(), req.NamespacedName, false, contract.ReasonThawed, "thawed leftover frozen source"); err != nil {
-			return ctrl.Result{}, fmt.Errorf("record SourceFrozen thawed: %w", err)
-		}
-		if !hasOutcome(ps) {
+		if !hasOutcome(livePS) {
 			reason := contract.ReasonFailed
 			msg := "checkpoint interrupted or failed; source container thawed"
-			if state, why, _ := cancelCheck(ctx, r.liveReader(), req.NamespacedName, true); state == workOrderCancelled {
+			state, why, cErr := cancelCheck(ctx, r.liveReader(), req.NamespacedName, true)
+			if cErr != nil {
+				return ctrl.Result{}, cErr
+			}
+			if state == workOrderCancelled {
 				reason = contract.ReasonCancelled
 				msg = fmt.Sprintf("cancelled (%s); source container thawed", why)
 			}
+			// r.finish atomically clears SourceFrozen=False and writes the terminal outcome in a single Status().Update
 			return ctrl.Result{}, r.finish(ctx, req, reason, msg)
+		}
+		// Outcome already exists elsewhere (e.g. Refused from controller demoting node): clear SourceFrozen directly.
+		if err := r.recordSourceFrozen(context.Background(), req.NamespacedName, false, contract.ReasonThawed, "thawed leftover frozen source"); err != nil {
+			return ctrl.Result{}, fmt.Errorf("record SourceFrozen thawed: %w", err)
 		}
 		return ctrl.Result{}, nil
 	}
 
-	if hasOutcome(ps) {
+	if hasOutcome(livePS) {
 		return ctrl.Result{}, nil
 	}
-	if !hasBucket(ps) {
+	if !hasBucket(livePS) {
 		// No bucket means no work order: the controller half withheld it for
 		// a refusal or a storage failure, and records that outcome itself.
 		// Writing Failed here (from every node's agent) would pre-empt its
@@ -362,27 +398,38 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	if err := r.run(ctx, req.NamespacedName, spec); err != nil {
 		if ctx.Err() != nil {
-			// The agent is shutting down: not an outcome. The work order
-			// stays open, and the next agent picks it up. Thaw the source
-			// container so clients aren't hung while the agent restarts (#148).
+			// The agent is shutting down: not an outcome. Unfreeze the source
+			// container so clients aren't hung while the agent restarts; on restart,
+			// the leftover handler will thaw if needed and settle Failed (#148).
 			logger.Info("agent shutting down; unfreezing source container", "detail", err.Error())
-			_ = r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.SourcePodUID, spec.Container)
+			if unfreezeErr := r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.SourcePodUID, spec.Container); unfreezeErr != nil {
+				logger.Error(unfreezeErr, "failed to unfreeze source container on agent shutdown")
+			}
 			return ctrl.Result{}, ctx.Err()
 		}
 		if errors.Is(err, errFinished) {
 			logger.Info("the PodSnapshot got an outcome elsewhere; checking if source container should be thawed", "detail", err.Error())
 			ps := contract.New(contract.GVKPodSnapshot)
 			if getErr := r.liveReader().Get(context.Background(), req.NamespacedName, ps); getErr != nil {
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, fmt.Errorf("read live PodSnapshot on errFinished: %w", getErr)
+				if apierrors.IsNotFound(getErr) {
+					logger.Info("PodSnapshot was deleted on errFinished; thawing source container")
+					if unfreezeErr := r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.SourcePodUID, spec.Container); unfreezeErr != nil {
+						logger.Error(unfreezeErr, "failed to unfreeze source container on NotFound errFinished; retrying in 2s")
+						return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+					}
+					return ctrl.Result{}, nil
+				}
+				logger.Error(getErr, "failed to read live PodSnapshot on errFinished; retrying in 2s")
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
-			if contract.IsSnapshotReady(ps) {
-				logger.Info("PodSnapshot is Ready; source container kept frozen for eviction")
+			if contract.IsSnapshotReady(ps) || checkpointTimedOut(ps) {
+				logger.Info("PodSnapshot is Ready or TimedOut; source container kept frozen for eviction")
 				return ctrl.Result{}, nil
 			}
 			logger.Info("PodSnapshot outcome was not Ready; unfreezing source container")
 			if unfreezeErr := r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.SourcePodUID, spec.Container); unfreezeErr != nil {
-				logger.Error(unfreezeErr, "failed to unfreeze source container on errFinished")
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, fmt.Errorf("unfreeze on errFinished: %w", unfreezeErr)
+				logger.Error(unfreezeErr, "failed to unfreeze source container on errFinished; retrying in 2s")
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 			if err := r.recordSourceFrozen(context.Background(), req.NamespacedName, false, contract.ReasonThawed, "thawed after outcome written elsewhere"); err != nil {
 				return ctrl.Result{}, fmt.Errorf("record SourceFrozen thawed: %w", err)
@@ -396,8 +443,8 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// On any other failure or cancel path: unfreeze the source container before reporting terminal outcome (#148).
 		logger.Info("checkpoint pipeline failed or cancelled; unfreezing source container", "detail", err.Error())
 		if unfreezeErr := r.Ops.Unfreeze(context.Background(), req.Namespace, spec.SourcePod, spec.SourcePodUID, spec.Container); unfreezeErr != nil {
-			logger.Error(unfreezeErr, "failed to unfreeze source container on failure path; keeping SourceFrozen and retrying")
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, fmt.Errorf("unfreeze source container: %w", unfreezeErr)
+			logger.Error(unfreezeErr, "failed to unfreeze source container on failure path; keeping SourceFrozen and retrying in 2s")
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
 		if errors.Is(err, errCancelled) {
@@ -415,14 +462,29 @@ func (r *NodeSnapshotReconciler) recordSourceFrozen(ctx context.Context, key typ
 		ps := contract.New(contract.GVKPodSnapshot)
 		if err := r.liveReader().Get(ctx, key, ps); err != nil {
 			if apierrors.IsNotFound(err) {
+				if frozen {
+					return errCancelled
+				}
 				return nil
+			}
+			if frozen {
+				return err
 			}
 			if err := r.Get(ctx, key, ps); err != nil {
 				return client.IgnoreNotFound(err)
 			}
 		}
-		if frozen && hasOutcome(ps) {
-			return nil
+		if frozen {
+			if ps.GetDeletionTimestamp() != nil || cancelRequested(ps) {
+				return errCancelled
+			}
+			if hasOutcome(ps) {
+				return errFinished
+			}
+		} else {
+			if contract.IsSnapshotReady(ps) || checkpointTimedOut(ps) {
+				return nil
+			}
 		}
 		if err := contract.SetSourceFrozen(ps, frozen, reason, msg); err != nil {
 			return err
@@ -438,7 +500,7 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	snapshot, ns := key.Name, key.Namespace
 
 	// ctx carries the uploads. The poller cancels it with errCancelled,
-	// which aborts an in-flight upload. The checkpoint call and the stop run
+	// which aborts an in-flight upload. The checkpoint call and the freeze run
 	// on parent (see the file comment).
 	ctx, cancel := context.WithCancelCause(parent)
 	pollerDone := make(chan struct{})
@@ -469,6 +531,9 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	// Freeze the source container before the checkpoint (C4 Frozen fencing mode, #148).
 	// Record what was paused before pausing it, so an agent restart or failure knows to thaw it.
 	if err := r.recordSourceFrozen(parent, key, true, contract.ReasonFrozen, "source container frozen before checkpoint"); err != nil {
+		if errors.Is(err, errCancelled) || errors.Is(err, errFinished) {
+			return err
+		}
 		return fmt.Errorf("record source frozen: %w", err)
 	}
 	if err := r.Ops.Freeze(parent, ns, spec.SourcePod, spec.SourcePodUID, spec.Container); err != nil {
@@ -644,7 +709,7 @@ func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, r
 			}
 		}
 		if hasOutcome(ps) {
-			if contract.IsSourceFrozen(ps) && !contract.IsSnapshotReady(ps) && (reason == contract.ReasonFailed || reason == contract.ReasonCancelled) {
+			if contract.IsSourceFrozen(ps) && !contract.IsSnapshotReady(ps) && !checkpointTimedOut(ps) && (reason == contract.ReasonFailed || reason == contract.ReasonCancelled) {
 				_ = contract.SetSourceFrozen(ps, false, contract.ReasonThawed, "unfrozen on "+reason)
 				return r.Status().Update(ctx, ps)
 			}

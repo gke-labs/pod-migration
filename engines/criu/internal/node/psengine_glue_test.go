@@ -212,6 +212,12 @@ func TestPSEngineUnfreezeContainer_PausedTaskResumesWithBoundedContext(t *testin
 	nodePaused := &Node{
 		Restorer: &restorer{
 			findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+				if err := ctx.Err(); err != nil {
+					t.Fatalf("findContainer called with error context: %v", err)
+				}
+				if dl, ok := ctx.Deadline(); !ok || dl.IsZero() {
+					t.Fatal("findContainer must be called with a bounded context with a deadline")
+				}
 				observedUnfreezeUID = podUID
 				return &containerRef{ID: "c-paused", Pid: 200}, nil
 			},

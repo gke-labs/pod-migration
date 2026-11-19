@@ -826,8 +826,11 @@ func TestCheckpointTimeoutLeavesSnapshotUnsettled(t *testing.T) {
 				ops.afterCheckpoint = func() { deleteTrigger(t, c, true) }
 			}
 			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Hour})
-			if len(ops.stopped) != 0 {
-				t.Fatalf("source stopped after a timed-out checkpoint: %v", ops.events)
+			if len(ops.unfrozen) != 0 {
+				t.Fatalf("source container was unfrozen after a timed-out checkpoint: %v", ops.events)
+			}
+			if !contract.IsSourceFrozen(getSnapshot(t, c, cancelSnapshot)) {
+				t.Fatalf("source container must remain SourceFrozen=True after timed-out checkpoint")
 			}
 			requireTimedOut(t, c)
 
@@ -1036,7 +1039,8 @@ func TestPSMTWritesAndCountsOutcomesOnce(t *testing.T) {
 }
 
 // The agent's context ending (shutdown) is not a pipeline outcome: nothing is
-// written, and the next agent picks the work order up again.
+// written at shutdown time, leaving leftover SourceFrozen state for the restarted
+// agent to thaw and fail (#148).
 func TestAgentShutdownWritesNoOutcome(t *testing.T) {
 	c := cancelFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())

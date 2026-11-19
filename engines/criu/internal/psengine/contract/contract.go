@@ -95,7 +95,7 @@ const (
 	// cancel (C9, #106). Not terminal: the orchestrator keeps waiting.
 	ReasonCancelRequested = "CancelRequested"
 	// ReasonCancelled = the node agent abandoned the work order after its
-	// trigger was deleted, and did not stop the source (C9, #106). Terminal;
+	// trigger was deleted, and thawed the source (C9, #106, #148). Terminal;
 	// written only once the agent's work has stopped. The orchestrator
 	// treats it like Failed.
 	ReasonCancelled = "Cancelled"
