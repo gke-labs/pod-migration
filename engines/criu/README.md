@@ -74,7 +74,19 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      don't re-check eligibility, and write only the non-terminal `Pending`
      (or, once the trigger is deleted, `CancelRequested`) onto it (#218). A
      trigger re-created for the same pod instance takes over an unfinished
-     work order without a new eligibility check.
+     work order without a new eligibility check. A work order that an
+     earlier instance of the trigger left with an outcome (`Ready`, `Failed`,
+     `Refused` or `Cancelled`) is deleted instead, and the trigger gets a new
+     one once it's gone (#262). `CheckpointTimedOut` is left as it is. A work
+     order that a job or pod still uses is never deleted. The engine checks
+     live for a PodMigrationJob whose `status.snapshotRef` names it, and for
+     a pod whose restore order names it and hasn't finished restoring. If
+     that job owns the trigger (the job created its trigger again), the
+     trigger takes the work order over and is answered with it. Otherwise
+     the trigger stays unanswered and is looked at again every 30 s, so its
+     job waits until its migration timeout and falls back to a cold
+     eviction. A work order from before the trigger UID was recorded is
+     answered as before in that case.
    - Serves `/psengine-restore-inject` to speculatively inject the `holder`
      initContainer and command wrapper into CRIU-routed gated replacement pods
      at `CREATE` (checking single-container `runc`/default pod shape in memory
@@ -373,7 +385,13 @@ labelled `PodSnapshot`s whose job is gone (`--orphan-snapshot-sweep-interval`,
   (`deleted`, `no_archive`, `failed`, `abandoned`).
 - A trigger re-created for the same pod instance never gets a `PodSnapshot`
   that's being deleted; it waits until it's gone and gets a new work order.
-- The engine controller needs `update` and `patch` on `podsnapshots` (in
+  It also never gets one that an earlier instance of the trigger left with an
+  outcome: the engine controller deletes that one first (#262). So a bucket
+  delete that keeps failing holds up the next migration of the same pod until
+  the give-up bound, and that job may time out and fall back to a cold
+  eviction.
+- The engine controller needs `update`, `patch` and `delete` on `podsnapshots`,
+  and `list` on `podmigrationjobs` for the in-use check (in
   `deploy/deploy.yaml`), and `storage.objects.delete` on the bucket, which
   its storage probe already uses.
 
