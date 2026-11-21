@@ -68,9 +68,11 @@ rules:
   - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshotpolicies/status", "podsnapshotmanualtriggers/status", "podsnapshots/status"]
     verbs: ["get", "update", "patch"]
+  # list: before deleting a work order an earlier trigger left, the engine
+  # checks live that no job still names it (#262).
   - apiGroups: ["podmigration.gke.io"]
     resources: ["podmigrationjobs"]
-    verbs: ["get"]
+    verbs: ["get", "list"]
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get"]
