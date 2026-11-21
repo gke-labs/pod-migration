@@ -28,20 +28,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// TestGKEProviderCheckStatus_Found: CheckStatus says whether it read the
-// snapshot the trigger names, so the controller can tell a snapshot it saw
-// from one that isn't created yet (#269).
-func TestGKEProviderCheckStatus_Found(t *testing.T) {
+// TestGKEProviderCheckStatus_FoundAndTriggerUnanswered: CheckStatus says
+// whether it read the snapshot the trigger names, so the controller can tell
+// a snapshot it saw from one that isn't created yet (#269), and whether the
+// trigger is still unanswered, for the timeout message.
+func TestGKEProviderCheckStatus_FoundAndTriggerUnanswered(t *testing.T) {
 	ready := [3]string{"Ready", "True", "AllSnapshotsAvailable"}
 	checkpointing := [3]string{"Checkpoint", "False", "InProgress"}
 	tests := map[string]struct {
-		objects   []client.Object
-		wantPhase Phase
-		wantRef   string
-		wantFound bool
+		objects        []client.Object
+		wantPhase      Phase
+		wantRef        string
+		wantFound      bool
+		wantUnanswered bool
 	}{
 		"no trigger yet":         {wantPhase: PhaseInProgress},
-		"trigger unanswered":     {objects: []client.Object{checkpointTestTrigger("")}, wantPhase: PhaseInProgress},
+		"trigger unanswered":     {objects: []client.Object{checkpointTestTrigger("")}, wantPhase: PhaseInProgress, wantUnanswered: true},
 		"snapshot not found":     {objects: []client.Object{checkpointTestTrigger("snap")}, wantPhase: PhaseInProgress, wantRef: "snap"},
 		"snapshot in progress":   {objects: []client.Object{checkpointTestTrigger("snap"), checkpointTestSnapshot("snap", true, checkpointing)}, wantPhase: PhaseInProgress, wantRef: "snap", wantFound: true},
 		"snapshot ready":         {objects: []client.Object{checkpointTestTrigger("snap"), checkpointTestSnapshot("snap", true, ready)}, wantPhase: PhaseReady, wantRef: "snap", wantFound: true},
@@ -54,9 +56,9 @@ func TestGKEProviderCheckStatus_Found(t *testing.T) {
 			if err != nil {
 				t.Fatalf("CheckStatus: %v", err)
 			}
-			if got.Phase != tc.wantPhase || got.SnapshotRef != tc.wantRef || got.Found != tc.wantFound {
-				t.Errorf("CheckStatus = phase %s, ref %q, found %t; want %s, %q, %t",
-					got.Phase, got.SnapshotRef, got.Found, tc.wantPhase, tc.wantRef, tc.wantFound)
+			if got.Phase != tc.wantPhase || got.SnapshotRef != tc.wantRef || got.Found != tc.wantFound || got.TriggerUnanswered != tc.wantUnanswered {
+				t.Errorf("CheckStatus = phase %s, ref %q, found %t, unanswered %t; want %s, %q, %t, %t",
+					got.Phase, got.SnapshotRef, got.Found, got.TriggerUnanswered, tc.wantPhase, tc.wantRef, tc.wantFound, tc.wantUnanswered)
 			}
 		})
 	}

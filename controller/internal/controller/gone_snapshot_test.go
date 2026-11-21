@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -279,6 +280,52 @@ func TestPodGate_GoneSnapshot_HoldsThenReleasesCold(t *testing.T) {
 	}
 	if got := getTestJob(t, c); !got.Status.Consumed || got.Status.RestoredPodUID != replacementUID {
 		t.Errorf("Consumed = %t, RestoredPodUID = %q; want the cold start recorded on %s", got.Status.Consumed, got.Status.RestoredPodUID, replacementUID)
+	}
+}
+
+// unansweredTrigger is the job's trigger, not yet answered with a snapshot.
+func unansweredTrigger(job *pmv1alpha1.PodMigrationJob) *unstructured.Unstructured {
+	trigger := ownedTrigger(job, "")
+	delete(trigger.Object, "status")
+	return trigger
+}
+
+// TestTimeout_UnansweredTrigger_MessagePointsAtTheTrigger: a job that times
+// out while its trigger is still unanswered says so, and where to look: the
+// CRIU engine records why it waits as events on the trigger.
+func TestTimeout_UnansweredTrigger_MessagePointsAtTheTrigger(t *testing.T) {
+	trigger := util.FormatPSMTName(fenceTestPod, fenceTestUID)
+	for name, tc := range map[string]struct {
+		snapRef     string
+		answered    bool
+		wantTrigger bool
+	}{
+		"trigger unanswered":            {wantTrigger: true},
+		"trigger answered, not created": {snapRef: goneSnapName, answered: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			job, source := pastDeadlineFencedJob(tc.snapRef, false)
+			trig := unansweredTrigger(job)
+			if tc.answered {
+				trig = ownedTrigger(job, tc.snapRef)
+			}
+			f := newGoneSnapshotFixture(t, job, false, source, trig)
+			reconcileN(t, f, 1)
+			got := f.job(t)
+			ready := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+			if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed || ready == nil || ready.Reason != "Timeout" {
+				t.Fatalf("phase = %s, Ready = %+v; want Failed with reason Timeout", got.Status.Phase, ready)
+			}
+			mentions := strings.Contains(ready.Message, "unanswered") &&
+				strings.Contains(ready.Message, "involvedObject.name="+trigger) &&
+				strings.Contains(ready.Message, "WorkOrderInUse")
+			if mentions != tc.wantTrigger {
+				t.Errorf("Ready message = %q; want it to point at the trigger's events: %t", ready.Message, tc.wantTrigger)
+			}
+			if !strings.HasPrefix(ready.Message, "Migration job timed out") {
+				t.Errorf("Ready message = %q, want it to still say the job timed out", ready.Message)
+			}
+		})
 	}
 }
 

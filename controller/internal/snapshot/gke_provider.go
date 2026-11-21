@@ -254,9 +254,10 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	if !found || snapshotName == "" {
 		logger.Info("Waiting for snapshot name to be populated in trigger status...", "trigger", triggerName)
 		return &Status{
-			Phase:   PhaseInProgress,
-			Reason:  "Snapshotting",
-			Message: "Waiting for GKE to populate snapshot name in trigger status",
+			Phase:             PhaseInProgress,
+			Reason:            "Snapshotting",
+			Message:           "Waiting for GKE to populate snapshot name in trigger status",
+			TriggerUnanswered: true,
 		}, nil
 	}
 

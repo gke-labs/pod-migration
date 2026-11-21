@@ -45,6 +45,9 @@ type Status struct {
 	// SnapshotRef set and Found false, the trigger named a snapshot that
 	// wasn't found: either it isn't created yet, or it's gone (#269).
 	Found bool
+	// TriggerUnanswered is true while the trigger exists but hasn't named
+	// its snapshot yet (no status.snapshotCreated.name).
+	TriggerUnanswered bool
 }
 
 // Provider abstracts the snapshot / checkpoint engine (e.g. GKE Pod Snapshots, CRIU, MicroVM).

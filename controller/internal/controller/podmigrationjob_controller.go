@@ -244,6 +244,20 @@ func (r *PodMigrationJobReconciler) checkSnapshotProgressing(ctx context.Context
 	return snapStatus, false
 }
 
+// triggerUnanswered reports whether a Snapshotting job's trigger exists but
+// hasn't named its snapshot yet, and returns the trigger's name. Only the
+// timeout message uses it, so a read error counts as answered.
+func (r *PodMigrationJobReconciler) triggerUnanswered(ctx context.Context, job *pmv1alpha1.PodMigrationJob) (bool, string) {
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || job.Status.SnapshotRef != "" {
+		return false, ""
+	}
+	st, err := r.getSnapshotProvider(job).CheckStatus(ctx, job, job.Spec.PodRef.Name)
+	if err != nil || st == nil || !st.TriggerUnanswered {
+		return false, ""
+	}
+	return true, util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
+}
+
 func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMigrationJob) bool {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		return false
@@ -1079,6 +1093,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					reason = util.ReasonDisruptionBudgetTimeout
 					outcome = "budget_timeout"
 					message = fmt.Sprintf("Migration job timed out (exceeded %v limit) waiting for the PodDisruptionBudget; nothing was checkpointed, and the next eviction starts a new job", migrationTimeout)
+				}
+				if unanswered, trigger := r.triggerUnanswered(ctx, job); unanswered {
+					message = fmt.Sprintf("Migration job timed out (exceeded %v limit) while its snapshot trigger %s was still unanswered: the engine never named a snapshot for it. The trigger's events may say why (for example WorkOrderInUse or WaitingForWorkOrderDeletion from the CRIU engine): kubectl get events -n %s --field-selector involvedObject.name=%s",
+						migrationTimeout, trigger, job.Namespace, trigger)
 				}
 				logger.Info("Migration job timed out, transitioning to Failed", "job", job.Name, "timeout", migrationTimeout, "reason", reason)
 				job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
