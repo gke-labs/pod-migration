@@ -46,6 +46,11 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --engine)
+      if [[ $# -lt 2 || -z "${2:-}" || "$2" == -* ]]; then
+        echo "Error: --engine requires a valid engine name argument" >&2
+        usage
+        exit 1
+      fi
       ENGINE="$2"
       shift 2
       ;;
@@ -67,18 +72,14 @@ done
 
 cd "${REPO_ROOT}/controller"
 
-TEST_PATTERN="TestEngineConformance"
-if [[ "${SELF_TEST}" == "true" ]]; then
-  TEST_PATTERN="TestEngineConformance|TestConformance_SabotageDetections"
-fi
-
+ENGINE_PATTERN=""
 if [[ -n "${ENGINE}" ]]; then
   case "${ENGINE}" in
     gke-pod-snapshots|gke)
-      TEST_PATTERN="TestEngineConformance_GKEPodSnapshots"
+      ENGINE_PATTERN="TestEngineConformance_GKEPodSnapshots"
       ;;
     criu)
-      TEST_PATTERN="TestEngineConformance_CRIU"
+      ENGINE_PATTERN="TestEngineConformance_CRIU"
       ;;
     *)
       echo "Unknown engine: ${ENGINE} (supported: gke-pod-snapshots, criu)" >&2
@@ -87,6 +88,27 @@ if [[ -n "${ENGINE}" ]]; then
   esac
 fi
 
-echo "=== Running Snapshot Engine Conformance Suite (#108) ==="
-go test -v -race -count=1 ./internal/engine/conformance/... -run "${TEST_PATTERN}"
+if [[ -n "${ENGINE_PATTERN}" && "${SELF_TEST}" == "true" ]]; then
+  TEST_PATTERN="^(${ENGINE_PATTERN}|TestConformance_SabotageDetections)$"
+elif [[ -n "${ENGINE_PATTERN}" ]]; then
+  TEST_PATTERN="^${ENGINE_PATTERN}$"
+elif [[ "${SELF_TEST}" == "true" ]]; then
+  TEST_PATTERN="^(TestEngineConformance|TestConformance_SabotageDetections)$"
+else
+  TEST_PATTERN="^TestEngineConformance"
+fi
+
+echo "=== Running Snapshot Engine Conformance Suite (Part of #108) ==="
+TEST_OUTPUT=$(go test -v -race -count=1 ./internal/engine/conformance/... -run "${TEST_PATTERN}" 2>&1)
+echo "${TEST_OUTPUT}"
+
+if echo "${TEST_OUTPUT}" | grep -q "\[no tests to run\]"; then
+  echo "Error: Pattern '${TEST_PATTERN}' matched no tests" >&2
+  exit 1
+fi
+
+if ! echo "${TEST_OUTPUT}" | grep -q "PASS"; then
+  exit 1
+fi
+
 echo "=== Engine Conformance Suite Complete: PASSED ==="

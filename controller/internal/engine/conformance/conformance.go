@@ -16,15 +16,16 @@
 // Package conformance provides the canonical snapshot engine conformance suite
 // (docs/design/engine-contract.md #81, #108).
 //
-// It audits an Engine implementation against the eleven contract clauses (C1–C11)
-// to verify that it provides the identity, eligibility, checkpoint outcomes,
-// source fencing, restore orders, outcome signals, failure classification,
-// placement constraints, and cleanup semantics required by the pod migration
-// controller.
+// It audits an Engine implementation against contract clauses C1–C11 (with C10
+// Security and C11 Observability audited in dedicated scenario suites) to verify
+// that it provides the identity, eligibility, checkpoint outcomes, source fencing,
+// restore orders, outcome signals, failure classification, placement, and cleanup
+// semantics required by the pod migration controller.
 package conformance
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -33,16 +34,18 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 )
 
 // ClauseID represents a formal clause identifier in the snapshot engine contract.
@@ -58,6 +61,8 @@ const (
 	ClauseC7FailureClassify      ClauseID = "C7"
 	ClauseC8Placement            ClauseID = "C8"
 	ClauseC9CancellationCleanup  ClauseID = "C9"
+	ClauseC10Security            ClauseID = "C10"
+	ClauseC11Observability       ClauseID = "C11"
 )
 
 // ClauseStatus represents the outcome of an evaluated conformance clause.
@@ -165,27 +170,11 @@ func (r *Report) Markdown() string {
 	return sb.String()
 }
 
-// TestScheme returns a runtime.Scheme populated with standard types and PMJ types.
-func TestScheme() *runtime.Scheme {
+func defaultScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = pmv1alpha1.AddToScheme(s)
 	return s
-}
-
-// NewTestClient returns a fake controller-runtime client with standard indices
-// (including involvedObject.uid for Event queries), matching the real API server.
-func NewTestClient(scheme *runtime.Scheme, objs ...client.Object) client.Client {
-	return fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithIndex(&corev1.Event{}, "involvedObject.uid", func(o client.Object) []string {
-			if evt, ok := o.(*corev1.Event); ok {
-				return []string{string(evt.InvolvedObject.UID)}
-			}
-			return nil
-		}).
-		WithObjects(objs...).
-		Build()
 }
 
 // Runner executes the engine contract conformance suite against an Engine.
@@ -195,15 +184,14 @@ type Runner struct {
 
 // NewRunner creates a conformance Runner with default scheme configuration.
 func NewRunner() *Runner {
-	return &Runner{Scheme: TestScheme()}
+	return &Runner{Scheme: defaultScheme()}
 }
 
-// Run executes the conformance suite against eng, registering assertions with t
-// and returning a structured Report.
-func (r *Runner) Run(t *testing.T, eng engine.Engine) *Report {
-	t.Helper()
+// Evaluate audits eng against contract clauses C1–C11 without testing.T dependencies.
+// It returns a Report reflecting full clause outcomes.
+func (r *Runner) Evaluate(eng engine.Engine) *Report {
 	if eng == nil {
-		t.Fatal("engine under conformance test is nil")
+		return &Report{Passed: false}
 	}
 
 	rep := &Report{
@@ -213,7 +201,7 @@ func (r *Runner) Run(t *testing.T, eng engine.Engine) *Report {
 		Passed:     true,
 	}
 
-	clauses := []func(*testing.T, engine.Engine) ClauseResult{
+	clauses := []func(engine.Engine) ClauseResult{
 		r.auditC1Identity,
 		r.auditC2Eligibility,
 		r.auditC3CheckpointOutcomes,
@@ -223,11 +211,13 @@ func (r *Runner) Run(t *testing.T, eng engine.Engine) *Report {
 		r.auditC7FailureClassification,
 		r.auditC8PlacementConstraints,
 		r.auditC9CancellationAndCleanup,
+		r.auditC10Security,
+		r.auditC11Observability,
 	}
 
 	for _, audit := range clauses {
-		cr := audit(t, eng)
-		if cr.Status == StatusFailed && cr.Required {
+		cr := audit(eng)
+		if cr.Status == StatusFailed {
 			rep.Passed = false
 		}
 		rep.Clauses = append(rep.Clauses, cr)
@@ -236,8 +226,27 @@ func (r *Runner) Run(t *testing.T, eng engine.Engine) *Report {
 	return rep
 }
 
+// Run executes the conformance suite against eng, logging any failing assertions to t
+// and returning a structured Report.
+func (r *Runner) Run(t *testing.T, eng engine.Engine) *Report {
+	t.Helper()
+	if eng == nil {
+		t.Fatal("engine under conformance test is nil")
+	}
+
+	rep := r.Evaluate(eng)
+	for _, cr := range rep.Clauses {
+		for _, st := range cr.Subtests {
+			if !st.Passed {
+				t.Errorf("[%s] %s: %s", cr.ID, st.Name, st.Message)
+			}
+		}
+	}
+	return rep
+}
+
 // auditC1Identity audits Clause C1: Identity and targeting.
-func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC1Identity(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC1Identity,
 		Title:    "Identity and targeting",
@@ -250,7 +259,6 @@ func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
 	if name == "" {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Name non-empty", Passed: false, Message: "Name() returned empty string"})
-		t.Errorf("[C1] Name() returned empty string")
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Name non-empty", Passed: true, Message: fmt.Sprintf("name=%q", name)})
 	}
@@ -260,7 +268,6 @@ func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
 	if err := engine.ValidateAPIGroup(group); err != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "APIGroup valid", Passed: false, Message: fmt.Sprintf("ValidateAPIGroup(%q) failed: %v", group, err)})
-		t.Errorf("[C1] APIGroup %q invalid: %v", group, err)
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "APIGroup valid", Passed: true, Message: fmt.Sprintf("group=%q", group)})
 	}
@@ -271,7 +278,6 @@ func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
 	if ann != expectedAnn {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "RestoreAnnotation matches group", Passed: false, Message: fmt.Sprintf("RestoreAnnotation() = %q, want %q", ann, expectedAnn)})
-		t.Errorf("[C1] RestoreAnnotation() = %q, want %q", ann, expectedAnn)
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "RestoreAnnotation matches group", Passed: true, Message: fmt.Sprintf("annotation=%q", ann)})
 	}
@@ -281,7 +287,6 @@ func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
 	if len(rClasses) == 0 {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "RuntimeClasses non-empty", Passed: false, Message: "RuntimeClasses() returned empty slice"})
-		t.Errorf("[C1] RuntimeClasses() returned empty slice")
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "RuntimeClasses non-empty", Passed: true, Message: fmt.Sprintf("classes=%v", rClasses)})
 	}
@@ -290,7 +295,6 @@ func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
 	if _, err := eng.NamespaceResources(nil); err == nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources nil guard", Passed: false, Message: "expected error when pm == nil"})
-		t.Errorf("[C1] NamespaceResources(nil) succeeded; want error")
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources nil guard", Passed: true})
 	}
@@ -312,11 +316,9 @@ func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
 	if err != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources valid GCS", Passed: false, Message: fmt.Sprintf("NamespaceResources error: %v", err)})
-		t.Errorf("[C1] NamespaceResources valid GCS failed: %v", err)
 	} else if len(objs) == 0 {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources non-empty", Passed: false, Message: "rendered zero resources"})
-		t.Errorf("[C1] NamespaceResources returned 0 resources")
 	} else {
 		hasOwnerLabel := false
 		for _, obj := range objs {
@@ -328,29 +330,25 @@ func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
 		if !hasOwnerLabel {
 			cr.Status = StatusFailed
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources OwnerUIDLabel", Passed: false, Message: "missing OwnerUIDLabel matching PodMigration UID"})
-			t.Errorf("[C1] NamespaceResources rendered objects without %s", engine.OwnerUIDLabel)
 		} else {
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources valid GCS", Passed: true, Message: fmt.Sprintf("%d object(s) rendered with owner label", len(objs))})
 		}
 	}
 
-	// 7. NamespaceResources: invalid location returns *StorageLocationError
+	// 7. NamespaceResources: invalid location returns *StorageLocationError (#233)
 	invalidPM := pm.DeepCopy()
 	invalidPM.Spec.Storage.Location = "invalid://bucket/path"
 	_, err = eng.NamespaceResources(invalidPM)
 	if err == nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources rejects invalid location", Passed: false, Message: "accepted invalid location without error"})
-		t.Errorf("[C1] NamespaceResources accepted invalid storage location")
 	} else {
 		var locErr *engine.StorageLocationError
-		if !strings.Contains(err.Error(), "invalid") && !strings.Contains(err.Error(), "gs://") {
+		if !errors.As(err, &locErr) {
 			cr.Status = StatusFailed
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources StorageLocationError", Passed: false, Message: fmt.Sprintf("unexpected error message: %v", err)})
-			t.Errorf("[C1] unexpected error type/message for invalid location: %v", err)
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources StorageLocationError", Passed: false, Message: fmt.Sprintf("expected *engine.StorageLocationError via errors.As, got %T: %v", err, err)})
 		} else {
-			_ = locErr
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources rejects invalid location", Passed: true, Message: fmt.Sprintf("rejected: %v", err)})
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "NamespaceResources rejects invalid location", Passed: true, Message: fmt.Sprintf("rejected with *StorageLocationError: %v", locErr)})
 		}
 	}
 
@@ -363,7 +361,7 @@ func (r *Runner) auditC1Identity(t *testing.T, eng engine.Engine) ClauseResult {
 }
 
 // auditC2Eligibility audits Clause C2: Eligibility and policy resolution.
-func (r *Runner) auditC2Eligibility(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC2Eligibility(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC2Eligibility,
 		Title:    "Eligibility and policy resolution",
@@ -376,7 +374,6 @@ func (r *Runner) auditC2Eligibility(t *testing.T, eng engine.Engine) ClauseResul
 	if verdict.OK || verdict.Reason == "" {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Eligible nil pod guard", Passed: false, Message: fmt.Sprintf("verdict=%+v; want OK=false with Reason", verdict)})
-		t.Errorf("[C2] Eligible(nil, nil) returned OK=true or empty reason: %+v", verdict)
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Eligible nil pod guard", Passed: true, Message: fmt.Sprintf("refusal reason: %q", verdict.Reason)})
 	}
@@ -386,7 +383,6 @@ func (r *Runner) auditC2Eligibility(t *testing.T, eng engine.Engine) ClauseResul
 	if _, err := eng.ResolvePolicy(ctx, nil); err == nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "ResolvePolicy nil pod guard", Passed: false, Message: "expected error when pod == nil"})
-		t.Errorf("[C2] ResolvePolicy(nil) succeeded; want error")
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "ResolvePolicy nil pod guard", Passed: true})
 	}
@@ -403,17 +399,15 @@ func (r *Runner) auditC2Eligibility(t *testing.T, eng engine.Engine) ClauseResul
 	if err != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "ResolvePolicy empty cache", Passed: false, Message: fmt.Sprintf("unexpected error on empty cache: %v", err)})
-		t.Errorf("[C2] ResolvePolicy unexpected error on empty cache: %v", err)
 	} else if polRef != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "ResolvePolicy empty cache", Passed: false, Message: fmt.Sprintf("returned non-nil PolicyRef %+v on empty cache", polRef)})
-		t.Errorf("[C2] ResolvePolicy returned PolicyRef on empty cache: %+v", polRef)
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "ResolvePolicy empty cache", Passed: true, Message: "returned nil PolicyRef (allows clean cold fallback)"})
 	}
 
 	if cr.Status == StatusPassed {
-		cr.Details = "Conservative eligibility and non-blocking policy resolution confirmed."
+		cr.Details = "Eligibility guard and policy resolution defaults verified."
 	} else {
 		cr.Details = "Contract C2 eligibility/policy resolution violations detected."
 	}
@@ -421,7 +415,7 @@ func (r *Runner) auditC2Eligibility(t *testing.T, eng engine.Engine) ClauseResul
 }
 
 // auditC3CheckpointOutcomes audits Clause C3: Checkpoint outcomes.
-func (r *Runner) auditC3CheckpointOutcomes(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC3CheckpointOutcomes(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC3CheckpointOutcomes,
 		Title:    "Checkpoint outcomes",
@@ -433,23 +427,29 @@ func (r *Runner) auditC3CheckpointOutcomes(t *testing.T, eng engine.Engine) Clau
 	if prov == nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Snapshots provider non-nil", Passed: false, Message: "Snapshots() returned nil"})
-		t.Errorf("[C3] Snapshots() returned nil provider")
 		cr.Details = "Engine does not supply a snapshot provider."
 		return cr
 	}
 	cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Snapshots provider non-nil", Passed: true})
 
 	// Check provider group and annotation alignment if provider exposes them
+	type apiGroupGetter interface{ APIGroup() string }
 	type groupGetter interface{ Group() string }
 	type restoreAnnotationGetter interface{ RestoreAnnotation() string }
 
-	if gg, ok := prov.(groupGetter); ok {
-		if got := gg.Group(); got != eng.APIGroup() {
+	var provGroup string
+	if agg, ok := prov.(apiGroupGetter); ok {
+		provGroup = agg.APIGroup()
+	} else if gg, ok := prov.(groupGetter); ok {
+		provGroup = gg.Group()
+	}
+
+	if provGroup != "" {
+		if provGroup != eng.APIGroup() {
 			cr.Status = StatusFailed
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Provider group alignment", Passed: false, Message: fmt.Sprintf("Provider Group %q != Engine APIGroup %q", got, eng.APIGroup())})
-			t.Errorf("[C3] Provider Group %q != Engine APIGroup %q", got, eng.APIGroup())
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Provider group alignment", Passed: false, Message: fmt.Sprintf("Provider group %q != Engine APIGroup %q", provGroup, eng.APIGroup())})
 		} else {
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Provider group alignment", Passed: true, Message: fmt.Sprintf("group=%q", got)})
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Provider group alignment", Passed: true, Message: fmt.Sprintf("group=%q", provGroup)})
 		}
 	}
 
@@ -457,18 +457,44 @@ func (r *Runner) auditC3CheckpointOutcomes(t *testing.T, eng engine.Engine) Clau
 		if got := rg.RestoreAnnotation(); got != eng.RestoreAnnotation() {
 			cr.Status = StatusFailed
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Provider restore annotation alignment", Passed: false, Message: fmt.Sprintf("Provider RestoreAnnotation %q != Engine RestoreAnnotation %q", got, eng.RestoreAnnotation())})
-			t.Errorf("[C3] Provider RestoreAnnotation %q != Engine RestoreAnnotation %q", got, eng.RestoreAnnotation())
 		} else {
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Provider restore annotation alignment", Passed: true, Message: fmt.Sprintf("annotation=%q", got)})
 		}
 	}
 
-	cr.Details = fmt.Sprintf("Snapshot provider configured and aligned with API group %q.", eng.APIGroup())
+	// Verify CheckStatus handles non-existent trigger cleanly (waiting/retryable in progress)
+	ctx := context.Background()
+	job := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-job-c3",
+			Namespace: "default",
+			UID:       types.UID("job-c3-uid"),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			TargetPodUID: "target-c3-uid",
+		},
+	}
+	st, err := prov.CheckStatus(ctx, job, "web-absent")
+	if err != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: false, Message: fmt.Sprintf("CheckStatus returned error on absent trigger: %v", err)})
+	} else if st == nil || st.Phase != snapshot.PhaseInProgress {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: false, Message: fmt.Sprintf("expected PhaseInProgress on absent trigger, got: %+v", st)})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: true, Message: fmt.Sprintf("returns InProgress (phase=%s, reason=%q)", st.Phase, st.Reason)})
+	}
+
+	if cr.Status == StatusPassed {
+		cr.Details = fmt.Sprintf("Snapshot provider configured and aligned with API group %q.", eng.APIGroup())
+	} else {
+		cr.Details = "Contract C3 snapshot provider violations detected."
+	}
 	return cr
 }
 
 // auditC4SourceFencing audits Clause C4: Source fencing.
-func (r *Runner) auditC4SourceFencing(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC4SourceFencing(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC4SourceFencing,
 		Title:    "Source fencing",
@@ -487,7 +513,6 @@ func (r *Runner) auditC4SourceFencing(t *testing.T, eng engine.Engine) ClauseRes
 	if !validModes[fencing] {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "FencingMode declaration valid", Passed: false, Message: fmt.Sprintf("invalid FencingMode %q", fencing)})
-		t.Errorf("[C4] invalid FencingMode %q", fencing)
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "FencingMode declaration valid", Passed: true, Message: fmt.Sprintf("mode=%s", fencing)})
 	}
@@ -508,14 +533,12 @@ func (r *Runner) auditC4SourceFencing(t *testing.T, eng engine.Engine) ClauseRes
 		if allowedNormal {
 			cr.Status = StatusFailed
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "FencingNone refuses un-annotated pod", Passed: false, Message: "allowed un-annotated pod under FencingNone"})
-			t.Errorf("[C4] AllowsFencing allowed un-annotated pod under FencingNone")
 		} else {
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "FencingNone refuses un-annotated pod", Passed: true, Message: fmt.Sprintf("refused with reason: %s", reasonNormal)})
 		}
 		if !allowedOptedIn {
 			cr.Status = StatusFailed
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "FencingNone accepts opted-in pod", Passed: false, Message: "refused opted-in pod under FencingNone"})
-			t.Errorf("[C4] AllowsFencing refused opted-in pod under FencingNone")
 		} else {
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "FencingNone accepts opted-in pod", Passed: true})
 		}
@@ -523,18 +546,21 @@ func (r *Runner) auditC4SourceFencing(t *testing.T, eng engine.Engine) ClauseRes
 		if !allowedNormal {
 			cr.Status = StatusFailed
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Fenced engine accepts pod", Passed: false, Message: fmt.Sprintf("refused pod under mode %s: %s", fencing, reasonNormal)})
-			t.Errorf("[C4] AllowsFencing refused normal pod under mode %s: %s", fencing, reasonNormal)
 		} else {
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Fenced engine accepts pod", Passed: true, Message: fmt.Sprintf("accepted under mode %s", fencing)})
 		}
 	}
 
-	cr.Details = fmt.Sprintf("Declared fencing mode: %s. AllowsFencing gating verified.", fencing)
+	if cr.Status == StatusPassed {
+		cr.Details = fmt.Sprintf("Declared fencing mode: %s. AllowsFencing declaration verified.", fencing)
+	} else {
+		cr.Details = "Contract C4 source fencing declaration violations detected."
+	}
 	return cr
 }
 
 // auditC5RestoreOrder audits Clause C5: Restore order and exactly-once restore.
-func (r *Runner) auditC5RestoreOrder(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC5RestoreOrder(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC5RestoreOrder,
 		Title:    "Restore order and exactly-once restore",
@@ -550,69 +576,116 @@ func (r *Runner) auditC5RestoreOrder(t *testing.T, eng engine.Engine) ClauseResu
 		return cr
 	}
 
-	// 1. OrderRestore fail closed on nil pod
 	job := &pmv1alpha1.PodMigrationJob{
 		Status: pmv1alpha1.PodMigrationJobStatus{SnapshotRef: "ps-snap-1234"},
 	}
+
+	// 1. Guard checks on nil inputs
 	if err := orderer.OrderRestore(nil, job); err == nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore nil pod guard", Passed: false, Message: "accepted nil pod without error"})
-		t.Errorf("[C5] OrderRestore(nil, job) succeeded; want error")
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore nil pod guard", Passed: true})
 	}
 
-	// 2. OrderRestore stamps order
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "repl-0"}}
-	if err := orderer.OrderRestore(pod, job); err != nil {
+	if err := orderer.OrderRestore(pod, nil); err == nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore nil job guard", Passed: false, Message: "accepted nil job without error"})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore nil job guard", Passed: true})
+	}
+
+	emptyJob := &pmv1alpha1.PodMigrationJob{}
+	if err := orderer.OrderRestore(pod, emptyJob); err == nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore empty snapshotRef guard", Passed: false, Message: "accepted job with empty SnapshotRef"})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore empty snapshotRef guard", Passed: true})
+	}
+
+	if err := orderer.OrderColdStartBypass(nil); err == nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderColdStartBypass nil pod guard", Passed: false, Message: "accepted nil pod without error"})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderColdStartBypass nil pod guard", Passed: true})
+	}
+
+	// 2. OrderRestore stamps order under RestoreAnnotation key
+	orderPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "repl-ordered"}}
+	if err := orderer.OrderRestore(orderPod, job); err != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore valid", Passed: false, Message: fmt.Sprintf("OrderRestore error: %v", err)})
-		t.Errorf("[C5] OrderRestore failed: %v", err)
 	} else {
-		snapRef, bypass, present := orderer.InspectRestoreOrder(pod)
+		annKey := eng.RestoreAnnotation()
+		stampedVal, stampedOk := orderPod.Annotations[annKey]
+		if !stampedOk || stampedVal != "ps-snap-1234" {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore key alignment", Passed: false, Message: fmt.Sprintf("pod.Annotations[%q] = %q (ok=%v), want %q (#135)", annKey, stampedVal, stampedOk, "ps-snap-1234")})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore key alignment", Passed: true, Message: fmt.Sprintf("stamped annotation %s=%q", annKey, stampedVal)})
+		}
+
+		snapRef, bypass, present := orderer.InspectRestoreOrder(orderPod)
 		if !present || bypass || snapRef != "ps-snap-1234" {
 			cr.Status = StatusFailed
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "InspectRestoreOrder after OrderRestore", Passed: false, Message: fmt.Sprintf("got (snapRef=%q, bypass=%v, present=%v), want (\"ps-snap-1234\", false, true)", snapRef, bypass, present)})
-			t.Errorf("[C5] InspectRestoreOrder mismatch after OrderRestore: got (%q, %v, %v)", snapRef, bypass, present)
 		} else {
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore and InspectRestoreOrder", Passed: true, Message: fmt.Sprintf("stamped and verified snapshotRef=%q", snapRef)})
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "InspectRestoreOrder after OrderRestore", Passed: true, Message: "verified (snapRef, bypass=false, present=true)"})
 		}
 	}
 
-	// 3. OrderColdStartBypass
-	bypassPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "repl-bypass"}}
-	if err := orderer.OrderColdStartBypass(bypassPod); err != nil {
+	// 3. OrderColdStartBypass replaces an existing restore order
+	if err := orderer.OrderColdStartBypass(orderPod); err != nil {
 		cr.Status = StatusFailed
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderColdStartBypass", Passed: false, Message: fmt.Sprintf("OrderColdStartBypass error: %v", err)})
-		t.Errorf("[C5] OrderColdStartBypass failed: %v", err)
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderColdStartBypass overwrites order", Passed: false, Message: fmt.Sprintf("OrderColdStartBypass error: %v", err)})
 	} else {
-		snapRef, bypass, present := orderer.InspectRestoreOrder(bypassPod)
+		snapRef, bypass, present := orderer.InspectRestoreOrder(orderPod)
 		if !present || !bypass || snapRef != "" {
 			cr.Status = StatusFailed
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "InspectRestoreOrder after OrderColdStartBypass", Passed: false, Message: fmt.Sprintf("got (snapRef=%q, bypass=%v, present=%v), want (\"\", true, true)", snapRef, bypass, present)})
-			t.Errorf("[C5] InspectRestoreOrder mismatch after OrderColdStartBypass: got (%q, %v, %v)", snapRef, bypass, present)
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderColdStartBypass overwrites order", Passed: false, Message: fmt.Sprintf("got (snapRef=%q, bypass=%v, present=%v), want (\"\", true, true)", snapRef, bypass, present)})
 		} else {
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderColdStartBypass and InspectRestoreOrder", Passed: true, Message: "stamped cold-start bypass (empty snapshotRef)"})
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderColdStartBypass overwrites order", Passed: true, Message: "bypass cleanly replaces existing restore order"})
 		}
 	}
 
-	// 4. Pristine unannotated pod inspect
+	// 4. OrderRestore re-orders over existing bypass
+	job2 := &pmv1alpha1.PodMigrationJob{
+		Status: pmv1alpha1.PodMigrationJobStatus{SnapshotRef: "ps-snap-5678"},
+	}
+	if err := orderer.OrderRestore(orderPod, job2); err != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore re-orders over bypass", Passed: false, Message: fmt.Sprintf("OrderRestore error: %v", err)})
+	} else {
+		snapRef, bypass, present := orderer.InspectRestoreOrder(orderPod)
+		if !present || bypass || snapRef != "ps-snap-5678" {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore re-orders over bypass", Passed: false, Message: fmt.Sprintf("got (snapRef=%q, bypass=%v, present=%v), want (\"ps-snap-5678\", false, true)", snapRef, bypass, present)})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "OrderRestore re-orders over bypass", Passed: true, Message: "re-ordered snapshotRef successfully"})
+		}
+	}
+
+	// 5. Pristine unannotated pod inspect
 	pristinePod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "repl-pristine"}}
 	snapRef, bypass, present := orderer.InspectRestoreOrder(pristinePod)
 	if present {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "InspectRestoreOrder pristine pod", Passed: false, Message: fmt.Sprintf("present=true on pristine unannotated pod (%q, %v)", snapRef, bypass)})
-		t.Errorf("[C5] InspectRestoreOrder present=true on pristine pod: (%q, %v)", snapRef, bypass)
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "InspectRestoreOrder pristine pod", Passed: true, Message: "present=false on unannotated pod"})
 	}
 
-	cr.Details = fmt.Sprintf("RestoreOrderer capability fully conforming. RestoreOnce=%v.", eng.Guarantees().RestoreOnce)
+	if cr.Status == StatusPassed {
+		cr.Details = fmt.Sprintf("Restore order annotation round-trip verified (key=%q). Declares RestoreOnce=%v.", eng.RestoreAnnotation(), eng.Guarantees().RestoreOnce)
+	} else {
+		cr.Details = "Contract C5 restore order annotation or validation violations detected."
+	}
 	return cr
 }
 
 // auditC6RestoreOutcomeSignal audits Clause C6: Restore outcome signal.
-func (r *Runner) auditC6RestoreOutcomeSignal(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC6RestoreOutcomeSignal(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC6RestoreOutcomeSignal,
 		Title:    "Restore outcome signal",
@@ -633,7 +706,15 @@ func (r *Runner) auditC6RestoreOutcomeSignal(t *testing.T, eng engine.Engine) Cl
 		Status: pmv1alpha1.PodMigrationJobStatus{SnapshotRef: "ps-snap-1"},
 	}
 
-	// 1. InProgress check on unready replacement
+	// 1. Nil pod guard
+	if _, err := verifier.VerifyRestore(ctx, job, nil); err == nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore nil pod guard", Passed: false, Message: "accepted nil pod without error"})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore nil pod guard", Passed: true})
+	}
+
+	// 2. InProgress check on unready replacement (!Confirmed)
 	unreadyPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "repl-unready", Namespace: "default"},
 		Status:     corev1.PodStatus{Phase: corev1.PodPending},
@@ -642,19 +723,47 @@ func (r *Runner) auditC6RestoreOutcomeSignal(t *testing.T, eng engine.Engine) Cl
 	if err != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore unready pod", Passed: false, Message: fmt.Sprintf("error: %v", err)})
-		t.Errorf("[C6] VerifyRestore unready pod failed: %v", err)
 	} else if verdict.Outcome != engine.RestoreInProgress {
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore unready pod", Passed: true, Message: fmt.Sprintf("outcome=%s (reason=%q)", verdict.Outcome, verdict.Reason)})
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore unready pod", Passed: false, Message: fmt.Sprintf("got outcome %s, want RestoreInProgress", verdict.Outcome)})
+	} else if verdict.Confirmed {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore unready pod", Passed: false, Message: "unready pod reported Confirmed=true without positive restore evidence"})
 	} else {
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore unready pod", Passed: true, Message: "returns InProgress while pod is not Ready"})
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore unready pod", Passed: true, Message: "returns InProgress with Confirmed=false"})
 	}
 
-	cr.Details = "RestoreVerifier capability verified for read-only outcome polling."
+	// 3. Ready pod with NO restore evidence must never report Confirmed=true
+	readyPodNoSignal := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "repl-ready-no-signal", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+	verdictReady, errReady := verifier.VerifyRestore(ctx, job, readyPodNoSignal)
+	if errReady != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore ready pod without signal", Passed: false, Message: fmt.Sprintf("error: %v", errReady)})
+	} else if verdictReady.Confirmed {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore ready pod without signal", Passed: false, Message: "reported Confirmed=true for ready pod with no positive restore evidence"})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore ready pod without signal", Passed: true, Message: fmt.Sprintf("Confirmed=false maintained without positive signal (outcome=%s)", verdictReady.Outcome)})
+	}
+
+	if cr.Status == StatusPassed {
+		cr.Details = "RestoreVerifier outcome signals and evidence requirements verified."
+	} else {
+		cr.Details = "Contract C6 restore outcome signal violations detected."
+	}
 	return cr
 }
 
 // auditC7FailureClassification audits Clause C7: Restore failure classification.
-func (r *Runner) auditC7FailureClassification(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC7FailureClassification(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC7FailureClassify,
 		Title:    "Restore failure classification",
@@ -675,25 +784,49 @@ func (r *Runner) auditC7FailureClassification(t *testing.T, eng engine.Engine) C
 	}
 
 	for _, rf := range failures {
+		if rf == nil {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Classifier non-nil", Passed: false, Message: "nil classifier in RestoreFailures()"})
+			continue
+		}
 		rfName := rf.Name()
 		if rfName == "" {
 			cr.Status = StatusFailed
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Classifier name non-empty", Passed: false, Message: "classifier returned empty Name()"})
-			t.Errorf("[C7] restore failure classifier returned empty Name()")
 		}
-		if scoped, ok := rf.(restore.RuntimeClassScoped); ok {
-			// Ensure it does not claim to cover classes that this engine does not serve
-			allKnownClasses := []string{"gvisor", "runc", "@default", "custom-runtime"}
-			for _, checkClass := range allKnownClasses {
-				if scoped.CoversRuntimeClass(checkClass) && !engClasses[checkClass] {
-					cr.Status = StatusFailed
-					cr.Subtests = append(cr.Subtests, SubtestResult{
-						Name:    "Classifier runtime class scope",
-						Passed:  false,
-						Message: fmt.Sprintf("classifier %q covers runtime class %q not served by engine %v", rfName, checkClass, eng.RuntimeClasses()),
-					})
-					t.Errorf("[C7] classifier %q covers class %q outside engine %v", rfName, checkClass, eng.RuntimeClasses())
-				}
+
+		// A classifier must implement restore.RuntimeClassScoped (#132)
+		scoped, ok := rf.(restore.RuntimeClassScoped)
+		if !ok {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{
+				Name:    "Classifier RuntimeClassScoped",
+				Passed:  false,
+				Message: fmt.Sprintf("classifier %q does not implement restore.RuntimeClassScoped; unscoped classifiers match across runtimes (#132)", rfName),
+			})
+			continue
+		}
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Classifier RuntimeClassScoped", Passed: true, Message: fmt.Sprintf("%q implements RuntimeClassScoped", rfName)})
+
+		// Probe standard classes, engine's own classes, DefaultRuntimeClassToken, and an unsupported sentinel
+		checkClasses := []string{
+			eligibility.DefaultRuntimeClassToken,
+			"unsupported-sentinel-runtime-class",
+		}
+		for _, stdClass := range []string{"gvisor", "runc"} {
+			if !engClasses[stdClass] {
+				checkClasses = append(checkClasses, stdClass)
+			}
+		}
+
+		for _, checkClass := range checkClasses {
+			if scoped.CoversRuntimeClass(checkClass) && !engClasses[checkClass] {
+				cr.Status = StatusFailed
+				cr.Subtests = append(cr.Subtests, SubtestResult{
+					Name:    "Classifier runtime class scope",
+					Passed:  false,
+					Message: fmt.Sprintf("classifier %q covers runtime class %q not served by engine %v (#132)", rfName, checkClass, eng.RuntimeClasses()),
+				})
 			}
 		}
 	}
@@ -707,7 +840,7 @@ func (r *Runner) auditC7FailureClassification(t *testing.T, eng engine.Engine) C
 }
 
 // auditC8PlacementConstraints audits Clause C8: Placement constraints.
-func (r *Runner) auditC8PlacementConstraints(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC8PlacementConstraints(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC8Placement,
 		Title:    "Placement constraints",
@@ -729,28 +862,48 @@ func (r *Runner) auditC8PlacementConstraints(t *testing.T, eng engine.Engine) Cl
 			OriginNodeInstanceType: "n2-standard-4",
 		},
 	}
+	jobBefore := jobWithMachine.DeepCopy()
 
-	// 1. Determinism test: repeated calls must return identical requirements
+	// 1. Determinism and job immutability test: repeated calls must return identical requirements
 	reqs1, err1 := advisor.Placement(ctx, jobWithMachine)
 	reqs2, err2 := advisor.Placement(ctx, jobWithMachine)
 	if err1 != nil || err2 != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement execution", Passed: false, Message: fmt.Sprintf("Placement returned error: %v / %v", err1, err2)})
-		t.Errorf("[C8] Placement returned unexpected error: %v / %v", err1, err2)
+	} else if !reflect.DeepEqual(jobBefore, jobWithMachine) {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement job immutability", Passed: false, Message: "Placement mutated input PodMigrationJob"})
 	} else if !reflect.DeepEqual(reqs1, reqs2) {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement determinism", Passed: false, Message: fmt.Sprintf("non-deterministic return values: %v vs %v", reqs1, reqs2)})
-		t.Errorf("[C8] Placement non-deterministic: %v != %v", reqs1, reqs2)
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement determinism", Passed: true, Message: fmt.Sprintf("returned %d requirement(s) identically across calls", len(reqs1))})
 	}
 
-	// 2. Requirements validity
+	// 2. Validate operators, keys, and values match selection.Operator requirements (#14)
+	operators := map[corev1.NodeSelectorOperator]selection.Operator{
+		corev1.NodeSelectorOpIn:           selection.In,
+		corev1.NodeSelectorOpNotIn:        selection.NotIn,
+		corev1.NodeSelectorOpExists:       selection.Exists,
+		corev1.NodeSelectorOpDoesNotExist: selection.DoesNotExist,
+		corev1.NodeSelectorOpGt:           selection.GreaterThan,
+		corev1.NodeSelectorOpLt:           selection.LessThan,
+	}
+
 	for i, req := range reqs1 {
 		if errs := validation.IsQualifiedName(req.Key); len(errs) > 0 {
 			cr.Status = StatusFailed
 			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Requirement %d key valid", i), Passed: false, Message: fmt.Sprintf("invalid label key %q: %v", req.Key, errs)})
-			t.Errorf("[C8] Placement returned invalid label key %q: %v", req.Key, errs)
+		}
+		op, ok := operators[req.Operator]
+		if !ok {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Requirement %d operator valid", i), Passed: false, Message: fmt.Sprintf("invalid operator %q", req.Operator)})
+		} else if _, err := labels.NewRequirement(req.Key, op, req.Values); err != nil {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Requirement %d value validity", i), Passed: false, Message: fmt.Sprintf("invalid requirement (%s %s %v): %v", req.Key, req.Operator, req.Values, err)})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Requirement %d valid", i), Passed: true, Message: fmt.Sprintf("%s %s %v", req.Key, req.Operator, req.Values)})
 		}
 	}
 
@@ -760,20 +913,34 @@ func (r *Runner) auditC8PlacementConstraints(t *testing.T, eng engine.Engine) Cl
 	if errEmpty != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement empty facts fallback", Passed: false, Message: fmt.Sprintf("returned error on empty facts: %v", errEmpty)})
-		t.Errorf("[C8] Placement returned error on empty facts: %v", errEmpty)
-	} else if len(reqsEmpty) > 0 && advisor != nil {
-		// Empty facts should generally state no requirements unless static
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement empty facts fallback", Passed: true, Message: fmt.Sprintf("%d static requirement(s)", len(reqsEmpty))})
+	} else if len(reqsEmpty) > 0 {
+		for i, req := range reqsEmpty {
+			op, ok := operators[req.Operator]
+			if !ok {
+				cr.Status = StatusFailed
+				cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Static requirement %d operator", i), Passed: false, Message: fmt.Sprintf("unknown operator %q", req.Operator)})
+			} else if _, err := labels.NewRequirement(req.Key, op, req.Values); err != nil {
+				cr.Status = StatusFailed
+				cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Static requirement %d validity", i), Passed: false, Message: fmt.Sprintf("invalid requirement: %v", err)})
+			}
+		}
+		if cr.Status != StatusFailed {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement empty facts fallback", Passed: true, Message: fmt.Sprintf("%d static requirement(s)", len(reqsEmpty))})
+		}
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement empty facts fallback", Passed: true, Message: "returns 0 requirements on unknown source facts"})
 	}
 
-	cr.Details = "PlacementAdvisor capability verified for deterministic label requirements."
+	if cr.Status == StatusPassed {
+		cr.Details = "PlacementAdvisor capability verified for deterministic label requirements."
+	} else {
+		cr.Details = "Contract C8 placement constraint violations detected."
+	}
 	return cr
 }
 
 // auditC9CancellationAndCleanup audits Clause C9: Cancellation and cleanup.
-func (r *Runner) auditC9CancellationAndCleanup(t *testing.T, eng engine.Engine) ClauseResult {
+func (r *Runner) auditC9CancellationAndCleanup(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC9CancellationCleanup,
 		Title:    "Cancellation and cleanup",
@@ -792,21 +959,104 @@ func (r *Runner) auditC9CancellationAndCleanup(t *testing.T, eng engine.Engine) 
 	ctx := context.Background()
 	job := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-job",
+			Name:      "test-job-cleanup",
 			Namespace: "default",
 			UID:       types.UID("job-cleanup-uid"),
 		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			TargetPodUID: "target-cleanup-uid",
+		},
 	}
+	podName := "web-cleanup-0"
 
-	// Cleanup should be idempotent and return nil error even if trigger doesn't exist
-	if err := prov.Cleanup(ctx, job, "web-0"); err != nil {
+	// 1. Create a trigger first
+	if _, err := prov.EnsureTrigger(ctx, job, podName); err != nil {
 		cr.Status = StatusFailed
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Cleanup idempotency", Passed: false, Message: fmt.Sprintf("Cleanup returned error on non-existent trigger: %v", err)})
-		t.Errorf("[C9] Cleanup returned error on non-existent trigger: %v", err)
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Trigger creation before cleanup", Passed: false, Message: fmt.Sprintf("EnsureTrigger error: %v", err)})
 	} else {
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Cleanup idempotency", Passed: true, Message: "idempotent on non-existent trigger"})
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Trigger creation before cleanup", Passed: true})
 	}
 
-	cr.Details = "Snapshot provider cleanup idempotency confirmed."
+	// 2. CheckStatus should see the trigger exists (TriggerUnanswered == true or PhaseInProgress)
+	st, err := prov.CheckStatus(ctx, job, podName)
+	if err != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus on created trigger", Passed: false, Message: fmt.Sprintf("CheckStatus error: %v", err)})
+	} else if st == nil || st.Phase != snapshot.PhaseInProgress {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus on created trigger", Passed: false, Message: fmt.Sprintf("unexpected status: %+v", st)})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus on created trigger", Passed: true, Message: fmt.Sprintf("phase=%s, unanswered=%v", st.Phase, st.TriggerUnanswered)})
+	}
+
+	// 3. First Cleanup deletes the trigger
+	if err := prov.Cleanup(ctx, job, podName); err != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Cleanup trigger", Passed: false, Message: fmt.Sprintf("Cleanup returned error: %v", err)})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Cleanup trigger", Passed: true})
+	}
+
+	// 4. Verify trigger is gone (CheckStatus no longer reports TriggerUnanswered: true)
+	stAfter, errAfter := prov.CheckStatus(ctx, job, podName)
+	if errAfter != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus after cleanup", Passed: false, Message: fmt.Sprintf("CheckStatus error: %v", errAfter)})
+	} else if stAfter != nil && stAfter.TriggerUnanswered {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Cleanup removes trigger", Passed: false, Message: "trigger still reported as existing/unanswered after Cleanup"})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Cleanup removes trigger", Passed: true, Message: "trigger successfully removed"})
+	}
+
+	// 5. CheckpointState if CheckpointReporter is implemented
+	if reporter, ok := prov.(snapshot.CheckpointReporter); ok {
+		state, err := reporter.CheckpointState(ctx, job, podName)
+		if err != nil {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckpointState after cleanup", Passed: false, Message: fmt.Sprintf("CheckpointState error: %v", err)})
+		} else if !state.Settled {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckpointState settled after cleanup", Passed: false, Message: "state.Settled = false after trigger cleanup"})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckpointState settled after cleanup", Passed: true, Message: fmt.Sprintf("Settled=%v, Completed=%v", state.Settled, state.Completed)})
+		}
+	}
+
+	// 6. Second Cleanup is idempotent
+	if err := prov.Cleanup(ctx, job, podName); err != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Cleanup idempotency", Passed: false, Message: fmt.Sprintf("idempotent Cleanup returned error: %v", err)})
+	} else {
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Cleanup idempotency", Passed: true, Message: "idempotent on already deleted trigger"})
+	}
+
+	if cr.Status == StatusPassed {
+		cr.Details = "Snapshot provider trigger creation, deletion, idempotency, and settled state confirmed."
+	} else {
+		cr.Details = "Contract C9 cancellation and cleanup violations detected."
+	}
 	return cr
+}
+
+// auditC10Security records the coverage state of Clause C10: Security.
+func (r *Runner) auditC10Security(eng engine.Engine) ClauseResult {
+	return ClauseResult{
+		ID:       ClauseC10Security,
+		Title:    "Security isolation and privilege boundaries",
+		Required: false,
+		Status:   StatusSkipped,
+		Details:  "Security boundaries (C10) are verified in T2/T3 scenarios (#129).",
+	}
+}
+
+// auditC11Observability records the coverage state of Clause C11: Observability.
+func (r *Runner) auditC11Observability(eng engine.Engine) ClauseResult {
+	return ClauseResult{
+		ID:       ClauseC11Observability,
+		Title:    "Telemetry and metric fidelity",
+		Required: false,
+		Status:   StatusSkipped,
+		Details:  "Telemetry labels and metric fidelity (C11) are verified in controller telemetry suites.",
+	}
 }
