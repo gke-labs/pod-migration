@@ -435,6 +435,9 @@ func TestDeployManifestGrantsArchiveFinalizer(t *testing.T) {
 		if !verbs["update"] || !verbs["patch"] {
 			t.Fatalf("pod-migrate-psengine-controller verbs on podsnapshots = %v, want update and patch for the archive finalizer", verbs)
 		}
+		if !verbs["delete"] {
+			t.Fatalf("pod-migrate-psengine-controller verbs on podsnapshots = %v, want delete for a work order an earlier trigger left (#262)", verbs)
+		}
 		return
 	}
 	t.Fatal("ClusterRole pod-migrate-psengine-controller not found in deploy.yaml")
