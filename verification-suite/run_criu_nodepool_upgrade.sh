@@ -47,6 +47,8 @@ TIMEOUT_SEC="${TIMEOUT_SEC:-1800}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-5}"
 SKIP_UPGRADE="${SKIP_UPGRADE:-false}"
 DRAIN_NODE="${DRAIN_NODE:-false}"
+ALLOW_SAME_VERSION="${ALLOW_SAME_VERSION:-false}"
+SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 SELF_TEST="${SELF_TEST:-false}"
 OUT_DIR="${OUT_DIR:-/tmp/pm-upgrade-test-runs}"
@@ -82,6 +84,8 @@ Options:
   --timeout <seconds>         Maximum seconds to wait for upgrade and migration (default: 1800)
   --skip-upgrade              Skip gcloud upgrade trigger (observe drain or existing upgrade)
   --drain-node                Trigger kubectl drain on source node rather than gcloud upgrade
+  --allow-same-version        Allow destination node to share source version (default: require version jump)
+  --skip-cleanup              Do not delete test workload or uncordon nodes after run (default: false)
   --out-dir <dir>             Directory for run logs and report (default: /tmp/pm-upgrade-test-runs)
   --dry-run                   Print actions without modifying cluster resources
   --self-test                 Run offline unit and sabotage validation suite (used in CI)
@@ -92,11 +96,11 @@ Examples:
   $(basename "$0") --self-test
 
   # Test rolling upgrade of pool 'criu-pool' to target patch version:
-  $(basename "$0") --cluster kyber-test --location northamerica-northeast2-b \\
+  $(basename "$0") --cluster <CLUSTER> --location <LOCATION> \\
     --node-pool criu-pool --target-version 1.34.2-gke.1100
 
   # Test rolling drain across mixed-version nodes without invoking gcloud upgrade:
-  $(basename "$0") --cluster kyber-test --namespace pm-upgrade-test --drain-node --skip-upgrade
+  $(basename "$0") --cluster <CLUSTER> --namespace pm-upgrade-test --drain-node --skip-upgrade
 EOF
 }
 
@@ -140,6 +144,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --drain-node)
       DRAIN_NODE="true"
+      shift
+      ;;
+    --allow-same-version)
+      ALLOW_SAME_VERSION="true"
+      shift
+      ;;
+    --skip-cleanup)
+      SKIP_CLEANUP="true"
       shift
       ;;
     --out-dir)
@@ -300,6 +312,20 @@ EOF
   esac
 }
 
+render_podmigration_manifest() {
+  local ns="$1"
+  cat <<EOF
+apiVersion: podmigration.gke.io/v1alpha1
+kind: PodMigration
+metadata:
+  name: default
+  namespace: ${ns}
+  annotations:
+    pod-migration.gke.io/runtime-class-engines: "@default=criu"
+spec: {}
+EOF
+}
+
 get_node_facts() {
   local node_name="$1"
   ${KUBECTL_CMD} get node "${node_name}" -o json | jq -r '
@@ -385,11 +411,14 @@ verify_restored_workload() {
 
 verify_pmj_outcome() {
   local pmj_json="$1"
-  local phase restored_reason restart_count
+  local phase restored_reason engine
 
   phase="$(echo "${pmj_json}" | jq -r '.status.phase // empty')"
   restored_reason="$(echo "${pmj_json}" | jq -r '
     .status.conditions[]? | select(.type=="Restored") | .reason // empty
+  ')"
+  engine="$(echo "${pmj_json}" | jq -r '
+    .metadata.annotations["pod-migration.gke.io/engine"] // empty
   ')"
 
   if [[ "${phase}" != "Succeeded" ]]; then
@@ -398,6 +427,34 @@ verify_pmj_outcome() {
 
   if [[ "${restored_reason}" != "RestoreVerified" && "${restored_reason}" != "RestoreInferred" ]]; then
     die "PodMigrationJob Restored condition reason is '${restored_reason}' (expected 'RestoreVerified' or 'RestoreInferred')"
+  fi
+
+  if [[ "${engine}" != "criu" ]]; then
+    die "PodMigrationJob engine annotation is '${engine}' (expected 'criu'; run did not use CRIU engine)"
+  fi
+}
+
+verify_node_transition() {
+  local src_node="$1"
+  local src_kubelet="$2"
+  local src_kernel="$3"
+  local dst_node="$4"
+  local dst_kubelet="$5"
+  local dst_kernel="$6"
+  local allow_same_version="$7"
+
+  if [[ "${src_node}" == "${dst_node}" ]]; then
+    die "Node transition check FAILED: destination node '${dst_node}' is identical to source node '${src_node}'; replacement did not migrate to a different node"
+  fi
+
+  if [[ "${src_kubelet}" == "${dst_kubelet}" && "${src_kernel}" == "${dst_kernel}" ]]; then
+    if [[ "${allow_same_version}" == "true" ]]; then
+      warn "Destination node '${dst_node}' has identical kubelet (${dst_kubelet}) and kernel (${dst_kernel}) versions to source node '${src_node}'"
+    else
+      die "Version transition check FAILED: destination node '${dst_node}' has identical kubelet (${dst_kubelet}) and kernel (${dst_kernel}) versions to source node '${src_node}'. Run did not cross node versions (pass --allow-same-version to permit same-version node migration)."
+    fi
+  else
+    log "Version transition check PASSED: Kubelet '${src_kubelet}' -> '${dst_kubelet}', Kernel '${src_kernel}' -> '${dst_kernel}'"
   fi
 }
 
@@ -411,7 +468,31 @@ verify_container_restarts() {
   fi
 }
 
+CORDONED_NODE=""
+WORKLOAD_DEPLOYED="false"
+
+cleanup() {
+  local exit_code=$?
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    return
+  fi
+  if [[ -n "${CORDONED_NODE}" ]]; then
+    log "Cleaning up: uncordoning node ${CORDONED_NODE}..."
+    ${KUBECTL_CMD} uncordon "${CORDONED_NODE}" || true
+    CORDONED_NODE=""
+  fi
+  if [[ "${SKIP_CLEANUP}" != "true" && "${WORKLOAD_DEPLOYED}" == "true" ]]; then
+    log "Cleaning up: deleting test workload and PodMigration in namespace ${NAMESPACE}..."
+    ${KUBECTL_CMD} delete statefulset "criu-upgrade-${WORKLOAD}" -n "${NAMESPACE}" --ignore-not-found || true
+    ${KUBECTL_CMD} delete service "criu-upgrade-${WORKLOAD}-svc" -n "${NAMESPACE}" --ignore-not-found || true
+    ${KUBECTL_CMD} delete podmigration default -n "${NAMESPACE}" --ignore-not-found || true
+  fi
+  exit "${exit_code}"
+}
+
 run_live() {
+  trap cleanup EXIT INT TERM
+
   mkdir -p "${OUT_DIR}"
   local run_log
   run_log="${OUT_DIR}/nodepool_upgrade_$(date +%Y%m%d_%H%M%S).log"
@@ -431,15 +512,19 @@ run_live() {
     [[ -n "${TARGET_VERSION}" ]] || die "Please specify --target-version"
   fi
 
-  # Ensure namespace
+  # Ensure namespace and CRIU-routed PodMigration
   ${KUBECTL_CMD} get namespace "${NAMESPACE}" >/dev/null 2>&1 || \
     ${KUBECTL_CMD} create namespace "${NAMESPACE}"
+
+  log "Configuring namespace PodMigration with CRIU engine route (@default=criu)..."
+  render_podmigration_manifest "${NAMESPACE}" | ${KUBECTL_CMD} apply -f -
 
   local workload_name="criu-upgrade-${WORKLOAD}"
   local pod_name="${workload_name}-0"
 
   log "Deploying stateful workload ${workload_name}..."
   render_workload_manifest "${workload_name}" "${NAMESPACE}" "${WORKLOAD}" | ${KUBECTL_CMD} apply -f -
+  WORKLOAD_DEPLOYED="true"
 
   log "Waiting for pod ${pod_name} to become Ready..."
   ${KUBECTL_CMD} wait --namespace "${NAMESPACE}" --for=condition=Ready "pod/${pod_name}" --timeout=180s
@@ -469,6 +554,7 @@ run_live() {
   # Trigger upgrade or drain
   if [[ "${DRAIN_NODE}" == "true" ]]; then
     log "Draining source node ${src_node} to trigger eviction and live migration..."
+    CORDONED_NODE="${src_node}"
     ${KUBECTL_CMD} drain "${src_node}" --ignore-daemonsets --delete-emptydir-data --force --pod-selector="app=${workload_name}" || true
   elif [[ "${SKIP_UPGRADE}" != "true" ]]; then
     local gcloud_args=(container clusters upgrade "${CLUSTER}" --node-pool "${NODE_POOL}" --cluster-version "${TARGET_VERSION}" --async)
@@ -540,22 +626,29 @@ run_live() {
   read -r dst_kubelet dst_kernel dst_runtime dst_os <<<"${dst_facts}"
   log "Destination node facts -> Kubelet: ${dst_kubelet}, Kernel: ${dst_kernel}, Runtime: ${dst_runtime}, OS: ${dst_os}"
 
+  # Verify node transition and version jump
+  verify_node_transition "${src_node}" "${src_kubelet}" "${src_kernel}" "${dst_node}" "${dst_kubelet}" "${dst_kernel}" "${ALLOW_SAME_VERSION}"
+
   # Acid test: verify state survived intact
   verify_restored_workload "${pod_name}" "${NAMESPACE}" "${WORKLOAD}" "${nonce}" "${initial_state}"
+
+  local report_title="GKE NODE-POOL UPGRADE & CRIU WARM-RESTORE: PASS"
+  if [[ "${src_kubelet}" == "${dst_kubelet}" && "${src_kernel}" == "${dst_kernel}" ]]; then
+    report_title="SAME-VERSION NODE DRAIN & CRIU WARM-RESTORE: PASS (NO VERSION JUMP)"
+  fi
 
   # Emit summary report
   cat <<REPORT
 
 ========================================================================
-🎉 GKE NODE-POOL UPGRADE & CRIU WARM-RESTORE: PASS
+🎉 ${report_title}
 ========================================================================
 Workload:             ${WORKLOAD} (${pod_name})
 Source Node:          ${src_node} (Kubelet: ${src_kubelet}, Kernel: ${src_kernel})
 Destination Node:     ${dst_node} (Kubelet: ${dst_kubelet}, Kernel: ${dst_kernel})
-PodMigrationJob:      ${pmj_name} (Phase: Succeeded)
+PodMigrationJob:      ${pmj_name} (Phase: Succeeded, Engine: criu)
 Container Restarts:   0
 In-Memory Integrity:  VERIFIED INTACT (unpersisted state survived)
-Safety Violations:    0
 Log:                  ${run_log}
 ========================================================================
 REPORT
@@ -566,9 +659,9 @@ run_self_test() {
   local test_tmp="/tmp/pm-upgrade-self-test-$$"
   mkdir -p "${test_tmp}"
 
-  # Test 1: Verify workload manifest rendering
-  log "[Self-Test 1/5] Testing workload manifest generation..."
-  local redis_mf counter_mf
+  # Test 1: Verify workload and PodMigration manifest rendering
+  log "[Self-Test 1/6] Testing manifest generation..."
+  local redis_mf counter_mf pm_mf
   redis_mf="$(render_workload_manifest "test-redis" "test-ns" "redis")"
   echo "${redis_mf}" | grep -q 'image: redis:7-alpine' || die "Self-test: redis manifest missing image"
   echo "${redis_mf}" | grep -q 'command: \["docker-entrypoint.sh"\]' || die "Self-test: redis manifest missing entrypoint"
@@ -578,21 +671,35 @@ run_self_test() {
   echo "${counter_mf}" | grep -q 'image: busybox:1.36' || die "Self-test: counter manifest missing image"
   echo "${counter_mf}" | grep -q 'pod-migration.gke.io/enabled: "true"' || die "Self-test: counter manifest missing opt-in label"
 
-  # Test 2: PMJ outcome verification logic (PASS vs FAIL)
-  log "[Self-Test 2/5] Testing PMJ outcome verification..."
-  local good_pmj='{"status":{"phase":"Succeeded","conditions":[{"type":"Restored","status":"True","reason":"RestoreVerified"}]}}'
+  pm_mf="$(render_podmigration_manifest "test-ns")"
+  echo "${pm_mf}" | grep -q 'kind: PodMigration' || die "Self-test: PodMigration manifest missing kind"
+  echo "${pm_mf}" | grep -q 'pod-migration.gke.io/runtime-class-engines: "@default=criu"' || die "Self-test: PodMigration manifest missing CRIU routing"
+
+  # Test 2: PMJ outcome verification logic (PASS vs FAIL, engine assertion)
+  log "[Self-Test 2/6] Testing PMJ outcome verification..."
+  local good_pmj='{"metadata":{"annotations":{"pod-migration.gke.io/engine":"criu"}},"status":{"phase":"Succeeded","conditions":[{"type":"Restored","status":"True","reason":"RestoreVerified"}]}}'
   verify_pmj_outcome "${good_pmj}"
 
-  local inferred_pmj='{"status":{"phase":"Succeeded","conditions":[{"type":"Restored","status":"True","reason":"RestoreInferred"}]}}'
+  local inferred_pmj='{"metadata":{"annotations":{"pod-migration.gke.io/engine":"criu"}},"status":{"phase":"Succeeded","conditions":[{"type":"Restored","status":"True","reason":"RestoreInferred"}]}}'
   verify_pmj_outcome "${inferred_pmj}"
 
-  local failed_pmj='{"status":{"phase":"Failed","conditions":[{"type":"Restored","status":"False","reason":"RestoreCrashFallback"}]}}'
+  local non_criu_pmj='{"metadata":{"annotations":{"pod-migration.gke.io/engine":"gke-pod-snapshots"}},"status":{"phase":"Succeeded","conditions":[{"type":"Restored","status":"True","reason":"RestoreVerified"}]}}'
+  if ( verify_pmj_outcome "${non_criu_pmj}" >/dev/null 2>&1 ); then
+    die "Self-test: expected verify_pmj_outcome to reject non-CRIU engine"
+  fi
+
+  local no_engine_pmj='{"status":{"phase":"Succeeded","conditions":[{"type":"Restored","status":"True","reason":"RestoreVerified"}]}}'
+  if ( verify_pmj_outcome "${no_engine_pmj}" >/dev/null 2>&1 ); then
+    die "Self-test: expected verify_pmj_outcome to reject PMJ missing engine annotation"
+  fi
+
+  local failed_pmj='{"metadata":{"annotations":{"pod-migration.gke.io/engine":"criu"}},"status":{"phase":"Failed","conditions":[{"type":"Restored","status":"False","reason":"RestoreCrashFallback"}]}}'
   if ( verify_pmj_outcome "${failed_pmj}" >/dev/null 2>&1 ); then
     die "Self-test: expected verify_pmj_outcome to reject Phase=Failed"
   fi
 
   # Test 3: Container restart verification logic (0 restarts vs >0 restarts)
-  log "[Self-Test 3/5] Testing container restart count verification..."
+  log "[Self-Test 3/6] Testing container restart count verification..."
   local good_pod='{"status":{"containerStatuses":[{"name":"redis","restartCount":0}]}}'
   verify_container_restarts "${good_pod}"
 
@@ -601,8 +708,25 @@ run_self_test() {
     die "Self-test: expected verify_container_restarts to reject restartCount > 0"
   fi
 
-  # Test 4: End-to-end simulated verification pipeline with mock CLI
-  log "[Self-Test 4/5] Testing mock CLI execution pipeline..."
+  # Test 4: Node transition and version jump verification logic
+  log "[Self-Test 4/6] Testing node transition and version jump verification..."
+  # Same node rejected
+  if ( verify_node_transition "nodeA" "v1" "k1" "nodeA" "v2" "k2" "false" >/dev/null 2>&1 ); then
+    die "Self-test: expected verify_node_transition to reject identical source and destination node"
+  fi
+  # Same version rejected when allow_same_version=false
+  if ( verify_node_transition "nodeA" "v1" "k1" "nodeB" "v1" "k1" "false" >/dev/null 2>&1 ); then
+    die "Self-test: expected verify_node_transition to reject identical versions when allow_same_version=false"
+  fi
+  # Same version allowed when allow_same_version=true
+  verify_node_transition "nodeA" "v1" "k1" "nodeB" "v1" "k1" "true" >/dev/null
+  # Different kubelet version accepted
+  verify_node_transition "nodeA" "v1" "k1" "nodeB" "v2" "k1" "false" >/dev/null
+  # Different kernel version accepted
+  verify_node_transition "nodeA" "v1" "k1" "nodeB" "v1" "k2" "false" >/dev/null
+
+  # Test 5: End-to-end simulated verification pipeline with mock CLI
+  log "[Self-Test 5/6] Testing mock CLI execution pipeline..."
   local mock_kubectl="${test_tmp}/mock_kubectl.sh"
   cat <<'EOF' >"${mock_kubectl}"
 #!/usr/bin/env bash
@@ -655,8 +779,8 @@ EOF
     die "Self-test: expected verify_restored_workload to fail on count rollback"
   fi
 
-  # Test 5: Verify usage and help flags
-  log "[Self-Test 5/5] Testing usage output..."
+  # Test 6: Verify usage and help flags
+  log "[Self-Test 6/6] Testing usage output..."
   "${SCRIPT_DIR}/run_criu_nodepool_upgrade.sh" --help >/dev/null
 
   rm -rf "${test_tmp}"

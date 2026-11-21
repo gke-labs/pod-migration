@@ -404,18 +404,17 @@ Rolling node-pool upgrades in GKE cordon and drain nodes one by one, triggering 
 
 ### Version Compatibility Matrix & Guidelines
 
-| Upgrade Type                   | Example Jump                               | Compatibility Status               | Operational Guidance & Behavior                                                                                                                                                                                                 |
-| ------------------------------ | ------------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **GKE Patch Upgrade**          | `1.34.1-gke.1000` &rarr; `1.34.2-gke.1100` | **Fully Supported**                | Identical kernel major.minor, identical glibc/ABI. In-memory state and socket structures restore with zero degradation.                                                                                                         |
-| **GKE Minor Upgrade**          | `1.34.x` &rarr; `1.35.x`                   | **Supported (forward-compatible)** | Newer kernel on destination node. Linux user-space ABI stability ensures task memory, threads, and file descriptors restore cleanly provided CPU features match.                                                                |
-| **Minor Downgrade / Rollback** | `1.35.x` &rarr; `1.34.x`                   | **Best-effort / Fallback**         | Checkpoints utilizing newer kernel syscalls or vDSO mappings may fail to restore on older kernels. Handled safely: the replacement pod falls back to a clean cold start with `RestoreCrashFallback`.                            |
-| **CPU Architecture Mismatch**  | Intel &rarr; AMD / mixed microarch         | **Refused (fenced)**               | Heterogeneous CPU instruction sets (e.g. missing AVX/AVX-512 flags) cause SIGILL on restore. Filtered via `status.sourceNode` facts recorded at checkpoint time ([#257](https://github.com/gke-labs/pod-migration/issues/257)). |
+| Upgrade Type                   | Example Jump                               | Compatibility Status   | Operational Guidance & Behavior                                                                                                                                                                                                 |
+| ------------------------------ | ------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **GKE Patch Upgrade**          | `1.34.1-gke.1000` &rarr; `1.34.2-gke.1100` | **Expected (untested)** | Identical kernel major.minor, identical glibc/ABI. In-memory state and socket structures expected to restore with zero degradation.                                                                                               |
+| **GKE Minor Upgrade**          | `1.34.x` &rarr; `1.35.x`                   | **Expected (untested)** | Newer kernel on destination node. Linux user-space ABI stability ensures task memory, threads, and file descriptors restore cleanly provided CPU features match.                                                                |
+| **Minor Downgrade / Rollback** | `1.35.x` &rarr; `1.34.x`                   | **Untested / Fallback**| Checkpoints utilizing newer kernel syscalls or vDSO mappings may fail to restore on older kernels. Handled safely: the replacement pod falls back to a clean cold start with `RestoreCrashFallback`.                            |
+| **CPU Architecture Mismatch**  | Intel &rarr; AMD / mixed microarch         | **Untested / Unfenced**| Heterogeneous CPU instruction sets (e.g. missing AVX/AVX-512 flags) cause SIGILL on restore. Issue #258 records node facts in `status.sourceNode`; filtering on those facts is planned for [#257](https://github.com/gke-labs/pod-migration/issues/257). |
 
 ### Prerequisites for Clean Upgrades
 
 1. **Homogeneous Node Pools:** Node pools participating in rolling upgrades must share CPU family and instruction sets.
-2. **Container Runtime Compatibility:** All nodes must run containerd `>= 2.0` (with patch requirements satisfying CVE-2026-95837) and `runc >= 1.2`.
-3. **In-Memory Integrity Verification:** Workloads must use explicit entrypoints (`command: ["docker-entrypoint.sh"]`) and opt-in labels.
+2. **Workload Opt-In & CRIU Routing:** Workloads must carry `pod-migration.gke.io/enabled: "true"` and the namespace must configure a `PodMigration` routing workloads to CRIU (e.g. `pod-migration.gke.io/runtime-class-engines: "@default=criu"`).
 
 ### Running the Live Upgrade Verification Suite
 
@@ -427,17 +426,18 @@ The repository includes an automated verification script in `verification-suite/
 
 # Live cluster rolling upgrade test:
 ./verification-suite/run_criu_nodepool_upgrade.sh \
-  --cluster kyber-test \
-  --location northamerica-northeast2-b \
-  --node-pool criu-pool \
-  --target-version 1.34.2-gke.1100 \
+  --cluster <CLUSTER> \
+  --location <LOCATION> \
+  --node-pool <NODE_POOL> \
+  --target-version <TARGET_VERSION> \
   --workload redis
 
-# Drain-only verification across existing mixed-version nodes:
+# Drain verification across nodes (use --allow-same-version if testing on identical node versions):
 ./verification-suite/run_criu_nodepool_upgrade.sh \
   --namespace pm-upgrade-test \
   --drain-node \
-  --skip-upgrade
+  --skip-upgrade \
+  --allow-same-version
 ```
 
 ## Building & Testing
