@@ -66,6 +66,16 @@ const ArchiveFinalizer = "pod-migrate.io/archive-cleanup"
 // so it's deleted first: a half-deleted archive never looks restorable.
 var ArchiveObjects = []string{"manifest.json", "checkpoint.tar", "spec.json"}
 
+// ArchivePartObjects returns the candidate part object names that a parallel
+// composite upload might have created (checkpoint.tar.part-000 through part-031).
+func ArchivePartObjects(baseTar string) []string {
+	parts := make([]string, 32)
+	for i := 0; i < 32; i++ {
+		parts[i] = fmt.Sprintf("%s.part-%03d", baseTar, i)
+	}
+	return parts
+}
+
 const (
 	// DefaultArchiveGCGiveUpAfter bounds how long the engine retries deleting
 	// an archive, from its first failed attempt, before it lets the
@@ -180,7 +190,9 @@ func (r *ArchiveGCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	var deleteErr error
-	for _, name := range ArchiveObjects {
+	toDelete := append([]string{}, ArchiveObjects...)
+	toDelete = append(toDelete, ArchivePartObjects("checkpoint.tar")...)
+	for _, name := range toDelete {
 		if err := r.Store.Delete(ctx, bucket, path.Join(prefix, name)); err != nil {
 			deleteErr = fmt.Errorf("deleting gs://%s/%s: %w", bucket, path.Join(prefix, name), err)
 			break

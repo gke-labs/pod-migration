@@ -94,8 +94,17 @@ type NodeRestoreReconciler struct {
 	// Empty disables the guard (both sides honest-absent).
 	CPUFamily string
 
+	ParallelUploadConfig ParallelUploadConfig
+
 	inflight sync.Map
 	signaled sync.Map
+}
+
+func (r *NodeRestoreReconciler) parallelConfig() ParallelUploadConfig {
+	if r.ParallelUploadConfig.ThresholdBytes > 0 {
+		return r.ParallelUploadConfig
+	}
+	return DefaultParallelUploadConfig
 }
 
 // Note: engines/criu does not run controller-gen; deploy/deploy.yaml is the RBAC source of truth.
@@ -337,7 +346,7 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 	prefix := ArchivePrefix(spec.Path, psName)
 
 	// manifest first — it is the upload-complete marker and integrity record.
-	mfBytes, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "manifest.json"), filepath.Join(dir, "manifest.json"), "", maxMetadataBytes)
+	mfBytes, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "manifest.json"), filepath.Join(dir, "manifest.json"), "", 0, maxMetadataBytes)
 	if err != nil {
 		return fmt.Errorf("fetch manifest: %w", err)
 	}
@@ -354,12 +363,12 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 		return fmt.Errorf("cpu family mismatch: archive from %q, this node is %q — refusing cross-family restore", mf.CPUFamily, r.CPUFamily)
 	}
 
-	specJSON, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "spec.json"), filepath.Join(dir, "spec.json"), mf.SpecSHA256, maxMetadataBytes)
+	specJSON, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "spec.json"), filepath.Join(dir, "spec.json"), mf.SpecSHA256, 0, maxMetadataBytes)
 	if err != nil {
 		return fmt.Errorf("fetch spec.json: %w", err)
 	}
 	tarPath := filepath.Join(dir, "checkpoint.tar")
-	if _, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "checkpoint.tar"), tarPath, mf.TarSHA256, maxTarBytes); err != nil {
+	if _, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "checkpoint.tar"), tarPath, mf.TarSHA256, mf.TarBytes, maxTarBytes); err != nil {
 		return fmt.Errorf("fetch checkpoint.tar: %w", err)
 	}
 
@@ -383,7 +392,15 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 // fetch downloads bucket/object to dst, verifying sha256 when expected != "".
 // Returns the content bytes only for small objects (expected use: manifest,
 // spec); for the tar the caller reads from dst.
-func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, expectedSHA string, maxBytes int64) ([]byte, error) {
+func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, expectedSHA string, expectedSize, maxBytes int64) ([]byte, error) {
+	if maxBytes > 0 && expectedSize > maxBytes {
+		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxBytes)
+	}
+	cfg := r.parallelConfig()
+	if rangeStore, ok := r.Store.(RangeObjectStore); ok && expectedSize >= cfg.ThresholdBytes {
+		return r.parallelFetch(ctx, rangeStore, bucket, object, dst, expectedSHA, expectedSize, maxBytes, cfg)
+	}
+
 	rc, err := r.Store.Get(ctx, bucket, object)
 	if err != nil {
 		return nil, err
@@ -404,7 +421,7 @@ func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, 
 	if cerr != nil {
 		return nil, cerr
 	}
-	if n > maxBytes {
+	if maxBytes > 0 && n > maxBytes {
 		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxBytes)
 	}
 	if expectedSHA != "" {
@@ -413,6 +430,109 @@ func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, 
 		}
 	}
 	return small.bytes, nil
+}
+
+func (r *NodeRestoreReconciler) parallelFetch(ctx context.Context, s RangeObjectStore, bucket, object, dst, expectedSHA string, totalBytes, maxBytes int64, cfg ParallelUploadConfig) ([]byte, error) {
+	if maxBytes > 0 && totalBytes > maxBytes {
+		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxBytes)
+	}
+
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	if err := f.Truncate(totalBytes); err != nil {
+		return nil, fmt.Errorf("pre-allocate %s: %w", dst, err)
+	}
+
+	numChunks := cfg.MaxConcurrency
+	if numChunks <= 0 {
+		numChunks = 8
+	}
+	minPart := cfg.MinPartSize
+	if minPart <= 0 {
+		minPart = 16 * 1024 * 1024
+	}
+	chunkSize := totalBytes / int64(numChunks)
+	if chunkSize < minPart {
+		chunkSize = minPart
+		numChunks = int(totalBytes / chunkSize)
+		if numChunks < 1 {
+			numChunks = 1
+		}
+	}
+
+	type chunkRange struct {
+		offset int64
+		size   int64
+	}
+	chunks := make([]chunkRange, numChunks)
+	for i := 0; i < numChunks; i++ {
+		offset := int64(i) * chunkSize
+		sz := chunkSize
+		if i == numChunks-1 {
+			sz = totalBytes - offset
+		}
+		chunks[i] = chunkRange{offset: offset, size: sz}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numChunks)
+	fetchCtx, cancelFetch := context.WithCancel(ctx)
+	defer cancelFetch()
+
+	for _, c := range chunks {
+		wg.Add(1)
+		go func(c chunkRange) {
+			defer wg.Done()
+			rc, err := s.GetRange(fetchCtx, bucket, object, c.offset, c.offset+c.size-1)
+			if err != nil {
+				cancelFetch()
+				errCh <- fmt.Errorf("fetch range %d-%d: %w", c.offset, c.offset+c.size-1, err)
+				return
+			}
+			defer rc.Close()
+
+			secWriter := io.NewOffsetWriter(f, c.offset)
+			lr := io.LimitReader(rc, c.size+1)
+			n, err := io.Copy(secWriter, lr)
+			if err != nil {
+				cancelFetch()
+				errCh <- fmt.Errorf("write range %d-%d: %w", c.offset, c.offset+c.size-1, err)
+				return
+			}
+			if n != c.size {
+				cancelFetch()
+				errCh <- fmt.Errorf("fetch range %d-%d: expected %d bytes, got %d", c.offset, c.offset+c.size-1, c.size, n)
+				return
+			}
+		}(c)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	if err := <-errCh; err != nil {
+		return nil, err
+	}
+
+	if expectedSHA != "" {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			return nil, fmt.Errorf("hash %s: %w", dst, err)
+		}
+		actualSHA := hex.EncodeToString(h.Sum(nil))
+		if actualSHA != expectedSHA {
+			return nil, fmt.Errorf("%s: sha256 %s != manifest %s (%d bytes)", object, actualSHA, expectedSHA, totalBytes)
+		}
+	}
+
+	return nil, nil
 }
 
 type boundedBuffer struct {

@@ -22,6 +22,7 @@ package psengine
 // dependency so the module dependency tree stays lean.
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5" //nolint:gosec // GCS integrity metadata is MD5; not used for security
 	"crypto/rand"
@@ -53,6 +54,19 @@ type ObjectStore interface {
 	Put(ctx context.Context, bucket, object string, r io.Reader) (*ObjectInfo, error)
 	Get(ctx context.Context, bucket, object string) (io.ReadCloser, error)
 	Delete(ctx context.Context, bucket, object string) error
+}
+
+// CompositeObjectStore is an ObjectStore that supports server-side composition
+// of multiple uploaded part objects into a single destination object.
+type CompositeObjectStore interface {
+	ObjectStore
+	Compose(ctx context.Context, bucket, destination string, sources []string) (*ObjectInfo, error)
+}
+
+// RangeObjectStore is an ObjectStore that supports byte-range GETs.
+type RangeObjectStore interface {
+	ObjectStore
+	GetRange(ctx context.Context, bucket, object string, start, end int64) (io.ReadCloser, error)
 }
 
 // GCSStore talks to the GCS JSON API using the GCE metadata server's default
@@ -150,17 +164,97 @@ func (g *GCSStore) Put(ctx context.Context, bucket, object string, r io.Reader) 
 
 // Get streams an object down.
 func (g *GCSStore) Get(ctx context.Context, bucket, object string) (io.ReadCloser, error) {
+	return g.GetRange(ctx, bucket, object, 0, -1)
+}
+
+// GetRange streams down a byte range [start, end] inclusive (-1 end indicates to EOF).
+func (g *GCSStore) GetRange(ctx context.Context, bucket, object string, start, end int64) (io.ReadCloser, error) {
 	u := fmt.Sprintf("%s/b/%s/o/%s?alt=media", g.APIBase, url.PathEscape(bucket), url.PathEscape(object))
-	resp, err := g.do(ctx, http.MethodGet, u, nil)
+	tok, err := g.bearer(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	wantStatus := http.StatusOK
+	if end >= 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+		wantStatus = http.StatusPartialContent
+	} else if start > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
+		wantStatus = http.StatusPartialContent
+	}
+	resp, err := g.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != wantStatus {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
-		return nil, fmt.Errorf("gcs get %s: HTTP %d: %s", object, resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("gcs get range %s: HTTP %d (want %d): %s", object, resp.StatusCode, wantStatus, strings.TrimSpace(string(b)))
 	}
 	return resp.Body, nil
+}
+
+// Compose combines up to 32 source objects into a single destination object
+// using the GCS compose API (POST /b/{bucket}/o/{destination}/compose).
+func (g *GCSStore) Compose(ctx context.Context, bucket, destination string, sources []string) (*ObjectInfo, error) {
+	u := fmt.Sprintf("%s/b/%s/o/%s/compose", g.APIBase, url.PathEscape(bucket), url.PathEscape(destination))
+	type sourceObj struct {
+		Name string `json:"name"`
+	}
+	type composeReq struct {
+		SourceObjects []sourceObj `json:"sourceObjects"`
+		Destination   struct {
+			ContentType string `json:"contentType,omitempty"`
+		} `json:"destination,omitempty"`
+	}
+	reqBody := composeReq{
+		SourceObjects: make([]sourceObj, len(sources)),
+	}
+	for i, s := range sources {
+		reqBody.SourceObjects[i] = sourceObj{Name: s}
+	}
+	reqBody.Destination.ContentType = "application/x-tar"
+
+	jsonBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("compose request encode: %w", err)
+	}
+
+	tok, err := g.bearer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(jsonBytes))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := g.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("gcs compose %s: HTTP %d: %s", destination, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var meta struct {
+		Size    string `json:"size"`
+		MD5Hash string `json:"md5Hash"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return nil, fmt.Errorf("gcs compose %s: decode response: %w", destination, err)
+	}
+	n, _ := strconv.ParseInt(meta.Size, 10, 64)
+	return &ObjectInfo{Bytes: n, MD5: meta.MD5Hash}, nil
 }
 
 // Delete removes an object (used by the probe; 404 is success).
@@ -247,4 +341,128 @@ func NewGCSProber(s ObjectStore) StorageProber {
 		}
 		return s.Delete(ctx, bucket, object)
 	}
+}
+
+// ParallelUploadConfig controls multi-stream chunked uploads.
+type ParallelUploadConfig struct {
+	MinPartSize    int64 // minimum part size (default: 16 MiB)
+	MaxConcurrency int   // maximum concurrent upload streams (default: 8)
+	ThresholdBytes int64 // minimum file size to trigger parallel multi-stream upload (default: 32 MiB)
+}
+
+// DefaultParallelUploadConfig provides concurrency defaults for parallel
+// object-storage uploads.
+var DefaultParallelUploadConfig = ParallelUploadConfig{
+	MinPartSize:    16 * 1024 * 1024, // 16 MiB
+	MaxConcurrency: 8,                // up to 8 parallel streams
+	ThresholdBytes: 32 * 1024 * 1024, // 32 MiB
+}
+
+// ParallelVerifiedPut uploads a reader in parallel multi-stream chunks using
+// composite objects if supported by the store, falling back to VerifiedPut.
+func ParallelVerifiedPut(ctx context.Context, s ObjectStore, bucket, object string, r io.ReaderAt, size int64) (int64, error) {
+	return ParallelVerifiedPutWithConfig(ctx, s, bucket, object, r, size, DefaultParallelUploadConfig)
+}
+
+// ParallelVerifiedPutWithConfig performs parallel composite upload using explicit configuration.
+func ParallelVerifiedPutWithConfig(ctx context.Context, s ObjectStore, bucket, object string, r io.ReaderAt, size int64, cfg ParallelUploadConfig) (int64, error) {
+	compStore, isComposite := s.(CompositeObjectStore)
+	if !isComposite || size < cfg.ThresholdBytes || cfg.MaxConcurrency <= 1 {
+		return VerifiedPut(ctx, s, bucket, object, io.NewSectionReader(r, 0, size))
+	}
+
+	minPartSize := cfg.MinPartSize
+	if minPartSize <= 0 {
+		minPartSize = DefaultParallelUploadConfig.MinPartSize
+	}
+	maxConcurrency := cfg.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = DefaultParallelUploadConfig.MaxConcurrency
+	}
+
+	numParts := int(size / minPartSize)
+	if numParts > maxConcurrency {
+		numParts = maxConcurrency
+	}
+	if numParts > 32 { // GCS compose limit
+		numParts = 32
+	}
+	if numParts <= 1 {
+		return VerifiedPut(ctx, s, bucket, object, io.NewSectionReader(r, 0, size))
+	}
+
+	type partInfo struct {
+		index  int
+		name   string
+		offset int64
+		bytes  int64
+	}
+
+	partSize := size / int64(numParts)
+	parts := make([]partInfo, numParts)
+	partNames := make([]string, numParts)
+	for i := 0; i < numParts; i++ {
+		offset := int64(i) * partSize
+		b := partSize
+		if i == numParts-1 {
+			b = size - offset
+		}
+		name := fmt.Sprintf("%s.part-%03d", object, i)
+		parts[i] = partInfo{index: i, name: name, offset: offset, bytes: b}
+		partNames[i] = name
+	}
+
+	uploadCtx, cancelUpload := context.WithCancel(ctx)
+	defer cancelUpload()
+
+	cleanupParts := func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for _, name := range partNames {
+			_ = s.Delete(cleanupCtx, bucket, name)
+		}
+	}
+
+	// Concurrently upload parts
+	errCh := make(chan error, numParts)
+	var wg sync.WaitGroup
+	for _, p := range parts {
+		wg.Add(1)
+		go func(p partInfo) {
+			defer wg.Done()
+			secReader := io.NewSectionReader(r, p.offset, p.bytes)
+			n, err := VerifiedPut(uploadCtx, s, bucket, p.name, secReader)
+			if err != nil {
+				cancelUpload()
+				errCh <- fmt.Errorf("upload part %d (%s): %w", p.index, p.name, err)
+				return
+			}
+			if n != p.bytes {
+				cancelUpload()
+				errCh <- fmt.Errorf("upload part %d (%s): uploaded %d bytes, want %d", p.index, p.name, n, p.bytes)
+				return
+			}
+		}(p)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	if err := <-errCh; err != nil {
+		cleanupParts()
+		return 0, err
+	}
+
+	// Compose the parts into the destination object
+	compInfo, err := compStore.Compose(ctx, bucket, object, partNames)
+	cleanupParts()
+	if err != nil {
+		return 0, fmt.Errorf("compose %s: %w", object, err)
+	}
+
+	if compInfo.Bytes != size {
+		return 0, fmt.Errorf("verify composed %s: expected %d bytes, got %d", object, size, compInfo.Bytes)
+	}
+
+	return size, nil
 }
