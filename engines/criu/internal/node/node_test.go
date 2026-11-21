@@ -76,6 +76,7 @@ func TestNode_DemoteAndRecoverOnContainerdRestart(t *testing.T) {
 		Client:       c,
 		NodeName:     "test-node",
 		SocketPath:   sockPath,
+		Inspector:    fakeReadyInspector(),
 		statSocketFn: getSocketInode,
 		installBundleFn: func() (string, error) {
 			bootstrapped++
@@ -424,6 +425,7 @@ func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
 			Client:     fc,
 			NodeName:   "test-node",
 			SocketPath: "/run/containerd/containerd.sock",
+			Inspector:  fakeReadyInspector(),
 			statSocketFn: func(string) (uint64, error) {
 				return 4242, nil
 			},
@@ -483,6 +485,7 @@ func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
 			Client:          fc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
+			Inspector:       fakeReadyInspector(),
 			statSocketFn:    func(string) (uint64, error) { return 4343, nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
 			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -534,6 +537,7 @@ func TestNode_TransientAPIErrorsRetryAndConvergeWithoutContainerdRestart(t *test
 			Client:          fc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
+			Inspector:       fakeReadyInspector(),
 			statSocketFn:    func(string) (uint64, error) { return 7777, nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
 			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -575,6 +579,7 @@ func TestNode_TransientAPIErrorsRetryAndConvergeWithoutContainerdRestart(t *test
 			Client:          fc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
+			Inspector:       fakeReadyInspector(),
 			lastSocketInode: 1000, // old pre-restart inode
 			statSocketFn:    func(string) (uint64, error) { return 2000, nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
@@ -635,6 +640,7 @@ func TestNode_DemotePatchFailureRetriedAndPoisonedInodeBlocked(t *testing.T) {
 		Client:          fc,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		ready:           true,
 		version:         "v3.19",
 		lastSocketInode: 8000, // containerd restarted while ready, then got poisoned on 9001
@@ -715,6 +721,7 @@ func TestNode_ConcurrentBootstrapCannotOverwriteDemotion(t *testing.T) {
 		Client:          c,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		statSocketFn:    func(string) (uint64, error) { return 3030, nil },
 		installBundleFn: func() (string, error) { return "v3.19", nil },
 		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -814,6 +821,7 @@ func TestNode_MidAnnotateNodeDemotePreservesUnreadyAndRetries(t *testing.T) {
 		Client:          hc,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		statSocketFn:    func(string) (uint64, error) { return 5050, nil },
 		installBundleFn: func() (string, error) { return "v3.19", nil },
 		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -897,6 +905,7 @@ func TestNode_CrossRestartDemotionAndZeroInodeDemotionNotClobbered(t *testing.T)
 			Client:          c,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
+			Inspector:       fakeReadyInspector(),
 			statSocketFn:    func(string) (uint64, error) { return currIno.Load(), nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
 			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -951,6 +960,7 @@ func TestNode_CrossRestartDemotionAndZeroInodeDemotionNotClobbered(t *testing.T)
 			Client:     c,
 			NodeName:   "test-node",
 			SocketPath: "/run/containerd/containerd.sock",
+			Inspector:  fakeReadyInspector(),
 			statSocketFn: func(string) (uint64, error) {
 				if failStat.Load() {
 					return 0, errors.New("socket temporarily unavailable")
@@ -1024,6 +1034,7 @@ func TestNode_CrossRestartDemotionAndZeroInodeDemotionNotClobbered(t *testing.T)
 			Client:          hc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
+			Inspector:       fakeReadyInspector(),
 			lastSocketInode: 1000, // prior pre-restart socket inode
 			statSocketFn: func(string) (uint64, error) {
 				if failStat.Load() {
@@ -1109,6 +1120,7 @@ func TestNode_UnsupportedContainerdVersionDoesNotReprobeWithoutRestart(t *testin
 		Client:     c,
 		NodeName:   "test-node",
 		SocketPath: "/run/containerd/containerd.sock",
+		Inspector:  fakeReadyInspector(),
 		statSocketFn: func(string) (uint64, error) {
 			return 5555, nil
 		},
@@ -1161,6 +1173,7 @@ func TestNode_ProbeReadinessReturnsFalseWhenVerifyCRIUFalse(t *testing.T) {
 		Client:     c,
 		NodeName:   "test-node",
 		SocketPath: "/run/containerd/containerd.sock",
+		Inspector:  fakeReadyInspector(),
 		statSocketFn: func(string) (uint64, error) {
 			return currentInode, nil
 		},
@@ -1544,6 +1557,7 @@ func TestNode_PersistentPatchFailureRetriesOnlyAnnotation(t *testing.T) {
 			Client:       fc,
 			NodeName:     "test-node",
 			SocketPath:   "/run/containerd/containerd.sock",
+			Inspector:    fakeReadyInspector(),
 			statSocketFn: func(string) (uint64, error) { return 4400, nil },
 			installBundleFn: func() (string, error) {
 				installCalls++
@@ -1628,6 +1642,7 @@ func TestNode_PersistentPatchFailureRetriesOnlyAnnotation(t *testing.T) {
 			Client:       fc,
 			NodeName:     "test-node",
 			SocketPath:   "/run/containerd/containerd.sock",
+			Inspector:    fakeReadyInspector(),
 			statSocketFn: func(string) (uint64, error) { return 4500, nil },
 		}
 
@@ -1688,6 +1703,7 @@ func TestNode_PersistentPatchFailureRetriesOnlyAnnotation(t *testing.T) {
 			Client:          fc,
 			NodeName:        "test-node",
 			SocketPath:      "/run/containerd/containerd.sock",
+			Inspector:       fakeReadyInspector(),
 			statSocketFn:    func(string) (uint64, error) { return 4600, nil },
 			installBundleFn: func() (string, error) { return "v3.19", nil },
 			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -1773,6 +1789,7 @@ func TestNode_AnnotateMuSerializesOverlappingPatchCalls(t *testing.T) {
 		Client:          sc,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		statSocketFn:    func(string) (uint64, error) { return 5151, nil },
 		installBundleFn: func() (string, error) { return "v3.19", nil },
 		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -1827,6 +1844,7 @@ func TestNode_MidVerifyCRIUPoisonReturnsCachedCRIUError(t *testing.T) {
 		Client:          c,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		statSocketFn:    func(string) (uint64, error) { return 3131, nil },
 		installBundleFn: func() (string, error) { return "v3.19", nil },
 		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -1901,6 +1919,7 @@ func TestNode_APICallsCarryBoundedTimeout(t *testing.T) {
 		Client:          dc,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		statSocketFn:    func(string) (uint64, error) { return 6262, nil },
 		installBundleFn: func() (string, error) { return "v3.19", nil },
 		execHostFn: func(context.Context, []string, string, ...string) (string, error) {
@@ -1958,6 +1977,7 @@ func TestPSEngineCheckpoint_SamplesSocketInodeBeforeKubeletCall(t *testing.T) {
 		Client:          c,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		version:         "v3.19",
 		ready:           true,
 		lastSocketInode: 7001,
@@ -2004,6 +2024,7 @@ func TestNode_CancelledBootstrapDoesNotCacheSyntheticVerdict(t *testing.T) {
 		Client:          c,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		statSocketFn:    func(string) (uint64, error) { return 8181, nil },
 		installBundleFn: func() (string, error) { return "v3.19", nil },
 		execHostFn: func(ctx context.Context, _ []string, _ string, _ ...string) (string, error) {
@@ -2053,6 +2074,7 @@ func TestNode_StalePreRestartPendingDemoteDoesNotBlockNewInodePendingVerdict(t *
 		Client:          fc,
 		NodeName:        "test-node",
 		SocketPath:      "/run/containerd/containerd.sock",
+		Inspector:       fakeReadyInspector(),
 		ready:           true,
 		version:         "v3.19",
 		lastSocketInode: 1000,

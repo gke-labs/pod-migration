@@ -112,6 +112,7 @@ func main() {
 	if err := (&psengine.NodeSnapshotReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
+		SourceNodeFacts: nd.PSEngineSourceNodeFacts,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node snapshot reconciler")
 		os.Exit(1)

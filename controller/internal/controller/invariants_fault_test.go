@@ -46,9 +46,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -235,8 +237,9 @@ func createTestNamespace(t *testing.T, ctx context.Context, k8sClient client.Cli
 }
 
 // TestT1_EnvtestFaultInjectionMatrix is the Tier 1 (T1) per-merge fault-injection suite
-// (scenarios S1-S8 plus the RestoreOrders I2 wiring check, covering invariants I1-I7, I9,
-// I11 and I12) run against a real kube-apiserver + etcd (envtest) under --invariant-mode=strict.
+// (scenarios S1-S9 plus the RestoreOrders I2 wiring check, covering invariants I1-I7, I9,
+// I11 and I12, and the cancel of a checkpoint that timed out, #106) run against a real
+// kube-apiserver + etcd (envtest) under --invariant-mode=strict.
 func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS not set; skipping envtest T1 fault-injection matrix")
@@ -244,7 +247,7 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{"../../config/crd/bases"},
-		CRDs:                  buildDynamicPodSnapshotCRDs(),
+		CRDs:                  append(buildDynamicPodSnapshotCRDs(), buildDynamicPodSnapshotCRDsForGroup(engine.CRIUAPIGroup)...),
 		ErrorIfCRDPathMissing: true,
 	}
 
@@ -1843,6 +1846,410 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		condActive := meta.FindStatusCondition(gotActive.Status.Conditions, "Ready")
 		if condActive == nil || condActive.Status != metav1.ConditionFalse || condActive.Reason != invariants.EventReasonInvariantViolation || !strings.Contains(condActive.Message, "[I12:RestoreOutcomeConfirmed]") || !strings.Contains(condActive.Message, "NonSucceededJobMarkedRestored") {
 			t.Fatalf("expected Ready=False condition with [I12:RestoreOutcomeConfirmed] NonSucceededJobMarkedRestored, got %+v", condActive)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// Scenario 9: Timeout Mid-Checkpoint, Engine Cancel (#106, contract C3/C4/C9)
+	// A CRIU-engine job times out in Snapshotting while its checkpoint is still
+	// in progress. Driven through Reconcile with the real snapshot provider for
+	// the CRIU API group:
+	//   Leg 1: The timeout fails the job and deletes the trigger, and the source
+	//          stays fenced, not evicted, while CancelRequested (non-terminal)
+	//          is reported. Cancelled (handled as Failed) settles it: the source
+	//          goes back into service, unchanged. Only the engine's
+	//          triggered-by label finds the snapshot here. A late Ready after
+	//          that neither evicts it nor restores anything; a late stop is
+	//          fenced again and cold-evicted.
+	//   Leg 2: A fresh CheckpointTimedOut doesn't extend the deadline, and it
+	//          never settles: the source stays fenced through the settle wait,
+	//          and then is kept fenced and cold-evicted.
+	//   Leg 3: A Ready that arrives during the settle wait (a trigger deletion
+	//          the agent missed) is a completed checkpoint: the source is kept
+	//          fenced and cold-evicted, and the job stays Failed.
+	// -------------------------------------------------------------------------
+	t.Run("S9_TimeoutMidCheckpointCancel_C9", func(t *testing.T) {
+		ns := createTestNamespace(t, ctx, k8sClient, "t1-s9-cancel")
+		recorder := record.NewFakeRecorder(256)
+		invEngine := invariants.NewEngine(invariants.ModeStrict, recorder)
+		policy, err := eligibility.ParseRuntimeClassPolicy("gvisor,@default,runc")
+		if err != nil {
+			t.Fatalf("ParseRuntimeClassPolicy: %v", err)
+		}
+		registry, err := engine.NewDefaultRegistry(k8sClient, scheme, policy, engine.WithCRIUAPIGroup(engine.CRIUAPIGroup))
+		if err != nil {
+			t.Fatalf("NewDefaultRegistry: %v", err)
+		}
+		const migrationTimeout = time.Minute
+		pmjRec := &PodMigrationJobReconciler{
+			Client:                  k8sClient,
+			APIReader:               k8sClient,
+			Scheme:                  scheme,
+			Recorder:                recorder,
+			InvariantEngine:         invEngine,
+			Engines:                 registry,
+			DefaultMigrationTimeout: migrationTimeout,
+		}
+		group := engine.CRIUAPIGroup
+		restoreAnn := snapshot.RestoreAnnotation(group)
+		violationsBefore := totalInvariantViolations()
+
+		reconcile := func(t *testing.T, name string) {
+			t.Helper()
+			if _, err := pmjRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}}); err != nil {
+				t.Fatalf("Reconcile(%s): %v", name, err)
+			}
+		}
+		getJob := func(t *testing.T, name string) *pmv1alpha1.PodMigrationJob {
+			t.Helper()
+			job := &pmv1alpha1.PodMigrationJob{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, job); err != nil {
+				t.Fatalf("get job %s: %v", name, err)
+			}
+			return job
+		}
+		// sourceAlive returns the source, failing if it was evicted or deleted.
+		sourceAlive := func(t *testing.T, name, when string) *corev1.Pod {
+			t.Helper()
+			pod := &corev1.Pod{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, pod); err != nil {
+				t.Fatalf("%s: the source must keep running, but getting it failed: %v", when, err)
+			}
+			if pod.DeletionTimestamp != nil {
+				t.Fatalf("%s: the source must keep running, but it's being deleted", when)
+			}
+			if pod.Status.Phase != corev1.PodRunning {
+				t.Fatalf("%s: source phase = %s, want Running", when, pod.Status.Phase)
+			}
+			return pod
+		}
+		sourceEvicted := func(t *testing.T, name, when string) {
+			t.Helper()
+			pod := &corev1.Pod{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, pod)
+			if err == nil && pod.DeletionTimestamp == nil {
+				t.Fatalf("%s: want the source evicted, but it's still running", when)
+			}
+			if err != nil && !apierrors.IsNotFound(err) {
+				t.Fatalf("%s: get source: %v", when, err)
+			}
+		}
+		fenceCond := func(t *testing.T, job *pmv1alpha1.PodMigrationJob) *metav1.Condition {
+			t.Helper()
+			cond := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced)
+			if cond == nil {
+				t.Fatalf("job %s has no %s condition", job.Name, ConditionSourceFenced)
+			}
+			return cond
+		}
+		// stillFencedAndWaiting: the job is Failed, the source is fenced and
+		// running, and the controller hasn't decided the fence yet.
+		stillFencedAndWaiting := func(t *testing.T, jobName, podName, when string) {
+			t.Helper()
+			job := getJob(t, jobName)
+			if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+				t.Fatalf("%s: job phase = %s, want Failed", when, job.Status.Phase)
+			}
+			if cond := fenceCond(t, job); cond.Status != metav1.ConditionTrue || cond.Reason != util.ReasonFenced {
+				t.Fatalf("%s: SourceFenced = %s/%s (%s), want True/%s while the checkpoint hasn't settled", when, cond.Status, cond.Reason, cond.Message, util.ReasonFenced)
+			}
+			pod := sourceAlive(t, podName, when)
+			if pod.Labels[util.LabelFenced] != "true" {
+				t.Fatalf("%s: the source lost its fence label before the checkpoint settled: %v", when, pod.Labels)
+			}
+		}
+		noRestore := func(t *testing.T, jobName, when string) {
+			t.Helper()
+			job := getJob(t, jobName)
+			if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
+				t.Fatalf("%s: job phase = %s, want Failed", when, job.Status.Phase)
+			}
+			if job.Status.EvictingStartTime != nil || job.Status.RestoredPodName != "" || job.Status.Consumed {
+				t.Fatalf("%s: a job that gave up must not move toward a restore: evictingStart=%v restoredPod=%q consumed=%t",
+					when, job.Status.EvictingStartTime, job.Status.RestoredPodName, job.Status.Consumed)
+			}
+		}
+		setSnapshotConditions := func(t *testing.T, snapName string, conds ...map[string]interface{}) {
+			t.Helper()
+			snap := &unstructured.Unstructured{}
+			snap.SetGroupVersionKind(snapshot.PodSnapshotGVK(group))
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: snapName}, snap); err != nil {
+				t.Fatalf("get snapshot %s: %v", snapName, err)
+			}
+			list := make([]interface{}, 0, len(conds))
+			for _, c := range conds {
+				list = append(list, c)
+			}
+			snap.Object["status"] = map[string]interface{}{"conditions": list}
+			if err := k8sClient.Status().Update(ctx, snap); err != nil {
+				t.Fatalf("update snapshot %s status: %v", snapName, err)
+			}
+		}
+		cond := func(cType, status, reason string, at time.Time) map[string]interface{} {
+			return map[string]interface{}{
+				"type": cType, "status": status, "reason": reason,
+				"lastTransitionTime": at.UTC().Format(time.RFC3339),
+			}
+		}
+
+		// stalledInProgress is a checkpoint whose last progress is older than
+		// the migration timeout.
+		stalledInProgress := func() []map[string]interface{} {
+			return []map[string]interface{}{cond("Checkpoint", "False", "InProgress", time.Now().Add(-5*migrationTimeout))}
+		}
+
+		// timeOutMidCheckpoint fences a running source, creates the trigger,
+		// starts a checkpoint that stalls with the snapshot conditions stall,
+		// and passes the migration deadline. It checks that the job failed,
+		// the trigger is gone and the source still runs, fenced, and returns
+		// the snapshot name.
+		timeOutMidCheckpoint := func(t *testing.T, leg string, stall []map[string]interface{}) (jobName, podName, snapName string) {
+			t.Helper()
+			isController := true
+			podName = "s9-source-" + leg
+			jobName = "s9-pmj-" + leg
+			snapName = "s9-snap-" + leg
+			source := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: ns,
+					Name:      podName,
+					Labels:    map[string]string{"app": "s9-" + leg},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "s9-rs-" + leg,
+						UID: types.UID("s9-rs-uid-" + leg), Controller: &isController,
+					}},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+			}
+			if err := k8sClient.Create(ctx, source); err != nil {
+				t.Fatalf("create source: %v", err)
+			}
+			source.Status = corev1.PodStatus{
+				Phase:      corev1.PodRunning,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now()}},
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name: "app", Image: "busybox", ImageID: "busybox", ContainerID: "containerd://s9-" + leg, Ready: true,
+					State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+				}},
+			}
+			if err := k8sClient.Status().Update(ctx, source); err != nil {
+				t.Fatalf("update source status: %v", err)
+			}
+
+			job := &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   ns,
+					Name:        jobName,
+					Annotations: map[string]string{engine.AnnotationEngine: engine.CRIUName},
+				},
+				Spec: pmv1alpha1.PodMigrationJobSpec{
+					PodRef:       corev1.LocalObjectReference{Name: podName},
+					TargetPodUID: string(source.UID),
+				},
+			}
+			if err := k8sClient.Create(ctx, job); err != nil {
+				t.Fatalf("create job: %v", err)
+			}
+			started := metav1.Now()
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
+			job.Status.SnapshottingStartTime = &started
+			if err := k8sClient.Status().Update(ctx, job); err != nil {
+				t.Fatalf("update job status: %v", err)
+			}
+
+			// The controller fences the source and creates the trigger.
+			triggerName := util.FormatPSMTName(podName, string(source.UID))
+			trigger := &unstructured.Unstructured{}
+			trigger.SetGroupVersionKind(snapshot.ManualTriggerGVK(group))
+			for i := 0; ; i++ {
+				reconcile(t, jobName)
+				err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: triggerName}, trigger)
+				if err == nil {
+					break
+				}
+				if !apierrors.IsNotFound(err) || i == 4 {
+					t.Fatalf("trigger %s/%s in group %s wasn't created: %v", ns, triggerName, group, err)
+				}
+			}
+			pod := sourceAlive(t, podName, "after the trigger")
+			if pod.Labels[util.LabelFenced] != "true" {
+				t.Fatalf("source isn't fenced before its checkpoint: %v", pod.Labels)
+			}
+			if v, ok := pod.Annotations[restoreAnn]; !ok || v != "" {
+				t.Fatalf("source lacks the cold-start bypass %s=\"\" before its checkpoint: %v", restoreAnn, pod.Annotations)
+			}
+
+			// The engine starts the checkpoint, which then stalls.
+			trigger.Object["status"] = map[string]interface{}{
+				"snapshotCreated": map[string]interface{}{"name": snapName},
+			}
+			if err := k8sClient.Status().Update(ctx, trigger); err != nil {
+				t.Fatalf("update trigger status: %v", err)
+			}
+			snap := &unstructured.Unstructured{}
+			snap.SetGroupVersionKind(snapshot.PodSnapshotGVK(group))
+			snap.SetNamespace(ns)
+			snap.SetName(snapName)
+			snap.SetLabels(map[string]string{"gke-pod-snapshot-triggered-by": triggerName})
+			if err := k8sClient.Create(ctx, snap); err != nil {
+				t.Fatalf("create snapshot: %v", err)
+			}
+			setSnapshotConditions(t, snapName, stall...)
+			reconcile(t, jobName)
+			if got := getJob(t, jobName); got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || got.Status.SnapshotRef != snapName {
+				t.Fatalf("before the deadline: job phase=%s snapshotRef=%q, want Snapshotting/%s", got.Status.Phase, got.Status.SnapshotRef, snapName)
+			}
+
+			// The migration deadline passes mid-checkpoint.
+			got := getJob(t, jobName)
+			past := metav1.NewTime(time.Now().Add(-2 * migrationTimeout))
+			got.Status.SnapshottingStartTime = &past
+			if err := k8sClient.Status().Update(ctx, got); err != nil {
+				t.Fatalf("backdate SnapshottingStartTime: %v", err)
+			}
+			reconcile(t, jobName)
+
+			got = getJob(t, jobName)
+			ready := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+			if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed || ready == nil || ready.Reason != "Timeout" {
+				t.Fatalf("after the deadline: phase=%s Ready=%+v, want Failed/Timeout", got.Status.Phase, ready)
+			}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: triggerName}, trigger); !apierrors.IsNotFound(err) {
+				t.Fatalf("after the deadline: the trigger must be deleted to cancel the checkpoint, got err=%v", err)
+			}
+			stillFencedAndWaiting(t, jobName, podName, "right after the timeout")
+			// The next pass waits for the checkpoint to settle.
+			reconcile(t, jobName)
+			stillFencedAndWaiting(t, jobName, podName, "checkpoint still in progress after the timeout")
+			return jobName, podName, snapName
+		}
+
+		t.Run("Leg1_CancelConfirmed_SourceBackInService", func(t *testing.T) {
+			jobName, podName, snapName := timeOutMidCheckpoint(t, "cancel", stalledInProgress())
+
+			// From here on, only the engine's triggered-by label finds the
+			// snapshot: the trigger is gone, and the job doesn't name it.
+			job := getJob(t, jobName)
+			job.Status.SnapshotRef = ""
+			if err := k8sClient.Status().Update(ctx, job); err != nil {
+				t.Fatalf("clear SnapshotRef: %v", err)
+			}
+
+			// The engine controller sees the trigger deleted and asks the
+			// node agent to cancel. CancelRequested isn't terminal (C3).
+			setSnapshotConditions(t, snapName, cond("Checkpoint", "Unknown", "CancelRequested", time.Now()))
+			for i := 0; i < 2; i++ {
+				reconcile(t, jobName)
+				stillFencedAndWaiting(t, jobName, podName, "CancelRequested")
+			}
+
+			// The agent thawed the source and confirms: Cancelled, handled as
+			// Failed. The checkpoint settled without completing, and the source
+			// never stopped, so it goes back into service.
+			setSnapshotConditions(t, snapName,
+				cond("Checkpoint", "False", "Cancelled", time.Now()),
+				cond("Ready", "False", "Cancelled", time.Now()))
+			reconcile(t, jobName)
+			job = getJob(t, jobName)
+			if c := fenceCond(t, job); c.Status != metav1.ConditionFalse || c.Reason != util.ReasonUnfenced {
+				t.Fatalf("Cancelled: SourceFenced = %s/%s (%s), want False/%s", c.Status, c.Reason, c.Message, util.ReasonUnfenced)
+			}
+			pod := sourceAlive(t, podName, "Cancelled")
+			if _, ok := pod.Labels[util.LabelFenced]; ok {
+				t.Fatalf("Cancelled: the source is still labeled fenced: %v", pod.Labels)
+			}
+			noRestore(t, jobName, "Cancelled")
+
+			// A defensive check: the agent never overwrites an outcome it
+			// recorded (C9), but a late Ready on the same snapshot must
+			// change nothing. The job gave up, so there's no eviction and no
+			// restore, and the source keeps its cold-start bypass, so a
+			// restart can't restore from it.
+			setSnapshotConditions(t, snapName,
+				cond("Checkpoint", "True", "Succeeded", time.Now()),
+				cond("Ready", "True", "Succeeded", time.Now()))
+			for i := 0; i < 2; i++ {
+				reconcile(t, jobName)
+			}
+			job = getJob(t, jobName)
+			if c := fenceCond(t, job); c.Status != metav1.ConditionFalse || c.Reason != util.ReasonUnfenced {
+				t.Fatalf("late Ready: SourceFenced = %s/%s (%s), want False/%s", c.Status, c.Reason, c.Message, util.ReasonUnfenced)
+			}
+			pod = sourceAlive(t, podName, "late Ready")
+			if _, ok := pod.Labels[util.LabelFenced]; ok {
+				t.Fatalf("late Ready: the source was fenced again: %v", pod.Labels)
+			}
+			if v, ok := pod.Annotations[restoreAnn]; !ok || v != "" {
+				t.Fatalf("late Ready: the source must keep the cold-start bypass %s=\"\": %v", restoreAnn, pod.Annotations)
+			}
+			noRestore(t, jobName, "late Ready")
+
+			// The late-stop watch: if the source stops after it went back
+			// into service (C4, #106), it's fenced again and cold-evicted.
+			pod.Status.ContainerStatuses[0].RestartCount = 1
+			if err := k8sClient.Status().Update(ctx, pod); err != nil {
+				t.Fatalf("restart the source's container: %v", err)
+			}
+			reconcile(t, jobName)
+			job = getJob(t, jobName)
+			if c := fenceCond(t, job); c.Status != metav1.ConditionTrue || c.Reason != util.ReasonFenceKept {
+				t.Fatalf("late stop: SourceFenced = %s/%s (%s), want True/%s", c.Status, c.Reason, c.Message, util.ReasonFenceKept)
+			}
+			sourceEvicted(t, podName, "late stop")
+			noRestore(t, jobName, "late stop")
+		})
+
+		t.Run("Leg2_CheckpointTimedOut_KeptFencedThenColdEvicted", func(t *testing.T) {
+			// The agent froze the source and its kubelet call timed out just
+			// now: the dump may still run, and the source may stay frozen. It
+			// never settles (C9). The fresh CheckpointTimedOut isn't progress,
+			// so it doesn't extend the deadline either.
+			jobName, podName, _ := timeOutMidCheckpoint(t, "timedout", []map[string]interface{}{
+				cond("SourceFrozen", "True", "Frozen", time.Now().Add(-5*migrationTimeout)),
+				cond("Checkpoint", "Unknown", "CheckpointTimedOut", time.Now()),
+			})
+			for i := 0; i < 2; i++ {
+				reconcile(t, jobName)
+				stillFencedAndWaiting(t, jobName, podName, "CheckpointTimedOut within the settle wait")
+			}
+
+			// Past the settle wait, the source is kept fenced and cold-evicted,
+			// never put back.
+			job := getJob(t, jobName)
+			concluded := metav1.NewTime(time.Now().Add(-fenceSettleTimeout - time.Second))
+			job.Status.CompletionTime = &concluded
+			if err := k8sClient.Status().Update(ctx, job); err != nil {
+				t.Fatalf("backdate CompletionTime: %v", err)
+			}
+			reconcile(t, jobName)
+			job = getJob(t, jobName)
+			if c := fenceCond(t, job); c.Status != metav1.ConditionTrue || c.Reason != util.ReasonFenceKept {
+				t.Fatalf("CheckpointTimedOut past the settle wait: SourceFenced = %s/%s (%s), want True/%s", c.Status, c.Reason, c.Message, util.ReasonFenceKept)
+			}
+			sourceEvicted(t, podName, "CheckpointTimedOut past the settle wait")
+			noRestore(t, jobName, "CheckpointTimedOut past the settle wait")
+		})
+
+		t.Run("Leg3_ReadyDuringSettleWait_KeptFencedAndColdEvicted", func(t *testing.T) {
+			jobName, podName, snapName := timeOutMidCheckpoint(t, "lateready", stalledInProgress())
+
+			// The agent missed the trigger deletion and committed: the
+			// checkpoint completed after the job gave up. The engine may stop
+			// the source after it, so it can't go back into service.
+			setSnapshotConditions(t, snapName,
+				cond("Checkpoint", "True", "Succeeded", time.Now()),
+				cond("Ready", "True", "Succeeded", time.Now()))
+			reconcile(t, jobName)
+			job := getJob(t, jobName)
+			if c := fenceCond(t, job); c.Status != metav1.ConditionTrue || c.Reason != util.ReasonFenceKept {
+				t.Fatalf("late Ready in the settle wait: SourceFenced = %s/%s (%s), want True/%s", c.Status, c.Reason, c.Message, util.ReasonFenceKept)
+			}
+			sourceEvicted(t, podName, "late Ready in the settle wait")
+			noRestore(t, jobName, "late Ready in the settle wait")
+		})
+
+		if delta := totalInvariantViolations() - violationsBefore; delta != 0 {
+			t.Fatalf("expected 0 invariant violations across S9 in strict mode, got %v", delta)
 		}
 	})
 

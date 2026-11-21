@@ -8,6 +8,7 @@ require (
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.2.1
+	github.com/pelletier/go-toml/v2 v2.2.3
 	github.com/prometheus/client_golang v1.23.2
 	k8s.io/api v0.35.0
 	k8s.io/apimachinery v0.35.0

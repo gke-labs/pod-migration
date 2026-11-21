@@ -92,6 +92,7 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
   - `podmigrationjobs` (`get` in `podmigration.gke.io`): Single live API `GET` in `RestoreInjector.Handle` (after in-memory pod-shape filtering) to confirm `pod-migration.gke.io/engine: criu` on the assigned `PodMigrationJob` before injecting the holder wrapper (`list`/`watch` are not granted).
   - `customresourcedefinitions` (`get` in `apiextensions.k8s.io`): Startup `VerifyCRDOwnership` preflight check for the configured `--api-group`.
   - `podsnapshotstorageconfigs`, `podsnapshotpolicies`, `podsnapshotmanualtriggers`, `podsnapshots` (`get`, `list`, `watch`, `create`) and `*/status` (`get`, `update`, `patch`) in `criu.podmigration.gke.io` (by default, #135).
+  - `podsnapshots` (`update`, `patch`) in `criu.podmigration.gke.io`: adds and removes the `pod-migrate.io/archive-cleanup` finalizer (#107).
   - `pods`, `nodes` (`get`, `list`, `watch`) and `events` (`create`, `patch`).
 - **Network Ingress & Health Probes**: The agent listens on host TCP port `:8091` (`hostNetwork: true`) for kubelet liveness (`/healthz`) and readiness (`/readyz`) probes. It does not expose other network services; all other traffic is outbound to the Kubernetes API server, containerd unix sockets, or cloud storage APIs.
 - **Resource Constraints**: Default resource requests (`100m` CPU, `128Mi` memory) and memory limits (`512Mi`) prevent memory exhaustion from runaway agent operations.
@@ -172,6 +173,7 @@ To prevent unauthorized access or tampering with checkpoint archives:
 2. **Bucket Permissions & Isolation**:
    - Checkpointing nodes require `roles/storage.objectCreator` and `roles/storage.objectViewer`.
    - Restoring nodes require `roles/storage.objectViewer`.
+   - The engine controller (`cmd/engine`) needs `storage.objects.create`, `storage.objects.get` and `storage.objects.delete`, for its storage probe and for archive garbage collection (#107). Without delete, archives are left behind, reported only by `ArchiveDeleteFailed` and `ArchiveDeleteAbandoned` events.
    - Avoid Default Compute Engine SA: In GKE, ensure nodes do not use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`), which often carries broad Project Editor permissions.
    - Enable Uniform Bucket-Level Access (UBLA) on the checkpoint GCS bucket to prevent ACL-based permission leakage.
 
@@ -185,6 +187,8 @@ To prevent unauthorized access or tampering with checkpoint archives:
 ### Lifecycle Management & Retention Policy
 
 Checkpoint archives are transient migration artifacts. They should not persist longer than needed to complete the migration.
+
+The engine deletes a job's archive when the controller deletes its `PodSnapshot` (#107, see "Archive garbage collection" in `engines/criu/README.md`). Keep the lifecycle rule as a backstop for archives it leaves behind (`ArchiveDeleteAbandoned`, and orphans until the orphan sweep lands).
 
 - Configure GCS Object Lifecycle Management rules on the bucket:
   ```json
