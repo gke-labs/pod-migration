@@ -463,10 +463,17 @@ func TestReconcilers_WatchCRIUAPIGroupManagedAndSnapshotObjects(t *testing.T) {
 		_, err := getCRIUPSP()
 		return err == nil
 	})
+	// The PSP is created before the reconcile's final status write lands, so
+	// wait for Ready=True first.  Otherwise pmRV can be read before that write
+	// and the RV check below fails for a reason that has nothing to do with
+	// the watch.
 	var curPM pmv1alpha1.PodMigration
-	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: "mig"}, &curPM); err != nil {
-		t.Fatalf("Get PodMigration: %v", err)
-	}
+	waitFor("PodMigration Ready=True before reading its resourceVersion", func() bool {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: "mig"}, &curPM); err != nil {
+			return false
+		}
+		return meta.IsStatusConditionTrue(curPM.Status.Conditions, "Ready")
+	})
 	pmRV := curPM.ResourceVersion
 
 	psp, err := getCRIUPSP()
