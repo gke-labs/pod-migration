@@ -448,6 +448,84 @@ webhooks:
         resources: ["pods/status"]
         scope: Namespaced
 ---
+# Restore orders on existing pods (C10 R1, C5, #233). mpodgate handles a
+# restore order only when a pod is created. This policy covers the rest of an
+# opted-in pod's life: only the controller sets, changes or removes a
+# <group>/ps-name annotation on it, for any engine's group.
+#
+# It is an admission policy, not a webhook: the API server evaluates it
+# itself, so it doesn't depend on the controller being up, and a controller
+# rollout can't block pod updates. matchConditions skip every update that
+# leaves the restore orders as they are, so labels (including removing
+# pod-migration.gke.io/enabled to opt out), other annotations, the spec and
+# the kubelet's status writes go through as before.
+#
+# Scope: pods that have the opt-in label before or after the update, like
+# mpodgate. A pod without it isn't migrated, and a restore order on it is a
+# restore outside a migration, which the engine authorizes (C10 R1, #55).
+#
+# The validation below names the controller's service account, namespace
+# included. An install that renames the namespace or the service account must
+# change it there too, or the controller itself is denied.
+#
+# To change a restore order by hand in an emergency, set the binding's
+# validationActions to ["Audit"], and back to ["Deny"] afterwards (see the
+# README). While it is Audit, no opted-in pod in the cluster is protected.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: pod-migration-restore-order
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        # A write to pods/status can change annotations too.
+        resources: ["pods", "pods/status"]
+        scope: Namespaced
+    objectSelector:
+      matchLabels:
+        pod-migration.gke.io/enabled: "true"
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - pod-migration-system
+            - kube-system
+  matchConditions:
+    # True when a <group>/ps-name annotation is added, changed or removed.
+    - name: restore-order-changed
+      expression: >-
+        (has(object.metadata.annotations) && object.metadata.annotations.exists(k,
+        k.endsWith('/ps-name') && (!has(oldObject.metadata.annotations) ||
+        !(k in oldObject.metadata.annotations) ||
+        oldObject.metadata.annotations[k] != object.metadata.annotations[k])))
+        ||
+        (has(oldObject.metadata.annotations) && oldObject.metadata.annotations.exists(k,
+        k.endsWith('/ps-name') && (!has(object.metadata.annotations) ||
+        !(k in object.metadata.annotations))))
+  validations:
+    # The controller's service account: the namespace and name of the
+    # ServiceAccount in this file.
+    - expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:pod-migration-system:pod-migration-controller'
+      message: >-
+        only the Pod Migration controller may set, change or remove a restore
+        order (<group>/ps-name) on an existing pod that is opted into migration
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: pod-migration-restore-order
+spec:
+  policyName: pod-migration-restore-order
+  validationActions: ["Deny"]
+---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

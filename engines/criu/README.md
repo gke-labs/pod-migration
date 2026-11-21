@@ -195,6 +195,20 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      (`node.AdaptSpec`), restores the process tree as a sibling `runc` container
      joining the holder's network/IPC/UTS namespaces, and stamps
      `pod-migrate.io/psengine-restore: restored` (or `failed`).
+     On an existing pod, only the agent may write this annotation, and only
+     once: the `pod-migrate-psengine-restore-status`
+     `ValidatingAdmissionPolicy` in `deploy/deploy.yaml` denies every other
+     write, change or removal (#233). To edit it by hand, set the
+     `validationActions` of the `ValidatingAdmissionPolicyBinding` of the
+     same name to `["Audit"]`, and back to `["Deny"]` afterwards; while it
+     is `Audit`, no pod in the cluster is protected. Don't apply
+     `deploy/deploy.yaml` again for this, which would also re-apply the
+     agent DaemonSet and the engine Deployment. See
+     [Changing a Restore Order by Hand](../../README.md#changing-a-restore-order-by-hand).
+     The policy names the agent's identity as a literal
+     (`system:serviceaccount:pod-migration-criu-system:pod-migrate-agent`):
+     an install with another namespace or service account name must change
+     it in the policy too, or the agent's own write is denied.
 3. **`cmd/holder` (static scratch binary):**
    - Seeded into replacement pods via an `initContainer` (`/holder seed`).
    - Wraps the replacement container's entrypoint (`/holder wrap`): reads
@@ -324,6 +338,10 @@ they start cold instead of being restored; also delete the
   - Single migration per pod instance: migrating an already-restored CRIU pod
     or holder-injected replacement is refused so the orchestrator falls back
     to a clean cold start without checkpointing the holder wrapper ([#121](https://github.com/gke-labs/pod-migration/issues/121)).
+  - The orchestrator checks the pod-level limits above itself before it starts
+    a migration (`CRIU.Eligible` in `controller/internal/engine/criu.go`):
+    a pod outside them is evicted without a migration, instead of going
+    through a `429` and a refused trigger first (#233).
 
 ## What Installing the Engine Changes on a Node
 
