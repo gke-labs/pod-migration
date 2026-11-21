@@ -86,7 +86,11 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      the trigger stays unanswered and is looked at again every 30 s, so its
      job waits until its migration timeout and falls back to a cold
      eviction. A work order from before the trigger UID was recorded is
-     answered as before in that case.
+     answered as before in that case. The trigger records why: a
+     `WorkOrderInUse` Warning event naming the work order and the job or
+     pod that uses it. Look for it with
+     `kubectl describe podsnapshotmanualtrigger <name>` when a job timed out
+     in `Snapshotting`.
    - Serves `/psengine-restore-inject` to speculatively inject the `holder`
      initContainer and command wrapper into CRIU-routed gated replacement pods
      at `CREATE` (checking single-container `runc`/default pod shape in memory
@@ -389,7 +393,14 @@ labelled `PodSnapshot`s whose job is gone (`--orphan-snapshot-sweep-interval`,
   outcome: the engine controller deletes that one first (#262). So a bucket
   delete that keeps failing holds up the next migration of the same pod until
   the give-up bound, and that job may time out and fall back to a cold
-  eviction.
+  eviction. While it waits, the trigger has a `WaitingForWorkOrderDeletion`
+  Normal event naming the work order.
+- Each of these waits is recorded once per trigger, not on every 2 s or
+  30 s look, and again every 10 min while it goes on, so it outlives the
+  apiserver's event TTL (`--event-ttl`, 1 h by default). A different work
+  order or user, or a trigger created again, records it again at once. The
+  engine remembers what it recorded in memory, so a restart records a wait
+  once more.
 - The engine controller needs `update`, `patch` and `delete` on `podsnapshots`,
   and `list` on `podmigrationjobs` for the in-use check (in
   `deploy/deploy.yaml`), and `storage.objects.delete` on the bucket, which
