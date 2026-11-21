@@ -65,6 +65,11 @@ const (
 	ReasonOrphanSnapshotDeleted = "OrphanSnapshotDeleted"
 
 	orphanSweepPageSize = 500
+	// orphanSweepChecksPerDelete bounds the live checks per pass as a
+	// multiple of the deletes.
+	orphanSweepChecksPerDelete = 4
+	// MinOrphanSnapshotSweepInterval is the shortest sweep interval.
+	MinOrphanSnapshotSweepInterval = time.Minute
 
 	// annotationCRIURestoredSnapshot is the CRIU node agent's record of the
 	// snapshot it restored into a pod (pod-migrate.io/psengine-snapshot in
@@ -88,6 +93,9 @@ func ValidateOrphanSnapshotSweep(interval, minAge, retention time.Duration) erro
 	}
 	if interval == 0 {
 		return nil
+	}
+	if interval < MinOrphanSnapshotSweepInterval {
+		return fmt.Errorf("orphan-snapshot-sweep-interval %v must be 0 (off) or at least %v", interval, MinOrphanSnapshotSweepInterval)
 	}
 	if floor := retention + OrphanSnapshotMinAgeMargin; minAge < floor {
 		return fmt.Errorf("orphan-snapshot-min-age %v must be at least --snapshot-retention (%v) plus %v", minAge, retention, OrphanSnapshotMinAgeMargin)
@@ -119,16 +127,18 @@ func ValidateOrphanSnapshotSweep(interval, minAge, retention time.Duration) erro
 //     snapshot (CRIU names snapshots after the pod).
 //   - a pod that isn't Succeeded or Failed carries a restore order naming it
 //     (any <group>/ps-name), the restore-completed annotation, or the CRIU
-//     engine's restored-snapshot annotation, or is assigned to the job.
+//     engine's restored-snapshot annotation, or is assigned to the job and
+//     still gated.
 //   - it records SourceFrozen=True and its source pod (the label's pod name
 //     and UID prefix) still exists: the CRIU node agent may still need it to
 //     thaw the source. A snapshot whose checkpoint never finished is
 //     otherwise deleted: its job and trigger are gone, so nothing waits for
 //     it, and the CRIU engine treats the delete as a cancel.
 //
-// The checks run first against the cache, then again live (APIReader) right
-// before the delete, with the job list read last, since a job is created
-// before its trigger. The delete carries a UID precondition.
+// The checks run first against the cache, then again live (APIReader), with
+// jobs read last, since a job is created before its trigger. Right before
+// the delete, the snapshot, its job and its trigger are read live again. The
+// delete carries a UID precondition.
 type OrphanSnapshotSweeper struct {
 	// Client reads pods and jobs from the cache. It reads unstructured
 	// PodSnapshots and triggers from the API server, and deletes.
@@ -140,8 +150,8 @@ type OrphanSnapshotSweeper struct {
 	Groups   []string
 	Interval time.Duration
 	MinAge   time.Duration
-	// MaxPerPass bounds the live checks and deletes in one pass.
-	// DefaultOrphanSnapshotSweepBatch when 0.
+	// MaxPerPass bounds the deletes in one pass, and live checks to four
+	// times that. DefaultOrphanSnapshotSweepBatch when 0.
 	MaxPerPass int
 	// Now defaults to time.Now.
 	Now func() time.Time
@@ -191,43 +201,90 @@ func (s *OrphanSnapshotSweeper) apiReader() client.Reader {
 }
 
 // SweepOnce runs one pass and returns how many PodSnapshots it deleted.
+//
+// Candidates are handled oldest first, a namespace at a time. A namespace
+// with a candidate that the cached check doesn't hold gets one live view
+// (triggers, pods, then jobs). Right before each delete, the snapshot, the
+// job that goes with its trigger and the trigger itself are read again live
+// with targeted GETs, so a job or trigger created since the view still holds
+// it.
 func (s *OrphanSnapshotSweeper) SweepOnce(ctx context.Context) (int, error) {
 	logger := log.FromContext(ctx)
-	budget := s.MaxPerPass
-	if budget <= 0 {
-		budget = DefaultOrphanSnapshotSweepBatch
+	maxDeletes := s.MaxPerPass
+	if maxDeletes <= 0 {
+		maxDeletes = DefaultOrphanSnapshotSweepBatch
 	}
+	// Live checks that end in a hold or a failed delete still cost API
+	// calls, so they're bounded too, but more loosely, so a few snapshots
+	// that can't be deleted don't starve the rest.
+	maxChecks := orphanSweepChecksPerDelete * maxDeletes
 	now := s.now()
-	deleted := 0
 	var errs []error
-	views := map[string]*sweepView{}
+
+	missing := map[string]bool{}
+	var all []*unstructured.Unstructured
 	for _, group := range s.Groups {
-		candidates, err := s.candidates(ctx, group, now)
+		candidates, found, err := s.candidates(ctx, group, now)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		for _, snap := range candidates {
-			if budget <= 0 {
-				logger.V(1).Info("Orphan PodSnapshot sweep reached its per-pass bound; the rest waits for the next pass")
-				return deleted, errors.Join(errs...)
-			}
-			ns := snap.GetNamespace()
-			view, ok := views[ns]
-			if !ok {
-				view, err = s.view(ctx, s.Client, ns)
-				if err != nil {
-					errs = append(errs, err)
-					continue
-				}
-				views[ns] = view
-			}
-			if why := view.holds(snap); why != "" {
+		if !found {
+			missing[group] = true
+			continue
+		}
+		all = append(all, candidates...)
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		return all[i].GetCreationTimestamp().Time.Before(all[j].GetCreationTimestamp().Time)
+	})
+	var namespaces []string
+	byNamespace := map[string][]*unstructured.Unstructured{}
+	for _, snap := range all {
+		ns := snap.GetNamespace()
+		if _, ok := byNamespace[ns]; !ok {
+			namespaces = append(namespaces, ns)
+		}
+		byNamespace[ns] = append(byNamespace[ns], snap)
+	}
+
+	deleted, checks := 0, 0
+	for _, ns := range namespaces {
+		if deleted >= maxDeletes || checks >= maxChecks {
+			logger.V(1).Info("Orphan PodSnapshot sweep reached its per-pass bound; the rest waits for the next pass")
+			break
+		}
+		cached, err := s.view(ctx, s.Client, ns, missing)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		var unheld []*unstructured.Unstructured
+		for _, snap := range byNamespace[ns] {
+			if why := cached.holds(snap); why != "" {
 				logger.V(1).Info("Keeping PodSnapshot", "namespace", ns, "snapshot", snap.GetName(), "why", why)
 				continue
 			}
-			budget--
-			ok, err := s.deleteIfStillOrphaned(ctx, group, snap, now)
+			unheld = append(unheld, snap)
+		}
+		if len(unheld) == 0 {
+			continue
+		}
+		live, err := s.view(ctx, s.apiReader(), ns, missing)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, snap := range unheld {
+			if deleted >= maxDeletes || checks >= maxChecks {
+				break
+			}
+			checks++
+			if why := live.holds(snap); why != "" {
+				logger.V(1).Info("Keeping PodSnapshot after the live check", "namespace", ns, "snapshot", snap.GetName(), "why", why)
+				continue
+			}
+			ok, err := s.deleteIfStillOrphaned(ctx, snap, now, missing)
 			if err != nil {
 				errs = append(errs, err)
 				continue
@@ -241,22 +298,22 @@ func (s *OrphanSnapshotSweeper) SweepOnce(ctx context.Context) (int, error) {
 }
 
 // candidates lists the PodSnapshots in group that our triggers made, that
-// aren't being deleted, and that are older than MinAge, oldest first.
-func (s *OrphanSnapshotSweeper) candidates(ctx context.Context, group string, now time.Time) ([]*unstructured.Unstructured, error) {
-	var out []*unstructured.Unstructured
+// aren't being deleted, and that are older than MinAge. found is false when
+// the group's PodSnapshot CRD isn't installed.
+func (s *OrphanSnapshotSweeper) candidates(ctx context.Context, group string, now time.Time) (out []*unstructured.Unstructured, found bool, err error) {
 	cont := ""
 	for {
 		list := &unstructured.UnstructuredList{}
 		list.SetGroupVersionKind(snapshot.PodSnapshotGVK(group).GroupVersion().WithKind("PodSnapshotList"))
-		opts := []client.ListOption{client.Limit(orphanSweepPageSize)}
+		opts := []client.ListOption{client.HasLabels{snapshot.TriggeredByLabel}, client.Limit(orphanSweepPageSize)}
 		if cont != "" {
 			opts = append(opts, client.Continue(cont))
 		}
 		if err := s.Client.List(ctx, list, opts...); err != nil {
 			if meta.IsNoMatchError(err) {
-				return nil, nil
+				return nil, false, nil
 			}
-			return nil, fmt.Errorf("listing PodSnapshots in %s: %w", group, err)
+			return nil, true, fmt.Errorf("listing PodSnapshots in %s: %w", group, err)
 		}
 		for i := range list.Items {
 			snap := &list.Items[i]
@@ -266,13 +323,9 @@ func (s *OrphanSnapshotSweeper) candidates(ctx context.Context, group string, no
 		}
 		cont = list.GetContinue()
 		if cont == "" {
-			break
+			return out, true, nil
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].GetCreationTimestamp().Time.Before(out[j].GetCreationTimestamp().Time)
-	})
-	return out, nil
 }
 
 func (s *OrphanSnapshotSweeper) isCandidate(snap *unstructured.Unstructured, now time.Time) bool {
@@ -286,31 +339,47 @@ func (s *OrphanSnapshotSweeper) isCandidate(snap *unstructured.Unstructured, now
 	return !created.IsZero() && now.Sub(created.Time) >= s.MinAge
 }
 
-// deleteIfStillOrphaned reads the snapshot and its namespace live, and
-// deletes the snapshot if it's still a candidate that nothing holds. It
-// reports whether it deleted it.
-func (s *OrphanSnapshotSweeper) deleteIfStillOrphaned(ctx context.Context, group string, listed *unstructured.Unstructured, now time.Time) (bool, error) {
+// deleteIfStillOrphaned reads the snapshot, the job that goes with its
+// trigger, and the trigger in every group live, and deletes the snapshot if
+// it's unchanged and neither exists. It reports whether it deleted it.
+func (s *OrphanSnapshotSweeper) deleteIfStillOrphaned(ctx context.Context, listed *unstructured.Unstructured, now time.Time, missing map[string]bool) (bool, error) {
 	ns, name := listed.GetNamespace(), listed.GetName()
-	logger := log.FromContext(ctx).WithValues("namespace", ns, "snapshot", name, "group", group)
+	gvk := listed.GroupVersionKind()
+	logger := log.FromContext(ctx).WithValues("namespace", ns, "snapshot", name, "group", gvk.Group)
+	reader := s.apiReader()
 	snap := &unstructured.Unstructured{}
-	snap.SetGroupVersionKind(snapshot.PodSnapshotGVK(group))
-	if err := s.apiReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, snap); err != nil {
+	snap.SetGroupVersionKind(gvk)
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, snap); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("reading PodSnapshot %s/%s: %w", ns, name, err)
 	}
-	if snap.GetUID() != listed.GetUID() || !s.isCandidate(snap, now) {
-		return false, nil
-	}
-	view, err := s.view(ctx, s.apiReader(), ns)
-	if err != nil {
-		return false, err
-	}
 	trigger := snap.GetLabels()[snapshot.TriggeredByLabel]
-	if why := view.holds(snap); why != "" {
-		logger.V(1).Info("Keeping PodSnapshot after the live check", "why", why)
+	if snap.GetUID() != listed.GetUID() || !s.isCandidate(snap, now) || trigger != listed.GetLabels()[snapshot.TriggeredByLabel] {
 		return false, nil
+	}
+	for _, group := range s.Groups {
+		if missing[group] {
+			continue
+		}
+		t := &unstructured.Unstructured{}
+		t.SetGroupVersionKind(snapshot.ManualTriggerGVK(group))
+		err := reader.Get(ctx, types.NamespacedName{Namespace: ns, Name: trigger}, t)
+		if err == nil {
+			logger.V(1).Info("Keeping PodSnapshot: its trigger exists", "trigger", trigger)
+			return false, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("reading trigger %s/%s in %s: %w", ns, trigger, group, err)
+		}
+	}
+	jobName := "pmj-" + strings.TrimPrefix(trigger, "psmt-")
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: ns, Name: jobName}, &pmv1alpha1.PodMigrationJob{}); err == nil {
+		logger.V(1).Info("Keeping PodSnapshot: its job exists", "job", jobName)
+		return false, nil
+	} else if !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("reading PodMigrationJob %s/%s: %w", ns, jobName, err)
 	}
 	uid := snap.GetUID()
 	if err := s.Client.Delete(ctx, snap, client.Preconditions{UID: &uid}); err != nil {
@@ -322,7 +391,7 @@ func (s *OrphanSnapshotSweeper) deleteIfStillOrphaned(ctx context.Context, group
 	logger.Info("Deleted orphaned PodSnapshot whose job is gone", "triggeredBy", trigger, "created", snap.GetCreationTimestamp().Time)
 	if s.Recorder != nil {
 		s.Recorder.Eventf(snap, corev1.EventTypeNormal, ReasonOrphanSnapshotDeleted,
-			"Deleted PodSnapshot %s: its trigger %s and job are gone, and no pod or trigger references it", name, trigger)
+			"Deleted PodSnapshot %s: its trigger %s and job %s are gone, and no pod, trigger or job references it", name, trigger, jobName)
 	}
 	return true, nil
 }
@@ -378,7 +447,7 @@ func (v *sweepView) holds(snap *unstructured.Unstructured) string {
 // view reads what holds snapshots in ns through reader: triggers, then
 // pods, then jobs. A job is created before its trigger and its snapshot, so
 // reading jobs last leaves the shortest window for a new job to be missed.
-func (s *OrphanSnapshotSweeper) view(ctx context.Context, reader client.Reader, ns string) (*sweepView, error) {
+func (s *OrphanSnapshotSweeper) view(ctx context.Context, reader client.Reader, ns string, missing map[string]bool) (*sweepView, error) {
 	v := &sweepView{
 		jobTriggers:  map[string]string{},
 		jobNames:     map[string]bool{},
@@ -391,12 +460,16 @@ func (s *OrphanSnapshotSweeper) view(ctx context.Context, reader client.Reader, 
 	}
 
 	for _, group := range s.Groups {
+		if missing[group] {
+			// No PodSnapshot CRD in this group, so none of its snapshots
+			// are candidates; its triggers can't hold another group's.
+			continue
+		}
 		triggers := &unstructured.UnstructuredList{}
 		triggers.SetGroupVersionKind(snapshot.ManualTriggerGVK(group).GroupVersion().WithKind("PodSnapshotManualTriggerList"))
 		if err := reader.List(ctx, triggers, client.InNamespace(ns)); err != nil {
-			if meta.IsNoMatchError(err) {
-				continue
-			}
+			// Including NoMatch: the group has PodSnapshots, so a missing
+			// trigger CRD is unexpected, and an unread trigger could hold.
 			return nil, fmt.Errorf("listing triggers in %s/%s: %w", group, ns, err)
 		}
 		for i := range triggers.Items {
@@ -427,7 +500,10 @@ func (s *OrphanSnapshotSweeper) view(ctx context.Context, reader client.Reader, 
 				key == util.AnnotationRestoreCompleted,
 				key == annotationCRIURestoredSnapshot:
 				v.podRefs[val] = pod.Name
-			case key == util.AnnotationAssignedPMJ:
+			case key == util.AnnotationAssignedPMJ && podHasMigrationGate(pod):
+				// Ungated, the pod has been through the pod gate: a restore
+				// order, if any, is on it now. The annotation stays for the
+				// pod's lifetime.
 				v.assigned[val] = pod.Name
 			}
 		}

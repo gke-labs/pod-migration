@@ -50,7 +50,7 @@ func TestOrphanSweep_Envtest(t *testing.T) {
 			filepath.Join("..", "..", "config", "crd", "bases"),
 			filepath.Join("..", "..", "..", "engines", "criu", "deploy", "crds.yaml"),
 		},
-		CRDs:                  []*apiextensionsv1.CustomResourceDefinition{gkePodSnapshotCRD()},
+		CRDs:                  []*apiextensionsv1.CustomResourceDefinition{gkePodSnapshotCRD(), gkeTriggerCRD()},
 		ErrorIfCRDPathMissing: true,
 	}
 	cfg, err := testEnv.Start()
@@ -106,6 +106,15 @@ func TestOrphanSweep_Envtest(t *testing.T) {
 	newSnap(snapshot.CRIUAPIGroup, "restoring", util.FormatPSMTName("api-0", "c1b2c3d4-0000"))
 	newSnap(snapshot.DefaultAPIGroup, "job-held", util.FormatPSMTName("cache-0", "d1b2c3d4-0000"))
 
+	newSnap(snapshot.DefaultAPIGroup, "trigger-held", util.FormatPSMTName("q-0", "f1b2c3d4-0000"))
+	trig := &unstructured.Unstructured{}
+	trig.SetGroupVersionKind(snapshot.ManualTriggerGVK(snapshot.DefaultAPIGroup))
+	trig.SetNamespace(ns)
+	trig.SetName(util.FormatPSMTName("q-0", "f1b2c3d4-0000"))
+	if err := admin.Create(ctx, trig); err != nil {
+		t.Fatalf("creating trigger: %v", err)
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-0-new",
 			Annotations: map[string]string{snapshot.RestoreAnnotation(snapshot.CRIUAPIGroup): "restoring"}},
@@ -125,9 +134,10 @@ func TestOrphanSweep_Envtest(t *testing.T) {
 	s := &OrphanSnapshotSweeper{
 		Client:    controllerClient,
 		APIReader: controllerClient,
-		Groups:    sweepGroups,
-		MinAge:    DefaultOrphanSnapshotMinAge,
-		Now:       func() time.Time { return time.Now().Add(2 * DefaultOrphanSnapshotMinAge) },
+		// An engine group whose CRDs aren't installed is skipped.
+		Groups: append(append([]string{}, sweepGroups...), "missing.example.com"),
+		MinAge: DefaultOrphanSnapshotMinAge,
+		Now:    func() time.Time { return time.Now().Add(2 * DefaultOrphanSnapshotMinAge) },
 	}
 	n, err := s.SweepOnce(ctx)
 	if err != nil {
@@ -145,6 +155,7 @@ func TestOrphanSweep_Envtest(t *testing.T) {
 		{snapshot.DefaultAPIGroup, "kubeflow", true},
 		{snapshot.CRIUAPIGroup, "restoring", true},
 		{snapshot.DefaultAPIGroup, "job-held", true},
+		{snapshot.DefaultAPIGroup, "trigger-held", true},
 	} {
 		if got := exists(tc.group, tc.name); got != tc.want {
 			t.Errorf("%s %s exists = %v, want %v", tc.group, tc.name, got, tc.want)
@@ -157,4 +168,16 @@ func TestOrphanSweep_Envtest(t *testing.T) {
 	if n, err := s.SweepOnce(ctx); err != nil || n != 0 || !exists(snapshot.DefaultAPIGroup, "young") {
 		t.Fatalf("SweepOnce on a young snapshot: deleted %d, err %v", n, err)
 	}
+}
+
+// gkeTriggerCRD is a minimal, open-schema
+// podsnapshotmanualtriggers.podsnapshot.gke.io CRD.
+func gkeTriggerCRD() *apiextensionsv1.CustomResourceDefinition {
+	crd := gkePodSnapshotCRD()
+	crd.Name = "podsnapshotmanualtriggers." + snapshot.DefaultAPIGroup
+	crd.Spec.Names = apiextensionsv1.CustomResourceDefinitionNames{
+		Plural: "podsnapshotmanualtriggers", Singular: "podsnapshotmanualtrigger",
+		Kind: "PodSnapshotManualTrigger", ListKind: "PodSnapshotManualTriggerList",
+	}
+	return crd
 }

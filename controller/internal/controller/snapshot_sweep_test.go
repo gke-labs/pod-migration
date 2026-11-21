@@ -17,14 +17,18 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
@@ -167,7 +171,11 @@ func TestOrphanSweep_NeverDeletesWhatALivePodReferences(t *testing.T) {
 		{"custom-group restore order", sweepPod("r1", corev1.PodRunning, map[string]string{"criu.example.com/ps-name": relSnap})},
 		{"restore-completed", sweepPod("r1", corev1.PodRunning, map[string]string{util.AnnotationRestoreCompleted: relSnap})},
 		{"CRIU restored snapshot", sweepPod("r1", corev1.PodRunning, map[string]string{"pod-migrate.io/psengine-snapshot": relSnap})},
-		{"assigned to the trigger's job", sweepPod("r1", corev1.PodPending, map[string]string{util.AnnotationAssignedPMJ: relJobName})},
+		{"gated and assigned to the trigger's job", func() *corev1.Pod {
+			p := sweepPod("r1", corev1.PodPending, map[string]string{util.AnnotationAssignedPMJ: relJobName})
+			p.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: MigrationGateName}}
+			return p
+		}()},
 		{"terminating pod", func() *corev1.Pod {
 			p := sweepPod("r1", corev1.PodRunning, map[string]string{snapshot.RestoreAnnotation(snapshot.DefaultAPIGroup): relSnap})
 			now := metav1.Now()
@@ -182,6 +190,18 @@ func TestOrphanSweep_NeverDeletesWhatALivePodReferences(t *testing.T) {
 				t.Fatal("deleted a snapshot that a live pod references")
 			}
 		})
+	}
+}
+
+// A pod that went through the pod gate keeps assigned-pmj for its lifetime;
+// it holds nothing once ungated.
+func TestOrphanSweep_UngatedAssignedPodDoesntHold(t *testing.T) {
+	c := relClient(
+		sweepSnap(snapshot.DefaultAPIGroup, relSnap, ownTrigger(), oldAge),
+		sweepPod("r1", corev1.PodRunning, map[string]string{util.AnnotationAssignedPMJ: relJobName}),
+	)
+	if n := sweep(t, newSweeper(c)); n != 1 {
+		t.Fatalf("deleted %d, want 1: an ungated pod has been through the gate", n)
 	}
 }
 
@@ -284,6 +304,8 @@ func TestValidateOrphanSnapshotSweep(t *testing.T) {
 		{DefaultOrphanSnapshotSweepInterval, DefaultOrphanSnapshotMinAge, MaxSnapshotRetention, true},
 		{0, 0, 0, true}, // off
 		{-time.Minute, DefaultOrphanSnapshotMinAge, 0, false},
+		{time.Second, DefaultOrphanSnapshotMinAge, 0, false},
+		{MinOrphanSnapshotSweepInterval, DefaultOrphanSnapshotMinAge, 0, true},
 		{DefaultOrphanSnapshotSweepInterval, 5 * time.Minute, 0, false},
 		{DefaultOrphanSnapshotSweepInterval, 25 * time.Minute, 20 * time.Minute, false},
 		{DefaultOrphanSnapshotSweepInterval, 30 * time.Minute, 20 * time.Minute, true},
@@ -339,4 +361,109 @@ func TestOrphanSweep_FrozenSource(t *testing.T) {
 			t.Fatalf("deleted %d, want 1: job and trigger are gone, nothing waits for it", n)
 		}
 	})
+}
+
+// Only the live targeted reads see a job or trigger created after the live
+// namespace view: they must still hold the snapshot.
+func TestOrphanSweep_TargetedRecheckBeforeDelete(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		obj  client.Object
+	}{
+		{"job", relJob(pmv1alpha1.PodMigrationJobPhasePending, 0)},
+		{"trigger", sweepTrigger(snapshot.CRIUAPIGroup, ownTrigger(), "")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := sweepSnap(snapshot.DefaultAPIGroup, relSnap, ownTrigger(), oldAge)
+			c := relClient(snap.DeepCopy())
+			live := relClient(snap.DeepCopy(), tc.obj)
+			s := newSweeper(c)
+			// Views (LISTs) see the cache-like client; targeted GETs see live.
+			s.APIReader = &listFrom{Reader: live, lists: c}
+			if n := sweep(t, s); n != 0 || !snapExists(t, c, snapshot.DefaultAPIGroup, relSnap) {
+				t.Fatalf("deleted a snapshot whose %s only the targeted live read sees", tc.name)
+			}
+		})
+	}
+}
+
+// listFrom answers Get from Reader and List from lists.
+type listFrom struct {
+	client.Reader
+	lists client.Reader
+}
+
+func (l *listFrom) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return l.lists.List(ctx, list, opts...)
+}
+
+// A delete that keeps failing must not starve the snapshots behind it.
+func TestOrphanSweep_FailingDeletesDontStarveTheRest(t *testing.T) {
+	var objs []client.Object
+	for i, name := range []string{"a", "b", "c"} {
+		objs = append(objs, sweepSnap(snapshot.DefaultAPIGroup, "snap-"+name, util.FormatPSMTName(name, "abcdef01-0000"), oldAge+time.Duration(3-i)*time.Minute))
+	}
+	base := relClient(objs...)
+	c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetName() == "snap-a" {
+				return apierrors.NewForbidden(schema.GroupResource{Resource: "podsnapshots"}, obj.GetName(), errors.New("denied"))
+			}
+			return cl.Delete(ctx, obj, opts...)
+		},
+	})
+	s := newSweeper(c)
+	s.MaxPerPass = 2
+	n, err := s.SweepOnce(context.Background())
+	if err == nil {
+		t.Fatal("a failed delete must be reported")
+	}
+	if n != 2 {
+		t.Fatalf("deleted %d, want 2: the oldest snapshot's failing delete starved the rest", n)
+	}
+}
+
+// A live read that fails deletes nothing.
+func TestOrphanSweep_LiveReadErrorDeletesNothing(t *testing.T) {
+	c := relClient(sweepSnap(snapshot.DefaultAPIGroup, relSnap, ownTrigger(), oldAge))
+	live := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return errors.New("apiserver unavailable")
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+	s := newSweeper(c)
+	s.APIReader = live
+	if n, err := s.SweepOnce(context.Background()); err == nil || n != 0 || !snapExists(t, c, snapshot.DefaultAPIGroup, relSnap) {
+		t.Fatalf("SweepOnce with a failing live pod list: deleted %d, err %v", n, err)
+	}
+}
+
+// A pod or another job that only the live namespace view sees (the cache
+// trails it) must still hold the snapshot.
+func TestOrphanSweep_LiveViewHolds(t *testing.T) {
+	other := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{Namespace: relNS, Name: "pmj-other-12345678"},
+		Spec:       pmv1alpha1.PodMigrationJobSpec{PodRef: corev1.LocalObjectReference{Name: "other"}, TargetPodUID: "12345678-aaaa"},
+		Status:     pmv1alpha1.PodMigrationJobStatus{SnapshotRef: relSnap},
+	}
+	for _, tc := range []struct {
+		name string
+		obj  client.Object
+	}{
+		{"pod with a restore order", sweepPod("r1", corev1.PodPending, map[string]string{snapshot.RestoreAnnotation(snapshot.DefaultAPIGroup): relSnap})},
+		{"another job's snapshotRef", other},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := sweepSnap(snapshot.DefaultAPIGroup, relSnap, ownTrigger(), oldAge)
+			cached := relClient(snap.DeepCopy())
+			s := newSweeper(cached)
+			s.APIReader = relClient(snap.DeepCopy(), tc.obj)
+			if n := sweep(t, s); n != 0 || !snapExists(t, cached, snapshot.DefaultAPIGroup, relSnap) {
+				t.Fatalf("deleted a snapshot that only the live view sees held (%s)", tc.name)
+			}
+		})
+	}
 }
