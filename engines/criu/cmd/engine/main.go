@@ -130,7 +130,8 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&psengine.PSMTReconciler{
-		Client: mgr.GetClient(),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine PSMT reconciler")
 		os.Exit(1)

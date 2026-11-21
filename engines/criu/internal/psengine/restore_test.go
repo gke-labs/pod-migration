@@ -1047,11 +1047,12 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	if !hasRule(controllerRole, contract.GVKStorageConfig.Group, "podsnapshotstorageconfigs", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list/watch on %s/podsnapshotstorageconfigs", contract.GVKStorageConfig.Group)
 	}
-	if !hasRule(controllerRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "get") {
-		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get on %s/podmigrationjobs", contract.GVKPodMigrationJob.Group)
+	// list: the live in-use check before a work order is deleted (#262).
+	if !hasRule(controllerRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "get", "list") {
+		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list on %s/podmigrationjobs", contract.GVKPodMigrationJob.Group)
 	}
-	if hasRule(controllerRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "list") || hasRule(controllerRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "watch") {
-		t.Errorf("pod-migrate-psengine-controller ClusterRole must grant only get (not list/watch) on %s/podmigrationjobs", contract.GVKPodMigrationJob.Group)
+	if hasRule(controllerRole, contract.GVKPodMigrationJob.Group, "podmigrationjobs", "watch") {
+		t.Errorf("pod-migrate-psengine-controller ClusterRole must not grant watch on %s/podmigrationjobs", contract.GVKPodMigrationJob.Group)
 	}
 
 	rnBytes, err := os.ReadFile("restore_node.go")

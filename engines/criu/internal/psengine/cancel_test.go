@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1052,5 +1053,408 @@ func TestAgentShutdownWritesNoOutcome(t *testing.T) {
 		Reconcile(ctx, ctrl.Request{NamespacedName: cancelSnapshotKey})
 	if ps := getSnapshot(t, c, cancelSnapshot); hasOutcome(ps) {
 		t.Fatalf("an outcome was written on shutdown: %+v", contract.Conditions(ps))
+	}
+}
+
+// --- A trigger re-created for the same pod instance -------------------------
+//
+// The orchestrator names the trigger after the pod and its UID, and the
+// engine names the work order the same way, so a later job for the same pod
+// instance creates a trigger with the same name. A work order that an earlier
+// instance of the trigger left with an outcome must not answer it: a Ready one
+// holds the source's state at that earlier checkpoint, and a Failed, Cancelled
+// or Refused one says nothing about this attempt.
+
+// psmtWithUID is psmtFor with the UID the API server gives each trigger, so a
+// trigger created again under the same name is a different instance.
+func psmtWithUID(pod, uid string) *unstructured.Unstructured {
+	u := psmtFor(pod)
+	u.SetUID(types.UID(uid))
+	return u
+}
+
+// dropFixtureJob deletes the Restoring PodMigrationJob that newClient adds,
+// whose status.snapshotRef names cancelSnapshot: these tests need a work
+// order that nothing uses any more.
+func dropFixtureJob(t *testing.T, c client.Client) {
+	t.Helper()
+	pmj := contract.New(contract.GVKPodMigrationJob)
+	pmj.SetNamespace("default")
+	pmj.SetName("test-pmj")
+	if err := c.Delete(context.Background(), pmj); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// staleFixture runs a first trigger for web-0 to an outcome on the node
+// agent, then deletes it, as the orchestrator does once the job moves on.
+func staleFixture(t *testing.T, ops *fakeNodeOps, store ObjectStore) client.Client {
+	t.Helper()
+	c := newClient(t,
+		pssc("pssc-x", "bkt", "snaps"),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		sourcePod("web-0", 1, "node-a"),
+		criuNode("node-a", true),
+		psmtWithUID("web-0", "trigger-1"),
+	)
+	dropFixtureJob(t, c)
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store})
+	deleteTrigger(t, c, true)
+	return c
+}
+
+func triggerAnswer(t *testing.T, c client.Client) string {
+	t.Helper()
+	psmt := contract.New(contract.GVKManualTrigger)
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: cancelTrigger}, psmt); err != nil {
+		t.Fatal(err)
+	}
+	return contract.TriggerSnapshotCreated(psmt)
+}
+
+// requireNotAnsweredWithEarlier: the new trigger isn't answered, and the
+// earlier work order is being deleted so the trigger can get its own.
+func requireNotAnsweredWithEarlier(t *testing.T, c client.Client) {
+	t.Helper()
+	if err := c.Create(context.Background(), psmtWithUID("web-0", "trigger-2")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := (&PSMTReconciler{Client: c}).Reconcile(context.Background(),
+		ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: cancelTrigger}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := triggerAnswer(t, c); got != "" {
+		t.Fatalf("the re-created trigger was answered with %q, the work order an earlier trigger left with %+v",
+			got, contract.Conditions(getSnapshot(t, c, got)))
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("RequeueAfter = %v, want a wait for the earlier work order to be gone", res.RequeueAfter)
+	}
+	if ps := getSnapshot(t, c, cancelSnapshot); ps.GetDeletionTimestamp() == nil {
+		t.Fatalf("the earlier work order wasn't deleted: %+v", contract.Conditions(ps))
+	}
+}
+
+// A later job for the same pod instance gets a new checkpoint, not the Ready
+// one an earlier job's trigger took. The source may have run since (a
+// container restart while frozen), so restoring the earlier checkpoint would
+// lose what it did.
+func TestRecreatedTriggerGetsNewCheckpointNotEarlierReady(t *testing.T) {
+	store := newMemStore()
+	c := staleFixture(t, &fakeNodeOps{tarContent: "FIRST", t: t}, store)
+	if !contract.IsSnapshotReady(getSnapshot(t, c, cancelSnapshot)) {
+		t.Fatal("test setup: the first checkpoint isn't Ready")
+	}
+
+	requireNotAnsweredWithEarlier(t, c)
+
+	// The engine deletes the archive, then lets the work order go.
+	if _, err := (&ArchiveGCReconciler{Client: c, Store: store}).Reconcile(context.Background(), ctrl.Request{NamespacedName: cancelSnapshotKey}); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	ps := getSnapshot(t, c, cancelSnapshot)
+	if hasOutcome(ps) || ps.GetDeletionTimestamp() != nil {
+		t.Fatalf("want a new work order for the new trigger, got %+v", contract.Conditions(ps))
+	}
+	if got := workOrderString(ps, specTriggerUID); got != "trigger-2" {
+		t.Fatalf("work order %s = %q, want trigger-2", specTriggerUID, got)
+	}
+	if got := triggerAnswer(t, c); got != cancelSnapshot {
+		t.Fatalf("trigger answer = %q, want %q", got, cancelSnapshot)
+	}
+
+	ops := &fakeNodeOps{tarContent: "SECOND", t: t}
+	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store})
+	if !contract.IsSnapshotReady(getSnapshot(t, c, cancelSnapshot)) || len(ops.events) == 0 || ops.events[0] != "freeze" {
+		t.Fatalf("want a new checkpoint for the new trigger: events %v, conditions %+v", ops.events, contract.Conditions(getSnapshot(t, c, cancelSnapshot)))
+	}
+}
+
+// An earlier trigger's failure isn't this trigger's outcome either.
+func TestRecreatedTriggerDoesNotInheritEarlierFailure(t *testing.T) {
+	c := staleFixture(t, &fakeNodeOps{failDump: true, t: t}, newMemStore())
+	if !hasTerminalCheckpoint(getSnapshot(t, c, cancelSnapshot)) {
+		t.Fatalf("test setup: want a failed first checkpoint, got %+v", contract.Conditions(getSnapshot(t, c, cancelSnapshot)))
+	}
+	requireNotAnsweredWithEarlier(t, c)
+}
+
+// The trigger that created a work order keeps being answered with it.
+func TestSameTriggerKeepsItsReadyWorkOrder(t *testing.T) {
+	c := newClient(t,
+		pssc("pssc-x", "bkt", "snaps"),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		sourcePod("web-0", 1, "node-a"),
+		criuNode("node-a", true),
+		psmtWithUID("web-0", "trigger-1"),
+	)
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "T", t: t}, Store: newMemStore()})
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	ps := getSnapshot(t, c, cancelSnapshot)
+	if !contract.IsSnapshotReady(ps) || ps.GetDeletionTimestamp() != nil || triggerAnswer(t, c) != cancelSnapshot {
+		t.Fatalf("the trigger's own Ready work order must stand: answer %q, conditions %+v", triggerAnswer(t, c), contract.Conditions(ps))
+	}
+}
+
+// A work order created before the engine recorded the trigger's UID is
+// judged by age: one created before the trigger can't be its own.
+func TestRecreatedTriggerSkipsLegacyWorkOrderOlderThanIt(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	for _, tc := range []struct {
+		name      string
+		createdAt time.Time
+		stale     bool
+	}{
+		{"created before the trigger", now.Add(-time.Hour), true},
+		{"created after the trigger", now.Add(time.Second), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := workOrderSnapshot(cancelSnapshot)
+			_ = unstructured.SetNestedField(ps.Object, cancelTrigger, "spec", specTriggerName)
+			ps.SetFinalizers([]string{ArchiveFinalizer})
+			ps.SetCreationTimestamp(metav1.NewTime(tc.createdAt))
+			ps.Object["status"] = map[string]interface{}{"conditions": []interface{}{
+				map[string]interface{}{"type": contract.CondCheckpoint, "status": "True", "reason": contract.ReasonSucceeded, "message": "ok", "lastTransitionTime": now.UTC().Format(time.RFC3339)},
+				map[string]interface{}{"type": contract.CondReady, "status": "True", "reason": contract.ReasonSucceeded, "message": "ok", "lastTransitionTime": now.UTC().Format(time.RFC3339)},
+			}}
+			trigger := psmtWithUID("web-0", "trigger-2")
+			trigger.SetCreationTimestamp(metav1.NewTime(now))
+			c := newClient(t,
+				pssc("pssc-x", "bkt", "snaps"),
+				readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+				sourcePod("web-0", 1, "node-a"),
+				criuNode("node-a", true),
+				trigger, ps,
+			)
+			dropFixtureJob(t, c)
+			reconcilePSMT(t, c, nil, cancelTrigger)
+			deleting := getSnapshot(t, c, cancelSnapshot).GetDeletionTimestamp() != nil
+			answered := triggerAnswer(t, c) == cancelSnapshot
+			if deleting != tc.stale || answered == tc.stale {
+				t.Fatalf("deleting=%v answered=%v, want stale=%v", deleting, answered, tc.stale)
+			}
+		})
+	}
+}
+
+// A work order that answers another trigger (another name) is left alone:
+// that trigger may still be using it.
+func TestRecreatedTriggerLeavesOtherTriggersWorkOrder(t *testing.T) {
+	c := staleFixture(t, &fakeNodeOps{tarContent: "FIRST", t: t}, newMemStore())
+	ps := getSnapshot(t, c, cancelSnapshot)
+	_ = unstructured.SetNestedField(ps.Object, "psmt-someone-else", "spec", specTriggerName)
+	if err := c.Update(context.Background(), ps); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), psmtWithUID("web-0", "trigger-2")); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	if getSnapshot(t, c, cancelSnapshot).GetDeletionTimestamp() != nil {
+		t.Fatal("deleted the work order of another trigger")
+	}
+}
+
+// A trigger created again while the earlier one's work order is still in
+// flight takes the work order over, so its Ready outcome is the new
+// trigger's and stays.
+func TestRecreatedTriggerTakesOverUnfinishedWorkOrder(t *testing.T) {
+	c := newClient(t,
+		pssc("pssc-x", "bkt", "snaps"),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		sourcePod("web-0", 1, "node-a"),
+		criuNode("node-a", true),
+		psmtWithUID("web-0", "trigger-1"),
+	)
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	deleteTrigger(t, c, true)
+	requireCancelRequested(t, c)
+	if err := c.Create(context.Background(), psmtWithUID("web-0", "trigger-2")); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	if got := workOrderString(getSnapshot(t, c, cancelSnapshot), specTriggerUID); got != "trigger-2" {
+		t.Fatalf("work order %s = %q, want trigger-2 after the take-over", specTriggerUID, got)
+	}
+	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "T", t: t}, Store: newMemStore()})
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	ps := getSnapshot(t, c, cancelSnapshot)
+	if !contract.IsSnapshotReady(ps) || ps.GetDeletionTimestamp() != nil || triggerAnswer(t, c) != cancelSnapshot {
+		t.Fatalf("the taken-over work order must stand once Ready: deleting=%v answer %q, conditions %+v",
+			ps.GetDeletionTimestamp() != nil, triggerAnswer(t, c), contract.Conditions(ps))
+	}
+}
+
+// A checkpoint that timed out never settles, and the orchestrator keeps its
+// source fenced and evicts it cold. A trigger created again leaves it alone:
+// a second kubelet checkpoint could run while the first dump still is.
+func TestRecreatedTriggerLeavesTimedOutWorkOrder(t *testing.T) {
+	c := newClient(t,
+		pssc("pssc-x", "bkt", "snaps"),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		sourcePod("web-0", 1, "node-a"),
+		criuNode("node-a", true),
+		psmtWithUID("web-0", "trigger-1"),
+	)
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	ps := getSnapshot(t, c, cancelSnapshot)
+	if err := contract.SetCondition(ps, metav1.Condition{Type: contract.CondCheckpoint, Status: metav1.ConditionUnknown, Reason: contract.ReasonCheckpointTimedOut, Message: "timed out"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Status().Update(context.Background(), ps); err != nil {
+		t.Fatal(err)
+	}
+	deleteTrigger(t, c, true)
+	if err := c.Create(context.Background(), psmtWithUID("web-0", "trigger-2")); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	ps = getSnapshot(t, c, cancelSnapshot)
+	if ps.GetDeletionTimestamp() != nil || workOrderString(ps, specTriggerUID) != "trigger-1" || !checkpointTimedOut(ps) {
+		t.Fatalf("the timed-out work order must be left as it is: deleting=%v %s=%q conditions %+v",
+			ps.GetDeletionTimestamp() != nil, specTriggerUID, workOrderString(ps, specTriggerUID), contract.Conditions(ps))
+	}
+}
+
+// requireKeptUnanswered: a re-created trigger leaves an earlier work order
+// that something still uses alone, and isn't answered with it.
+func requireKeptUnanswered(t *testing.T, c client.Client) {
+	t.Helper()
+	if err := c.Create(context.Background(), psmtWithUID("web-0", "trigger-2")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := (&PSMTReconciler{Client: c, APIReader: c}).Reconcile(context.Background(),
+		ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: cancelTrigger}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := getSnapshot(t, c, cancelSnapshot)
+	if ps.GetDeletionTimestamp() != nil {
+		t.Fatal("deleted a work order that is still in use")
+	}
+	if !contract.IsSnapshotReady(ps) {
+		t.Fatalf("the work order in use must stay Ready: %+v", contract.Conditions(ps))
+	}
+	if got := triggerAnswer(t, c); got != "" {
+		t.Fatalf("the re-created trigger was answered with %q, an earlier trigger's work order", got)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("RequeueAfter = %v, want a later look", res.RequeueAfter)
+	}
+}
+
+// A job that's restoring from the work order keeps it: a trigger created
+// again for the same pod doesn't delete it.
+func TestRecreatedTriggerKeepsWorkOrderAJobUses(t *testing.T) {
+	c := staleFixture(t, &fakeNodeOps{tarContent: "FIRST", t: t}, newMemStore())
+	pmj := contract.New(contract.GVKPodMigrationJob)
+	pmj.SetNamespace("default")
+	pmj.SetName("other-pmj")
+	_ = unstructured.SetNestedField(pmj.Object, "web-0", "spec", "podRef", "name")
+	_ = unstructured.SetNestedField(pmj.Object, "Restoring", "status", "phase")
+	_ = unstructured.SetNestedField(pmj.Object, cancelSnapshot, "status", "snapshotRef")
+	if err := c.Create(context.Background(), pmj); err != nil {
+		t.Fatal(err)
+	}
+	requireKeptUnanswered(t, c)
+}
+
+// So does a pod whose restore order names it, until its restore completed.
+func TestRecreatedTriggerKeepsWorkOrderAPodUses(t *testing.T) {
+	c := staleFixture(t, &fakeNodeOps{tarContent: "FIRST", t: t}, newMemStore())
+	pod := sourcePod("web-1", 1, "node-b")
+	pod.UID = "replacement-uid"
+	pod.Annotations = map[string]string{contract.AnnotationPSName: cancelSnapshot}
+	if err := c.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	requireKeptUnanswered(t, c)
+}
+
+// A pod that already restored from the work order, or has terminated, no
+// longer uses it.
+func TestRecreatedTriggerIgnoresPodsDoneWithWorkOrder(t *testing.T) {
+	for name, mutate := range map[string]func(*corev1.Pod){
+		"restored status":   func(p *corev1.Pod) { p.Annotations[contract.AnnotationRestoreStatus] = contract.RestoreStatusRestored },
+		"restored snapshot": func(p *corev1.Pod) { p.Annotations[contract.AnnotationSnapshot] = cancelSnapshot },
+		"restore completed": func(p *corev1.Pod) { p.Annotations[annotationRestoreCompleted] = cancelSnapshot },
+		"terminated":        func(p *corev1.Pod) { p.Status.Phase = corev1.PodSucceeded },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := staleFixture(t, &fakeNodeOps{tarContent: "FIRST", t: t}, newMemStore())
+			pod := sourcePod("web-1", 1, "node-b")
+			pod.UID = "replacement-uid"
+			pod.Annotations = map[string]string{contract.AnnotationPSName: cancelSnapshot}
+			mutate(pod)
+			if err := c.Create(context.Background(), pod); err != nil {
+				t.Fatal(err)
+			}
+			requireNotAnsweredWithEarlier(t, c)
+		})
+	}
+}
+
+// A trigger that its own job created again (the job already recorded the
+// work order as its snapshot) is answered with that work order, which it
+// takes over: the checkpoint is the job's own.
+func TestRecreatedTriggerOfSameJobKeepsItsWorkOrder(t *testing.T) {
+	c := staleFixture(t, &fakeNodeOps{tarContent: "FIRST", t: t}, newMemStore())
+	pmj := contract.New(contract.GVKPodMigrationJob)
+	pmj.SetNamespace("default")
+	pmj.SetName("pmj-web-0-deadbeef")
+	pmj.SetUID("job-uid")
+	_ = unstructured.SetNestedField(pmj.Object, "Snapshotting", "status", "phase")
+	_ = unstructured.SetNestedField(pmj.Object, cancelSnapshot, "status", "snapshotRef")
+	if err := c.Create(context.Background(), pmj); err != nil {
+		t.Fatal(err)
+	}
+	trigger := psmtWithUID("web-0", "trigger-2")
+	isController := true
+	trigger.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: contract.GVKPodMigrationJob.GroupVersion().String(), Kind: contract.GVKPodMigrationJob.Kind,
+		Name: pmj.GetName(), UID: "job-uid", Controller: &isController,
+	}})
+	if err := c.Create(context.Background(), trigger); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	ps := getSnapshot(t, c, cancelSnapshot)
+	if ps.GetDeletionTimestamp() != nil || !contract.IsSnapshotReady(ps) || triggerAnswer(t, c) != cancelSnapshot {
+		t.Fatalf("want the job's own Ready work order kept and answered: deleting=%v answer %q", ps.GetDeletionTimestamp() != nil, triggerAnswer(t, c))
+	}
+	if got := workOrderString(ps, specTriggerUID); got != "trigger-2" {
+		t.Fatalf("work order %s = %q, want trigger-2 after the take-over", specTriggerUID, got)
+	}
+}
+
+// A legacy work order (no trigger UID) that's still in use is answered as
+// before: its age alone doesn't make it an earlier trigger's.
+func TestRecreatedTriggerKeepsLegacyWorkOrderInUse(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	ps := workOrderSnapshot(cancelSnapshot)
+	_ = unstructured.SetNestedField(ps.Object, cancelTrigger, "spec", specTriggerName)
+	ps.SetFinalizers([]string{ArchiveFinalizer})
+	ps.SetCreationTimestamp(metav1.NewTime(now.Add(-time.Hour)))
+	ps.Object["status"] = map[string]interface{}{"conditions": []interface{}{
+		map[string]interface{}{"type": contract.CondCheckpoint, "status": "True", "reason": contract.ReasonSucceeded, "message": "ok", "lastTransitionTime": now.UTC().Format(time.RFC3339)},
+		map[string]interface{}{"type": contract.CondReady, "status": "True", "reason": contract.ReasonSucceeded, "message": "ok", "lastTransitionTime": now.UTC().Format(time.RFC3339)},
+	}}
+	trigger := psmtWithUID("web-0", "trigger-2")
+	trigger.SetCreationTimestamp(metav1.NewTime(now))
+	// newClient's Restoring test-pmj names the work order.
+	c := newClient(t,
+		pssc("pssc-x", "bkt", "snaps"),
+		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
+		sourcePod("web-0", 1, "node-a"),
+		criuNode("node-a", true),
+		trigger, ps,
+	)
+	reconcilePSMT(t, c, nil, cancelTrigger)
+	if getSnapshot(t, c, cancelSnapshot).GetDeletionTimestamp() != nil || triggerAnswer(t, c) != cancelSnapshot {
+		t.Fatalf("want the legacy work order in use kept and answered as before, answer %q", triggerAnswer(t, c))
 	}
 }
