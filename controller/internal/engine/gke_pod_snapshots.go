@@ -117,6 +117,17 @@ func NewGKEPodSnapshots(c client.Client, scheme *runtime.Scheme, opts ...GKEOpti
 	return e
 }
 
+// Client returns the controller-runtime client used by the engine.
+func (e *GKEPodSnapshots) Client() client.Client {
+	if e == nil {
+		return nil
+	}
+	if c, ok := e.reader.(client.Client); ok {
+		return c
+	}
+	return nil
+}
+
 // NewDefaultRegistry returns the registry of a stock deployment: GKE Pod
 // Snapshots (registered as the default engine), plus CRIU only when requested
 // via WithCRIUAPIGroup. Unless SetRoutes overrides the cluster routes, GKE Pod

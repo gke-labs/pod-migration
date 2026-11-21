@@ -66,6 +66,14 @@ func NewGKEProviderForGroup(c client.Client, s *runtime.Scheme, group string) (*
 	return &GKEProvider{client: c, scheme: s, group: group}, nil
 }
 
+// Client returns the controller-runtime client used by this provider.
+func (p *GKEProvider) Client() client.Client {
+	if p == nil {
+		return nil
+	}
+	return p.client
+}
+
 // APIGroup returns the API group of the snapshot CRs this provider reads and writes.
 func (p *GKEProvider) APIGroup() string {
 	if p == nil || p.group == "" {

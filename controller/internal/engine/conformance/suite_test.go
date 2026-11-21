@@ -128,6 +128,7 @@ type faultyEngine struct {
 	namespaceErr      error
 	untypedLocErr     bool
 	eligibleOK        bool
+	admitInvalid      bool
 
 	// RestoreOrderer behavior
 	orderWrongKey bool
@@ -180,7 +181,24 @@ func (f *faultyEngine) NamespaceResources(pm *pmv1alpha1.PodMigration) ([]*unstr
 }
 func (f *faultyEngine) Eligible(pod *corev1.Pod, node *corev1.Node) engine.Verdict {
 	if pod == nil {
-		return engine.Verdict{OK: f.eligibleOK, Reason: "nil pod"}
+		if f.eligibleOK {
+			return engine.Verdict{OK: true}
+		}
+		return engine.Verdict{OK: false, Reason: "nil pod"}
+	}
+	if f.name == "criu" && !f.admitInvalid {
+		if pod.Spec.HostNetwork {
+			return engine.Verdict{OK: false, Reason: "CRIU engine does not support hostNetwork pods"}
+		}
+		if len(pod.Spec.Containers) > 1 {
+			return engine.Verdict{OK: false, Reason: "CRIU engine requires a single-container pod"}
+		}
+		if node == nil {
+			return engine.Verdict{OK: false, Reason: "node is nil"}
+		}
+	}
+	if f.admitInvalid {
+		return engine.Verdict{OK: true}
 	}
 	return engine.Verdict{OK: true}
 }
@@ -193,6 +211,12 @@ func (f *faultyEngine) ResolvePolicy(ctx context.Context, pod *corev1.Pod) (*eng
 func (f *faultyEngine) Snapshots() snapshot.Provider      { return f.provider }
 func (f *faultyEngine) RestoreFailures() []restore.Engine { return f.failures }
 func (f *faultyEngine) Guarantees() engine.Guarantees     { return f.guarantees }
+func (f *faultyEngine) Client() client.Client {
+	if ch, ok := f.provider.(interface{ Client() client.Client }); ok {
+		return ch.Client()
+	}
+	return nil
+}
 
 // RestoreOrderer implementation
 func (f *faultyEngine) OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) error {
@@ -251,6 +275,9 @@ func (f *faultyEngine) VerifyRestore(ctx context.Context, job *pmv1alpha1.PodMig
 	if f.verifyVerdict != (engine.RestoreVerdict{}) {
 		return f.verifyVerdict, nil
 	}
+	if pod.Annotations != nil && strings.TrimSpace(pod.Annotations["pod-migrate.io/psengine-restore"]) == "failed" {
+		return engine.RestoreVerdict{Outcome: engine.ColdStart, Reason: "restore failed signal"}, nil
+	}
 	if pod.Status.Phase != corev1.PodRunning {
 		return engine.RestoreVerdict{Outcome: engine.RestoreInProgress, Confirmed: false}, nil
 	}
@@ -293,6 +320,69 @@ func (unscopedClassifier) MatchesRestoreFailure(msg string) (string, bool) {
 	return "", false
 }
 
+// foreignClassClassifier implements restore.Engine and restore.RuntimeClassScoped, but
+// only covers a foreign runtime class ("gvisor-v2") that the engine does not serve.
+type foreignClassClassifier struct{}
+
+func (foreignClassClassifier) Name() string { return "foreign" }
+func (foreignClassClassifier) MatchesRestoreFailure(msg string) (string, bool) {
+	return "", false
+}
+func (foreignClassClassifier) CoversRuntimeClass(rc string) bool {
+	return rc == "gvisor-v2"
+}
+
+// neverTerminalProvider wraps a valid provider but converts any terminal Failed/Refused
+// phase into PhaseInProgress.
+type neverTerminalProvider struct {
+	snapshot.Provider
+}
+
+func (p *neverTerminalProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (*snapshot.Status, error) {
+	st, err := p.Provider.CheckStatus(ctx, job, podName)
+	if err != nil || st == nil {
+		return st, err
+	}
+	if st.Phase == snapshot.PhaseFailed || st.Phase == snapshot.PhaseRefused {
+		cp := *st
+		cp.Phase = snapshot.PhaseInProgress
+		return &cp, nil
+	}
+	return st, nil
+}
+func (p *neverTerminalProvider) Unwrap() snapshot.Provider { return p.Provider }
+func (p *neverTerminalProvider) Client() client.Client {
+	if ch, ok := p.Provider.(interface{ Client() client.Client }); ok {
+		return ch.Client()
+	}
+	return nil
+}
+
+// prematureFailedProvider wraps a valid provider but fails on transient Ready=False.
+type prematureFailedProvider struct {
+	snapshot.Provider
+}
+
+func (p *prematureFailedProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (*snapshot.Status, error) {
+	st, err := p.Provider.CheckStatus(ctx, job, podName)
+	if err != nil || st == nil {
+		return st, err
+	}
+	if podName == "c3-transient" {
+		cp := *st
+		cp.Phase = snapshot.PhaseFailed
+		return &cp, nil
+	}
+	return st, nil
+}
+func (p *prematureFailedProvider) Unwrap() snapshot.Provider { return p.Provider }
+func (p *prematureFailedProvider) Client() client.Client {
+	if ch, ok := p.Provider.(interface{ Client() client.Client }); ok {
+		return ch.Client()
+	}
+	return nil
+}
+
 // noopCleanupProvider wraps a valid provider but makes Cleanup a no-op.
 type noopCleanupProvider struct {
 	snapshot.Provider
@@ -300,6 +390,13 @@ type noopCleanupProvider struct {
 
 func (p *noopCleanupProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) error {
 	return nil // No-op: never deletes the trigger!
+}
+func (p *noopCleanupProvider) Unwrap() snapshot.Provider { return p.Provider }
+func (p *noopCleanupProvider) Client() client.Client {
+	if ch, ok := p.Provider.(interface{ Client() client.Client }); ok {
+		return ch.Client()
+	}
+	return nil
 }
 
 func findClause(rep *Report, id ClauseID) *ClauseResult {
@@ -313,7 +410,7 @@ func findClause(rep *Report, id ClauseID) *ClauseResult {
 
 func TestConformance_SabotageDetections(t *testing.T) {
 	scheme := testScheme()
-	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	cl := NewTestClient(scheme)
 	validProvider, _ := snapshot.NewGKEProviderForGroup(cl, scheme, engine.DefaultCRIUAPIGroup)
 
 	runner := NewRunner()
@@ -624,6 +721,112 @@ func TestConformance_SabotageDetections(t *testing.T) {
 		cr := findClause(rep, ClauseC9CancellationCleanup)
 		if cr == nil || cr.Status != StatusFailed {
 			t.Errorf("Expected Clause C9 FAILED on no-op Cleanup, got %+v", cr)
+		}
+	})
+
+	t.Run("Sabotage_C3_NeverTerminal", func(t *testing.T) {
+		testCl := NewTestClient(scheme)
+		prov, _ := snapshot.NewGKEProviderForGroup(testCl, scheme, engine.DefaultCRIUAPIGroup)
+		faultyProv := &neverTerminalProvider{Provider: prov}
+
+		faulty := &faultyEngine{
+			name:              "faulty-3-never-terminal",
+			apiGroup:          engine.DefaultCRIUAPIGroup,
+			restoreAnnotation: engine.DefaultCRIUAPIGroup + "/ps-name",
+			runtimeClasses:    []string{"runc"},
+			provider:          faultyProv,
+			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
+		}
+		rep := runner.Evaluate(faulty)
+		if rep.Passed {
+			t.Errorf("Expected Report.Passed = false on never-terminal CheckStatus")
+		}
+		cr := findClause(rep, ClauseC3CheckpointOutcomes)
+		if cr == nil || cr.Status != StatusFailed {
+			t.Errorf("Expected Clause C3 FAILED on never-terminal CheckStatus, got %+v", cr)
+		}
+	})
+
+	t.Run("Sabotage_C3_TransientReadyFailed", func(t *testing.T) {
+		testCl := NewTestClient(scheme)
+		prov, _ := snapshot.NewGKEProviderForGroup(testCl, scheme, engine.DefaultCRIUAPIGroup)
+		faultyProv := &prematureFailedProvider{Provider: prov}
+
+		faulty := &faultyEngine{
+			name:              "faulty-3-transient-fail",
+			apiGroup:          engine.DefaultCRIUAPIGroup,
+			restoreAnnotation: engine.DefaultCRIUAPIGroup + "/ps-name",
+			runtimeClasses:    []string{"runc"},
+			provider:          faultyProv,
+			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
+		}
+		rep := runner.Evaluate(faulty)
+		if rep.Passed {
+			t.Errorf("Expected Report.Passed = false on premature failed CheckStatus")
+		}
+		cr := findClause(rep, ClauseC3CheckpointOutcomes)
+		if cr == nil || cr.Status != StatusFailed {
+			t.Errorf("Expected Clause C3 FAILED on premature failed CheckStatus, got %+v", cr)
+		}
+	})
+
+	t.Run("Sabotage_C6_IgnoresFailureSignal", func(t *testing.T) {
+		faulty := &faultyEngine{
+			name:              "faulty-6-ignores-signal",
+			apiGroup:          engine.DefaultCRIUAPIGroup,
+			restoreAnnotation: engine.DefaultCRIUAPIGroup + "/ps-name",
+			runtimeClasses:    []string{"runc"},
+			provider:          validProvider,
+			verifyVerdict:     engine.RestoreVerdict{Outcome: engine.Restored, Confirmed: false}, // Always returns Restored, ignoring failure signal!
+			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
+		}
+		rep := runner.Evaluate(faulty)
+		if rep.Passed {
+			t.Errorf("Expected Report.Passed = false when verifier ignores failure signals")
+		}
+		cr := findClause(rep, ClauseC6RestoreOutcomeSignal)
+		if cr == nil || cr.Status != StatusFailed {
+			t.Errorf("Expected Clause C6 FAILED when ignoring failure signal, got %+v", cr)
+		}
+	})
+
+	t.Run("Sabotage_C2_CRIUAdmitsHostNetwork", func(t *testing.T) {
+		faulty := &faultyEngine{
+			name:              "criu",
+			apiGroup:          engine.DefaultCRIUAPIGroup,
+			restoreAnnotation: engine.DefaultCRIUAPIGroup + "/ps-name",
+			runtimeClasses:    []string{"runc"},
+			provider:          validProvider,
+			admitInvalid:      true, // Admits hostNetwork!
+			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
+		}
+		rep := runner.Evaluate(faulty)
+		if rep.Passed {
+			t.Errorf("Expected Report.Passed = false when CRIU admits hostNetwork")
+		}
+		cr := findClause(rep, ClauseC2Eligibility)
+		if cr == nil || cr.Status != StatusFailed {
+			t.Errorf("Expected Clause C2 FAILED on CRIU admitting hostNetwork, got %+v", cr)
+		}
+	})
+
+	t.Run("Sabotage_C7_ForeignClassOnly", func(t *testing.T) {
+		faulty := &faultyEngine{
+			name:              "faulty-7-foreign",
+			apiGroup:          engine.DefaultCRIUAPIGroup,
+			restoreAnnotation: engine.DefaultCRIUAPIGroup + "/ps-name",
+			runtimeClasses:    []string{"runc"},                           // only runc!
+			failures:          []restore.Engine{foreignClassClassifier{}}, // covers gvisor-v2!
+			provider:          validProvider,
+			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
+		}
+		rep := runner.Evaluate(faulty)
+		if rep.Passed {
+			t.Errorf("Expected Report.Passed = false on classifier covering only foreign runtime class")
+		}
+		cr := findClause(rep, ClauseC7FailureClassify)
+		if cr == nil || cr.Status != StatusFailed {
+			t.Errorf("Expected Clause C7 FAILED on foreign runtime class classifier, got %+v", cr)
 		}
 	})
 }

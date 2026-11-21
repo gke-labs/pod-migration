@@ -46,6 +46,9 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // ClauseID represents a formal clause identifier in the snapshot engine contract.
@@ -191,11 +194,53 @@ func defaultScheme() *runtime.Scheme {
 // Runner executes the engine contract conformance suite against an Engine.
 type Runner struct {
 	Scheme *runtime.Scheme
+	Client client.Client
 }
 
 // NewRunner creates a conformance Runner with default scheme configuration.
 func NewRunner() *Runner {
 	return &Runner{Scheme: defaultScheme()}
+}
+
+func getClient(eng engine.Engine, prov snapshot.Provider, r *Runner) client.Client {
+	type clientHolder interface {
+		Client() client.Client
+	}
+	type engineUnwrapper interface {
+		Unwrap() engine.Engine
+	}
+	type providerUnwrapper interface {
+		Unwrap() snapshot.Provider
+	}
+
+	currProv := prov
+	for currProv != nil {
+		if ch, ok := currProv.(clientHolder); ok && ch.Client() != nil {
+			return ch.Client()
+		}
+		if uw, ok := currProv.(providerUnwrapper); ok {
+			currProv = uw.Unwrap()
+		} else {
+			break
+		}
+	}
+
+	currEng := eng
+	for currEng != nil {
+		if ch, ok := currEng.(clientHolder); ok && ch.Client() != nil {
+			return ch.Client()
+		}
+		if uw, ok := currEng.(engineUnwrapper); ok {
+			currEng = uw.Unwrap()
+		} else {
+			break
+		}
+	}
+
+	if r != nil && r.Client != nil {
+		return r.Client
+	}
+	return nil
 }
 
 // Evaluate audits eng against contract clauses C1–C11 without testing.T dependencies.
@@ -417,8 +462,79 @@ func (r *Runner) auditC2Eligibility(eng engine.Engine) ClauseResult {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "ResolvePolicy empty cache", Passed: true, Message: "returned nil PolicyRef (allows clean cold fallback)"})
 	}
 
+	// 4. Engine-specific refusal invariants (CRIU C2)
+	if eng.Name() == engine.CRIUName {
+		readyNode := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "criu-ready-node",
+				Annotations: map[string]string{
+					engine.CRIUNodeReadyAnnotation: "true",
+				},
+			},
+		}
+
+		// a. hostNetwork pod refusal (#229)
+		hostNetPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "hostnet-pod", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "c1", Command: []string{"sh"}},
+				},
+				HostNetwork: true,
+				NodeName:    "criu-ready-node",
+			},
+		}
+		vHost := eng.Eligible(hostNetPod, readyNode)
+		if vHost.OK || !strings.Contains(strings.ToLower(vHost.Reason), "hostnetwork") {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CRIU hostNetwork refusal", Passed: false, Message: fmt.Sprintf("verdict=%+v; want OK=false with Reason mentioning hostNetwork", vHost)})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CRIU hostNetwork refusal", Passed: true, Message: fmt.Sprintf("refusal reason: %q", vHost.Reason)})
+		}
+
+		// b. multi-container pod refusal
+		multiPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "multicont-pod", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "c1", Command: []string{"sh"}},
+					{Name: "c2", Command: []string{"sh"}},
+				},
+				NodeName: "criu-ready-node",
+			},
+		}
+		vMulti := eng.Eligible(multiPod, readyNode)
+		if vMulti.OK || !strings.Contains(strings.ToLower(vMulti.Reason), "container") {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CRIU multi-container refusal", Passed: false, Message: fmt.Sprintf("verdict=%+v; want OK=false with Reason mentioning container", vMulti)})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CRIU multi-container refusal", Passed: true, Message: fmt.Sprintf("refusal reason: %q", vMulti.Reason)})
+		}
+
+		// c. nil node refusal
+		singlePod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "single-pod", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "c1", Command: []string{"sh"}},
+				},
+			},
+		}
+		vNilNode := eng.Eligible(singlePod, nil)
+		if vNilNode.OK || vNilNode.Reason == "" {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CRIU nil node refusal", Passed: false, Message: fmt.Sprintf("verdict=%+v; want OK=false with non-empty Reason", vNilNode)})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CRIU nil node refusal", Passed: true, Message: fmt.Sprintf("refusal reason: %q", vNilNode.Reason)})
+		}
+	}
+
 	if cr.Status == StatusPassed {
-		cr.Details = "Eligibility guard and policy resolution defaults verified."
+		if eng.Name() == engine.CRIUName {
+			cr.Details = "Nil pod guard, policy cache miss defaults, and CRIU refusal invariants (hostNetwork, multi-container, nil node) verified."
+		} else {
+			cr.Details = "Nil pod guard and policy resolution cache miss defaults verified."
+		}
 	} else {
 		cr.Details = "Contract C2 eligibility/policy resolution violations detected."
 	}
@@ -473,33 +589,251 @@ func (r *Runner) auditC3CheckpointOutcomes(eng engine.Engine) ClauseResult {
 		}
 	}
 
-	// Verify CheckStatus handles non-existent trigger cleanly (waiting/retryable in progress)
 	ctx := context.Background()
-	job := &pmv1alpha1.PodMigrationJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-job-c3",
-			Namespace: "default",
-			UID:       types.UID("job-c3-uid"),
+	cl := getClient(eng, prov, r)
+
+	// If no client is available, verify CheckStatus on absent trigger as a baseline.
+	if cl == nil {
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-job-c3",
+				Namespace: "default",
+				UID:       types.UID("job-c3-uid"),
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				TargetPodUID: "target-c3-uid",
+			},
+		}
+		st, err := prov.CheckStatus(ctx, job, "web-absent")
+		if err != nil {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: false, Message: fmt.Sprintf("CheckStatus returned error on absent trigger: %v", err)})
+		} else if st == nil || st.Phase != snapshot.PhaseInProgress {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: false, Message: fmt.Sprintf("expected PhaseInProgress on absent trigger, got: %+v", st)})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: true, Message: fmt.Sprintf("returns InProgress (phase=%s, reason=%q)", st.Phase, st.Reason)})
+		}
+		if cr.Status == StatusPassed {
+			cr.Details = fmt.Sprintf("Snapshot provider configured and aligned with API group %q.", eng.APIGroup())
+		} else {
+			cr.Details = "Contract C3 snapshot provider violations detected."
+		}
+		return cr
+	}
+
+	// When a client is available, drive CheckStatus over the canonical PodSnapshot lifecycle fixtures.
+	type fixtureCase struct {
+		name         string
+		subtestName  string
+		podName      string
+		targetUID    string
+		snapName     string
+		conditions   []map[string]interface{}
+		finalizers   []string
+		deleting     bool
+		omitSnapshot bool // trigger exists, but snapshot is gone (#269)
+		wantPhase    snapshot.Phase
+		wantReason   string
+		wantFound    *bool
+	}
+
+	tBool := true
+	fBool := false
+	nowTime := time.Now().UTC()
+	recentStr := nowTime.Format(time.RFC3339)
+
+	cases := []fixtureCase{
+		{
+			name:        "transient_ready_false",
+			subtestName: "CheckStatus transient Ready=False is retryable (#75/#95)",
+			podName:     "c3-transient",
+			targetUID:   "uid-transient",
+			snapName:    "snap-transient",
+			conditions: []map[string]interface{}{
+				{"type": "Checkpoint", "status": "False", "reason": "InProgress", "lastTransitionTime": recentStr},
+				{"type": "StorageReplicated", "status": "False", "reason": "AwaitingCheckpoint", "lastTransitionTime": recentStr},
+				{"type": "Ready", "status": "False", "reason": "Failed", "message": "transient race", "lastTransitionTime": recentStr},
+			},
+			wantPhase: snapshot.PhaseInProgress,
+			wantFound: &tBool,
 		},
-		Spec: pmv1alpha1.PodMigrationJobSpec{
-			TargetPodUID: "target-c3-uid",
+		{
+			name:        "refused",
+			subtestName: "CheckStatus Refused is terminal",
+			podName:     "c3-refused",
+			targetUID:   "uid-refused",
+			snapName:    "snap-refused",
+			conditions: []map[string]interface{}{
+				{"type": "Checkpoint", "status": "False", "reason": "Refused", "message": "unsupported pod shape"},
+				{"type": "Ready", "status": "False", "reason": "Refused", "message": "unsupported pod shape"},
+			},
+			wantPhase: snapshot.PhaseRefused,
+		},
+		{
+			name:        "cancel_requested",
+			subtestName: "CheckStatus CancelRequested is retryable",
+			podName:     "c3-cancel",
+			targetUID:   "uid-cancel",
+			snapName:    "snap-cancel",
+			conditions: []map[string]interface{}{
+				{"type": "Checkpoint", "status": "Unknown", "reason": "CancelRequested", "lastTransitionTime": recentStr},
+			},
+			wantPhase: snapshot.PhaseInProgress,
+			wantFound: &tBool,
+		},
+		{
+			name:        "checkpoint_timed_out",
+			subtestName: "CheckStatus CheckpointTimedOut is retryable",
+			podName:     "c3-timeout",
+			targetUID:   "uid-timeout",
+			snapName:    "snap-timeout",
+			conditions: []map[string]interface{}{
+				{"type": "Checkpoint", "status": "Unknown", "reason": "CheckpointTimedOut", "lastTransitionTime": recentStr},
+			},
+			wantPhase: snapshot.PhaseInProgress,
+			wantFound: &tBool,
+		},
+		{
+			name:        "being_deleted",
+			subtestName: "CheckStatus snapshot being deleted is retryable (#265)",
+			podName:     "c3-deleting",
+			targetUID:   "uid-deleting",
+			snapName:    "snap-deleting",
+			finalizers:  []string{"criu.podmigration.gke.io/archive-cleanup"},
+			deleting:    true,
+			conditions: []map[string]interface{}{
+				{"type": "Checkpoint", "status": "True", "reason": "Succeeded"},
+				{"type": "Ready", "status": "True", "reason": "AllSnapshotsAvailable"},
+			},
+			wantPhase:  snapshot.PhaseInProgress,
+			wantReason: snapshot.ReasonSnapshotDeleting,
+			wantFound:  &tBool,
+		},
+		{
+			name:         "snapshot_gone",
+			subtestName:  "CheckStatus snapshot gone is retryable with Found=false (#269)",
+			podName:      "c3-gone",
+			targetUID:    "uid-gone",
+			snapName:     "snap-gone",
+			omitSnapshot: true,
+			wantPhase:    snapshot.PhaseInProgress,
+			wantFound:    &fBool,
+		},
+		{
+			name:        "failed_terminal",
+			subtestName: "CheckStatus Failed is terminal",
+			podName:     "c3-failed",
+			targetUID:   "uid-failed",
+			snapName:    "snap-failed",
+			conditions: []map[string]interface{}{
+				{"type": "Checkpoint", "status": "False", "reason": "Failed", "message": "checkpointing container failed"},
+			},
+			wantPhase: snapshot.PhaseFailed,
 		},
 	}
-	st, err := prov.CheckStatus(ctx, job, "web-absent")
-	if err != nil {
-		cr.Status = StatusFailed
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: false, Message: fmt.Sprintf("CheckStatus returned error on absent trigger: %v", err)})
-	} else if st == nil || st.Phase != snapshot.PhaseInProgress {
-		cr.Status = StatusFailed
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: false, Message: fmt.Sprintf("expected PhaseInProgress on absent trigger, got: %+v", st)})
-	} else {
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus absent trigger", Passed: true, Message: fmt.Sprintf("returns InProgress (phase=%s, reason=%q)", st.Phase, st.Reason)})
+
+	triggerGVK := snapshot.ManualTriggerGVK(eng.APIGroup())
+	snapshotGVK := snapshot.PodSnapshotGVK(eng.APIGroup())
+	jobNamespace := "default"
+
+	for _, tc := range cases {
+		job := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("job-%s", tc.name),
+				Namespace: jobNamespace,
+				UID:       types.UID(fmt.Sprintf("job-%s-uid", tc.name)),
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				TargetPodUID: tc.targetUID,
+			},
+		}
+		triggerName := util.FormatPSMTName(tc.podName, tc.targetUID)
+
+		// Create trigger pointing to tc.snapName
+		trig := &unstructured.Unstructured{}
+		trig.SetGroupVersionKind(triggerGVK)
+		trig.SetName(triggerName)
+		trig.SetNamespace(jobNamespace)
+		_ = unstructured.SetNestedField(trig.Object, tc.snapName, "status", "snapshotCreated", "name")
+		if err := cl.Create(ctx, trig); err != nil {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: tc.subtestName, Passed: false, Message: fmt.Sprintf("failed to create trigger: %v", err)})
+			continue
+		}
+
+		var snap *unstructured.Unstructured
+		if !tc.omitSnapshot {
+			snap = &unstructured.Unstructured{}
+			snap.SetGroupVersionKind(snapshotGVK)
+			snap.SetName(tc.snapName)
+			snap.SetNamespace(jobNamespace)
+			if len(tc.finalizers) > 0 {
+				snap.SetFinalizers(tc.finalizers)
+			}
+			if tc.deleting {
+				delTime := metav1.Now()
+				snap.SetDeletionTimestamp(&delTime)
+			}
+			if len(tc.conditions) > 0 {
+				condSlice := make([]interface{}, len(tc.conditions))
+				for i, c := range tc.conditions {
+					condSlice[i] = c
+				}
+				_ = unstructured.SetNestedSlice(snap.Object, condSlice, "status", "conditions")
+			}
+			if err := cl.Create(ctx, snap); err != nil {
+				cr.Status = StatusFailed
+				cr.Subtests = append(cr.Subtests, SubtestResult{Name: tc.subtestName, Passed: false, Message: fmt.Sprintf("failed to create snapshot: %v", err)})
+				_ = cl.Delete(ctx, trig)
+				continue
+			}
+			if tc.deleting {
+				// Deleting an object with finalizers in fake.Client sets metadata.deletionTimestamp
+				_ = cl.Delete(ctx, snap)
+			}
+		}
+
+		st, err := prov.CheckStatus(ctx, job, tc.podName)
+
+		// Clean up created objects immediately
+		_ = cl.Delete(ctx, trig)
+		if snap != nil {
+			currentSnap := &unstructured.Unstructured{}
+			currentSnap.SetGroupVersionKind(snapshotGVK)
+			if err := cl.Get(ctx, types.NamespacedName{Namespace: jobNamespace, Name: tc.snapName}, currentSnap); err == nil {
+				if len(currentSnap.GetFinalizers()) > 0 {
+					currentSnap.SetFinalizers(nil)
+					_ = cl.Update(ctx, currentSnap)
+				}
+				_ = cl.Delete(ctx, currentSnap)
+			}
+		}
+
+		if err != nil {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: tc.subtestName, Passed: false, Message: fmt.Sprintf("CheckStatus returned error: %v", err)})
+		} else if st == nil {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: tc.subtestName, Passed: false, Message: "CheckStatus returned nil status"})
+		} else if st.Phase != tc.wantPhase {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: tc.subtestName, Passed: false, Message: fmt.Sprintf("got Phase=%s (reason=%q), want Phase=%s", st.Phase, st.Reason, tc.wantPhase)})
+		} else if tc.wantReason != "" && st.Reason != tc.wantReason {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: tc.subtestName, Passed: false, Message: fmt.Sprintf("got Reason=%q, want Reason=%q", st.Reason, tc.wantReason)})
+		} else if tc.wantFound != nil && st.Found != *tc.wantFound {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: tc.subtestName, Passed: false, Message: fmt.Sprintf("got Found=%v, want Found=%v", st.Found, *tc.wantFound)})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: tc.subtestName, Passed: true, Message: fmt.Sprintf("phase=%s, reason=%q, found=%v", st.Phase, st.Reason, st.Found)})
+		}
 	}
 
 	if cr.Status == StatusPassed {
-		cr.Details = fmt.Sprintf("Snapshot provider configured and aligned with API group %q.", eng.APIGroup())
+		cr.Details = fmt.Sprintf("Snapshot provider aligned with API group %q; terminal and retryable outcomes verified across lifecycle fixtures (#75, #95, #265, #269).", eng.APIGroup())
 	} else {
-		cr.Details = "Contract C3 snapshot provider violations detected."
+		cr.Details = "Contract C3 snapshot provider or CheckStatus outcome classification violations detected."
 	}
 	return cr
 }
@@ -570,11 +904,11 @@ func (r *Runner) auditC4SourceFencing(eng engine.Engine) ClauseResult {
 	return cr
 }
 
-// auditC5RestoreOrder audits Clause C5: Restore order and exactly-once restore.
+// auditC5RestoreOrder audits Clause C5: Restore order.
 func (r *Runner) auditC5RestoreOrder(eng engine.Engine) ClauseResult {
 	cr := ClauseResult{
 		ID:       ClauseC5RestoreOrder,
-		Title:    "Restore order and exactly-once restore",
+		Title:    "Restore order",
 		Required: true,
 		Status:   StatusPassed,
 	}
@@ -688,7 +1022,11 @@ func (r *Runner) auditC5RestoreOrder(eng engine.Engine) ClauseResult {
 	}
 
 	if cr.Status == StatusPassed {
-		cr.Details = fmt.Sprintf("Restore order annotation round-trip verified (key=%q). Declares RestoreOnce=%v.", eng.RestoreAnnotation(), eng.Guarantees().RestoreOnce)
+		if eng.Guarantees().RestoreOnce {
+			cr.Details = fmt.Sprintf("Restore order annotation round-trip verified (key=%q); declares RestoreOnce=true.", eng.RestoreAnnotation())
+		} else {
+			cr.Details = fmt.Sprintf("Restore order annotation round-trip verified (key=%q); at-most-once restore not declared (RestoreOnce=false).", eng.RestoreAnnotation())
+		}
 	} else {
 		cr.Details = "Contract C5 restore order annotation or validation violations detected."
 	}
@@ -765,10 +1103,63 @@ func (r *Runner) auditC6RestoreOutcomeSignal(eng engine.Engine) ClauseResult {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore ready pod without signal", Passed: true, Message: fmt.Sprintf("Confirmed=false maintained without positive signal (outcome=%s)", verdictReady.Outcome)})
 	}
 
-	if cr.Status == StatusPassed {
-		cr.Details = "RestoreVerifier outcome signals and evidence requirements verified."
+	// 4. Failure signal check: pod with restore failure signal must yield ColdStart
+	cl := getClient(eng, nil, r)
+	failedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "repl-failed-signal",
+			Namespace: "default",
+			UID:       types.UID("repl-failed-signal-uid"),
+			Annotations: map[string]string{
+				"pod-migrate.io/psengine-restore": "failed",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+	var warningEvt *corev1.Event
+	if cl != nil {
+		warningEvt = &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "repl-failed-signal-warning",
+				Namespace: failedPod.Namespace,
+			},
+			InvolvedObject: corev1.ObjectReference{
+				UID:       failedPod.UID,
+				Name:      failedPod.Name,
+				Namespace: failedPod.Namespace,
+			},
+			Type:          corev1.EventTypeWarning,
+			Reason:        "FailedRestore",
+			Message:       "failed to restore snapshot; falling back to a cold start",
+			LastTimestamp: metav1.Now(),
+		}
+		_ = cl.Create(ctx, warningEvt)
+	}
+
+	verdictFail, errFail := verifier.VerifyRestore(ctx, job, failedPod)
+	if warningEvt != nil && cl != nil {
+		_ = cl.Delete(ctx, warningEvt)
+	}
+
+	if errFail != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore failure signal yields ColdStart", Passed: false, Message: fmt.Sprintf("error: %v", errFail)})
+	} else if verdictFail.Outcome != engine.ColdStart {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore failure signal yields ColdStart", Passed: false, Message: fmt.Sprintf("got outcome %s, want ColdStart", verdictFail.Outcome)})
 	} else {
-		cr.Details = "Contract C6 restore outcome signal violations detected."
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "VerifyRestore failure signal yields ColdStart", Passed: true, Message: fmt.Sprintf("ColdStart confirmed on failure signal (reason: %q)", verdictFail.Reason)})
+	}
+
+	if cr.Status == StatusPassed {
+		cr.Details = "RestoreVerifier outcome signals, unconfirmed ready pod requirements, and ColdStart failure signals verified."
+	} else {
+		cr.Details = "Contract C6 restore outcome signal or ColdStart failure classification violations detected."
 	}
 	return cr
 }
@@ -818,6 +1209,25 @@ func (r *Runner) auditC7FailureClassification(eng engine.Engine) ClauseResult {
 			continue
 		}
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Classifier RuntimeClassScoped", Passed: true, Message: fmt.Sprintf("%q implements RuntimeClassScoped", rfName)})
+
+		// A classifier must cover at least one runtime class served by the engine
+		coversOwn := false
+		for _, ownClass := range eng.RuntimeClasses() {
+			if scoped.CoversRuntimeClass(ownClass) {
+				coversOwn = true
+				break
+			}
+		}
+		if !coversOwn {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{
+				Name:    "Classifier runtime class coverage",
+				Passed:  false,
+				Message: fmt.Sprintf("classifier %q covers none of engine %s own runtime classes %v", rfName, eng.Name(), eng.RuntimeClasses()),
+			})
+			continue
+		}
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Classifier runtime class coverage", Passed: true, Message: fmt.Sprintf("%q covers served runtime class(es)", rfName)})
 
 		// Probe standard classes, engine's own classes, DefaultRuntimeClassToken, and an unsupported sentinel
 		checkClasses := []string{

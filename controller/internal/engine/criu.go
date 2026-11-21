@@ -96,6 +96,17 @@ func NewCRIU(c client.Client, scheme *runtime.Scheme, apiGroup string) (*CRIU, e
 	}, nil
 }
 
+// Client returns the controller-runtime client used by the engine.
+func (e *CRIU) Client() client.Client {
+	if e == nil {
+		return nil
+	}
+	if c, ok := e.reader.(client.Client); ok {
+		return c
+	}
+	return nil
+}
+
 // Name implements Engine.
 func (*CRIU) Name() string { return CRIUName }
 
