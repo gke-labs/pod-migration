@@ -16,6 +16,7 @@
 package psengine
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5" //nolint:gosec
 	"encoding/base64"
@@ -152,6 +153,34 @@ func (m *memStore) Get(_ context.Context, bucket, object string) (io.ReadCloser,
 func (m *memStore) Delete(_ context.Context, bucket, object string) error {
 	delete(m.objects, bucket+"/"+object)
 	return nil
+}
+
+func (m *memStore) Compose(_ context.Context, bucket, destination string, sources []string) (*ObjectInfo, error) {
+	var combined []byte
+	for _, src := range sources {
+		data, ok := m.objects[bucket+"/"+src]
+		if !ok {
+			return nil, errors.New("not found: " + src)
+		}
+		combined = append(combined, data...)
+	}
+	m.objects[bucket+"/"+destination] = combined
+	m.order = append(m.order, destination)
+	return &ObjectInfo{Bytes: int64(len(combined)), MD5: md5b64(combined)}, nil
+}
+
+func (m *memStore) GetRange(_ context.Context, bucket, object string, start, end int64) (io.ReadCloser, error) {
+	data, ok := m.objects[bucket+"/"+object]
+	if !ok {
+		return nil, errors.New("not found: " + object)
+	}
+	if start > int64(len(data)) {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	if end < 0 || end >= int64(len(data)) {
+		end = int64(len(data)) - 1
+	}
+	return io.NopCloser(bytes.NewReader(data[start : end+1])), nil
 }
 
 // failingStore fails Put on objects whose name contains failSubstr —

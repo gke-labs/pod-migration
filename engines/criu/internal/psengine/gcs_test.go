@@ -69,6 +69,40 @@ func (f *fakeGCS) handler() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]string{"size": fmt.Sprint(len(data)), "md5Hash": md5b64})
 	})
 	mux.HandleFunc("/api/b/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/compose") && r.Method == http.MethodPost {
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/b/"), "/")
+			bucket := parts[0]
+			destPath := strings.TrimSuffix(strings.Join(parts[2:], "/"), "/compose")
+			var req struct {
+				SourceObjects []struct {
+					Name string `json:"name"`
+				} `json:"sourceObjects"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			f.mu.Lock()
+			var combined []byte
+			for _, s := range req.SourceObjects {
+				data, ok := f.objects[bucket+"/"+s.Name]
+				if !ok {
+					f.mu.Unlock()
+					http.Error(w, "source not found: "+s.Name, http.StatusNotFound)
+					return
+				}
+				combined = append(combined, data...)
+			}
+			f.objects[bucket+"/"+destPath] = combined
+			f.mu.Unlock()
+			sum := md5.Sum(combined) //nolint:gosec
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"size":    fmt.Sprint(len(combined)),
+				"md5Hash": base64.StdEncoding.EncodeToString(sum[:]),
+			})
+			return
+		}
+
 		parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/api/b/"), "/o/", 2)
 		if len(parts) != 2 {
 			http.Error(w, "bad path", http.StatusBadRequest)
@@ -83,6 +117,19 @@ func (f *fakeGCS) handler() http.Handler {
 			if !ok {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
+			}
+			rangeHdr := r.Header.Get("Range")
+			if rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") {
+				rangeSpec := strings.TrimPrefix(rangeHdr, "bytes=")
+				var start, end int64
+				if _, err := fmt.Sscanf(rangeSpec, "%d-%d", &start, &end); err == nil {
+					if end >= int64(len(data)) {
+						end = int64(len(data)) - 1
+					}
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = w.Write(data[start : end+1])
+					return
+				}
 			}
 			_, _ = w.Write(data)
 		case http.MethodDelete:

@@ -606,7 +606,7 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	if err != nil {
 		return err
 	}
-	n, err := VerifiedPut(ctx, r.Store, spec.Bucket, path.Join(prefix, "checkpoint.tar"), f)
+	n, err := ParallelVerifiedPut(ctx, r.Store, spec.Bucket, path.Join(prefix, "checkpoint.tar"), f, tarBytes)
 	f.Close()
 	if c := cancelledAt("during the upload"); c != nil {
 		return c
