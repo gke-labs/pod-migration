@@ -45,6 +45,7 @@ def main():
 
     clusterrole_sub_count = 0
     webhook_sub_count = 0
+    policy_sub_count = 0
     for i, doc in enumerate(documents):
         if re.search(r'^kind: ClusterRole\s*$', doc, re.MULTILINE) and re.search(r'^\s*name:\s*pod-migration-controller-role\s*$', doc, re.MULTILINE):
             documents[i] = role_content + '\n'
@@ -58,6 +59,17 @@ def main():
                 sys.exit(1)
             webhook_sub_count += count
             documents[i] = new_doc
+        elif re.search(r'^kind: ValidatingAdmissionPolicy\s*$', doc, re.MULTILINE):
+            # An admission policy's spec.matchConstraints.namespaceSelector is
+            # at the same depth as a webhook's, so the same pattern applies.
+            pattern = r'(    namespaceSelector:\n      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
+            formatted = format_namespace_selector(indent=4) + '\n'
+            new_doc, count = re.subn(pattern, formatted, doc)
+            if count == 0:
+                print(f"Error: namespaceSelector replacement failed in admission policy document {i}", file=sys.stderr)
+                sys.exit(1)
+            policy_sub_count += count
+            documents[i] = new_doc
 
     if clusterrole_sub_count != 1:
         print(f"Error: Expected exactly 1 ClusterRole (name: pod-migration-controller-role) replacement, got {clusterrole_sub_count}", file=sys.stderr)
@@ -68,11 +80,16 @@ def main():
         print(f"Error: Expected 4 webhook namespaceSelector replacements, got {webhook_sub_count}", file=sys.stderr)
         sys.exit(1)
 
+    # The restore order policy (pod-migration-restore-order).
+    if policy_sub_count != 1:
+        print(f"Error: Expected 1 admission policy namespaceSelector replacement, got {policy_sub_count}", file=sys.stderr)
+        sys.exit(1)
+
     new_deploy_content = '---\n'.join(documents)
     with open('deploy.yaml', 'w') as f:
         f.write(new_deploy_content)
 
-    print("Successfully assembled deploy.yaml with config/rbac/role.yaml and webhook namespace selectors")
+    print("Successfully assembled deploy.yaml with config/rbac/role.yaml and webhook and admission policy namespace selectors")
 
 if __name__ == '__main__':
     main()

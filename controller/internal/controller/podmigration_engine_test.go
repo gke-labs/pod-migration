@@ -38,6 +38,7 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/restore"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 // renderingEngine is an engine whose NamespaceResources returns fixed
@@ -565,5 +566,226 @@ func TestPodMigrationReconciler_DeletesEveryEngineResources(t *testing.T) {
 	got := &pmv1alpha1.PodMigration{}
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(config), got); !apierrors.IsNotFound(err) {
 		t.Errorf("the PodMigration is still there (finalizers %v, error %v), want it gone", got.Finalizers, err)
+	}
+}
+
+// renderForLookup renders an engine's objects for a PodMigration whose
+// storage location the engine rejects, with a placeholder location: their
+// kinds, namespaces and names are those of the objects synced before the
+// location was edited (#233). Any other render error is returned as is.
+func TestRenderForLookup(t *testing.T) {
+	criu, err := engine.NewCRIU(nil, nil, engine.CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	valid := engineTestPodMigration("gs://my-test-bucket/snapshots")
+	want, err := criu.NamespaceResources(valid)
+	if err != nil {
+		t.Fatalf("NamespaceResources: %v", err)
+	}
+	identity := func(objs []*unstructured.Unstructured) []string {
+		var out []string
+		for _, o := range objs {
+			out = append(out, o.GroupVersionKind().String()+" "+o.GetNamespace()+"/"+o.GetName())
+		}
+		return out
+	}
+
+	t.Run("a valid location renders as usual", func(t *testing.T) {
+		got, err := renderForLookup(criu, valid)
+		if err != nil {
+			t.Fatalf("renderForLookup: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("renderForLookup = %v, want the engine's own rendering %v", got, want)
+		}
+	})
+
+	for _, location := range []string{"", "not-a-gcs-uri", "s3://bucket", "gs://", "gs:///path"} {
+		t.Run("rejected location "+location, func(t *testing.T) {
+			pm := engineTestPodMigration(location)
+			got, err := renderForLookup(criu, pm)
+			if err != nil {
+				t.Fatalf("renderForLookup: %v", err)
+			}
+			if !reflect.DeepEqual(identity(got), identity(want)) {
+				t.Errorf("renderForLookup renders %v, want the objects synced for a valid location %v", identity(got), identity(want))
+			}
+			if pm.Spec.Storage.Location != location {
+				t.Errorf("renderForLookup changed the PodMigration's location to %q", pm.Spec.Storage.Location)
+			}
+		})
+	}
+
+	t.Run("another render error is returned", func(t *testing.T) {
+		renderErr := errors.New("render failed")
+		got, err := renderForLookup(&renderingEngine{err: renderErr}, valid)
+		if !errors.Is(err, renderErr) || got != nil {
+			t.Errorf("renderForLookup = %v, %v; want no objects and %v", got, err, renderErr)
+		}
+	})
+
+	t.Run("an engine that rejects the placeholder too renders nothing", func(t *testing.T) {
+		locationErr := &engine.StorageLocationError{Location: "x", Message: "never valid"}
+		got, err := renderForLookup(&renderingEngine{err: locationErr}, valid)
+		var gotErr *engine.StorageLocationError
+		if !errors.As(err, &gotErr) || got != nil {
+			t.Errorf("renderForLookup = %v, %v; want no objects and the *StorageLocationError", got, err)
+		}
+	})
+
+	t.Run("a nil PodMigration", func(t *testing.T) {
+		if got, err := renderForLookup(criu, nil); err == nil || got != nil {
+			t.Errorf("renderForLookup(nil) = %v, %v; want an error", got, err)
+		}
+	})
+}
+
+// A PodMigration's storage location can be edited to one that the engines
+// reject after their objects were synced. Deleting it must still wait for a
+// CRIU migration in flight, and then delete the CRIU policy and storage
+// config: their names don't depend on the location (#233).
+func TestPodMigrationReconciler_DeletionAfterInvalidLocationEdit(t *testing.T) {
+	for _, location := range []string{"gs://", "gs:///snapshots", "not-a-gcs-uri", ""} {
+		t.Run("location "+location, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = pmv1alpha1.AddToScheme(scheme)
+
+			// The objects as they were synced, while the location was valid.
+			config := engineTestPodMigration("gs://my-test-bucket/snapshots")
+			gkeObjects, err := engine.NewGKEPodSnapshots(nil, nil).NamespaceResources(config)
+			if err != nil {
+				t.Fatalf("GKE Pod Snapshots NamespaceResources: %v", err)
+			}
+			criuForRender, err := engine.NewCRIU(nil, nil, engine.CRIUAPIGroup)
+			if err != nil {
+				t.Fatalf("NewCRIU: %v", err)
+			}
+			criuObjects, err := criuForRender.NamespaceResources(config)
+			if err != nil {
+				t.Fatalf("CRIU NamespaceResources: %v", err)
+			}
+
+			// Then the location is edited, and the PodMigration deleted.
+			config.Spec.Storage.Location = location
+			config.Finalizers = []string{StorageCleanupFinalizer}
+			now := metav1.Now()
+			config.DeletionTimestamp = &now
+
+			// The eviction gate records only the policy that serves a job
+			// (#185). For a CRIU job that is the CRIU policy, which only the
+			// engine's rendering names.
+			job := &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: config.Namespace,
+					Name:      "pmj-counter-0-abcd1234",
+					Annotations: map[string]string{
+						util.AnnotationPodSnapshotPolicy: engine.CRIUPodSnapshotPolicyName(config.Name),
+					},
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting},
+			}
+
+			objects := []client.Object{config, job}
+			for _, o := range append(append([]*unstructured.Unstructured{}, gkeObjects...), criuObjects...) {
+				objects = append(objects, o.DeepCopy())
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).
+				WithStatusSubresource(&pmv1alpha1.PodMigration{}, &pmv1alpha1.PodMigrationJob{}).Build()
+			criu, err := engine.NewCRIU(c, scheme, engine.CRIUAPIGroup)
+			if err != nil {
+				t.Fatalf("NewCRIU: %v", err)
+			}
+			registry := mustRoutedRegistry(t, "gvisor="+engine.GKEPodSnapshotsName+",@default="+engine.CRIUName,
+				engine.NewGKEPodSnapshots(c, scheme), criu)
+			r := &PodMigrationReconciler{Client: c, Scheme: scheme, Engines: registry}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(config)}
+
+			// 1. The CRIU job is in flight: the deletion waits, and nothing
+			// is deleted under it.
+			res, err := r.Reconcile(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Reconcile with a job in flight: %v", err)
+			}
+			if res.RequeueAfter == 0 {
+				t.Errorf("Reconcile with a CRIU job in flight didn't requeue: the deletion wasn't deferred")
+			}
+			if cond := readyCondition(t, c, config); cond == nil || cond.Reason != "DeletionBlockedByInFlightMigrations" {
+				t.Errorf("Ready condition with a CRIU job in flight = %+v, want reason DeletionBlockedByInFlightMigrations", cond)
+			}
+			for _, o := range append(append([]*unstructured.Unstructured{}, gkeObjects...), criuObjects...) {
+				if !objectExists(t, c, o) {
+					t.Errorf("%s %s was deleted while a CRIU job is in flight", o.GetKind(), o.GetName())
+				}
+			}
+
+			// 2. The job ends: the deletion goes on, and deletes the CRIU
+			// objects with GKE Pod Snapshots'.
+			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
+			if err := c.Status().Update(context.Background(), job); err != nil {
+				t.Fatalf("ending the job: %v", err)
+			}
+			if _, err := r.Reconcile(context.Background(), req); err != nil {
+				t.Fatalf("Reconcile after the job ended: %v", err)
+			}
+			for _, o := range criuObjects {
+				if objectExists(t, c, o) {
+					t.Errorf("CRIU %s %s wasn't deleted", o.GetKind(), o.GetName())
+				}
+			}
+			for _, o := range gkeObjects {
+				if objectExists(t, c, o) {
+					t.Errorf("GKE Pod Snapshots' %s %s wasn't deleted", o.GetKind(), o.GetName())
+				}
+			}
+			got := &pmv1alpha1.PodMigration{}
+			if err := c.Get(context.Background(), req.NamespacedName, got); !apierrors.IsNotFound(err) {
+				t.Errorf("the PodMigration is still there (finalizers %v, error %v), want it gone", got.Finalizers, err)
+			}
+		})
+	}
+}
+
+// A CRIU storage config that another PodMigration rendered under the same
+// name (OwnerUIDLabel) is kept, also when the location is invalid.
+func TestPodMigrationReconciler_DeletionAfterInvalidLocationEditKeepsOthersObjects(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+	config := engineTestPodMigration("gs://my-test-bucket/snapshots")
+	criuForRender, err := engine.NewCRIU(nil, nil, engine.CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	criuObjects, err := criuForRender.NamespaceResources(config)
+	if err != nil {
+		t.Fatalf("CRIU NamespaceResources: %v", err)
+	}
+	storage, policy := criuObjects[0].DeepCopy(), criuObjects[1].DeepCopy()
+	labels := storage.GetLabels()
+	labels[engine.OwnerUIDLabel] = "another-podmigration"
+	storage.SetLabels(labels)
+
+	config.Spec.Storage.Location = "gs://"
+	config.Finalizers = []string{StorageCleanupFinalizer}
+	now := metav1.Now()
+	config.DeletionTimestamp = &now
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config, storage, policy).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).Build()
+	criu, err := engine.NewCRIU(c, scheme, engine.CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	registry := mustRoutedRegistry(t, "gvisor="+engine.GKEPodSnapshotsName+",@default="+engine.CRIUName,
+		engine.NewGKEPodSnapshots(c, scheme), criu)
+	r := &PodMigrationReconciler{Client: c, Scheme: scheme, Engines: registry}
+	if err := reconcileEngineTestPodMigration(t, r, config); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !objectExists(t, c, storage) {
+		t.Errorf("the CRIU storage config labeled for another PodMigration was deleted")
+	}
+	if objectExists(t, c, policy) {
+		t.Errorf("the CRIU policy wasn't deleted")
 	}
 }

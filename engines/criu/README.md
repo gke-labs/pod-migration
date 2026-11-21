@@ -195,6 +195,12 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      (`node.AdaptSpec`), restores the process tree as a sibling `runc` container
      joining the holder's network/IPC/UTS namespaces, and stamps
      `pod-migrate.io/psengine-restore: restored` (or `failed`).
+     On an existing pod, only the agent may write this annotation, and only
+     once: the `pod-migrate-psengine-restore-status`
+     `ValidatingAdmissionPolicy` in `deploy/deploy.yaml` denies every other
+     write, change or removal (#233). To edit it by hand, delete the
+     `ValidatingAdmissionPolicyBinding` of the same name first, and apply
+     `deploy/deploy.yaml` again afterwards.
 3. **`cmd/holder` (static scratch binary):**
    - Seeded into replacement pods via an `initContainer` (`/holder seed`).
    - Wraps the replacement container's entrypoint (`/holder wrap`): reads
@@ -324,6 +330,10 @@ they start cold instead of being restored; also delete the
   - Single migration per pod instance: migrating an already-restored CRIU pod
     or holder-injected replacement is refused so the orchestrator falls back
     to a clean cold start without checkpointing the holder wrapper ([#121](https://github.com/gke-labs/pod-migration/issues/121)).
+  - The orchestrator checks the pod-level limits above itself before it starts
+    a migration (`CRIU.Eligible` in `controller/internal/engine/criu.go`):
+    a pod outside them is evicted without a migration, instead of going
+    through a `429` and a refused trigger first (#233).
 
 ## What Installing the Engine Changes on a Node
 

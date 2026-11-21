@@ -118,7 +118,7 @@ func TestEvictionGate_SideBySideGVisorAndCRIUAPIGroups(t *testing.T) {
 		Spec: corev1.PodSpec{
 			RuntimeClassName: &gvisorClass,
 			NodeName:         unreadyNode.Name, // gVisor does not read source Node
-			Containers:       []corev1.Container{{Name: "app"}},
+			Containers:       []corev1.Container{{Name: "app", Command: []string{"/app"}}},
 		},
 	}
 	criuReadyPod := &corev1.Pod{
@@ -130,7 +130,7 @@ func TestEvictionGate_SideBySideGVisorAndCRIUAPIGroups(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{
 			NodeName:   readyNode.Name,
-			Containers: []corev1.Container{{Name: "app"}},
+			Containers: []corev1.Container{{Name: "app", Command: []string{"/app"}}},
 		},
 	}
 	criuUnreadyPod := &corev1.Pod{
@@ -142,7 +142,7 @@ func TestEvictionGate_SideBySideGVisorAndCRIUAPIGroups(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{
 			NodeName:   unreadyNode.Name,
-			Containers: []corev1.Container{{Name: "app"}},
+			Containers: []corev1.Container{{Name: "app", Command: []string{"/app"}}},
 		},
 	}
 
@@ -248,7 +248,7 @@ func TestEvictionGate_SideBySideGVisorAndCRIUAPIGroups(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{
 			NodeName:   "vanished-node",
-			Containers: []corev1.Container{{Name: "app"}},
+			Containers: []corev1.Container{{Name: "app", Command: []string{"/app"}}},
 		},
 	}
 	if err := cl.Create(context.Background(), missingNodePod); err != nil {
@@ -304,7 +304,7 @@ func criuMissingOrTransientPod() *corev1.Pod {
 		},
 		Spec: corev1.PodSpec{
 			NodeName:   "node-criu-ready",
-			Containers: []corev1.Container{{Name: "app"}},
+			Containers: []corev1.Container{{Name: "app", Command: []string{"/app"}}},
 		},
 	}
 }

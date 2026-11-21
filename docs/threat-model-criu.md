@@ -103,12 +103,17 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
 
 A central risk in process checkpoint and restore is **unauthorized privilege gain**: restoring an unprivileged container into a higher-privileged configuration, or an archive injecting malicious mounts, devices, or capabilities into a destination host. Process restoration is governed by strict boundaries (tracked in [#129](https://github.com/gke-labs/pod-migration/issues/129)):
 
-### R1. Authorization & Admission Validation (Partial Enforcement; see #233)
+### R1. Authorization & Admission Validation
 
 - **Work Order & PMJ Verification**: At `CREATE`, `/psengine-restore-inject` (`RestoreInjector`) injects the holder wrapper only into gated single-container `runc`/default pods (outside `kube-system`, `pod-migration-system`, and `pod-migration-criu-system`) whose assigned `PodMigrationJob` (`get` on `podmigrationjobs`) carries `pod-migration.gke.io/engine: criu` (#135). At restore time, the node agent restores a pod only after verifying that the target pod carries a restore order annotation (`<group>/ps-name`) matching an authorized work order whose referenced `PodMigrationJob` is either actively `Restoring` or `Succeeded` (warm-retry fallback window).
-- **Partial Admission Boundaries (Known Gap: #233)**: Today, admission-level authorization is **partial**:
-  - The replacement webhook (`PodGateInjector`) only intercepts `CREATE` requests. For Kubeflow and third-party orchestration interop, it intentionally preserves pre-existing, non-empty `podsnapshot.gke.io/ps-name` annotations when no matching PMJ is found, rather than unconditionally stripping them.
-  - Furthermore, post-creation annotation tampering (mutating or injecting restore annotations onto running pods) is not currently blocked at admission time. Issue [#233](https://github.com/gke-labs/pod-migration/issues/233) tracks enforcing strict admission and mutating validation to prevent post-creation annotation tampering and enforce controller-only binding.
+- **Admission Boundaries at `CREATE`**: The replacement webhook (`PodGateInjector`) only intercepts `CREATE` requests. For Kubeflow and third-party orchestration interop, it intentionally preserves pre-existing, non-empty `podsnapshot.gke.io/ps-name` annotations when no matching PMJ is found, rather than unconditionally stripping them.
+- **Admission Boundaries on `UPDATE` (#233)**: Two `ValidatingAdmissionPolicy` objects block tampering with restore annotations on existing pods. The API server evaluates them itself, so they don't depend on a webhook being up, and their `matchConditions` skip every update that leaves the protected annotations as they are. They cover updates of a pod and of its `status` subresource, since a status write can change annotations too.
+  - `pod-migration-restore-order` (in `controller/deploy.yaml`): on a pod opted into migration (`pod-migration.gke.io/enabled: "true"` before or after the update), only the controller's service account may set, change or remove a restore order (`<group>/ps-name`, for any engine's group).
+  - `pod-migrate-psengine-restore-status` (in `engines/criu/deploy/deploy.yaml`): only the node agent's service account may record a restore outcome (`pod-migrate.io/psengine-restore`), only once, and only as `restored` or `failed`. Nobody may change or remove it afterwards.
+- **Remaining Gaps**:
+  - A pod that opts out (its opt-in label is removed, which stays allowed) leaves the scope of `pod-migration-restore-order`. A restore order set on it afterwards is a restore outside a migration. The node agent's work order check above still applies to it.
+  - Engine annotations that a pod already carries when it is created (`pod-migrate.io/psengine-restore`, `pod-migrate.io/psengine-injected`) aren't removed. They come from the pod's own template, so they affect only that pod: it starts cold, or its holder waits without a restore.
+  - Whoever may delete a `ValidatingAdmissionPolicyBinding` (a cluster admin) can lift a policy. That is also the way to edit these annotations by hand in an emergency.
 
 ### R2. Archive Integrity vs. Provenance (Integrity Only; see #129 R2)
 

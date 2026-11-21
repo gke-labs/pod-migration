@@ -423,3 +423,90 @@ webhooks:
         operations: ["CREATE"]
         resources: ["pods"]
         scope: Namespaced
+---
+# The restore outcome on a pod (#233). The node agent records it once in
+# pod-migrate.io/psengine-restore: "restored" or "failed". The holder reads it to
+# continue as the restored process or to start cold, and the engine and the
+# orchestrator read it to judge the restore. So on an existing pod, only the
+# agent may write it, only once, and nobody may change or remove it afterwards.
+#
+# It is an admission policy, not a webhook: the API server evaluates it
+# itself, so it doesn't depend on the engine being up. matchConditions skip
+# every update that leaves the annotation as it is, the kubelet's status
+# writes included.
+#
+# To edit the annotation by hand in an emergency, delete the binding below,
+# and apply it again afterwards.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: pod-migrate-psengine-restore-status
+  labels:
+    pod-migrate.io/component: psengine
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        # A write to pods/status can change annotations too.
+        resources: ["pods", "pods/status"]
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - pod-migration-system
+            - pod-migration-criu-system
+  matchConditions:
+    # True when the annotation is added, changed or removed.
+    - name: restore-status-changed
+      expression: >-
+        (has(object.metadata.annotations) &&
+        'pod-migrate.io/psengine-restore' in object.metadata.annotations)
+        !=
+        (has(oldObject.metadata.annotations) &&
+        'pod-migrate.io/psengine-restore' in oldObject.metadata.annotations)
+        ||
+        (has(object.metadata.annotations) &&
+        'pod-migrate.io/psengine-restore' in object.metadata.annotations &&
+        has(oldObject.metadata.annotations) &&
+        'pod-migrate.io/psengine-restore' in oldObject.metadata.annotations &&
+        object.metadata.annotations['pod-migrate.io/psengine-restore'] !=
+        oldObject.metadata.annotations['pod-migrate.io/psengine-restore'])
+  validations:
+    # The node agent's service account: the namespace and name of the
+    # pod-migrate-agent ServiceAccount in this file.
+    - expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:pod-migration-criu-system:pod-migrate-agent'
+      message: >-
+        only the CRIU node agent may record a restore outcome
+        (pod-migrate.io/psengine-restore) on a pod
+      reason: Forbidden
+    # Written once: from unset (or empty) to restored or failed.
+    - expression: >-
+        !(has(oldObject.metadata.annotations) &&
+        'pod-migrate.io/psengine-restore' in oldObject.metadata.annotations &&
+        oldObject.metadata.annotations['pod-migrate.io/psengine-restore'] != '')
+        &&
+        has(object.metadata.annotations) &&
+        'pod-migrate.io/psengine-restore' in object.metadata.annotations &&
+        object.metadata.annotations['pod-migrate.io/psengine-restore'] in ['restored', 'failed']
+      message: >-
+        pod-migrate.io/psengine-restore is written once, as "restored" or
+        "failed", and can't be changed or removed afterwards
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: pod-migrate-psengine-restore-status
+  labels:
+    pod-migrate.io/component: psengine
+spec:
+  policyName: pod-migrate-psengine-restore-status
+  validationActions: ["Deny"]

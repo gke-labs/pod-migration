@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,25 +99,25 @@ func TestCRIU_Eligible(t *testing.T) {
 		Spec: corev1.PodSpec{
 			NodeName:       readyNode.Name,
 			InitContainers: []corev1.Container{{Name: "init-once"}},
-			Containers:     []corev1.Container{{Name: "app"}},
+			Containers:     []corev1.Container{{Name: "app", Command: []string{"/app"}}},
 		},
 	}
 	unscheduledPod := &corev1.Pod{
 		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: "app"}},
+			Containers: []corev1.Container{{Name: "app", Command: []string{"/app"}}},
 		},
 	}
 	multiPod := &corev1.Pod{
 		Spec: corev1.PodSpec{
 			NodeName:   readyNode.Name,
-			Containers: []corev1.Container{{Name: "app"}, {Name: "sidecar"}},
+			Containers: []corev1.Container{{Name: "app", Command: []string{"/app"}}, {Name: "sidecar", Command: []string{"/sidecar"}}},
 		},
 	}
 	nativeSidecarPod := &corev1.Pod{
 		Spec: corev1.PodSpec{
 			NodeName:       readyNode.Name,
 			InitContainers: []corev1.Container{{Name: "istio-proxy", RestartPolicy: &always}},
-			Containers:     []corev1.Container{{Name: "app"}},
+			Containers:     []corev1.Container{{Name: "app", Command: []string{"/app"}}},
 		},
 	}
 
@@ -140,6 +141,162 @@ func TestCRIU_Eligible(t *testing.T) {
 	}
 	if v := e.Eligible(nativeSidecarPod, readyNode); v.OK {
 		t.Errorf("Eligible(nativeSidecarPod, readyNode) = %+v, want refused", v)
+	}
+}
+
+// Eligible refuses what the CRIU engine itself refuses or can't restore, so
+// that such a pod isn't sent through an eviction 429 and a Refused trigger
+// first (#233): hostNetwork (#229), a pod the engine already restored or
+// wrapped with its holder (#236), and a container without an explicit command,
+// whose replacement the restore webhook leaves unwired.
+func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
+	e, err := NewCRIU(nil, nil, CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	readyNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "node-ready",
+			Annotations: map[string]string{CRIUNodeReadyAnnotation: "true"},
+		},
+	}
+	basePod := func() *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "app-0"},
+			Spec: corev1.PodSpec{
+				NodeName:   readyNode.Name,
+				Containers: []corev1.Container{{Name: "app", Command: []string{"/app"}}},
+			},
+		}
+	}
+
+	for _, tc := range []struct {
+		name       string
+		mutate     func(*corev1.Pod)
+		wantOK     bool
+		wantReason string // a substring of the refusal
+	}{
+		{name: "plain single-container pod with a command", mutate: func(*corev1.Pod) {}, wantOK: true},
+		{
+			name:       "hostNetwork",
+			mutate:     func(p *corev1.Pod) { p.Spec.HostNetwork = true },
+			wantReason: "hostNetwork",
+		},
+		{
+			name: "already restored by the engine",
+			mutate: func(p *corev1.Pod) {
+				p.Annotations = map[string]string{CRIURestoreStatusAnnotation: CRIURestoreStatusRestored}
+			},
+			wantReason: "already restored or wrapped",
+		},
+		{
+			name: "already restored, with whitespace around the status",
+			mutate: func(p *corev1.Pod) {
+				p.Annotations = map[string]string{CRIURestoreStatusAnnotation: " " + CRIURestoreStatusRestored + "\n"}
+			},
+			wantReason: "already restored or wrapped",
+		},
+		{
+			name: "wrapped by the holder, restore not decided yet",
+			mutate: func(p *corev1.Pod) {
+				p.Annotations = map[string]string{CRIUInjectedAnnotation: "true"}
+			},
+			wantReason: "already restored or wrapped",
+		},
+		{
+			name: "wrapped by the holder, restore failed",
+			mutate: func(p *corev1.Pod) {
+				p.Annotations = map[string]string{
+					CRIUInjectedAnnotation:      "true",
+					CRIURestoreStatusAnnotation: CRIURestoreStatusFailed,
+				}
+			},
+			wantReason: "already restored or wrapped",
+		},
+		{
+			// The engine refuses only "restored" and injected=true: a failed
+			// restore status alone, or injected with another value, is no
+			// refusal there, so it's none here.
+			name: "restore status failed without the holder",
+			mutate: func(p *corev1.Pod) {
+				p.Annotations = map[string]string{
+					CRIURestoreStatusAnnotation: CRIURestoreStatusFailed,
+					CRIUInjectedAnnotation:      "false",
+				}
+			},
+			wantOK: true,
+		},
+		{
+			name:       "container without an explicit command",
+			mutate:     func(p *corev1.Pod) { p.Spec.Containers[0].Command = nil },
+			wantReason: "explicit command",
+		},
+		{
+			name: "container with args but no command",
+			mutate: func(p *corev1.Pod) {
+				p.Spec.Containers[0].Command = []string{}
+				p.Spec.Containers[0].Args = []string{"--serve"}
+			},
+			wantReason: "explicit command",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := basePod()
+			tc.mutate(pod)
+			got := e.Eligible(pod, readyNode)
+			if got.OK != tc.wantOK {
+				t.Fatalf("Eligible = %+v, want OK=%v", got, tc.wantOK)
+			}
+			if !tc.wantOK && !strings.Contains(got.Reason, tc.wantReason) {
+				t.Errorf("Eligible reason = %q, want it to contain %q", got.Reason, tc.wantReason)
+			}
+		})
+	}
+
+	// These refusals don't depend on the node, so they come before the node
+	// checks: a pod the engine would never take is refused for that, not for
+	// a node that isn't in the cache yet.
+	hostNet := basePod()
+	hostNet.Spec.HostNetwork = true
+	if got := e.Eligible(hostNet, nil); got.OK || !strings.Contains(got.Reason, "hostNetwork") {
+		t.Errorf("Eligible(hostNetwork pod, nil node) = %+v, want the hostNetwork refusal", got)
+	}
+}
+
+// A location without a bucket name is rejected like one without gs://: a
+// storage config for it could never store a checkpoint (#233).
+func TestCRIU_NamespaceResourcesRejectsUnusableLocations(t *testing.T) {
+	e, err := NewCRIU(nil, nil, CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	for _, location := range []string{"", "bucket/path", "s3://bucket", "gs://", "gs:///", "gs:///path"} {
+		t.Run(location, func(t *testing.T) {
+			pm := &pmv1alpha1.PodMigration{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mig", UID: types.UID("pm-uid-1")},
+				Spec:       pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: location}},
+			}
+			got, err := e.NamespaceResources(pm)
+			var locationErr *StorageLocationError
+			if !errors.As(err, &locationErr) {
+				t.Fatalf("NamespaceResources(%q) error = %v, want a *StorageLocationError", location, err)
+			}
+			if locationErr.Location != location {
+				t.Errorf("StorageLocationError.Location = %q, want %q", locationErr.Location, location)
+			}
+			if len(got) != 0 {
+				t.Errorf("NamespaceResources(%q) returned objects %v with the error", location, got)
+			}
+		})
+	}
+	for _, location := range []string{"gs://bucket", "gs://bucket/", "gs://bucket/path"} {
+		pm := &pmv1alpha1.PodMigration{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mig", UID: types.UID("pm-uid-1")},
+			Spec:       pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: location}},
+		}
+		if got, err := e.NamespaceResources(pm); err != nil || len(got) != 2 {
+			t.Errorf("NamespaceResources(%q) = %v, %v; want 2 objects", location, got, err)
+		}
 	}
 }
 

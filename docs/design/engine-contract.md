@@ -166,6 +166,7 @@ A checkpoint is a memory dump, which can hold tokens and keys, and a restore run
   - Only the controller's identity may set or change restore orders, enforced for example by a ValidatingAdmissionPolicy on `request.userInfo`.
   - Never treat a user-supplied engine annotation as already processed.
   - R1 covers the restore orders of migrations. A restore requested outside a migration is out of scope; for example, a Kubeflow workspace restore sets `ps-name` itself, and the controller deliberately leaves it alone (#55). An engine that supports such restores must authorize them itself.
+  - Status (#233): when a pod is created, the replacement webhook handles its restore orders. On an existing pod that is opted into migration, the `pod-migration-restore-order` ValidatingAdmissionPolicy in `controller/deploy.yaml` lets only the controller set, change or remove `<group>/ps-name`, for any engine's group. The CRIU engine's manifest adds `pod-migrate-psengine-restore-status`: only its node agent records `pod-migrate.io/psengine-restore`, once. Still open: engine annotations that a pod carries when it's created aren't removed.
 - **R2. Provenance.**
   - The engine signs or MACs the archive manifest with a key that workloads can't read.
   - The manifest binds the cluster UID, the job UID, the source pod UID and the archive digests.

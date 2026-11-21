@@ -2338,7 +2338,12 @@ func TestPodMigrationReconciler_MapsManagedObjectToPodMigration(t *testing.T) {
 		{"policy named for a PodMigration in another namespace", managed(pspGVKForTest, pm.Namespace, getPSPManualName(other.Name), nil), nil},
 		{"unrelated policy", managed(pspGVKForTest, pm.Namespace, "psp-someone-else", nil), nil},
 		{"unrelated storage config", managed(psscGVKForTest, "", "pssc-someone-else", nil), nil},
-		{"policy of a PodMigration that renders nothing", managed(pspGVKForTest, invalid.Namespace, getPSPManualName(invalid.Name), nil), nil},
+		// The objects' names don't depend on the storage location, so one
+		// synced before the location was edited to an invalid one still maps
+		// to its PodMigration (#233).
+		{"policy of a PodMigration whose storage location is invalid", managed(pspGVKForTest, invalid.Namespace, getPSPManualName(invalid.Name), nil),
+			[]ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: invalid.Namespace, Name: invalid.Name}}}},
+		{"unrelated policy next to a PodMigration whose storage location is invalid", managed(pspGVKForTest, invalid.Namespace, "psp-someone-else", nil), nil},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			if got := r.podMigrationsForManagedObject(context.Background(), tc.obj); !reflect.DeepEqual(got, tc.want) {

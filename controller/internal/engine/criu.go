@@ -121,11 +121,21 @@ func (*CRIU) RuntimeClasses() []string {
 	return []string{eligibility.DefaultRuntimeClassToken, "runc"}
 }
 
-// Eligible implements Engine with pure local checks (no API calls): single
-// application container, no native sidecar initContainers, and a cached source
-// node verified CRIU-ready (pod-migrate.io/criu-ready=true). If node is nil
-// (unscheduled pod or source node missing from cache), Eligible fails closed so
-// no PodMigrationJob is spawned for an unverified node.
+// Eligible implements Engine with pure local checks (no API calls). It mirrors
+// the CRIU engine's own refusals (engines/criu, C2), so that a pod the engine
+// would refuse is not sent through an eviction 429 and a Refused trigger first
+// (#233):
+//
+//   - a single application container, with an explicit command: the engine's
+//     restore webhook leaves a replacement without one unwired, so it would
+//     start cold;
+//   - no native sidecar initContainers;
+//   - no hostNetwork (#229);
+//   - not already restored by the engine, and not wrapped by its holder (#236);
+//   - a cached source node verified CRIU-ready (pod-migrate.io/criu-ready=true).
+//
+// If node is nil (unscheduled pod or source node missing from cache), Eligible
+// fails closed so no PodMigrationJob is spawned for an unverified node.
 func (*CRIU) Eligible(pod *corev1.Pod, node *corev1.Node) Verdict {
 	if pod == nil {
 		return Verdict{Reason: "no pod to migrate"}
@@ -138,6 +148,20 @@ func (*CRIU) Eligible(pod *corev1.Pod, node *corev1.Node) Verdict {
 		if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
 			return Verdict{Reason: "CRIU engine does not support sidecar initContainers (restartPolicy=Always)"}
 		}
+	}
+	if pod.Spec.HostNetwork {
+		return Verdict{Reason: "CRIU engine does not support hostNetwork pods"}
+	}
+	if strings.TrimSpace(pod.Annotations[CRIURestoreStatusAnnotation]) == CRIURestoreStatusRestored ||
+		pod.Annotations[CRIUInjectedAnnotation] == "true" {
+		return Verdict{Reason: fmt.Sprintf(
+			"CRIU engine does not checkpoint a pod it already restored or wrapped (%s=%s or %s=true)",
+			CRIURestoreStatusAnnotation, CRIURestoreStatusRestored, CRIUInjectedAnnotation)}
+	}
+	if len(pod.Spec.Containers[0].Command) == 0 {
+		return Verdict{Reason: fmt.Sprintf(
+			"CRIU engine requires an explicit command on container %s: its replacement could not be restored and would start cold",
+			pod.Spec.Containers[0].Name)}
 	}
 	if node == nil {
 		if pod.Spec.NodeName != "" {
@@ -208,6 +232,14 @@ func (e *CRIU) NamespaceResources(pm *pmv1alpha1.PodMigration) ([]*unstructured.
 		}
 	}
 	parts := strings.SplitN(strings.TrimPrefix(location, "gs://"), "/", 2)
+	if parts[0] == "" {
+		// gs:// or gs:///path: a storage config without a bucket could never
+		// store a checkpoint (#233).
+		return nil, &StorageLocationError{
+			Location: location,
+			Message:  fmt.Sprintf("invalid GCS location: %s (missing bucket name)", location),
+		}
+	}
 	gcs := map[string]interface{}{
 		"bucket": parts[0],
 	}

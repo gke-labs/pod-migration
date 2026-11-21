@@ -23,6 +23,7 @@ The controller is implemented as a custom Operator consisting of the following c
 - **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods matched to an active `PodMigrationJob`, it injects the `gke.io/pod-migration-gate` scheduling gate (and scrubs untrusted `<group>/ps-name` restore annotations across registered engines) to hold the pod in a pending state until checkpoint readiness and volume detachment complete, preventing replica collisions; by default (`--shorten-restored-readiness-delay=true`), it also sets `readinessProbe.initialDelaySeconds` to `0` on the replacement's containers and restartable sidecar init containers unless the pod sets `pod-migration.gke.io/preserve-readiness-delay: "true"`, leaving liveness and startup probes untouched (#141). On scale-up pods, it stamps per-engine cold-start bypasses.
 - **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Handled by `PodStatusMutator`. Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
 - **Fence Webhook (`/mutate-v1-pod-fence`)**: Handled by `PodFenceMutator`. Intercepts status updates of Pods labeled `pod-migration.gke.io/fenced: "true"` and holds their `Ready` condition at `False` (reason `PodMigrationFenced`), so a fenced migration source stays out of its Services' endpoints (#131). The other conditions, including `ContainersReady`, keep the kubelet's view. It uses `failurePolicy: Fail`: while the webhook is down, a fenced Pod's status writes are rejected, so it stays NotReady, and it can't finish deleting either, because the kubelet writes a Pod's final status before the Pod is removed. That heals when the webhook is back. Pods without the label never reach it. See [Source fence](#3-source-fence).
+- **Restore Order Policy (`pod-migration-restore-order`)**: A `ValidatingAdmissionPolicy` in `controller/deploy.yaml`, not a webhook: the API server evaluates it itself, so it doesn't depend on the controller being up. The replacement webhook handles restore orders only when a Pod is created. Afterwards, on a Pod that is opted in, only the controller may set, change or remove a restore order (`<group>/ps-name`, for any engine) (#233). It covers updates of the Pod and of its `status` subresource, which can change annotations too. The policy is skipped for every update that leaves the restore orders as they are, so labels (including removing `pod-migration.gke.io/enabled` to opt out), other annotations, the spec and the kubelet's status writes aren't affected. See [Changing a Restore Order by Hand](#changing-a-restore-order-by-hand).
 
 ### 2. Reconcilers
 - **`PodMigration` (Config) Reconciler**: Watches `PodMigration` resources. It automatically provisions the required GKE `PodSnapshotStorageConfig` (PSSC) and manual `PodSnapshotPolicy` (PSP) resources with `postCheckpoint: stop` in the target namespace. It also watches those two objects. If someone edits their spec, it changes it back right away. If someone deletes one, it recreates it right away. If one is stuck being deleted, for example because another component's finalizer holds it, the controller doesn't touch it and sets the PodMigration's `Ready` condition to `False` with reason `ManagedObjectTerminating`. Once the object is gone, the controller recreates it (#144).
@@ -520,6 +521,28 @@ Stateful workloads with `ReadWriteOnce` (`RWO`) or `ReadWriteOncePod` (`RWOP`) P
 
 - **Evicting Phase Volume Detachment Wait:** During the `Evicting` phase, after the source Pod is deleted, the controller monitors `VolumeAttachment` resources for all RWO/RWOP volumes (`job.status.pvsToDetach`) and verifies detachment from the origin node before transitioning the job to `Restoring`. Non-RWO volumes (such as `ReadWriteMany` or `ReadOnlyMany`) do not block migration.
 - **Volume Detach Timeout & Snapshot Preservation:** If volume detachment from the origin node exceeds the migration timeout, the PMJ concludes as `SucceededWithoutRestore` with reason `VolumeDetachTimeout`. This preserves the durable snapshot reference for inspection and manual recovery while releasing the replacement Pod for a cold start.
+
+### Changing a Restore Order by Hand
+
+On a Pod that is opted into migration, only the controller may set, change or remove a restore order (`<group>/ps-name`). Anyone else, a cluster admin included, gets:
+
+```
+ValidatingAdmissionPolicy 'pod-migration-restore-order' with binding 'pod-migration-restore-order' denied request: only the Pod Migration controller may set, change or remove a restore order (<group>/ps-name) on an existing pod that is opted into migration
+```
+
+Other updates of the Pod aren't affected, and a Pod without the `pod-migration.gke.io/enabled: "true"` label isn't either. If you must edit a restore order by hand, for example in a test reset:
+
+1. **Delete the policy's binding.** The API server stops enforcing the policy within a few seconds:
+   ```bash
+   kubectl delete validatingadmissionpolicybinding pod-migration-restore-order
+   ```
+2. **Edit the annotation.**
+3. **Apply the manifest again**, which recreates the binding:
+   ```bash
+   sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
+   ```
+
+The CRIU engine protects its restore outcome (`pod-migrate.io/psengine-restore`) the same way, with the `pod-migrate-psengine-restore-status` policy in `engines/criu/deploy/deploy.yaml`.
 
 ## 8. Monitoring & Prometheus Metrics
 
