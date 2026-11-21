@@ -221,6 +221,22 @@ func TestSnapshotRelease_NeverDeletesAnotherTriggersSnapshot(t *testing.T) {
 	}
 }
 
+// Ownership is checked before the deletion timestamp, so another trigger's
+// snapshot that someone else is already deleting still reads as not ours.
+func TestSnapshotRelease_AnotherTriggersDeletingSnapshotIsNotOwned(t *testing.T) {
+	snap := relSnapshot(snapshot.DefaultAPIGroup, relSnap, "ws-notebook-trigger")
+	snap.SetFinalizers([]string{"example.com/hold"})
+	now := metav1.Now()
+	snap.SetDeletionTimestamp(&now)
+	c := relClient(relJob(pmv1alpha1.PodMigrationJobPhaseSucceeded, time.Second), snap)
+	r := &PodMigrationJobReconciler{Client: c, Scheme: relScheme()}
+	relReconcile(t, r)
+	cond := releasedCond(t, c)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonSnapshotNotOwned {
+		t.Fatalf("SnapshotReleased condition = %+v, want False/%s", cond, ReasonSnapshotNotOwned)
+	}
+}
+
 // A snapshot without the label (older CRIU snapshots, long trigger names) is
 // identified by the job's snapshotRef alone.
 func TestSnapshotRelease_UnlabelledSnapshotUsesSnapshotRef(t *testing.T) {

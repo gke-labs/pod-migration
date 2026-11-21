@@ -189,23 +189,32 @@ func (r *ArchiveGCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if deleteErr != nil {
 		first, _ := r.firstFailure.LoadOrStore(ps.GetUID(), r.clock())
 		if r.clock().Sub(first.(time.Time)) >= r.giveUpAfter() {
+			// Release first.  If the finalizer patch fails (a conflict), the
+			// retry must still see the original first failure, and the event
+			// and metric must only be recorded once.
+			if err := r.release(ctx, ps); err != nil {
+				return ctrl.Result{}, err
+			}
 			r.firstFailure.Delete(ps.GetUID())
-			logger.Error(deleteErr, "giving up deleting the archive; releasing the PodSnapshot and leaving the archive behind", "archive", "gs://"+bucket+"/"+prefix)
+			logger.Error(deleteErr, "gave up deleting the archive; released the PodSnapshot and left the archive behind", "archive", "gs://"+bucket+"/"+prefix)
 			r.event(ps, corev1.EventTypeWarning, ReasonArchiveDeleteAbandoned,
 				"Gave up deleting archive gs://%s/%s after %s; it's left in the bucket: %v", bucket, prefix, r.giveUpAfter(), deleteErr)
 			archiveGCOutcomes.WithLabelValues("abandoned").Inc()
-			return ctrl.Result{}, r.release(ctx, ps)
+			return ctrl.Result{}, nil
 		}
 		r.event(ps, corev1.EventTypeWarning, ReasonArchiveDeleteFailed, "Failed to delete archive gs://%s/%s, retrying: %v", bucket, prefix, deleteErr)
 		archiveGCOutcomes.WithLabelValues("failed").Inc()
 		return ctrl.Result{}, deleteErr
 	}
 
+	if err := r.release(ctx, ps); err != nil {
+		return ctrl.Result{}, err
+	}
 	r.firstFailure.Delete(ps.GetUID())
 	logger.Info("deleted the archive", "archive", "gs://"+bucket+"/"+prefix)
 	r.event(ps, corev1.EventTypeNormal, ReasonArchiveDeleted, "Deleted archive gs://%s/%s", bucket, prefix)
 	archiveGCOutcomes.WithLabelValues("deleted").Inc()
-	return ctrl.Result{}, r.release(ctx, ps)
+	return ctrl.Result{}, nil
 }
 
 // release removes ArchiveFinalizer.

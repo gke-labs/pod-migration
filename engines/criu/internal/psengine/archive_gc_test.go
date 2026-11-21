@@ -29,10 +29,12 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	k8syaml "sigs.k8s.io/yaml"
 
@@ -455,5 +457,51 @@ func TestArchiveGC_FinalizerPatchKeepsOtherWriters(t *testing.T) {
 	got, _ := gcGet(t, c)
 	if !controllerutil.ContainsFinalizer(got, "example.com/other") {
 		t.Fatalf("finalizers = %v, another writer's finalizer was dropped", got.GetFinalizers())
+	}
+}
+
+// A finalizer patch that fails on the give-up path (a conflict) must not
+// restart the give-up clock or record the abandon twice.
+func TestArchiveGC_GiveUpReleaseConflictKeepsClock(t *testing.T) {
+	failPatch := 1
+	c := newClientWithInterceptor(t, interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if obj.GetDeletionTimestamp() != nil && failPatch > 0 {
+				failPatch--
+				return apierrors.NewConflict(schema.GroupResource{Resource: "podsnapshots"}, obj.GetName(), errors.New("stale"))
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	}, gcSnapshot(true, true))
+	store := gcStoreWithArchive()
+	store.deleteErr = errors.New("gcs delete: HTTP 403")
+	rec := record.NewFakeRecorder(20)
+	r := &ArchiveGCReconciler{Client: c, Store: store, Recorder: rec, GiveUpAfter: time.Minute}
+	gcDelete(t, c)
+	start := time.Now()
+	r.now = func() time.Time { return start }
+	if _, err := gcReconcile(t, r); err == nil {
+		t.Fatal("first failed attempt gave up, want a retry")
+	}
+	// Past the bound: the release hits a conflict.
+	r.now = func() time.Time { return start.Add(2 * time.Minute) }
+	if _, err := gcReconcile(t, r); !apierrors.IsConflict(err) {
+		t.Fatalf("Reconcile = %v, want the release conflict", err)
+	}
+	// The immediate retry still sees the original first failure and releases.
+	if _, err := gcReconcile(t, r); err != nil {
+		t.Fatalf("retry after the conflict: %v (the give-up clock restarted?)", err)
+	}
+	if _, ok := gcGet(t, c); ok {
+		t.Fatal("PodSnapshot still exists after the retry past the give-up bound")
+	}
+	abandoned := 0
+	for len(rec.Events) > 0 {
+		if ev := <-rec.Events; strings.Contains(ev, ReasonArchiveDeleteAbandoned) {
+			abandoned++
+		}
+	}
+	if abandoned != 1 {
+		t.Fatalf("%d %s events, want exactly 1", abandoned, ReasonArchiveDeleteAbandoned)
 	}
 }

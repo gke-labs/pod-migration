@@ -139,11 +139,6 @@ func (r *PodMigrationJobReconciler) releaseSnapshot(ctx context.Context, job *pm
 		}
 		return snapshotReleaseRecheck, fmt.Errorf("reading PodSnapshot %s: %w", snapName, err)
 	}
-	if snap.GetDeletionTimestamp() != nil {
-		return r.recordSnapshotReleased(ctx, job, metav1.ConditionTrue, ReasonSnapshotDeleted,
-			fmt.Sprintf("PodSnapshot %s is being deleted", snapName))
-	}
-
 	trigger := util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
 	if by, ok := snap.GetLabels()[snapshot.TriggeredByLabel]; ok && by != trigger {
 		logger.Info("Not deleting a PodSnapshot that another trigger created", "triggeredBy", by, "trigger", trigger)
@@ -151,6 +146,12 @@ func (r *PodMigrationJobReconciler) releaseSnapshot(ctx context.Context, job *pm
 			"Not deleting PodSnapshot %s: it was created by trigger %s, not this job's trigger %s", snapName, by, trigger)
 		return r.recordSnapshotReleased(ctx, job, metav1.ConditionFalse, ReasonSnapshotNotOwned,
 			fmt.Sprintf("PodSnapshot %s was created by trigger %s, not %s, so it's left alone", snapName, by, trigger))
+	}
+	// Checked after ownership, so a snapshot another trigger made reads as
+	// SnapshotNotOwned even when someone else is already deleting it.
+	if snap.GetDeletionTimestamp() != nil {
+		return r.recordSnapshotReleased(ctx, job, metav1.ConditionTrue, ReasonSnapshotDeleted,
+			fmt.Sprintf("PodSnapshot %s is being deleted", snapName))
 	}
 
 	if held, why, err := r.triggersStillAround(ctx, job, group, trigger, snapName); err != nil {
