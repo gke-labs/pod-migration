@@ -341,7 +341,9 @@ For full threat analysis, blast radius documentation, and restore path verificat
 The orchestrator deletes a job's `PodSnapshot` once it's done with the
 checkpoint: once the job is `Succeeded` (restore verified or inferred) or
 `Failed`, after the controller's `--snapshot-retention` (#107, contract clause C9). The engine owns the
-archive, so `cmd/engine` deletes it:
+archive, so `cmd/engine` deletes it. The controller's orphan sweep also deletes
+labelled `PodSnapshot`s whose job is gone (`--orphan-snapshot-sweep-interval`,
+`--orphan-snapshot-min-age`), and the engine handles those the same way:
 
 - Every CRIU `PodSnapshot` carries the `pod-migrate.io/archive-cleanup`
   finalizer. The engine controller adds it when it creates the work order,

@@ -188,7 +188,7 @@ To prevent unauthorized access or tampering with checkpoint archives:
 
 Checkpoint archives are transient migration artifacts. They should not persist longer than needed to complete the migration.
 
-The engine deletes a job's archive when the controller deletes its `PodSnapshot` (#107, see "Archive garbage collection" in `engines/criu/README.md`). Keep the lifecycle rule as a backstop for archives it leaves behind (`ArchiveDeleteAbandoned`, and orphans until the orphan sweep lands).
+The engine deletes a job's archive when the controller deletes its `PodSnapshot` (#107, see "Archive garbage collection" in `engines/criu/README.md`). Keep the lifecycle rule as a backstop for archives it leaves behind (`ArchiveDeleteAbandoned`, and unlabelled `PodSnapshot`s, which the controller's orphan sweep never deletes).
 
 - Configure GCS Object Lifecycle Management rules on the bucket:
   ```json

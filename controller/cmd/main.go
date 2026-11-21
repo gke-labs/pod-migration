@@ -98,6 +98,8 @@ func main() {
 		placementDeadline     time.Duration
 		shortenReadinessDelay bool
 		snapshotRetention     time.Duration
+		orphanSweepInterval   time.Duration
+		orphanMinAge          time.Duration
 		showVersion           bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -119,6 +121,8 @@ func main() {
 	flag.DurationVar(&placementDeadline, "restore-placement-deadline", controller.DefaultRestorePlacementDeadline, "How long a replacement pod released with --restore-placement's node constraints may stay unschedulable. Then, if a node that doesn't meet the constraints could take it, the job concludes SucceededWithoutRestore with reason "+controller.ReasonPlacementTimeout+", and the pod is deleted so that its ReplicaSet or StatefulSet recreates it to start cold. Otherwise it keeps waiting, because deleting it wouldn't get it scheduled sooner, and at the restore ceiling the job concludes "+controller.ReasonPlacementTimeout+" and deletes it anyway, so that any node can be added for it. Only a pod that the scheduler reports unschedulable is deleted. A pod that the scheduler hasn't tried (another scheduling gate may hold it) or has nominated a node for is left alone; if it's still like that at the restore ceiling, the job concludes RestoreTimeout, then checks the pod every 15s and deletes it once the scheduler reports it unschedulable. A pod nominated just before the delete, or whose delete failed, is also checked every 15s. The checks end when the job is garbage collected, 30m after it concluded. Must be more than 0, and at least 1m shorter than the restore ceiling, 5m plus --restore-stabilization-window: at most 4m30s with the default window.")
 	flag.BoolVar(&shortenReadinessDelay, "shorten-restored-readiness-delay", true, "Clear readinessProbe.initialDelaySeconds on gated restore-candidate replacement pods unless annotated with "+util.AnnotationPreserveReadinessDelay+"=true; liveness and startup probes are never changed")
 	flag.DurationVar(&snapshotRetention, "snapshot-retention", 0, fmt.Sprintf("How long a job that concluded Succeeded (restore verified or inferred) or Failed keeps the PodSnapshot its trigger created before the controller deletes it, which tells the snapshot engine to delete the checkpoint archive (#107). 0 (the default) deletes it as soon as nothing can still restore from it. Jobs that concluded SucceededWithoutRestore keep their snapshot. At most %s, so the deletion can still be retried before concluded jobs are garbage collected 30m after they concluded.", controller.MaxSnapshotRetention))
+	flag.DurationVar(&orphanSweepInterval, "orphan-snapshot-sweep-interval", controller.DefaultOrphanSnapshotSweepInterval, "How often the leader deletes orphaned PodSnapshots: ones our triggers created (gke-pod-snapshot-triggered-by is psmt-<pod>-<uid>) whose PodMigrationJob is gone, and that no pod, trigger or job references (#107). Deleting a PodSnapshot tells its snapshot engine to delete the checkpoint archive. 0 turns the sweep off.")
+	flag.DurationVar(&orphanMinAge, "orphan-snapshot-min-age", controller.DefaultOrphanSnapshotMinAge, fmt.Sprintf("How old an orphaned PodSnapshot must be, from its creation, before the sweep deletes it. At least --snapshot-retention plus %s.", controller.OrphanSnapshotMinAgeMargin))
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -175,7 +179,9 @@ func main() {
 		"restorePlacement", restorePlacement,
 		"restorePlacementDeadline", placementDeadline,
 		"shortenRestoredReadinessDelay", shortenReadinessDelay,
-		"snapshotRetention", snapshotRetention)
+		"snapshotRetention", snapshotRetention,
+		"orphanSnapshotSweepInterval", orphanSweepInterval,
+		"orphanSnapshotMinAge", orphanMinAge)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -196,6 +202,11 @@ func main() {
 
 	if err := controller.ValidateSnapshotRetention(snapshotRetention); err != nil {
 		setupLog.Error(err, "invalid snapshot retention flag")
+		os.Exit(1)
+	}
+
+	if err := controller.ValidateOrphanSnapshotSweep(orphanSweepInterval, orphanMinAge, snapshotRetention); err != nil {
+		setupLog.Error(err, "invalid orphan snapshot sweep flags")
 		os.Exit(1)
 	}
 
@@ -353,6 +364,21 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create NodePreemptionReconciler")
 		os.Exit(1)
+	}
+
+	// Orphaned PodSnapshots whose job is gone (#107). Leader only.
+	if orphanSweepInterval > 0 {
+		if err := mgr.Add(&controller.OrphanSnapshotSweeper{
+			Client:    mgr.GetClient(),
+			APIReader: mgr.GetAPIReader(),
+			Recorder:  eventRecorder,
+			Groups:    engines.APIGroups(),
+			Interval:  orphanSweepInterval,
+			MinAge:    orphanMinAge,
+		}); err != nil {
+			setupLog.Error(err, "unable to add the orphan PodSnapshot sweep")
+			os.Exit(1)
+		}
 	}
 
 	// --- Webhooks ------------------------------------------------------------
