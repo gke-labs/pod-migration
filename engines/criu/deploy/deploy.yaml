@@ -59,10 +59,12 @@ rules:
     resources: ["podsnapshotstorageconfigs", "podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
     verbs: ["get", "list", "watch", "create"]
   # The archive finalizer: added at create, removed once the archive is
-  # deleted from the bucket (#107).
+  # deleted from the bucket (#107). Delete: a work order an earlier trigger
+  # left with an outcome is deleted before the trigger, created again for the
+  # same pod, gets its own (#262).
   - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshots"]
-    verbs: ["update", "patch"]
+    verbs: ["update", "patch", "delete"]
   - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshotpolicies/status", "podsnapshotmanualtriggers/status", "podsnapshots/status"]
     verbs: ["get", "update", "patch"]
