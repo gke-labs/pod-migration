@@ -100,6 +100,9 @@ type Manifest struct {
 	CPUFamily     string    `json:"cpuFamily,omitempty"` // restore-side compat guard
 	EngineVersion string    `json:"engineVersion"`
 	CreatedAt     time.Time `json:"createdAt"`
+	// SourceNode records the facts about the checkpoint's node that decide
+	// where it can be restored (#257). Absent when none were known.
+	SourceNode *contract.SourceNodeFacts `json:"sourceNode,omitempty"`
 }
 
 const engineVersion = "psengine/v1alpha1"
@@ -143,6 +146,10 @@ type NodeSnapshotReconciler struct {
 	Ops       NodeOps
 	Store     ObjectStore
 	CPUFamily string // from the node agent's capability probe; recorded in the manifest
+	// SourceNodeFacts reports this node's facts for each checkpoint (#257),
+	// recorded in the manifest and in PodSnapshot status.sourceNode. It must
+	// not fail: unknown facts are empty. Nil records none.
+	SourceNodeFacts func(context.Context) contract.SourceNodeFacts
 	// APIReader reads past the cache: the PodSnapshot and its trigger for the
 	// cancel checks before the pipeline starts and right before the commit
 	// point, and the PodSnapshot in finish. Nil falls back to Client (tests).
@@ -396,7 +403,12 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	logger.Info("checkpoint pipeline start", "pod", spec.SourcePod, "uid", spec.SourcePodUID, "container", spec.Container,
 		"dest", fmt.Sprintf("gs://%s/%s", spec.Bucket, ArchivePrefix(spec.Path, ps.GetName())))
 
-	if err := r.run(ctx, req.NamespacedName, spec); err != nil {
+	// Gathered before the freeze, so the probes add nothing to it.
+	var facts contract.SourceNodeFacts
+	if r.SourceNodeFacts != nil {
+		facts = r.SourceNodeFacts(ctx)
+	}
+	if err := r.run(ctx, req.NamespacedName, spec, facts); err != nil {
 		if ctx.Err() != nil {
 			// The agent is shutting down: not an outcome. Unfreeze the source
 			// container so clients aren't hung while the agent restarts; on restart,
@@ -458,7 +470,8 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		logger.Error(err, "checkpoint pipeline failed; source container thawed")
 		return ctrl.Result{}, r.finish(ctx, req, contract.ReasonFailed, truncateMsg(err.Error(), 1500))
 	}
-	return ctrl.Result{}, r.finish(ctx, req, contract.ReasonSucceeded, "archive uploaded + verified; source container frozen")
+	return ctrl.Result{}, r.finishWith(ctx, req, contract.ReasonSucceeded, "archive uploaded + verified; source container frozen",
+		func(ps *unstructured.Unstructured) error { return contract.SetSourceNodeFacts(ps, facts) })
 }
 
 func (r *NodeSnapshotReconciler) recordSourceFrozen(ctx context.Context, key types.NamespacedName, frozen bool, reason, msg string) error {
@@ -500,7 +513,7 @@ func (r *NodeSnapshotReconciler) recordSourceFrozen(ctx context.Context, key typ
 // run executes: freeze source -> checkpoint -> hash -> upload spec.json +
 // checkpoint.tar -> manifest.json (last, verified) -> commit. Any error
 // before the commit thaws the source container, and so does a cancel.
-func (r *NodeSnapshotReconciler) run(parent context.Context, key types.NamespacedName, spec snapshotSpec) error {
+func (r *NodeSnapshotReconciler) run(parent context.Context, key types.NamespacedName, spec snapshotSpec, facts contract.SourceNodeFacts) error {
 	snapshot, ns := key.Name, key.Namespace
 
 	// ctx carries the uploads. The poller cancels it with errCancelled,
@@ -611,6 +624,9 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 		TarSHA256: tarSHA, TarBytes: tarBytes, SpecSHA256: specSHA,
 		CPUFamily: r.CPUFamily, EngineVersion: engineVersion, CreatedAt: time.Now().UTC(),
 	}
+	if !facts.IsEmpty() {
+		mf.SourceNode = &facts
+	}
 	mfJSON, err := json.MarshalIndent(mf, "", "  ")
 	if err != nil {
 		return err
@@ -689,6 +705,14 @@ func (r *NodeSnapshotReconciler) pollForCancel(ctx context.Context, cancel conte
 // already stopped. CheckpointTimedOut is written as Checkpoint=Unknown only,
 // so the orchestrator never sees it settle.
 func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, reason, msg string) error {
+	return r.finishWith(ctx, req, reason, msg, nil)
+}
+
+// finishWith is finish, and applies setStatus (when not nil) to the
+// PodSnapshot in the same status write as the outcome, so a Ready snapshot
+// carries its status.sourceNode from the moment it is Ready. A setStatus
+// error is logged and the outcome is written without it.
+func (r *NodeSnapshotReconciler) finishWith(ctx context.Context, req ctrl.Request, reason, msg string, setStatus func(*unstructured.Unstructured) error) error {
 	conds := []metav1.Condition{
 		{Type: contract.CondCheckpoint, Status: metav1.ConditionFalse, Reason: reason, Message: msg},
 		{Type: contract.CondReady, Status: metav1.ConditionFalse, Reason: reason, Message: msg},
@@ -727,6 +751,12 @@ func (r *NodeSnapshotReconciler) finish(ctx context.Context, req ctrl.Request, r
 		for _, c := range conds {
 			if err := contract.SetCondition(ps, c); err != nil {
 				return err
+			}
+		}
+		if setStatus != nil {
+			// Best effort: extra status never holds back the outcome.
+			if err := setStatus(ps); err != nil {
+				log.FromContext(ctx).Error(err, "extra PodSnapshot status not recorded", "podsnapshot", req.NamespacedName)
 			}
 		}
 		if err := r.Status().Update(ctx, ps); err != nil {

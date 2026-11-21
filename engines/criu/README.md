@@ -145,6 +145,26 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      labels each `PodSnapshot` `gke-pod-snapshot-triggered-by: <trigger>` (when
      the trigger name fits in a label value), so the orchestrator finds
      unfinished snapshots after the trigger is deleted.
+   - Records the source node's facts with each checkpoint, so that a later
+     change can place restores only on compatible nodes ([#257](https://github.com/gke-labs/pod-migration/issues/257)).
+     The agent gathers them just before it freezes the source and writes
+     them twice: as `sourceNode` in `manifest.json`, next to the archive, and
+     as `status.sourceNode` on the `PodSnapshot`, in the same status write
+     that marks it `Ready=True`. The orchestrator can read the `PodSnapshot`
+     without access to the bucket. The fields are `cpuModel` (the
+     `model name` line of `/proc/cpuinfo`, absent on arm64, which has no such
+     line), `cpuFeatures` (the `flags` (x86) or `Features` (arm64) lines, the
+     union across processors, sorted, raw: on x86 they include kernel and
+     mitigation flags), `kernelVersion` (`/proc/sys/kernel/osrelease`),
+     `criuVersion` (the CRIU bundle's `VERSION` file), `runcVersion`
+     (`runc --version` in the host mount namespace, on the `PATH` the agent's
+     restores use, which may not be the runc containerd is configured with)
+     and `containerdVersion` (containerd's version API, without the leading
+     `v`). Every probe is best effort and bounded: a fact the agent can't read
+     is left out, and never fails the checkpoint. A failed checkpoint records
+     nothing on the `PodSnapshot`; one that fails at the commit point has
+     already uploaded its manifest, facts included. Nothing reads these facts
+     yet: the restore node still checks only `cpuFamily`.
    - Reconciles replacement pods on its node carrying the restore order,
      `<group>/ps-name` (`psengine.NodeRestoreReconciler`): downloads
      and SHA-256 verifies the archive from GCS, checks CPU family compatibility,
