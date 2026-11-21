@@ -24,20 +24,26 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // benchStore models a cloud object store supporting composite object composition
 // and byte-range reads, with simulated streaming bandwidth.
 type benchStore struct {
-	mu           sync.Mutex
-	objects      map[string][]byte
-	uploadedByte int64
-	streamSpeed  float64 // simulated MB/s per stream
-	failOnPart   string
+	mu                  sync.Mutex
+	objects             map[string][]byte
+	uploadedByte        int64
+	streamSpeed         float64 // simulated MB/s per stream
+	failOnPart          string
+	failOnDelete        bool
+	corruptComposedSize bool
 }
 
 func newBenchStore(streamSpeedMBps float64) *benchStore {
@@ -111,8 +117,11 @@ func (b *benchStore) GetRange(ctx context.Context, bucket, object string, start,
 
 func (b *benchStore) Delete(_ context.Context, bucket, object string) error {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.failOnDelete {
+		return fmt.Errorf("403 Forbidden: storage.objects.delete denied on %s", object)
+	}
 	delete(b.objects, bucket+"/"+object)
-	b.mu.Unlock()
 	return nil
 }
 
@@ -129,7 +138,11 @@ func (b *benchStore) Compose(ctx context.Context, bucket, destination string, so
 		combined = append(combined, data...)
 	}
 	b.objects[bucket+"/"+destination] = combined
-	return &ObjectInfo{Bytes: int64(len(combined)), MD5: md5b64(combined)}, nil
+	size := int64(len(combined))
+	if b.corruptComposedSize {
+		size -= 100
+	}
+	return &ObjectInfo{Bytes: size, MD5: md5b64(combined)}, nil
 }
 
 func TestParallelUpload_MultiStreamCompositeAndRestoreDownload(t *testing.T) {
@@ -233,50 +246,177 @@ func TestParallelUpload_AbortCleansUpParts(t *testing.T) {
 	}
 }
 
-// TestBenchmark_SpotRescue12GiBUploadWithin30sBudget verifies the benchmark requirement
-// from Issue #248: demonstrate >11 GiB checkpoint upload completion within a 30-second preemption budget.
-func TestBenchmark_SpotRescue12GiBUploadWithin30sBudget(t *testing.T) {
-	const (
-		preemptionBudget = 30 * time.Second
-		// 12 GiB workload (>11 GiB bottleneck identified in #248)
-		twelveGiB = int64(12 * 1024 * 1024 * 1024)
-		// Single-stream throughput cap noted in #248 (~450 MB/s)
-		singleStreamMBps = 450.0
-	)
+func TestParallelUpload_FetchEnforcesMaxBytes(t *testing.T) {
+	store := newBenchStore(0)
+	ctx := context.Background()
 
-	// Mathematical throughput modeling:
-	// Single stream: 12,288 MiB / 450 MiB/s = 27.30 seconds.
-	// Accounting for 1s preemption notice + 2s CRIU dump/freeze + 1s k8s orchestration:
-	// Single-stream total latency = 31.30s > 30s (Doomed / Preempted!).
-	singleSecs := float64(twelveGiB) / (singleStreamMBps * 1024 * 1024)
-	singleStreamTransferDuration := time.Duration(singleSecs * float64(time.Second))
-	totalSingleStreamTime := singleStreamTransferDuration + 4*time.Second
-	if totalSingleStreamTime <= preemptionBudget {
-		t.Fatalf("expected single stream to exceed 30s budget for 12 GiB, got %v", totalSingleStreamTime)
-	}
-	t.Logf("Single stream transfer for 12 GiB at 450 MB/s requires %v (total with dump/orchestration: %v > 30s budget)",
-		singleStreamTransferDuration, totalSingleStreamTime)
+	payloadSize := int64(64 * 1024 * 1024)
+	buf := make([]byte, payloadSize)
+	reader := bytes.NewReader(buf)
 
-	// Multi-stream parallel upload model (8 concurrent streams with GCS composite objects):
-	// Aggregate throughput = 8 * 350-450 MB/s ~= 2,800 MB/s.
-	// Transfer duration = 12,288 MiB / 2,800 MiB/s = 4.38 seconds!
-	// Total with 1s notice + 2s dump + 1s compose/orchestration = 8.38 seconds << 30s budget!
-	streams := 8
-	effectiveAggregateMBps := singleStreamMBps * float64(streams) * 0.8 // 80% efficiency factor under network saturation
-	multiSecs := float64(twelveGiB) / (effectiveAggregateMBps * 1024 * 1024)
-	multiStreamTransferDuration := time.Duration(multiSecs * float64(time.Second))
-	totalMultiStreamTime := multiStreamTransferDuration + 4*time.Second
-
-	t.Logf("8-stream parallel composite transfer for 12 GiB requires %v (aggregate throughput: %.2f MB/s, total: %v << 30s)",
-		multiStreamTransferDuration, effectiveAggregateMBps, totalMultiStreamTime)
-
-	if totalMultiStreamTime >= preemptionBudget {
-		t.Fatalf("parallel upload failed to complete within 30s preemption budget: %v", totalMultiStreamTime)
+	cfg := ParallelUploadConfig{
+		MinPartSize:    16 * 1024 * 1024,
+		MaxConcurrency: 4,
+		ThresholdBytes: 32 * 1024 * 1024,
 	}
 
-	remainingRescueHeadroom := preemptionBudget - totalMultiStreamTime
-	t.Logf("Verified Spot preemption rescue headroom: %v remaining within 30s budget", remainingRescueHeadroom)
-	if remainingRescueHeadroom < 15*time.Second {
-		t.Fatalf("insufficient safety headroom under preemption budget: %v", remainingRescueHeadroom)
+	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-limit/checkpoint.tar", reader, payloadSize, cfg)
+	if err != nil {
+		t.Fatalf("ParallelVerifiedPut failed: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	dstFile := filepath.Join(tmpDir, "downloaded.tar")
+	nr := &NodeRestoreReconciler{
+		Store: store,
+	}
+
+	// Fetch with maxBytes smaller than payloadSize must fail fast
+	maxBytes := int64(1 * 1024 * 1024) // 1 MiB cap on 64 MiB payload
+	_, err = nr.fetch(ctx, "test-bucket", "snaps/ps-limit/checkpoint.tar", dstFile, "", payloadSize, maxBytes)
+	if err == nil {
+		t.Fatal("expected fetch to fail when payloadSize > maxBytes, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum allowed download size") {
+		t.Fatalf("expected error mentioning exceeds maximum allowed download size, got: %v", err)
 	}
 }
+
+func TestParallelUpload_FetchEnforcesSHA(t *testing.T) {
+	store := newBenchStore(0)
+	ctx := context.Background()
+
+	payloadSize := int64(64 * 1024 * 1024)
+	buf := make([]byte, payloadSize)
+	reader := bytes.NewReader(buf)
+
+	cfg := ParallelUploadConfig{
+		MinPartSize:    16 * 1024 * 1024,
+		MaxConcurrency: 4,
+		ThresholdBytes: 32 * 1024 * 1024,
+	}
+
+	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-sha/checkpoint.tar", reader, payloadSize, cfg)
+	if err != nil {
+		t.Fatalf("ParallelVerifiedPut failed: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	dstFile := filepath.Join(tmpDir, "downloaded.tar")
+	nr := &NodeRestoreReconciler{
+		Store: store,
+	}
+
+	// Fetch with bogus expected SHA must fail
+	_, err = nr.fetch(ctx, "test-bucket", "snaps/ps-sha/checkpoint.tar", dstFile, "badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadb", payloadSize, 100*1024*1024)
+	if err == nil {
+		t.Fatal("expected fetch to fail on SHA mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "sha256") {
+		t.Fatalf("expected SHA mismatch error, got: %v", err)
+	}
+}
+
+func TestParallelUpload_CleanupFailureFailsUpload(t *testing.T) {
+	store := newBenchStore(0)
+	store.failOnDelete = true // simulate missing storage.objects.delete IAM permission
+	ctx := context.Background()
+
+	payloadSize := int64(64 * 1024 * 1024)
+	buf := make([]byte, payloadSize)
+	reader := bytes.NewReader(buf)
+
+	cfg := ParallelUploadConfig{
+		MinPartSize:    16 * 1024 * 1024,
+		MaxConcurrency: 4,
+		ThresholdBytes: 32 * 1024 * 1024,
+	}
+
+	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-leak/checkpoint.tar", reader, payloadSize, cfg)
+	if err == nil {
+		t.Fatal("expected error when cleanup Delete fails, got nil (parts would leak under missing delete IAM)")
+	}
+}
+
+func TestParallelUpload_ComposedSizeMismatchFails(t *testing.T) {
+	store := newBenchStore(0)
+	store.corruptComposedSize = true
+	ctx := context.Background()
+
+	payloadSize := int64(64 * 1024 * 1024)
+	buf := make([]byte, payloadSize)
+	reader := bytes.NewReader(buf)
+
+	cfg := ParallelUploadConfig{
+		MinPartSize:    16 * 1024 * 1024,
+		MaxConcurrency: 4,
+		ThresholdBytes: 32 * 1024 * 1024,
+	}
+
+	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-size/checkpoint.tar", reader, payloadSize, cfg)
+	if err == nil {
+		t.Fatal("expected error on composed size mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "verify composed") {
+		t.Fatalf("expected error mentioning verify composed, got: %v", err)
+	}
+}
+
+func TestNodePipeline_ParallelUploadAndRestoreEndToEnd(t *testing.T) {
+	ps := workOrderSnapshot("ps-web-0-parallel")
+	c := newClient(t, ps)
+	payload := strings.Repeat("PARALLEL_DATA_1234567890", 100) // 2400 bytes
+	ops := &fakeNodeOps{tarContent: payload, t: t}
+	store := newMemStore()
+	cfg := ParallelUploadConfig{
+		ThresholdBytes: 500,
+		MinPartSize:    200,
+		MaxConcurrency: 4,
+	}
+	r := &NodeSnapshotReconciler{
+		Client:               c,
+		NodeName:             "node-a",
+		Ops:                  ops,
+		Store:                store,
+		CPUFamily:            "Intel(R) Xeon(R) test",
+		ParallelUploadConfig: cfg,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-parallel"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify checkpoint.tar exists and matches payload
+	if string(store.objects["bkt/snaps/ps-web-0-parallel/checkpoint.tar"]) != payload {
+		t.Fatal("tar content mismatch")
+	}
+
+	// Verify temporary parts were cleaned up
+	for k := range store.objects {
+		if strings.Contains(k, ".part-") {
+			t.Fatalf("part leaked in store: %s", k)
+		}
+	}
+
+	// Verify restore fetch via parallel path
+	tmpDir := t.TempDir()
+	dstFile := filepath.Join(tmpDir, "restored.tar")
+	nr := &NodeRestoreReconciler{
+		Store:                store,
+		ParallelUploadConfig: cfg,
+	}
+	h := sha256.Sum256([]byte(payload))
+	expectedSHA := hex.EncodeToString(h[:])
+	_, err := nr.fetch(context.Background(), "bkt", "snaps/ps-web-0-parallel/checkpoint.tar", dstFile, expectedSHA, int64(len(payload)), 10*1024*1024)
+	if err != nil {
+		t.Fatalf("parallel fetch: %v", err)
+	}
+	gotBytes, err := os.ReadFile(dstFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotBytes) != payload {
+		t.Fatalf("restored content mismatch: got %d bytes, want %d", len(gotBytes), len(payload))
+	}
+}
+

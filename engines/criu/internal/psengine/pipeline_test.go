@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,6 +127,7 @@ func (f *fakeNodeOps) SourceInfo(_ context.Context, ns, pod, podUID, container s
 
 // memStore is an in-memory ObjectStore recording write order.
 type memStore struct {
+	mu      sync.Mutex
 	objects map[string][]byte
 	order   []string
 }
@@ -137,12 +139,16 @@ func (m *memStore) Put(_ context.Context, bucket, object string, r io.Reader) (*
 	if err != nil {
 		return nil, err
 	}
+	m.mu.Lock()
 	m.objects[bucket+"/"+object] = data
 	m.order = append(m.order, object)
+	m.mu.Unlock()
 	return &ObjectInfo{Bytes: int64(len(data)), MD5: md5b64(data)}, nil
 }
 
 func (m *memStore) Get(_ context.Context, bucket, object string) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	data, ok := m.objects[bucket+"/"+object]
 	if !ok {
 		return nil, errors.New("not found: " + object)
@@ -151,11 +157,15 @@ func (m *memStore) Get(_ context.Context, bucket, object string) (io.ReadCloser,
 }
 
 func (m *memStore) Delete(_ context.Context, bucket, object string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.objects, bucket+"/"+object)
 	return nil
 }
 
 func (m *memStore) Compose(_ context.Context, bucket, destination string, sources []string) (*ObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var combined []byte
 	for _, src := range sources {
 		data, ok := m.objects[bucket+"/"+src]
@@ -170,6 +180,8 @@ func (m *memStore) Compose(_ context.Context, bucket, destination string, source
 }
 
 func (m *memStore) GetRange(_ context.Context, bucket, object string, start, end int64) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	data, ok := m.objects[bucket+"/"+object]
 	if !ok {
 		return nil, errors.New("not found: " + object)

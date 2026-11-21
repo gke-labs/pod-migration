@@ -109,7 +109,9 @@ func (r *PodMigrationJobReconciler) releaseSnapshot(ctx context.Context, job *pm
 		if _, err := r.Engines.ForJob(job); err != nil {
 			// Without its engine, the job's API group isn't known: a
 			// snapshot looked up in the default group could be reported
-			// gone while it's still there. Leave it to the orphan sweep.
+			// gone while it's still there. Leave it alone. The orphan
+			// sweep only covers registered engines' groups too, so it
+			// stays until the engine is registered again.
 			return 0, nil
 		}
 	}

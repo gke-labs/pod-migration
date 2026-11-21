@@ -70,6 +70,10 @@ func (f *fakeGCS) handler() http.Handler {
 	})
 	mux.HandleFunc("/api/b/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/compose") && r.Method == http.MethodPost {
+			if r.Header.Get("Content-Type") != "application/json" {
+				http.Error(w, "missing content-type application/json", http.StatusBadRequest)
+				return
+			}
 			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/b/"), "/")
 			bucket := parts[0]
 			destPath := strings.TrimSuffix(strings.Join(parts[2:], "/"), "/compose")
@@ -200,5 +204,57 @@ func TestGCSProber(t *testing.T) {
 	defer fake.mu.Unlock()
 	if len(fake.objects) != 0 {
 		t.Fatalf("probe must clean up after itself: %v", len(fake.objects))
+	}
+}
+
+func TestGCSStore_ComposeAndGetRange(t *testing.T) {
+	store, _ := newFakeStore(t)
+	ctx := context.Background()
+
+	// Put two parts
+	_, err := store.Put(ctx, "bkt", "snaps/ps-1/checkpoint.tar.part-000", strings.NewReader("hello-"))
+	if err != nil {
+		t.Fatalf("Put part 0: %v", err)
+	}
+	_, err = store.Put(ctx, "bkt", "snaps/ps-1/checkpoint.tar.part-001", strings.NewReader("world!"))
+	if err != nil {
+		t.Fatalf("Put part 1: %v", err)
+	}
+
+	// Compose
+	info, err := store.Compose(ctx, "bkt", "snaps/ps-1/checkpoint.tar", []string{
+		"snaps/ps-1/checkpoint.tar.part-000",
+		"snaps/ps-1/checkpoint.tar.part-001",
+	})
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	if info.Bytes != 12 {
+		t.Fatalf("composed bytes = %d, want 12", info.Bytes)
+	}
+
+	// Test GetRange with valid range [0, 4] -> "hello"
+	rc, err := store.GetRange(ctx, "bkt", "snaps/ps-1/checkpoint.tar", 0, 4)
+	if err != nil {
+		t.Fatalf("GetRange: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(got) != "hello" {
+		t.Fatalf("GetRange(0, 4) = %q, want %q", got, "hello")
+	}
+
+	// Test GetRange requires 206: if server returns 200 on range request, GetRange returns error
+	badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK) // returns 200 instead of 206
+		_, _ = w.Write([]byte("full-object"))
+	}))
+	defer badServer.Close()
+	badStore := &GCSStore{
+		HTTP:    badServer.Client(),
+		APIBase: badServer.URL,
+	}
+	if _, err := badStore.GetRange(ctx, "bkt", "obj", 0, 4); err == nil {
+		t.Fatal("expected GetRange to reject HTTP 200 when 206 is required")
 	}
 }

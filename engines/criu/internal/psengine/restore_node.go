@@ -94,8 +94,17 @@ type NodeRestoreReconciler struct {
 	// Empty disables the guard (both sides honest-absent).
 	CPUFamily string
 
+	ParallelUploadConfig ParallelUploadConfig
+
 	inflight sync.Map
 	signaled sync.Map
+}
+
+func (r *NodeRestoreReconciler) parallelConfig() ParallelUploadConfig {
+	if r.ParallelUploadConfig.ThresholdBytes > 0 {
+		return r.ParallelUploadConfig
+	}
+	return DefaultParallelUploadConfig
 }
 
 // Note: engines/criu does not run controller-gen; deploy/deploy.yaml is the RBAC source of truth.
@@ -384,8 +393,12 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 // Returns the content bytes only for small objects (expected use: manifest,
 // spec); for the tar the caller reads from dst.
 func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, expectedSHA string, expectedSize, maxBytes int64) ([]byte, error) {
-	if rangeStore, ok := r.Store.(RangeObjectStore); ok && expectedSize >= DefaultParallelUploadConfig.ThresholdBytes {
-		return r.parallelFetch(ctx, rangeStore, bucket, object, dst, expectedSHA, expectedSize)
+	if maxBytes > 0 && expectedSize > maxBytes {
+		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxBytes)
+	}
+	cfg := r.parallelConfig()
+	if rangeStore, ok := r.Store.(RangeObjectStore); ok && expectedSize >= cfg.ThresholdBytes {
+		return r.parallelFetch(ctx, rangeStore, bucket, object, dst, expectedSHA, expectedSize, maxBytes, cfg)
 	}
 
 	rc, err := r.Store.Get(ctx, bucket, object)
@@ -408,7 +421,7 @@ func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, 
 	if cerr != nil {
 		return nil, cerr
 	}
-	if n > maxBytes {
+	if maxBytes > 0 && n > maxBytes {
 		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxBytes)
 	}
 	if expectedSHA != "" {
@@ -419,7 +432,11 @@ func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, 
 	return small.bytes, nil
 }
 
-func (r *NodeRestoreReconciler) parallelFetch(ctx context.Context, s RangeObjectStore, bucket, object, dst, expectedSHA string, totalBytes int64) ([]byte, error) {
+func (r *NodeRestoreReconciler) parallelFetch(ctx context.Context, s RangeObjectStore, bucket, object, dst, expectedSHA string, totalBytes, maxBytes int64, cfg ParallelUploadConfig) ([]byte, error) {
+	if maxBytes > 0 && totalBytes > maxBytes {
+		return nil, fmt.Errorf("%s exceeds maximum allowed download size (%d bytes)", object, maxBytes)
+	}
+
 	f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -430,13 +447,17 @@ func (r *NodeRestoreReconciler) parallelFetch(ctx context.Context, s RangeObject
 		return nil, fmt.Errorf("pre-allocate %s: %w", dst, err)
 	}
 
-	numChunks := DefaultParallelUploadConfig.MaxConcurrency
+	numChunks := cfg.MaxConcurrency
 	if numChunks <= 0 {
 		numChunks = 8
 	}
+	minPart := cfg.MinPartSize
+	if minPart <= 0 {
+		minPart = 16 * 1024 * 1024
+	}
 	chunkSize := totalBytes / int64(numChunks)
-	if chunkSize < DefaultParallelUploadConfig.MinPartSize {
-		chunkSize = DefaultParallelUploadConfig.MinPartSize
+	if chunkSize < minPart {
+		chunkSize = minPart
 		numChunks = int(totalBytes / chunkSize)
 		if numChunks < 1 {
 			numChunks = 1

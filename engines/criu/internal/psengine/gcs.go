@@ -179,19 +179,22 @@ func (g *GCSStore) GetRange(ctx context.Context, bucket, object string, start, e
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
+	wantStatus := http.StatusOK
 	if end >= 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+		wantStatus = http.StatusPartialContent
 	} else if start > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
+		wantStatus = http.StatusPartialContent
 	}
 	resp, err := g.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+	if resp.StatusCode != wantStatus {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
-		return nil, fmt.Errorf("gcs get range %s: HTTP %d: %s", object, resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("gcs get range %s: HTTP %d (want %d): %s", object, resp.StatusCode, wantStatus, strings.TrimSpace(string(b)))
 	}
 	return resp.Body, nil
 }
@@ -222,7 +225,17 @@ func (g *GCSStore) Compose(ctx context.Context, bucket, destination string, sour
 		return nil, fmt.Errorf("compose request encode: %w", err)
 	}
 
-	resp, err := g.do(ctx, http.MethodPost, u, bytes.NewReader(jsonBytes))
+	tok, err := g.bearer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(jsonBytes))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := g.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -399,10 +412,14 @@ func ParallelVerifiedPutWithConfig(ctx context.Context, s ObjectStore, bucket, o
 		partNames[i] = name
 	}
 
-	cleanupParts := func() {
+	cleanupParts := func() error {
+		var firstErr error
 		for _, name := range partNames {
-			_ = s.Delete(context.Background(), bucket, name)
+			if err := s.Delete(context.Background(), bucket, name); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("cleanup part %s: %w", name, err)
+			}
 		}
+		return firstErr
 	}
 
 	// Concurrently upload parts
@@ -429,15 +446,18 @@ func ParallelVerifiedPutWithConfig(ctx context.Context, s ObjectStore, bucket, o
 	close(errCh)
 
 	if err := <-errCh; err != nil {
-		cleanupParts()
+		_ = cleanupParts()
 		return 0, err
 	}
 
 	// Compose the parts into the destination object
 	compInfo, err := compStore.Compose(ctx, bucket, object, partNames)
-	cleanupParts()
+	cleanErr := cleanupParts()
 	if err != nil {
 		return 0, fmt.Errorf("compose %s: %w", object, err)
+	}
+	if cleanErr != nil {
+		return 0, cleanErr
 	}
 
 	if compInfo.Bytes != size {

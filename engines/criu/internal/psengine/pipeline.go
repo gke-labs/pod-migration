@@ -158,7 +158,16 @@ type NodeSnapshotReconciler struct {
 	// (cached read). Zero means defaultCancelPollInterval.
 	CancelPollInterval time.Duration
 
+	ParallelUploadConfig ParallelUploadConfig
+
 	inflight sync.Map
+}
+
+func (r *NodeSnapshotReconciler) parallelConfig() ParallelUploadConfig {
+	if r.ParallelUploadConfig.ThresholdBytes > 0 {
+		return r.ParallelUploadConfig
+	}
+	return DefaultParallelUploadConfig
 }
 
 const defaultCancelPollInterval = 2 * time.Second
@@ -606,7 +615,7 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	if err != nil {
 		return err
 	}
-	n, err := ParallelVerifiedPut(ctx, r.Store, spec.Bucket, path.Join(prefix, "checkpoint.tar"), f, tarBytes)
+	n, err := ParallelVerifiedPutWithConfig(ctx, r.Store, spec.Bucket, path.Join(prefix, "checkpoint.tar"), f, tarBytes, r.parallelConfig())
 	f.Close()
 	if c := cancelledAt("during the upload"); c != nil {
 		return c
