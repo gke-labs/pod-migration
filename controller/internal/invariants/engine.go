@@ -36,9 +36,9 @@ type Engine struct {
 
 	mu                   sync.Mutex
 	activeViolations     map[string]map[string]string    // scopeKey -> violationKey -> message
-	consecutiveCounts    map[string]map[string]int        // subjectKey -> invariantID -> consecutive count
-	consecutiveFirstSeen map[string]map[string]time.Time  // subjectKey -> invariantID -> first seen timestamp
-	consecutiveEscalated map[string]map[string]bool       // subjectKey -> invariantID -> whether escalation event was emitted
+	consecutiveCounts    map[string]map[string]int       // subjectKey -> invariantID -> consecutive count
+	consecutiveFirstSeen map[string]map[string]time.Time // subjectKey -> invariantID -> first seen timestamp
+	consecutiveEscalated map[string]map[string]bool      // subjectKey -> invariantID -> whether escalation event was emitted
 }
 
 // NewEngine constructs an invariant Engine with DefaultRules.

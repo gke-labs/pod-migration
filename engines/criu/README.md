@@ -168,13 +168,15 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      labels each `PodSnapshot` `gke-pod-snapshot-triggered-by: <trigger>` (when
      the trigger name fits in a label value), so the orchestrator finds
      unfinished snapshots after the trigger is deleted.
-   - Records the source node's facts with each checkpoint, so that a later
-     change can place restores only on compatible nodes ([#257](https://github.com/gke-labs/pod-migration/issues/257)).
+   - Records the source node's facts with each checkpoint, so that the
+     orchestrator places the restore only on a compatible node ([#257](https://github.com/gke-labs/pod-migration/issues/257),
+     see [Restore placement](#restore-placement)).
      The agent gathers them just before it freezes the source and writes
      them twice: as `sourceNode` in `manifest.json`, next to the archive, and
      as `status.sourceNode` on the `PodSnapshot`, in the same status write
      that marks it `Ready=True`. The orchestrator can read the `PodSnapshot`
-     without access to the bucket. The fields are `cpuModel` (the
+     without access to the bucket. The fields are `cpuVendor` (the
+     `vendor_id` line of `/proc/cpuinfo`, absent on arm64), `cpuModel` (the
      `model name` line of `/proc/cpuinfo`, absent on arm64, which has no such
      line), `cpuFeatures` (the `flags` (x86) or `Features` (arm64) lines, the
      union across processors, sorted, raw: on x86 they include kernel and
@@ -183,11 +185,14 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      (`runc --version` in the host mount namespace, on the `PATH` the agent's
      restores use, which may not be the runc containerd is configured with)
      and `containerdVersion` (containerd's version API, without the leading
-     `v`). Every probe is best effort and bounded: a fact the agent can't read
+     `v`), plus `placementLabels`, the node label format the agent publishes
+     (`v1`). Every probe is best effort and bounded: a fact the agent can't read
      is left out, and never fails the checkpoint. A failed checkpoint records
      nothing on the `PodSnapshot`; one that fails at the commit point has
-     already uploaded its manifest, facts included. Nothing reads these facts
-     yet: the restore node still checks only `cpuFamily`.
+     already uploaded its manifest, facts included. The restore node itself
+     still checks only `cpuFamily`.
+   - Publishes its own node's facts on the `Node`, as labels for restore
+     placement and annotations for people (see [Restore placement](#restore-placement)).
    - Reconciles replacement pods on its node carrying the restore order,
      `<group>/ps-name` (`psengine.NodeRestoreReconciler`): downloads
      and SHA-256 verifies the archive from GCS, checks CPU family compatibility,
@@ -429,6 +434,107 @@ kubectl get podsnapshots.criu.podmigration.gke.io -A -o jsonpath='{range .items[
 The controller's `make -C controller undeploy` doesn't touch CRIU
 `PodSnapshot`s, so it isn't affected.
 
+## Restore placement
+
+A CRIU checkpoint only restores on a node that is compatible with the one it
+was taken on ([#257](https://github.com/gke-labs/pod-migration/issues/257)).
+With the controller's `--restore-placement` (on by default), a replacement
+that its ReplicaSet or StatefulSet would recreate is released with required
+node affinity that only compatible nodes meet, and the controller's usual
+placement deadline and cold-start fallback apply when none can take it (engine
+contract C8, as for GKE Pod Snapshots). The controller reads the source node's
+facts from the `PodSnapshot`'s `status.sourceNode`, and every node's facts
+from labels that the node agent publishes on its own `Node`.
+
+**The rule.** A node can restore the checkpoint when, for each fact known on
+both nodes:
+
+- the architecture is the same (the node's `kubernetes.io/arch` label, which
+  the kubelet sets, against the agent's architecture recorded as `arch`);
+- the CPU vendor (`vendor_id`) is the same;
+- the CPU model name is the same. The agent's restore refuses a checkpoint
+  from another model name (its `cpuFamily` guard), so placement does too;
+- on x86, the node has every instruction flag of the source that CRIU itself
+  compares, and exactly the source's XSAVE state flags (`avx`, `avx512f`,
+  `ospke`, `amx_tile`);
+- the kernel, CRIU, runc and containerd versions are the same or newer. The
+  leading `major.minor.patch` is compared, so `6.6.72+` and `6.6.72-gke.1`
+  are the same version.
+
+A fact that is unknown on either node, or a version that doesn't parse, never
+excludes a node: the source then adds no constraint for it, and a node
+publishes it as `unknown` (versions as `1000000000`, newer than any real one).
+The controller logs the source facts it couldn't use, at verbosity 1. A checkpoint taken by an
+agent from before this change carries no `placementLabels` in its facts, and
+gets no constraints, so a controller upgraded before the agents doesn't send
+restores waiting for labels that no node has yet.
+
+**Which CPU flags count.** The instruction flags are CRIU's own `ins` CPU
+capability set (`x86_ins_capability_mask` in `criu/arch/x86/cpu.c`: the
+user-visible instruction set extensions, such as `sse4_2`, `avx2`,
+`avx512f`, `sha_ni` and `rtm`), under their `/proc/cpuinfo` names, plus
+`xsaves` from CRIU's `fpu` check. `osxsave` is in CRIU's set too, but Linux
+doesn't show it. CRIU's set predates some user-visible extensions, so these
+are compared too: `fma`, `avx512ifma`, `avx512_bf16`, `avx512_fp16`,
+`avx_vnni`, `amx_bf16`, `amx_int8`, `movdiri`, `movdir64b`, `serialize`,
+`cldemote` and `waitpkg`. Everything else in the `flags` line isn't compared, as in
+CRIU: the kernel's mitigation and bug flags (`pti`, `md_clear`, `ibrs`,
+`ssbd`, ...), virtualization flags (`hypervisor`, `vmx`, ...), and timer and
+power management flags (`constant_tsc`, `arat`, ...), which vary between
+hosts and kernels without changing what the application can run. CRIU's `fpu`
+check also requires the same XSAVE area size on both nodes, because glibc
+caches it at startup, so the XSAVE state flags must match exactly rather than
+as a superset. CRIU only applies these checks itself with `--cpu-cap`, which
+runc doesn't pass, so placement is the only CPU check before the restore.
+The list is in `internal/psengine/contract/node_placement.go`, with a copy in
+the controller's `internal/criuplacement`; tests keep them equal. Off x86,
+CPU features aren't compared (CRIU doesn't either).
+
+**What the agent publishes.** The agent reads its node's facts once its
+bootstrap has run (even a failed one), then every 10 minutes, and patches only what changed; a failed publish is retried after 30 seconds. For
+its own node, `cpuFeatures` is the intersection across processors. Labels
+(all are always present, except the missing-flag ones):
+
+| Label | Value |
+| ----- | ----- |
+| `criu.pod-migrate.io/cpu-vendor` | `vendor_id`, or `unknown` |
+| `criu.pod-migrate.io/cpu-model` | the first 16 hex digits of the SHA-256 of the model name, or `unknown` |
+| `criu.pod-migrate.io/xstate` | the XSAVE state flags the node has, dot-separated (`avx.avx512f.ospke`), `none`, or `unknown` (features unknown, or not x86) |
+| `criu.pod-migrate.io/kernel-version-code`, `criu-version-code`, `runc-version-code`, `containerd-version-code` | `major*1000000 + minor*1000 + patch`, or `1000000000` if unknown |
+| `missing-cpu.criu.pod-migrate.io/<flag>` | `true`, for each compared x86 instruction flag the node lacks; none when its features are unknown |
+
+The controller requires `kubernetes.io/arch In [<source arch>]`,
+`In [<source value>, unknown]` on the vendor, model
+and XSAVE labels, `Gt <source code - 1>` on the version labels (none for a code of 0), and
+`DoesNotExist` on the missing-flag label of each compared flag the source
+had. Annotations `pod-migrate.io/criu-node-facts` (the facts as JSON, without
+the CPU features) and `pod-migrate.io/criu-node-cpu-features` (the features,
+space-separated) show the same facts to people. The agent removes
+`criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` labels that
+it no longer publishes, so don't put your own labels under those prefixes.
+A node without the agent carries no version labels, so a restore with known
+source versions isn't placed there; it can't restore a CRIU checkpoint
+anyway. The engine's readiness on the target (`pod-migrate.io/criu-ready`) isn't
+a constraint yet: a node whose agent reports `criu-ready=false` still meets
+them, and its restore falls back to a cold start as before.
+
+**Limits.** Node labels only exist once the agent has published them, so:
+
+- During a rolling upgrade of the agent DaemonSet, a checkpoint taken by an
+  upgraded agent excludes nodes whose agent hasn't published the labels yet,
+  even if they could restore it. If no node fits within
+  `--restore-placement-deadline`, the replacement starts cold, as for any
+  placement timeout. Upgrade the agents before the window in which you
+  drain nodes.
+- The cluster autoscaler builds a new node from its node pool's template,
+  which doesn't carry these labels, so it doesn't scale a pool up for a
+  replacement with these constraints. In a pool that is full or scaled to
+  zero, the replacement waits until the restore timeout, then starts cold.
+
+**Not tested live yet.** The rule and the label format are unit-tested, and
+the constraints are checked against a real API server (envtest); an
+end-to-end run with an incompatible node is still to do.
+
 ## Rolling Node-Pool Upgrades & Kernel Compatibility
 
 Rolling node-pool upgrades in GKE cordon and drain nodes one by one, triggering the `EvictionGate` to initiate live migrations for opted-in stateful pods (`pod-migration.gke.io/enabled: "true"`). During a rolling upgrade, pods checkpointed on an older node are restored onto an upgraded node that may run a newer Linux kernel, containerd, runc, or CRIU version.
@@ -439,12 +545,12 @@ Rolling node-pool upgrades in GKE cordon and drain nodes one by one, triggering 
 | ------------------------------ | ------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **GKE Patch Upgrade**          | `1.34.1-gke.1000` &rarr; `1.34.2-gke.1100` | **Expected (untested)** | Identical kernel major.minor, identical glibc/ABI. In-memory state and socket structures expected to restore with zero degradation.                                                                                               |
 | **GKE Minor Upgrade**          | `1.34.x` &rarr; `1.35.x`                   | **Expected (untested)** | Newer kernel on destination node. Linux user-space ABI stability ensures task memory, threads, and file descriptors restore cleanly provided CPU features match.                                                                |
-| **Minor Downgrade / Rollback** | `1.35.x` &rarr; `1.34.x`                   | **Untested / Fallback**| Checkpoints utilizing newer kernel syscalls or vDSO mappings may fail to restore on older kernels. Handled safely: the replacement pod falls back to a clean cold start with `RestoreCrashFallback`.                            |
-| **CPU Architecture Mismatch**  | Intel &rarr; AMD / mixed microarch         | **Untested / Unfenced**| Heterogeneous CPU instruction sets (e.g. missing AVX/AVX-512 flags) cause SIGILL on restore. PR #258 records node facts in `status.sourceNode` and `manifest.json`; filtering on those facts is planned for [#257](https://github.com/gke-labs/pod-migration/issues/257). |
+| **Minor Downgrade / Rollback** | `1.35.x` &rarr; `1.34.x`                   | **Placed away (untested live)** | With `--restore-placement` (on by default), a node with an older kernel, CRIU, runc or containerd than the source doesn't meet the restore's constraints ([Restore placement](#restore-placement)), so a ReplicaSet or StatefulSet replacement isn't restored there. With placement off, or for a replacement that placement doesn't constrain (a Job's or a bare pod), a failed restore falls back to a cold start with `RestoreCrashFallback`. |
+| **CPU Architecture Mismatch**  | Intel &rarr; AMD / mixed microarch         | **Placed (untested live)** | Heterogeneous CPU instruction sets (e.g. missing AVX/AVX-512 flags) cause SIGILL on restore. With `--restore-placement` (on by default), the replacement only goes to a node with the same vendor and model and the source's instruction set ([Restore placement](#restore-placement), [#257](https://github.com/gke-labs/pod-migration/issues/257)); this applies to ReplicaSet and StatefulSet replacements only. If no node meets it, the replacement is recreated to start cold after `--restore-placement-deadline` when another node could take it, or at the restore timeout otherwise. |
 
 ### Prerequisites for Clean Upgrades
 
-1. **Homogeneous Node Pools:** Node pools participating in rolling upgrades must share CPU family and instruction sets.
+1. **Homogeneous Node Pools:** Node pools participating in rolling upgrades should share CPU model and instruction sets, and upgrade forward only. Otherwise placement finds no compatible node and the replacement starts cold ([Restore placement](#restore-placement)).
 2. **Workload Opt-In & CRIU Routing:** Workloads must carry `pod-migration.gke.io/enabled: "true"` and the namespace must configure a `PodMigration` routing workloads to CRIU (e.g. `pod-migration.gke.io/runtime-class-engines: "@default=criu"`).
 
 ### Running the Live Upgrade Verification Suite

@@ -7,8 +7,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/gke-labs/pod-migration/controller/internal/util"
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
 // TestEvaluateI4_SnapshottingStartTimeAnchor: the deadline runs from creation

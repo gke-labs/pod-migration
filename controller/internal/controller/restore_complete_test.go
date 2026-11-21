@@ -325,4 +325,3 @@ func TestRestoreVerified_CeilingPathCompletesTheRestoreFirst(t *testing.T) {
 		t.Errorf("phase = %s, want Succeeded", phase)
 	}
 }
-

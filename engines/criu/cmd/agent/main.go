@@ -96,6 +96,11 @@ func main() {
 		if err := nd.Bootstrap(ctx); err != nil {
 			log.Error(err, "CRIU bootstrap failed (continuing; node remains unready)")
 		}
+		// Publish this node's facts as restore placement labels (#257) after
+		// bootstrap, so the CRIU bundle's version is readable, and keep them
+		// current. A failed bootstrap still publishes: a version the agent
+		// can't read is published as unknown.
+		go nd.RunNodeFactsLoop(ctx, node.DefaultNodeFactsInterval, node.DefaultNodeFactsRetry)
 		if err := nd.SweepOrphanRestores(ctx); err != nil {
 			log.Error(err, "orphan restore sweep failed (continuing)")
 		}

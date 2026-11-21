@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -58,11 +59,26 @@ type factsProbe struct {
 	// timeout bounds each probe that leaves the agent; zero means
 	// defaultFactsProbeTimeout.
 	timeout time.Duration
+	// ownNode gathers the node's facts as a restore target (node_facts.go):
+	// the CPU features every processor has, rather than any processor.
+	ownNode bool
 }
 
 // PSEngineSourceNodeFacts reports this node's facts for a checkpoint taken
 // now. Unknown facts are empty.
 func (n *Node) PSEngineSourceNodeFacts(ctx context.Context) contract.SourceNodeFacts {
+	f := n.newFactsProbe().gather(ctx)
+	if !f.IsEmpty() {
+		f.Arch = runtime.GOARCH
+		f.PlacementLabels = contract.PlacementLabelsVersion
+	}
+	logf.FromContext(ctx).V(1).Info("source node facts", "facts", f)
+	return f
+}
+
+// newFactsProbe returns the probe for this node, on the host's procfs, the
+// installed CRIU bundle, and the agent's host runner and containerd client.
+func (n *Node) newFactsProbe() factsProbe {
 	p := factsProbe{
 		procRoot:        "/proc",
 		criuVersionFile: filepath.Join(criuBundleDir, "VERSION"),
@@ -79,15 +95,18 @@ func (n *Node) PSEngineSourceNodeFacts(ctx context.Context) contract.SourceNodeF
 			}
 		}
 	}
-	f := p.gather(ctx)
-	logf.FromContext(ctx).V(1).Info("source node facts", "facts", f)
-	return f
+	return p
 }
 
 func (p factsProbe) gather(ctx context.Context) contract.SourceNodeFacts {
 	var f contract.SourceNodeFacts
 	if b, err := os.ReadFile(filepath.Join(p.procRoot, "cpuinfo")); err == nil {
-		f.CPUModel, f.CPUFeatures = parseCPUInfo(string(b))
+		if p.ownNode {
+			f.CPUModel, f.CPUFeatures = parseCPUInfoCommon(string(b))
+		} else {
+			f.CPUModel, f.CPUFeatures = parseCPUInfo(string(b))
+		}
+		f.CPUVendor = parseCPUVendor(string(b))
 	}
 	if b, err := os.ReadFile(filepath.Join(p.procRoot, "sys", "kernel", "osrelease")); err == nil {
 		f.KernelVersion = strings.TrimSpace(string(b))
@@ -145,6 +164,54 @@ func parseCPUInfo(s string) (model string, features []string) {
 	}
 	sort.Strings(features)
 	return model, features
+}
+
+// parseCPUInfoCommon is parseCPUInfo with the feature flags that every
+// processor has: the intersection, which is what a restore target offers.
+func parseCPUInfoCommon(s string) (model string, features []string) {
+	var common map[string]bool
+	for _, line := range strings.Split(s, "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "model name":
+			if model == "" {
+				model = strings.TrimSpace(v)
+			}
+		case "flags", "Features":
+			these := map[string]bool{}
+			for _, flag := range strings.Fields(v) {
+				these[flag] = true
+			}
+			if common == nil {
+				common = these
+				continue
+			}
+			for flag := range common {
+				if !these[flag] {
+					delete(common, flag)
+				}
+			}
+		}
+	}
+	for flag := range common {
+		features = append(features, flag)
+	}
+	sort.Strings(features)
+	return model, features
+}
+
+// parseCPUVendor returns the first "vendor_id" (x86). Empty when there is
+// none, as on arm64.
+func parseCPUVendor(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(k) == "vendor_id" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 var versionNumber = regexp.MustCompile(`[0-9]+\.[0-9]+(\.[0-9]+)?`)
