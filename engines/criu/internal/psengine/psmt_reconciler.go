@@ -86,7 +86,7 @@ type PSMTReconciler struct {
 
 // +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotmanualtriggers/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods;nodes,verbs=get;list;watch
 
@@ -143,6 +143,14 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
+	if err == nil && ps.GetDeletionTimestamp() != nil {
+		// Its archive is being deleted (ArchiveFinalizer, #107): never hand it
+		// to a trigger re-created for the same pod instance. Once it's gone,
+		// that trigger gets a new work order. The orchestrator deletes a
+		// job's PodSnapshot only after the job's own trigger is gone.
+		logger.Info("work order is being deleted; waiting for it to be gone", "snapshot", snapshotName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 	// Eligibility is decided once, when the work order is created (#218). A
 	// work order with a bucket was judged eligible and may already be running
 	// on the node agent, which owns its outcome from here. Later passes (the
@@ -175,6 +183,9 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			psLabels[contract.LabelTriggeredBy] = req.Name
 		}
 		ps.SetLabels(psLabels)
+		// The engine deletes the archive before the work order goes away
+		// (archive_gc.go, #107).
+		ps.SetFinalizers([]string{ArchiveFinalizer})
 		spec := map[string]interface{}{
 			"sourcePod":    pod.Name,
 			"sourcePodUID": string(pod.UID),

@@ -89,6 +89,7 @@ rules:
   resources:
   - podsnapshots
   verbs:
+  - delete
   - get
   - list
   - watch
