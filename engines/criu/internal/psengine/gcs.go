@@ -350,8 +350,8 @@ type ParallelUploadConfig struct {
 	ThresholdBytes int64 // minimum file size to trigger parallel multi-stream upload (default: 32 MiB)
 }
 
-// DefaultParallelUploadConfig provides tuned concurrency defaults for high-speed
-// object-storage uploads during short (~30s) preemption windows.
+// DefaultParallelUploadConfig provides concurrency defaults for parallel
+// object-storage uploads.
 var DefaultParallelUploadConfig = ParallelUploadConfig{
 	MinPartSize:    16 * 1024 * 1024, // 16 MiB
 	MaxConcurrency: 8,                // up to 8 parallel streams
@@ -412,14 +412,15 @@ func ParallelVerifiedPutWithConfig(ctx context.Context, s ObjectStore, bucket, o
 		partNames[i] = name
 	}
 
-	cleanupParts := func() error {
-		var firstErr error
+	uploadCtx, cancelUpload := context.WithCancel(ctx)
+	defer cancelUpload()
+
+	cleanupParts := func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
 		for _, name := range partNames {
-			if err := s.Delete(context.Background(), bucket, name); err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("cleanup part %s: %w", name, err)
-			}
+			_ = s.Delete(cleanupCtx, bucket, name)
 		}
-		return firstErr
 	}
 
 	// Concurrently upload parts
@@ -430,12 +431,14 @@ func ParallelVerifiedPutWithConfig(ctx context.Context, s ObjectStore, bucket, o
 		go func(p partInfo) {
 			defer wg.Done()
 			secReader := io.NewSectionReader(r, p.offset, p.bytes)
-			n, err := VerifiedPut(ctx, s, bucket, p.name, secReader)
+			n, err := VerifiedPut(uploadCtx, s, bucket, p.name, secReader)
 			if err != nil {
+				cancelUpload()
 				errCh <- fmt.Errorf("upload part %d (%s): %w", p.index, p.name, err)
 				return
 			}
 			if n != p.bytes {
+				cancelUpload()
 				errCh <- fmt.Errorf("upload part %d (%s): uploaded %d bytes, want %d", p.index, p.name, n, p.bytes)
 				return
 			}
@@ -446,18 +449,15 @@ func ParallelVerifiedPutWithConfig(ctx context.Context, s ObjectStore, bucket, o
 	close(errCh)
 
 	if err := <-errCh; err != nil {
-		_ = cleanupParts()
+		cleanupParts()
 		return 0, err
 	}
 
 	// Compose the parts into the destination object
 	compInfo, err := compStore.Compose(ctx, bucket, object, partNames)
-	cleanErr := cleanupParts()
+	cleanupParts()
 	if err != nil {
 		return 0, fmt.Errorf("compose %s: %w", object, err)
-	}
-	if cleanErr != nil {
-		return 0, cleanErr
 	}
 
 	if compInfo.Bytes != size {

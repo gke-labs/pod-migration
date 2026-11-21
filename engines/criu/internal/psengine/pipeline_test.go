@@ -127,9 +127,11 @@ func (f *fakeNodeOps) SourceInfo(_ context.Context, ns, pod, podUID, container s
 
 // memStore is an in-memory ObjectStore recording write order.
 type memStore struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	order   []string
+	mu           sync.Mutex
+	objects      map[string][]byte
+	order        []string
+	composeCalls int
+	rangeCalls   int
 }
 
 func newMemStore() *memStore { return &memStore{objects: map[string][]byte{}} }
@@ -166,6 +168,7 @@ func (m *memStore) Delete(_ context.Context, bucket, object string) error {
 func (m *memStore) Compose(_ context.Context, bucket, destination string, sources []string) (*ObjectInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.composeCalls++
 	var combined []byte
 	for _, src := range sources {
 		data, ok := m.objects[bucket+"/"+src]
@@ -182,6 +185,7 @@ func (m *memStore) Compose(_ context.Context, bucket, destination string, source
 func (m *memStore) GetRange(_ context.Context, bucket, object string, start, end int64) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.rangeCalls++
 	data, ok := m.objects[bucket+"/"+object]
 	if !ok {
 		return nil, errors.New("not found: " + object)

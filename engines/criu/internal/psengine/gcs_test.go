@@ -251,10 +251,15 @@ func TestGCSStore_ComposeAndGetRange(t *testing.T) {
 	}))
 	defer badServer.Close()
 	badStore := &GCSStore{
-		HTTP:    badServer.Client(),
-		APIBase: badServer.URL,
+		HTTP:     badServer.Client(),
+		APIBase:  badServer.URL,
+		TokenURL: store.TokenURL,
 	}
-	if _, err := badStore.GetRange(ctx, "bkt", "obj", 0, 4); err == nil {
+	_, err = badStore.GetRange(ctx, "bkt", "obj", 0, 4)
+	if err == nil {
 		t.Fatal("expected GetRange to reject HTTP 200 when 206 is required")
+	}
+	if !strings.Contains(err.Error(), "HTTP 200") {
+		t.Fatalf("expected error mentioning HTTP 200, got: %v", err)
 	}
 }

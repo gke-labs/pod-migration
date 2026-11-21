@@ -30,8 +30,12 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 )
 
 // benchStore models a cloud object store supporting composite object composition
@@ -149,8 +153,8 @@ func TestParallelUpload_MultiStreamCompositeAndRestoreDownload(t *testing.T) {
 	store := newBenchStore(0)
 	ctx := context.Background()
 
-	// Generate 64 MiB payload
-	payloadSize := int64(64 * 1024 * 1024)
+	// Generate 4 MiB payload
+	payloadSize := int64(4 * 1024 * 1024)
 	buf := make([]byte, payloadSize)
 	for i := range buf {
 		buf[i] = byte(i % 251)
@@ -160,9 +164,9 @@ func TestParallelUpload_MultiStreamCompositeAndRestoreDownload(t *testing.T) {
 	expectedSHA := hex.EncodeToString(h.Sum(nil))
 
 	cfg := ParallelUploadConfig{
-		MinPartSize:    16 * 1024 * 1024,
+		MinPartSize:    1024 * 1024,
 		MaxConcurrency: 4,
-		ThresholdBytes: 32 * 1024 * 1024,
+		ThresholdBytes: 2 * 1024 * 1024,
 	}
 
 	reader := bytes.NewReader(buf)
@@ -223,14 +227,14 @@ func TestParallelUpload_AbortCleansUpParts(t *testing.T) {
 	store.failOnPart = "snaps/ps-2/checkpoint.tar.part-002"
 	ctx := context.Background()
 
-	payloadSize := int64(64 * 1024 * 1024)
+	payloadSize := int64(4 * 1024 * 1024)
 	buf := make([]byte, payloadSize)
 	reader := bytes.NewReader(buf)
 
 	cfg := ParallelUploadConfig{
-		MinPartSize:    16 * 1024 * 1024,
+		MinPartSize:    1024 * 1024,
 		MaxConcurrency: 4,
-		ThresholdBytes: 32 * 1024 * 1024,
+		ThresholdBytes: 2 * 1024 * 1024,
 	}
 
 	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-2/checkpoint.tar", reader, payloadSize, cfg)
@@ -250,14 +254,14 @@ func TestParallelUpload_FetchEnforcesMaxBytes(t *testing.T) {
 	store := newBenchStore(0)
 	ctx := context.Background()
 
-	payloadSize := int64(64 * 1024 * 1024)
+	payloadSize := int64(4 * 1024 * 1024)
 	buf := make([]byte, payloadSize)
 	reader := bytes.NewReader(buf)
 
 	cfg := ParallelUploadConfig{
-		MinPartSize:    16 * 1024 * 1024,
+		MinPartSize:    1024 * 1024,
 		MaxConcurrency: 4,
-		ThresholdBytes: 32 * 1024 * 1024,
+		ThresholdBytes: 2 * 1024 * 1024,
 	}
 
 	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-limit/checkpoint.tar", reader, payloadSize, cfg)
@@ -272,7 +276,7 @@ func TestParallelUpload_FetchEnforcesMaxBytes(t *testing.T) {
 	}
 
 	// Fetch with maxBytes smaller than payloadSize must fail fast
-	maxBytes := int64(1 * 1024 * 1024) // 1 MiB cap on 64 MiB payload
+	maxBytes := int64(512 * 1024) // 512 KiB cap on 4 MiB payload
 	_, err = nr.fetch(ctx, "test-bucket", "snaps/ps-limit/checkpoint.tar", dstFile, "", payloadSize, maxBytes)
 	if err == nil {
 		t.Fatal("expected fetch to fail when payloadSize > maxBytes, got nil")
@@ -286,14 +290,14 @@ func TestParallelUpload_FetchEnforcesSHA(t *testing.T) {
 	store := newBenchStore(0)
 	ctx := context.Background()
 
-	payloadSize := int64(64 * 1024 * 1024)
+	payloadSize := int64(4 * 1024 * 1024)
 	buf := make([]byte, payloadSize)
 	reader := bytes.NewReader(buf)
 
 	cfg := ParallelUploadConfig{
-		MinPartSize:    16 * 1024 * 1024,
+		MinPartSize:    1024 * 1024,
 		MaxConcurrency: 4,
-		ThresholdBytes: 32 * 1024 * 1024,
+		ThresholdBytes: 2 * 1024 * 1024,
 	}
 
 	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-sha/checkpoint.tar", reader, payloadSize, cfg)
@@ -317,24 +321,30 @@ func TestParallelUpload_FetchEnforcesSHA(t *testing.T) {
 	}
 }
 
-func TestParallelUpload_CleanupFailureFailsUpload(t *testing.T) {
+func TestParallelUpload_CleanupFailureDoesNotFailUpload(t *testing.T) {
 	store := newBenchStore(0)
-	store.failOnDelete = true // simulate missing storage.objects.delete IAM permission
+	store.failOnDelete = true // simulate missing storage.objects.delete IAM permission on node agent
 	ctx := context.Background()
 
-	payloadSize := int64(64 * 1024 * 1024)
+	payloadSize := int64(4 * 1024 * 1024)
 	buf := make([]byte, payloadSize)
 	reader := bytes.NewReader(buf)
 
 	cfg := ParallelUploadConfig{
-		MinPartSize:    16 * 1024 * 1024,
+		MinPartSize:    1024 * 1024,
 		MaxConcurrency: 4,
-		ThresholdBytes: 32 * 1024 * 1024,
+		ThresholdBytes: 2 * 1024 * 1024,
 	}
 
-	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-leak/checkpoint.tar", reader, payloadSize, cfg)
-	if err == nil {
-		t.Fatal("expected error when cleanup Delete fails, got nil (parts would leak under missing delete IAM)")
+	n, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-leak/checkpoint.tar", reader, payloadSize, cfg)
+	if err != nil {
+		t.Fatalf("expected upload to succeed despite part cleanup failure (best-effort cleanup), got: %v", err)
+	}
+	if n != payloadSize {
+		t.Fatalf("uploaded %d bytes, want %d", n, payloadSize)
+	}
+	if _, ok := store.objects["test-bucket/snaps/ps-leak/checkpoint.tar"]; !ok {
+		t.Fatal("expected composed checkpoint.tar to exist")
 	}
 }
 
@@ -343,14 +353,14 @@ func TestParallelUpload_ComposedSizeMismatchFails(t *testing.T) {
 	store.corruptComposedSize = true
 	ctx := context.Background()
 
-	payloadSize := int64(64 * 1024 * 1024)
+	payloadSize := int64(4 * 1024 * 1024)
 	buf := make([]byte, payloadSize)
 	reader := bytes.NewReader(buf)
 
 	cfg := ParallelUploadConfig{
-		MinPartSize:    16 * 1024 * 1024,
+		MinPartSize:    1024 * 1024,
 		MaxConcurrency: 4,
-		ThresholdBytes: 32 * 1024 * 1024,
+		ThresholdBytes: 2 * 1024 * 1024,
 	}
 
 	_, err := ParallelVerifiedPutWithConfig(ctx, store, "test-bucket", "snaps/ps-size/checkpoint.tar", reader, payloadSize, cfg)
@@ -363,7 +373,7 @@ func TestParallelUpload_ComposedSizeMismatchFails(t *testing.T) {
 }
 
 func TestNodePipeline_ParallelUploadAndRestoreEndToEnd(t *testing.T) {
-	ps := workOrderSnapshot("ps-web-0-parallel")
+	ps := workOrderSnapshot("ps-web-0-deadbeef")
 	c := newClient(t, ps)
 	payload := strings.Repeat("PARALLEL_DATA_1234567890", 100) // 2400 bytes
 	ops := &fakeNodeOps{tarContent: payload, t: t}
@@ -382,13 +392,18 @@ func TestNodePipeline_ParallelUploadAndRestoreEndToEnd(t *testing.T) {
 		ParallelUploadConfig: cfg,
 	}
 
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-parallel"}}); err != nil {
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
 	}
 
 	// Verify checkpoint.tar exists and matches payload
-	if string(store.objects["bkt/snaps/ps-web-0-parallel/checkpoint.tar"]) != payload {
+	if string(store.objects["bkt/snaps/ps-web-0-deadbeef/checkpoint.tar"]) != payload {
 		t.Fatal("tar content mismatch")
+	}
+
+	// Assert Compose was actually called on the store for the parallel upload path
+	if store.composeCalls == 0 {
+		t.Fatal("expected Compose to be called during parallel upload")
 	}
 
 	// Verify temporary parts were cleaned up
@@ -398,25 +413,44 @@ func TestNodePipeline_ParallelUploadAndRestoreEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Verify restore fetch via parallel path
-	tmpDir := t.TempDir()
-	dstFile := filepath.Join(tmpDir, "restored.tar")
-	nr := &NodeRestoreReconciler{
-		Store:                store,
-		ParallelUploadConfig: cfg,
-	}
-	h := sha256.Sum256([]byte(payload))
-	expectedSHA := hex.EncodeToString(h[:])
-	_, err := nr.fetch(context.Background(), "bkt", "snaps/ps-web-0-parallel/checkpoint.tar", dstFile, expectedSHA, int64(len(payload)), 10*1024*1024)
-	if err != nil {
-		t.Fatalf("parallel fetch: %v", err)
-	}
-	gotBytes, err := os.ReadFile(dstFile)
-	if err != nil {
+	// Setup replacement pod and snapshot Ready condition for restore reconciliation
+	if err := contract.SetCondition(ps, metav1.Condition{
+		Type:   contract.CondReady,
+		Status: metav1.ConditionTrue,
+		Reason: contract.ReasonSucceeded,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if string(gotBytes) != payload {
-		t.Fatalf("restored content mismatch: got %d bytes, want %d", len(gotBytes), len(payload))
+	pod := replacementPodOnNode("ps-web-0-deadbeef")
+	c = newClient(t, ps, pod)
+
+	restoreOps := &fakeRestoreOps{}
+	nr := &NodeRestoreReconciler{
+		Client:               c,
+		NodeName:             "node-a",
+		Ops:                  restoreOps,
+		Store:                store,
+		WorkDir:              t.TempDir(),
+		ParallelUploadConfig: cfg,
+	}
+
+	if _, err := nr.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
+		t.Fatalf("reconcile restore: %v", err)
+	}
+
+	// Assert GetRange was called during restore through the production Reconcile path
+	if store.rangeCalls == 0 {
+		t.Fatal("expected GetRange to be called for parallel fetch during restore reconciliation")
+	}
+
+	if len(restoreOps.restored) != 1 {
+		t.Fatalf("restore calls: %d", len(restoreOps.restored))
+	}
+	gotPod := &corev1.Pod{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, gotPod); err != nil {
+		t.Fatal(err)
+	}
+	if gotPod.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusRestored {
+		t.Fatalf("restore status: %q", gotPod.Annotations[contract.AnnotationRestoreStatus])
 	}
 }
-

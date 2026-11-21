@@ -480,25 +480,31 @@ func (r *NodeRestoreReconciler) parallelFetch(ctx context.Context, s RangeObject
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, numChunks)
+	fetchCtx, cancelFetch := context.WithCancel(ctx)
+	defer cancelFetch()
 
 	for _, c := range chunks {
 		wg.Add(1)
 		go func(c chunkRange) {
 			defer wg.Done()
-			rc, err := s.GetRange(ctx, bucket, object, c.offset, c.offset+c.size-1)
+			rc, err := s.GetRange(fetchCtx, bucket, object, c.offset, c.offset+c.size-1)
 			if err != nil {
+				cancelFetch()
 				errCh <- fmt.Errorf("fetch range %d-%d: %w", c.offset, c.offset+c.size-1, err)
 				return
 			}
 			defer rc.Close()
 
 			secWriter := io.NewOffsetWriter(f, c.offset)
-			n, err := io.Copy(secWriter, rc)
+			lr := io.LimitReader(rc, c.size+1)
+			n, err := io.Copy(secWriter, lr)
 			if err != nil {
+				cancelFetch()
 				errCh <- fmt.Errorf("write range %d-%d: %w", c.offset, c.offset+c.size-1, err)
 				return
 			}
 			if n != c.size {
+				cancelFetch()
 				errCh <- fmt.Errorf("fetch range %d-%d: expected %d bytes, got %d", c.offset, c.offset+c.size-1, c.size, n)
 				return
 			}
