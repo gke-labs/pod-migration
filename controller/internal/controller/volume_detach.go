@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controller
+
+import (
+	"context"
+
+	storagev1 "k8s.io/api/storage/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// ReasonVolumeDetachTimeout is recorded when origin pod volume detachment exceeds migration timeout.
+const ReasonVolumeDetachTimeout = "VolumeDetachTimeout"
+
+// areOriginVolumesDetached reports whether all PersistentVolumes listed in pvs have
+// detached from originNodeName. Attachments on other nodes (such as the destination node
+// or existing ReadWriteMany attachments) do not block detachment verification.
+func areOriginVolumesDetached(ctx context.Context, cl client.Reader, originNodeName string, pvs []string) (bool, error) {
+	for _, targetPV := range pvs {
+		if targetPV == "" {
+			continue
+		}
+		vaList := &storagev1.VolumeAttachmentList{}
+		if err := cl.List(ctx, vaList, client.MatchingFields{VolumeAttachmentPVIndex: targetPV}); err != nil {
+			return false, err
+		}
+
+		for _, va := range vaList.Items {
+			// If originNodeName is known, only check detachment from the origin node.
+			// Attachments on other nodes (e.g. destination node or existing RWX attachments) must not block migration.
+			if originNodeName != "" && va.Spec.NodeName != originNodeName {
+				continue
+			}
+			if va.Status.Attached {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}

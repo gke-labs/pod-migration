@@ -27,7 +27,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1015,7 +1014,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				logger.Info("Migration exceeded baseline timeout but Evicting phase is within budget; extending deadline",
 					"job", job.Name, "timeout", migrationTimeout)
 			} else {
-				// If the job was observed to be blocked by PDB or eviction misconfiguration during Evicting phase,
+				// If the job was observed to be blocked by PDB, eviction misconfiguration, or volume detachment during Evicting phase,
 				// conclude as SucceededWithoutRestore so the durable snapshot remains for operator recovery.
 				if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseEvicting {
 					pdbBlockedCond := meta.FindStatusCondition(job.Status.Conditions, "BlockedByPDB")
@@ -1024,26 +1023,34 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					misconfigCond := meta.FindStatusCondition(job.Status.Conditions, "EvictionMisconfigured")
 					isMisconfigured := misconfigCond != nil && misconfigCond.Status == metav1.ConditionTrue
 
-					if isPDBBlocked || isMisconfigured {
+					readyCond := meta.FindStatusCondition(job.Status.Conditions, "Ready")
+					isWaitingDetach := readyCond != nil && readyCond.Reason == "WaitingForVolumeDetach"
+
+					if isPDBBlocked || isMisconfigured || isWaitingDetach {
 						reason := "PDBEvictionTimeout"
 						message := "Origin pod eviction timed out while waiting for PDB budget"
 						if isMisconfigured {
 							reason = "EvictionMisconfiguredTimeout"
 							message = "Origin pod eviction timed out due to eviction configuration error (500 InternalServerError / multiple PDBs)"
+						} else if isWaitingDetach {
+							reason = ReasonVolumeDetachTimeout
+							message = fmt.Sprintf("Origin pod volume detachment timed out while waiting for VolumeAttachments to detach: %v", job.Status.PVsToDetach)
 						}
-						logger.Info("Evicting PMJ timed out due to eviction blockage; concluding as SucceededWithoutRestore", "job", job.Name, "reason", reason)
+						logger.Info("Evicting PMJ timed out due to eviction or volume detachment blockage; concluding as SucceededWithoutRestore", "job", job.Name, "reason", reason)
 
 						// Annotate the origin pod to detect repeat eviction attempts and prevent re-snapshot churn
-						pod := &corev1.Pod{}
-						if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: podName}, pod); err == nil {
-							if job.Spec.TargetPodUID == "" || string(pod.UID) == job.Spec.TargetPodUID {
-								if pod.Annotations == nil {
-									pod.Annotations = make(map[string]string)
-								}
-								pod.Annotations[util.AnnotationPDBEvictionTimeout] = "true"
-								if err := r.Update(ctx, pod); err != nil {
-									logger.Error(err, "Failed to annotate origin pod with pdb-eviction-timeout", "pod", podName)
-									return ctrl.Result{}, err
+						if isPDBBlocked || isMisconfigured {
+							pod := &corev1.Pod{}
+							if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: podName}, pod); err == nil {
+								if job.Spec.TargetPodUID == "" || string(pod.UID) == job.Spec.TargetPodUID {
+									if pod.Annotations == nil {
+										pod.Annotations = make(map[string]string)
+									}
+									pod.Annotations[util.AnnotationPDBEvictionTimeout] = "true"
+									if err := r.Update(ctx, pod); err != nil {
+										logger.Error(err, "Failed to annotate origin pod with pdb-eviction-timeout", "pod", podName)
+										return ctrl.Result{}, err
+									}
 								}
 							}
 						}
@@ -1750,35 +1757,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// 4.3. Wait for volume detachment from GCE node using VolumeAttachment API
 		if len(job.Status.PVsToDetach) > 0 {
-			activeAttachment := false
-			for _, targetPV := range job.Status.PVsToDetach {
-				if targetPV == "" {
-					continue
-				}
-				vaList := &storagev1.VolumeAttachmentList{}
-				if err := r.List(ctx, vaList, client.MatchingFields{VolumeAttachmentPVIndex: targetPV}); err != nil {
-					logger.Error(err, "Failed to list VolumeAttachments for PV", "pv", targetPV)
-					return ctrl.Result{}, err
-				}
-
-				for _, va := range vaList.Items {
-					// If OriginNodeName is known, only wait for detachment from the origin node.
-					// Other nodes (e.g. destination node or existing RWX attachments) must not block migration.
-					if job.Status.OriginNodeName != "" && va.Spec.NodeName != job.Status.OriginNodeName {
-						continue
-					}
-					if va.Status.Attached {
-						logger.Info("Volume is still attached, waiting...", "pv", targetPV, "volumeAttachment", va.Name, "node", va.Spec.NodeName)
-						activeAttachment = true
-						break
-					}
-				}
-				if activeAttachment {
-					break
-				}
+			detached, err := areOriginVolumesDetached(ctx, r.Client, job.Status.OriginNodeName, job.Status.PVsToDetach)
+			if err != nil {
+				logger.Error(err, "Failed to check VolumeAttachments for PV detachment", "pvs", job.Status.PVsToDetach)
+				return ctrl.Result{}, err
 			}
 
-			if activeAttachment {
+			if !detached {
 				cond := metav1.Condition{
 					Type:               "Ready",
 					Status:             metav1.ConditionFalse,

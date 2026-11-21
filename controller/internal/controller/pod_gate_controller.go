@@ -293,6 +293,23 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 				logger.Info("Assigned PMJ completed without restore; releasing scheduling gate for cold-start fallback",
 					"pod", pod.Name, "pmj", correctedPMJ, "phase", phase)
 			}
+			// If the migration job has PersistentVolumes to detach from an origin node,
+			// do not release the replacement pod until volume detachment from the origin node
+			// has completed. Releasing the pod while volumes are still attached to the origin node
+			// causes Kubernetes attachdetach-controller to wedge on Multi-Attach errors.
+			if len(job.Status.PVsToDetach) > 0 && job.Status.OriginNodeName != "" {
+				detached, err := areOriginVolumesDetached(ctx, r.Client, job.Status.OriginNodeName, job.Status.PVsToDetach)
+				if err != nil {
+					logger.Error(err, "Failed to check volume detachment before releasing cold fallback", "pvs", job.Status.PVsToDetach)
+					return ctrl.Result{}, err
+				}
+				if !detached {
+					logger.Info("Volumes still attached to origin node; holding replacement pod scheduling gate to prevent Multi-Attach error",
+						"pod", pod.Name, "pvs", job.Status.PVsToDetach, "originNode", job.Status.OriginNodeName)
+					return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+				}
+			}
+
 			// Record which pod fell back so verification and triage can find it,
 			// then release with the explicit bypass: without it GKE may attempt a
 			// native restore from a stale or mismatched snapshot.
@@ -321,6 +338,21 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		}
 
 		logger.Info("Assigned PMJ snapshot is durable; releasing scheduling gate and injecting snapshot ref", "pod", pod.Name, "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
+
+		// Before releasing the scheduling gate for warm restore, verify that origin node
+		// volumes have completed detachment to prevent Multi-Attach errors on the destination node.
+		if len(job.Status.PVsToDetach) > 0 && job.Status.OriginNodeName != "" {
+			detached, err := areOriginVolumesDetached(ctx, r.Client, job.Status.OriginNodeName, job.Status.PVsToDetach)
+			if err != nil {
+				logger.Error(err, "Failed to verify volume detachment before releasing warm restore gate", "pmj", correctedPMJ)
+				return ctrl.Result{}, err
+			}
+			if !detached {
+				logger.Info("Volumes still attached to origin node; holding replacement pod scheduling gate before warm restore",
+					"pod", pod.Name, "pvs", job.Status.PVsToDetach, "originNode", job.Status.OriginNodeName)
+				return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+			}
+		}
 
 		adoptStranded := false
 		if job.Status.Consumed && job.Status.RestoredPodUID != string(pod.UID) {
