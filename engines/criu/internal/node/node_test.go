@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1202,6 +1203,334 @@ func TestNode_ProbeReadinessReturnsFalseWhenVerifyCRIUFalse(t *testing.T) {
 	}
 	if ready {
 		t.Fatal("expected ProbeReadiness to return false when verifyCRIU was false")
+	}
+}
+
+func TestNode_SweepOrphanRestores_FiltersOtherNodesAndTerminatingPods(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme(t)
+
+	// Pod 1: on node-a, living
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-living",
+			Namespace: "default",
+			UID:       types.UID("living-uid"),
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "living-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+		},
+	}
+	// Pod 2: on node-b (other node), living
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-other-node",
+			Namespace: "default",
+			UID:       types.UID("other-node-uid"),
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "other-node-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-b",
+		},
+	}
+	// Pod 3: on node-a, terminating with grace period active
+	futureTime := metav1.NewTime(time.Now().Add(30 * time.Second))
+	grace30 := int64(30)
+	pod3 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       "pod-terminating",
+			Namespace:                  "default",
+			UID:                        types.UID("terminating-uid"),
+			DeletionTimestamp:          &futureTime,
+			DeletionGracePeriodSeconds: &grace30,
+			Finalizers:                 []string{"test.io/keep"},
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "terminating-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+		},
+	}
+	// Pod 4: on node-a, terminating with grace period expired
+	pastTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	grace10 := int64(10)
+	pod4 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       "pod-expired",
+			Namespace:                  "default",
+			UID:                        types.UID("expired-uid"),
+			DeletionTimestamp:          &pastTime,
+			DeletionGracePeriodSeconds: &grace10,
+			Finalizers:                 []string{"test.io/keep"},
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "expired-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+		},
+	}
+	// Pod 5: on node-a, terminating with nil grace period (force delete)
+	pod5 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       "pod-nil-grace",
+			Namespace:                  "default",
+			UID:                        types.UID("nil-grace-uid"),
+			DeletionTimestamp:          &futureTime,
+			DeletionGracePeriodSeconds: nil,
+			Finalizers:                 []string{"test.io/keep"},
+			Annotations: map[string]string{
+				"pod-migrate.io/ps-name": "nil-grace-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+			return []string{obj.(*corev1.Pod).Spec.NodeName}
+		}).
+		WithObjects(pod1, pod2, pod3, pod4, pod5).
+		Build()
+
+	r := &restorer{
+		pmRootDir: t.TempDir(),
+	}
+	// Stub listLeasesFn to return empty
+	r.listLeasesFn = func(ctx context.Context) ([]leases.Lease, error) {
+		return nil, nil
+	}
+
+	nd := &Node{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		NodeName:  "node-a",
+		Restorer:  r,
+	}
+
+	// Intercept SweepOrphans via a custom wrapper or inspect after
+	// Since SweepOrphans is called with livingUIDs and livingSnaps, we can test it directly:
+	r.listLeasesFn = func(ctx context.Context) ([]leases.Lease, error) {
+		// Just capture or verify via lease behavior
+		return []leases.Lease{
+			{ID: "lease-pm-living", Labels: map[string]string{"pod-migrate.io/pod-uid": "living-uid"}},
+			{ID: "lease-pm-other-node", Labels: map[string]string{"pod-migrate.io/pod-uid": "other-node-uid"}},
+			{ID: "lease-pm-terminating", Labels: map[string]string{"pod-migrate.io/pod-uid": "terminating-uid"}},
+			{ID: "lease-pm-expired", Labels: map[string]string{"pod-migrate.io/pod-uid": "expired-uid"}},
+			{ID: "lease-pm-nil-grace", Labels: map[string]string{"pod-migrate.io/pod-uid": "nil-grace-uid"}},
+		}, nil
+	}
+
+	var swept []string
+	r.deleteLeaseFn = func(ctx context.Context, lid string) error {
+		swept = append(swept, lid)
+		return nil
+	}
+	r.unmountTreeFn = func(dir string) error { return nil }
+	r.removeSnapshotFn = func(ctx context.Context, key string) error { return nil }
+	r.runcDeleteFn = func(ctx context.Context, cid string) error { return nil }
+
+	if err := nd.SweepOrphanRestores(ctx); err != nil {
+		t.Fatalf("SweepOrphanRestores: %v", err)
+	}
+
+	sweptSet := make(map[string]bool)
+	for _, s := range swept {
+		sweptSet[s] = true
+	}
+
+	// lease-pm-living belongs to living pod on node-a -> must NOT be swept
+	if sweptSet["lease-pm-living"] {
+		t.Errorf("living pod on node-a was swept")
+	}
+	// lease-pm-other-node belongs to pod on node-b -> must be swept as orphan on node-a
+	if !sweptSet["lease-pm-other-node"] {
+		t.Errorf("pod on other node was not swept")
+	}
+	// lease-pm-terminating belongs to terminating pod whose grace period is still active -> must NOT be swept
+	if sweptSet["lease-pm-terminating"] {
+		t.Errorf("terminating pod within active grace period was swept")
+	}
+	// lease-pm-expired belongs to terminating pod whose grace deadline has passed -> must be swept
+	if !sweptSet["lease-pm-expired"] {
+		t.Errorf("expired terminating pod was not swept")
+	}
+	// lease-pm-nil-grace belongs to force-deleted pod with nil grace period -> must be swept
+	if !sweptSet["lease-pm-nil-grace"] {
+		t.Errorf("nil grace period terminating pod was not swept")
+	}
+}
+
+func TestNode_SweepOrphanRestores_KeepsLivePodAfterCompleteRestore(t *testing.T) {
+	live := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web-1", Namespace: "default", UID: types.UID("live-uid"),
+			Annotations: map[string]string{
+				"podsnapshot.gke.io/ps-name":             "", // cleared by CompleteRestore
+				"pod-migration.gke.io/restore-completed": "snap-a",
+				"pod-migrate.io/psengine-restore":        "restored",
+				"pod-migrate.io/psengine-injected":       "true",
+			},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newTestScheme(t)).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
+			return []string{o.(*corev1.Pod).Spec.NodeName}
+		}).WithObjects(live).Build()
+
+	root := t.TempDir()
+	bundle := filepath.Join(root, "bundles", "pm-psengine-snap-a")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(bundle, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	var killed []string
+	r := &restorer{pmRootDir: root}
+	r.listLeasesFn = func(context.Context) ([]leases.Lease, error) {
+		return []leases.Lease{{
+			ID: "lease-pm-psengine-snap-a", CreatedAt: old,
+			Labels: map[string]string{"pod-migrate.io/pod-uid": "live-uid"},
+		}}, nil
+	}
+	r.runcDeleteFn = func(_ context.Context, id string) error { killed = append(killed, id); return nil }
+	r.deleteLeaseFn = func(context.Context, string) error { return nil }
+	r.unmountTreeFn = func(string) error { return nil }
+	r.removeSnapshotFn = func(context.Context, string) error { return nil }
+
+	nd := &Node{Client: fc, APIReader: fc, NodeName: "node-a", Restorer: r}
+	if err := nd.SweepOrphanRestores(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("sweep tore down a live restored pod: runc delete -f %v", killed)
+	}
+}
+
+func TestNode_SweepOrphanRestores_KeepsLivePodWithAnnotationSnapshotOnly(t *testing.T) {
+	live := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web-2", Namespace: "default", UID: types.UID("live-uid-2"),
+			Annotations: map[string]string{
+				"pod-migrate.io/psengine-snapshot": "snap-b", // only engine-owned AnnotationSnapshot set
+				"pod-migrate.io/psengine-restore":  "restored",
+				"pod-migrate.io/psengine-injected": "true",
+			},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newTestScheme(t)).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
+			return []string{o.(*corev1.Pod).Spec.NodeName}
+		}).WithObjects(live).Build()
+
+	root := t.TempDir()
+	bundle := filepath.Join(root, "bundles", "pm-psengine-snap-b")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(bundle, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	var killed []string
+	r := &restorer{pmRootDir: root}
+	r.listLeasesFn = func(context.Context) ([]leases.Lease, error) {
+		// Legacy or missing pod-uid label on lease; identity resolves via livingSnapshots
+		return []leases.Lease{{
+			ID: "lease-pm-psengine-snap-b", CreatedAt: old,
+		}}, nil
+	}
+	r.runcDeleteFn = func(_ context.Context, id string) error { killed = append(killed, id); return nil }
+	r.deleteLeaseFn = func(context.Context, string) error { return nil }
+	r.unmountTreeFn = func(string) error { return nil }
+	r.removeSnapshotFn = func(context.Context, string) error { return nil }
+
+	nd := &Node{Client: fc, APIReader: fc, NodeName: "node-a", Restorer: r}
+	if err := nd.SweepOrphanRestores(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("sweep tore down a live restored pod with only AnnotationSnapshot: runc delete -f %v", killed)
+	}
+}
+
+func TestNode_SweepOrphanRestores_TreatsTerminalAndFailedRestoresAsDead(t *testing.T) {
+	// Pod 1: Succeeded phase
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-succeeded", Namespace: "default", UID: types.UID("succeeded-uid"),
+			Annotations: map[string]string{
+				"pod-migrate.io/psengine-snapshot": "snap-succeeded",
+			},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	// Pod 2: Failed phase
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-failed", Namespace: "default", UID: types.UID("failed-uid"),
+			Annotations: map[string]string{
+				"pod-migrate.io/psengine-snapshot": "snap-failed",
+			},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+	// Pod 3: Failed restore status annotation
+	pod3 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-restore-failed", Namespace: "default", UID: types.UID("restore-failed-uid"),
+			Annotations: map[string]string{
+				"pod-migrate.io/psengine-restore":  "failed",
+				"pod-migrate.io/psengine-snapshot": "snap-restore-failed",
+			},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newTestScheme(t)).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
+			return []string{o.(*corev1.Pod).Spec.NodeName}
+		}).WithObjects(pod1, pod2, pod3).Build()
+
+	root := t.TempDir()
+	r := &restorer{pmRootDir: root}
+	old := time.Now().Add(-time.Hour)
+	r.listLeasesFn = func(context.Context) ([]leases.Lease, error) {
+		return []leases.Lease{
+			{ID: "lease-pm-snap-succeeded", CreatedAt: old, Labels: map[string]string{"pod-migrate.io/pod-uid": "succeeded-uid"}},
+			{ID: "lease-pm-snap-failed", CreatedAt: old, Labels: map[string]string{"pod-migrate.io/pod-uid": "failed-uid"}},
+			{ID: "lease-pm-snap-restore-failed", CreatedAt: old, Labels: map[string]string{"pod-migrate.io/pod-uid": "restore-failed-uid"}},
+		}, nil
+	}
+	var deletedLeases []string
+	r.deleteLeaseFn = func(_ context.Context, id string) error { deletedLeases = append(deletedLeases, id); return nil }
+	r.runcDeleteFn = func(context.Context, string) error { return nil }
+	r.unmountTreeFn = func(string) error { return nil }
+	r.removeSnapshotFn = func(context.Context, string) error { return nil }
+
+	nd := &Node{Client: fc, APIReader: fc, NodeName: "node-a", Restorer: r}
+	if err := nd.SweepOrphanRestores(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(deletedLeases) != 3 {
+		t.Fatalf("expected 3 terminal/failed pods swept, got %d (%v)", len(deletedLeases), deletedLeases)
 	}
 }
 

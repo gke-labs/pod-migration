@@ -23,9 +23,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -599,7 +602,7 @@ func TestRestore_FailureCleansNetnsLock(t *testing.T) {
 			}
 			return os.CreateTemp(t.TempDir(), "netns-holder")
 		},
-		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error) {
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (string, error) {
 			rf := filepath.Join(bundleDir, "rootfs")
 			_ = os.MkdirAll(rf, 0o755)
 			return rf, nil
@@ -702,7 +705,7 @@ func TestRestore_Variant0CgroupFailureCleansNetnsBeforeVariant1(t *testing.T) {
 			}
 			return os.CreateTemp(t.TempDir(), "netns-holder")
 		},
-		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error) {
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (string, error) {
 			rf := filepath.Join(bundleDir, "rootfs")
 			_ = os.MkdirAll(rf, 0o755)
 			return rf, nil
@@ -787,7 +790,7 @@ func TestRestore_PreRestoreCleansStaleNetnsLock(t *testing.T) {
 		openPodNetnsFn: func(holderPid int) (*os.File, error) {
 			return os.CreateTemp(t.TempDir(), "netns-holder")
 		},
-		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error) {
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (string, error) {
 			rf := filepath.Join(bundleDir, "rootfs")
 			_ = os.MkdirAll(rf, 0o755)
 			return rf, nil
@@ -869,7 +872,7 @@ func TestRestore_MissingPidFileCleansNetnsLock(t *testing.T) {
 		openPodNetnsFn: func(holderPid int) (*os.File, error) {
 			return os.CreateTemp(t.TempDir(), "netns-holder")
 		},
-		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error) {
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (string, error) {
 			rf := filepath.Join(bundleDir, "rootfs")
 			_ = os.MkdirAll(rf, 0o755)
 			return rf, nil
@@ -1266,5 +1269,883 @@ func TestAdaptSpec_RejectsRelativeCgroupsPath(t *testing.T) {
 	p.CgroupsPath = "relative.slice/pm-mig1" // missing leading slash
 	if _, err := AdaptSpec(s, p); err == nil {
 		t.Error("AdaptSpec accepted relative CgroupsPath without leading slash")
+	}
+}
+
+func TestCleanup_OrderAndTeardown(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-test-cleanup"
+	bundleDir := filepath.Join(tmpDir, "bundles", id)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			calls = append(calls, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			calls = append(calls, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			calls = append(calls, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			calls = append(calls, "lease-delete:"+lid)
+			return nil
+		},
+	}
+
+	notes, err := r.cleanup(context.Background(), "test-cleanup", "", "", false)
+	if err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+	if len(notes) > 0 {
+		t.Fatalf("unexpected cleanup notes: %v", notes)
+	}
+
+	wantOrder := []string{
+		"runc-delete:" + id,
+		"unmount:" + bundleDir,
+		"snapshot-remove:" + id,
+		"lease-delete:lease-" + id,
+	}
+	if len(calls) != len(wantOrder) {
+		t.Fatalf("calls = %v, want %v", calls, wantOrder)
+	}
+	for i := range wantOrder {
+		if calls[i] != wantOrder[i] {
+			t.Errorf("step %d = %q, want %q", i, calls[i], wantOrder[i])
+		}
+	}
+
+	// Bundle directory should be removed.
+	if _, err := os.Stat(bundleDir); !os.IsNotExist(err) {
+		t.Errorf("bundle directory still exists after cleanup: %v", err)
+	}
+}
+
+func TestCleanup_StopsOnFirstFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-test-fail-order"
+	bundleDir := filepath.Join(tmpDir, "bundles", id)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. runc delete failure must stop immediately and NOT unmount or delete snapshot/lease
+	unmounted := false
+	snapRemoved := false
+	leaseDeleted := false
+	r1 := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			return errors.New("runc delete in D-state")
+		},
+		unmountTreeFn: func(dir string) error {
+			unmounted = true
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			snapRemoved = true
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			leaseDeleted = true
+			return nil
+		},
+	}
+	err := r1.Cleanup(context.Background(), "test-fail-order")
+	if err == nil {
+		t.Fatal("expected cleanup to return error on runc delete failure, got nil")
+	}
+	if unmounted || snapRemoved || leaseDeleted {
+		t.Fatalf("subsequent steps executed after runc delete failed: unmounted=%v, snapRemoved=%v, leaseDeleted=%v",
+			unmounted, snapRemoved, leaseDeleted)
+	}
+
+	// 2. unmount failure must stop immediately and NOT remove snapshot or lease
+	snapRemoved2 := false
+	leaseDeleted2 := false
+	r2 := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			return errors.New("mount busy")
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			snapRemoved2 = true
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			leaseDeleted2 = true
+			return nil
+		},
+	}
+	err2 := r2.Cleanup(context.Background(), "test-fail-order")
+	if err2 == nil {
+		t.Fatal("expected cleanup to return error on unmount failure, got nil")
+	}
+	if snapRemoved2 || leaseDeleted2 {
+		t.Fatalf("subsequent steps executed after unmount failed: snapRemoved=%v, leaseDeleted=%v",
+			snapRemoved2, leaseDeleted2)
+	}
+}
+
+func TestCleanup_RealRuncDeleteAndKillArgv(t *testing.T) {
+	var executedCommands [][]string
+	r := &restorer{
+		pmRootDir: t.TempDir(),
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			executedCommands = append(executedCommands, append([]string{name}, args...))
+			return "", nil
+		},
+	}
+
+	// Test Cleanup argv
+	if err := r.Cleanup(context.Background(), "test-cmd"); err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+	if len(executedCommands) != 1 {
+		t.Fatalf("expected 1 execHost call, got %d", len(executedCommands))
+	}
+	wantDel := []string{"runc", "--root", "/run/pod-migrate/runc", "delete", "-f", "pm-test-cmd"}
+	if strings.Join(executedCommands[0], " ") != strings.Join(wantDel, " ") {
+		t.Errorf("runc delete argv = %v, want %v", executedCommands[0], wantDel)
+	}
+
+	// Test Signal argv
+	if err := r.Signal(context.Background(), "test-cmd", 15); err != nil {
+		t.Fatalf("signal failed: %v", err)
+	}
+	if len(executedCommands) != 2 {
+		t.Fatalf("expected 2 execHost calls, got %d", len(executedCommands))
+	}
+	wantKill := []string{"runc", "--root", "/run/pod-migrate/runc", "kill", "pm-test-cmd", "15"}
+	if strings.Join(executedCommands[1], " ") != strings.Join(wantKill, " ") {
+		t.Errorf("runc kill argv = %v, want %v", executedCommands[1], wantKill)
+	}
+}
+
+func TestRestore_DoubleRestoreTeardownBeforePrepareRootfs(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-double-restore"
+	bundleDir := filepath.Join(tmpDir, "bundles", id)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	criuConf := filepath.Join(tmpDir, "criu")
+	if err := os.MkdirAll(criuConf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(criuConf, "runc.conf"), []byte("file-validation buildid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	r := &restorer{
+		pmRootDir:       tmpDir,
+		criuConfDirPath: criuConf,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      sampleTargetSpec(),
+				ImageName: "redis:7",
+			}, nil
+		},
+		openPodNetnsFn: func(holderPid int) (*os.File, error) {
+			return os.CreateTemp(t.TempDir(), "netns-holder")
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-pod123.slice/c1.scope\n"), nil
+		},
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			events = append(events, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			events = append(events, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			events = append(events, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			events = append(events, "lease-delete:"+lid)
+			return nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bDir, diffTar string, labels map[string]string) (string, error) {
+			events = append(events, "prepare-rootfs:"+key)
+			if labels["pod-migrate.io/pod-uid"] != "pod-uid-456" {
+				t.Errorf("expected pod-uid label, got %v", labels)
+			}
+			rf := filepath.Join(bDir, "rootfs")
+			_ = os.MkdirAll(rf, 0o755)
+			return rf, nil
+		},
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "Version: 3.19", nil
+		},
+		execRestoreFn: func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
+			for i := 0; i < len(args)-1; i++ {
+				if args[i] == "--pid-file" {
+					_ = os.WriteFile(args[i+1], []byte("5678\n"), 0o644)
+				}
+			}
+			events = append(events, "exec-restore")
+			return "", nil
+		},
+	}
+
+	in := restoreInputs{
+		MigrationName: "double-restore",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  "pod-uid-456",
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec:       sampleSpec(),
+	}
+
+	out, err := r.restore(context.Background(), in)
+	if err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	if out.Pid != 5678 {
+		t.Errorf("pid = %d, want 5678", out.Pid)
+	}
+
+	// Verify that teardown events occurred BEFORE prepare-rootfs
+	foundPrep := false
+	for _, ev := range events {
+		if ev == "prepare-rootfs:"+id {
+			foundPrep = true
+			break
+		}
+		if !strings.HasPrefix(ev, "runc-delete:") && !strings.HasPrefix(ev, "unmount:") &&
+			!strings.HasPrefix(ev, "snapshot-remove:") && !strings.HasPrefix(ev, "lease-delete:") {
+			t.Errorf("unexpected pre-restore event: %q", ev)
+		}
+	}
+	if !foundPrep {
+		t.Fatal("prepare-rootfs event not found")
+	}
+}
+
+func TestRestore_PreRestoreCleanupFailureReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-cleanup-err"
+	bundleDir := filepath.Join(tmpDir, "bundles", id)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &restorer{
+		pmRootDir: tmpDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      sampleTargetSpec(),
+				ImageName: "redis:7",
+			}, nil
+		},
+		openPodNetnsFn: func(holderPid int) (*os.File, error) {
+			return os.CreateTemp(t.TempDir(), "netns-holder")
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-pod123.slice/c1.scope\n"), nil
+		},
+		unmountTreeFn: func(dir string) error {
+			return errors.New("unmount device busy")
+		},
+	}
+	in := restoreInputs{
+		MigrationName: "cleanup-err",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  "pod-uid-456",
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec:       sampleSpec(),
+	}
+	_, err := r.restore(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected pre-restore cleanup failure to return error, got nil")
+	}
+	if !strings.Contains(err.Error(), "pre-restore cleanup failed") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRestore_FailureTeardownCleansContainerMountsSnapshot(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-fail-restore"
+
+	var cleaned []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      &specs.Spec{Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "sb1"}},
+				ImageName: "redis:7",
+			}, nil
+		},
+		openPodNetnsFn: func(holderPid int) (*os.File, error) {
+			return os.CreateTemp(t.TempDir(), "netns-holder")
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-pod123.slice/c1.scope\n"), nil
+		},
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			cleaned = append(cleaned, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			cleaned = append(cleaned, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bDir, diffTar string, labels map[string]string) (string, error) {
+			rf := filepath.Join(bDir, "rootfs")
+			_ = os.MkdirAll(rf, 0o755)
+			return rf, nil
+		},
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "Version: 3.19", nil
+		},
+		execRestoreFn: func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
+			return "Error: failed to restore memory pages", errors.New("runc exit status 1")
+		},
+	}
+
+	in := restoreInputs{
+		MigrationName: "fail-restore",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  "pod-uid-456",
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec: &specs.Spec{
+			Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "src-sb"},
+		},
+	}
+
+	_, err := r.restore(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected restore to fail, got nil")
+	}
+
+	// Verify that teardown ran on restore failure
+	hasRuncDel := false
+	hasUnmount := false
+	hasSnapRem := false
+	hasLeaseDel := false
+	for _, cl := range cleaned {
+		if cl == "runc-delete:"+id {
+			hasRuncDel = true
+		}
+		if cl == "unmount:"+filepath.Join(tmpDir, "bundles", id) {
+			hasUnmount = true
+		}
+		if cl == "snapshot-remove:"+id {
+			hasSnapRem = true
+		}
+		if cl == "lease-delete:lease-"+id {
+			hasLeaseDel = true
+		}
+	}
+	if !hasRuncDel || !hasUnmount || !hasSnapRem || !hasLeaseDel {
+		t.Fatalf("missing failure teardown actions; cleaned = %v", cleaned)
+	}
+}
+
+func TestSweepOrphans_CleansOrphanLeasesAndBundles(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Stage an orphaned bundle dir
+	bundleOrphan := filepath.Join(tmpDir, "bundles", "pm-psengine-orphan-snap")
+	if err := os.MkdirAll(bundleOrphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stage a living bundle dir
+	bundleLiving := filepath.Join(tmpDir, "bundles", "pm-psengine-living-snap")
+	if err := os.MkdirAll(bundleLiving, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stage a living bundle dir matching the living lease (verifies lease verdict carries into bundle pass)
+	bundleLivingLease := filepath.Join(tmpDir, "bundles", "pm-psengine-living-lease")
+	if err := os.MkdirAll(bundleLivingLease, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stage an orphaned bundle dir created after sweepStart (must be skipped)
+	bundleAfterSweep := filepath.Join(tmpDir, "bundles", "pm-psengine-after-sweep-snap")
+	if err := os.MkdirAll(bundleAfterSweep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	futureTime := time.Now().Add(10 * time.Minute)
+	if err := os.Chtimes(bundleAfterSweep, futureTime, futureTime); err != nil {
+		t.Fatal(err)
+	}
+
+	var cleaned []string
+	deletedLeaseIDs := make(map[string]bool)
+	r := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			cleaned = append(cleaned, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			cleaned = append(cleaned, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			deletedLeaseIDs[lid] = true
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+		listLeasesFn: func(ctx context.Context) ([]leases.Lease, error) {
+			return []leases.Lease{
+				{
+					ID: "lease-pm-psengine-orphan-lease",
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "dead-pod-uid",
+					},
+				},
+				{
+					ID: "lease-pm-psengine-living-lease",
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "live-pod-uid",
+					},
+				},
+				// Lease created after sweepStart belongs to a restore started after the sweep began (must be skipped)
+				{
+					ID:        "lease-pm-psengine-after-sweep-lease",
+					CreatedAt: futureTime,
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "dead-pod-uid",
+					},
+				},
+				// Lease without lease-pm- prefix must be ignored (unpinned check)
+				{
+					ID: "lease-other-service-dead",
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "dead-pod-uid",
+					},
+				},
+				// Lease with snapshot-name label
+				{
+					ID: "lease-pm-psengine-snap-orphan",
+					Labels: map[string]string{
+						"pod-migrate.io/snapshot-name": "dead-snap",
+					},
+				},
+				{
+					ID: "lease-pm-psengine-snap-living",
+					Labels: map[string]string{
+						"pod-migrate.io/snapshot-name": "living-snap",
+					},
+				},
+			}, nil
+		},
+	}
+
+	livingUIDs := map[string]bool{"live-pod-uid": true}
+	livingSnaps := map[string]bool{"living-snap": true}
+
+	sweepStart := time.Now()
+	swept, err := r.SweepOrphans(context.Background(), livingUIDs, livingSnaps, sweepStart)
+	if err != nil {
+		t.Fatalf("SweepOrphans failed: %v", err)
+	}
+
+	// Should sweep orphan-lease, orphan-snap, and snap-orphan, but NOT living-lease, living-snap, snap-living, or other-service
+	sweptSet := make(map[string]bool)
+	for _, s := range swept {
+		sweptSet[s] = true
+	}
+	if !sweptSet["psengine-orphan-lease"] {
+		t.Errorf("orphan lease was not swept; swept = %v", swept)
+	}
+	if !sweptSet["psengine-orphan-snap"] {
+		t.Errorf("orphan bundle was not swept; swept = %v", swept)
+	}
+	if !sweptSet["psengine-snap-orphan"] {
+		t.Errorf("snapshot-name orphan lease was not swept; swept = %v", swept)
+	}
+	if sweptSet["psengine-living-lease"] {
+		t.Errorf("living lease was incorrectly swept; swept = %v", swept)
+	}
+	if sweptSet["psengine-living-snap"] {
+		t.Errorf("living bundle was incorrectly swept; swept = %v", swept)
+	}
+	if sweptSet["psengine-after-sweep-lease"] || deletedLeaseIDs["lease-pm-psengine-after-sweep-lease"] {
+		t.Errorf("after-sweep lease was incorrectly swept; swept = %v, deleted = %v", swept, deletedLeaseIDs)
+	}
+	if sweptSet["psengine-after-sweep-snap"] {
+		t.Errorf("after-sweep bundle was incorrectly swept; swept = %v", swept)
+	}
+	if sweptSet["psengine-snap-living"] {
+		t.Errorf("living snapshot-name lease was incorrectly swept; swept = %v", swept)
+	}
+	if sweptSet["other-service-dead"] || sweptSet["lease-other-service-dead"] || deletedLeaseIDs["lease-other-service-dead"] {
+		t.Errorf("non-pm lease was incorrectly swept; swept = %v, deleted = %v", swept, deletedLeaseIDs)
+	}
+}
+
+func TestSweepOrphans_SkipsInflightRestores(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Stage an orphaned bundle dir for an in-flight migration
+	bundleInflight := filepath.Join(tmpDir, "bundles", "pm-psengine-inflight-mig")
+	if err := os.MkdirAll(bundleInflight, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var cleaned []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			cleaned = append(cleaned, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			cleaned = append(cleaned, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+		listLeasesFn: func(ctx context.Context) ([]leases.Lease, error) {
+			return []leases.Lease{
+				{
+					ID: "lease-pm-psengine-inflight-mig",
+					Labels: map[string]string{
+						"pod-migrate.io/pod-uid": "inflight-pod-uid",
+					},
+				},
+			}, nil
+		},
+	}
+
+	// Mark in flight
+	r.markInflight("psengine-inflight-mig", "pm-psengine-inflight-mig", "inflight-pod-uid")
+
+	// Neither pod UID nor snapshot is in living sets (simulating restore starting before pod is visible or during sweep)
+	livingUIDs := map[string]bool{}
+	livingSnaps := map[string]bool{}
+
+	swept, err := r.SweepOrphans(context.Background(), livingUIDs, livingSnaps, time.Time{})
+	if err != nil {
+		t.Fatalf("SweepOrphans failed: %v", err)
+	}
+
+	if len(swept) > 0 {
+		t.Fatalf("in-flight restore was swept! swept = %v", swept)
+	}
+	if len(cleaned) > 0 {
+		t.Fatalf("cleanup called on in-flight restore! cleaned = %v", cleaned)
+	}
+}
+
+func TestRestore_FailureInsidePrepareRootfsCleansUp(t *testing.T) {
+	tmpDir := t.TempDir()
+	id := "pm-fail-prep"
+
+	prepCalled := false
+	var cleaned []string
+	var failureCleaned []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, podUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      &specs.Spec{Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "sb1"}},
+				ImageName: "redis:7",
+			}, nil
+		},
+		openPodNetnsFn: func(holderPid int) (*os.File, error) {
+			return os.CreateTemp(t.TempDir(), "netns-holder")
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/kubepods-pod123.slice/c1.scope\n"), nil
+		},
+		runcDeleteFn: func(ctx context.Context, cid string) error {
+			if prepCalled {
+				failureCleaned = append(failureCleaned, "runc-delete:"+cid)
+			}
+			cleaned = append(cleaned, "runc-delete:"+cid)
+			return nil
+		},
+		unmountTreeFn: func(dir string) error {
+			if prepCalled {
+				failureCleaned = append(failureCleaned, "unmount:"+dir)
+			}
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, key string) error {
+			if prepCalled {
+				failureCleaned = append(failureCleaned, "snapshot-remove:"+key)
+			}
+			cleaned = append(cleaned, "snapshot-remove:"+key)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			if prepCalled {
+				failureCleaned = append(failureCleaned, "lease-delete:"+lid)
+			}
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bDir, diffTar string, labels map[string]string) (string, error) {
+			prepCalled = true
+			return "", errors.New("containerd prepare snapshot failed: OOM")
+		},
+	}
+
+	in := restoreInputs{
+		MigrationName: "fail-prep",
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  "pod-uid-456",
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec: &specs.Spec{
+			Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "src-sb"},
+		},
+	}
+
+	_, err := r.restore(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected restore to fail when prepareRootfs fails, got nil")
+	}
+
+	// Verify that teardown ran on restore failure after prepareRootfs failed
+	if len(failureCleaned) == 0 {
+		t.Fatalf("expected failure cleanup defer to execute after prepareRootfs failed, got empty failureCleaned")
+	}
+	hasUnmount := false
+	hasSnapRem := false
+	hasLeaseDel := false
+	for _, cl := range failureCleaned {
+		if cl == "unmount:"+filepath.Join(tmpDir, "bundles", id) {
+			hasUnmount = true
+		}
+		if cl == "snapshot-remove:"+id {
+			hasSnapRem = true
+		}
+		if cl == "lease-delete:lease-"+id {
+			hasLeaseDel = true
+		}
+	}
+	if !hasUnmount || !hasSnapRem || !hasLeaseDel {
+		t.Fatalf("missing failure teardown actions when prepFn fails; failureCleaned = %v", failureCleaned)
+	}
+}
+
+func TestPrepareRootfs_RollbackOnFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	bundleDir := filepath.Join(tmpDir, "bundles", "pm-test-prep-snap")
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := "test-prep-snap"
+
+	var cleaned []string
+	r := &restorer{
+		pmRootDir: tmpDir,
+		getImageChainIDFn: func(ctx context.Context, imageName string) (string, error) {
+			return "sha256:parent123", nil
+		},
+		createLeaseFn: func(ctx context.Context, id string, labels map[string]string) error {
+			return nil
+		},
+		prepareSnapshotFn: func(ctx context.Context, k, parent string) ([]mount.Mount, error) {
+			return []mount.Mount{{Type: "overlay", Source: "overlay"}}, nil
+		},
+		mountAllFn: func(mounts []mount.Mount, target string) error {
+			return errors.New("mount failed: permission denied")
+		},
+		unmountTreeFn: func(dir string) error {
+			cleaned = append(cleaned, "unmount:"+dir)
+			return nil
+		},
+		removeSnapshotFn: func(ctx context.Context, k string) error {
+			cleaned = append(cleaned, "snapshot-remove:"+k)
+			return nil
+		},
+		deleteLeaseFn: func(ctx context.Context, lid string) error {
+			cleaned = append(cleaned, "lease-delete:"+lid)
+			return nil
+		},
+	}
+
+	_, err := r.prepareRootfs(context.Background(), "redis:7", key, bundleDir, "", map[string]string{"pod-migrate.io/pod-uid": "uid123"})
+	if err == nil {
+		t.Fatal("expected prepareRootfs to fail on mount error, got nil")
+	}
+
+	// Verify that the internal rollback defer inside prepareRootfs executed:
+	// 1. Snapshot removed
+	// 2. Lease deleted
+	// 3. Bundle dir removed
+	hasSnapRem := false
+	hasLeaseDel := false
+	for _, cl := range cleaned {
+		if cl == "snapshot-remove:"+key {
+			hasSnapRem = true
+		}
+		if cl == "lease-delete:lease-"+key {
+			hasLeaseDel = true
+		}
+	}
+	if !hasSnapRem {
+		t.Errorf("internal prepareRootfs rollback did not remove snapshot: %v", cleaned)
+	}
+	if !hasLeaseDel {
+		t.Errorf("internal prepareRootfs rollback did not delete lease: %v", cleaned)
+	}
+	if _, err := os.Stat(bundleDir); !os.IsNotExist(err) {
+		t.Errorf("internal prepareRootfs rollback did not remove bundleDir: %v", err)
+	}
+}
+
+func TestRestore_InflightTracking(t *testing.T) {
+	tmpDir := t.TempDir()
+	migName := "inflight-test"
+	id := "pm-" + migName
+	podUID := "pod-uid-inflight"
+
+	var observedInflightDuringRestore bool
+	var r *restorer
+	r = &restorer{
+		pmRootDir: tmpDir,
+		findContainerFn: func(ctx context.Context, podNS, podName, pUID, containerName string) (*containerRef, error) {
+			return &containerRef{
+				ID:        "c-holder",
+				Pid:       1234,
+				Spec:      &specs.Spec{Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "sb1"}},
+				ImageName: "redis:7",
+			}, nil
+		},
+		openPodNetnsFn: func(holderPid int) (*os.File, error) {
+			return os.CreateTemp(t.TempDir(), "netns-holder")
+		},
+		readProcCgroupFn: func(pid int) ([]byte, error) {
+			return []byte("0::/kubepods.slice/c1.scope\n"), nil
+		},
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bDir, diffTar string, labels map[string]string) (string, error) {
+			// Check inflight status while restore is running
+			if r.isInflight(migName) && r.isInflight(id) && r.isInflight(podUID) {
+				observedInflightDuringRestore = true
+			}
+			return "", errors.New("abort after checking inflight")
+		},
+	}
+
+	in := restoreInputs{
+		MigrationName: migName,
+		PodNamespace:  "default",
+		TargetPod:     "web-1",
+		TargetPodUID:  podUID,
+		ContainerName: "app",
+		CheckpointDir: tmpDir,
+		SrcSpec: &specs.Spec{
+			Annotations: map[string]string{"io.kubernetes.cri.sandbox-id": "src-sb"},
+		},
+	}
+
+	_, _ = r.restore(context.Background(), in)
+
+	if !observedInflightDuringRestore {
+		t.Errorf("expected r.isInflight to be true during restore")
+	}
+	// After restore completes/fails, inflight keys must be cleared
+	if r.isInflight(migName) || r.isInflight(id) || r.isInflight(podUID) {
+		t.Errorf("inflight keys were not cleared after restore: mig=%v, id=%v, uid=%v",
+			r.isInflight(migName), r.isInflight(id), r.isInflight(podUID))
+	}
+}
+
+func TestCleanup_RuncDoesNotExistTolerance(t *testing.T) {
+	tmpDir := t.TempDir()
+	r := &restorer{
+		pmRootDir: tmpDir,
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "container does not exist", errors.New("exit status 1")
+		},
+	}
+
+	// runc delete -f returning "does not exist" should be tolerated
+	notes, err := r.cleanup(context.Background(), "no-such-container", "", "", false)
+	if err != nil {
+		t.Errorf("expected cleanup to tolerate missing runc container, got: %v", err)
+	}
+	_ = notes
+
+	// Signal returning "does not exist" should also be tolerated
+	if err := r.Signal(context.Background(), "no-such-container", 15); err != nil {
+		t.Errorf("expected Signal to tolerate missing runc container, got: %v", err)
+	}
+}
+
+func TestRestorer_IsRunning(t *testing.T) {
+	rRunning := &restorer{
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return `{"status": "running", "pid": 1234}`, nil
+		},
+	}
+	running, err := rRunning.IsRunning(context.Background(), "running-app")
+	if err != nil || !running {
+		t.Errorf("expected running=true, nil; got %v, %v", running, err)
+	}
+
+	rStopped := &restorer{
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return `{"status": "stopped", "pid": 0}`, nil
+		},
+	}
+	stopped, err := rStopped.IsRunning(context.Background(), "stopped-app")
+	if err != nil || stopped {
+		t.Errorf("expected running=false, nil; got %v, %v", stopped, err)
+	}
+
+	rMissing := &restorer{
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			return "container does not exist", errors.New("exit status 1")
+		},
+	}
+	missing, err := rMissing.IsRunning(context.Background(), "missing-app")
+	if err != nil || missing {
+		t.Errorf("expected running=false, nil; got %v, %v", missing, err)
 	}
 }

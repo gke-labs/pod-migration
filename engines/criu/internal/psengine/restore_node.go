@@ -32,6 +32,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -69,6 +70,15 @@ type RestoreOps interface {
 	// Restore performs the sandbox-sibling runc restore into the target
 	// pod's namespaces (the holder keeps the sandbox alive).
 	Restore(ctx context.Context, in RestoreInputs) (pid int, durMs int64, err error)
+	// Cleanup tears down all restore artifacts (container, mounts, snapshot, lease, bundle)
+	// when the restored pod is deleted.
+	Cleanup(ctx context.Context, in RestoreInputs) error
+	// Signal sends a signal (e.g. 15 / SIGTERM) to the restored runc container.
+	Signal(ctx context.Context, in RestoreInputs, sig int) error
+	// IsSiblingRunning returns true if the restored runc container is still running.
+	IsSiblingRunning(ctx context.Context, in RestoreInputs) (bool, error)
+	// SignalHolder sends a signal (e.g. 2 / SIGINT) to the holder container process to wake it early upon cleanup.
+	SignalHolder(ctx context.Context, in RestoreInputs, sig int) error
 }
 
 // NodeRestoreReconciler watches pods on its node and executes restores.
@@ -85,6 +95,7 @@ type NodeRestoreReconciler struct {
 	CPUFamily string
 
 	inflight sync.Map
+	signaled sync.Map
 }
 
 // Note: engines/criu does not run controller-gen; deploy/deploy.yaml is the RBAC source of truth.
@@ -97,6 +108,30 @@ type NodeRestoreReconciler struct {
 // +kubebuilder:rbac:groups="",resources=nodes/checkpoint,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
+// resolveSnapshot extracts the snapshot name for a pod, checking the durable
+// engine-owned AnnotationSnapshot, the controller's restore-completed annotation,
+// the configured AnnotationPSName, and any suffix "/ps-name" annotation.
+func resolveSnapshot(pod *corev1.Pod) string {
+	if pod == nil || pod.Annotations == nil {
+		return ""
+	}
+	if snap := pod.Annotations[contract.AnnotationSnapshot]; snap != "" {
+		return snap
+	}
+	if snap := pod.Annotations["pod-migration.gke.io/restore-completed"]; snap != "" {
+		return snap
+	}
+	if snap := pod.Annotations[contract.AnnotationPSName]; snap != "" {
+		return snap
+	}
+	for k, v := range pod.Annotations {
+		if strings.HasSuffix(k, "/ps-name") && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("pod", req.NamespacedName, "node", r.NodeName)
 
@@ -107,6 +142,75 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if pod.Spec.NodeName != r.NodeName {
 		return ctrl.Result{}, nil
 	}
+
+	// 1. Pod deletion teardown: when a restored pod is deleted, send SIGTERM to the
+	// sibling container, wait out the grace period (or until the sibling container exits),
+	// and then tear down the sibling container, mounts, snapshot, and lease.
+	// NOTE: We deliberately do NOT use a finalizer here. A node crash, agent failure,
+	// or undeployment with a finalizer would wedge StatefulSets in Terminating forever (issue #128, #35).
+	// Any missed deletion event is safely cleaned up by the periodic orphan sweep.
+	if pod.DeletionTimestamp != nil {
+		psName := resolveSnapshot(pod)
+		if psName == "" || pod.Annotations[AnnotationInjected] != "true" || pod.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusRestored {
+			return ctrl.Result{}, nil
+		}
+
+		container := ""
+		if len(pod.Spec.Containers) > 0 {
+			container = pod.Spec.Containers[0].Name
+		}
+		in := RestoreInputs{
+			SnapshotName:  psName,
+			PodNamespace:  pod.Namespace,
+			TargetPod:     pod.Name,
+			ContainerName: container,
+			TargetPodUID:  string(pod.UID),
+		}
+
+		// Send SIGTERM once to the sibling container so it gets graceful termination.
+		if _, alreadySignaled := r.signaled.Load(string(pod.UID)); !alreadySignaled {
+			if err := r.Ops.Signal(ctx, in, 15); err == nil {
+				r.signaled.Store(string(pod.UID), true)
+			} else {
+				logger.V(1).Info("signaling sibling container failed", "pod", pod.Name, "err", err)
+			}
+		}
+
+		// Check if the sibling container has exited or if the grace period expired.
+		siblingRunning := true
+		if isRunning, err := r.Ops.IsSiblingRunning(ctx, in); err == nil {
+			siblingRunning = isRunning
+		} else {
+			logger.V(1).Info("checking sibling running state failed", "pod", pod.Name, "err", err)
+		}
+
+		gracePeriodExpired := false
+		if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds > 0 {
+			if time.Now().After(pod.DeletionTimestamp.Time) {
+				gracePeriodExpired = true
+			}
+		} else {
+			gracePeriodExpired = true
+		}
+
+		if siblingRunning && !gracePeriodExpired {
+			// Sibling received SIGTERM; wait for sibling to exit or grace period to elapse.
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		}
+
+		logger.Info("tearing down restored sibling artifacts after sibling exit/grace period", "pod", pod.Name)
+		if err := r.Ops.Cleanup(ctx, in); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cleanup restore artifacts for %s: %w", pod.Name, err)
+		}
+		r.signaled.Delete(string(pod.UID))
+		logger.Info("cleaned up restore artifacts on pod deletion", "pod", pod.Name)
+		// Wake the holder container if it is waiting out the grace period:
+		if err := r.Ops.SignalHolder(ctx, in, 2); err != nil {
+			logger.V(1).Info("signaling holder container failed", "pod", pod.Name, "err", err)
+		}
+		return ctrl.Result{}, nil
+	}
+
 	psName := pod.Annotations[contract.AnnotationPSName]
 	if psName == "" || pod.Annotations[AnnotationInjected] != "true" {
 		return ctrl.Result{}, nil // not a restore order for this engine
@@ -145,6 +249,9 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		latest.Annotations = map[string]string{}
 	}
 	latest.Annotations[contract.AnnotationRestoreStatus] = status
+	if status == contract.RestoreStatusRestored {
+		latest.Annotations[contract.AnnotationSnapshot] = psName
+	}
 	if uerr := r.Update(ctx, latest); uerr != nil {
 		return ctrl.Result{}, uerr
 	}

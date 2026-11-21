@@ -27,11 +27,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/gke-labs/pod-migration/engines/criu/internal/psengine/contract"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -41,13 +43,15 @@ import (
 // capability probe.
 type Node struct {
 	client.Client
-	NodeName string
+	APIReader client.Reader
+	NodeName  string
 
 	Kubelet  *kubeletCheckpoint
 	Restorer *restorer
 
-	SocketPath string
-	Inspector  *ContainerdReadinessInspector
+	SocketPath    string
+	SweepInterval time.Duration // default 5m
+	Inspector     *ContainerdReadinessInspector
 
 	// annotateMu serializes Node annotation GET/PATCH calls so concurrent
 	// Bootstrap and DemoteNode writes never land out of order on the API server.
@@ -582,9 +586,16 @@ func (n *Node) retryContainerdReadiness(ctx context.Context, ino uint64) (bool, 
 }
 
 // RunProbeLoop runs periodic readiness probes while ctx is active.
+// Orphan restore sweeps run on their own longer interval (default 5m).
 func (n *Node) RunProbeLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	sweepInterval := n.SweepInterval
+	if sweepInterval <= 0 {
+		sweepInterval = 5 * time.Minute
+	}
+	sweepTicker := time.NewTicker(sweepInterval)
+	defer sweepTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -593,8 +604,78 @@ func (n *Node) RunProbeLoop(ctx context.Context, interval time.Duration) {
 			if _, err := n.ProbeReadiness(ctx); err != nil {
 				logf.FromContext(ctx).Error(err, "readiness re-probe failed", "node", n.NodeName)
 			}
+		case <-sweepTicker.C:
+			if err := n.SweepOrphanRestores(ctx); err != nil {
+				logf.FromContext(ctx).Error(err, "periodic orphan restore sweep failed", "node", n.NodeName)
+			}
 		}
 	}
+}
+
+// SweepOrphanRestores lists pods on this node from the API reader and cleans up
+// any leftover CRIU restore containers, mounts, snapshots, or leases whose pods
+// are gone or terminating.
+func (n *Node) SweepOrphanRestores(ctx context.Context) error {
+	sweepStart := time.Now()
+	var podList corev1.PodList
+	reader := n.APIReader
+	if reader == nil {
+		reader = n.Client
+	}
+	if reader == nil {
+		return nil
+	}
+	var listOpts []client.ListOption
+	if n.NodeName != "" {
+		listOpts = append(listOpts, client.MatchingFields{"spec.nodeName": n.NodeName})
+	}
+	if err := reader.List(ctx, &podList, listOpts...); err != nil {
+		return fmt.Errorf("list pods on node %s: %w", n.NodeName, err)
+	}
+	livingUIDs := make(map[string]bool)
+	livingSnaps := make(map[string]bool)
+	now := time.Now()
+	for _, p := range podList.Items {
+		if p.Spec.NodeName != n.NodeName && n.NodeName != "" {
+			continue
+		}
+		// Treat terminal pods (Succeeded, Failed) or failed restores as dead.
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if p.Annotations != nil && p.Annotations[contract.AnnotationRestoreStatus] == contract.RestoreStatusFailed {
+			continue
+		}
+		// Count terminating pods as alive until their grace deadline has elapsed.
+		alive := p.DeletionTimestamp == nil
+		if !alive && p.DeletionGracePeriodSeconds != nil && *p.DeletionGracePeriodSeconds > 0 {
+			if now.Before(p.DeletionTimestamp.Time) {
+				alive = true
+			}
+		}
+		if alive {
+			livingUIDs[string(p.UID)] = true
+			for k, v := range p.Annotations {
+				if strings.HasSuffix(k, "/ps-name") && v != "" {
+					livingSnaps[v] = true
+				}
+			}
+			if snap := p.Annotations[contract.AnnotationSnapshot]; snap != "" {
+				livingSnaps[snap] = true
+			}
+			if snap := p.Annotations["pod-migration.gke.io/restore-completed"]; snap != "" {
+				livingSnaps[snap] = true
+			}
+		}
+	}
+	if n.Restorer == nil {
+		return nil
+	}
+	swept, err := n.Restorer.SweepOrphans(ctx, livingUIDs, livingSnaps, sweepStart)
+	if len(swept) > 0 {
+		logf.FromContext(ctx).Info("swept orphan restore artifacts", "count", len(swept), "migrations", swept)
+	}
+	return err
 }
 
 func joinNotes(notes []string) string {

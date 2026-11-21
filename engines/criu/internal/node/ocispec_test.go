@@ -389,7 +389,7 @@ func TestRestoreEndToEndEnforcesTargetSpec(t *testing.T) {
 		readProcCgroupFn: func(pid int) ([]byte, error) {
 			return []byte("0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice/cri-containerd-holder.scope\n"), nil
 		},
-		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string) (string, error) {
+		prepareRootfsFn: func(ctx context.Context, imageName, key, bundleDir, rootfsDiffTar string, labels map[string]string) (string, error) {
 			preparedImage = imageName
 			rf := filepath.Join(bundleDir, "rootfs")
 			_ = os.MkdirAll(rf, 0o755)

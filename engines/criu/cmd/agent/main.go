@@ -85,15 +85,19 @@ func main() {
 		log.Error(err, "unable to init node worker")
 		os.Exit(1)
 	}
+	nd.APIReader = mgr.GetAPIReader()
 
 	// Run CRIU bundle installation + node capability annotation once the cache starts,
-	// and run a background probe loop to recover node readiness when containerd restarts.
+	// run orphan restore sweep, and run a background probe loop to recover node readiness when containerd restarts.
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
 			return nil
 		}
 		if err := nd.Bootstrap(ctx); err != nil {
 			log.Error(err, "CRIU bootstrap failed (continuing; node remains unready)")
+		}
+		if err := nd.SweepOrphanRestores(ctx); err != nil {
+			log.Error(err, "orphan restore sweep failed (continuing)")
 		}
 		nd.RunProbeLoop(ctx, 10*time.Second)
 		return nil
@@ -183,4 +187,20 @@ func (a *nodeOpsAdapter) Restore(ctx context.Context, in psengine.RestoreInputs)
 		ContainerName: in.ContainerName, SourcePodUID: in.SourcePodUID, TargetPodUID: in.TargetPodUID,
 		CheckpointDir: in.CheckpointDir, SpecJSON: in.SpecJSON, ImageName: in.ImageName,
 	})
+}
+
+func (a *nodeOpsAdapter) Cleanup(ctx context.Context, in psengine.RestoreInputs) error {
+	return a.n.PSEngineCleanup(ctx, in.SnapshotName)
+}
+
+func (a *nodeOpsAdapter) Signal(ctx context.Context, in psengine.RestoreInputs, sig int) error {
+	return a.n.PSEngineSignal(ctx, in.SnapshotName, sig)
+}
+
+func (a *nodeOpsAdapter) IsSiblingRunning(ctx context.Context, in psengine.RestoreInputs) (bool, error) {
+	return a.n.PSEngineIsSiblingRunning(ctx, in.SnapshotName)
+}
+
+func (a *nodeOpsAdapter) SignalHolder(ctx context.Context, in psengine.RestoreInputs, sig int) error {
+	return a.n.PSEngineSignalHolder(ctx, in.PodNamespace, in.TargetPod, in.TargetPodUID, in.ContainerName, sig)
 }

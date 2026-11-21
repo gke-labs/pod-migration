@@ -130,6 +130,13 @@ const (
 	AnnotationRestoreStatus = "pod-migrate.io/psengine-restore"
 	RestoreStatusRestored   = "restored"
 	RestoreStatusFailed     = "failed"
+
+	// AnnotationSnapshot records the snapshot name restored into the pod, stamped
+	// by the node agent upon successful restore. Unlike */ps-name, which CompleteRestore
+	// clears to "" upon job success, this durable annotation survives for the lifetime
+	// of the pod so the orphan sweep and deletion reconciler know which snapshot artifacts
+	// belong to this pod.
+	AnnotationSnapshot = "pod-migrate.io/psengine-snapshot"
 )
 
 // The engine's API group and what follows from it. They hold DefaultGroup

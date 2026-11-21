@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/containerd/containerd/v2 v2.0.13
 	github.com/containerd/errdefs v1.0.0
+	github.com/moby/sys/mountinfo v0.7.2
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.2.1
 	github.com/pelletier/go-toml/v2 v2.2.3
@@ -59,7 +60,6 @@ require (
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/moby/locker v1.0.1 // indirect
-	github.com/moby/sys/mountinfo v0.7.2 // indirect
 	github.com/moby/sys/sequential v0.6.0 // indirect
 	github.com/moby/sys/signal v0.7.1 // indirect
 	github.com/moby/sys/user v0.4.1 // indirect
