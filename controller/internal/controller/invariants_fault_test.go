@@ -333,6 +333,11 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		if err := k8sClient.Status().Update(ctx, pmj); err != nil {
 			t.Fatalf("update PMJ status to Restoring: %v", err)
 		}
+		// The job reached Restoring on this snapshot. The pod gate holds a
+		// replacement whose snapshot is gone (#269).
+		if err := k8sClient.Create(ctx, readySnapshot(snapshot.DefaultAPIGroup, ns, pmj.Status.SnapshotRef)); err != nil {
+			t.Fatalf("create PodSnapshot: %v", err)
+		}
 
 		isController := true
 		makeContenderPod := func(name string) *corev1.Pod {

@@ -722,7 +722,7 @@ func TestPodGateReconciler_RestoreOrdersComeFromTheEngine(t *testing.T) {
 				WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 				WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 				WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-				WithObjects(objects...).
+				WithObjects(withReadySnapshots(objects, engine.DefaultAPIGroup, "engine.example.com")...).
 				Build()
 
 			r := &PodGateReconciler{Client: c, Scheme: scheme, Engines: registryOf(t, tt.engines...)}

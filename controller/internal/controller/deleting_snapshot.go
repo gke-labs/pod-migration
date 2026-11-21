@@ -17,7 +17,8 @@ package controller
 
 // A PodSnapshot that's being deleted is never restorable (#265). Its
 // deletionTimestamp is set, and a finalizer (the CRIU engine controller's
-// archive cleanup, or GKE's own) holds it while its archive goes away.
+// archive cleanup, or GKE's own) holds it while its archive goes away. Nor
+// is one that's already gone (#269).
 
 import (
 	"context"
@@ -38,21 +39,33 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
-// ConditionSnapshotRestorable is False, with reason SnapshotDeleting, on a
-// Restoring job whose replacement the pod gate holds because the job's
-// snapshot is being deleted (#265). The job reconciler concludes such a job
-// SucceededWithoutRestore, and the gate then releases the replacement cold.
+// ConditionSnapshotRestorable is False, with reason SnapshotDeleting or
+// SnapshotGone, on a Restoring job whose replacement the pod gate holds
+// because the job's snapshot is being deleted (#265) or is gone (#269). The
+// job reconciler concludes such a job SucceededWithoutRestore, and the gate
+// then releases the replacement cold.
 const ConditionSnapshotRestorable = "SnapshotRestorable"
 
-// snapshotDeletingHold returns the condition with which the pod gate
+// ConditionSnapshotObserved is True on a Snapshotting job once the
+// controller has read the PodSnapshot in status.snapshotRef. It's the
+// durable evidence that the snapshot existed: a trigger can name its
+// snapshot before the snapshot is created, so without it a snapshot that
+// isn't found may just not exist yet (#269).
+const ConditionSnapshotObserved = "SnapshotObserved"
+
+// reasonSnapshotFound is the reason of ConditionSnapshotObserved.
+const reasonSnapshotFound = "SnapshotFound"
+
+// snapshotUnrestorableHold returns the condition with which the pod gate
 // recorded that it holds job's replacement because the job's snapshot is
-// being deleted. It only counts while the job is Restoring.
-func snapshotDeletingHold(job *pmv1alpha1.PodMigrationJob) (*metav1.Condition, bool) {
+// being deleted or is gone. It only counts while the job is Restoring.
+func snapshotUnrestorableHold(job *pmv1alpha1.PodMigrationJob) (*metav1.Condition, bool) {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
 		return nil, false
 	}
 	cond := meta.FindStatusCondition(job.Status.Conditions, ConditionSnapshotRestorable)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != snapshot.ReasonSnapshotDeleting {
+	if cond == nil || cond.Status != metav1.ConditionFalse ||
+		(cond.Reason != snapshot.ReasonSnapshotDeleting && cond.Reason != snapshot.ReasonSnapshotGone) {
 		return nil, false
 	}
 	return cond, true
@@ -61,6 +74,82 @@ func snapshotDeletingHold(job *pmv1alpha1.PodMigrationJob) (*metav1.Condition, b
 // snapshotDeletingMessage says why a job can't restore its snapshot.
 func snapshotDeletingMessage(snapshotRef string) string {
 	return fmt.Sprintf("PodSnapshot %q is being deleted, so it can't be restored; the replacement starts cold", snapshotRef)
+}
+
+// snapshotGoneMessage says why a job can't restore its snapshot.
+func snapshotGoneMessage(snapshotRef string) string {
+	return fmt.Sprintf("PodSnapshot %q is gone, so it can't be restored; the replacement starts cold", snapshotRef)
+}
+
+// unrestorableMessage returns the hold's message for reason.
+func unrestorableMessage(reason, snapshotRef string) string {
+	if reason == snapshot.ReasonSnapshotGone {
+		return snapshotGoneMessage(snapshotRef)
+	}
+	return snapshotDeletingMessage(snapshotRef)
+}
+
+// unrestorableVerdict returns the restore verdict metric label for reason.
+func unrestorableVerdict(reason string) string {
+	if reason == snapshot.ReasonSnapshotGone {
+		return "snapshot_gone"
+	}
+	return "snapshot_deleting"
+}
+
+// snapshotObserved reports whether the controller recorded that it read the
+// job's current snapshot.
+func snapshotObserved(job *pmv1alpha1.PodMigrationJob) bool {
+	return job.Status.SnapshotRef != "" && meta.IsStatusConditionTrue(job.Status.Conditions, ConditionSnapshotObserved)
+}
+
+// recordSnapshotObserved updates job's ConditionSnapshotObserved from st, in
+// memory, and reports whether it changed. The condition goes when the
+// trigger names a different snapshot: it's about the snapshot in
+// status.snapshotRef. Call it after status.snapshotRef is updated from st.
+func recordSnapshotObserved(job *pmv1alpha1.PodMigrationJob, st *snapshot.Status, refChanged bool) bool {
+	changed := false
+	if refChanged {
+		changed = meta.RemoveStatusCondition(&job.Status.Conditions, ConditionSnapshotObserved)
+	}
+	if st.Found && st.SnapshotRef != "" && st.SnapshotRef == job.Status.SnapshotRef {
+		if meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+			Type:               ConditionSnapshotObserved,
+			Status:             metav1.ConditionTrue,
+			Reason:             reasonSnapshotFound,
+			Message:            fmt.Sprintf("PodSnapshot %q exists; if it isn't found later, it was deleted", st.SnapshotRef),
+			ObservedGeneration: job.Generation,
+		}) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// snapshotGone reports whether a Snapshotting job's snapshot, which the job
+// recorded seeing, is gone. st is the provider's (cached) view: it must name
+// the job's snapshot as not found. A cached miss can be a lagging informer,
+// so the API server must confirm it. A snapshot never seen may not be
+// created yet, so it's never gone here, and the job waits as before.
+func (r *PodMigrationJobReconciler) snapshotGone(ctx context.Context, job *pmv1alpha1.PodMigrationJob, st *snapshot.Status) (bool, error) {
+	if st == nil || st.Phase != snapshot.PhaseInProgress || st.Found || st.SnapshotRef == "" ||
+		st.SnapshotRef != job.Status.SnapshotRef || !snapshotObserved(job) {
+		return false, nil
+	}
+	// Read the group the provider read the snapshot from.
+	group := r.jobAPIGroup(job)
+	if gp, ok := r.getSnapshotProvider(job).(*snapshot.GKEProvider); ok && gp != nil {
+		group = gp.APIGroup()
+	}
+	reason, err := snapshot.PodSnapshotUnrestorable(ctx, r.liveReader(), group, job.Namespace, job.Status.SnapshotRef)
+	if err != nil {
+		return false, err
+	}
+	if reason != snapshot.ReasonSnapshotGone {
+		log.FromContext(ctx).Info("The cache doesn't have the job's snapshot, but the API server does; looking again", "snapshot", job.Status.SnapshotRef)
+		return false, nil
+	}
+	return true, nil
 }
 
 // replacementReleased reports whether job's replacement was released from
@@ -131,13 +220,33 @@ func (r *PodMigrationJobReconciler) failSnapshotDeleting(ctx context.Context, re
 
 	message := fmt.Sprintf("PodSnapshot %q is being deleted, so it can't be restored", job.Status.SnapshotRef)
 	logger.Info("The job's snapshot is being deleted; failing the migration", "snapshot", job.Status.SnapshotRef, "checkpointCompleted", completed)
+	return r.failUnrestorableSnapshot(ctx, req, job, origJob, snapshot.ReasonSnapshotDeleting, message, completed, why)
+}
+
+// failSnapshotGone fails a Snapshotting job whose snapshot, seen before, is
+// gone (#269): it can never become restorable. Whether its checkpoint
+// completed can't be read any more, so the source stays fenced (C4), in the
+// same status write, and the next pass evicts it cold. The caller has
+// confirmed on the API server that the snapshot is gone.
+func (r *PodMigrationJobReconciler) failSnapshotGone(ctx context.Context, req ctrl.Request, job, origJob *pmv1alpha1.PodMigrationJob) (ctrl.Result, error) {
+	_ = r.getSnapshotProvider(job).Cleanup(ctx, job, job.Spec.PodRef.Name)
+	message := fmt.Sprintf("PodSnapshot %q is gone, so it can't be restored", job.Status.SnapshotRef)
+	log.FromContext(ctx).Info("The job's snapshot is gone; failing the migration", "snapshot", job.Status.SnapshotRef)
+	return r.failUnrestorableSnapshot(ctx, req, job, origJob, snapshot.ReasonSnapshotGone, message, true,
+		"the snapshot is gone, so whether its checkpoint completed can't be read, and the engine may have stopped the source")
+}
+
+// failUnrestorableSnapshot fails a Snapshotting job with reason and message.
+// If completed, and the source is fenced, the same write keeps it fenced
+// (FenceKept), for why.
+func (r *PodMigrationJobReconciler) failUnrestorableSnapshot(ctx context.Context, req ctrl.Request, job, origJob *pmv1alpha1.PodMigrationJob, reason, message string, completed bool, why string) (ctrl.Result, error) {
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseFailed
 	now := metav1.Now()
 	job.Status.CompletionTime = &now
 	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 		Type:               "Ready",
 		Status:             metav1.ConditionFalse,
-		Reason:             snapshot.ReasonSnapshotDeleting,
+		Reason:             reason,
 		Message:            message,
 		ObservedGeneration: job.Generation,
 	})
@@ -154,7 +263,7 @@ func (r *PodMigrationJobReconciler) failSnapshotDeleting(ctx context.Context, re
 		})
 	}
 	if err := r.patchStatus(ctx, job, origJob); err != nil {
-		return r.handleStatusError(ctx, err, "Failed to update job status to Failed for a snapshot being deleted")
+		return r.handleStatusError(ctx, err, "Failed to update job status to Failed for an unrestorable snapshot")
 	}
 	metrics.MarkPMJInactive(req.NamespacedName.String())
 	metrics.RecordOutcome("failed")

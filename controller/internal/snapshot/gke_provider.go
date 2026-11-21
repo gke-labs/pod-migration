@@ -254,9 +254,10 @@ func (p *GKEProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrat
 	if !found || snapshotName == "" {
 		logger.Info("Waiting for snapshot name to be populated in trigger status...", "trigger", triggerName)
 		return &Status{
-			Phase:   PhaseInProgress,
-			Reason:  "Snapshotting",
-			Message: "Waiting for GKE to populate snapshot name in trigger status",
+			Phase:             PhaseInProgress,
+			Reason:            "Snapshotting",
+			Message:           "Waiting for GKE to populate snapshot name in trigger status",
+			TriggerUnanswered: true,
 		}, nil
 	}
 
@@ -301,6 +302,7 @@ func checkPodSnapshotStatus(targetSnapshot *unstructured.Unstructured, now time.
 			SnapshotRef: snapshotName,
 			Reason:      "Snapshotting",
 			Message:     fmt.Sprintf("Waiting for GKE PodSnapshot %q status to be populated", snapshotName),
+			Found:       true,
 		}
 	}
 
@@ -330,7 +332,11 @@ func checkPodSnapshotStatus(targetSnapshot *unstructured.Unstructured, now time.
 	}
 	topPhase, _ := snapStatus["phase"].(string)
 	st := statusFromConditions(snapshotName, conditions, targetSnapshot.GetCreationTimestamp().Time, topPhase, now, logInfo)
-	return demoteDeletingSnapshot(targetSnapshot, st, logInfo)
+	st = demoteDeletingSnapshot(targetSnapshot, st, logInfo)
+	if st != nil {
+		st.Found = true
+	}
+	return st
 }
 
 // demoteDeletingSnapshot keeps a PodSnapshot that's being deleted from being
@@ -704,6 +710,35 @@ func isSnapshotSubconditionInProgressReason(reason string) bool {
 // ReasonSnapshotDeleting is the reason of the InProgress status reported for
 // a PodSnapshot that's being deleted (#265).
 const ReasonSnapshotDeleting = "SnapshotDeleting"
+
+// ReasonSnapshotGone is the reason with which the controller records that a
+// job's PodSnapshot, seen before, no longer exists (#269).
+const ReasonSnapshotGone = "SnapshotGone"
+
+// PodSnapshotUnrestorable reads the PodSnapshot name, in group, and reports
+// why it can't be restored: ReasonSnapshotDeleting while it's being deleted
+// (#265), ReasonSnapshotGone when it doesn't exist (#269), or "" otherwise.
+// A group whose PodSnapshot CRD isn't installed reports "", so callers keep
+// their behavior for it. Read it with an API reader: a cached miss can be a
+// lagging informer. NotFound only means gone to a caller that knows the
+// snapshot existed; one can also not be created yet.
+func PodSnapshotUnrestorable(ctx context.Context, r client.Reader, group, namespace, name string) (string, error) {
+	snap := &unstructured.Unstructured{}
+	snap.SetGroupVersionKind(PodSnapshotGVK(group))
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, snap); err != nil {
+		switch {
+		case apierrors.IsNotFound(err):
+			return ReasonSnapshotGone, nil
+		case meta.IsNoMatchError(err):
+			return "", nil
+		}
+		return "", fmt.Errorf("reading snapshot %s/%s: %w", namespace, name, err)
+	}
+	if snap.GetDeletionTimestamp() != nil {
+		return ReasonSnapshotDeleting, nil
+	}
+	return "", nil
+}
 
 // PodSnapshotBeingDeleted reports whether the PodSnapshot name, in group, is
 // being deleted: its deletionTimestamp is set, and a finalizer (the CRIU
