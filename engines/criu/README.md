@@ -85,16 +85,23 @@ The CRIU snapshot engine consists of three binaries built from this Go module
    - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 3.19
      bundle into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
      writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
-     `nsenter`, and stamps `pod-migrate.io/criu-ready` and
+     `nsenter`, verifies containerd readiness (inspecting containerd's process
+     PATH or shim PATH and ensuring `enable_criu != false` in containerd configuration
+     before declaring the node ready), and stamps `pod-migrate.io/criu-ready` and
      `pod-migrate.io/criu-version` on the `Node`.
-     If containerd cached a failed CRIU lookup (e.g. before criu was on its PATH),
-     the agent marks the node `pod-migrate.io/criu-ready: false` with reason and
-     remediation annotations (`pod-migrate.io/criu-reason` and `pod-migrate.io/criu-remediation`).
+     If containerd cannot resolve CRIU on its PATH/shim PATH, or CRIU is disabled
+     by configuration, or containerd cached a failed CRIU lookup, the agent marks
+     the node `pod-migrate.io/criu-ready: false` with reason and remediation
+     annotations (`pod-migrate.io/criu-reason` and `pod-migrate.io/criu-remediation`).
+     This prevents orchestrators from dispatching checkpoints to nodes where containerd
+     would poison its CRIU lookup cache (#130).
+     Containerd inspection reads containerd's primary configuration file (from
+     `--config` / `-c` or default `/etc/containerd/config.toml`) and does not follow
+     multi-file `imports` / `conf.d` drop-ins.
      The agent mounts `/run/containerd` and probes containerd's socket every 10s
      while the node is unready; once containerd restarts, the agent detects the
-     new socket inode, re-runs `Bootstrap` (`criu check` against the host kernel),
-     and restores `pod-migrate.io/criu-ready: true` (verifying containerd's own
-     `PATH` lookup remains tracked in [#130](https://github.com/gke-labs/pod-migration/issues/130)).
+     new socket inode, re-runs readiness verification and kernel checks, and restores
+     `pod-migrate.io/criu-ready: true`.
    - Reconciles `PodSnapshot` work orders scheduled on its node
      (`psengine.NodeSnapshotReconciler`): implements the `Frozen` fencing mode
      (contract clause C4, #148). Pauses (freezes) the source container task via
