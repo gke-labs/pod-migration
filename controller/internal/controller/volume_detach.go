@@ -20,7 +20,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -44,21 +43,13 @@ func isRWOAccessMode(accessModes []corev1.PersistentVolumeAccessMode) bool {
 	return false
 }
 
-// areOriginVolumesDetached reports whether all RWO/RWOP PersistentVolumes listed in pvs have
+// areOriginVolumesDetached reports whether all PersistentVolumes listed in pvs have
 // detached from originNodeName. Attachments on other nodes (such as the destination node
-// or existing ReadWriteMany attachments) do not block detachment verification. Non-RWO
-// volumes (e.g. ReadWriteMany, ReadOnlyMany) are skipped.
+// or existing ReadWriteMany attachments) do not block detachment verification.
 func areOriginVolumesDetached(ctx context.Context, cl client.Reader, originNodeName string, pvs []string) (bool, error) {
 	for _, targetPV := range pvs {
 		if targetPV == "" {
 			continue
-		}
-		// If the PersistentVolume object is accessible, skip non-RWO volumes (RWX/ROX).
-		pv := &corev1.PersistentVolume{}
-		if err := cl.Get(ctx, types.NamespacedName{Name: targetPV}, pv); err == nil {
-			if len(pv.Spec.AccessModes) > 0 && !isRWOAccessMode(pv.Spec.AccessModes) {
-				continue
-			}
 		}
 
 		vaList := &storagev1.VolumeAttachmentList{}

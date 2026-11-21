@@ -42,9 +42,6 @@ func TestAreOriginVolumesDetached(t *testing.T) {
 
 	pvName := "pv-data-1"
 	pvOther := "pv-data-2"
-	pvRWX := "pv-rwx"
-	pvROX := "pv-rox"
-	pvRWOP := "pv-rwop"
 	originNode := "node-origin"
 	destNode := "node-dest"
 
@@ -98,57 +95,6 @@ func TestAreOriginVolumesDetached(t *testing.T) {
 		Status: storagev1.VolumeAttachmentStatus{
 			Attached: true,
 		},
-	}
-
-	pvRWXObj := &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: pvRWX},
-		Spec: corev1.PersistentVolumeSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
-		},
-	}
-	vaRWXAttached := &storagev1.VolumeAttachment{
-		ObjectMeta: metav1.ObjectMeta{Name: "va-rwx"},
-		Spec: storagev1.VolumeAttachmentSpec{
-			NodeName: originNode,
-			Source: storagev1.VolumeAttachmentSource{
-				PersistentVolumeName: &pvRWX,
-			},
-		},
-		Status: storagev1.VolumeAttachmentStatus{Attached: true},
-	}
-
-	pvROXObj := &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: pvROX},
-		Spec: corev1.PersistentVolumeSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
-		},
-	}
-	vaROXAttached := &storagev1.VolumeAttachment{
-		ObjectMeta: metav1.ObjectMeta{Name: "va-rox"},
-		Spec: storagev1.VolumeAttachmentSpec{
-			NodeName: originNode,
-			Source: storagev1.VolumeAttachmentSource{
-				PersistentVolumeName: &pvROX,
-			},
-		},
-		Status: storagev1.VolumeAttachmentStatus{Attached: true},
-	}
-
-	pvRWOPObj := &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: pvRWOP},
-		Spec: corev1.PersistentVolumeSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
-		},
-	}
-	vaRWOPAttached := &storagev1.VolumeAttachment{
-		ObjectMeta: metav1.ObjectMeta{Name: "va-rwop"},
-		Spec: storagev1.VolumeAttachmentSpec{
-			NodeName: originNode,
-			Source: storagev1.VolumeAttachmentSource{
-				PersistentVolumeName: &pvRWOP,
-			},
-		},
-		Status: storagev1.VolumeAttachmentStatus{Attached: true},
 	}
 
 	t.Run("empty pvs returns true", func(t *testing.T) {
@@ -220,54 +166,6 @@ func TestAreOriginVolumesDetached(t *testing.T) {
 		}
 		if detached {
 			t.Fatalf("expected detached=false because pvOther is still attached")
-		}
-	})
-
-	t.Run("RWX volume attached on origin node is skipped", func(t *testing.T) {
-		cl := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
-			WithObjects(pvRWXObj, vaRWXAttached).
-			Build()
-
-		detached, err := areOriginVolumesDetached(context.Background(), cl, originNode, []string{pvRWX})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !detached {
-			t.Fatalf("expected detached=true because RWX volume is not RWO")
-		}
-	})
-
-	t.Run("ROX volume attached on origin node is skipped", func(t *testing.T) {
-		cl := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
-			WithObjects(pvROXObj, vaROXAttached).
-			Build()
-
-		detached, err := areOriginVolumesDetached(context.Background(), cl, originNode, []string{pvROX})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !detached {
-			t.Fatalf("expected detached=true because ROX volume is not RWO")
-		}
-	})
-
-	t.Run("RWOP volume attached on origin node returns false", func(t *testing.T) {
-		cl := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
-			WithObjects(pvRWOPObj, vaRWOPAttached).
-			Build()
-
-		detached, err := areOriginVolumesDetached(context.Background(), cl, originNode, []string{pvRWOP})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if detached {
-			t.Fatalf("expected detached=false because RWOP is single-writer")
 		}
 	})
 }
