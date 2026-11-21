@@ -64,13 +64,14 @@ var (
 	// RestoreVerdictsTotal counts restore verdicts on replacement pods (C6),
 	// by engine and verdict, so a restore the engine confirmed can be told
 	// apart from one that was inferred.
-	// Verdicts: confirmed | inferred | cold_start | failed | lost | timeout | no_compatible_node | placement_timeout
+	// Verdicts: confirmed | inferred | cold_start | failed | lost | timeout | no_compatible_node | placement_timeout | snapshot_deleting
 	// (no_compatible_node: only for a job that an earlier version of the pod
 	// gate held, with placement on, because no node met the engine's
 	// placement constraints; its replacement started cold;
 	// placement_timeout: the replacement released with those constraints
 	// wasn't scheduled in time, so it was deleted for its owner to recreate,
-	// to start cold; #14)
+	// to start cold; #14; snapshot_deleting: the job's snapshot was being
+	// deleted before its replacement was released, so it started cold; #265)
 	RestoreVerdictsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_restore_verdicts_total",
 		Help: "Total number of restore verdicts on replacement pods, by engine and verdict.",

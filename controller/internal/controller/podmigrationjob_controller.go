@@ -1003,6 +1003,11 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if snapStatus != nil {
 				lastSnapStatus = snapStatus
 			}
+			if snapStatus != nil && snapStatus.Reason == snapshot.ReasonSnapshotDeleting {
+				// As in Snapshotting below: the fence must be kept if the
+				// checkpoint completed, recorded before the snapshot is gone.
+				return r.failSnapshotDeleting(ctx, req, job, origJob, snapStatus)
+			}
 			if progressing {
 				logger.Info("Migration exceeded baseline timeout but snapshot is actively progressing; extending deadline",
 					"job", job.Name, "snapshot", job.Status.SnapshotRef, "timeout", migrationTimeout)
@@ -1503,6 +1508,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{Requeue: true}, nil
 
 		case snapshot.PhaseInProgress:
+			// A snapshot being deleted never becomes restorable (#265).
+			if snapStatus.Reason == snapshot.ReasonSnapshotDeleting {
+				return r.failSnapshotDeleting(ctx, req, job, origJob, snapStatus)
+			}
 			// If origin pod entered terminal phase (Failed or Succeeded) while snapshotting, fail fast.
 			// It has no running process left to checkpoint.
 			originPod := &corev1.Pod{}
@@ -1843,6 +1852,30 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			metrics.RecordRestoreVerdict(r.jobEngine(job).Name(), "no_compatible_node")
 			r.eventf(job, corev1.EventTypeWarning, ReasonNoCompatibleNode, "%s", cond.Message)
 			return ctrl.Result{}, nil
+		}
+
+		// The pod gate found the job's snapshot being deleted and holds the
+		// replacement rather than order a restore from it (#265). Conclude
+		// without a restore, and the gate then releases it cold. This only
+		// applies while no replacement was actually released, and it comes
+		// before the restore ceiling, which waits for a gated replacement
+		// forever. The patch checks the resourceVersion, so a stale view
+		// can't conclude a job that changed since.
+		if cond, held := snapshotDeletingHold(job); held {
+			released, err := r.replacementReleased(ctx, job)
+			if err != nil {
+				logger.Error(err, "Couldn't tell whether the replacement was released; not concluding for the deleting snapshot yet", "job", job.Name)
+			} else if !released {
+				logger.Info("The job's snapshot is being deleted; concluding without a restore", "job", job.Name, "snapshot", job.Status.SnapshotRef)
+				orig := job.DeepCopy()
+				if err := r.markSucceededWithoutRestore(ctx, job, orig, snapshot.ReasonSnapshotDeleting, cond.Message, client.MergeFromWithOptimisticLock{}); err != nil {
+					*job = *orig
+					return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore for a snapshot being deleted")
+				}
+				metrics.RecordRestoreVerdict(r.jobEngine(job).Name(), "snapshot_deleting")
+				r.eventf(job, corev1.EventTypeWarning, snapshot.ReasonSnapshotDeleting, "%s", cond.Message)
+				return ctrl.Result{}, nil
+			}
 		}
 
 		// The pod gate released the replacement with the restore's node
