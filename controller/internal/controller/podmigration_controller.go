@@ -477,13 +477,35 @@ func (r *PodMigrationReconciler) deleteNamespaceResources(ctx context.Context, c
 	return r.deleteEngineResources(ctx, config)
 }
 
+// lookupStorageLocation stands in for a storage location that an engine
+// rejects, where only the identity of the rendered objects matters.
+const lookupStorageLocation = "gs://placeholder"
+
+// renderForLookup renders the objects that eng syncs for pm, to find or
+// delete them: callers use only their kinds, namespaces and names, which
+// don't depend on the storage location. The location can be edited to one
+// the engine rejects (*engine.StorageLocationError) after the objects were
+// synced, so in that case it renders them for a shallow copy of pm with a
+// placeholder location instead (#233). The result must never be synced.
+func renderForLookup(eng engine.Engine, pm *pmv1alpha1.PodMigration) ([]*unstructured.Unstructured, error) {
+	resources, err := eng.NamespaceResources(pm)
+	var locationErr *engine.StorageLocationError
+	if err == nil || pm == nil || !errors.As(err, &locationErr) {
+		return resources, err
+	}
+	withPlaceholder := *pm
+	withPlaceholder.Spec.Storage.Location = lookupStorageLocation
+	return eng.NamespaceResources(&withPlaceholder)
+}
+
 // deleteEngineResources deletes the objects that engines other than GKE Pod
 // Snapshots rendered for config; deleteStorageResources deletes GKE Pod
 // Snapshots' objects. Routes can change after objects were synced, so it
 // renders the objects of every registered engine, skipping an engine that
 // can't render them, and deletes those that exist, in reverse sync order.
-// An object labeled as rendered for another PodMigration (OwnerUIDLabel) is
-// kept.
+// An engine that only rejects the storage location still renders them
+// (renderForLookup). An object labeled as rendered for another PodMigration
+// (OwnerUIDLabel) is kept.
 func (r *PodMigrationReconciler) deleteEngineResources(ctx context.Context, config *pmv1alpha1.PodMigration) error {
 	registry, err := r.engines()
 	if err != nil || registry == nil {
@@ -497,7 +519,7 @@ func (r *PodMigrationReconciler) deleteEngineResources(ctx context.Context, conf
 		if _, isGKE := eng.(*engine.GKEPodSnapshots); isGKE {
 			continue
 		}
-		resources, err := eng.NamespaceResources(config)
+		resources, err := renderForLookup(eng, config)
 		if err != nil {
 			log.FromContext(ctx).Info("Not cleaning up an engine's objects: it can't render them",
 				"engine", name, "error", err.Error())
@@ -613,6 +635,10 @@ func isPMJOwnedByPodMigration(pmj *pmv1alpha1.PodMigrationJob, config *pmv1alpha
 	return false
 }
 
+// renderedPolicyNames names the objects that the registered engines render in
+// config's namespace, which are their policies. A job records the policy that
+// serves it, so these names tie a job to config (isPMJOwnedByPodMigration).
+// An invalid storage location doesn't hide them (renderForLookup).
 func (r *PodMigrationReconciler) renderedPolicyNames(config *pmv1alpha1.PodMigration) []string {
 	if config == nil {
 		return nil
@@ -627,7 +653,7 @@ func (r *PodMigrationReconciler) renderedPolicyNames(config *pmv1alpha1.PodMigra
 		if !ok {
 			continue
 		}
-		resources, err := eng.NamespaceResources(config)
+		resources, err := renderForLookup(eng, config)
 		if err != nil {
 			continue
 		}
@@ -800,11 +826,13 @@ func (r *PodMigrationReconciler) podMigrationsForManagedObject(ctx context.Conte
 }
 
 // rendersObject reports whether the engines that serve pm render an object of
-// kind gk named namespace/name. An engine that can't render pm's objects, for
-// example because its storage location is invalid, renders nothing.
+// kind gk named namespace/name. An engine that can't render pm's objects
+// renders nothing; one that only rejects pm's storage location still renders
+// them (renderForLookup), so an event on an object synced before the location
+// was edited still maps to pm.
 func rendersObject(registry *engine.Registry, pm *pmv1alpha1.PodMigration, gk schema.GroupKind, namespace, name string) bool {
 	for _, eng := range registry.EnginesFor(pm) {
-		resources, err := eng.NamespaceResources(pm)
+		resources, err := renderForLookup(eng, pm)
 		if err != nil {
 			continue
 		}
