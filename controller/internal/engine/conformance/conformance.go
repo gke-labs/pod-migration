@@ -202,42 +202,8 @@ func NewRunner() *Runner {
 	return &Runner{Scheme: defaultScheme()}
 }
 
-func getClient(eng engine.Engine, prov snapshot.Provider, r *Runner) client.Client {
-	type clientHolder interface {
-		Client() client.Client
-	}
-	type engineUnwrapper interface {
-		Unwrap() engine.Engine
-	}
-	type providerUnwrapper interface {
-		Unwrap() snapshot.Provider
-	}
-
-	currProv := prov
-	for currProv != nil {
-		if ch, ok := currProv.(clientHolder); ok && ch.Client() != nil {
-			return ch.Client()
-		}
-		if uw, ok := currProv.(providerUnwrapper); ok {
-			currProv = uw.Unwrap()
-		} else {
-			break
-		}
-	}
-
-	currEng := eng
-	for currEng != nil {
-		if ch, ok := currEng.(clientHolder); ok && ch.Client() != nil {
-			return ch.Client()
-		}
-		if uw, ok := currEng.(engineUnwrapper); ok {
-			currEng = uw.Unwrap()
-		} else {
-			break
-		}
-	}
-
-	if r != nil && r.Client != nil {
+func (r *Runner) client() client.Client {
+	if r != nil {
 		return r.Client
 	}
 	return nil
@@ -590,7 +556,7 @@ func (r *Runner) auditC3CheckpointOutcomes(eng engine.Engine) ClauseResult {
 	}
 
 	ctx := context.Background()
-	cl := getClient(eng, prov, r)
+	cl := r.client()
 
 	// If no client is available, verify CheckStatus on absent trigger as a baseline.
 	if cl == nil {
@@ -1104,7 +1070,7 @@ func (r *Runner) auditC6RestoreOutcomeSignal(eng engine.Engine) ClauseResult {
 	}
 
 	// 4. Failure signal check: pod with restore failure signal must yield ColdStart
-	cl := getClient(eng, nil, r)
+	cl := r.client()
 	failedPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "repl-failed-signal",

@@ -62,7 +62,7 @@ func TestEngineConformance_GKEPodSnapshots(t *testing.T) {
 	cl := NewTestClient(scheme)
 	gkeEngine := engine.NewGKEPodSnapshots(cl, scheme)
 
-	runner := NewRunner()
+	runner := &Runner{Scheme: scheme, Client: cl}
 	report := runner.Run(t, gkeEngine)
 
 	t.Logf("\n%s", report.Markdown())
@@ -87,13 +87,13 @@ func TestEngineConformance_GKEPodSnapshots(t *testing.T) {
 
 func TestEngineConformance_CRIU(t *testing.T) {
 	scheme := testScheme()
-	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	cl := NewTestClient(scheme)
 	criuEngine, err := engine.NewCRIU(cl, scheme, engine.DefaultCRIUAPIGroup)
 	if err != nil {
 		t.Fatalf("NewCRIU: %v", err)
 	}
 
-	runner := NewRunner()
+	runner := &Runner{Scheme: scheme, Client: cl}
 	report := runner.Run(t, criuEngine)
 
 	t.Logf("\n%s", report.Markdown())
@@ -211,12 +211,6 @@ func (f *faultyEngine) ResolvePolicy(ctx context.Context, pod *corev1.Pod) (*eng
 func (f *faultyEngine) Snapshots() snapshot.Provider      { return f.provider }
 func (f *faultyEngine) RestoreFailures() []restore.Engine { return f.failures }
 func (f *faultyEngine) Guarantees() engine.Guarantees     { return f.guarantees }
-func (f *faultyEngine) Client() client.Client {
-	if ch, ok := f.provider.(interface{ Client() client.Client }); ok {
-		return ch.Client()
-	}
-	return nil
-}
 
 // RestoreOrderer implementation
 func (f *faultyEngine) OrderRestore(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob) error {
@@ -350,13 +344,6 @@ func (p *neverTerminalProvider) CheckStatus(ctx context.Context, job *pmv1alpha1
 	}
 	return st, nil
 }
-func (p *neverTerminalProvider) Unwrap() snapshot.Provider { return p.Provider }
-func (p *neverTerminalProvider) Client() client.Client {
-	if ch, ok := p.Provider.(interface{ Client() client.Client }); ok {
-		return ch.Client()
-	}
-	return nil
-}
 
 // prematureFailedProvider wraps a valid provider but fails on transient Ready=False.
 type prematureFailedProvider struct {
@@ -375,13 +362,6 @@ func (p *prematureFailedProvider) CheckStatus(ctx context.Context, job *pmv1alph
 	}
 	return st, nil
 }
-func (p *prematureFailedProvider) Unwrap() snapshot.Provider { return p.Provider }
-func (p *prematureFailedProvider) Client() client.Client {
-	if ch, ok := p.Provider.(interface{ Client() client.Client }); ok {
-		return ch.Client()
-	}
-	return nil
-}
 
 // noopCleanupProvider wraps a valid provider but makes Cleanup a no-op.
 type noopCleanupProvider struct {
@@ -390,13 +370,6 @@ type noopCleanupProvider struct {
 
 func (p *noopCleanupProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) error {
 	return nil // No-op: never deletes the trigger!
-}
-func (p *noopCleanupProvider) Unwrap() snapshot.Provider { return p.Provider }
-func (p *noopCleanupProvider) Client() client.Client {
-	if ch, ok := p.Provider.(interface{ Client() client.Client }); ok {
-		return ch.Client()
-	}
-	return nil
 }
 
 func findClause(rep *Report, id ClauseID) *ClauseResult {
@@ -413,7 +386,7 @@ func TestConformance_SabotageDetections(t *testing.T) {
 	cl := NewTestClient(scheme)
 	validProvider, _ := snapshot.NewGKEProviderForGroup(cl, scheme, engine.DefaultCRIUAPIGroup)
 
-	runner := NewRunner()
+	runner := &Runner{Scheme: scheme, Client: cl}
 
 	t.Run("BaselineConformingEngine", func(t *testing.T) {
 		cl := NewTestClient(scheme)
@@ -429,6 +402,7 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			provider:          prov,
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped, RestoreOnce: true},
 		}
+		runner := &Runner{Scheme: scheme, Client: cl}
 		rep := runner.Evaluate(conforming)
 		if !rep.Passed {
 			t.Fatalf("Expected baseline conforming engine to pass all clauses, got failed report:\n%s", rep.Markdown())
@@ -714,6 +688,7 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			provider:          noopProv, // Cleanup does not delete trigger!
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
 		}
+		runner := &Runner{Scheme: scheme, Client: testCl}
 		rep := runner.Evaluate(faulty)
 		if rep.Passed {
 			t.Errorf("Expected Report.Passed = false on no-op Cleanup")
@@ -737,6 +712,7 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			provider:          faultyProv,
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
 		}
+		runner := &Runner{Scheme: scheme, Client: testCl}
 		rep := runner.Evaluate(faulty)
 		if rep.Passed {
 			t.Errorf("Expected Report.Passed = false on never-terminal CheckStatus")
@@ -760,6 +736,7 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			provider:          faultyProv,
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
 		}
+		runner := &Runner{Scheme: scheme, Client: testCl}
 		rep := runner.Evaluate(faulty)
 		if rep.Passed {
 			t.Errorf("Expected Report.Passed = false on premature failed CheckStatus")
