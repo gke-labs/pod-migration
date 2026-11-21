@@ -18,6 +18,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,7 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -353,6 +355,54 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			adoptStranded = true
 		}
 
+		// Never order a restore from a snapshot that's being deleted: its
+		// archive is going away (#265). Hold the replacement instead. The job
+		// reconciler concludes such a job SucceededWithoutRestore, and the PMJ
+		// watch brings the pod back here to be released cold, recorded, above.
+		// A read error keeps the pod gated too. A recorded hold sticks until
+		// the job concludes: the snapshot can finish going away meanwhile,
+		// and a snapshot that's gone isn't reported as being deleted.
+		if _, held := snapshotDeletingHold(job); held {
+			logger.Info("Holding the replacement until the job concludes without a restore; its snapshot was being deleted",
+				"pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+		}
+		if phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
+			deleting, err := snapshot.PodSnapshotBeingDeleted(ctx, r.apiReader(), r.jobSnapshotGroup(job), job.Namespace, job.Status.SnapshotRef)
+			if err != nil {
+				logger.Error(err, "Failed to check whether the job's snapshot is being deleted", "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
+				return ctrl.Result{}, err
+			}
+			if deleting {
+				logger.Info("The job's snapshot is being deleted, so it can't be restored; holding the replacement until the job concludes without a restore",
+					"pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
+				// Record the hold for the job reconciler to conclude on, as
+				// for NoCompatibleNode, so it needn't read the snapshot on
+				// every pass. The resourceVersion check keeps a stale view
+				// from dropping a condition written since.
+				if _, recorded := snapshotDeletingHold(job); !recorded {
+					orig := job.DeepCopy()
+					patch := client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
+					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+						Type:               ConditionSnapshotRestorable,
+						Status:             metav1.ConditionFalse,
+						Reason:             snapshot.ReasonSnapshotDeleting,
+						Message:            snapshotDeletingMessage(job.Status.SnapshotRef),
+						ObservedGeneration: job.Generation,
+					})
+					if err := r.Status().Patch(ctx, job, patch); err != nil {
+						*job = *orig
+						if apierrors.IsConflict(err) {
+							return ctrl.Result{RequeueAfter: time.Second}, nil
+						}
+						logger.Error(err, "Failed to record that the job's snapshot is being deleted", "pmj", correctedPMJ)
+						return ctrl.Result{}, err
+					}
+				}
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+			}
+		}
+
 		// Place the restore on a node that can restore it (C8, #14). The
 		// constraints go into the update that removes the gate, the only
 		// time Kubernetes lets them be added, and they can't be removed
@@ -654,6 +704,20 @@ func (r *PodGateReconciler) releaseWithColdStartBypass(ctx context.Context, pod 
 
 func isGVisorPod(pod *corev1.Pod) bool {
 	return pod != nil && pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName == "gvisor"
+}
+
+// jobSnapshotGroup returns the API group of job's PodSnapshot: its engine's,
+// or GKE Pod Snapshots' without a registry or for an engine that isn't
+// registered.
+func (r *PodGateReconciler) jobSnapshotGroup(job *pmv1alpha1.PodMigrationJob) string {
+	if r.Engines != nil {
+		if eng, err := r.Engines.ForJob(job); err == nil && eng != nil {
+			if g := strings.TrimSpace(eng.APIGroup()); g != "" {
+				return g
+			}
+		}
+	}
+	return snapshot.DefaultAPIGroup
 }
 
 func (r *PodGateReconciler) apiReader() client.Reader {

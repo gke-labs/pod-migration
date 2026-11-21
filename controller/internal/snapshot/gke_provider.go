@@ -329,7 +329,31 @@ func checkPodSnapshotStatus(targetSnapshot *unstructured.Unstructured, now time.
 		conditions = append(conditions, mc)
 	}
 	topPhase, _ := snapStatus["phase"].(string)
-	return statusFromConditions(snapshotName, conditions, targetSnapshot.GetCreationTimestamp().Time, topPhase, now, logInfo)
+	st := statusFromConditions(snapshotName, conditions, targetSnapshot.GetCreationTimestamp().Time, topPhase, now, logInfo)
+	return demoteDeletingSnapshot(targetSnapshot, st, logInfo)
+}
+
+// demoteDeletingSnapshot keeps a PodSnapshot that's being deleted from being
+// reported Ready, or as making progress (#265). Its archive is going away, so
+// it can't be restored, and the job mustn't move to Evicting on it or extend
+// its deadline on it. It isn't reported Failed either: the checkpoint may
+// have completed, so the source must stay fenced (C4). The reason
+// SnapshotDeleting lets the controller fail the job and record the fence
+// decision while the snapshot can still tell whether the checkpoint
+// completed. A terminal failure is still reported as it is.
+func demoteDeletingSnapshot(snap *unstructured.Unstructured, st *Status, logInfo func(string, ...interface{})) *Status {
+	if st == nil || snap.GetDeletionTimestamp() == nil || st.Phase == PhaseFailed || st.Phase == PhaseRefused {
+		return st
+	}
+	if logInfo != nil {
+		logInfo("PodSnapshot is being deleted, so it can't be restored", "snapshot", snap.GetName(), "reportedPhase", st.Phase)
+	}
+	return &Status{
+		Phase:       PhaseInProgress,
+		SnapshotRef: st.SnapshotRef,
+		Reason:      ReasonSnapshotDeleting,
+		Message:     fmt.Sprintf("PodSnapshot %q is being deleted, so it can't be restored", snap.GetName()),
+	}
 }
 
 // StatusFromConditions evaluates GKE PodSnapshot status from already-extracted
@@ -675,4 +699,26 @@ func isSnapshotSubconditionInProgressReason(reason string) bool {
 		return true
 	}
 	return false
+}
+
+// ReasonSnapshotDeleting is the reason of the InProgress status reported for
+// a PodSnapshot that's being deleted (#265).
+const ReasonSnapshotDeleting = "SnapshotDeleting"
+
+// PodSnapshotBeingDeleted reports whether the PodSnapshot name, in group, is
+// being deleted: its deletionTimestamp is set, and a finalizer (the CRIU
+// engine controller's archive cleanup, or GKE's own) holds it while its
+// archive goes away (#265). Such a snapshot must never be restored. A snapshot
+// that's gone, or a group whose PodSnapshot CRD isn't installed, isn't
+// reported as being deleted, so callers keep their behavior for those.
+func PodSnapshotBeingDeleted(ctx context.Context, r client.Reader, group, namespace, name string) (bool, error) {
+	snap := &unstructured.Unstructured{}
+	snap.SetGroupVersionKind(PodSnapshotGVK(group))
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, snap); err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading snapshot %s/%s: %w", namespace, name, err)
+	}
+	return snap.GetDeletionTimestamp() != nil, nil
 }

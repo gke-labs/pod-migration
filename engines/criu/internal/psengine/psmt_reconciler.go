@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -86,6 +88,72 @@ type PSMTReconciler struct {
 	// still uses a work order before the work order is deleted (#262).
 	// Nil means the cached Client.
 	APIReader client.Reader
+	// Recorder records on the trigger why it's left unanswered on purpose
+	// (WorkOrderInUse, WaitingForWorkOrderDeletion). Nil records nothing.
+	Recorder record.EventRecorder
+
+	// waits maps a trigger's NamespacedName to the last wait recorded for
+	// it (a recordedWait), so a wait the requeue sees again isn't recorded
+	// again. In memory: a restart records each wait once more.
+	waits sync.Map
+	// now is the clock (tests). Nil means time.Now.
+	now func() time.Time
+}
+
+// waitEventInterval is how often a wait that goes on is recorded again.
+// Events expire (the kube-apiserver's --event-ttl, 1 h by default), and a
+// recent event shows the wait is still going.
+const waitEventInterval = 10 * time.Minute
+
+type recordedWait struct {
+	token string
+	at    time.Time
+}
+
+// Reasons of the events the PSMT reconciler records on a trigger it leaves
+// unanswered on purpose.
+const (
+	// EventReasonWorkOrderInUse (Warning): an earlier trigger's work order
+	// with an outcome is still used by a job or pod, so the trigger isn't
+	// answered (#262). Its job may time out and evict the pod cold.
+	EventReasonWorkOrderInUse = "WorkOrderInUse"
+	// EventReasonWaitingForWorkOrderDeletion (Normal): the work order is
+	// being deleted, and the trigger gets a new one once it's gone (#260).
+	EventReasonWaitingForWorkOrderDeletion = "WaitingForWorkOrderDeletion"
+)
+
+// recordWait records an event on the trigger for a wait, unless the same wait
+// (same trigger instance, reason, work order and message) was already
+// recorded in the last waitEventInterval. The requeue sees a wait every 2 or
+// 30 s; recording it each time would write the Event on every look.
+func (r *PSMTReconciler) recordWait(key types.NamespacedName, psmt, ps *unstructured.Unstructured, eventType, reason, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	token := strings.Join([]string{string(psmt.GetUID()), reason, string(ps.GetUID()), msg}, "\x00")
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	if prev, ok := r.waits.Load(key); ok {
+		if p := prev.(recordedWait); p.token == token && now.Sub(p.at) < waitEventInterval {
+			return
+		}
+	}
+	r.waits.Store(key, recordedWait{token: token, at: now})
+	if r.Recorder != nil {
+		r.Recorder.Event(psmt, eventType, reason, msg)
+	}
+}
+
+// forgetWait drops the trigger's recorded wait: it's answered, or gone.
+func (r *PSMTReconciler) forgetWait(key types.NamespacedName) {
+	r.waits.Delete(key)
+}
+
+// recordedWaits counts the remembered waits (tests).
+func (r *PSMTReconciler) recordedWaits() int {
+	n := 0
+	r.waits.Range(func(any, any) bool { n++; return true })
+	return n
 }
 
 func (r *PSMTReconciler) liveReader() client.Reader {
@@ -101,6 +169,7 @@ func (r *PSMTReconciler) liveReader() client.Reader {
 // +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods;nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("psmt", req.NamespacedName)
@@ -113,11 +182,13 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			// PodSnapshot survives, since the replacement pod's restore
 			// still needs it. A work order that hasn't finished gets a
 			// cancel request (C9, #106); the node agent acts on it.
+			r.forgetWait(req.NamespacedName)
 			return ctrl.Result{}, r.cancelWorkOrders(ctx, req.NamespacedName)
 		}
 		return ctrl.Result{}, err
 	}
 	if psmt.GetDeletionTimestamp() != nil {
+		r.forgetWait(req.NamespacedName)
 		return ctrl.Result{}, r.cancelWorkOrders(ctx, req.NamespacedName)
 	}
 
@@ -162,6 +233,9 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		// job's PodSnapshot only after the job's own trigger is gone, and
 		// this controller deletes one only to replace it (#262).
 		logger.Info("work order is being deleted; waiting for it to be gone", "snapshot", snapshotName)
+		r.recordWait(req.NamespacedName, psmt, ps, corev1.EventTypeNormal, EventReasonWaitingForWorkOrderDeletion,
+			"Not answering this trigger yet: work order (PodSnapshot) %s is being deleted (its archive is deleted first). "+
+				"The trigger gets a new work order once it is gone. If this goes on, see the PodSnapshot's ArchiveDeleteFailed events.", snapshotName)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 	if err == nil && fromEarlierTrigger(ps, psmt) {
@@ -201,6 +275,10 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 				// until nothing uses the work order.
 				logger.Info("work order was left by an earlier trigger and is still in use; not answering the trigger with it",
 					"snapshot", snapshotName, "usedBy", user)
+				r.recordWait(req.NamespacedName, psmt, ps, corev1.EventTypeWarning, EventReasonWorkOrderInUse,
+					"Not answering this trigger: work order (PodSnapshot) %s, which an earlier trigger left with an outcome, is still used by %s. "+
+						"The engine looks again every 30s. Until nothing uses it, this trigger's job waits and may time out and evict the pod cold.",
+					snapshotName, user)
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 			}
 			logger.Info("work order was left by an earlier trigger; deleting it so this trigger gets its own",
@@ -224,6 +302,8 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		// CheckpointTimedOut never settles: the orchestrator keeps the
 		// source fenced and evicts it cold, so it's left as it is.
 	}
+	// No wait from here on: the trigger is answered below.
+	r.forgetWait(req.NamespacedName)
 	// Eligibility is decided once, when the work order is created (#218). A
 	// work order with a bucket was judged eligible and may already be running
 	// on the node agent, which owns its outcome from here. Later passes (the
