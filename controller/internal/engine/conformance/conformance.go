@@ -195,6 +195,14 @@ func defaultScheme() *runtime.Scheme {
 type Runner struct {
 	Scheme *runtime.Scheme
 	Client client.Client
+	// PlacementJob, when set, is a job for which the engine under test has
+	// real source facts to place on (for CRIU, a job whose
+	// status.snapshotRef names a PodSnapshot with status.sourceNode in
+	// Client). C8 then also checks Placement on it for determinism,
+	// immutability and valid requirements, and fails when it returns no
+	// requirements, so an advisor that ignores its facts can't pass
+	// vacuously. Unset, C8 uses only its built-in GKE-shaped job.
+	PlacementJob *pmv1alpha1.PodMigrationJob
 }
 
 // NewRunner creates a conformance Runner with default scheme configuration.
@@ -1249,48 +1257,20 @@ func (r *Runner) auditC8PlacementConstraints(eng engine.Engine) ClauseResult {
 			OriginNodeInstanceType: "n2-standard-4",
 		},
 	}
-	jobBefore := jobWithMachine.DeepCopy()
 
-	// 1. Determinism and job immutability test: repeated calls must return identical requirements
-	reqs1, err1 := advisor.Placement(ctx, jobWithMachine)
-	reqs2, err2 := advisor.Placement(ctx, jobWithMachine)
-	if err1 != nil || err2 != nil {
-		cr.Status = StatusFailed
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement execution", Passed: false, Message: fmt.Sprintf("Placement returned error: %v / %v", err1, err2)})
-	} else if !reflect.DeepEqual(jobBefore, jobWithMachine) {
-		cr.Status = StatusFailed
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement job immutability", Passed: false, Message: "Placement mutated input PodMigrationJob"})
-	} else if !reflect.DeepEqual(reqs1, reqs2) {
-		cr.Status = StatusFailed
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement determinism", Passed: false, Message: fmt.Sprintf("non-deterministic return values: %v vs %v", reqs1, reqs2)})
-	} else {
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement determinism", Passed: true, Message: fmt.Sprintf("returned %d requirement(s) identically across calls", len(reqs1))})
-	}
+	// 1-2. Determinism, job immutability and requirement validity.
+	checkPlacementJob(ctx, advisor, jobWithMachine, "", &cr)
 
-	// 2. Validate operators, keys, and values match selection.Operator requirements (#14)
-	operators := map[corev1.NodeSelectorOperator]selection.Operator{
-		corev1.NodeSelectorOpIn:           selection.In,
-		corev1.NodeSelectorOpNotIn:        selection.NotIn,
-		corev1.NodeSelectorOpExists:       selection.Exists,
-		corev1.NodeSelectorOpDoesNotExist: selection.DoesNotExist,
-		corev1.NodeSelectorOpGt:           selection.GreaterThan,
-		corev1.NodeSelectorOpLt:           selection.LessThan,
-	}
-
-	for i, req := range reqs1 {
-		if errs := validation.IsQualifiedName(req.Key); len(errs) > 0 {
-			cr.Status = StatusFailed
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Requirement %d key valid", i), Passed: false, Message: fmt.Sprintf("invalid label key %q: %v", req.Key, errs)})
-		}
-		op, ok := operators[req.Operator]
-		if !ok {
-			cr.Status = StatusFailed
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Requirement %d operator valid", i), Passed: false, Message: fmt.Sprintf("invalid operator %q", req.Operator)})
-		} else if _, err := labels.NewRequirement(req.Key, op, req.Values); err != nil {
-			cr.Status = StatusFailed
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Requirement %d value validity", i), Passed: false, Message: fmt.Sprintf("invalid requirement (%s %s %v): %v", req.Key, req.Operator, req.Values, err)})
-		} else {
-			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Requirement %d valid", i), Passed: true, Message: fmt.Sprintf("%s %s %v", req.Key, req.Operator, req.Values)})
+	// 1b. Engine-supplied fixture with real source facts: the same checks,
+	// and at least one requirement, so the clause isn't passed vacuously.
+	if r != nil && r.PlacementJob != nil {
+		if reqs, ok := checkPlacementJob(ctx, advisor, r.PlacementJob, "fixture ", &cr); ok {
+			if len(reqs) == 0 {
+				cr.Status = StatusFailed
+				cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement fixture non-vacuous", Passed: false, Message: "Placement returned no requirements for a job with known source facts"})
+			} else {
+				cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement fixture non-vacuous", Passed: true, Message: fmt.Sprintf("returned %d requirement(s) for a job with known source facts", len(reqs))})
+			}
 		}
 	}
 
@@ -1302,7 +1282,7 @@ func (r *Runner) auditC8PlacementConstraints(eng engine.Engine) ClauseResult {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement empty facts fallback", Passed: false, Message: fmt.Sprintf("returned error on empty facts: %v", errEmpty)})
 	} else if len(reqsEmpty) > 0 {
 		for i, req := range reqsEmpty {
-			op, ok := operators[req.Operator]
+			op, ok := placementOperators[req.Operator]
 			if !ok {
 				cr.Status = StatusFailed
 				cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("Static requirement %d operator", i), Passed: false, Message: fmt.Sprintf("unknown operator %q", req.Operator)})
@@ -1324,6 +1304,61 @@ func (r *Runner) auditC8PlacementConstraints(eng engine.Engine) ClauseResult {
 		cr.Details = "Contract C8 placement constraint violations detected."
 	}
 	return cr
+}
+
+// placementOperators maps node selector operators to label selection operators,
+// for validating Placement's requirements (#14).
+var placementOperators = map[corev1.NodeSelectorOperator]selection.Operator{
+	corev1.NodeSelectorOpIn:           selection.In,
+	corev1.NodeSelectorOpNotIn:        selection.NotIn,
+	corev1.NodeSelectorOpExists:       selection.Exists,
+	corev1.NodeSelectorOpDoesNotExist: selection.DoesNotExist,
+	corev1.NodeSelectorOpGt:           selection.GreaterThan,
+	corev1.NodeSelectorOpLt:           selection.LessThan,
+}
+
+// checkPlacementJob calls advisor.Placement twice on job and records, in cr,
+// whether it errored, mutated job, or returned different or invalid
+// requirements. prefix labels the subtests. ok is false when the calls failed
+// or disagreed, so reqs can't be trusted.
+func checkPlacementJob(ctx context.Context, advisor engine.PlacementAdvisor, job *pmv1alpha1.PodMigrationJob, prefix string, cr *ClauseResult) (reqs []corev1.NodeSelectorRequirement, ok bool) {
+	jobBefore := job.DeepCopy()
+	reqs1, err1 := advisor.Placement(ctx, job)
+	reqs2, err2 := advisor.Placement(ctx, job)
+	if err1 != nil || err2 != nil {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement " + prefix + "execution", Passed: false, Message: fmt.Sprintf("Placement returned error: %v / %v", err1, err2)})
+		return nil, false
+	}
+	if !reflect.DeepEqual(jobBefore, job) {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement " + prefix + "job immutability", Passed: false, Message: "Placement mutated input PodMigrationJob"})
+		return nil, false
+	}
+	if !reflect.DeepEqual(reqs1, reqs2) {
+		cr.Status = StatusFailed
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement " + prefix + "determinism", Passed: false, Message: fmt.Sprintf("non-deterministic return values: %v vs %v", reqs1, reqs2)})
+		return nil, false
+	}
+	cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Placement " + prefix + "determinism", Passed: true, Message: fmt.Sprintf("returned %d requirement(s) identically across calls", len(reqs1))})
+
+	for i, req := range reqs1 {
+		if errs := validation.IsQualifiedName(req.Key); len(errs) > 0 {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("%sRequirement %d key valid", prefix, i), Passed: false, Message: fmt.Sprintf("invalid label key %q: %v", req.Key, errs)})
+		}
+		op, known := placementOperators[req.Operator]
+		if !known {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("%sRequirement %d operator valid", prefix, i), Passed: false, Message: fmt.Sprintf("invalid operator %q", req.Operator)})
+		} else if _, err := labels.NewRequirement(req.Key, op, req.Values); err != nil {
+			cr.Status = StatusFailed
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("%sRequirement %d value validity", prefix, i), Passed: false, Message: fmt.Sprintf("invalid requirement (%s %s %v): %v", req.Key, req.Operator, req.Values, err)})
+		} else {
+			cr.Subtests = append(cr.Subtests, SubtestResult{Name: fmt.Sprintf("%sRequirement %d valid", prefix, i), Passed: true, Message: fmt.Sprintf("%s %s %v", req.Key, req.Operator, req.Values)})
+		}
+	}
+	return reqs1, true
 }
 
 // auditC9CancellationAndCleanup audits Clause C9: Cancellation and cleanup.

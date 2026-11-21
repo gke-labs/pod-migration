@@ -85,15 +85,55 @@ func TestEngineConformance_GKEPodSnapshots(t *testing.T) {
 	}
 }
 
+// criuPlacementFixture returns a CRIU PodSnapshot whose status.sourceNode
+// carries source node facts in the format the CRIU node agent records them
+// (engines/criu/internal/psengine/contract.SourceNodeFacts, placementLabels
+// "v1"), and a job whose snapshotRef names it, so C8 has real facts to place
+// on.
+func criuPlacementFixture(apiGroup string) (*unstructured.Unstructured, *pmv1alpha1.PodMigrationJob) {
+	const ns, name = "conformance", "ps-criu-placement"
+	ps := &unstructured.Unstructured{}
+	ps.SetGroupVersionKind(snapshot.PodSnapshotGVK(apiGroup))
+	ps.SetNamespace(ns)
+	ps.SetName(name)
+	ps.Object["status"] = map[string]interface{}{
+		"sourceNode": map[string]interface{}{
+			"arch":              "amd64",
+			"cpuVendor":         "GenuineIntel",
+			"cpuModel":          "Intel(R) Xeon(R) CPU @ 2.20GHz",
+			"cpuFeatures":       []interface{}{"avx", "avx2", "fpu", "hypervisor", "sse2", "xsave", "xsaveopt"},
+			"kernelVersion":     "6.6.72+",
+			"criuVersion":       "4.1",
+			"runcVersion":       "1.2.5",
+			"containerdVersion": "2.0.4",
+			"placementLabels":   "v1",
+		},
+	}
+	job := &pmv1alpha1.PodMigrationJob{}
+	job.Namespace = ns
+	job.Name = "pmj-criu-placement"
+	job.Status.SnapshotRef = name
+	return ps, job
+}
+
+// nilPlacementCRIU is the CRIU engine with a Placement that ignores the
+// snapshot's source facts and returns no requirements.
+type nilPlacementCRIU struct{ *engine.CRIU }
+
+func (nilPlacementCRIU) Placement(context.Context, *pmv1alpha1.PodMigrationJob) ([]corev1.NodeSelectorRequirement, error) {
+	return nil, nil
+}
+
 func TestEngineConformance_CRIU(t *testing.T) {
 	scheme := testScheme()
-	cl := NewTestClient(scheme)
+	ps, placementJob := criuPlacementFixture(engine.DefaultCRIUAPIGroup)
+	cl := NewTestClient(scheme, ps)
 	criuEngine, err := engine.NewCRIU(cl, scheme, engine.DefaultCRIUAPIGroup)
 	if err != nil {
 		t.Fatalf("NewCRIU: %v", err)
 	}
 
-	runner := &Runner{Scheme: scheme, Client: cl}
+	runner := &Runner{Scheme: scheme, Client: cl, PlacementJob: placementJob}
 	report := runner.Run(t, criuEngine)
 
 	t.Logf("\n%s", report.Markdown())
@@ -101,6 +141,34 @@ func TestEngineConformance_CRIU(t *testing.T) {
 	if !report.Passed {
 		t.Fatalf("CRIU failed conformance:\n%s", report.Markdown())
 	}
+
+	c8 := findClause(report, ClauseC8Placement)
+	if c8 == nil || c8.Status != StatusPassed {
+		t.Fatalf("Expected Clause C8 PASSED for CRIU, got %+v", c8)
+	}
+	var nonVacuous bool
+	for _, st := range c8.Subtests {
+		if st.Name == "Placement fixture non-vacuous" && st.Passed {
+			nonVacuous = true
+		}
+	}
+	if !nonVacuous {
+		t.Errorf("Expected C8 to place the CRIU fixture job on at least one requirement, got subtests %+v", c8.Subtests)
+	}
+	if reqs, err := criuEngine.Placement(context.Background(), placementJob); err != nil || len(reqs) == 0 {
+		t.Errorf("CRIU Placement on the fixture job = %d requirement(s), err %v; want > 0", len(reqs), err)
+	}
+
+	t.Run("Sabotage_C8_PlacementIgnoresFacts", func(t *testing.T) {
+		rep := runner.Evaluate(nilPlacementCRIU{criuEngine})
+		if rep.Passed {
+			t.Errorf("Expected Report.Passed = false when CRIU Placement ignores the source facts")
+		}
+		cr := findClause(rep, ClauseC8Placement)
+		if cr == nil || cr.Status != StatusFailed {
+			t.Errorf("Expected Clause C8 FAILED when Placement returns nothing despite facts, got %+v", cr)
+		}
+	})
 
 	summary := report.Summary()
 	if !strings.Contains(summary, "PASSED") {
