@@ -411,3 +411,111 @@ func TestSnapshotRelease_HelperRefusesOtherPhases(t *testing.T) {
 		}
 	}
 }
+
+func relTrigger(name, answered string) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(snapshot.ManualTriggerGVK(snapshot.DefaultAPIGroup))
+	u.SetNamespace(relNS)
+	u.SetName(name)
+	if answered != "" {
+		u.Object["status"] = map[string]interface{}{"snapshotCreated": map[string]interface{}{"name": answered}}
+	}
+	return u
+}
+
+// While the job's trigger survives (a fire-and-forget Cleanup failed), the
+// CRIU engine would answer it with a new work order once the snapshot is
+// gone, and checkpoint the source again: Cleanup is retried, and the
+// snapshot is deleted only once the trigger is gone.
+func TestSnapshotRelease_WaitsForTheJobsTriggerToGo(t *testing.T) {
+	c := relClient(relJob(pmv1alpha1.PodMigrationJobPhaseFailed, time.Second),
+		relSnapshot(snapshot.DefaultAPIGroup, relSnap, ownTrigger()), relTrigger(ownTrigger(), relSnap))
+	r := &PodMigrationJobReconciler{Client: c, Scheme: relScheme()}
+	relReconcile(t, r)
+	if !snapExists(t, c, snapshot.DefaultAPIGroup, relSnap) {
+		t.Fatal("snapshot deleted while the job's trigger still exists")
+	}
+	// That pass retried Cleanup, so the next one deletes the snapshot.
+	relReconcile(t, r)
+	if snapExists(t, c, snapshot.DefaultAPIGroup, relSnap) {
+		t.Fatal("snapshot still exists after the trigger was cleaned up")
+	}
+}
+
+// Another live trigger answered with the same snapshot (CRIU names its
+// snapshots after the pod) holds it.
+func TestSnapshotRelease_WaitsForOtherTriggerAnsweredWithIt(t *testing.T) {
+	c := relClient(relJob(pmv1alpha1.PodMigrationJobPhaseSucceeded, time.Second),
+		relSnapshot(snapshot.DefaultAPIGroup, relSnap, ownTrigger()), relTrigger("ws-notebook-trigger", relSnap))
+	r := &PodMigrationJobReconciler{Client: c, Scheme: relScheme()}
+	relReconcile(t, r)
+	if !snapExists(t, c, snapshot.DefaultAPIGroup, relSnap) {
+		t.Fatal("snapshot deleted while another live trigger names it")
+	}
+}
+
+// A terminating or finished pod no longer restores, so it doesn't hold the
+// snapshot.
+func TestSnapshotRelease_FinishedPodDoesNotHoldIt(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: relNS, Name: "web-0-old", UID: "old-uid",
+		Annotations: map[string]string{snapshot.RestoreAnnotation(snapshot.DefaultAPIGroup): relSnap}},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	c := relClient(relJob(pmv1alpha1.PodMigrationJobPhaseFailed, time.Second), relSnapshot(snapshot.DefaultAPIGroup, relSnap, ownTrigger()), pod)
+	r := &PodMigrationJobReconciler{Client: c, Scheme: relScheme()}
+	relReconcile(t, r)
+	if snapExists(t, c, snapshot.DefaultAPIGroup, relSnap) {
+		t.Fatal("a finished pod held the snapshot")
+	}
+}
+
+// A snapshot that's already being deleted (an engine finalizer holds it) is
+// recorded as released, without a second delete.
+func TestSnapshotRelease_BeingDeletedIsReleased(t *testing.T) {
+	snap := relSnapshot(snapshot.DefaultAPIGroup, relSnap, "")
+	snap.SetFinalizers([]string{"pod-migrate.io/archive-cleanup"})
+	c := relClient(relJob(pmv1alpha1.PodMigrationJobPhaseSucceeded, time.Second), snap)
+	if err := c.Delete(context.Background(), snap.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	r := &PodMigrationJobReconciler{Client: c, Scheme: relScheme()}
+	relReconcile(t, r)
+	cond := releasedCond(t, c)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Message != "PodSnapshot "+relSnap+" is being deleted" {
+		t.Fatalf("SnapshotReleased = %+v, want True (being deleted)", cond)
+	}
+}
+
+// A job whose engine isn't registered doesn't know its API group: nothing
+// is recorded or deleted.
+func TestSnapshotRelease_UnregisteredEngineSkips(t *testing.T) {
+	job := relJob(pmv1alpha1.PodMigrationJobPhaseFailed, time.Second)
+	job.Annotations = map[string]string{engine.AnnotationEngine: "gone-engine"}
+	c := relClient(job, relSnapshot(snapshot.DefaultAPIGroup, relSnap, ownTrigger()))
+	reg := engine.NewRegistry(engine.GKEPodSnapshotsName)
+	if err := reg.Register(engine.NewGKEPodSnapshots(c, relScheme())); err != nil {
+		t.Fatal(err)
+	}
+	r := &PodMigrationJobReconciler{Client: c, Scheme: relScheme(), Engines: reg}
+	if _, err := r.releaseSnapshot(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if !snapExists(t, c, snapshot.DefaultAPIGroup, relSnap) || releasedCond(t, c) != nil {
+		t.Fatal("released a snapshot for a job whose engine isn't registered")
+	}
+}
+
+// The cache can trail the pod gate: the job's recorded replacement is read
+// from the API server too, and holds the snapshot if it carries the restore
+// order there.
+func TestSnapshotRelease_LiveReadsTheRecordedReplacement(t *testing.T) {
+	job := relJob(pmv1alpha1.PodMigrationJobPhaseFailed, time.Second)
+	job.Status.RestoredPodName = "web-0-repl"
+	c := relClient(job, relSnapshot(snapshot.DefaultAPIGroup, relSnap, ownTrigger()))
+	live := relClient(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: relNS, Name: "web-0-repl", UID: "repl-uid",
+		Annotations: map[string]string{snapshot.RestoreAnnotation(snapshot.DefaultAPIGroup): relSnap}}})
+	r := &PodMigrationJobReconciler{Client: c, APIReader: live, Scheme: relScheme()}
+	relReconcile(t, r)
+	if !snapExists(t, c, snapshot.DefaultAPIGroup, relSnap) {
+		t.Fatal("snapshot deleted while the API server shows the replacement carrying its restore order")
+	}
+}

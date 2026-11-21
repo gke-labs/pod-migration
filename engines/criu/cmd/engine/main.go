@@ -65,7 +65,7 @@ func main() {
 	flag.StringVar(&apiGroup, "api-group", contract.DefaultGroup, "API group of the snapshot engine CRDs this engine serves; the restore-order annotation is <group>/ps-name. The node agent's --api-group and the installed CRDs must use the same group")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 50, "Kubernetes API client QPS limit")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 100, "Kubernetes API client burst limit")
-	flag.DurationVar(&archiveGCGiveUp, "archive-gc-give-up", psengine.DefaultArchiveGCGiveUpAfter, "how long after a PodSnapshot is deleted the engine keeps retrying to delete its archive from the bucket; then it removes its finalizer, leaves the archive behind and records an ArchiveDeleteAbandoned event")
+	flag.DurationVar(&archiveGCGiveUp, "archive-gc-give-up", psengine.DefaultArchiveGCGiveUpAfter, "how long after its first failed attempt the engine keeps retrying to delete a deleted PodSnapshot's archive from the bucket; then it removes its finalizer, leaves the archive behind and records an ArchiveDeleteAbandoned event")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()

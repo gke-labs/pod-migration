@@ -153,7 +153,7 @@ Non-goals:
 
 - **Cancel.** Deleting the engine's trigger means: start nothing new against the source, and stop what can still be stopped. The engine confirms the cancel, so the controller knows whether the source is safe to put back (C4, #106).
 - **Node cleanup.** The engine cleans up everything it created on the node for a restore, on success and on failure (#126, #128). Restored processes are charged to the pod (#127).
-- **Archives.** The engine owns archive garbage collection. The controller tells it when a checkpoint is no longer needed: once the restore is verified, or when the job fails terminally, with an optional retention period for debugging (#107). The signal is the PodSnapshot delete: the controller deletes the PodSnapshot its own trigger created, and the engine deletes the archive when its PodSnapshot goes away.
+- **Archives.** The engine owns archive garbage collection. The controller tells it when a checkpoint is no longer needed: once the job is Succeeded (restore verified or inferred), or when it fails terminally, with an optional retention period for debugging (#107). The signal is the PodSnapshot delete: the controller deletes the PodSnapshot its own trigger created, and the engine deletes the archive when its PodSnapshot goes away.
 
 ### C10. Security
 

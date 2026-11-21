@@ -261,7 +261,17 @@ func TestArchiveGC_GivesUpAfterBound(t *testing.T) {
 	rec := record.NewFakeRecorder(10)
 	r := &ArchiveGCReconciler{Client: c, Store: store, Recorder: rec, GiveUpAfter: time.Minute}
 	gcDelete(t, c)
-	r.now = func() time.Time { return time.Now().Add(2 * time.Minute) }
+	// Even long after the delete was requested (the engine controller was
+	// down), the first failure doesn't give up: the bound runs from it.
+	start := time.Now().Add(time.Hour)
+	r.now = func() time.Time { return start }
+	if _, err := gcReconcile(t, r); err == nil {
+		t.Fatal("first failed attempt gave up, want a retry")
+	}
+	if _, ok := gcGet(t, c); !ok {
+		t.Fatal("PodSnapshot released on the first failure")
+	}
+	r.now = func() time.Time { return start.Add(2 * time.Minute) }
 	if _, err := gcReconcile(t, r); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -426,4 +436,24 @@ func TestDeployManifestGrantsArchiveFinalizer(t *testing.T) {
 		return
 	}
 	t.Fatal("ClusterRole pod-migrate-psengine-controller not found in deploy.yaml")
+}
+
+// The finalizer patch checks the resourceVersion: a stale copy never drops a
+// finalizer another writer added since.
+func TestArchiveGC_FinalizerPatchKeepsOtherWriters(t *testing.T) {
+	c := newClient(t, gcSnapshot(true, true))
+	stale, _ := gcGet(t, c)
+	fresh, _ := gcGet(t, c)
+	fresh.SetFinalizers(append(fresh.GetFinalizers(), "example.com/other"))
+	if err := c.Update(context.Background(), fresh); err != nil {
+		t.Fatal(err)
+	}
+	r := &ArchiveGCReconciler{Client: c, Store: gcStoreWithArchive()}
+	if err := r.release(context.Background(), stale); !apierrors.IsConflict(err) {
+		t.Fatalf("release with a stale copy = %v, want a conflict", err)
+	}
+	got, _ := gcGet(t, c)
+	if !controllerutil.ContainsFinalizer(got, "example.com/other") {
+		t.Fatalf("finalizers = %v, another writer's finalizer was dropped", got.GetFinalizers())
+	}
 }

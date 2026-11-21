@@ -145,7 +145,9 @@ func (r *PSMTReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 	if err == nil && ps.GetDeletionTimestamp() != nil {
 		// Its archive is being deleted (ArchiveFinalizer, #107): never hand it
-		// to a trigger. Once it's gone, the trigger gets a new work order.
+		// to a trigger re-created for the same pod instance. Once it's gone,
+		// that trigger gets a new work order. The orchestrator deletes a
+		// job's PodSnapshot only after the job's own trigger is gone.
 		logger.Info("work order is being deleted; waiting for it to be gone", "snapshot", snapshotName)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}

@@ -34,6 +34,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -67,12 +68,14 @@ var ArchiveObjects = []string{"manifest.json", "checkpoint.tar", "spec.json"}
 
 const (
 	// DefaultArchiveGCGiveUpAfter bounds how long the engine retries deleting
-	// an archive before it lets the PodSnapshot go and reports the leak.
+	// an archive, from its first failed attempt, before it lets the
+	// PodSnapshot go and reports the leak.
 	DefaultArchiveGCGiveUpAfter = 10 * time.Minute
 	// DefaultArchiveGCSettleWait bounds how long a deleted work order without
 	// an outcome waits for the node agent to record one (a deletion cancels
 	// it), so an upload in flight can't recreate objects after the delete.
-	DefaultArchiveGCSettleWait = 2 * time.Minute
+	// It covers the agent's 150 s kubelet checkpoint wait plus the upload.
+	DefaultArchiveGCSettleWait = 5 * time.Minute
 
 	archiveGCSettlePoll = 5 * time.Second
 
@@ -102,6 +105,10 @@ type ArchiveGCReconciler struct {
 	SettleWait time.Duration
 
 	now func() time.Time
+	// firstFailure maps a PodSnapshot UID to its first failed delete, so a
+	// controller that was down past GiveUpAfter doesn't give up on its first
+	// transient error. In memory: a restart starts the bound over.
+	firstFailure sync.Map
 }
 
 // +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch;update;patch
@@ -180,7 +187,9 @@ func (r *ArchiveGCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 	if deleteErr != nil {
-		if since >= r.giveUpAfter() {
+		first, _ := r.firstFailure.LoadOrStore(ps.GetUID(), r.clock())
+		if r.clock().Sub(first.(time.Time)) >= r.giveUpAfter() {
+			r.firstFailure.Delete(ps.GetUID())
 			logger.Error(deleteErr, "giving up deleting the archive; releasing the PodSnapshot and leaving the archive behind", "archive", "gs://"+bucket+"/"+prefix)
 			r.event(ps, corev1.EventTypeWarning, ReasonArchiveDeleteAbandoned,
 				"Gave up deleting archive gs://%s/%s after %s; it's left in the bucket: %v", bucket, prefix, r.giveUpAfter(), deleteErr)
@@ -192,6 +201,7 @@ func (r *ArchiveGCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, deleteErr
 	}
 
+	r.firstFailure.Delete(ps.GetUID())
 	logger.Info("deleted the archive", "archive", "gs://"+bucket+"/"+prefix)
 	r.event(ps, corev1.EventTypeNormal, ReasonArchiveDeleted, "Deleted archive gs://%s/%s", bucket, prefix)
 	archiveGCOutcomes.WithLabelValues("deleted").Inc()

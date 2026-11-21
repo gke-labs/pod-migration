@@ -52,10 +52,11 @@ const (
 	// triggered-by label of another trigger, so it's left alone.
 	ReasonSnapshotNotOwned = "SnapshotNotOwned"
 
-	// MaxSnapshotRetention is the longest --snapshot-retention: concluded
+	// MaxSnapshotRetention is the longest --snapshot-retention. Concluded
 	// jobs are garbage collected 30 minutes after they concluded, and the
-	// job is the only record of which snapshot is its own.
-	MaxSnapshotRetention = 30 * time.Minute
+	// job is the only record of which snapshot is its own, so the release
+	// needs room to retry before that.
+	MaxSnapshotRetention = 20 * time.Minute
 
 	// snapshotReleaseRecheck is how soon a release that's waiting on
 	// something (a pod that still references the snapshot, a gated claimant,
@@ -95,10 +96,22 @@ func ValidateSnapshotRetention(d time.Duration) error {
 //     doesn't hold the snapshot.
 //   - a pod still gated on the job hasn't been through the pod gate.
 //   - another job that names the snapshot and isn't Succeeded or Failed.
+//   - the job's trigger still exists: the CRIU engine would answer it with a
+//     new work order and checkpoint the source again. Cleanup is retried.
+//   - another live trigger was answered with the snapshot (CRIU snapshot
+//     names depend only on the pod).
 func (r *PodMigrationJobReconciler) releaseSnapshot(ctx context.Context, job *pmv1alpha1.PodMigrationJob) (time.Duration, error) {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded &&
 		job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
 		return 0, nil
+	}
+	if r.Engines != nil {
+		if _, err := r.Engines.ForJob(job); err != nil {
+			// Without its engine, the job's API group isn't known: a
+			// snapshot looked up in the default group could be reported
+			// gone while it's still there. Leave it to the orphan sweep.
+			return 0, nil
+		}
 	}
 	snapName := job.Status.SnapshotRef
 	if snapName == "" || job.Status.CompletionTime == nil {
@@ -138,6 +151,13 @@ func (r *PodMigrationJobReconciler) releaseSnapshot(ctx context.Context, job *pm
 			"Not deleting PodSnapshot %s: it was created by trigger %s, not this job's trigger %s", snapName, by, trigger)
 		return r.recordSnapshotReleased(ctx, job, metav1.ConditionFalse, ReasonSnapshotNotOwned,
 			fmt.Sprintf("PodSnapshot %s was created by trigger %s, not %s, so it's left alone", snapName, by, trigger))
+	}
+
+	if held, why, err := r.triggersStillAround(ctx, job, group, trigger, snapName); err != nil {
+		return snapshotReleaseRecheck, err
+	} else if held {
+		logger.Info("Keeping the PodSnapshot while a trigger still names it", "why", why)
+		return snapshotReleaseRecheck, nil
 	}
 
 	if !snapshot.CheckpointFinished(snap) {
@@ -240,6 +260,27 @@ func (r *PodMigrationJobReconciler) snapshotStillNeeded(ctx context.Context, job
 		}
 	}
 
+	// The cache can trail the pod gate: read the job's recorded replacement
+	// from the API server too, in case it was just released with a restore
+	// order (#36 adoption racing a strict-mode failure).
+	if name := job.Status.RestoredPodName; name != "" {
+		pod := &corev1.Pod{}
+		if err := r.liveReader().Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: name}, pod); err == nil {
+			if pod.DeletionTimestamp == nil && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+				if pod.Annotations[util.AnnotationAssignedPMJ] == job.Name && podHasMigrationGate(pod) {
+					return true, fmt.Sprintf("pod %s is still gated on the job", pod.Name), nil
+				}
+				for key := range restoreKeys {
+					if pod.Annotations[key] == snapName {
+						return true, fmt.Sprintf("pod %s carries the restore order %s=%s", pod.Name, key, snapName), nil
+					}
+				}
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return false, "", fmt.Errorf("reading pod %s: %w", name, err)
+		}
+	}
+
 	jobs := &pmv1alpha1.PodMigrationJobList{}
 	if err := r.List(ctx, jobs, client.InNamespace(job.Namespace)); err != nil {
 		return false, "", fmt.Errorf("listing PodMigrationJobs: %w", err)
@@ -252,6 +293,34 @@ func (r *PodMigrationJobReconciler) snapshotStillNeeded(ctx context.Context, job
 		if other.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceeded &&
 			other.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
 			return true, fmt.Sprintf("job %s (%s) also names it", other.Name, other.Status.Phase), nil
+		}
+	}
+	return false, "", nil
+}
+
+// triggersStillAround reports whether the job's own trigger still exists
+// (then it retries Cleanup), or another live trigger in group was answered
+// with snapName.
+func (r *PodMigrationJobReconciler) triggersStillAround(ctx context.Context, job *pmv1alpha1.PodMigrationJob, group, trigger, snapName string) (bool, string, error) {
+	triggers := &unstructured.UnstructuredList{}
+	triggers.SetGroupVersionKind(snapshot.ManualTriggerGVK(group).GroupVersion().WithKind("PodSnapshotManualTriggerList"))
+	if err := r.List(ctx, triggers, client.InNamespace(job.Namespace)); err != nil {
+		if meta.IsNoMatchError(err) {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("listing triggers: %w", err)
+	}
+	for i := range triggers.Items {
+		t := &triggers.Items[i]
+		if t.GetName() == trigger {
+			_ = r.getSnapshotProvider(job).Cleanup(ctx, job, job.Spec.PodRef.Name)
+			return true, fmt.Sprintf("the job's trigger %s still exists", trigger), nil
+		}
+		if t.GetDeletionTimestamp() != nil {
+			continue
+		}
+		if name, _, _ := unstructured.NestedString(t.Object, "status", "snapshotCreated", "name"); name == snapName {
+			return true, fmt.Sprintf("trigger %s was answered with it", t.GetName()), nil
 		}
 	}
 	return false, "", nil
