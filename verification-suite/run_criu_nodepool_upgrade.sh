@@ -41,7 +41,8 @@ CLUSTER="${CLUSTER:-}"
 LOCATION="${LOCATION:-}"
 NODE_POOL="${NODE_POOL:-}"
 TARGET_VERSION="${TARGET_VERSION:-}"
-NAMESPACE="${NAMESPACE:-pm-upgrade-test}"
+NAMESPACE="${NAMESPACE:-}"
+STORAGE_LOCATION="${STORAGE_LOCATION:-}"
 WORKLOAD="${WORKLOAD:-redis}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-1800}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-5}"
@@ -55,6 +56,8 @@ OUT_DIR="${OUT_DIR:-/tmp/pm-upgrade-test-runs}"
 
 KUBECTL_CMD="${KUBECTL_CMD:-kubectl}"
 GCLOUD_CMD="${GCLOUD_CMD:-gcloud}"
+
+USER_NAMESPACE_SPECIFIED="false"
 
 log() {
   printf "\033[1;36m[%s]\033[0m %s\n" "$(date -u +%H:%M:%S)" "$*"
@@ -80,7 +83,8 @@ Options:
   --node-pool <pool>          Target GKE node pool to upgrade
   --target-version <version>  Target GKE version for node pool upgrade (e.g. 1.35.2-gke.1000)
   --workload <redis|counter>  Workload type to test (default: redis)
-  --namespace <ns>            Namespace for test workload (default: pm-upgrade-test)
+  --namespace <ns>            Namespace for test workload (default: auto-generated dedicated namespace)
+  --storage-location <uri>    GCS storage location for PodMigration (e.g. gs://bucket/path)
   --timeout <seconds>         Maximum seconds to wait for upgrade and migration (default: 1800)
   --skip-upgrade              Skip gcloud upgrade trigger (observe drain or existing upgrade)
   --drain-node                Trigger kubectl drain on source node rather than gcloud upgrade
@@ -132,6 +136,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --namespace)
       NAMESPACE="$2"
+      USER_NAMESPACE_SPECIFIED="true"
+      shift 2
+      ;;
+    --storage-location)
+      STORAGE_LOCATION="$2"
       shift 2
       ;;
     --timeout)
@@ -314,6 +323,7 @@ EOF
 
 render_podmigration_manifest() {
   local ns="$1"
+  local storage_loc="${2:-${STORAGE_LOCATION:-gs://pod-migration-checkpoints/default}}"
   cat <<EOF
 apiVersion: podmigration.gke.io/v1alpha1
 kind: PodMigration
@@ -322,7 +332,9 @@ metadata:
   namespace: ${ns}
   annotations:
     pod-migration.gke.io/runtime-class-engines: "@default=criu"
-spec: {}
+spec:
+  storage:
+    location: ${storage_loc}
 EOF
 }
 
@@ -470,6 +482,7 @@ verify_container_restarts() {
 
 CORDONED_NODE=""
 WORKLOAD_DEPLOYED="false"
+OWNED_NAMESPACE="false"
 
 cleanup() {
   local exit_code=$?
@@ -481,11 +494,16 @@ cleanup() {
     ${KUBECTL_CMD} uncordon "${CORDONED_NODE}" || true
     CORDONED_NODE=""
   fi
-  if [[ "${SKIP_CLEANUP}" != "true" && "${WORKLOAD_DEPLOYED}" == "true" ]]; then
-    log "Cleaning up: deleting test workload and PodMigration in namespace ${NAMESPACE}..."
-    ${KUBECTL_CMD} delete statefulset "criu-upgrade-${WORKLOAD}" -n "${NAMESPACE}" --ignore-not-found || true
-    ${KUBECTL_CMD} delete service "criu-upgrade-${WORKLOAD}-svc" -n "${NAMESPACE}" --ignore-not-found || true
-    ${KUBECTL_CMD} delete podmigration default -n "${NAMESPACE}" --ignore-not-found || true
+  if [[ "${SKIP_CLEANUP}" != "true" ]]; then
+    if [[ "${OWNED_NAMESPACE}" == "true" ]]; then
+      log "Cleaning up: deleting dedicated test namespace ${NAMESPACE}..."
+      ${KUBECTL_CMD} delete namespace "${NAMESPACE}" --ignore-not-found || true
+    elif [[ "${WORKLOAD_DEPLOYED}" == "true" ]]; then
+      log "Cleaning up: deleting test workload and PodMigration in namespace ${NAMESPACE}..."
+      ${KUBECTL_CMD} delete statefulset "criu-upgrade-${WORKLOAD}" -n "${NAMESPACE}" --ignore-not-found || true
+      ${KUBECTL_CMD} delete service "criu-upgrade-${WORKLOAD}-svc" -n "${NAMESPACE}" --ignore-not-found || true
+      ${KUBECTL_CMD} delete podmigration default -n "${NAMESPACE}" --ignore-not-found || true
+    fi
   fi
   exit "${exit_code}"
 }
@@ -497,6 +515,13 @@ run_live() {
   local run_log
   run_log="${OUT_DIR}/nodepool_upgrade_$(date +%Y%m%d_%H%M%S).log"
   exec > >(tee -a "${run_log}") 2>&1
+
+  # Auto-generate fresh dedicated namespace if not specified
+  if [[ -z "${NAMESPACE}" ]]; then
+    NAMESPACE="pm-upgrade-test-$(date +%s)-$RANDOM"
+    OWNED_NAMESPACE="true"
+    log "Generated dedicated test namespace: ${NAMESPACE}"
+  fi
 
   log "=== GKE Node-Pool Upgrade & CRIU Warm-Restore Live Suite ==="
   log "Namespace: ${NAMESPACE}, Workload: ${WORKLOAD}, Timeout: ${TIMEOUT_SEC}s"
@@ -512,12 +537,48 @@ run_live() {
     [[ -n "${TARGET_VERSION}" ]] || die "Please specify --target-version"
   fi
 
-  # Ensure namespace and CRIU-routed PodMigration
-  ${KUBECTL_CMD} get namespace "${NAMESPACE}" >/dev/null 2>&1 || \
+  # Namespace setup & PodMigration singleton check (#98)
+  if ${KUBECTL_CMD} get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    local existing_pm
+    existing_pm="$(${KUBECTL_CMD} get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+    if [[ -n "${existing_pm}" ]]; then
+      die "Namespace '${NAMESPACE}' already contains a PodMigration (${existing_pm}). PodMigrations are singletons per namespace (#98); run in a dedicated namespace or let the script create a fresh one."
+    fi
+  else
+    log "Creating dedicated test namespace ${NAMESPACE}..."
     ${KUBECTL_CMD} create namespace "${NAMESPACE}"
+    OWNED_NAMESPACE="true"
+  fi
 
-  log "Configuring namespace PodMigration with CRIU engine route (@default=criu)..."
-  render_podmigration_manifest "${NAMESPACE}" | ${KUBECTL_CMD} apply -f -
+  # Resolve storage location if not provided
+  if [[ -z "${STORAGE_LOCATION}" ]]; then
+    local discovered_loc
+    discovered_loc="$(${KUBECTL_CMD} get podmigrations -A -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+    if [[ -n "${discovered_loc}" ]]; then
+      log "Discovered storage location from existing cluster PodMigration: ${discovered_loc}"
+      STORAGE_LOCATION="${discovered_loc}"
+    else
+      discovered_loc="$(${KUBECTL_CMD} get podsnapshotstorageconfig -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
+      if [[ -n "${discovered_loc}" ]]; then
+        local pssc_path
+        pssc_path="$(${KUBECTL_CMD} get podsnapshotstorageconfig -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
+        STORAGE_LOCATION="gs://${discovered_loc}/${pssc_path#/}"
+        log "Discovered storage location from cluster PodSnapshotStorageConfig: ${STORAGE_LOCATION}"
+      fi
+    fi
+  fi
+
+  if [[ -z "${STORAGE_LOCATION}" ]]; then
+    die "No storage location provided or discovered. Pass --storage-location <gs://bucket/prefix> or set STORAGE_LOCATION (required by PodMigration CRD spec.storage.location)."
+  fi
+
+  log "Validating PodMigration manifest against apiserver (--dry-run=server)..."
+  if ! render_podmigration_manifest "${NAMESPACE}" "${STORAGE_LOCATION}" | ${KUBECTL_CMD} apply --dry-run=server -f - >/dev/null; then
+    die "PodMigration manifest rejected by apiserver in dry-run validation. Check CRD and --storage-location (${STORAGE_LOCATION})."
+  fi
+
+  log "Configuring namespace PodMigration with CRIU engine route (@default=criu) and storage ${STORAGE_LOCATION}..."
+  render_podmigration_manifest "${NAMESPACE}" "${STORAGE_LOCATION}" | ${KUBECTL_CMD} apply -f -
 
   local workload_name="criu-upgrade-${WORKLOAD}"
   local pod_name="${workload_name}-0"
@@ -671,9 +732,10 @@ run_self_test() {
   echo "${counter_mf}" | grep -q 'image: busybox:1.36' || die "Self-test: counter manifest missing image"
   echo "${counter_mf}" | grep -q 'pod-migration.gke.io/enabled: "true"' || die "Self-test: counter manifest missing opt-in label"
 
-  pm_mf="$(render_podmigration_manifest "test-ns")"
+  pm_mf="$(render_podmigration_manifest "test-ns" "gs://test-bucket/checkpoints")"
   echo "${pm_mf}" | grep -q 'kind: PodMigration' || die "Self-test: PodMigration manifest missing kind"
   echo "${pm_mf}" | grep -q 'pod-migration.gke.io/runtime-class-engines: "@default=criu"' || die "Self-test: PodMigration manifest missing CRIU routing"
+  echo "${pm_mf}" | grep -q 'location: gs://test-bucket/checkpoints' || die "Self-test: PodMigration manifest missing storage location"
 
   # Test 2: PMJ outcome verification logic (PASS vs FAIL, engine assertion)
   log "[Self-Test 2/6] Testing PMJ outcome verification..."
