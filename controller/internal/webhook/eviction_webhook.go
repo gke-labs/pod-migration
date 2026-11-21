@@ -277,6 +277,10 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if verdict := eng.Eligible(pod, sourceNode); !verdict.OK {
 		logger.Info("Snapshot engine can't migrate the pod, allowing eviction immediately",
 			"engine", eng.Name(), "runtimeClass", eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName), "reason", verdict.Reason)
+		if a.Recorder != nil {
+			a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedIneligible",
+				"Snapshot engine %s can't migrate the pod: %s; allowing cold eviction", eng.Name(), verdict.Reason)
+		}
 		return admission.Allowed(verdict.Reason)
 	}
 	if ok, reason := engine.AllowsFencing(pod, eng); !ok {

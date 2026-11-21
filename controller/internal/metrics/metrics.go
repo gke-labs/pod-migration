@@ -105,7 +105,8 @@ var (
 	})
 
 	// SpotPreemptionSkippedTotal counts pods skipped on spot preemption by reason.
-	// Reasons: budget_exceeded | no_policy | unknown_memory | unfenced_engine
+	// Reasons: ineligible | unfenced_engine | no_policy | unknown_memory |
+	// no_replica_key | ambiguous_replica_key | budget_exceeded
 	SpotPreemptionSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_spot_preemption_skipped_total",
 		Help: "Total number of pods skipped for spot preemption migration by reason.",

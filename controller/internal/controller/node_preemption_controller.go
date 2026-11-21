@@ -218,7 +218,18 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 		eng, ok := r.engineFor(pod, pm)
-		if !ok || !eng.Eligible(pod, node).OK {
+		if !ok {
+			continue
+		}
+		if verdict := eng.Eligible(pod, node); !verdict.OK {
+			logger.Info("Skipping pod on preempting node: snapshot engine can't migrate the pod",
+				"pod", pod.Name, "namespace", pod.Namespace, "engine", eng.Name(), "reason", verdict.Reason)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedIneligible",
+					"Snapshot engine %s can't migrate the pod: %s; skipping spot preemption migration", eng.Name(), verdict.Reason)
+			}
+			metrics.RecordSpotPreemptionSkipped("ineligible")
+			r.processedPods.Store(pod.UID, time.Now())
 			continue
 		}
 		if ok, reason := engine.AllowsFencing(pod, eng); !ok {
