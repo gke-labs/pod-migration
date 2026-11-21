@@ -188,7 +188,7 @@ func reconcilePlacementWith(t *testing.T, restorePlacement bool, engines *engine
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(withReadySnapshots(objs, engine.DefaultAPIGroup, "engine.example.com")...).
+		WithObjects(withReadySnapshots(objs, engine.DefaultAPIGroup, "engine.example.com", engine.CRIUAPIGroup)...).
 		WithInterceptorFuncs(funcs).
 		Build()
 	recorder := record.NewFakeRecorder(20)
