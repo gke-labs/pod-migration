@@ -158,6 +158,12 @@ type PodMigrationJobReconciler struct {
 	// <= 0.
 	FenceLateStopWatch time.Duration
 
+	// SnapshotRetention is how long a job that concluded Succeeded or Failed
+	// keeps its PodSnapshot before the controller deletes it, which tells the
+	// engine to delete the archive (C9, #107). Zero deletes it right away.
+	// At most MaxSnapshotRetention.
+	SnapshotRetention time.Duration
+
 	// FenceDeleteUnwedgeTimeout is how long the controller waits for a deleting
 	// job to settle its source fence before stripping the finalizer to unwedge
 	// deletion (#167). Defaults to DefaultFenceDeleteUnwedgeTimeout if unset or <= 0.
@@ -674,10 +680,10 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch
+// +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=podsnapshot.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshotmanualtriggers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch
+// +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=criu.podmigration.gke.io,resources=podsnapshots/status,verbs=get
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
@@ -1143,6 +1149,19 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
+
+		// Delete the job's PodSnapshot once it's done with it (C9, #107).
+		// Best effort, like the placement checks above: an error is retried
+		// on the next look and doesn't hold garbage collection.
+		snapshotRecheck, err := r.releaseSnapshot(ctx, job)
+		if err != nil {
+			logger.Error(err, "Failed to release the job's PodSnapshot; will retry", "snapshot", job.Status.SnapshotRef)
+		}
+		// releaseSnapshot only looks again for a job with a CompletionTime,
+		// so the requeue below covers it.
+		if snapshotRecheck > 0 && (placementRecheck <= 0 || snapshotRecheck < placementRecheck) {
+			placementRecheck = snapshotRecheck
+		}
 
 		if job.Status.CompletionTime != nil {
 			ttl := time.Minute * 30 // Extended 30m window prevents premature deletion during large drains

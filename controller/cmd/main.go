@@ -97,6 +97,7 @@ func main() {
 		restorePlacement      bool
 		placementDeadline     time.Duration
 		shortenReadinessDelay bool
+		snapshotRetention     time.Duration
 		showVersion           bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -117,6 +118,7 @@ func main() {
 	flag.BoolVar(&restorePlacement, "restore-placement", true, "Place a replacement pod that restores a snapshot on a node its snapshot engine can restore on (on by default; --restore-placement=false turns it off). Only a pod that its ReplicaSet or StatefulSet would recreate is placed: the engine's node constraints (for GKE Pod Snapshots, the source node's machine type, if the job recorded it) go into its required node affinity when its scheduling gate is released, unless its own node selector or node affinity already requires them, and even if no node meets them yet, so that a node can still come up, for example one that the cluster autoscaler adds; see --restore-placement-deadline. Any other pod, such as a Job's, is released without them, as with --restore-placement=false, since nothing would recreate it without them if it got stuck. The release event says whether a node met them then: a Ready node (stricter than the scheduler, which leaves not-ready nodes to their taints) that the pod's node selector, node affinity and tolerations allow, cordoned only if the pod tolerates it; resources, volume zones, host ports, pod affinity and topology spread, and other scheduling gates aren't looked at.")
 	flag.DurationVar(&placementDeadline, "restore-placement-deadline", controller.DefaultRestorePlacementDeadline, "How long a replacement pod released with --restore-placement's node constraints may stay unschedulable. Then, if a node that doesn't meet the constraints could take it, the job concludes SucceededWithoutRestore with reason "+controller.ReasonPlacementTimeout+", and the pod is deleted so that its ReplicaSet or StatefulSet recreates it to start cold. Otherwise it keeps waiting, because deleting it wouldn't get it scheduled sooner, and at the restore ceiling the job concludes "+controller.ReasonPlacementTimeout+" and deletes it anyway, so that any node can be added for it. Only a pod that the scheduler reports unschedulable is deleted. A pod that the scheduler hasn't tried (another scheduling gate may hold it) or has nominated a node for is left alone; if it's still like that at the restore ceiling, the job concludes RestoreTimeout, then checks the pod every 15s and deletes it once the scheduler reports it unschedulable. A pod nominated just before the delete, or whose delete failed, is also checked every 15s. The checks end when the job is garbage collected, 30m after it concluded. Must be more than 0, and at least 1m shorter than the restore ceiling, 5m plus --restore-stabilization-window: at most 4m30s with the default window.")
 	flag.BoolVar(&shortenReadinessDelay, "shorten-restored-readiness-delay", true, "Clear readinessProbe.initialDelaySeconds on gated restore-candidate replacement pods unless annotated with "+util.AnnotationPreserveReadinessDelay+"=true; liveness and startup probes are never changed")
+	flag.DurationVar(&snapshotRetention, "snapshot-retention", 0, fmt.Sprintf("How long a job that concluded Succeeded (restore verified) or Failed keeps the PodSnapshot its trigger created before the controller deletes it, which tells the snapshot engine to delete the checkpoint archive (#107). 0 (the default) deletes it as soon as nothing can still restore from it. Jobs that concluded SucceededWithoutRestore keep their snapshot. At most %s, when concluded jobs are garbage collected.", controller.MaxSnapshotRetention))
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -172,7 +174,8 @@ func main() {
 		"restoreStabilizationWindow", restoreStabilization,
 		"restorePlacement", restorePlacement,
 		"restorePlacementDeadline", placementDeadline,
-		"shortenRestoredReadinessDelay", shortenReadinessDelay)
+		"shortenRestoredReadinessDelay", shortenReadinessDelay,
+		"snapshotRetention", snapshotRetention)
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -188,6 +191,11 @@ func main() {
 
 	if restoreStabilization < 0 || restoreStabilization > controller.MaxRestoreStabilizationWindow {
 		setupLog.Error(fmt.Errorf("restore-stabilization-window %v out of range [0s, %v]", restoreStabilization, controller.MaxRestoreStabilizationWindow), "invalid restore stabilization window flag")
+		os.Exit(1)
+	}
+
+	if err := controller.ValidateSnapshotRetention(snapshotRetention); err != nil {
+		setupLog.Error(err, "invalid snapshot retention flag")
 		os.Exit(1)
 	}
 
@@ -312,6 +320,7 @@ func main() {
 		Engines:               engines,
 		FencePreCheckpointCap: fenceCap,
 		FenceLateStopWatch:    fenceLateStopWatch,
+		SnapshotRetention:     snapshotRetention,
 	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)

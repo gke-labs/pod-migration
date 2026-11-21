@@ -159,6 +159,65 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      downward-API volume, holding the pod sandbox alive when `restored` or
      falling through to `exec` the original command on restore failure/timeout.
 
+## Archive garbage collection
+
+The orchestrator deletes a job's `PodSnapshot` once it's done with the
+checkpoint: after a verified restore, or when the job fails, after its
+`--snapshot-retention` (#107, contract clause C9). The engine owns the
+archive, so `cmd/engine` deletes it:
+
+- Every CRIU `PodSnapshot` carries the `pod-migrate.io/archive-cleanup`
+  finalizer. The engine controller adds it when it creates the work order,
+  and adds it to `PodSnapshot`s created before the upgrade, so their archives
+  are deleted with them too.
+- When a `PodSnapshot` is deleted, the engine deletes `manifest.json` (first,
+  since it marks an archive complete), `checkpoint.tar` and `spec.json` under
+  `gs://<bucket>/<path>/<snapshot>/`, then removes the finalizer. The bucket
+  and path come from the work order itself, so a deleted
+  `PodSnapshotStorageConfig` doesn't matter. A missing object or bucket is
+  success. A work order without a bucket (refused, or no storage) has no
+  archive and is released right away.
+- A work order without an outcome may still be uploading. Deleting it cancels
+  it (the node agent treats a `PodSnapshot` being deleted as a cancel), and
+  the engine waits up to 2 minutes for the agent to record the outcome before
+  it deletes the archive, so an upload in flight can't write objects after
+  the delete.
+- A delete that fails (for example a missing bucket permission) is retried
+  with backoff, from 1 s up to 1 min, with an `ArchiveDeleteFailed` Warning
+  event on the `PodSnapshot`. After `--archive-gc-give-up` (default `10m`)
+  from the delete, the engine removes the finalizer anyway and records an
+  `ArchiveDeleteAbandoned` Warning event naming the archive left in the
+  bucket. So deleting a namespace never wedges on the finalizer while the
+  engine controller runs. Metric: `pm_psengine_archive_gc_total{result}`
+  (`deleted`, `no_archive`, `failed`, `abandoned`).
+- A trigger re-created for the same pod instance never gets a `PodSnapshot`
+  that's being deleted; it waits until it's gone and gets a new work order.
+- The engine controller needs `update` and `patch` on `podsnapshots` (in
+  `deploy/deploy.yaml`), and `storage.objects.delete` on the bucket, which
+  its storage probe already uses.
+
+**Uninstalling the engine:** nothing removes the finalizer once the engine
+controller is gone, so once no migration is in flight, delete the CRIU
+`PodSnapshot`s while it still runs:
+
+```bash
+kubectl delete podsnapshots.criu.podmigration.gke.io -A -l pod-migrate.io/engine=criu --timeout=15m
+```
+
+If the engine is already gone, remove the finalizer by hand (the archives
+stay in the bucket):
+
+```bash
+kubectl get podsnapshots.criu.podmigration.gke.io -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' |
+  while read -r ns name; do
+    kubectl patch podsnapshots.criu.podmigration.gke.io -n "$ns" "$name" --type=json \
+      -p='[{"op":"remove","path":"/metadata/finalizers"}]'
+  done
+```
+
+The controller's `make -C controller undeploy` doesn't touch CRIU
+`PodSnapshot`s, so it isn't affected.
+
 ## API group
 
 The engine serves its four contract CRs (`PodSnapshotStorageConfig`,

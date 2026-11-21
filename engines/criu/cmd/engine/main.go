@@ -54,6 +54,7 @@ func main() {
 	var apiGroup string
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
+	var archiveGCGiveUp time.Duration
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint bind address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe bind address")
@@ -64,6 +65,7 @@ func main() {
 	flag.StringVar(&apiGroup, "api-group", contract.DefaultGroup, "API group of the snapshot engine CRDs this engine serves; the restore-order annotation is <group>/ps-name. The node agent's --api-group and the installed CRDs must use the same group")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 50, "Kubernetes API client QPS limit")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 100, "Kubernetes API client burst limit")
+	flag.DurationVar(&archiveGCGiveUp, "archive-gc-give-up", psengine.DefaultArchiveGCGiveUpAfter, "how long after a PodSnapshot is deleted the engine keeps retrying to delete its archive from the bucket; then it removes its finalizer, leaves the archive behind and records an ArchiveDeleteAbandoned event")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -131,6 +133,20 @@ func main() {
 		Client: mgr.GetClient(),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine PSMT reconciler")
+		os.Exit(1)
+	}
+
+	if archiveGCGiveUp <= 0 {
+		log.Error(fmt.Errorf("--archive-gc-give-up must be more than 0, got %v", archiveGCGiveUp), "invalid flag")
+		os.Exit(1)
+	}
+	if err := (&psengine.ArchiveGCReconciler{
+		Client:      mgr.GetClient(),
+		Store:       gcsStore,
+		Recorder:    mgr.GetEventRecorderFor("psengine-archive-gc"),
+		GiveUpAfter: archiveGCGiveUp,
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to set up psengine archive GC")
 		os.Exit(1)
 	}
 

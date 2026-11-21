@@ -58,6 +58,11 @@ rules:
   - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshotstorageconfigs", "podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
     verbs: ["get", "list", "watch", "create"]
+  # The archive finalizer: added at create, removed once the archive is
+  # deleted from the bucket (#107).
+  - apiGroups: ["criu.podmigration.gke.io"]
+    resources: ["podsnapshots"]
+    verbs: ["update", "patch"]
   - apiGroups: ["criu.podmigration.gke.io"]
     resources: ["podsnapshotpolicies/status", "podsnapshotmanualtriggers/status", "podsnapshots/status"]
     verbs: ["get", "update", "patch"]
