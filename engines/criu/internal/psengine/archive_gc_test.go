@@ -352,6 +352,33 @@ func TestArchiveGC_DeletesEverythingThePipelineUploads(t *testing.T) {
 	}
 }
 
+// Composite upload parts left behind by source node agent cleanup failure
+// must be swept by ArchiveGC.
+func TestArchiveGC_SweepsCompositeParts(t *testing.T) {
+	c := newClient(t, gcSnapshot(true, true))
+	store := newMemStore()
+	prefix := ArchivePrefix(gcPath, gcSnap)
+	store.objects[gcBucket+"/"+path.Join(prefix, "manifest.json")] = []byte("{}")
+	store.objects[gcBucket+"/"+path.Join(prefix, "checkpoint.tar")] = []byte("tar-data")
+	store.objects[gcBucket+"/"+path.Join(prefix, "checkpoint.tar.part-000")] = []byte("part-0")
+	store.objects[gcBucket+"/"+path.Join(prefix, "checkpoint.tar.part-001")] = []byte("part-1")
+	store.objects[gcBucket+"/"+path.Join(prefix, "checkpoint.tar.part-002")] = []byte("part-2")
+
+	gcDelete(t, c)
+	r := &ArchiveGCReconciler{Client: c, Store: &gcStore{memStore: store}}
+	if _, err := gcReconcile(t, r); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for obj := range store.objects {
+		if strings.Contains(obj, "checkpoint.tar.part-") {
+			t.Fatalf("composite part object left behind by ArchiveGC: %s", obj)
+		}
+	}
+	if len(store.objects) != 0 {
+		t.Fatalf("objects left after ArchiveGC: %v", store.objects)
+	}
+}
+
 // The engine controller adds the finalizer when it creates a work order, so a
 // PodSnapshot deleted before the GC reconciler first sees it still has its
 // archive cleaned up.

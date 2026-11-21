@@ -514,6 +514,13 @@ When migrating single-replica workloads (such as a `StatefulSet` with `replicas:
 
 The pod gate sets `podsnapshot.gke.io/ps-name` on the replacement to the migration snapshot, so that GKE Pod Snapshots restores the replacement from it. The agent reads that annotation whenever it creates the pod's sandbox, so a later sandbox restart (a sandbox crash, a containerd restart) would restore the migration snapshot again and roll the app back to its state at migration time (#152). So once the restore is verified, the controller sets the annotation to `""`, the cold-start bypass: later restarts start cold, like any other pod's, and GKE Pod Snapshots emits a `falling back to a cold start` Warning event for each of them.
 
+### Safe RWO PersistentVolume Detachment
+
+Stateful workloads with `ReadWriteOnce` (`RWO`) or `ReadWriteOncePod` (`RWOP`) PersistentVolumes require detachment sequencing to avoid Kubernetes volume attachment conflicts across nodes (#249):
+
+- **Evicting Phase Volume Detachment Wait:** During the `Evicting` phase, after the source Pod is deleted, the controller monitors `VolumeAttachment` resources for all RWO/RWOP volumes (`job.status.pvsToDetach`) and verifies detachment from the origin node before transitioning the job to `Restoring`. Non-RWO volumes (such as `ReadWriteMany` or `ReadOnlyMany`) do not block migration.
+- **Volume Detach Timeout & Snapshot Preservation:** If volume detachment from the origin node exceeds the migration timeout, the PMJ concludes as `SucceededWithoutRestore` with reason `VolumeDetachTimeout`. This preserves the durable snapshot reference for inspection and manual recovery while releasing the replacement Pod for a cold start.
+
 ## 8. Monitoring & Prometheus Metrics
 
 The controller registers Prometheus metrics on the standard controller-runtime metrics endpoint (`:8080/metrics` by default):

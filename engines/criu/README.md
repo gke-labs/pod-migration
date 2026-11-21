@@ -353,7 +353,7 @@ Because CRIU checkpoint archives contain complete, unencrypted process address s
    - Engine controller (`cmd/engine`): `storage.objects.create`, `storage.objects.get` and `storage.objects.delete`, for its storage probe and archive garbage collection (#107). Without delete, archives are left behind, reported only by events.
    - Avoid Default Compute Engine SA: Do **not** use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`).
 3. **CMEK Encryption:** Configure Cloud KMS Customer-Managed Encryption Keys (CMEK) on the checkpoint bucket.
-4. **Lifecycle Retention:** Apply GCS Object Lifecycle Management rules to automatically delete checkpoint archives after **1 to 7 days**, preventing cold archives from lingering. The engine deletes a job's archive when its `PodSnapshot` is deleted (see Archive garbage collection below); keep the rule as a backstop for archives it leaves behind.
+4. **Lifecycle Retention:** Apply GCS Object Lifecycle Management rules to automatically delete checkpoint archives after **1 to 7 days**, preventing cold archives from lingering. The engine deletes a job's archive when its `PodSnapshot` is deleted (see Archive garbage collection below); keep the rule as a backstop for archives it leaves behind (including temporary composite upload parts matching `checkpoint.tar.part-*`).
 
 For full threat analysis, blast radius documentation, and restore path verification details, see [Threat Model and Security Guidance for the CRIU Engine](../../docs/threat-model-criu.md) and [SECURITY.md](../../SECURITY.md).
 

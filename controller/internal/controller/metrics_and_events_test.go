@@ -353,6 +353,7 @@ func TestMetrics_ActiveGaugeAndOutcomes(t *testing.T) {
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, "FallbackToColdStart", "fallback"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, "RestoreTimeout", "timeout"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, "PDBEvictionTimeout", "timeout"},
+		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, ReasonVolumeDetachTimeout, "timeout"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, "ReplacementPodMismatch", "succeeded_without_restore"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, ReasonRestoreLost, "restore_lost"},
 		{pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, ReasonRestoreFailed, "succeeded_without_restore"},
