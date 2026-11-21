@@ -1857,10 +1857,13 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 	//   Leg 1: The timeout fails the job and deletes the trigger, and the source
 	//          stays fenced, not evicted, while CancelRequested (non-terminal)
 	//          is reported. Cancelled (handled as Failed) settles it: the source
-	//          goes back into service, unchanged. A late Ready after that
-	//          neither evicts it nor restores anything.
-	//   Leg 2: CheckpointTimedOut never settles: the source stays fenced through
-	//          the settle wait, and then is kept fenced and cold-evicted.
+	//          goes back into service, unchanged. Only the engine's
+	//          triggered-by label finds the snapshot here. A late Ready after
+	//          that neither evicts it nor restores anything; a late stop is
+	//          fenced again and cold-evicted.
+	//   Leg 2: A fresh CheckpointTimedOut doesn't extend the deadline, and it
+	//          never settles: the source stays fenced through the settle wait,
+	//          and then is kept fenced and cold-evicted.
 	//   Leg 3: A Ready that arrives during the settle wait (a trigger deletion
 	//          the agent missed) is a completed checkpoint: the source is kept
 	//          fenced and cold-evicted, and the job stays Failed.
@@ -1989,11 +1992,18 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			}
 		}
 
+		// stalledInProgress is a checkpoint whose last progress is older than
+		// the migration timeout.
+		stalledInProgress := func() []map[string]interface{} {
+			return []map[string]interface{}{cond("Checkpoint", "False", "InProgress", time.Now().Add(-5*migrationTimeout))}
+		}
+
 		// timeOutMidCheckpoint fences a running source, creates the trigger,
-		// starts a checkpoint that stops making progress, and passes the
-		// migration deadline. It checks that the job failed, the trigger is
-		// gone and the source still runs, fenced, and returns the snapshot name.
-		timeOutMidCheckpoint := func(t *testing.T, leg string) (jobName, podName, snapName string) {
+		// starts a checkpoint that stalls with the snapshot conditions stall,
+		// and passes the migration deadline. It checks that the job failed,
+		// the trigger is gone and the source still runs, fenced, and returns
+		// the snapshot name.
+		timeOutMidCheckpoint := func(t *testing.T, leg string, stall []map[string]interface{}) (jobName, podName, snapName string) {
 			t.Helper()
 			isController := true
 			podName = "s9-source-" + leg
@@ -2069,8 +2079,7 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 				t.Fatalf("source lacks the cold-start bypass %s=\"\" before its checkpoint: %v", restoreAnn, pod.Annotations)
 			}
 
-			// The engine starts the checkpoint, which then stalls: its last
-			// progress is older than the migration timeout.
+			// The engine starts the checkpoint, which then stalls.
 			trigger.Object["status"] = map[string]interface{}{
 				"snapshotCreated": map[string]interface{}{"name": snapName},
 			}
@@ -2085,7 +2094,7 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			if err := k8sClient.Create(ctx, snap); err != nil {
 				t.Fatalf("create snapshot: %v", err)
 			}
-			setSnapshotConditions(t, snapName, cond("Checkpoint", "False", "InProgress", time.Now().Add(-5*migrationTimeout)))
+			setSnapshotConditions(t, snapName, stall...)
 			reconcile(t, jobName)
 			if got := getJob(t, jobName); got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || got.Status.SnapshotRef != snapName {
 				t.Fatalf("before the deadline: job phase=%s snapshotRef=%q, want Snapshotting/%s", got.Status.Phase, got.Status.SnapshotRef, snapName)
@@ -2116,7 +2125,15 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		}
 
 		t.Run("Leg1_CancelConfirmed_SourceBackInService", func(t *testing.T) {
-			jobName, podName, snapName := timeOutMidCheckpoint(t, "cancel")
+			jobName, podName, snapName := timeOutMidCheckpoint(t, "cancel", stalledInProgress())
+
+			// From here on, only the engine's triggered-by label finds the
+			// snapshot: the trigger is gone, and the job doesn't name it.
+			job := getJob(t, jobName)
+			job.Status.SnapshotRef = ""
+			if err := k8sClient.Status().Update(ctx, job); err != nil {
+				t.Fatalf("clear SnapshotRef: %v", err)
+			}
 
 			// The engine controller sees the trigger deleted and asks the
 			// node agent to cancel. CancelRequested isn't terminal (C3).
@@ -2133,7 +2150,7 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 				cond("Checkpoint", "False", "Cancelled", time.Now()),
 				cond("Ready", "False", "Cancelled", time.Now()))
 			reconcile(t, jobName)
-			job := getJob(t, jobName)
+			job = getJob(t, jobName)
 			if c := fenceCond(t, job); c.Status != metav1.ConditionFalse || c.Reason != util.ReasonUnfenced {
 				t.Fatalf("Cancelled: SourceFenced = %s/%s (%s), want False/%s", c.Status, c.Reason, c.Message, util.ReasonUnfenced)
 			}
@@ -2143,12 +2160,14 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			}
 			noRestore(t, jobName, "Cancelled")
 
-			// A late Ready on the same snapshot must change nothing: the job
-			// gave up, so there's no eviction and no restore, and the source
-			// keeps its cold-start bypass, so a restart can't restore from it.
+			// A defensive check: the agent never overwrites an outcome it
+			// recorded (C9), but a late Ready on the same snapshot must
+			// change nothing. The job gave up, so there's no eviction and no
+			// restore, and the source keeps its cold-start bypass, so a
+			// restart can't restore from it.
 			setSnapshotConditions(t, snapName,
 				cond("Checkpoint", "True", "Succeeded", time.Now()),
-				cond("Ready", "True", "Ready", time.Now()))
+				cond("Ready", "True", "Succeeded", time.Now()))
 			for i := 0; i < 2; i++ {
 				reconcile(t, jobName)
 			}
@@ -2164,14 +2183,31 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 				t.Fatalf("late Ready: the source must keep the cold-start bypass %s=\"\": %v", restoreAnn, pod.Annotations)
 			}
 			noRestore(t, jobName, "late Ready")
+
+			// The late-stop watch: if the source stops after it went back
+			// into service (C4, #106), it's fenced again and cold-evicted.
+			pod.Status.ContainerStatuses[0].RestartCount = 1
+			if err := k8sClient.Status().Update(ctx, pod); err != nil {
+				t.Fatalf("restart the source's container: %v", err)
+			}
+			reconcile(t, jobName)
+			job = getJob(t, jobName)
+			if c := fenceCond(t, job); c.Status != metav1.ConditionTrue || c.Reason != util.ReasonFenceKept {
+				t.Fatalf("late stop: SourceFenced = %s/%s (%s), want True/%s", c.Status, c.Reason, c.Message, util.ReasonFenceKept)
+			}
+			sourceEvicted(t, podName, "late stop")
+			noRestore(t, jobName, "late stop")
 		})
 
 		t.Run("Leg2_CheckpointTimedOut_KeptFencedThenColdEvicted", func(t *testing.T) {
-			jobName, podName, snapName := timeOutMidCheckpoint(t, "timedout")
-
-			// The agent's kubelet call timed out: the dump may still run, and
-			// the source may stay frozen. It never settles (C9).
-			setSnapshotConditions(t, snapName, cond("Checkpoint", "Unknown", "CheckpointTimedOut", time.Now()))
+			// The agent froze the source and its kubelet call timed out just
+			// now: the dump may still run, and the source may stay frozen. It
+			// never settles (C9). The fresh CheckpointTimedOut isn't progress,
+			// so it doesn't extend the deadline either.
+			jobName, podName, _ := timeOutMidCheckpoint(t, "timedout", []map[string]interface{}{
+				cond("SourceFrozen", "True", "Frozen", time.Now().Add(-5*migrationTimeout)),
+				cond("Checkpoint", "Unknown", "CheckpointTimedOut", time.Now()),
+			})
 			for i := 0; i < 2; i++ {
 				reconcile(t, jobName)
 				stillFencedAndWaiting(t, jobName, podName, "CheckpointTimedOut within the settle wait")
@@ -2195,14 +2231,14 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 		})
 
 		t.Run("Leg3_ReadyDuringSettleWait_KeptFencedAndColdEvicted", func(t *testing.T) {
-			jobName, podName, snapName := timeOutMidCheckpoint(t, "lateready")
+			jobName, podName, snapName := timeOutMidCheckpoint(t, "lateready", stalledInProgress())
 
 			// The agent missed the trigger deletion and committed: the
 			// checkpoint completed after the job gave up. The engine may stop
 			// the source after it, so it can't go back into service.
 			setSnapshotConditions(t, snapName,
 				cond("Checkpoint", "True", "Succeeded", time.Now()),
-				cond("Ready", "True", "Ready", time.Now()))
+				cond("Ready", "True", "Succeeded", time.Now()))
 			reconcile(t, jobName)
 			job := getJob(t, jobName)
 			if c := fenceCond(t, job); c.Status != metav1.ConditionTrue || c.Reason != util.ReasonFenceKept {
