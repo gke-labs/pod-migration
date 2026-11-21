@@ -126,23 +126,21 @@ type faultyEngine struct {
 	provider          snapshot.Provider
 	failures          []restore.Engine
 	namespaceErr      error
+	untypedLocErr     bool
 	eligibleOK        bool
 
 	// RestoreOrderer behavior
-	isOrderer         bool
-	orderWrongKey     bool
-	bypassNoop       bool
+	orderWrongKey bool
+	bypassNoop    bool
 
 	// RestoreVerifier behavior
-	isVerifier        bool
-	verifyVerdict     engine.RestoreVerdict
-	verifyErr         error
+	verifyVerdict engine.RestoreVerdict
+	verifyErr     error
 
 	// PlacementAdvisor behavior
-	isAdvisor         bool
-	placementReqs     []corev1.NodeSelectorRequirement
-	nonDeterministic  bool
-	callCount         int
+	placementReqs    []corev1.NodeSelectorRequirement
+	nonDeterministic bool
+	callCount        int
 }
 
 func (f *faultyEngine) Name() string              { return f.name }
@@ -155,6 +153,15 @@ func (f *faultyEngine) NamespaceResources(pm *pmv1alpha1.PodMigration) ([]*unstr
 	}
 	if f.namespaceErr != nil {
 		return nil, f.namespaceErr
+	}
+	if !strings.HasPrefix(pm.Spec.Storage.Location, "gs://") {
+		if f.untypedLocErr {
+			return nil, errors.New("invalid storage location without typed error")
+		}
+		return nil, &engine.StorageLocationError{
+			Location: pm.Spec.Storage.Location,
+			Message:  "unsupported storage location: must begin with gs://",
+		}
 	}
 	return []*unstructured.Unstructured{
 		{
@@ -241,7 +248,13 @@ func (f *faultyEngine) VerifyRestore(ctx context.Context, job *pmv1alpha1.PodMig
 	if f.verifyErr != nil {
 		return engine.RestoreVerdict{}, f.verifyErr
 	}
-	return f.verifyVerdict, nil
+	if f.verifyVerdict != (engine.RestoreVerdict{}) {
+		return f.verifyVerdict, nil
+	}
+	if pod.Status.Phase != corev1.PodRunning {
+		return engine.RestoreVerdict{Outcome: engine.RestoreInProgress, Confirmed: false}, nil
+	}
+	return engine.RestoreVerdict{Outcome: engine.Restored, Confirmed: false}, nil
 }
 
 // PlacementAdvisor implementation
@@ -305,6 +318,31 @@ func TestConformance_SabotageDetections(t *testing.T) {
 
 	runner := NewRunner()
 
+	t.Run("BaselineConformingEngine", func(t *testing.T) {
+		cl := NewTestClient(scheme)
+		prov, err := snapshot.NewGKEProviderForGroup(cl, scheme, engine.DefaultCRIUAPIGroup)
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		conforming := &faultyEngine{
+			name:              "conforming-mock",
+			apiGroup:          engine.DefaultCRIUAPIGroup,
+			restoreAnnotation: engine.RestoreAnnotation(engine.DefaultCRIUAPIGroup),
+			runtimeClasses:    []string{"runc"},
+			provider:          prov,
+			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped, RestoreOnce: true},
+		}
+		rep := runner.Evaluate(conforming)
+		if !rep.Passed {
+			t.Fatalf("Expected baseline conforming engine to pass all clauses, got failed report:\n%s", rep.Markdown())
+		}
+		for _, cr := range rep.Clauses {
+			if cr.Status == StatusFailed {
+				t.Errorf("Expected clause %s not to fail, got details: %s", cr.ID, cr.Details)
+			}
+		}
+	})
+
 	t.Run("Sabotage_C1_InvalidAPIGroup", func(t *testing.T) {
 		faulty := &faultyEngine{
 			name:              "faulty-1",
@@ -351,7 +389,7 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			runtimeClasses:    []string{"runc"},
 			provider:          validProvider,
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
-			namespaceErr:      errors.New("invalid storage location without typed error"),
+			untypedLocErr:     true,
 		}
 		rep := runner.Evaluate(faulty)
 		if rep.Passed {
@@ -429,7 +467,6 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			runtimeClasses:    []string{"runc"},
 			provider:          validProvider,
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
-			isOrderer:         true,
 			orderWrongKey:     true, // Stamping wrong annotation key (#135)!
 		}
 		rep := runner.Evaluate(faulty)
@@ -450,7 +487,6 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			runtimeClasses:    []string{"runc"},
 			provider:          validProvider,
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
-			isOrderer:         true,
 			bypassNoop:        true, // Faulty: OrderColdStartBypass does not clear existing order!
 		}
 		rep := runner.Evaluate(faulty)
@@ -471,7 +507,6 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			runtimeClasses:    []string{"runc"},
 			provider:          validProvider,
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
-			isVerifier:        true,
 			verifyVerdict: engine.RestoreVerdict{
 				Outcome:   engine.Restored,
 				Confirmed: true, // Faulty: returns Confirmed=true for pending unready pod!
@@ -534,7 +569,6 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			restoreAnnotation: engine.DefaultCRIUAPIGroup + "/ps-name",
 			runtimeClasses:    []string{"runc"},
 			provider:          validProvider,
-			isAdvisor:         true,
 			nonDeterministic:  true, // Faulty: oscillates requirements!
 			guarantees:        engine.Guarantees{Fencing: engine.FencingStopped},
 		}
@@ -555,7 +589,6 @@ func TestConformance_SabotageDetections(t *testing.T) {
 			restoreAnnotation: engine.DefaultCRIUAPIGroup + "/ps-name",
 			runtimeClasses:    []string{"runc"},
 			provider:          validProvider,
-			isAdvisor:         true,
 			placementReqs: []corev1.NodeSelectorRequirement{
 				{Key: "node.kubernetes.io/instance-type", Operator: corev1.NodeSelectorOpIn, Values: []string{}}, // Empty values for In!
 			},

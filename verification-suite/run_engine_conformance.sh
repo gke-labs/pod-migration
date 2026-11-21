@@ -18,7 +18,7 @@
 #
 # Runs the canonical engine conformance test suite against registered snapshot
 # engines (GKE Pod Snapshots, CRIU) to evaluate compliance with contract
-# clauses C1–C11 (identity, eligibility, checkpoint outcomes, source fencing,
+# clauses C1–C9 (identity, eligibility, checkpoint outcomes, source fencing,
 # restore order, outcome signals, failure classification, placement, and cleanup).
 #
 # Usage:
@@ -93,13 +93,14 @@ if [[ -n "${ENGINE_PATTERN}" && "${SELF_TEST}" == "true" ]]; then
 elif [[ -n "${ENGINE_PATTERN}" ]]; then
   TEST_PATTERN="^${ENGINE_PATTERN}$"
 elif [[ "${SELF_TEST}" == "true" ]]; then
-  TEST_PATTERN="^(TestEngineConformance|TestConformance_SabotageDetections)$"
+  TEST_PATTERN="^(TestEngineConformance_.+|TestConformance_SabotageDetections)$"
 else
   TEST_PATTERN="^TestEngineConformance"
 fi
 
 echo "=== Running Snapshot Engine Conformance Suite (Part of #108) ==="
-TEST_OUTPUT=$(go test -v -race -count=1 ./internal/engine/conformance/... -run "${TEST_PATTERN}" 2>&1)
+TEST_RC=0
+TEST_OUTPUT=$(go test -v -race -count=1 ./internal/engine/conformance/... -run "${TEST_PATTERN}" 2>&1) || TEST_RC=$?
 echo "${TEST_OUTPUT}"
 
 if echo "${TEST_OUTPUT}" | grep -q "\[no tests to run\]"; then
@@ -107,8 +108,8 @@ if echo "${TEST_OUTPUT}" | grep -q "\[no tests to run\]"; then
   exit 1
 fi
 
-if ! echo "${TEST_OUTPUT}" | grep -q "PASS"; then
-  exit 1
+if [[ ${TEST_RC} -ne 0 ]]; then
+  exit ${TEST_RC}
 fi
 
 echo "=== Engine Conformance Suite Complete: PASSED ==="

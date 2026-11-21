@@ -16,11 +16,11 @@
 // Package conformance provides the canonical snapshot engine conformance suite
 // (docs/design/engine-contract.md #81, #108).
 //
-// It audits an Engine implementation against contract clauses C1–C11 (with C10
-// Security and C11 Observability audited in dedicated scenario suites) to verify
+// It audits an Engine implementation against contract clauses C1–C9 to verify
 // that it provides the identity, eligibility, checkpoint outcomes, source fencing,
 // restore orders, outcome signals, failure classification, placement, and cleanup
-// semantics required by the pod migration controller.
+// semantics required by the pod migration controller. Clauses C10 (Security) and
+// C11 (Observability) are tracked separately and not audited by this suite.
 package conformance
 
 import (
@@ -69,9 +69,10 @@ const (
 type ClauseStatus string
 
 const (
-	StatusPassed  ClauseStatus = "PASSED"
-	StatusFailed  ClauseStatus = "FAILED"
-	StatusSkipped ClauseStatus = "SKIPPED"
+	StatusPassed     ClauseStatus = "PASSED"
+	StatusFailed     ClauseStatus = "FAILED"
+	StatusSkipped    ClauseStatus = "SKIPPED"
+	StatusNotCovered ClauseStatus = "NOT_COVERED"
 )
 
 // SubtestResult records the outcome of an individual assertion within a clause.
@@ -105,6 +106,7 @@ func (r *Report) Summary() string {
 	passedCount := 0
 	failedCount := 0
 	skippedCount := 0
+	notCoveredCount := 0
 	for _, c := range r.Clauses {
 		switch c.Status {
 		case StatusPassed:
@@ -113,11 +115,17 @@ func (r *Report) Summary() string {
 			failedCount++
 		case StatusSkipped:
 			skippedCount++
+		case StatusNotCovered:
+			notCoveredCount++
 		}
 	}
 	verdict := "PASSED"
 	if !r.Passed {
 		verdict = "FAILED"
+	}
+	if notCoveredCount > 0 {
+		return fmt.Sprintf("Engine Conformance for %q (%s): %s (%d passed, %d failed, %d skipped, %d not covered)",
+			r.EngineName, r.APIGroup, verdict, passedCount, failedCount, skippedCount, notCoveredCount)
 	}
 	return fmt.Sprintf("Engine Conformance for %q (%s): %s (%d passed, %d failed, %d skipped)",
 		r.EngineName, r.APIGroup, verdict, passedCount, failedCount, skippedCount)
@@ -143,6 +151,9 @@ func (r *Report) Markdown() string {
 		scope := "Mandatory"
 		if !c.Required {
 			scope = "Optional"
+		}
+		if c.Status == StatusNotCovered {
+			scope = "Not Covered"
 		}
 		statusBadge := fmt.Sprintf("[%s]", c.Status)
 		sb.WriteString(fmt.Sprintf("| **%s** | %s | `%s` | %s | %s |\n",
@@ -977,14 +988,14 @@ func (r *Runner) auditC9CancellationAndCleanup(eng engine.Engine) ClauseResult {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "Trigger creation before cleanup", Passed: true})
 	}
 
-	// 2. CheckStatus should see the trigger exists (TriggerUnanswered == true or PhaseInProgress)
+	// 2. CheckStatus should see the trigger exists (PhaseInProgress and TriggerUnanswered == true)
 	st, err := prov.CheckStatus(ctx, job, podName)
 	if err != nil {
 		cr.Status = StatusFailed
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus on created trigger", Passed: false, Message: fmt.Sprintf("CheckStatus error: %v", err)})
-	} else if st == nil || st.Phase != snapshot.PhaseInProgress {
+	} else if st == nil || st.Phase != snapshot.PhaseInProgress || !st.TriggerUnanswered {
 		cr.Status = StatusFailed
-		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus on created trigger", Passed: false, Message: fmt.Sprintf("unexpected status: %+v", st)})
+		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus on created trigger", Passed: false, Message: fmt.Sprintf("unexpected status: %+v (expected PhaseInProgress and TriggerUnanswered=true)", st)})
 	} else {
 		cr.Subtests = append(cr.Subtests, SubtestResult{Name: "CheckStatus on created trigger", Passed: true, Message: fmt.Sprintf("phase=%s, unanswered=%v", st.Phase, st.TriggerUnanswered)})
 	}
@@ -1045,8 +1056,8 @@ func (r *Runner) auditC10Security(eng engine.Engine) ClauseResult {
 		ID:       ClauseC10Security,
 		Title:    "Security isolation and privilege boundaries",
 		Required: false,
-		Status:   StatusSkipped,
-		Details:  "Security boundaries (C10) are verified in T2/T3 scenarios (#129).",
+		Status:   StatusNotCovered,
+		Details:  "Not checked by this adapter suite; tracked in #129.",
 	}
 }
 
@@ -1056,7 +1067,7 @@ func (r *Runner) auditC11Observability(eng engine.Engine) ClauseResult {
 		ID:       ClauseC11Observability,
 		Title:    "Telemetry and metric fidelity",
 		Required: false,
-		Status:   StatusSkipped,
-		Details:  "Telemetry labels and metric fidelity (C11) are verified in controller telemetry suites.",
+		Status:   StatusNotCovered,
+		Details:  "Not checked by this adapter suite; observability and telemetry fidelity tracked in controller telemetry suites.",
 	}
 }
