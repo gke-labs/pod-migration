@@ -45,33 +45,44 @@ func TestDeployManifestRestoreStatusPolicyMatchesTheAgent(t *testing.T) {
 		binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding
 		agent   *appsv1.DaemonSet
 	)
+	// Pick each object by kind and name, so that another policy, binding or
+	// DaemonSet added to the manifest later can't be taken for these.
 	for _, doc := range strings.Split(string(raw), "\n---") {
+		var meta struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		}
+		if err := k8syaml.Unmarshal([]byte(doc), &meta); err != nil {
+			t.Fatalf("unmarshal a document of deploy.yaml: %v", err)
+		}
 		switch {
-		case strings.Contains(doc, "\nkind: ValidatingAdmissionPolicy\n"):
+		case meta.Kind == "ValidatingAdmissionPolicy" && meta.Metadata.Name == name:
 			policy = &admissionregistrationv1.ValidatingAdmissionPolicy{}
 			if err := k8syaml.Unmarshal([]byte(doc), policy); err != nil {
 				t.Fatalf("unmarshal ValidatingAdmissionPolicy: %v", err)
 			}
-		case strings.Contains(doc, "\nkind: ValidatingAdmissionPolicyBinding\n"):
+		case meta.Kind == "ValidatingAdmissionPolicyBinding" && meta.Metadata.Name == name:
 			binding = &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
 			if err := k8syaml.Unmarshal([]byte(doc), binding); err != nil {
 				t.Fatalf("unmarshal ValidatingAdmissionPolicyBinding: %v", err)
 			}
-		case strings.Contains(doc, "\nkind: DaemonSet\n"):
+		case meta.Kind == "DaemonSet" && meta.Metadata.Name == "pod-migrate-agent":
 			agent = &appsv1.DaemonSet{}
 			if err := k8syaml.Unmarshal([]byte(doc), agent); err != nil {
 				t.Fatalf("unmarshal DaemonSet: %v", err)
 			}
 		}
 	}
-	if policy == nil || policy.Name != name {
-		t.Fatalf("deploy.yaml has no ValidatingAdmissionPolicy %s (found %+v)", name, policy)
+	if policy == nil {
+		t.Fatalf("deploy.yaml has no ValidatingAdmissionPolicy %s", name)
 	}
 	if binding == nil || binding.Spec.PolicyName != name {
 		t.Fatalf("deploy.yaml has no ValidatingAdmissionPolicyBinding for %s (found %+v)", name, binding)
 	}
 	if agent == nil {
-		t.Fatal("deploy.yaml has no agent DaemonSet")
+		t.Fatal("deploy.yaml has no pod-migrate-agent DaemonSet")
 	}
 	if len(binding.Spec.ValidationActions) != 1 || binding.Spec.ValidationActions[0] != admissionregistrationv1.Deny {
 		t.Errorf("binding's validationActions = %v, want [Deny]", binding.Spec.ValidationActions)

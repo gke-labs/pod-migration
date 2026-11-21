@@ -232,9 +232,9 @@ func (e *CRIU) NamespaceResources(pm *pmv1alpha1.PodMigration) ([]*unstructured.
 		}
 	}
 	parts := strings.SplitN(strings.TrimPrefix(location, "gs://"), "/", 2)
-	if parts[0] == "" {
-		// gs:// or gs:///path: a storage config without a bucket could never
-		// store a checkpoint (#233).
+	if strings.TrimSpace(parts[0]) == "" {
+		// gs://, gs:///path or a blank bucket name: a storage config without
+		// a bucket could never store a checkpoint (#233).
 		return nil, &StorageLocationError{
 			Location: location,
 			Message:  fmt.Sprintf("invalid GCS location: %s (missing bucket name)", location),

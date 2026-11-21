@@ -73,6 +73,9 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 	}
 	ctx := context.Background()
 
+	// The tenant namespace of the test's pods.
+	const ns = "apps"
+
 	// The identities, each with the RBAC that its manifest gives it. A
 	// tenant may edit pods, like a namespace's editors.
 	agentRole := &rbacv1.ClusterRole{}
@@ -94,6 +97,26 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 			{APIGroups: []string{""}, Resources: []string{"pods/status"}, Verbs: []string{"get", "update", "patch"}},
 		},
 	}
+	// Impostors: service accounts that only look like the allowed ones. Each
+	// policy compares the whole username, so a service account with the
+	// controller's name in a tenant namespace, or the engine's other service
+	// account, must be denied like anyone else. They may edit pods, so a
+	// denial is the policy's and not RBAC's.
+	podEditorRole := func(name string) *rbacv1.ClusterRole {
+		return &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Rules: []rbacv1.PolicyRule{
+				{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list", "update", "patch"}},
+				{APIGroups: []string{""}, Resources: []string{"pods/status"}, Verbs: []string{"get", "update", "patch"}},
+			},
+		}
+	}
+	const (
+		controllerImpostorUsername = "system:serviceaccount:" + ns + ":pod-migration-controller"
+		engineControllerUsername   = "system:serviceaccount:pod-migration-criu-system:pod-migrate-psengine-controller"
+	)
+	controllerImpostor := clientForRole(ctx, t, testEnv, admin, scheme, controllerImpostorUsername, podEditorRole("controller-impostor-pod-editor"))
+	engineController := clientForRole(ctx, t, testEnv, admin, scheme, engineControllerUsername, podEditorRole("engine-controller-pod-editor"))
 	controller := clientForRole(ctx, t, testEnv, admin, scheme, controllerUsername, controllerClusterRole(t))
 	statusWriter := clientForRole(ctx, t, testEnv, admin, scheme, "status-writer", statusRole)
 	agent := clientForRole(ctx, t, testEnv, admin, scheme, criuAgentUsername, agentRole)
@@ -108,7 +131,6 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 		}
 	}
 
-	const ns = "apps"
 	if err := admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
 		t.Fatalf("creating namespace: %v", err)
 	}
@@ -249,7 +271,10 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 					t.Errorf("%s = %q after the denials, want it unset", key, v)
 				}
 
-				ordered := newPod(t, ns, name+"-ordered", optedIn, map[string]string{key: "snap-a"})
+				// Another annotation stays on the pod, so that removing the
+				// order leaves the pod with annotations: the policy must
+				// notice a key that is gone, not only a pod without any.
+				ordered := newPod(t, ns, name+"-ordered", optedIn, map[string]string{key: "snap-a", "example.com/keep": "true"})
 				wantDenied(t, patch(t, tenant, ordered, set(key, "snap-evil")), restoreOrderPolicyName, "changing "+key)
 				wantDenied(t, patch(t, tenant, ordered, set(key, "")), restoreOrderPolicyName, "changing "+key+" to the cold-start bypass")
 				wantDenied(t, patch(t, tenant, ordered, unset(key)), restoreOrderPolicyName, "removing "+key)
@@ -270,6 +295,26 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 			if err != nil && !strings.Contains(err.Error(), want) {
 				t.Errorf("denial message = %q, want it to contain %q", err.Error(), want)
 			}
+		})
+
+		t.Run("a service account that only looks like the controller can't either", func(t *testing.T) {
+			pod := newPod(t, ns, "order-impostor", optedIn, map[string]string{gkeOrder: "snap-a", "example.com/keep": "true"})
+			for who, c := range map[string]client.Client{
+				"a same-named service account in a tenant namespace": controllerImpostor,
+				"the CRIU engine controller's service account":       engineController,
+				"the CRIU node agent":                                agent,
+			} {
+				wantDenied(t, patch(t, c, pod, set(gkeOrder, "snap-evil")), restoreOrderPolicyName, who+" changing the restore order")
+				wantDenied(t, patch(t, c, pod, set(criuOrder, "snap-evil")), restoreOrderPolicyName, who+" setting another group's restore order")
+				wantDenied(t, patch(t, c, pod, unset(gkeOrder)), restoreOrderPolicyName, who+" removing the restore order")
+			}
+			wantDenied(t, patchStatus(t, controllerImpostor, pod, set(gkeOrder, "snap-evil")), restoreOrderPolicyName,
+				"a same-named service account changing the restore order through pods/status")
+			if v, _ := annotation(t, pod, gkeOrder); v != "snap-a" {
+				t.Errorf("%s = %q after the denials, want snap-a", gkeOrder, v)
+			}
+			// They aren't locked out of the rest of the pod.
+			wantAllowed(t, patch(t, controllerImpostor, pod, set("example.com/owner", "team-a")), "a same-named service account adding another annotation")
 		})
 
 		t.Run("the controller orders a restore and completes it", func(t *testing.T) {
@@ -308,7 +353,7 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 		})
 
 		t.Run("the status subresource is no way around it", func(t *testing.T) {
-			pod := newPod(t, ns, "order-via-status", optedIn, map[string]string{gkeOrder: "snap-a"})
+			pod := newPod(t, ns, "order-via-status", optedIn, map[string]string{gkeOrder: "snap-a", "example.com/keep": "true"})
 			wantDenied(t, patchStatus(t, statusWriter, pod, set(gkeOrder, "snap-evil")), restoreOrderPolicyName, "changing the order through pods/status")
 			wantDenied(t, patchStatus(t, statusWriter, pod, set(criuOrder, "snap-evil")), restoreOrderPolicyName, "setting another group's order through pods/status")
 			wantDenied(t, patchStatus(t, statusWriter, pod, unset(gkeOrder)), restoreOrderPolicyName, "removing the order through pods/status")
@@ -420,7 +465,14 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 
 		t.Run("nobody else records it", func(t *testing.T) {
 			pod := newPod(t, ns, "status-others", optedIn, nil)
-			for who, c := range map[string]client.Client{"a tenant": tenant, "the controller": controller, "an admin": admin} {
+			for who, c := range map[string]client.Client{
+				"a tenant":       tenant,
+				"the controller": controller,
+				"an admin":       admin,
+				// Service accounts that only look like the node agent's.
+				"the CRIU engine controller's service account":       engineController,
+				"a same-named service account in a tenant namespace": controllerImpostor,
+			} {
 				wantDenied(t, patch(t, c, pod, set(status, engine.CRIURestoreStatusRestored)), restoreStatusPolicyName, who+" recording restored")
 				wantDenied(t, patch(t, c, pod, set(status, "")), restoreStatusPolicyName, who+" setting an empty outcome")
 			}
@@ -455,25 +507,46 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 		})
 	})
 
-	// Break glass: with the binding deleted, the policy no longer denies.
-	t.Run("deleting the binding lifts the restore order policy", func(t *testing.T) {
+	// Break glass, as the README describes it: with the binding's action set to
+	// Audit the policy no longer denies, and it denies again once the action
+	// is Deny. Nothing is deleted or applied again.
+	t.Run("setting the binding to Audit lifts the restore order policy until it is Deny again", func(t *testing.T) {
 		pod := newPod(t, ns, "order-break-glass", optedIn, map[string]string{gkeOrder: "snap-a"})
-		if err := admin.Delete(ctx, orderBinding); err != nil {
-			t.Fatalf("deleting the binding: %v", err)
+		setActions := func(actions ...admissionregistrationv1.ValidationAction) {
+			t.Helper()
+			binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+			if err := admin.Get(ctx, client.ObjectKeyFromObject(orderBinding), binding); err != nil {
+				t.Fatalf("reading the binding: %v", err)
+			}
+			base := binding.DeepCopy()
+			binding.Spec.ValidationActions = actions
+			if err := admin.Patch(ctx, binding, client.MergeFrom(base)); err != nil {
+				t.Fatalf("setting the binding's validationActions to %v: %v", actions, err)
+			}
 		}
-		deadline := time.Now().Add(60 * time.Second)
-		for i := 0; ; i++ {
-			err := patch(t, admin, pod, set(gkeOrder, fmt.Sprintf("snap-manual-%d", i)))
-			if err == nil {
-				break
+		// The API server picks up a binding change within a moment.
+		waitFor := func(what string, done func(err error) bool) {
+			t.Helper()
+			deadline := time.Now().Add(60 * time.Second)
+			for i := 0; ; i++ {
+				err := patch(t, admin, pod, set(gkeOrder, fmt.Sprintf("snap-manual-%s-%d", what, i)))
+				if done(err) {
+					return
+				}
+				if err != nil && !deniedBy(err, restoreOrderPolicyName) {
+					t.Fatalf("changing the restore order while waiting for the policy to be %s: %v", what, err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the policy isn't %s 60s after the binding changed (last error: %v)", what, err)
+				}
+				time.Sleep(200 * time.Millisecond)
 			}
-			if !deniedBy(err, restoreOrderPolicyName) {
-				t.Fatalf("changing the restore order without the binding: %v", err)
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("the policy still denies 60s after its binding was deleted: %v", err)
-			}
-			time.Sleep(200 * time.Millisecond)
 		}
+
+		setActions(admissionregistrationv1.Audit)
+		waitFor("lifted", func(err error) bool { return err == nil })
+
+		setActions(admissionregistrationv1.Deny)
+		waitFor("enforced", func(err error) bool { return deniedBy(err, restoreOrderPolicyName) })
 	})
 }

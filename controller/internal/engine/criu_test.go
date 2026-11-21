@@ -270,7 +270,7 @@ func TestCRIU_NamespaceResourcesRejectsUnusableLocations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCRIU: %v", err)
 	}
-	for _, location := range []string{"", "bucket/path", "s3://bucket", "gs://", "gs:///", "gs:///path"} {
+	for _, location := range []string{"", "bucket/path", "s3://bucket", "gs://", "gs:///", "gs:///path", "gs:// ", "gs:// /path", "gs://\t/path"} {
 		t.Run(location, func(t *testing.T) {
 			pm := &pmv1alpha1.PodMigration{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mig", UID: types.UID("pm-uid-1")},

@@ -464,8 +464,13 @@ webhooks:
 # mpodgate. A pod without it isn't migrated, and a restore order on it is a
 # restore outside a migration, which the engine authorizes (C10 R1, #55).
 #
-# To change a restore order by hand in an emergency, delete the binding below,
-# and apply it again afterwards.
+# The validation below names the controller's service account, namespace
+# included. An install that renames the namespace or the service account must
+# change it there too, or the controller itself is denied.
+#
+# To change a restore order by hand in an emergency, set the binding's
+# validationActions to ["Audit"], and back to ["Deny"] afterwards (see the
+# README). While it is Audit, no opted-in pod in the cluster is protected.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:

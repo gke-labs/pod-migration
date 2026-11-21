@@ -641,6 +641,53 @@ func TestRenderForLookup(t *testing.T) {
 	})
 }
 
+// renderForLookup is only right for an engine whose rendered objects have the
+// same kinds, namespaces and names whatever the storage location is: with a
+// placeholder location it would otherwise look up, and delete, the wrong
+// objects. Nothing in the Engine interface enforces that, so this checks it
+// for every engine the controller registers. Add a new engine here.
+func TestEngineObjectNamesDontDependOnTheStorageLocation(t *testing.T) {
+	criu, err := engine.NewCRIU(nil, nil, engine.CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	criuSharedGroup, err := engine.NewCRIU(nil, nil, engine.DefaultAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	engines := map[string]engine.Engine{
+		engine.GKEPodSnapshotsName:                engine.NewGKEPodSnapshots(nil, nil),
+		engine.CRIUName:                           criu,
+		engine.CRIUName + " in the default group": criuSharedGroup,
+	}
+	identity := func(t *testing.T, eng engine.Engine, location string) []string {
+		t.Helper()
+		objs, err := eng.NamespaceResources(engineTestPodMigration(location))
+		if err != nil {
+			t.Fatalf("NamespaceResources(%q): %v", location, err)
+		}
+		var out []string
+		for _, o := range objs {
+			out = append(out, o.GroupVersionKind().String()+" "+o.GetNamespace()+"/"+o.GetName())
+		}
+		return out
+	}
+	for name, eng := range engines {
+		t.Run(name, func(t *testing.T) {
+			want := identity(t, eng, lookupStorageLocation)
+			if len(want) == 0 {
+				t.Fatalf("the engine renders no objects for %s", lookupStorageLocation)
+			}
+			for _, location := range []string{"gs://bucket-a", "gs://bucket-b/some/long/path", "gs://another-bucket/"} {
+				if got := identity(t, eng, location); !reflect.DeepEqual(got, want) {
+					t.Errorf("objects for %s are %v, but for %s they are %v: renderForLookup would look up the wrong objects",
+						location, got, lookupStorageLocation, want)
+				}
+			}
+		})
+	}
+}
+
 // A PodMigration's storage location can be edited to one that the engines
 // reject after their objects were synced. Deleting it must still wait for a
 // CRIU migration in flight, and then delete the CRIU policy and storage

@@ -530,19 +530,27 @@ On a Pod that is opted into migration, only the controller may set, change or re
 ValidatingAdmissionPolicy 'pod-migration-restore-order' with binding 'pod-migration-restore-order' denied request: only the Pod Migration controller may set, change or remove a restore order (<group>/ps-name) on an existing pod that is opted into migration
 ```
 
-Other updates of the Pod aren't affected, and a Pod without the `pod-migration.gke.io/enabled: "true"` label isn't either. If you must edit a restore order by hand, for example in a test reset:
+Other updates of the Pod aren't affected, and a Pod without the `pod-migration.gke.io/enabled: "true"` label isn't either. If you must edit a restore order by hand, for example in a test reset, switch the policy's binding from denying to only auditing, and back. Don't delete the binding and don't apply `controller/deploy.yaml` again for this: applying the whole manifest can also roll the controller onto another image and restart it.
 
-1. **Delete the policy's binding.** The API server stops enforcing the policy within a few seconds:
+> [!WARNING]
+> While the binding is set to `Audit`, no opted-in Pod in the cluster is protected: anyone who may update Pods can set a restore order. Keep the window short.
+
+1. **Set the binding to audit only.** The API server stops denying within a few seconds:
    ```bash
-   kubectl delete validatingadmissionpolicybinding pod-migration-restore-order
+   kubectl patch validatingadmissionpolicybinding pod-migration-restore-order \
+     --type=json -p='[{"op": "replace", "path": "/spec/validationActions", "value": ["Audit"]}]'
    ```
 2. **Edit the annotation.**
-3. **Apply the manifest again**, which recreates the binding:
+3. **Set the binding back to deny**, and check it:
    ```bash
-   sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
+   kubectl patch validatingadmissionpolicybinding pod-migration-restore-order \
+     --type=json -p='[{"op": "replace", "path": "/spec/validationActions", "value": ["Deny"]}]'
+   kubectl get validatingadmissionpolicybinding pod-migration-restore-order -o jsonpath='{.spec.validationActions}'
    ```
 
-The CRIU engine protects its restore outcome (`pod-migrate.io/psengine-restore`) the same way, with the `pod-migrate-psengine-restore-status` policy in `engines/criu/deploy/deploy.yaml`.
+The CRIU engine protects its restore outcome (`pod-migrate.io/psengine-restore`) the same way, with the `pod-migrate-psengine-restore-status` policy and binding in `engines/criu/deploy/deploy.yaml`. The same steps apply to that binding.
+
+**Custom namespace or service account:** each policy names the one identity it allows, as a literal: `system:serviceaccount:pod-migration-system:pod-migration-controller` in `controller/deploy.yaml`, and `system:serviceaccount:pod-migration-criu-system:pod-migrate-agent` in `engines/criu/deploy/deploy.yaml`. If you install into another namespace or rename a service account, change that line in the policy too. Otherwise the controller is denied whenever it orders a restore, and the node agent whenever it records an outcome.
 
 ## 8. Monitoring & Prometheus Metrics
 
