@@ -66,57 +66,6 @@ func TestIsNodePreempting(t *testing.T) {
 			expected: true,
 		},
 		{
-			name: "node with cloud.google.com/gke-preempted taint",
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: "gke-preempted-node-taint"},
-				Spec: corev1.NodeSpec{
-					Taints: []corev1.Taint{
-						{Key: TaintGKEPreempted, Effect: corev1.TaintEffectNoSchedule},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "node with pod-migration.gke.io/node-preempting taint",
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: "pm-preempting-node-taint"},
-				Spec: corev1.NodeSpec{
-					Taints: []corev1.Taint{
-						{Key: TaintPodMigrationPreempting, Effect: corev1.TaintEffectNoSchedule},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "node with pod-migration.gke.io/node-preempting=true label",
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "pm-preempting-node-label",
-					Labels: map[string]string{
-						LabelNodePreempting: ValueNodePreempting,
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "node with PreemptionImminent=True condition",
-			node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: "preemption-imminent-cond-node"},
-				Status: corev1.NodeStatus{
-					Conditions: []corev1.NodeCondition{
-						{
-							Type:   ConditionPreemptionImminent,
-							Status: corev1.ConditionTrue,
-						},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
 			name: "node with GKE active maintenance label ONGOING",
 			node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{

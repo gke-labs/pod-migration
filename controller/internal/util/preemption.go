@@ -37,22 +37,9 @@ const (
 	// TaintImpendingNodeTermination is applied by GKE during scheduled host maintenance / node termination.
 	TaintImpendingNodeTermination = "cloud.google.com/impending-node-termination"
 
-	// TaintGKEPreempted is applied by GKE on Spot VM preemption.
-	TaintGKEPreempted = "cloud.google.com/gke-preempted"
-
-	// TaintPodMigrationPreempting is applied by node-local preemption watchers for sub-second signaling.
-	TaintPodMigrationPreempting = "pod-migration.gke.io/node-preempting"
-
 	// LabelActiveNodeMaintenance is applied by GKE during active host maintenance.
 	LabelActiveNodeMaintenance = "cloud.google.com/active-node-maintenance"
 	ValueMaintenanceOngoing    = "ONGOING"
-
-	// LabelNodePreempting is applied by node-local preemption watchers for sub-second signaling.
-	LabelNodePreempting = "pod-migration.gke.io/node-preempting"
-	ValueNodePreempting = "true"
-
-	// ConditionPreemptionImminent indicates that host-level preemption / maintenance notice was received.
-	ConditionPreemptionImminent = corev1.NodeConditionType("PreemptionImminent")
 
 	// PreemptionDefaultTimeout is the migration deadline for spot preemption triggers (2 minutes),
 	// bounding PMJ duration so doomed migrations fail fast rather than waiting on departed nodes.
@@ -72,41 +59,28 @@ const (
 //
 // Signals checked:
 //  1. GKE host maintenance taint: cloud.google.com/impending-node-termination
-//  2. Spot preemption taints: cloud.google.com/gke-preempted, pod-migration.gke.io/node-preempting
-//  3. GKE active host maintenance label: cloud.google.com/active-node-maintenance=ONGOING
-//  4. Low-latency node preemption label: pod-migration.gke.io/node-preempting=true
-//  5. Low-latency condition: PreemptionImminent=True
-//  6. Kubelet graceful node shutdown: NodeReady condition Status=False with
+//  2. GKE host maintenance label: cloud.google.com/active-node-maintenance=ONGOING
+//  3. Kubelet graceful node shutdown: NodeReady condition Status=False with
 //     Reason "KubeletNotReady", and message containing "node is shutting down".
 func IsNodePreempting(node *corev1.Node) bool {
 	if node == nil {
 		return false
 	}
 
-	// 1. Taints: GKE impending node termination or Spot preemption taints
+	// 1. Taints: GKE impending node termination taint
 	for _, taint := range node.Spec.Taints {
-		if taint.Key == TaintImpendingNodeTermination ||
-			taint.Key == TaintGKEPreempted ||
-			taint.Key == TaintPodMigrationPreempting {
+		if taint.Key == TaintImpendingNodeTermination {
 			return true
 		}
 	}
 
-	// 2. Labels: GKE active host maintenance or low-latency node preemption label
-	if node.Labels != nil {
-		if node.Labels[LabelActiveNodeMaintenance] == ValueMaintenanceOngoing ||
-			node.Labels[LabelNodePreempting] == ValueNodePreempting {
-			return true
-		}
+	// 2. Labels: GKE active host maintenance
+	if node.Labels != nil && node.Labels[LabelActiveNodeMaintenance] == ValueMaintenanceOngoing {
+		return true
 	}
 
-	// 3. Conditions: low-latency PreemptionImminent condition or Kubelet graceful shutdown
-	for _, cond := range node.Status.Conditions {
-		if cond.Type == ConditionPreemptionImminent && cond.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-
+	// 3. Conditions: Kubelet Graceful Node Shutdown sets NodeReady to False with reason
+	// KubeletNotReady and message indicating the node is shutting down.
 	return IsNodeShuttingDown(node)
 }
 
