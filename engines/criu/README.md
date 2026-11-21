@@ -398,6 +398,48 @@ kubectl get podsnapshots.criu.podmigration.gke.io -A -o jsonpath='{range .items[
 The controller's `make -C controller undeploy` doesn't touch CRIU
 `PodSnapshot`s, so it isn't affected.
 
+## Rolling Node-Pool Upgrades & Kernel Compatibility
+
+Rolling node-pool upgrades in GKE cordon and drain nodes one by one, triggering the `EvictionGate` to initiate live migrations for opted-in stateful pods (`pod-migration.gke.io/enabled: "true"`). During a rolling upgrade, pods checkpointed on an older node are restored onto an upgraded node that may run a newer Linux kernel, containerd, runc, or CRIU version.
+
+### Version Compatibility Matrix & Guidelines
+
+| Upgrade Type                   | Example Jump                               | Compatibility Status               | Operational Guidance & Behavior                                                                                                                                                                                                 |
+| ------------------------------ | ------------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **GKE Patch Upgrade**          | `1.34.1-gke.1000` &rarr; `1.34.2-gke.1100` | **Fully Supported**                | Identical kernel major.minor, identical glibc/ABI. In-memory state and socket structures restore with zero degradation.                                                                                                         |
+| **GKE Minor Upgrade**          | `1.34.x` &rarr; `1.35.x`                   | **Supported (forward-compatible)** | Newer kernel on destination node. Linux user-space ABI stability ensures task memory, threads, and file descriptors restore cleanly provided CPU features match.                                                                |
+| **Minor Downgrade / Rollback** | `1.35.x` &rarr; `1.34.x`                   | **Best-effort / Fallback**         | Checkpoints utilizing newer kernel syscalls or vDSO mappings may fail to restore on older kernels. Handled safely: the replacement pod falls back to a clean cold start with `RestoreCrashFallback`.                            |
+| **CPU Architecture Mismatch**  | Intel &rarr; AMD / mixed microarch         | **Refused (fenced)**               | Heterogeneous CPU instruction sets (e.g. missing AVX/AVX-512 flags) cause SIGILL on restore. Filtered via `status.sourceNode` facts recorded at checkpoint time ([#257](https://github.com/gke-labs/pod-migration/issues/257)). |
+
+### Prerequisites for Clean Upgrades
+
+1. **Homogeneous Node Pools:** Node pools participating in rolling upgrades must share CPU family and instruction sets.
+2. **Container Runtime Compatibility:** All nodes must run containerd `>= 2.0` (with patch requirements satisfying CVE-2026-95837) and `runc >= 1.2`.
+3. **In-Memory Integrity Verification:** Workloads must use explicit entrypoints (`command: ["docker-entrypoint.sh"]`) and opt-in labels.
+
+### Running the Live Upgrade Verification Suite
+
+The repository includes an automated verification script in `verification-suite/run_criu_nodepool_upgrade.sh` that deploys an in-memory stateful workload (Redis or monotonic counter), seeds unpersisted in-memory state, drives/monitors the node pool upgrade, and verifies zero restarts, verified restore outcomes, and data survival:
+
+```bash
+# Offline self-test (validates manifests, verifiers, and failure paths):
+./verification-suite/run_criu_nodepool_upgrade.sh --self-test
+
+# Live cluster rolling upgrade test:
+./verification-suite/run_criu_nodepool_upgrade.sh \
+  --cluster kyber-test \
+  --location northamerica-northeast2-b \
+  --node-pool criu-pool \
+  --target-version 1.34.2-gke.1100 \
+  --workload redis
+
+# Drain-only verification across existing mixed-version nodes:
+./verification-suite/run_criu_nodepool_upgrade.sh \
+  --namespace pm-upgrade-test \
+  --drain-node \
+  --skip-upgrade
+```
+
 ## Building & Testing
 
 ```bash
