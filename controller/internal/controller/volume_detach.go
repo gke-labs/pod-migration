@@ -18,21 +18,49 @@ package controller
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // ReasonVolumeDetachTimeout is recorded when origin pod volume detachment exceeds migration timeout.
 const ReasonVolumeDetachTimeout = "VolumeDetachTimeout"
 
-// areOriginVolumesDetached reports whether all PersistentVolumes listed in pvs have
+// ReasonWaitingForVolumeDetach is the Ready condition reason while waiting for origin volumes to detach.
+const ReasonWaitingForVolumeDetach = "WaitingForVolumeDetach"
+
+// isRWOAccessMode reports whether accessModes specifies ReadWriteOnce or ReadWriteOncePod.
+// An empty slice is treated as RWO for test fixture compatibility where AccessModes was omitted.
+func isRWOAccessMode(accessModes []corev1.PersistentVolumeAccessMode) bool {
+	if len(accessModes) == 0 {
+		return true
+	}
+	for _, mode := range accessModes {
+		if mode == corev1.ReadWriteOnce || mode == corev1.ReadWriteOncePod {
+			return true
+		}
+	}
+	return false
+}
+
+// areOriginVolumesDetached reports whether all RWO/RWOP PersistentVolumes listed in pvs have
 // detached from originNodeName. Attachments on other nodes (such as the destination node
-// or existing ReadWriteMany attachments) do not block detachment verification.
+// or existing ReadWriteMany attachments) do not block detachment verification. Non-RWO
+// volumes (e.g. ReadWriteMany, ReadOnlyMany) are skipped.
 func areOriginVolumesDetached(ctx context.Context, cl client.Reader, originNodeName string, pvs []string) (bool, error) {
 	for _, targetPV := range pvs {
 		if targetPV == "" {
 			continue
 		}
+		// If the PersistentVolume object is accessible, skip non-RWO volumes (RWX/ROX).
+		pv := &corev1.PersistentVolume{}
+		if err := cl.Get(ctx, types.NamespacedName{Name: targetPV}, pv); err == nil {
+			if len(pv.Spec.AccessModes) > 0 && !isRWOAccessMode(pv.Spec.AccessModes) {
+				continue
+			}
+		}
+
 		vaList := &storagev1.VolumeAttachmentList{}
 		if err := cl.List(ctx, vaList, client.MatchingFields{VolumeAttachmentPVIndex: targetPV}); err != nil {
 			return false, err

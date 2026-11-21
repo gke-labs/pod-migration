@@ -1024,7 +1024,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					isMisconfigured := misconfigCond != nil && misconfigCond.Status == metav1.ConditionTrue
 
 					readyCond := meta.FindStatusCondition(job.Status.Conditions, "Ready")
-					isWaitingDetach := readyCond != nil && readyCond.Reason == "WaitingForVolumeDetach"
+					isWaitingDetach := readyCond != nil && readyCond.Reason == ReasonWaitingForVolumeDetach
 
 					if isPDBBlocked || isMisconfigured || isWaitingDetach {
 						reason := "PDBEvictionTimeout"
@@ -1378,7 +1378,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 							logger.Error(err, "Failed to get PVC for volume analysis", "pvc", vol.PersistentVolumeClaim.ClaimName)
 							return ctrl.Result{}, err // Return error to trigger manager retry
 						}
-						if pvc.Spec.VolumeName != "" {
+						if pvc.Spec.VolumeName != "" && isRWOAccessMode(pvc.Spec.AccessModes) {
 							pvs = append(pvs, pvc.Spec.VolumeName)
 						}
 					}
@@ -1767,7 +1767,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				cond := metav1.Condition{
 					Type:               "Ready",
 					Status:             metav1.ConditionFalse,
-					Reason:             "WaitingForVolumeDetach",
+					Reason:             ReasonWaitingForVolumeDetach,
 					Message:            fmt.Sprintf("Waiting for PVs to detach: %v", job.Status.PVsToDetach),
 					ObservedGeneration: job.Generation,
 				}

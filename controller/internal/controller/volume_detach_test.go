@@ -37,10 +37,14 @@ import (
 
 func TestAreOriginVolumesDetached(t *testing.T) {
 	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
 	_ = storagev1.AddToScheme(scheme)
 
 	pvName := "pv-data-1"
 	pvOther := "pv-data-2"
+	pvRWX := "pv-rwx"
+	pvROX := "pv-rox"
+	pvRWOP := "pv-rwop"
 	originNode := "node-origin"
 	destNode := "node-dest"
 
@@ -94,6 +98,57 @@ func TestAreOriginVolumesDetached(t *testing.T) {
 		Status: storagev1.VolumeAttachmentStatus{
 			Attached: true,
 		},
+	}
+
+	pvRWXObj := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: pvRWX},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+		},
+	}
+	vaRWXAttached := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-rwx"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			NodeName: originNode,
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvRWX,
+			},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+
+	pvROXObj := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: pvROX},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+		},
+	}
+	vaROXAttached := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-rox"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			NodeName: originNode,
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvROX,
+			},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+
+	pvRWOPObj := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: pvRWOP},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
+		},
+	}
+	vaRWOPAttached := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-rwop"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			NodeName: originNode,
+			Source: storagev1.VolumeAttachmentSource{
+				PersistentVolumeName: &pvRWOP,
+			},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
 	}
 
 	t.Run("empty pvs returns true", func(t *testing.T) {
@@ -167,11 +222,54 @@ func TestAreOriginVolumesDetached(t *testing.T) {
 			t.Fatalf("expected detached=false because pvOther is still attached")
 		}
 	})
-}
 
-func makeTestRegistry(cl ...runtime.Object) *engine.Registry {
-	reg := engine.NewRegistry(engine.GKEPodSnapshotsName)
-	return reg
+	t.Run("RWX volume attached on origin node is skipped", func(t *testing.T) {
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+			WithObjects(pvRWXObj, vaRWXAttached).
+			Build()
+
+		detached, err := areOriginVolumesDetached(context.Background(), cl, originNode, []string{pvRWX})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !detached {
+			t.Fatalf("expected detached=true because RWX volume is not RWO")
+		}
+	})
+
+	t.Run("ROX volume attached on origin node is skipped", func(t *testing.T) {
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+			WithObjects(pvROXObj, vaROXAttached).
+			Build()
+
+		detached, err := areOriginVolumesDetached(context.Background(), cl, originNode, []string{pvROX})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !detached {
+			t.Fatalf("expected detached=true because ROX volume is not RWO")
+		}
+	})
+
+	t.Run("RWOP volume attached on origin node returns false", func(t *testing.T) {
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
+			WithObjects(pvRWOPObj, vaRWOPAttached).
+			Build()
+
+		detached, err := areOriginVolumesDetached(context.Background(), cl, originNode, []string{pvRWOP})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if detached {
+			t.Fatalf("expected detached=false because RWOP is single-writer")
+		}
+	})
 }
 
 func TestPodMigrationJob_VolumeDetachTimeout_ConcludesSucceededWithoutRestore(t *testing.T) {
@@ -207,7 +305,7 @@ func TestPodMigrationJob_VolumeDetachTimeout_ConcludesSucceededWithoutRestore(t 
 				{
 					Type:               "Ready",
 					Status:             metav1.ConditionFalse,
-					Reason:             "WaitingForVolumeDetach",
+					Reason:             ReasonWaitingForVolumeDetach,
 					Message:            fmt.Sprintf("Waiting for PVs to detach: [%s]", pvName),
 					ObservedGeneration: 1,
 				},
@@ -272,27 +370,46 @@ func TestPodMigrationJob_VolumeDetachTimeout_ConcludesSucceededWithoutRestore(t 
 	}
 }
 
-func TestPodGate_HoldsReplacementGateUntilVolumesDetached_OnColdFallback(t *testing.T) {
+// TestVolumeDetach_VANeverDetaches_DegradesToColdStart verifies that when an origin VolumeAttachment
+// never detaches through the migration deadline, the PMJ concludes as SucceededWithoutRestore / VolumeDetachTimeout,
+// and the PodGateReconciler releases the replacement pod cold on the first pass without wedging.
+func TestVolumeDetach_VANeverDetaches_DegradesToColdStart(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
 	_ = storagev1.AddToScheme(scheme)
 
-	pvName := "pv-data-cold"
-	originNode := "node-source"
+	pvName := "pv-data-never-detach"
+	originNode := "node-source-stuck"
+	now := metav1.Now()
+	evictingStart := metav1.NewTime(now.Add(-15 * time.Minute))
 
 	pmj := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pmj-cold-fallback",
-			Namespace: "default",
+			Name:              "pmj-stuck-va",
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(now.Add(-20 * time.Minute)),
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
-			PodRef: corev1.LocalObjectReference{Name: "app-0"},
+			PodRef:       corev1.LocalObjectReference{Name: "app-0"},
+			TargetPodUID: "uid-app-0",
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase:          pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
-			OriginNodeName: originNode,
-			PVsToDetach:    []string{pvName},
+			Phase:                 pmv1alpha1.PodMigrationJobPhaseEvicting,
+			SnapshotRef:           "snap-app-0",
+			OriginNodeName:        originNode,
+			PVsToDetach:           []string{pvName},
+			EvictingStartTime:     &evictingStart,
+			SnapshottingStartTime: &evictingStart,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             ReasonWaitingForVolumeDetach,
+					Message:            fmt.Sprintf("Waiting for PVs to detach: [%s]", pvName),
+					ObservedGeneration: 1,
+				},
+			},
 		},
 	}
 
@@ -312,8 +429,9 @@ func TestPodGate_HoldsReplacementGateUntilVolumesDetached_OnColdFallback(t *test
 		},
 	}
 
+	// VolumeAttachment remains attached on origin node indefinitely.
 	va := &storagev1.VolumeAttachment{
-		ObjectMeta: metav1.ObjectMeta{Name: "va-cold"},
+		ObjectMeta: metav1.ObjectMeta{Name: "va-stuck"},
 		Spec: storagev1.VolumeAttachmentSpec{
 			NodeName: originNode,
 			Source: storagev1.VolumeAttachmentSource{
@@ -334,168 +452,203 @@ func TestPodGate_HoldsReplacementGateUntilVolumesDetached_OnColdFallback(t *test
 	reg := engine.NewRegistry(engine.GKEPodSnapshotsName)
 	_ = reg.Register(engine.NewGKEPodSnapshots(cl, scheme))
 
-	r := &PodGateReconciler{
+	pmjReconciler := &PodMigrationJobReconciler{
+		Client:                  cl,
+		Scheme:                  scheme,
+		DefaultMigrationTimeout: 10 * time.Minute,
+		Engines:                 reg,
+	}
+
+	// 1. PMJ reconciler runs: timeout exceeded -> transitions to SucceededWithoutRestore (VolumeDetachTimeout).
+	pmjRes, err := pmjReconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: pmj.Namespace, Name: pmj.Name},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling PMJ: %v", err)
+	}
+	if pmjRes.Requeue || pmjRes.RequeueAfter != 0 {
+		t.Fatalf("expected terminal PMJ with no requeue, got: %+v", pmjRes)
+	}
+
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: pmj.Namespace, Name: pmj.Name}, updatedPMJ); err != nil {
+		t.Fatalf("failed to get updated PMJ: %v", err)
+	}
+	if updatedPMJ.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		t.Fatalf("expected phase %s, got %s", pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore, updatedPMJ.Status.Phase)
+	}
+
+	// 2. Pod Gate reconciler runs: job is terminal -> must release replacement pod cold on first pass.
+	gateReconciler := &PodGateReconciler{
 		Client:    cl,
 		APIReader: cl,
 		Scheme:    scheme,
 		Engines:   reg,
 	}
 
-	// First pass: volume is still attached to origin node -> must hold gate and requeue.
-	res, err := r.Reconcile(context.Background(), reconcile.Request{
+	gateRes, err := gateReconciler.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
 	})
 	if err != nil {
-		t.Fatalf("unexpected reconcile error: %v", err)
+		t.Fatalf("unexpected error reconciling pod gate: %v", err)
 	}
-	if res.RequeueAfter != 3*time.Second {
-		t.Fatalf("expected requeue after 3s while volume is attached, got: %v", res.RequeueAfter)
+	if gateRes.RequeueAfter != 0 {
+		t.Fatalf("expected immediate completion without requeue, got: %v", gateRes.RequeueAfter)
 	}
 
 	checkPod := &corev1.Pod{}
 	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, checkPod); err != nil {
 		t.Fatalf("failed to get pod: %v", err)
 	}
-	if len(checkPod.Spec.SchedulingGates) == 0 {
-		t.Fatalf("scheduling gate was prematurely removed while volume was still attached to origin node!")
-	}
-
-	// Second pass: volume finishes detaching.
-	va.Status.Attached = false
-	if err := cl.Status().Update(context.Background(), va); err != nil {
-		t.Fatalf("failed to update volume attachment status: %v", err)
-	}
-
-	res, err = r.Reconcile(context.Background(), reconcile.Request{
-		NamespacedName: types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
-	})
-	if err != nil {
-		t.Fatalf("unexpected reconcile error after detachment: %v", err)
-	}
-	if res.RequeueAfter != 0 {
-		t.Fatalf("expected immediate completion without requeue, got: %v", res.RequeueAfter)
-	}
-
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, checkPod); err != nil {
-		t.Fatalf("failed to get pod after detachment: %v", err)
-	}
 	if len(checkPod.Spec.SchedulingGates) != 0 {
-		t.Fatalf("expected scheduling gate to be removed once volume detached, but gate remains")
+		t.Fatalf("scheduling gate was not removed; replacement was wedged!")
 	}
 	if checkPod.Annotations["podsnapshot.gke.io/ps-name"] != "" {
-		t.Fatalf("expected empty snapshot annotation on cold-start bypass, got %v", checkPod.Annotations)
+		t.Fatalf("expected cold-start bypass (empty ps-name annotation), got: %s", checkPod.Annotations["podsnapshot.gke.io/ps-name"])
 	}
 }
 
-func TestPodGate_HoldsReplacementGateUntilVolumesDetached_OnWarmRestore(t *testing.T) {
+// TestPodMigrationJob_VolumeAnalysis_FiltersNonRWOVolumes verifies that during Pending phase,
+// only RWO and RWOP PersistentVolumes are added to PVsToDetach, while RWX and ROX volumes are excluded.
+func TestPodMigrationJob_VolumeAnalysis_FiltersNonRWOVolumes(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
 	_ = storagev1.AddToScheme(scheme)
 
-	pvName := "pv-data-warm"
-	originNode := "node-source-warm"
+	namespace := "default"
+	podName := "app-volumes-0"
+	nodeName := "node-1"
 
-	pmj := &pmv1alpha1.PodMigrationJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pmj-warm-restore",
-			Namespace: "default",
+	pvcRWO := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "pvc-rwo"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:  "pv-rwo",
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 		},
-		Spec: pmv1alpha1.PodMigrationJobSpec{
-			PodRef: corev1.LocalObjectReference{Name: "db-0"},
+	}
+	pvcRWOP := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "pvc-rwop"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:  "pv-rwop",
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
 		},
-		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase:          pmv1alpha1.PodMigrationJobPhaseRestoring,
-			SnapshotRef:    "snap-db-0",
-			OriginNodeName: originNode,
-			PVsToDetach:    []string{pvName},
+	}
+	pvcRWX := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "pvc-rwx"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:  "pv-rwx",
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+		},
+	}
+	pvcROX := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "pvc-rox"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:  "pv-rox",
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
 		},
 	}
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "db-0",
-			Namespace: "default",
-			UID:       "uid-replacement-warm",
-			Annotations: map[string]string{
-				util.AnnotationAssignedPMJ: pmj.Name,
-			},
+			Namespace: namespace,
+			Name:      podName,
+			UID:       "uid-app-vol",
 		},
 		Spec: corev1.PodSpec{
-			SchedulingGates: []corev1.PodSchedulingGate{
-				{Name: MigrationGateName},
+			NodeName: nodeName,
+			Volumes: []corev1.Volume{
+				{
+					Name: "vol-rwo",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcRWO.Name},
+					},
+				},
+				{
+					Name: "vol-rwop",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcRWOP.Name},
+					},
+				},
+				{
+					Name: "vol-rwx",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcRWX.Name},
+					},
+				},
+				{
+					Name: "vol-rox",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcROX.Name},
+					},
+				},
 			},
 		},
 	}
 
-	va := &storagev1.VolumeAttachment{
-		ObjectMeta: metav1.ObjectMeta{Name: "va-warm"},
-		Spec: storagev1.VolumeAttachmentSpec{
-			NodeName: originNode,
-			Source: storagev1.VolumeAttachmentSource{
-				PersistentVolumeName: &pvName,
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeName,
+			Labels: map[string]string{
+				"node.kubernetes.io/instance-type": "e2-standard-4",
 			},
 		},
-		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "pmj-volume-analysis",
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: podName},
+			TargetPodUID: "uid-app-vol",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhasePending,
+		},
 	}
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
-		WithIndex(&storagev1.VolumeAttachment{}, VolumeAttachmentPVIndex, VolumeAttachmentPVIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(pmj, pod, va).
+		WithObjects(pmj, pod, node, pvcRWO, pvcRWOP, pvcRWX, pvcROX).
 		Build()
 
 	reg := engine.NewRegistry(engine.GKEPodSnapshotsName)
 	_ = reg.Register(engine.NewGKEPodSnapshots(cl, scheme))
 
-	r := &PodGateReconciler{
-		Client:    cl,
-		APIReader: cl,
-		Scheme:    scheme,
-		Engines:   reg,
+	r := &PodMigrationJobReconciler{
+		Client:                  cl,
+		Scheme:                  scheme,
+		DefaultMigrationTimeout: 10 * time.Minute,
+		Engines:                 reg,
 	}
 
-	// 1. When volume is still attached to origin node, warm restore gate is held.
-	res, err := r.Reconcile(context.Background(), reconcile.Request{
-		NamespacedName: types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
+	_, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: namespace, Name: pmj.Name},
 	})
 	if err != nil {
-		t.Fatalf("unexpected reconcile error: %v", err)
-	}
-	if res.RequeueAfter != 3*time.Second {
-		t.Fatalf("expected 3s requeue while volume is attached to origin node, got: %v", res.RequeueAfter)
+		t.Fatalf("unexpected error reconciling PMJ in Pending phase: %v", err)
 	}
 
-	checkPod := &corev1.Pod{}
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, checkPod); err != nil {
-		t.Fatalf("failed to get pod: %v", err)
-	}
-	if len(checkPod.Spec.SchedulingGates) == 0 {
-		t.Fatalf("warm restore gate was removed prematurely while volume was still attached to origin node!")
+	updatedPMJ := &pmv1alpha1.PodMigrationJob{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: pmj.Name}, updatedPMJ); err != nil {
+		t.Fatalf("failed to get updated PMJ: %v", err)
 	}
 
-	// 2. Once detached from origin node, gate is released and snapshot reference is injected.
-	va.Status.Attached = false
-	if err := cl.Status().Update(context.Background(), va); err != nil {
-		t.Fatalf("failed to update volume attachment status: %v", err)
+	// PVsToDetach should only contain RWO and RWOP volumes.
+	expected := map[string]bool{
+		"pv-rwo":  true,
+		"pv-rwop": true,
 	}
-
-	res, err = r.Reconcile(context.Background(), reconcile.Request{
-		NamespacedName: types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name},
-	})
-	if err != nil {
-		t.Fatalf("unexpected reconcile error: %v", err)
+	if len(updatedPMJ.Status.PVsToDetach) != len(expected) {
+		t.Fatalf("expected %d PVs in PVsToDetach, got %d: %v", len(expected), len(updatedPMJ.Status.PVsToDetach), updatedPMJ.Status.PVsToDetach)
 	}
-
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, checkPod); err != nil {
-		t.Fatalf("failed to get pod: %v", err)
-	}
-	if len(checkPod.Spec.SchedulingGates) != 0 {
-		t.Fatalf("expected gate to be released once volume detached, got: %v", checkPod.Spec.SchedulingGates)
-	}
-	if checkPod.Annotations["podsnapshot.gke.io/ps-name"] != "snap-db-0" {
-		t.Fatalf("expected snapshot annotation snap-db-0, got %s", checkPod.Annotations["podsnapshot.gke.io/ps-name"])
+	for _, pv := range updatedPMJ.Status.PVsToDetach {
+		if !expected[pv] {
+			t.Errorf("unexpected volume %q in PVsToDetach: %v", pv, updatedPMJ.Status.PVsToDetach)
+		}
 	}
 }
