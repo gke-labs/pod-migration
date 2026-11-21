@@ -270,7 +270,7 @@ func TestEvents_ReplacementPod_MigrationRestoreReleased(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pmj, replacementPod).
+		WithRuntimeObjects(withReadySnapshots([]runtime.Object{pmj, replacementPod})...).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithStatusSubresource(pmj).
 		Build()

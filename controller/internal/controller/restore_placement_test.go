@@ -188,7 +188,7 @@ func reconcilePlacementWith(t *testing.T, restorePlacement bool, engines *engine
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(objs...).
+		WithObjects(withReadySnapshots(objs, engine.DefaultAPIGroup, "engine.example.com")...).
 		WithInterceptorFuncs(funcs).
 		Build()
 	recorder := record.NewFakeRecorder(20)
@@ -1635,7 +1635,7 @@ func newPlacementFlowFor(t *testing.T, pod *corev1.Pod, job *pmv1alpha1.PodMigra
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(append([]client.Object{pod, job}, nodes...)...).
+		WithObjects(withReadySnapshots(append([]client.Object{pod, job}, nodes...))...).
 		Build()
 	recorder := record.NewFakeRecorder(100)
 	checks := invariants.NewEngine(invariants.ModeObserve, recorder)

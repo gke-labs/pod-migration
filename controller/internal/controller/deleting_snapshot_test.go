@@ -445,7 +445,7 @@ func TestPodGate_DeletingSnapshot_HoldsThenReleasesCold(t *testing.T) {
 				t.Error("RequeueAfter = 0, want the hold to look again")
 			}
 			got := getTestJob(t, c)
-			if _, held := snapshotDeletingHold(got); !held {
+			if _, held := snapshotUnrestorableHold(got); !held {
 				t.Fatalf("conditions = %+v, want the hold recorded", got.Status.Conditions)
 			}
 			if got.Status.Consumed != job.Status.Consumed || got.Status.GateReleased != job.Status.GateReleased {
@@ -491,8 +491,12 @@ func TestPodGate_DeletingSnapshot_UsesTheJobsEngineGroup(t *testing.T) {
 		"deleting snapshot in the other group": {snapGroup: snapshot.DefaultAPIGroup},
 	} {
 		t.Run(name, func(t *testing.T) {
-			c := newRestoringClient(interceptor.Funcs{}, criuJob(), heldReplacement(true),
-				testSnapshot(tc.snapGroup, deletingSnapName, true, condCheckpointed, condReady))
+			objs := []client.Object{criuJob(), heldReplacement(true), testSnapshot(tc.snapGroup, deletingSnapName, true, condCheckpointed, condReady)}
+			if !tc.wantHeld {
+				// The job's own CRIU snapshot exists and isn't being deleted.
+				objs = append(objs, testSnapshot(engine.CRIUAPIGroup, deletingSnapName, false, condCheckpointed, condReady))
+			}
+			c := newRestoringClient(interceptor.Funcs{}, objs...)
 			reg := engine.NewRegistry(engine.GKEPodSnapshotsName)
 			if err := reg.Register(engine.NewGKEPodSnapshots(c, fenceTestScheme())); err != nil {
 				t.Fatal(err)

@@ -1008,6 +1008,20 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				// checkpoint completed, recorded before the snapshot is gone.
 				return r.failSnapshotDeleting(ctx, req, job, origJob, snapStatus)
 			}
+			// Likewise for a snapshot that was seen and is gone (#269).
+			// Past the hard cap checkSnapshotProgressing doesn't read the
+			// snapshot, so read it here: the plain timeout would decide
+			// the fence without the completed checkpoint it can no longer
+			// see. A failed read doesn't hold up the timeout.
+			goneStatus := snapStatus
+			if goneStatus == nil && job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting && snapshotObserved(job) {
+				goneStatus, _ = r.getSnapshotProvider(job).CheckStatus(ctx, job, podName)
+			}
+			if gone, err := r.snapshotGone(ctx, job, goneStatus); err != nil {
+				logger.Error(err, "Couldn't confirm whether the job's snapshot is gone; timing out as usual", "snapshot", job.Status.SnapshotRef)
+			} else if gone {
+				return r.failSnapshotGone(ctx, req, job, origJob)
+			}
 			if progressing {
 				logger.Info("Migration exceeded baseline timeout but snapshot is actively progressing; extending deadline",
 					"job", job.Name, "snapshot", job.Status.SnapshotRef, "timeout", migrationTimeout)
@@ -1512,6 +1526,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if snapStatus.Reason == snapshot.ReasonSnapshotDeleting {
 				return r.failSnapshotDeleting(ctx, req, job, origJob, snapStatus)
 			}
+			// Nor does one that was seen and is gone (#269). One never seen
+			// may not be created yet, and the job waits for it.
+			if gone, err := r.snapshotGone(ctx, job, snapStatus); err != nil {
+				return ctrl.Result{}, err
+			} else if gone {
+				return r.failSnapshotGone(ctx, req, job, origJob)
+			}
 			// If origin pod entered terminal phase (Failed or Succeeded) while snapshotting, fail fast.
 			// It has no running process left to checkpoint.
 			originPod := &corev1.Pod{}
@@ -1566,7 +1587,10 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				job.Status.SnapshotRef = snapStatus.SnapshotRef
 				refChanged = true
 			}
-			if condChanged || refChanged {
+			// Record that the snapshot exists, as evidence for #269 that a
+			// later miss means it's gone.
+			observedChanged := recordSnapshotObserved(job, snapStatus, refChanged)
+			if condChanged || refChanged || observedChanged {
 				if err := r.patchStatus(ctx, job, origJob); err != nil {
 					return r.handleStatusError(ctx, err, "Failed to update snapshot status in progress")
 				}
@@ -1854,26 +1878,28 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{}, nil
 		}
 
-		// The pod gate found the job's snapshot being deleted and holds the
-		// replacement rather than order a restore from it (#265). Conclude
-		// without a restore, and the gate then releases it cold. This only
-		// applies while no replacement was actually released, and it comes
-		// before the restore ceiling, which waits for a gated replacement
-		// forever. The patch checks the resourceVersion, so a stale view
-		// can't conclude a job that changed since.
-		if cond, held := snapshotDeletingHold(job); held {
+		// The pod gate found the job's snapshot being deleted (#265) or gone
+		// (#269) and holds the replacement rather than order a restore from
+		// it. Conclude without a restore, with the gate's reason, and the
+		// gate then releases it cold. This only applies while no replacement
+		// was actually released, and it comes before the restore ceiling,
+		// which waits for a gated replacement forever. The patch checks the
+		// resourceVersion, so a stale view can't conclude a job that changed
+		// since.
+		if cond, held := snapshotUnrestorableHold(job); held {
 			released, err := r.replacementReleased(ctx, job)
 			if err != nil {
-				logger.Error(err, "Couldn't tell whether the replacement was released; not concluding for the deleting snapshot yet", "job", job.Name)
+				logger.Error(err, "Couldn't tell whether the replacement was released; not concluding for the unrestorable snapshot yet", "job", job.Name)
 			} else if !released {
-				logger.Info("The job's snapshot is being deleted; concluding without a restore", "job", job.Name, "snapshot", job.Status.SnapshotRef)
+				logger.Info("The job's snapshot can't be restored; concluding without a restore", "job", job.Name, "snapshot", job.Status.SnapshotRef, "reason", cond.Reason)
+				reason, message := cond.Reason, cond.Message
 				orig := job.DeepCopy()
-				if err := r.markSucceededWithoutRestore(ctx, job, orig, snapshot.ReasonSnapshotDeleting, cond.Message, client.MergeFromWithOptimisticLock{}); err != nil {
+				if err := r.markSucceededWithoutRestore(ctx, job, orig, reason, message, client.MergeFromWithOptimisticLock{}); err != nil {
 					*job = *orig
-					return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore for a snapshot being deleted")
+					return r.handleStatusError(ctx, err, "Failed to update job status to SucceededWithoutRestore for an unrestorable snapshot")
 				}
-				metrics.RecordRestoreVerdict(r.jobEngine(job).Name(), "snapshot_deleting")
-				r.eventf(job, corev1.EventTypeWarning, snapshot.ReasonSnapshotDeleting, "%s", cond.Message)
+				metrics.RecordRestoreVerdict(r.jobEngine(job).Name(), unrestorableVerdict(reason))
+				r.eventf(job, corev1.EventTypeWarning, reason, "%s", message)
 				return ctrl.Result{}, nil
 			}
 		}

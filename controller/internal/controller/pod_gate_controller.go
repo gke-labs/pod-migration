@@ -355,49 +355,49 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			adoptStranded = true
 		}
 
-		// Never order a restore from a snapshot that's being deleted: its
-		// archive is going away (#265). Hold the replacement instead. The job
-		// reconciler concludes such a job SucceededWithoutRestore, and the PMJ
-		// watch brings the pod back here to be released cold, recorded, above.
-		// A read error keeps the pod gated too. A recorded hold sticks until
-		// the job concludes: the snapshot can finish going away meanwhile,
-		// and a snapshot that's gone isn't reported as being deleted.
-		if _, held := snapshotDeletingHold(job); held {
-			logger.Info("Holding the replacement until the job concludes without a restore; its snapshot was being deleted",
+		// Never order a restore from a snapshot that's being deleted (#265)
+		// or is gone (#269): its archive is going away, or went. Hold the
+		// replacement instead. The job reconciler concludes such a job
+		// SucceededWithoutRestore, and the PMJ watch brings the pod back here
+		// to be released cold, recorded, above. A read error keeps the pod
+		// gated too. A recorded hold sticks until the job concludes: a
+		// snapshot being deleted can finish going away meanwhile. A Restoring
+		// job only got there on a Ready snapshot, so one that isn't found on
+		// the API server is gone, not yet to be created.
+		if _, held := snapshotUnrestorableHold(job); held {
+			logger.Info("Holding the replacement until the job concludes without a restore; its snapshot can't be restored",
 				"pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 		if phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
-			deleting, err := snapshot.PodSnapshotBeingDeleted(ctx, r.apiReader(), r.jobSnapshotGroup(job), job.Namespace, job.Status.SnapshotRef)
+			reason, err := snapshot.PodSnapshotUnrestorable(ctx, r.apiReader(), r.jobSnapshotGroup(job), job.Namespace, job.Status.SnapshotRef)
 			if err != nil {
-				logger.Error(err, "Failed to check whether the job's snapshot is being deleted", "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
+				logger.Error(err, "Failed to check whether the job's snapshot can be restored", "pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
 				return ctrl.Result{}, err
 			}
-			if deleting {
-				logger.Info("The job's snapshot is being deleted, so it can't be restored; holding the replacement until the job concludes without a restore",
-					"pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef)
+			if reason != "" {
+				logger.Info("The job's snapshot can't be restored; holding the replacement until the job concludes without a restore",
+					"pmj", correctedPMJ, "snapshot", job.Status.SnapshotRef, "reason", reason)
 				// Record the hold for the job reconciler to conclude on, as
 				// for NoCompatibleNode, so it needn't read the snapshot on
 				// every pass. The resourceVersion check keeps a stale view
 				// from dropping a condition written since.
-				if _, recorded := snapshotDeletingHold(job); !recorded {
-					orig := job.DeepCopy()
-					patch := client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
-					meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
-						Type:               ConditionSnapshotRestorable,
-						Status:             metav1.ConditionFalse,
-						Reason:             snapshot.ReasonSnapshotDeleting,
-						Message:            snapshotDeletingMessage(job.Status.SnapshotRef),
-						ObservedGeneration: job.Generation,
-					})
-					if err := r.Status().Patch(ctx, job, patch); err != nil {
-						*job = *orig
-						if apierrors.IsConflict(err) {
-							return ctrl.Result{RequeueAfter: time.Second}, nil
-						}
-						logger.Error(err, "Failed to record that the job's snapshot is being deleted", "pmj", correctedPMJ)
-						return ctrl.Result{}, err
+				orig := job.DeepCopy()
+				patch := client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})
+				meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
+					Type:               ConditionSnapshotRestorable,
+					Status:             metav1.ConditionFalse,
+					Reason:             reason,
+					Message:            unrestorableMessage(reason, job.Status.SnapshotRef),
+					ObservedGeneration: job.Generation,
+				})
+				if err := r.Status().Patch(ctx, job, patch); err != nil {
+					*job = *orig
+					if apierrors.IsConflict(err) {
+						return ctrl.Result{RequeueAfter: time.Second}, nil
 					}
+					logger.Error(err, "Failed to record that the job's snapshot can't be restored", "pmj", correctedPMJ)
+					return ctrl.Result{}, err
 				}
 				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 			}

@@ -745,7 +745,7 @@ func TestPodGateReconciler_GVisorRoutedToCRIUStampsGKEColdStartBypass(t *testing
 			WithScheme(scheme).
 			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 			WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
-			WithObjects(job, pod).
+			WithObjects(withReadySnapshots([]client.Object{job, pod}, engine.CRIUAPIGroup)...).
 			Build()
 		reg, err := engine.NewDefaultRegistry(cl, scheme, allowPolicy, engine.WithCRIUAPIGroup(engine.CRIUAPIGroup))
 		if err != nil {
