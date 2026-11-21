@@ -42,7 +42,8 @@ import (
 // user bound to exactly the controller's generated ClusterRole, in both
 // engine groups: a Ready PodSnapshot whose deletion a finalizer holds is
 // seen as being deleted and never reported Ready, and a Restoring job held
-// for it concludes SucceededWithoutRestore.
+// for it concludes SucceededWithoutRestore. Once the snapshot is gone, it's
+// read as gone (#269), and a job held for that concludes too.
 func TestDeletingSnapshot_Envtest(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS not set; skipping envtest deleting-snapshot test")
@@ -164,6 +165,52 @@ func TestDeletingSnapshot_Envtest(t *testing.T) {
 			}
 			if cond := meta.FindStatusCondition(concluded.Status.Conditions, "Restored"); cond == nil || cond.Reason != snapshot.ReasonSnapshotDeleting {
 				t.Errorf("Restored = %+v, want reason %s", cond, snapshot.ReasonSnapshotDeleting)
+			}
+
+			// #269: once the finalizer is gone, so is the snapshot, and the
+			// controller's role reads that as gone (not as "no such CRD").
+			if err := admin.Get(ctx, types.NamespacedName{Namespace: tc.ns, Name: relSnap}, snap); err != nil {
+				t.Fatalf("getting snapshot: %v", err)
+			}
+			snap.SetFinalizers(nil)
+			if err := admin.Update(ctx, snap); err != nil {
+				t.Fatalf("removing the snapshot's finalizer: %v", err)
+			}
+			reason, err := snapshot.PodSnapshotUnrestorable(ctx, controllerClient, tc.group, tc.ns, relSnap)
+			if err != nil || reason != snapshot.ReasonSnapshotGone {
+				t.Fatalf("PodSnapshotUnrestorable = %q, %v; want %s", reason, err, snapshot.ReasonSnapshotGone)
+			}
+			goneJob := &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{Namespace: tc.ns, Name: relJobName + "-gone"},
+				Spec:       pmv1alpha1.PodMigrationJobSpec{PodRef: corev1.LocalObjectReference{Name: relPod}, TargetPodUID: relSourceUID},
+			}
+			if tc.engine != "" {
+				goneJob.Annotations = map[string]string{engine.AnnotationEngine: tc.engine}
+			}
+			if err := admin.Create(ctx, goneJob); err != nil {
+				t.Fatalf("creating job: %v", err)
+			}
+			goneJob.Status = pmv1alpha1.PodMigrationJobStatus{
+				Phase: pmv1alpha1.PodMigrationJobPhaseRestoring, SnapshotRef: relSnap, RestoringStartTime: &start,
+				Conditions: []metav1.Condition{{
+					Type: ConditionSnapshotRestorable, Status: metav1.ConditionFalse, Reason: snapshot.ReasonSnapshotGone,
+					Message: snapshotGoneMessage(relSnap), LastTransitionTime: start,
+				}},
+			}
+			if err := admin.Status().Update(ctx, goneJob); err != nil {
+				t.Fatalf("setting job status: %v", err)
+			}
+			if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(goneJob)}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if err := admin.Get(ctx, client.ObjectKeyFromObject(goneJob), concluded); err != nil {
+				t.Fatalf("getting job: %v", err)
+			}
+			if concluded.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+				t.Fatalf("phase = %s, want SucceededWithoutRestore", concluded.Status.Phase)
+			}
+			if cond := meta.FindStatusCondition(concluded.Status.Conditions, "Restored"); cond == nil || cond.Reason != snapshot.ReasonSnapshotGone {
+				t.Errorf("Restored = %+v, want reason %s", cond, snapshot.ReasonSnapshotGone)
 			}
 		})
 	}
