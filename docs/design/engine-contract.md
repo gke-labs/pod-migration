@@ -72,7 +72,7 @@ Non-goals:
 
 ### C2. Eligibility
 
-- `Eligible(pod, node)` returns a verdict and a reason, from the pod and its source node as the caller's informer cache has them. It makes no API server calls, so it fits the eviction webhook's deadline. Both the eviction webhook and the preemption trigger call it.
+- `Eligible(pod, node)` returns a verdict and a reason, from the pod and its source node as the caller's informer cache has them. It makes no API server calls, so it fits the eviction webhook's deadline. Both the eviction webhook and the preemption trigger call it. A refused pod isn't migrated (the eviction goes ahead cold, or the preempted node stops it), with a `MigrationSkippedIneligible` Warning event on the pod that names the engine and its reason (#275).
 - `ResolvePolicy(pod)` finds the engine's policy for the pod, also from the cache. Today that's the List of Ready, manual, `stop` `PodSnapshotPolicy` objects that select the pod. No policy means the migration is skipped (`MigrationSkippedNoPolicy`) and the eviction goes ahead cold. The engine owns this lookup, so an engine in its own API group finds its own policies, and `postCheckpoint: stop` becomes the GKE Pod Snapshots engine's requirement rather than a global one.
 - It must be conservative. A wrong "yes" costs a `Refused` round trip at best, and silent state loss at worst.
 - It covers the engine's shape limits (the CRIU engine v1 takes one container, and #114 adds sidecars) and the source node's readiness. The target node's readiness is a placement constraint (C8).

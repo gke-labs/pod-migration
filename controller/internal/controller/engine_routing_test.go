@@ -444,11 +444,13 @@ func TestNodePreemptionReconciler_UsesThePodEngine(t *testing.T) {
 		wantEngine         string
 		wantNoPolicy       bool
 		wantNoEvents       bool
+		wantEvent          string // set: the only event recorded
 	}{
 		{
-			name:         "the engine refuses the pod",
-			engines:      []engine.Engine{gvisorEngine(routedEngine{verdict: engine.Verdict{Reason: "not for this engine"}})},
-			wantNoEvents: true,
+			// The engine says why (#275).
+			name:      "the engine refuses the pod",
+			engines:   []engine.Engine{gvisorEngine(routedEngine{verdict: engine.Verdict{Reason: "not for this engine"}})},
+			wantEvent: "Warning MigrationSkippedIneligible Snapshot engine routed can't migrate the pod: not for this engine; skipping spot preemption migration",
 		},
 		{
 			name:       "the engine's policy and name are recorded on the job",
@@ -565,7 +567,10 @@ func TestNodePreemptionReconciler_UsesThePodEngine(t *testing.T) {
 				t.Errorf("MigrationSkippedNoPolicy event seen = %t, want %t (events %v)", sawNoPolicy, tt.wantNoPolicy, events)
 			}
 			if tt.wantNoEvents && len(events) > 0 {
-				t.Errorf("events = %v, want none for a pod the engine refuses", events)
+				t.Errorf("events = %v, want none", events)
+			}
+			if tt.wantEvent != "" && (len(events) != 1 || events[0] != tt.wantEvent) {
+				t.Errorf("events = %q, want [%q]", events, tt.wantEvent)
 			}
 		})
 	}
@@ -906,5 +911,82 @@ func TestPodMigrationJobReconciler_SnapshottingPhaseRefused(t *testing.T) {
 	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "SnapshotRefused" {
 		t.Errorf("Ready condition = %+v, want False/SnapshotRefused", cond)
+	}
+}
+
+// A pod on a preempting node that its engine refuses is skipped with a
+// Warning event that says which engine refused it and why, and counted under
+// the "ineligible" skip reason (#275).
+func TestNodePreemptionReconciler_IneligiblePodRecordsEvent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	node := createTestNode("spot-node-ineligible", true, "taint-gke")
+	if node.Annotations == nil {
+		node.Annotations = map[string]string{}
+	}
+	node.Annotations[engine.CRIUNodeReadyAnnotation] = "true"
+	// No command: the container relies on the image's entrypoint, which
+	// CRIU.Eligible refuses since #273.
+	pod := createTestPod("pod-ineligible", "default", "spot-node-ineligible", "1Gi", "uid-ineligible")
+	runc := "runc"
+	pod.Spec.RuntimeClassName = &runc
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(node, pod).
+		Build()
+	criu, err := engine.NewCRIU(c, scheme, engine.CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	verdict := criu.Eligible(pod, node)
+	if verdict.OK {
+		t.Fatalf("CRIU.Eligible(pod without command) = OK, want refused")
+	}
+	allowList, err := eligibility.ParseRuntimeClassPolicy("runc")
+	if err != nil {
+		t.Fatalf("ParseRuntimeClassPolicy: %v", err)
+	}
+	recorder := record.NewFakeRecorder(10)
+	r := &NodePreemptionReconciler{
+		Client:                  c,
+		Scheme:                  scheme,
+		Recorder:                recorder,
+		DefaultMigrationTimeout: 10 * time.Minute,
+		SpotPreemptionBudget:    15 * 1024 * 1024 * 1024,
+		RuntimeClassPolicy:      allowList,
+		Engines:                 registryOf(t, criu),
+	}
+
+	beforeSkipped := testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("ineligible"))
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "spot-node-ineligible"}}
+	// The second reconcile must not record the event again.
+	for range 2 {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+	}
+
+	jobs := &pmv1alpha1.PodMigrationJobList{}
+	if err := c.List(context.Background(), jobs); err != nil {
+		t.Fatalf("listing jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Errorf("created %d job(s), want none", len(jobs.Items))
+	}
+
+	var events []string
+	for len(recorder.Events) > 0 {
+		events = append(events, <-recorder.Events)
+	}
+	want := "Warning MigrationSkippedIneligible Snapshot engine criu can't migrate the pod: " + verdict.Reason + "; skipping spot preemption migration"
+	if len(events) != 1 || events[0] != want {
+		t.Errorf("events = %q, want [%q]", events, want)
+	}
+	if gotDiff := testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("ineligible")) - beforeSkipped; gotDiff != 1 {
+		t.Errorf("SpotPreemptionSkippedTotal[ineligible] diff = %v, want 1", gotDiff)
 	}
 }

@@ -500,3 +500,83 @@ func TestEvictionGate_UnfencedEngineRequiresPodOptIn(t *testing.T) {
 		})
 	}
 }
+
+// A pod that its engine refuses is evicted cold, with a Warning event that
+// says which engine refused it and why (#275).
+func TestEvictionGate_IneligiblePodRecordsEvent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	runc := "runc"
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:        "node-a",
+		Annotations: map[string]string{engine.CRIUNodeReadyAnnotation: "true"},
+	}}
+	// No command: the container relies on the image's entrypoint, which
+	// CRIU.Eligible refuses since #273.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-pod",
+			UID:       "test-uid-12345",
+			Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:         node.Name,
+			RuntimeClassName: &runc,
+			Containers:       []corev1.Container{{Name: "app", Image: "redis:7"}},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, pod).Build()
+
+	criu, err := engine.NewCRIU(c, scheme, engine.CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	reg := engine.NewRegistry(criu.Name())
+	if err := reg.Register(criu); err != nil {
+		t.Fatalf("Register(criu): %v", err)
+	}
+	routes, err := engine.ParseRoutes("runc=criu")
+	if err != nil {
+		t.Fatalf("ParseRoutes: %v", err)
+	}
+	if err := reg.SetRoutes(routes); err != nil {
+		t.Fatalf("SetRoutes: %v", err)
+	}
+	allowList, err := eligibility.ParseRuntimeClassPolicy("runc")
+	if err != nil {
+		t.Fatalf("ParseRuntimeClassPolicy: %v", err)
+	}
+	verdict := criu.Eligible(pod, node)
+	if verdict.OK {
+		t.Fatalf("CRIU.Eligible(pod without command) = OK, want refused")
+	}
+
+	recorder := record.NewFakeRecorder(10)
+	gate := &EvictionGate{Client: c, APIReader: c, Recorder: recorder, Eligibility: allowList, Engines: reg}
+	req := admission.Request{}
+	req.Namespace, req.Name, req.SubResource = "default", "test-pod", "eviction"
+	resp := gate.Handle(context.Background(), req)
+
+	if !resp.Allowed {
+		t.Errorf("Allowed = false, want true (cold eviction)")
+	}
+	jobs := &pmv1alpha1.PodMigrationJobList{}
+	if err := c.List(context.Background(), jobs); err != nil {
+		t.Fatalf("listing jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Errorf("found %d job(s), want none", len(jobs.Items))
+	}
+
+	var events []string
+	for len(recorder.Events) > 0 {
+		events = append(events, <-recorder.Events)
+	}
+	want := "Warning MigrationSkippedIneligible Snapshot engine criu can't migrate the pod: " + verdict.Reason + "; allowing cold eviction"
+	if len(events) != 1 || events[0] != want {
+		t.Errorf("events = %q, want [%q]", events, want)
+	}
+}
