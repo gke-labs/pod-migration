@@ -236,3 +236,81 @@ func TestRunNodeFactsLoopRetriesAndRepublishes(t *testing.T) {
 		t.Errorf("patches = %d, want the failed one and its retry", patches)
 	}
 }
+
+// TestRunNodeFactsLoopRetriesIncompleteFacts pins that facts published with
+// something still unknown, such as a containerd version read during a
+// containerd restart, are read again after retry rather than interval, until
+// they're complete, and that the fast retries are bounded.
+func TestRunNodeFactsLoopRetriesIncompleteFacts(t *testing.T) {
+	const interval, retry = time.Hour, time.Minute
+	incomplete := intelFacts
+	incomplete.Arch = "amd64"
+	incomplete.ContainerdVersion = ""
+	complete := intelFacts
+	complete.Arch = "amd64"
+
+	run := func(t *testing.T, reads []contract.SourceNodeFacts, publishErr error) []time.Duration {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var waits []time.Duration
+		i := 0
+		read := func(context.Context) contract.SourceNodeFacts {
+			f := reads[min(i, len(reads)-1)]
+			i++
+			return f
+		}
+		publish := func(context.Context, contract.SourceNodeFacts) error { return publishErr }
+		fired := make(chan time.Time)
+		close(fired)
+		after := func(d time.Duration) <-chan time.Time {
+			waits = append(waits, d)
+			if len(waits) == len(reads) {
+				cancel()
+				return nil
+			}
+			return fired
+		}
+		runNodeFactsLoop(ctx, interval, retry, "n1", read, publish, after)
+		return waits
+	}
+
+	t.Run("incomplete facts are retried soon until complete", func(t *testing.T) {
+		got := run(t, []contract.SourceNodeFacts{incomplete, incomplete, complete, complete}, nil)
+		if want := []time.Duration{retry, retry, interval, interval}; !reflect.DeepEqual(got, want) {
+			t.Errorf("waits = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("an arm64 node has no vendor or model, and is complete without them", func(t *testing.T) {
+		arm := complete
+		arm.Arch, arm.CPUVendor, arm.CPUModel, arm.CPUFeatures = "arm64", "", "", []string{"fp", "asimd"}
+		if got := run(t, []contract.SourceNodeFacts{arm}, nil); !reflect.DeepEqual(got, []time.Duration{interval}) {
+			t.Errorf("waits = %v, want %v", got, []time.Duration{interval})
+		}
+	})
+
+	t.Run("facts that stay incomplete fall back to interval after interval/retry fast retries", func(t *testing.T) {
+		reads := make([]contract.SourceNodeFacts, int(interval/retry)+2)
+		for i := range reads {
+			reads[i] = incomplete
+		}
+		got := run(t, reads, nil)
+		fast := int(interval / retry)
+		for i, d := range got {
+			want := retry
+			if i >= fast {
+				want = interval
+			}
+			if d != want {
+				t.Fatalf("wait %d = %v, want %v (all: %v)", i, d, want, got)
+			}
+		}
+	})
+
+	t.Run("a failed publish is retried soon", func(t *testing.T) {
+		if got := run(t, []contract.SourceNodeFacts{complete, complete}, errors.New("forbidden")); !reflect.DeepEqual(got, []time.Duration{retry, retry}) {
+			t.Errorf("waits = %v, want %v", got, []time.Duration{retry, retry})
+		}
+	})
+}

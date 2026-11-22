@@ -2192,5 +2192,23 @@
       "criu.pod-migrate.io/runc-version-code": "1000000000",
       "criu.pod-migrate.io/xstate": "unknown"
     }
+  },
+  {
+    "name": "literal-unknown-vendor",
+    "facts": {
+      "arch": "amd64",
+      "cpuVendor": "unknown",
+      "kernelVersion": "6.6.72+",
+      "placementLabels": "v1"
+    },
+    "labels": {
+      "criu.pod-migrate.io/containerd-version-code": "1000000000",
+      "criu.pod-migrate.io/cpu-model": "unknown",
+      "criu.pod-migrate.io/cpu-vendor": "unknown",
+      "criu.pod-migrate.io/criu-version-code": "1000000000",
+      "criu.pod-migrate.io/kernel-version-code": "6006072",
+      "criu.pod-migrate.io/runc-version-code": "1000000000",
+      "criu.pod-migrate.io/xstate": "unknown"
+    }
   }
 ]

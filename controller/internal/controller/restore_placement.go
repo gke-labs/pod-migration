@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -36,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/criuplacement"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 )
 
@@ -62,6 +64,14 @@ const (
 	// If a pod keeps one after the scheduler's gate is turned off, the check
 	// can accept a node that the scheduler then rejects.
 	tolerationComparisonOperators = true
+
+	// RestorePlacementAddedAnnotation, on a replacement pod, records how
+	// many node selector requirements addRequiredNodeAffinity appended to
+	// each term of its required node affinity, comma-separated in term
+	// order. withoutRequirements takes out only those, so a requirement the
+	// pod's own template already had, such as kubernetes.io/arch In
+	// [amd64], stays in the estimate of the pod as its owner recreates it.
+	RestorePlacementAddedAnnotation = "pod-migrate.io/restore-placement-added"
 )
 
 // restorePlacement returns the node constraints to add to pod, the
@@ -291,8 +301,10 @@ func addRequiredNodeAffinity(pod *corev1.Pod, reqs []corev1.NodeSelectorRequirem
 		nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{
 			NodeSelectorTerms: []corev1.NodeSelectorTerm{term},
 		}
+		recordAddedRequirements(pod, []int{len(reqs)})
 		return
 	}
+	added := make([]int, len(required.NodeSelectorTerms))
 	for i := range required.NodeSelectorTerms {
 		term := &required.NodeSelectorTerms[i]
 		if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 {
@@ -301,9 +313,55 @@ func addRequiredNodeAffinity(pod *corev1.Pod, reqs []corev1.NodeSelectorRequirem
 		for _, req := range reqs {
 			if !hasNodeSelectorRequirement(term.MatchExpressions, req) {
 				term.MatchExpressions = append(term.MatchExpressions, *req.DeepCopy())
+				added[i]++
 			}
 		}
 	}
+	recordAddedRequirements(pod, added)
+}
+
+// recordAddedRequirements records on pod how many requirements were
+// appended to each term (RestorePlacementAddedAnnotation).
+func recordAddedRequirements(pod *corev1.Pod, added []int) {
+	counts := make([]string, len(added))
+	for i, n := range added {
+		counts[i] = strconv.Itoa(n)
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[RestorePlacementAddedAnnotation] = strings.Join(counts, ",")
+}
+
+// addedRequirements returns how many requirements addRequiredNodeAffinity
+// appended to each of terms, pod's terms, as pod records it. ok is false
+// when pod has no record, or one that doesn't fit terms: a pod released by
+// an earlier version, for one. Each appended requirement must be one of
+// reqs.
+func addedRequirements(pod *corev1.Pod, terms []corev1.NodeSelectorTerm, reqs []corev1.NodeSelectorRequirement) (added []int, ok bool) {
+	value, found := pod.Annotations[RestorePlacementAddedAnnotation]
+	if !found {
+		return nil, false
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) != len(terms) {
+		return nil, false
+	}
+	added = make([]int, len(parts))
+	for i, part := range parts {
+		n, err := strconv.Atoi(part)
+		exprs := terms[i].MatchExpressions
+		if err != nil || n < 0 || n > len(exprs) {
+			return nil, false
+		}
+		for _, expr := range exprs[len(exprs)-n:] {
+			if !hasNodeSelectorRequirement(reqs, expr) {
+				return nil, false
+			}
+		}
+		added[i] = n
+	}
+	return added, true
 }
 
 func hasNodeSelectorRequirement(reqs []corev1.NodeSelectorRequirement, req corev1.NodeSelectorRequirement) bool {
@@ -317,13 +375,16 @@ func hasNodeSelectorRequirement(reqs []corev1.NodeSelectorRequirement, req corev
 
 // withoutRequirements returns a copy of pod with reqs taken out of its
 // required node affinity: the pod as its owner recreates it, without the
-// constraints that addRequiredNodeAffinity added. A term left with nothing
-// held only reqs, the term added to a pod without terms, so it's dropped,
-// and a pod left without terms has no required node affinity. An empty term
-// that the pod had is kept: addRequiredNodeAffinity leaves those alone. A
-// requirement that one of the pod's own terms already had is taken out too;
-// restorePlacement adds none when every term has them, so that only matters
-// for a pod whose terms differ in it.
+// constraints that addRequiredNodeAffinity added. Only the requirements
+// that pod records as appended (RestorePlacementAddedAnnotation) are taken
+// out, so one that the pod's own template already had stays: a template
+// that requires kubernetes.io/arch In [amd64], as the CRIU engine does too,
+// still rules out an arm64 node. A term left with nothing held only reqs,
+// the term added to a pod without terms, so it's dropped, and a pod left
+// without terms has no required node affinity. An empty term that the pod
+// had is kept: addRequiredNodeAffinity leaves those alone. A pod without
+// the record, released by an earlier version, has every requirement in
+// reqs taken out, including ones its own terms had.
 func withoutRequirements(pod *corev1.Pod, reqs []corev1.NodeSelectorRequirement) *corev1.Pod {
 	stripped := pod.DeepCopy()
 	if stripped.Spec.Affinity == nil || stripped.Spec.Affinity.NodeAffinity == nil ||
@@ -331,16 +392,23 @@ func withoutRequirements(pod *corev1.Pod, reqs []corev1.NodeSelectorRequirement)
 		return stripped
 	}
 	required := stripped.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	added, recorded := addedRequirements(pod, required.NodeSelectorTerms, reqs)
 	var terms []corev1.NodeSelectorTerm
-	for _, term := range required.NodeSelectorTerms {
+	for i, term := range required.NodeSelectorTerms {
 		if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 {
 			terms = append(terms, term)
 			continue
 		}
 		var kept []corev1.NodeSelectorRequirement
-		for _, expr := range term.MatchExpressions {
-			if !hasNodeSelectorRequirement(reqs, expr) {
-				kept = append(kept, expr)
+		if recorded {
+			if n := len(term.MatchExpressions) - added[i]; n > 0 {
+				kept = slices.Clone(term.MatchExpressions[:n])
+			}
+		} else {
+			for _, expr := range term.MatchExpressions {
+				if !hasNodeSelectorRequirement(reqs, expr) {
+					kept = append(kept, expr)
+				}
 			}
 		}
 		if len(kept) == 0 && len(term.MatchFields) == 0 {
@@ -449,16 +517,35 @@ func labelSelectorFor(reqs []corev1.NodeSelectorRequirement) (labels.Selector, b
 	return selector, true
 }
 
-// describeRequirements renders reqs for events and logs, for example
-// "node.kubernetes.io/instance-type In [n2-standard-4]".
+// describeRequirements renders reqs for events, the RestorePlacement
+// condition and logs, for example
+// "node.kubernetes.io/instance-type In [n2-standard-4]". The CRIU engine's
+// missing-CPU-flag requirements, one per instruction flag the source node
+// had (up to ~90), are summarized by count, so that kubectl describe stays
+// readable; the pod's spec has them all.
 func describeRequirements(reqs []corev1.NodeSelectorRequirement) string {
 	parts := make([]string, 0, len(reqs))
+	cpuFlags := 0
 	for _, req := range reqs {
+		if strings.HasPrefix(req.Key, criuplacement.MissingCPUFlagLabelPrefix) && req.Operator == corev1.NodeSelectorOpDoesNotExist {
+			cpuFlags++
+			continue
+		}
 		if len(req.Values) == 0 {
 			parts = append(parts, fmt.Sprintf("%s %s", req.Key, req.Operator))
 			continue
 		}
 		parts = append(parts, fmt.Sprintf("%s %s [%s]", req.Key, req.Operator, strings.Join(req.Values, ", ")))
+	}
+	if cpuFlags > 0 {
+		summary := fmt.Sprintf("%d CPU-flag requirements (%s<flag> DoesNotExist)", cpuFlags, criuplacement.MissingCPUFlagLabelPrefix)
+		if cpuFlags == 1 {
+			summary = fmt.Sprintf("1 CPU-flag requirement (%s<flag> DoesNotExist)", criuplacement.MissingCPUFlagLabelPrefix)
+		}
+		if len(parts) > 0 {
+			summary = "and " + summary
+		}
+		parts = append(parts, summary)
 	}
 	return strings.Join(parts, ", ")
 }

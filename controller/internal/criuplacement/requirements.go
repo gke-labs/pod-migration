@@ -127,10 +127,15 @@ func versionCode(v string) (code int64, ok bool) {
 	return code, true
 }
 
-// labelVendor is the source vendor as a label value, or "" when it's
-// unknown or isn't a valid label value, which the agent publishes as
-// unknown too.
-func labelVendor(vendor string) string { return labelValue(vendor) }
+// labelVendor is the vendor as a label value, or "" when it's unknown,
+// isn't a valid label value, or is literally LabelValueUnknown: the agent
+// publishes all of them as unknown.
+func labelVendor(vendor string) string {
+	if vendor == LabelValueUnknown {
+		return ""
+	}
+	return labelValue(vendor)
+}
 
 // labelValue is v, or "" when it isn't a valid, non-empty label value.
 func labelValue(v string) string {

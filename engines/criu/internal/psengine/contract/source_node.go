@@ -70,7 +70,7 @@ type SourceNodeFacts struct {
 
 // IsEmpty reports whether no fact is known. PlacementLabels isn't a fact.
 func (f SourceNodeFacts) IsEmpty() bool {
-	return f.CPUVendor == "" && f.CPUModel == "" && len(f.CPUFeatures) == 0 && f.KernelVersion == "" &&
+	return f.Arch == "" && f.CPUVendor == "" && f.CPUModel == "" && len(f.CPUFeatures) == 0 && f.KernelVersion == "" &&
 		f.CRIUVersion == "" && f.RuncVersion == "" && f.ContainerdVersion == ""
 }
 

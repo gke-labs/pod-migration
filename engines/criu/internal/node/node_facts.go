@@ -103,30 +103,68 @@ func publishNodeFacts(ctx context.Context, c client.Client, nodeName string, f c
 // publishes them again every interval, until ctx is done, so they follow an
 // in-place upgrade and come back if someone removes them. Publishing facts
 // that the Node already shows writes nothing. A failed publish is retried
-// after retry. Zero durations take the defaults.
+// after retry. So are facts published with something still unknown
+// (nodeFactsComplete), such as a version read while containerd restarts or
+// before a failed bootstrap is retried, so that the node doesn't show it as
+// unknown for a whole interval; after interval/retry such retries in a row,
+// the loop falls back to interval, for a fact that stays unknown. Zero
+// durations take the defaults.
 func (n *Node) RunNodeFactsLoop(ctx context.Context, interval, retry time.Duration) {
+	runNodeFactsLoop(ctx, interval, retry, n.NodeName, n.NodeFacts, n.PublishNodeFacts, time.After)
+}
+
+func runNodeFactsLoop(ctx context.Context, interval, retry time.Duration, nodeName string,
+	read func(context.Context) contract.SourceNodeFacts,
+	publish func(context.Context, contract.SourceNodeFacts) error,
+	after func(time.Duration) <-chan time.Time) {
 	if interval <= 0 {
 		interval = DefaultNodeFactsInterval
 	}
 	if retry <= 0 {
 		retry = DefaultNodeFactsRetry
 	}
-	log := logf.FromContext(ctx).WithValues("node", n.NodeName)
+	log := logf.FromContext(ctx).WithValues("node", nodeName)
+	maxIncompleteRetries := int(interval / retry)
 	var published *contract.SourceNodeFacts
+	incompleteRetries := 0
 	for {
 		wait := interval
-		f := n.NodeFacts(ctx)
-		if err := n.PublishNodeFacts(ctx, f); err != nil {
+		f := read(ctx)
+		if err := publish(ctx, f); err != nil {
 			log.Error(err, "publishing node facts for restore placement failed; retrying")
 			wait = retry
-		} else if published == nil || !reflect.DeepEqual(*published, f) {
-			log.Info("published node facts for restore placement", "facts", contract.NodeFactsAnnotations(f)[contract.AnnotationNodeFacts])
-			published = &f
+		} else {
+			if published == nil || !reflect.DeepEqual(*published, f) {
+				log.Info("published node facts for restore placement", "facts", contract.NodeFactsAnnotations(f)[contract.AnnotationNodeFacts])
+				published = &f
+			}
+			switch {
+			case nodeFactsComplete(f):
+				incompleteRetries = 0
+			case incompleteRetries < maxIncompleteRetries:
+				incompleteRetries++
+				wait = retry
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(wait):
+		case <-after(wait):
 		}
 	}
+}
+
+// nodeFactsComplete reports whether f, this node's facts, has every fact the
+// agent can read on a healthy node: the architecture, the CPU features, the
+// four versions, and on x86 the CPU vendor and model, which arm64's
+// /proc/cpuinfo doesn't have.
+func nodeFactsComplete(f contract.SourceNodeFacts) bool {
+	if f.Arch == "" || len(f.CPUFeatures) == 0 || f.KernelVersion == "" || f.CRIUVersion == "" ||
+		f.RuncVersion == "" || f.ContainerdVersion == "" {
+		return false
+	}
+	if f.Arch == "amd64" || f.Arch == "386" {
+		return f.CPUVendor != "" && f.CPUModel != ""
+	}
+	return true
 }

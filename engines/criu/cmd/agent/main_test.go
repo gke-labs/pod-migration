@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -32,6 +33,8 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/gke-labs/pod-migration/engines/criu/internal/node"
 )
 
 func TestAgentManagerOptions_DisablesNodeInformerUnderGetPatchRBAC(t *testing.T) {
@@ -123,4 +126,40 @@ func TestAgentManagerOptions_DisablesNodeInformerUnderGetPatchRBAC(t *testing.T)
 	if getCalls.Load() != 1 || patchCalls.Load() != 1 {
 		t.Fatalf("expected 1 Get and 1 Patch call, got get=%d patch=%d", getCalls.Load(), patchCalls.Load())
 	}
+}
+
+// fakeNodeWorker records what runNodeWorker starts.
+type fakeNodeWorker struct {
+	factsLoop chan [2]time.Duration
+}
+
+func (f *fakeNodeWorker) Bootstrap(context.Context) error { return errors.New("bootstrap failed") }
+func (f *fakeNodeWorker) RunNodeFactsLoop(_ context.Context, interval, retry time.Duration) {
+	f.factsLoop <- [2]time.Duration{interval, retry}
+}
+func (f *fakeNodeWorker) SweepOrphanRestores(context.Context) error         { return nil }
+func (f *fakeNodeWorker) RunProbeLoop(ctx context.Context, _ time.Duration) { <-ctx.Done() }
+
+// TestRunNodeWorkerStartsNodeFactsLoop pins that the agent publishes its
+// node's facts, even after a failed bootstrap: without the labels, every
+// constrained CRIU restore waits out the restore ceiling (#257).
+func TestRunNodeWorkerStartsNodeFactsLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &fakeNodeWorker{factsLoop: make(chan [2]time.Duration, 1)}
+	done := make(chan struct{})
+	go func() {
+		runNodeWorker(ctx, w)
+		close(done)
+	}()
+	select {
+	case got := <-w.factsLoop:
+		if want := [2]time.Duration{node.DefaultNodeFactsInterval, node.DefaultNodeFactsRetry}; got != want {
+			t.Errorf("RunNodeFactsLoop(interval, retry) = %v, want %v", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runNodeWorker didn't start the node facts loop")
+	}
+	cancel()
+	<-done
 }

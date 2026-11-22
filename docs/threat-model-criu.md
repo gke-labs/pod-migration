@@ -81,7 +81,7 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
 - **Compromise Impact**: If the `pod-migrate-agent` container is compromised, the attacker achieves root on the host node and access to local containerd sockets.
 - **Cluster RBAC Scope**: The agent uses a ClusterRole (`pod-migrate-psengine-agent`) granting cluster-wide permissions:
   - `nodes/checkpoint` (`create`): Triggers kubelet container checkpoints (cluster-wide scope in Kubernetes RBAC).
-  - `nodes` (`get`, `patch`): Publishes readiness and capability annotations (`pod-migrate.io/criu-ready`, `pod-migrate.io/criu-version`).
+  - `nodes` (`get`, `patch`): Publishes readiness and capability annotations (`pod-migrate.io/criu-ready`, `pod-migrate.io/criu-version`), and the restore placement facts (#257): the `criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` labels and the `pod-migrate.io/criu-node-facts` and `pod-migrate.io/criu-node-cpu-features` annotations. They stay on the `Node` after the engine is uninstalled.
   - `pods` (`get`, `list`, `watch`, `update`, `patch`): Tracks replacement pod lifecycle and stamps `pod-migrate.io/psengine-restore`.
   - `podsnapshots` (`get`, `list`, `watch`) and `podsnapshots/status` (`get`, `update`, `patch`): Read-only work order inspection and status reporting.
   - `podmigrationjobs` (`get`, `list`, `watch`): Validates active migration job bindings.

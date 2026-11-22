@@ -84,6 +84,8 @@ func TestCompatible(t *testing.T) {
 		{"unknown target architecture is compatible", intel(), intel(func(f *Facts) { f.Arch = "" }), true, ""},
 		{"target has more XSAVE state", intel(), intel(with("amx_tile")), false, "XSAVE"},
 		{"target has less XSAVE state", intel(with("amx_tile")), intel(), false, "XSAVE"},
+		{"literal unknown target vendor is compatible", intel(), intel(func(f *Facts) { f.CPUVendor = LabelValueUnknown }), true, ""},
+		{"literal unknown source vendor is compatible", intel(func(f *Facts) { f.CPUVendor = LabelValueUnknown; f.CPUFeatures = nil }), intel(), true, ""},
 		{"vendor mismatch", intel(), intel(func(f *Facts) { f.CPUVendor = "AuthenticAMD" }), false, "vendor"},
 		{"model mismatch", intel(), intel(func(f *Facts) { f.CPUModel = "Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz" }), false, "model"},
 		{"older kernel refused", intel(), intel(func(f *Facts) { f.KernelVersion = "6.1.100+" }), false, "kernel"},
@@ -179,6 +181,13 @@ func TestRequirements(t *testing.T) {
 	})
 	t.Run("version 0.0.0 needs no requirement", func(t *testing.T) {
 		for _, req := range Requirements(Facts{PlacementLabels: PlacementLabelsVersion, RuncVersion: "0.0.0"}) {
+			t.Errorf("unexpected requirement %v", req)
+		}
+	})
+	t.Run("a literal unknown vendor is unknown", func(t *testing.T) {
+		// The agent publishes vendor_id "unknown" as an unreadable vendor,
+		// so it must not become a requirement (or ["unknown", "unknown"]).
+		for _, req := range Requirements(Facts{PlacementLabels: PlacementLabelsVersion, CPUVendor: LabelValueUnknown}) {
 			t.Errorf("unexpected requirement %v", req)
 		}
 	})

@@ -93,18 +93,7 @@ func main() {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
 			return nil
 		}
-		if err := nd.Bootstrap(ctx); err != nil {
-			log.Error(err, "CRIU bootstrap failed (continuing; node remains unready)")
-		}
-		// Publish this node's facts as restore placement labels (#257) after
-		// bootstrap, so the CRIU bundle's version is readable, and keep them
-		// current. A failed bootstrap still publishes: a version the agent
-		// can't read is published as unknown.
-		go nd.RunNodeFactsLoop(ctx, node.DefaultNodeFactsInterval, node.DefaultNodeFactsRetry)
-		if err := nd.SweepOrphanRestores(ctx); err != nil {
-			log.Error(err, "orphan restore sweep failed (continuing)")
-		}
-		nd.RunProbeLoop(ctx, 10*time.Second)
+		runNodeWorker(ctx, nd)
 		return nil
 	})); err != nil {
 		log.Error(err, "unable to register bootstrap runnable")
@@ -149,6 +138,34 @@ func main() {
 // node agent. ClusterRole/pod-migrate-psengine-agent intentionally grants only
 // get and patch on core/nodes (no list/watch), so *corev1.Node reads bypass
 // the informer cache and talk directly to the API server.
+// nodeWorker is what runNodeWorker runs: *node.Node.
+type nodeWorker interface {
+	Bootstrap(ctx context.Context) error
+	RunNodeFactsLoop(ctx context.Context, interval, retry time.Duration)
+	SweepOrphanRestores(ctx context.Context) error
+	RunProbeLoop(ctx context.Context, interval time.Duration)
+}
+
+// runNodeWorker bootstraps the node, starts publishing its facts, sweeps
+// orphan restores, then runs the readiness probe loop until ctx is done.
+func runNodeWorker(ctx context.Context, nd nodeWorker) {
+	log := ctrl.Log.WithName("setup")
+	if err := nd.Bootstrap(ctx); err != nil {
+		log.Error(err, "CRIU bootstrap failed (continuing; node remains unready)")
+	}
+	// Publish this node's facts as restore placement labels (#257) after
+	// bootstrap, so the CRIU bundle's version is readable, and keep them
+	// current. A failed bootstrap still publishes: a version the agent
+	// can't read is published as unknown. Without this, checkpoints still
+	// say placementLabels v1, and every constrained restore waits out the
+	// restore ceiling for a node with the labels.
+	go nd.RunNodeFactsLoop(ctx, node.DefaultNodeFactsInterval, node.DefaultNodeFactsRetry)
+	if err := nd.SweepOrphanRestores(ctx); err != nil {
+		log.Error(err, "orphan restore sweep failed (continuing)")
+	}
+	nd.RunProbeLoop(ctx, 10*time.Second)
+}
+
 func agentManagerOptions(probeAddr string) ctrl.Options {
 	return ctrl.Options{
 		Scheme:                 scheme,

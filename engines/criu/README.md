@@ -175,7 +175,9 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      them twice: as `sourceNode` in `manifest.json`, next to the archive, and
      as `status.sourceNode` on the `PodSnapshot`, in the same status write
      that marks it `Ready=True`. The orchestrator can read the `PodSnapshot`
-     without access to the bucket. The fields are `cpuVendor` (the
+     without access to the bucket. The fields are `arch` (the agent's
+     architecture as Go names it, `amd64` or `arm64`, matching the node's
+     `kubernetes.io/arch` label), `cpuVendor` (the
      `vendor_id` line of `/proc/cpuinfo`, absent on arm64), `cpuModel` (the
      `model name` line of `/proc/cpuinfo`, absent on arm64, which has no such
      line), `cpuFeatures` (the `flags` (x86) or `Features` (arm64) lines, the
@@ -363,7 +365,13 @@ When `pod-migrate-agent` starts on a node, it applies the following modification
 | **CRIU System Wrapper** | `/usr/local/sbin/criu`              | Executable wrapper script that launches CRIU via the bundled dynamic linker.                                                                                     |
 | **Runc Configuration**  | `/etc/criu/runc.conf`               | CRIU global configuration specifying `tcp-close`, `skip-in-flight`, `file-validation buildid`, and `file-locks`.                                                 |
 | **Node Annotations**    | Kubernetes `Node` metadata          | Annotated with `pod-migrate.io/criu-ready` (`true` or `false`) and `pod-migrate.io/criu-version`. Stale reason/remediation annotations are cleared on promotion. |
+| **Node Placement Facts** | Kubernetes `Node` metadata         | Labelled with `criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` placement labels, and annotated with `pod-migrate.io/criu-node-facts` and `pod-migrate.io/criu-node-cpu-features` (see [Restore placement](#restore-placement)). |
 | **Socket Watching**     | `/run/containerd/containerd.sock`   | Monitored for inode changes to detect containerd daemon restarts and re-probe readiness.                                                                         |
+
+Uninstalling the engine doesn't remove the `Node` labels and annotations: they
+stay on each `Node` until you remove them, for example with
+`kubectl label node <node> criu.pod-migrate.io/cpu-vendor-` for each label, or
+until the node is replaced.
 
 ## Storage Security & Bucket IAM Guidance
 
@@ -514,7 +522,11 @@ the controller's `internal/criuplacement`; tests keep them equal. Off x86,
 CPU features aren't compared (CRIU doesn't either).
 
 **What the agent publishes.** The agent reads its node's facts once its
-bootstrap has run (even a failed one), then every 10 minutes, and patches only what changed; a failed publish is retried after 30 seconds. For
+bootstrap has run (even a failed one), then every 10 minutes, and patches only what changed; a failed publish is retried after 30 seconds. So is a
+publish with a fact still unknown (a version, the CPU features, or on x86 the
+vendor or model), for example a containerd version read while containerd
+restarts, until the facts are complete or 10 minutes of such retries have
+passed. For
 its own node, `cpuFeatures` is the intersection across processors. Labels
 (all are always present, except the missing-flag ones):
 
@@ -549,14 +561,29 @@ them, and its restore falls back to a cold start as before.
   `--restore-placement-deadline`, the replacement starts cold, as for any
   placement timeout. Upgrade the agents before the window in which you
   drain nodes.
+- A new node is `Ready` briefly before its agent has bootstrapped and
+  published the labels. If `--restore-placement-deadline` expires in that
+  window, the controller counts that unlabelled `Ready` node as a way out,
+  a node the replacement could run on without the constraints, so it
+  concludes `PlacementTimeout` and the recreated replacement starts cold.
 - The cluster autoscaler builds a new node from its node pool's template,
   which doesn't carry these labels, so it doesn't scale a pool up for a
-  replacement with these constraints. In a pool that is full or scaled to
-  zero, the replacement waits until the restore timeout, then starts cold.
+  replacement with these constraints. This changes today's behaviour: in a
+  full pool, a replacement with these constraints now waits until the
+  restore ceiling (the restore timeout, 5m30s with the default
+  `--restore-stabilization-window`) and then starts cold, where without them
+  it could be scheduled as soon as the autoscaler added a node. In a pool
+  scaled to zero it waits the same way. The workaround is the controller's
+  `--restore-placement=false`, which turns restore placement off for every
+  engine, GKE Pod Snapshots included. The autoscaler may copy the labels
+  from an existing node in a non-empty pool, in which case only pools scaled
+  to zero are affected; the #257 live end-to-end run is to settle that, and
+  should include a non-empty autoscaled pool.
 
 **Not tested live yet.** The rule and the label format are unit-tested, and
 the constraints are checked against a real API server (envtest); an
-end-to-end run with an incompatible node is still to do.
+end-to-end run with an incompatible node, and with a non-empty autoscaled
+pool (see Limits), is still to do.
 
 ## Rolling Node-Pool Upgrades & Kernel Compatibility
 
