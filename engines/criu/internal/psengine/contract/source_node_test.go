@@ -74,6 +74,12 @@ func TestSourceNodeFactsEmptyWritesNothing(t *testing.T) {
 	if !(SourceNodeFacts{}).IsEmpty() || (SourceNodeFacts{RuncVersion: "1.2.5"}).IsEmpty() {
 		t.Fatal("IsEmpty is wrong")
 	}
+	if (SourceNodeFacts{Arch: "amd64"}).IsEmpty() {
+		t.Fatal("IsEmpty ignores Arch, a fact")
+	}
+	if !(SourceNodeFacts{PlacementLabels: PlacementLabelsVersion}).IsEmpty() {
+		t.Fatal("IsEmpty counts PlacementLabels, which isn't a fact")
+	}
 }
 
 func TestSourceNodeFactsKeepsConditions(t *testing.T) {

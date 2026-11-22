@@ -28,9 +28,16 @@ import (
 // status.sourceNode. An empty field means the fact is unknown, never that the
 // node lacks it.
 //
-// Nothing reads them yet. A later change adds the orchestrator's placement
-// (C8) for the CRIU engine and the compatibility rule.
+// The controller reads them from status.sourceNode to place the restore
+// (C8): see node_placement.go and controller/internal/criuplacement.
 type SourceNodeFacts struct {
+	// Arch is the node's architecture as Go names it (amd64, arm64): the
+	// agent's own, which runs natively on the node. It matches the
+	// kubernetes.io/arch label the kubelet sets.
+	Arch string `json:"arch,omitempty"`
+	// CPUVendor is the "vendor_id" line of /proc/cpuinfo (x86), such as
+	// GenuineIntel. Absent on arm64.
+	CPUVendor string `json:"cpuVendor,omitempty"`
 	// CPUModel is the "model name" line of /proc/cpuinfo, the value the
 	// restore node's CPU family guard compares (restore_node.go). Absent on
 	// arm64, whose cpuinfo has no such line.
@@ -55,11 +62,15 @@ type SourceNodeFacts struct {
 	// ContainerdVersion is the version containerd reports, without a
 	// leading "v".
 	ContainerdVersion string `json:"containerdVersion,omitempty"`
+	// PlacementLabels is the node label format (PlacementLabelsVersion)
+	// that the agent which took the checkpoint publishes on its own node.
+	// The controller only places a restore by those labels when it's set.
+	PlacementLabels string `json:"placementLabels,omitempty"`
 }
 
-// IsEmpty reports whether no fact is known.
+// IsEmpty reports whether no fact is known. PlacementLabels isn't a fact.
 func (f SourceNodeFacts) IsEmpty() bool {
-	return f.CPUModel == "" && len(f.CPUFeatures) == 0 && f.KernelVersion == "" &&
+	return f.Arch == "" && f.CPUVendor == "" && f.CPUModel == "" && len(f.CPUFeatures) == 0 && f.KernelVersion == "" &&
 		f.CRIUVersion == "" && f.RuncVersion == "" && f.ContainerdVersion == ""
 }
 

@@ -90,6 +90,7 @@ func TestSourceNodeFactsAllKnown(t *testing.T) {
 	}
 	got := p.gather(context.Background())
 	want := contract.SourceNodeFacts{
+		CPUVendor:         "GenuineIntel",
 		CPUModel:          "Intel(R) Xeon(R) CPU @ 2.20GHz",
 		CPUFeatures:       []string{"avx2", "avx512f", "fpu", "sse4_2"}, // union across processors, sorted, deduped
 		KernelVersion:     "6.6.72+",

@@ -399,6 +399,34 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 		concluded(t, reconcileTimeout(t, releasedJob(past), pod, timeoutSetup{engines: registryOf(t, eng), nodes: []client.Object{inside, outside}}))
 	})
 
+	t.Run("a requirement the pod's own template has is kept when estimating the recreated pod", func(t *testing.T) {
+		// The CRIU engine requires kubernetes.io/arch In [amd64]. A pod
+		// whose template requires the same must keep it when the deadline
+		// check strips the engine's constraints, or an idle arm64 node
+		// counts as a way out and the pod is deleted at the deadline
+		// instead of waiting for the ceiling.
+		amd64 := corev1.NodeSelectorRequirement{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}
+		vendor := corev1.NodeSelectorRequirement{Key: "criu.pod-migrate.io/cpu-vendor", Operator: corev1.NodeSelectorOpIn, Values: []string{"GenuineIntel", "unknown"}}
+		reqs := []corev1.NodeSelectorRequirement{amd64, vendor}
+		eng := &placementEngine{orderingEngine: orderingEngine{routedEngine{name: "placing", provider: &fakeSnapshotProvider{}}}, reqs: reqs}
+		pod := stuckPod(func(p *corev1.Pod) {
+			p.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{amd64}}},
+			}}}
+			addRequiredNodeAffinity(p, reqs)
+		})
+		arch := func(a string) func(*corev1.Node) {
+			return func(n *corev1.Node) { n.Labels[corev1.LabelArchStable] = a }
+		}
+		idleARM := placementNode("arm-a", "t2a-standard-4", arch("arm64"))
+		fullIntel := placementNode("n2-a", "n2-standard-4", arch("amd64"), func(n *corev1.Node) { n.Labels[vendor.Key] = "GenuineIntel" })
+		untouched(t, reconcileTimeout(t, releasedJob(past), pod, timeoutSetup{engines: registryOf(t, eng), nodes: []client.Object{idleARM, fullIntel}}))
+		// An amd64 node of another vendor is a way out: the template
+		// allows it, only the engine's vendor requirement doesn't.
+		amd := placementNode("c2d-a", "c2d-standard-4", arch("amd64"), func(n *corev1.Node) { n.Labels[vendor.Key] = "AuthenticAMD" })
+		concluded(t, reconcileTimeout(t, releasedJob(past), pod, timeoutSetup{engines: registryOf(t, eng), nodes: []client.Object{idleARM, fullIntel, amd}}))
+	})
+
 	t.Run("a node list that fails is retried, not taken as no node", func(t *testing.T) {
 		failing := interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 			if _, ok := list.(*corev1.NodeList); ok {

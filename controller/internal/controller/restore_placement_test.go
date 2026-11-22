@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/criuplacement"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
@@ -188,7 +189,7 @@ func reconcilePlacementWith(t *testing.T, restorePlacement bool, engines *engine
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(withReadySnapshots(objs, engine.DefaultAPIGroup, "engine.example.com")...).
+		WithObjects(withReadySnapshots(objs, engine.DefaultAPIGroup, "engine.example.com", engine.CRIUAPIGroup)...).
 		WithInterceptorFuncs(funcs).
 		Build()
 	recorder := record.NewFakeRecorder(20)
@@ -1360,14 +1361,35 @@ func TestWithoutRequirements(t *testing.T) {
 		})
 	}
 
-	t.Run("a term of its own that has the requirement loses it too", func(t *testing.T) {
-		// restorePlacement adds nothing when every term has it, so this
-		// only happens when the pod's terms differ in it.
+	t.Run("a term of its own that has the requirement keeps it", func(t *testing.T) {
+		// Only what addRequiredNodeAffinity appended is taken out: the
+		// recreated pod still has its template's own requirement.
 		placed := &corev1.Pod{Spec: corev1.PodSpec{Affinity: requiredAffinity(termOf(req, zoneA), termOf(zoneB))}}
 		addRequiredNodeAffinity(placed, reqs)
-		want := []corev1.NodeSelectorTerm{termOf(zoneA), termOf(zoneB)}
+		if got := placed.Annotations[RestorePlacementAddedAnnotation]; got != "0,1" {
+			t.Errorf("%s = %q, want \"0,1\"", RestorePlacementAddedAnnotation, got)
+		}
+		want := []corev1.NodeSelectorTerm{termOf(req, zoneA), termOf(zoneB)}
 		if got := requiredTerms(withoutRequirements(placed, reqs)); !reflect.DeepEqual(got, want) {
 			t.Errorf("required terms = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("without the record, or with one that doesn't fit, every requirement in reqs is taken out", func(t *testing.T) {
+		// A pod released by an earlier version has no record.
+		for name, value := range map[string]string{"no record": "", "wrong term count": "1", "not a number": "x,1", "too many": "0,3", "not one of reqs": "1,1"} {
+			t.Run(name, func(t *testing.T) {
+				placed := &corev1.Pod{Spec: corev1.PodSpec{Affinity: requiredAffinity(termOf(req, zoneA), termOf(zoneB))}}
+				addRequiredNodeAffinity(placed, reqs)
+				delete(placed.Annotations, RestorePlacementAddedAnnotation)
+				if value != "" {
+					placed.Annotations[RestorePlacementAddedAnnotation] = value
+				}
+				want := []corev1.NodeSelectorTerm{termOf(zoneA), termOf(zoneB)}
+				if got := requiredTerms(withoutRequirements(placed, reqs)); !reflect.DeepEqual(got, want) {
+					t.Errorf("required terms = %+v, want %+v", got, want)
+				}
+			})
 		}
 	})
 }
@@ -1605,6 +1627,22 @@ func TestDescribeRequirements(t *testing.T) {
 	if got != want {
 		t.Errorf("describeRequirements() = %q, want %q", got, want)
 	}
+
+	t.Run("CRIU's missing-cpu requirements are summarized", func(t *testing.T) {
+		reqs := criuplacement.Requirements(criuplacement.Facts{
+			Arch: "amd64", CPUVendor: "GenuineIntel", CPUFeatures: []string{"fpu", "sse", "sse2", "avx", "md_clear"},
+			PlacementLabels: criuplacement.PlacementLabelsVersion,
+		})
+		got := describeRequirements(reqs)
+		want := "kubernetes.io/arch In [amd64], criu.pod-migrate.io/cpu-vendor In [GenuineIntel, unknown], criu.pod-migrate.io/xstate In [avx, unknown], " +
+			"and 4 CPU-flag requirements (missing-cpu.criu.pod-migrate.io/<flag> DoesNotExist)"
+		if got != want {
+			t.Errorf("describeRequirements() = %q, want %q", got, want)
+		}
+		if strings.Contains(got, "missing-cpu.criu.pod-migrate.io/sse ") {
+			t.Errorf("describeRequirements() lists a flag: %q", got)
+		}
+	})
 }
 
 // placementFlow drives the pod gate and the job reconciler over one fake
