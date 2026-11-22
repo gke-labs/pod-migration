@@ -335,7 +335,10 @@ they start cold instead of being restored; also delete the
     `runtimeClassName` unset/`""` or literal `"runc"`, and no native sidecar
     `initContainers` with `restartPolicy: Always`).
   - Explicit `command` in the pod spec (required so the `holder` wrapper can
-    fall through to a cold start if restore fails).
+    fall through to a cold start if restore fails). Most Deployments rely on
+    the image's entrypoint and set no `command`: with the CRIU engine, such a
+    pod is not migrated. It is evicted cold, with a Warning
+    `MigrationSkippedIneligible` event on the pod that says why (#273, #275).
   - Non-host-network pods (`hostNetwork: false`); pods declaring
     `hostNetwork: true` are refused across `PSMTReconciler`, `RestoreInjector`,
     and `NodeRestoreReconciler`.
@@ -346,7 +349,9 @@ they start cold instead of being restored; also delete the
   - The orchestrator checks the pod-level limits above itself before it starts
     a migration (`CRIU.Eligible` in `controller/internal/engine/criu.go`):
     a pod outside them is evicted without a migration, instead of going
-    through a `429` and a refused trigger first (#233).
+    through a `429` and a refused trigger first (#233). The eviction webhook
+    and the preemption controller record a Warning `MigrationSkippedIneligible`
+    event on such a pod, with the engine's reason (#275).
 
 ## What Installing the Engine Changes on a Node
 
