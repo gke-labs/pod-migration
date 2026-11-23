@@ -91,6 +91,12 @@ func TestCRDSchema_PodMigrationJob_StatusFields(t *testing.T) {
 	job.Status.OriginNodeKubeletVersion = "v1.37.1-gke.2097000"
 	now := metav1.NewTime(time.Now().Truncate(time.Second))
 	job.Status.RestoringStartTime = &now
+	trafficStopped := metav1.NewTime(now.Add(-5 * time.Second))
+	job.Status.TrafficStoppedTime = &trafficStopped
+	readyTime := metav1.NewTime(now.Add(2 * time.Second))
+	job.Status.ReplacementReadyTime = &readyTime
+	pauseDur := metav1.Duration{Duration: 7 * time.Second}
+	job.Status.ApplicationPauseDuration = &pauseDur
 	if err := k8sClient.Status().Update(ctx, job); err != nil {
 		t.Fatalf("Failed to update PodMigrationJob status: %v", err)
 	}
@@ -119,5 +125,14 @@ func TestCRDSchema_PodMigrationJob_StatusFields(t *testing.T) {
 	}
 	if fetched.Status.RestoringStartTime == nil || !fetched.Status.RestoringStartTime.Equal(&now) {
 		t.Errorf("Expected fetched.Status.RestoringStartTime == %v, got %v", now, fetched.Status.RestoringStartTime)
+	}
+	if fetched.Status.TrafficStoppedTime == nil || !fetched.Status.TrafficStoppedTime.Equal(&trafficStopped) {
+		t.Errorf("Expected fetched.Status.TrafficStoppedTime == %v, got %v", trafficStopped, fetched.Status.TrafficStoppedTime)
+	}
+	if fetched.Status.ReplacementReadyTime == nil || !fetched.Status.ReplacementReadyTime.Equal(&readyTime) {
+		t.Errorf("Expected fetched.Status.ReplacementReadyTime == %v, got %v", readyTime, fetched.Status.ReplacementReadyTime)
+	}
+	if fetched.Status.ApplicationPauseDuration == nil || fetched.Status.ApplicationPauseDuration.Duration != pauseDur.Duration {
+		t.Errorf("Expected fetched.Status.ApplicationPauseDuration == %v, got %v", pauseDur, fetched.Status.ApplicationPauseDuration)
 	}
 }
