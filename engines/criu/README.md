@@ -827,6 +827,38 @@ docker build -f build/agent/Dockerfile  -t <YOUR_CRIU_AGENT_IMAGE> .
 docker build -f build/holder/Dockerfile -t <YOUR_CRIU_HOLDER_IMAGE> .
 ```
 
+### End-to-end test on kind
+
+CI runs real migrations on a local kind cluster for pull requests and pushes
+to `main` that touch `engines/criu/`, `controller/`, `verification-suite/` or
+`.github/workflows/` (`.github/workflows/criu-e2e.yaml`,
+[#230](https://github.com/gke-labs/pod-migration/issues/230)). The kind
+workers run real containerd, runc and CRIU, and `fake-gcs-server` stands in
+for the bucket. Two stateful pods, each in its own namespace, are drained to
+the other worker: the first must be restored warm; the second holds a file on
+an emptyDir, which doesn't move, so its restore must fail and its replacement
+must start cold and serve.
+
+To run it locally you need an x86-64 Linux host whose kernel passes
+`criu check`, with Docker, kind v0.33.0 (the version CI pins), kubectl, make,
+jq and openssl. `up.sh` first deletes any kind cluster named `pm-e2e`, and
+creates the archive signing key Secret with a random key before it applies
+the engine's manifest (see [Archive signing](#archive-signing)).
+
+```bash
+verification-suite/kind/up.sh
+verification-suite/run_criu_kind_e2e.sh    # or name scenarios: warm-restore restore-failure
+kind delete cluster --name pm-e2e && docker rm -f pm-e2e-gcs    # tear down
+```
+
+The engine and the agent use the GCS emulator named by
+`STORAGE_EMULATOR_HOST` instead of GCS when it is set: `host:port`, as
+Google's client libraries take it (plain HTTP), or a URL such as
+`http://host:port`. They then send no credentials and log a `WARNING` line at
+startup. `up.sh` sets it; the shipped manifests never do. It is for tests
+only: never set it on a real cluster, where whoever runs the emulator could
+read, delete or corrupt the checkpoint archives.
+
 ## Installing on a Test Cluster
 
 Apply the `criu.podmigration.gke.io` CRDs, create the archive signing key
