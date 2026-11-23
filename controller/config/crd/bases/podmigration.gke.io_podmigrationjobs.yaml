@@ -193,8 +193,9 @@ spec:
                   type: string
                 type: array
               replacementReadyTime:
-                description: ReplacementReadyTime is the timestamp when the replacement
-                  pod first transitioned to Ready.
+                description: |-
+                  ReplacementReadyTime is the timestamp when the replacement pod transitioned to Ready
+                  (or most recently transitioned to Ready if readiness flapped).
                 format: date-time
                 type: string
               restoredPodName:

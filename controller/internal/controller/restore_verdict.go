@@ -213,7 +213,7 @@ func (r *PodMigrationJobReconciler) concludeRestored(
 	}
 
 	reason, label := ReasonRestoreInferred, "inferred"
-	outcome := "RestoreInferred"
+	outcome := metrics.OutcomeRestoreInferred
 	message := fmt.Sprintf("Replacement pod %s is Ready, and engine %s inferred the restore without positive evidence: %s",
 		pod.Name, engineName, verdict.Evidence)
 	if r.RestoreStabilizationWindow > 0 {
@@ -222,7 +222,7 @@ func (r *PodMigrationJobReconciler) concludeRestored(
 	}
 	if verdict.Confirmed {
 		reason, label = ReasonRestoreVerified, "confirmed"
-		outcome = "RestoreVerified"
+		outcome = metrics.OutcomeRestoreVerified
 		message = fmt.Sprintf("Pod state restored from snapshot and replacement pod %s is Ready; engine %s confirmed the restore: %s",
 			pod.Name, engineName, verdict.Evidence)
 	}
@@ -231,7 +231,7 @@ func (r *PodMigrationJobReconciler) concludeRestored(
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
 	now := metav1.Now()
 	job.Status.CompletionTime = &now
-	r.recordDowntimeMetricsAndStatus(job, pod, engineName, outcome)
+	r.recordDowntimeStatus(job, pod)
 	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 		Type:               "Restored",
 		Status:             metav1.ConditionTrue,
@@ -252,6 +252,9 @@ func (r *PodMigrationJobReconciler) concludeRestored(
 	if err := r.patchStatus(ctx, job, origJob); err != nil {
 		return r.handleStatusError(ctx, err, "Failed to update job status to Succeeded")
 	}
+	if job.Status.ApplicationPauseDuration != nil {
+		metrics.RecordApplicationDowntime(engineName, outcome, job.Status.ApplicationPauseDuration.Duration.Seconds())
+	}
 	metrics.MarkPMJInactive(req.NamespacedName.String())
 	metrics.RecordOutcome("succeeded")
 	metrics.RecordRestoreVerdict(engineName, label)
@@ -269,7 +272,7 @@ func (r *PodMigrationJobReconciler) concludeWithoutRestore(
 	verdict engine.RestoreVerdict,
 ) error {
 	reason, label := ReasonFallbackToColdStart, "cold_start"
-	outcome := "ColdStart"
+	outcome := metrics.OutcomeColdStart
 	if verdict.Outcome == engine.RestoreFailed {
 		reason, label = ReasonRestoreFailed, "failed"
 		outcome = ""
@@ -282,11 +285,14 @@ func (r *PodMigrationJobReconciler) concludeWithoutRestore(
 		message += " (" + verdict.Evidence + ")"
 	}
 	log.FromContext(ctx).Info("Replacement pod wasn't restored", "pod", pod.Name, "engine", engineName, "reason", reason, "message", message)
-	if outcome != "" {
-		r.recordDowntimeMetricsAndStatus(job, pod, engineName, outcome)
+	if outcome != "" && pod != nil {
+		r.recordDowntimeStatus(job, pod)
 	}
 	if err := r.markSucceededWithoutRestore(ctx, job, origJob, reason, message); err != nil {
 		return err
+	}
+	if outcome != "" && job.Status.ApplicationPauseDuration != nil {
+		metrics.RecordApplicationDowntime(engineName, outcome, job.Status.ApplicationPauseDuration.Duration.Seconds())
 	}
 	metrics.RecordRestoreVerdict(engineName, label)
 	return nil
@@ -307,6 +313,7 @@ func (r *PodMigrationJobReconciler) concludeRestoreLost(
 	message := fmt.Sprintf("Container %q of replacement pod %s restarted before the restore was verified (%d restart(s)), so it runs without its restored state",
 		container, pod.Name, restarts)
 	log.FromContext(ctx).Info("Restored state lost", "pod", pod.Name, "engine", engineName, "container", container, "restarts", restarts)
+	r.recordDowntimeStatus(job, pod)
 	if err := r.markSucceededWithoutRestore(ctx, job, origJob, ReasonRestoreLost, message); err != nil {
 		return err
 	}
@@ -317,60 +324,63 @@ func (r *PodMigrationJobReconciler) concludeRestoreLost(
 }
 
 // trafficStoppedTime returns when the source pod stopped serving traffic:
-// either when ConditionSourceFenced was set to True, or when SnapshottingStartTime was recorded.
+// either when ConditionSourceFenced was set to True, or when SnapshottingStartTime was recorded,
+// or CreationTimestamp. Returning DeepCopy avoids pointer aliasing into Job or Condition fields.
 func (r *PodMigrationJobReconciler) trafficStoppedTime(job *pmv1alpha1.PodMigrationJob) *metav1.Time {
 	if job.Status.TrafficStoppedTime != nil && !job.Status.TrafficStoppedTime.IsZero() {
-		return job.Status.TrafficStoppedTime
+		return job.Status.TrafficStoppedTime.DeepCopy()
 	}
 	if fenced := meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced); fenced != nil && fenced.Status == metav1.ConditionTrue && !fenced.LastTransitionTime.IsZero() {
-		return &fenced.LastTransitionTime
+		return fenced.LastTransitionTime.DeepCopy()
 	}
 	if job.Status.SnapshottingStartTime != nil && !job.Status.SnapshottingStartTime.IsZero() {
-		return job.Status.SnapshottingStartTime
+		return job.Status.SnapshottingStartTime.DeepCopy()
 	}
 	if !job.CreationTimestamp.IsZero() {
-		return &job.CreationTimestamp
+		return job.CreationTimestamp.DeepCopy()
 	}
 	now := metav1.Now()
 	return &now
 }
 
-// replacementPodReadyTime returns when the replacement pod first transitioned to Ready.
-// If the pod has a PodReady=True condition, it returns its LastTransitionTime; otherwise
-// it falls back to now.
-func (r *PodMigrationJobReconciler) replacementPodReadyTime(pod *corev1.Pod) *metav1.Time {
-	if pod != nil {
-		for _, cond := range pod.Status.Conditions {
-			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue && !cond.LastTransitionTime.IsZero() {
-				return &cond.LastTransitionTime
-			}
-		}
+// replacementPodReadyTime returns when the replacement pod transitioned to Ready,
+// or most recently transitioned to Ready if readiness flapped.
+// It reports whether a Ready pod was actually observed.
+// Future-skewed timestamps are clamped to now.
+func (r *PodMigrationJobReconciler) replacementPodReadyTime(pod *corev1.Pod) (*metav1.Time, bool) {
+	if pod == nil {
+		return nil, false
 	}
-	now := metav1.Now()
-	return &now
+	readySince := podReadySince(pod)
+	if readySince.IsZero() {
+		return nil, false
+	}
+	now := time.Now()
+	if readySince.After(now) {
+		readySince = now
+	}
+	t := metav1.NewTime(readySince)
+	return &t, true
 }
 
-// recordDowntimeMetricsAndStatus populates TrafficStoppedTime, ReplacementReadyTime,
-// and ApplicationPauseDuration on job.Status, and exports the Prometheus downtime histogram
-// metric partitioned by engine and outcome (RestoreVerified, RestoreInferred, ColdStart).
-func (r *PodMigrationJobReconciler) recordDowntimeMetricsAndStatus(
+// recordDowntimeStatus populates TrafficStoppedTime, ReplacementReadyTime,
+// and ApplicationPauseDuration on job.Status if replacementPod is Ready.
+func (r *PodMigrationJobReconciler) recordDowntimeStatus(
 	job *pmv1alpha1.PodMigrationJob,
 	replacementPod *corev1.Pod,
-	engineName, outcome string,
 ) {
-	trafficStopped := r.trafficStoppedTime(job)
-	readyTime := r.replacementPodReadyTime(replacementPod)
-
-	job.Status.TrafficStoppedTime = trafficStopped
+	if job.Status.TrafficStoppedTime == nil {
+		job.Status.TrafficStoppedTime = r.trafficStoppedTime(job)
+	}
+	readyTime, ok := r.replacementPodReadyTime(replacementPod)
+	if !ok {
+		return
+	}
 	job.Status.ReplacementReadyTime = readyTime
 
-	pauseDuration := readyTime.Time.Sub(trafficStopped.Time)
+	pauseDuration := readyTime.Time.Sub(job.Status.TrafficStoppedTime.Time)
 	if pauseDuration < 0 {
 		pauseDuration = 0
 	}
 	job.Status.ApplicationPauseDuration = &metav1.Duration{Duration: pauseDuration}
-
-	if outcome == "RestoreVerified" || outcome == "RestoreInferred" || outcome == "ColdStart" {
-		metrics.RecordApplicationDowntime(engineName, outcome, pauseDuration.Seconds())
-	}
 }

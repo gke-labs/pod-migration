@@ -1194,6 +1194,15 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore ||
 		job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed {
 
+		var coldStartRecheck time.Duration
+		if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+			var err error
+			coldStartRecheck, err = r.backfillColdStartDowntime(ctx, job)
+			if err != nil {
+				logger.Error(err, "Failed to backfill cold-start downtime; will retry", "pod", job.Status.RestoredPodName)
+			}
+		}
+
 		// Delete the job's PodSnapshot once it's done with it (C9, #107).
 		// Best effort, like the placement checks above: an error is retried
 		// on the next look and doesn't hold garbage collection.
@@ -1205,6 +1214,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// so the requeue below covers it.
 		if snapshotRecheck > 0 && (placementRecheck <= 0 || snapshotRecheck < placementRecheck) {
 			placementRecheck = snapshotRecheck
+		}
+		if coldStartRecheck > 0 && (placementRecheck <= 0 || coldStartRecheck < placementRecheck) {
+			placementRecheck = coldStartRecheck
 		}
 
 		if job.Status.CompletionTime != nil {
@@ -1444,9 +1456,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
 		now := metav1.Now()
 		job.Status.SnapshottingStartTime = &now
-		if job.Status.TrafficStoppedTime == nil {
-			job.Status.TrafficStoppedTime = &now
-		}
 		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -2259,13 +2268,6 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 	now := metav1.Now()
 	job.Status.CompletionTime = &now
-	if job.Status.ApplicationPauseDuration == nil {
-		outcome := ""
-		if reason == ReasonFallbackToColdStart {
-			outcome = "ColdStart"
-		}
-		r.recordDowntimeMetricsAndStatus(job, nil, r.jobEngine(job).Name(), outcome)
-	}
 	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 		Type:               "Restored",
 		Status:             metav1.ConditionFalse,
@@ -2291,6 +2293,68 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 	metrics.RecordOutcome(outcome)
 	r.recordPreviousPhaseDuration(job, prevPhase)
 	return nil
+}
+
+// backfillColdStartDowntime checks if a SucceededWithoutRestore job that concluded
+// with ReasonFallbackToColdStart still needs its ReplacementReadyTime and ApplicationPauseDuration
+// populated. If the replacement pod (RestoredPodName) is now Ready, it patches status and records
+// the ColdStart downtime histogram sample. If not ready yet and within restoreTimeout since
+// completion, it returns a 5s requeue duration.
+func (r *PodMigrationJobReconciler) backfillColdStartDowntime(
+	ctx context.Context,
+	job *pmv1alpha1.PodMigrationJob,
+) (time.Duration, error) {
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
+		return 0, nil
+	}
+	if job.Status.ReplacementReadyTime != nil {
+		return 0, nil
+	}
+	cond := meta.FindStatusCondition(job.Status.Conditions, "Restored")
+	if cond == nil || cond.Reason != ReasonFallbackToColdStart {
+		return 0, nil
+	}
+	if job.Status.CompletionTime == nil || time.Since(job.Status.CompletionTime.Time) > restoreTimeout {
+		return 0, nil
+	}
+	if job.Status.RestoredPodName == "" {
+		return 0, nil
+	}
+
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: job.Status.RestoredPodName}, pod)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if job.Status.RestoredPodUID != "" && string(pod.UID) != job.Status.RestoredPodUID {
+		return 0, nil
+	}
+
+	readyTime, ok := r.replacementPodReadyTime(pod)
+	if !ok {
+		// Bounded recheck: 5s while within restoreTimeout
+		return 5 * time.Second, nil
+	}
+
+	orig := job.DeepCopy()
+	if job.Status.TrafficStoppedTime == nil {
+		job.Status.TrafficStoppedTime = r.trafficStoppedTime(job)
+	}
+	job.Status.ReplacementReadyTime = readyTime
+	pauseDuration := readyTime.Time.Sub(job.Status.TrafficStoppedTime.Time)
+	if pauseDuration < 0 {
+		pauseDuration = 0
+	}
+	job.Status.ApplicationPauseDuration = &metav1.Duration{Duration: pauseDuration}
+
+	if err := r.patchStatus(ctx, job, orig, client.MergeFromWithOptimisticLock{}); err != nil {
+		return 0, err
+	}
+	metrics.RecordApplicationDowntime(r.jobEngine(job).Name(), metrics.OutcomeColdStart, pauseDuration.Seconds())
+	return 0, nil
 }
 
 // clearEvictionBlockageConditions retracts the BlockedByPDB and EvictionMisconfigured

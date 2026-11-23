@@ -87,6 +87,9 @@ func TestApplicationDowntime_Envtest(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "pmj-downtime-warm",
 				Namespace: "default",
+				Annotations: map[string]string{
+					"pod-migration.gke.io/engine": "criu",
+				},
 			},
 			Spec: pmv1alpha1.PodMigrationJobSpec{
 				PodRef:       corev1.LocalObjectReference{Name: "source-warm"},
@@ -127,13 +130,13 @@ func TestApplicationDowntime_Envtest(t *testing.T) {
 			t.Fatalf("updating replacement pod status: %v", err)
 		}
 
-		hist := metrics.ApplicationDowntimeSeconds.WithLabelValues("gke-pod-snapshots", "RestoreVerified")
+		hist := metrics.ApplicationDowntimeSeconds.WithLabelValues("criu", "RestoreVerified")
 		beforeCount := getHistogramSampleCount(hist)
 
 		origJob := job.DeepCopy()
 		verdict := engine.RestoreVerdict{Outcome: engine.Restored, Confirmed: true, Evidence: "confirmed warm restore"}
 		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job.Name}}
-		if _, err := r.concludeRestored(ctx, req, job, origJob, replacementPod, "gke-pod-snapshots", verdict); err != nil {
+		if _, err := r.concludeRestored(ctx, req, job, origJob, replacementPod, "criu", verdict); err != nil {
 			t.Fatalf("concludeRestored failed: %v", err)
 		}
 

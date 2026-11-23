@@ -91,7 +91,8 @@ type PodMigrationJobStatus struct {
 	// +optional
 	TrafficStoppedTime *metav1.Time `json:"trafficStoppedTime,omitempty"`
 
-	// ReplacementReadyTime is the timestamp when the replacement pod first transitioned to Ready.
+	// ReplacementReadyTime is the timestamp when the replacement pod transitioned to Ready
+	// (or most recently transitioned to Ready if readiness flapped).
 	// +optional
 	ReplacementReadyTime *metav1.Time `json:"replacementReadyTime,omitempty"`
 

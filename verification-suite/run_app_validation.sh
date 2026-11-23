@@ -57,6 +57,21 @@ wait_for_pod_ready() {
   done
   echo "[*] Pod $pod_name exists. Waiting for readiness (timeout ${timeout}s)..."
   kubectl wait --for=condition=Ready "pod/$pod_name" --timeout="${timeout}s"
+
+  # If a migration job exists for this pod, wait briefly for conclusion to measure application downtime
+  local has_pmj
+  has_pmj=$(kubectl get podmigrationjobs.podmigration.gke.io -o json 2>/dev/null | jq -r --arg p "$pod_name" '[.items[] | select(.spec.podRef.name == $p or .status.restoredPodName == $p)] | length')
+  if [ -n "$has_pmj" ] && [ "$has_pmj" -gt 0 ]; then
+    local pause_dur=""
+    for i in $(seq 1 30); do
+      pause_dur=$(kubectl get podmigrationjobs.podmigration.gke.io -o json 2>/dev/null | jq -r --arg p "$pod_name" '.items[] | select(.spec.podRef.name == $p or .status.restoredPodName == $p) | .status.applicationPauseDuration // empty')
+      if [ -n "$pause_dur" ]; then
+        echo "[+] Measured application downtime (pause duration): $pause_dur"
+        break
+      fi
+      sleep 1
+    done
+  fi
 }
 
 drain_node_and_verify_single_hop() {
@@ -77,11 +92,6 @@ drain_node_and_verify_single_hop() {
       exit 1
     fi
     echo "[+] Verified single-hop migration (1 PodMigrationJob for $pod_name)."
-    local pause_dur
-    pause_dur=$(kubectl get podmigrationjobs.podmigration.gke.io -o json | jq -r --arg p "$pod_name" '.items[] | select(.spec.podRef.name == $p) | .status.applicationPauseDuration // empty')
-    if [ -n "$pause_dur" ]; then
-      echo "[+] Measured application downtime (pause duration): $pause_dur"
-    fi
   fi
 }
 

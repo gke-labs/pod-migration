@@ -29,6 +29,12 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
+const (
+	OutcomeRestoreVerified = "RestoreVerified"
+	OutcomeRestoreInferred = "RestoreInferred"
+	OutcomeColdStart       = "ColdStart"
+)
+
 var (
 	// RestoreCrashFallbackTotal counts cold-start fallbacks triggered because
 	// a replacement pod crashed with a recognised gVisor/OCI restore-failure
@@ -155,7 +161,7 @@ var (
 	ApplicationDowntimeSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "pod_migration_application_downtime_seconds",
 		Help:    "Application pause duration (traffic stopped on source until replacement became Ready) in seconds, by engine and restore outcome.",
-		Buckets: prometheus.ExponentialBuckets(0.25, 2, 11),
+		Buckets: prometheus.ExponentialBuckets(1, 2, 12),
 	}, []string{"engine", "outcome"})
 
 	activeJobsMu sync.Mutex
