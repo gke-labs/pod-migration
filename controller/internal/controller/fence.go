@@ -300,6 +300,7 @@ func (r *PodMigrationJobReconciler) fenceSource(ctx context.Context, job, origJo
 	}
 
 	if !meta.IsStatusConditionTrue(job.Status.Conditions, ConditionSourceFenced) {
+		now := metav1.Now()
 		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 			Type:               ConditionSourceFenced,
 			Status:             metav1.ConditionTrue,
@@ -307,6 +308,9 @@ func (r *PodMigrationJobReconciler) fenceSource(ctx context.Context, job, origJo
 			Message:            "The source is fenced before its checkpoint: it's labeled " + util.LabelFenced + " and held NotReady, so its Services don't send it traffic",
 			ObservedGeneration: job.Generation,
 		})
+		if job.Status.TrafficStoppedTime == nil {
+			job.Status.TrafficStoppedTime = &now
+		}
 		if err := r.patchStatus(ctx, job, origJob); err != nil {
 			return err
 		}

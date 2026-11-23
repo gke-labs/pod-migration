@@ -150,6 +150,19 @@ func (in *PodMigrationJobStatus) DeepCopyInto(out *PodMigrationJobStatus) {
 		in, out := &in.RestoringStartTime, &out.RestoringStartTime
 		*out = (*in).DeepCopy()
 	}
+	if in.TrafficStoppedTime != nil {
+		in, out := &in.TrafficStoppedTime, &out.TrafficStoppedTime
+		*out = (*in).DeepCopy()
+	}
+	if in.ReplacementReadyTime != nil {
+		in, out := &in.ReplacementReadyTime, &out.ReplacementReadyTime
+		*out = (*in).DeepCopy()
+	}
+	if in.ApplicationPauseDuration != nil {
+		in, out := &in.ApplicationPauseDuration, &out.ApplicationPauseDuration
+		*out = new(v1.Duration)
+		**out = **in
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

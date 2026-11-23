@@ -86,6 +86,21 @@ type PodMigrationJobStatus struct {
 	// +optional
 	RestoringStartTime *metav1.Time `json:"restoringStartTime,omitempty"`
 
+	// TrafficStoppedTime is the timestamp when the source pod stopped serving traffic
+	// (either when it was fenced or when its checkpoint was initiated).
+	// +optional
+	TrafficStoppedTime *metav1.Time `json:"trafficStoppedTime,omitempty"`
+
+	// ReplacementReadyTime is the timestamp when the replacement pod transitioned to Ready
+	// (or most recently transitioned to Ready if readiness flapped).
+	// +optional
+	ReplacementReadyTime *metav1.Time `json:"replacementReadyTime,omitempty"`
+
+	// ApplicationPauseDuration is the elapsed duration between when traffic stopped on the source
+	// pod and when the replacement pod first became Ready.
+	// +optional
+	ApplicationPauseDuration *metav1.Duration `json:"applicationPauseDuration,omitempty"`
+
 	// Consumed indicates whether this migration snapshot has been adopted by a replacement pod.
 	// If the recorded consumer pod is deleted before its scheduling gate is released (GateReleased == false),
 	// a subsequent replacement pod may recover and re-adopt this PMJ. Once GateReleased is true, subsequent

@@ -29,6 +29,12 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 )
 
+const (
+	OutcomeRestoreVerified = "RestoreVerified"
+	OutcomeRestoreInferred = "RestoreInferred"
+	OutcomeColdStart       = "ColdStart"
+)
+
 var (
 	// RestoreCrashFallbackTotal counts cold-start fallbacks triggered because
 	// a replacement pod crashed with a recognised gVisor/OCI restore-failure
@@ -181,6 +187,15 @@ var (
 		Help: "Share of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime (0.0 to 1.0).",
 	}, []string{"namespace"})
 
+	// ApplicationDowntimeSeconds tracks the observed application downtime (pause duration)
+	// from source pod traffic stop to replacement pod Ready, by engine and outcome.
+	// Outcomes: RestoreVerified | RestoreInferred | ColdStart
+	ApplicationDowntimeSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "pod_migration_application_downtime_seconds",
+		Help:    "Application pause duration (traffic stopped on source until replacement became Ready) in seconds, by engine and restore outcome.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 12),
+	}, []string{"engine", "outcome"})
+
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
 )
@@ -204,6 +219,7 @@ func init() {
 		MigratableCoveredRunningPods,
 		MigratableTotalRunningPods,
 		MigratableCoverageRatio,
+		ApplicationDowntimeSeconds,
 	)
 }
 
@@ -241,6 +257,14 @@ func ClearNamespaceCoverage(namespace string) {
 	MigratableCoverageRatio.DeleteLabelValues(namespace)
 }
 
+// RecordApplicationDowntime records the observed application downtime in seconds
+// for a completed migration by engine and restore outcome (RestoreVerified,
+// RestoreInferred, ColdStart).
+func RecordApplicationDowntime(engine, outcome string, durationSeconds float64) {
+	if engine != "" && outcome != "" && durationSeconds >= 0 {
+		ApplicationDowntimeSeconds.WithLabelValues(engine, outcome).Observe(durationSeconds)
+	}
+}
 // RecordSourceFence increments the source fence counter for the given action.
 func RecordSourceFence(action string) {
 	if action != "" {
