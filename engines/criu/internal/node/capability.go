@@ -47,7 +47,7 @@ const (
 	RemediationRestartContainerd = "restart containerd (systemctl restart containerd)"
 
 	// imageBundleDir is where the agent image carries the self-contained CRIU
-	// bundle (built by build/agent/Dockerfile from a criu >= 3.19 distro).
+	// bundle (built by build/agent/Dockerfile from a criu >= 4.2.1 distro).
 	imageBundleDir = "/opt/criu-bundle"
 
 	// hostPathBinDir is a host directory on containerd's/kubelet's PATH
@@ -93,13 +93,15 @@ func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir str
 	// reads /etc/criu/runc.conf for dump AND restore. tcp-close and
 	// skip-in-flight abandon established and half-open connections so clients
 	// reconnect cleanly; file-validation buildid verifies binary identity on
-	// restore. Written at bootstrap because the kubelet checkpoint dump happens
-	// before any agent-driven restore.
+	// restore. network-lock iptables pins the lock method, whose default the
+	// CRIU package chooses at build time, to the one cleanNetnsLock removes
+	// after a failed restore (#126). Written at bootstrap because the kubelet
+	// checkpoint dump happens before any agent-driven restore.
 	if err := os.MkdirAll(dstConfDir, 0o755); err != nil {
 		return "", err
 	}
 	if err := writeFileAtomic(filepath.Join(dstConfDir, "runc.conf"),
-		[]byte("tcp-close\nskip-in-flight\nfile-validation buildid\nfile-locks\n"), 0o644); err != nil {
+		[]byte("tcp-close\nskip-in-flight\nfile-validation buildid\nfile-locks\nnetwork-lock iptables\n"), 0o644); err != nil {
 		return "", fmt.Errorf("write criu runc.conf: %w", err)
 	}
 	// Put the wrapper on the host PATH so containerd/runc (and therefore the

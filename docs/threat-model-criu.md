@@ -243,7 +243,7 @@ The CRIU snapshot engine follows secure container build practices:
 - **Minimal Base Images**:
   - `cmd/engine` (Controller): Built on `gcr.io/distroless/static:nonroot`. Runs as non-root UID `65532:65532`.
   - `cmd/holder` (Sandbox Placeholder): Built `FROM scratch`. Static binary, no shell, no package manager, non-root UID `65532:65532`.
-  - `cmd/agent` (Node Agent): Built from Debian trixie (for CRIU 4.x package build) into an Ubuntu 24.04 runtime with `util-linux` and `ca-certificates`.
+  - `cmd/agent` (Node Agent): Bundles CRIU from Debian forky (trixie's CRIU 4.1.1 is older than the 4.2.1 the build requires) into an Ubuntu 24.04 runtime with `util-linux` and `ca-certificates`. Forky is Debian's testing suite: its versions change between builds and the Debian security team doesn't cover it, so `/opt/criu-bundle/licenses/package-versions.txt` records exactly what an image carries.
 - **Reproducible & Trimmed Binaries**: All Go binaries are compiled with:
   ```bash
   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"
