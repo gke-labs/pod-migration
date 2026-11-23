@@ -78,14 +78,15 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
 
 ### Blast Radius & Mitigations
 
-- **Compromise Impact**: If the `pod-migrate-agent` container is compromised, the attacker achieves root on the host node and access to local containerd sockets.
+- **Compromise Impact**: If the `pod-migrate-agent` container is compromised, the attacker achieves root on the host node and access to local containerd sockets, and to the archive signing keys, so it can sign archives that any node restores (R2).
 - **Cluster RBAC Scope**: The agent uses a ClusterRole (`pod-migrate-psengine-agent`) granting cluster-wide permissions:
   - `nodes/checkpoint` (`create`): Triggers kubelet container checkpoints (cluster-wide scope in Kubernetes RBAC).
   - `nodes` (`get`, `patch`): Publishes readiness and capability annotations (`pod-migrate.io/criu-ready`, `pod-migrate.io/criu-version`), and the restore placement facts (#257): the `criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` labels and the `pod-migrate.io/criu-node-facts` and `pod-migrate.io/criu-node-cpu-features` annotations. They stay on the `Node` after the engine is uninstalled.
-  - `pods` (`get`, `list`, `watch`, `update`, `patch`): Tracks replacement pod lifecycle and stamps `pod-migrate.io/psengine-restore`.
+  - `pods` (`get`, `list`, `watch`, `update`, `patch`): Tracks replacement pod lifecycle and stamps `pod-migrate.io/psengine-restore` (with `pod-migrate.io/psengine-restore-reason` on a failure).
   - `podsnapshots` (`get`, `list`, `watch`) and `podsnapshots/status` (`get`, `update`, `patch`): Read-only work order inspection and status reporting.
   - `podmigrationjobs` (`get`, `list`, `watch`): Validates active migration job bindings.
-  - `podsnapshotmanualtriggers` (`get`): Verifies cancellation state.
+  - `podsnapshotmanualtriggers` (`get`): Verifies cancellation state, and reads the trigger's controller reference: the PodMigrationJob whose UID the archive manifest binds (#244).
+  - `namespaces` (`get`, on `kube-system` only): Reads the cluster UID that archive manifests bind (#244).
   - `events` (`create`, `patch`): Emits node restore and failure warning events.
     _Note on RBAC Breadth_: Because Kubernetes RBAC cannot scope `nodes/checkpoint`, `nodes/patch`, or `pods/update` to the DaemonSet's local node, a compromised agent holds broad cluster-wide write privileges against these resources.
 - **Engine Controller RBAC Scope (`pod-migrate-psengine-controller`)**: The cluster-level `cmd/engine` controller and `/psengine-restore-inject` webhook run as non-root (`65532:65532`) with narrower RBAC:
@@ -109,18 +110,27 @@ A central risk in process checkpoint and restore is **unauthorized privilege gai
 - **Admission Boundaries at `CREATE`**: The replacement webhook (`PodGateInjector`) only intercepts `CREATE` requests. For Kubeflow and third-party orchestration interop, it intentionally preserves pre-existing, non-empty `podsnapshot.gke.io/ps-name` annotations when no matching PMJ is found, rather than unconditionally stripping them.
 - **Admission Boundaries on `UPDATE` (#233)**: Two `ValidatingAdmissionPolicy` objects block tampering with restore annotations on existing pods. The API server evaluates them itself, so they don't depend on a webhook being up, and their `matchConditions` skip every update that leaves the protected annotations as they are. They cover updates of a pod and of its `status` subresource, since a status write can change annotations too.
   - `pod-migration-restore-order` (in `controller/deploy.yaml`): on a pod opted into migration (`pod-migration.gke.io/enabled: "true"` before or after the update), only the controller's service account may set, change or remove a restore order (`<group>/ps-name`, for any engine's group).
-  - `pod-migrate-psengine-restore-status` (in `engines/criu/deploy/deploy.yaml`): only the node agent's service account may record a restore outcome (`pod-migrate.io/psengine-restore`), only once, and only as `restored` or `failed`. Nobody may change or remove it afterwards.
-- **Engine Annotations at `CREATE`**: On a pod opted into migration, the replacement webhook (`PodGateInjector`) removes `pod-migrate.io/psengine-restore` and `pod-migrate.io/psengine-injected` that the pod's template carries, so a pod can't be created with an outcome or a holder marker of its own.
+  - `pod-migrate-psengine-restore-status` (in `engines/criu/deploy/deploy.yaml`): only the node agent's service account may record a restore outcome (`pod-migrate.io/psengine-restore`), only once, and only as `restored` or `failed`, with a failure's reason (`pod-migrate.io/psengine-restore-reason`, #244) in the same update and only next to `failed`. Nobody may change or remove either afterwards.
+- **Engine Annotations at `CREATE`**: On a pod opted into migration, the replacement webhook (`PodGateInjector`) removes `pod-migrate.io/psengine-restore`, `pod-migrate.io/psengine-restore-reason` and `pod-migrate.io/psengine-injected` that the pod's template carries, so a pod can't be created with an outcome, a reason or a holder marker of its own.
 - **Remaining Gaps**:
   - A pod that opts out (its opt-in label is removed, which stays allowed) leaves the scope of `pod-migration-restore-order`. A restore order set on it afterwards is a restore outside a migration, and it stays on the pod if the label is added back later: that last update doesn't change the order, so the policy doesn't see it. The node agent's work order check above still applies to it.
   - The policies see updates of a pod and of its `status`. They don't see a `pods/binding` request, which can also set annotations on a pod when it binds the pod to a node. The built-in `edit` and `admin` roles don't grant `pods/binding`; keep it to schedulers.
   - Whoever may change or delete a `ValidatingAdmissionPolicyBinding` (a cluster admin) can lift a policy. That is also the way to edit these annotations by hand in an emergency: set the binding's `validationActions` to `Audit`, and back to `Deny` afterwards.
   - Each policy names the one service account it allows, namespace included. An install that renames either must change the policy too.
 
-### R2. Archive Integrity vs. Provenance (Integrity Only; see #129 R2)
+### R2. Archive Integrity & Provenance (in place for CRIU, #244)
 
 - **Integrity Against Corruption**: Checkpoint archives in GCS (`manifest.json`, `spec.json`, `checkpoint.tar`) are validated against SHA-256 and MD5 hashes before unpacking.
-- **No Provenance or Signatures Today**: SHA-256 and MD5 checks provide integrity against transmission or storage corruption, **not cryptographic provenance**. Archives are not cryptographically signed or MAC'd; an attacker who can write to the GCS bucket can replace the archive and update the digests.
+- **Signed, Bound Manifests**: The node agent signs each archive's manifest with an HMAC-SHA256 key from the `pod-migrate-archive-signing-keys` Secret in `pod-migration-criu-system`, which only the agent mounts (read-only, mode `0400`). `manifest.json` is a DSSE envelope; its payload carries the SHA-256 of `spec.json` and `checkpoint.tar` and binds the archive to its snapshot, namespace, source pod name and UID, container, bucket and path, the UID of the PodMigrationJob that controls the work order's trigger, and the cluster UID (the `kube-system` Namespace's UID). It also records the trigger's name and UID, which the restore doesn't check: the job UID ties the archive to its job, and a job that creates its trigger again takes its own work order over (#262).
+- **Verified Before Anything Else Is Downloaded**: The restoring agent verifies the manifest's signature with its keys, then compares every binding with its own work order, the replacement's assigned PodMigrationJob and its own cluster, before it downloads `spec.json` or `checkpoint.tar`, which must then match the signed digests. A replaced or re-signed archive, a genuine archive copied into another snapshot's prefix, an archive kept from an earlier job and put back, or one from another cluster is refused, and so is an unsigned one. The replacement falls back to a cold start, with the reason in `pod-migrate.io/psengine-restore-reason` and in the PodMigrationJob's message (`engines/criu/README.md`, "Archive signing"). Neither that reason nor the Warning event on the pod names key IDs or cluster UIDs; the agent's log does.
+- **Bounded Verification**: A bucket writer can't make verification expensive. An envelope with more than 8 signatures is refused as malformed before any MAC is computed, a signature that isn't 32 bytes never matches, and each key's MAC is computed at most once per envelope.
+- **No Key, No Checkpoint**: An agent without a signing key or the cluster UID fails a work order before it freezes the source, and an agent without keys refuses every archive.
+- **No Job, No Commit**: An archive that no restore would accept is never committed with its source kept frozen for eviction. Right before signing, the agent reads the work order and its trigger past the cache and takes the job from the trigger's controller reference. It reads again for a few seconds while a trigger that was created again takes the work order over (#262), cancels the checkpoint if the trigger or the work order is gone, and fails it before `manifest.json` is uploaded if no job can be bound. At the commit point it reads the trigger again by name and fails if another PodMigrationJob controls it by then. Each time, the source thaws.
+- **Residual Risks**:
+  - Anyone who can read Secrets in `pod-migration-criu-system`, or who compromises a node agent, can sign an archive. With a MAC, every agent holds the key, so one compromised node can forge archives that any node restores.
+  - Anyone who can write to the bucket can still delete or corrupt archives (forcing cold starts) and read them, until R5 (dedicated storage credentials, #244) lands.
+  - Archives written before signing are refused, and their replacements start cold.
+  - The commit point reads the trigger once more, after `manifest.json` is uploaded. A trigger that passes to another PodMigrationJob after that read isn't seen: the snapshot goes Ready, and that job's restore refuses the archive (cold start).
 - **Archive Size Bounds**: Strict caps prevent denial-of-service via resource exhaustion:
   - Metadata files (`manifest.json`, `spec.json`): Capped at 4 MiB.
   - Archive payload (`checkpoint.tar`): Capped at 8 GiB.
@@ -140,7 +150,7 @@ When restoring a process, security posture is governed at two layers:
    - Container device rules (`Devices`)
    - Linux namespaces (`IPC`, `Network`, `UTS`, `PID`, `Cgroup`)
    - Volume mounts (restricted to destination pod's declared volumes)
-2. **CRIU Process State Inherent Privileges**: While `AdaptSpec` governs the OCI container spec, CRIU restores process credentials, capabilities, and seccomp state directly from the checkpoint image files (`core-*.img`). Nothing currently compares in-image process credentials against destination constraints. Consequently, as warned in the project banner: **anyone who can write to the checkpoint GCS bucket (including workloads on nodes sharing the default GCE service account) can get root on a restoring node until R2 (provenance/signatures) and R5 (isolated storage credentials) land**.
+2. **CRIU Process State Inherent Privileges**: While `AdaptSpec` governs the OCI container spec, CRIU restores process credentials, capabilities, and seccomp state directly from the checkpoint image files (`core-*.img`). Nothing currently compares in-image process credentials against destination constraints. Signed manifests (R2, #244) mean that writing to the checkpoint GCS bucket no longer gets an attacker's process image restored. But **anyone who can read the archive signing keys (Secrets in `pod-migration-criu-system`) or compromise a node agent can sign an archive that gets root on a restoring node**, and until R5 (isolated storage credentials) lands, anyone who can write to the bucket (including workloads on nodes sharing the default GCE service account) can delete, corrupt or read archives.
 
 - **Pending Host Network Refusal (#229)**: Refusal of pods declaring `hostNetwork: true` across all CRIU boundaries (`PSMTReconciler`, `injectHolder`, and `NodeRestoreReconciler.restore`) is implemented in [#229](https://github.com/gke-labs/pod-migration/pull/229) (pending merge).
 
@@ -176,7 +186,7 @@ To prevent unauthorized access or tampering with checkpoint archives:
    - The node agent runs with `hostNetwork: true` to communicate with the local kubelet and manage network namespaces.
    - **Workload Identity does not apply to `hostNetwork: true` pods** on GKE (they bypass the GKE metadata server's token interception and receive credentials from the underlying node's GCE service account).
    - Because the agent uses the node's GCE service account, **"workloads must never get bucket access" is not achievable today on nodes where general workloads share the default node service account**.
-   - Until R5 (#129) lands (dedicated secret-mounted or sidecar storage credentials), clusters deploying the CRIU engine must run CRIU nodes in dedicated node pools using a dedicated GSA, isolated from untrusted workloads.
+   - Until R5 (#244) lands (dedicated secret-mounted or sidecar storage credentials), clusters deploying the CRIU engine must run CRIU nodes in dedicated node pools using a dedicated GSA, isolated from untrusted workloads.
 2. **Bucket Permissions & Isolation**:
    - Checkpointing nodes require `roles/storage.objectCreator` and `roles/storage.objectViewer`.
    - Restoring nodes require `roles/storage.objectViewer`.

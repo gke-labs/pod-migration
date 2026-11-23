@@ -332,7 +332,7 @@ func TestArchiveGC_DeletesEverythingThePipelineUploads(t *testing.T) {
 	ps.SetFinalizers([]string{ArchiveFinalizer})
 	c := newClient(t, ps)
 	store := newMemStore()
-	pipe := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: store}
+	pipe := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: store}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}
 	if _, err := pipe.Reconcile(context.Background(), req); err != nil {
 		t.Fatal(err)

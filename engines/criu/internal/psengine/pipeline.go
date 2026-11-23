@@ -44,6 +44,7 @@ package psengine
 // and cold-evicts it.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -57,6 +58,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
@@ -86,7 +88,8 @@ type NodeOps interface {
 }
 
 // Manifest is the archive's integrity + identity record; its presence in GCS
-// marks the upload complete (it is written last).
+// marks the upload complete (it is written last). It travels as the signed
+// payload of manifest.json (signing.go, C10 R2, #244).
 type Manifest struct {
 	Snapshot      string    `json:"snapshot"`
 	SourcePod     string    `json:"sourcePod"`
@@ -103,9 +106,33 @@ type Manifest struct {
 	// SourceNode records the facts about the checkpoint's node that decide
 	// where it can be restored (#257). Absent when none were known.
 	SourceNode *contract.SourceNodeFacts `json:"sourceNode,omitempty"`
+
+	// What the archive is bound to (C10 R2, #244), with Snapshot, SourcePod,
+	// SourcePodUID and Container above: the restore refuses an archive whose
+	// bindings don't match its own work order, job and cluster, so a genuine
+	// archive copied into another snapshot's prefix, or kept and put back for
+	// a later job, is never restored.
+	Namespace string `json:"namespace"`
+	Bucket    string `json:"bucket"`
+	Path      string `json:"path"`
+	// TriggerName and TriggerUID name the trigger instance the work order
+	// answered when the manifest was signed; empty for a work order from
+	// before the engine recorded them. Recorded, not checked at restore:
+	// JobUID ties the archive to its job, and a job that creates its trigger
+	// again takes its own work order over (#262).
+	TriggerName string `json:"triggerName"`
+	TriggerUID  string `json:"triggerUID"`
+	// JobUID is the UID of the PodMigrationJob that controls that trigger,
+	// which a restore requires. The agent never uploads a manifest without
+	// one, and commits only while that job still controls the trigger.
+	JobUID string `json:"jobUID"`
+	// ClusterUID is the UID of the cluster's kube-system Namespace.
+	ClusterUID string `json:"clusterUID"`
 }
 
-const engineVersion = "psengine/v1alpha1"
+// engineVersion v1alpha2: manifest.json is a signed envelope and the manifest
+// carries its bindings (#244).
+const engineVersion = "psengine/v1alpha2"
 
 // snapshotSpec is the work order the PSMT watcher wrote into the PodSnapshot.
 type snapshotSpec struct {
@@ -115,6 +142,10 @@ type snapshotSpec struct {
 	NodeName     string
 	Bucket       string
 	Path         string
+	// TriggerName and TriggerUID are the trigger the work order answers
+	// (specTriggerName, specTriggerUID); empty on older work orders.
+	TriggerName string
+	TriggerUID  string
 }
 
 func readSnapshotSpec(ps *unstructured.Unstructured) (snapshotSpec, error) {
@@ -126,6 +157,7 @@ func readSnapshotSpec(ps *unstructured.Unstructured) (snapshotSpec, error) {
 	s.SourcePod, s.SourcePodUID = get("sourcePod"), get("sourcePodUID")
 	s.Container, s.NodeName = get("container"), get("nodeName")
 	s.Bucket, s.Path = get("bucket"), get("path")
+	s.TriggerName, s.TriggerUID = get(specTriggerName), get(specTriggerUID)
 	if s.SourcePod == "" || s.Container == "" || s.NodeName == "" || s.Bucket == "" {
 		return s, fmt.Errorf("incomplete work order: sourcePod=%q container=%q nodeName=%q bucket=%q",
 			s.SourcePod, s.Container, s.NodeName, s.Bucket)
@@ -157,6 +189,13 @@ type NodeSnapshotReconciler struct {
 	// CancelPollInterval is how often an in-flight upload looks for a cancel
 	// (cached read). Zero means defaultCancelPollInterval.
 	CancelPollInterval time.Duration
+	// Signer signs each archive's manifest (C10 R2, #244). Nil means the
+	// agent has no signing key: work orders then fail before the source is
+	// frozen, since no restore would accept their archives.
+	Signer *Signer
+	// ClusterUID is this cluster's UID (ReadClusterUID), which each manifest
+	// binds the archive to. Empty fails work orders like a nil Signer.
+	ClusterUID string
 
 	ParallelUploadConfig ParallelUploadConfig
 
@@ -172,13 +211,24 @@ func (r *NodeSnapshotReconciler) parallelConfig() ParallelUploadConfig {
 
 const defaultCancelPollInterval = 2 * time.Second
 
-// The live check before the commit point makes four attempts with waits of
-// 0.5, 1 and 2 s between them (3.5 s), each attempt bounded by
-// preCommitCheckTimeout, before it fails closed: about 11.5 s in the worst
-// case, when every attempt hangs to its deadline. That stays inside the
-// orchestrator's 30 s checkpoint-settle wait. A brief API server blip then
-// doesn't turn a durable archive into Failed, and one hung request can't use
-// up the budget. Variables so tests can shrink the waits.
+// Two live checks run while the source is frozen: the binding read right
+// before the manifest is signed (readArchiveBinding), and the check before
+// the commit point. Each makes four attempts with waits of 0.5, 1 and 2 s
+// between them (3.5 s), each attempt bounded by preCommitCheckTimeout, before
+// it fails closed: about 11.5 s each in the worst case, when every attempt
+// hangs to its deadline, so up to about 23 s more of freeze while the API
+// server is failing. A brief API server blip then doesn't turn a durable
+// archive into Failed, and one hung request can't use up the budget. The
+// binding read also waits out, within the same attempts, a trigger created
+// again that hasn't taken the work order over yet (#262).
+//
+// The orchestrator's 30 s checkpoint-settle wait (fenceSettleTimeout) starts
+// when it gives up on a job and deletes the trigger: if the snapshot hasn't
+// settled by then, it keeps the source fenced and evicts it cold instead of
+// returning it to service. A deleted trigger is seen at once (gone is never
+// retried), so these budgets only press against that wait while the API
+// server is failing, when keeping the fence is the safe outcome anyway.
+// Variables so tests can shrink the waits.
 var (
 	preCommitCheckBackoff = wait.Backoff{Steps: 4, Duration: 500 * time.Millisecond, Factor: 2}
 	preCommitCheckTimeout = 2 * time.Second
@@ -235,37 +285,45 @@ const (
 // checked before the trigger, because deleting the trigger of a Ready
 // snapshot is the normal Evicting cleanup, not a cancel.
 func cancelCheck(ctx context.Context, rd client.Reader, key types.NamespacedName, checkTrigger bool) (workOrderState, string, error) {
+	state, why, _, _, err := checkWorkOrder(ctx, rd, key, checkTrigger)
+	return state, why, err
+}
+
+// checkWorkOrder is cancelCheck, and also returns what it read: the
+// PodSnapshot, unless it's gone, and, with checkTrigger, the trigger, when
+// the work order is active and names one. Nil otherwise.
+func checkWorkOrder(ctx context.Context, rd client.Reader, key types.NamespacedName, checkTrigger bool) (workOrderState, string, *unstructured.Unstructured, *unstructured.Unstructured, error) {
 	ps := contract.New(contract.GVKPodSnapshot)
 	if err := rd.Get(ctx, key, ps); err != nil {
 		if apierrors.IsNotFound(err) {
-			return workOrderCancelled, "the PodSnapshot was deleted", nil
+			return workOrderCancelled, "the PodSnapshot was deleted", nil, nil, nil
 		}
-		return workOrderActive, "", err
+		return workOrderActive, "", nil, nil, err
 	}
 	if ps.GetDeletionTimestamp() != nil {
-		return workOrderCancelled, "the PodSnapshot is being deleted", nil
+		return workOrderCancelled, "the PodSnapshot is being deleted", ps, nil, nil
 	}
 	if hasOutcome(ps) {
-		return workOrderFinished, "the PodSnapshot already has an outcome", nil
+		return workOrderFinished, "the PodSnapshot already has an outcome", ps, nil, nil
 	}
 	if cancelRequested(ps) {
-		return workOrderCancelled, "the engine controller saw the trigger deleted", nil
+		return workOrderCancelled, "the engine controller saw the trigger deleted", ps, nil, nil
 	}
 	trigger := snapshotTrigger(ps)
 	if !checkTrigger || trigger == "" {
-		return workOrderActive, "", nil
+		return workOrderActive, "", ps, nil, nil
 	}
 	psmt := contract.New(contract.GVKManualTrigger)
 	if err := rd.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: trigger}, psmt); err != nil {
 		if apierrors.IsNotFound(err) {
-			return workOrderCancelled, fmt.Sprintf("trigger %s was deleted", trigger), nil
+			return workOrderCancelled, fmt.Sprintf("trigger %s was deleted", trigger), ps, nil, nil
 		}
-		return workOrderActive, "", err
+		return workOrderActive, "", ps, nil, err
 	}
 	if psmt.GetDeletionTimestamp() != nil {
-		return workOrderCancelled, fmt.Sprintf("trigger %s is being deleted", trigger), nil
+		return workOrderCancelled, fmt.Sprintf("trigger %s is being deleted", trigger), ps, nil, nil
 	}
-	return workOrderActive, "", nil
+	return workOrderActive, "", ps, psmt, nil
 }
 
 // cancelRequested: the controller half asked for a cancel, or the agent
@@ -409,6 +467,15 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, r.finish(ctx, req, contract.ReasonCancelled, msg)
 	}
 
+	// A restore refuses an archive that isn't signed and bound to this
+	// cluster (C10 R2, #244). Without a key or the cluster UID, a checkpoint
+	// could only end in a cold start after its source was frozen and
+	// evicted, so fail it before the source is touched.
+	if why := r.signingUnavailable(); why != "" {
+		logger.Error(nil, "not checkpointing: the archive could not be signed", "why", why)
+		return ctrl.Result{}, r.finish(ctx, req, contract.ReasonFailed, why+"; the source container was not touched")
+	}
+
 	logger.Info("checkpoint pipeline start", "pod", spec.SourcePod, "uid", spec.SourcePodUID, "container", spec.Container,
 		"dest", fmt.Sprintf("gs://%s/%s", spec.Bucket, ArchivePrefix(spec.Path, ps.GetName())))
 
@@ -520,8 +587,9 @@ func (r *NodeSnapshotReconciler) recordSourceFrozen(ctx context.Context, key typ
 }
 
 // run executes: freeze source -> checkpoint -> hash -> upload spec.json +
-// checkpoint.tar -> manifest.json (last, verified) -> commit. Any error
-// before the commit thaws the source container, and so does a cancel.
+// checkpoint.tar -> bind and sign the manifest -> manifest.json (last,
+// verified) -> commit. Any error before the commit thaws the source
+// container, and so does a cancel.
 func (r *NodeSnapshotReconciler) run(parent context.Context, key types.NamespacedName, spec snapshotSpec, facts contract.SourceNodeFacts) error {
 	snapshot, ns := key.Name, key.Namespace
 
@@ -627,20 +695,61 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 		return fmt.Errorf("upload checkpoint.tar: streamed %d bytes, hashed %d", n, tarBytes)
 	}
 
+	// Read right before signing, so a trigger created again that took the
+	// work order over during the checkpoint (#262) is the one recorded, and
+	// its job the one bound. One created again that hasn't taken the work
+	// order over yet is read again: the take-over normally lands within a
+	// second or two. Retried like the check before the commit point, and
+	// failed closed the same way. An archive that no restore would accept
+	// (one bound to no job) is never uploaded: the source thaws instead.
+	var binding archiveBinding
+	err = retry.OnError(preCommitCheckBackoff,
+		func(err error) bool {
+			return ctx.Err() == nil && !apierrors.IsForbidden(err) &&
+				!errors.Is(err, errCancelled) && !errors.Is(err, errFinished)
+		},
+		func() (err error) {
+			attempt, cancelAttempt := context.WithTimeout(ctx, preCommitCheckTimeout)
+			defer cancelAttempt()
+			binding, err = r.readArchiveBinding(attempt, key, spec)
+			return err
+		})
+	if c := cancelledAt("while binding the archive"); c != nil {
+		return c
+	}
+	switch {
+	case errors.Is(err, errCancelled), errors.Is(err, errFinished):
+		return err
+	case errors.Is(err, errTriggerNotTakenOver):
+		return fmt.Errorf("trigger %s was created again and hasn't taken this work order over, so the archive can't be bound to its PodMigrationJob; no restore would accept it", binding.TriggerName)
+	case err != nil:
+		return fmt.Errorf("bind the archive to its trigger and job: %w", err)
+	case binding.TriggerName == "":
+		return errors.New("the work order names no trigger, so the archive can't be bound to a PodMigrationJob; no restore would accept it")
+	case binding.JobUID == "":
+		return fmt.Errorf("trigger %s isn't controlled by a PodMigrationJob that owns this work order; no restore would accept the archive", binding.TriggerName)
+	}
+
 	mf := Manifest{
-		Snapshot: snapshot, SourcePod: spec.SourcePod, SourcePodUID: spec.SourcePodUID,
+		Snapshot: snapshot, Namespace: ns, SourcePod: spec.SourcePod, SourcePodUID: spec.SourcePodUID,
 		Container: spec.Container, Node: spec.NodeName, ImageName: imageName,
+		Bucket: spec.Bucket, Path: spec.Path,
+		TriggerName: binding.TriggerName, TriggerUID: binding.TriggerUID, JobUID: binding.JobUID, ClusterUID: r.ClusterUID,
 		TarSHA256: tarSHA, TarBytes: tarBytes, SpecSHA256: specSHA,
 		CPUFamily: r.CPUFamily, EngineVersion: engineVersion, CreatedAt: time.Now().UTC(),
 	}
 	if !facts.IsEmpty() {
 		mf.SourceNode = &facts
 	}
-	mfJSON, err := json.MarshalIndent(mf, "", "  ")
+	payload, err := json.Marshal(mf)
 	if err != nil {
 		return err
 	}
-	if _, err := VerifiedPut(ctx, r.Store, spec.Bucket, path.Join(prefix, "manifest.json"), strings.NewReader(string(mfJSON))); err != nil {
+	envelope, err := r.Signer.Sign(payload)
+	if err != nil {
+		return fmt.Errorf("sign manifest.json: %w", err)
+	}
+	if _, err := VerifiedPut(ctx, r.Store, spec.Bucket, path.Join(prefix, "manifest.json"), bytes.NewReader(envelope)); err != nil {
 		if c := cancelledAt("during the upload"); c != nil {
 			return c
 		}
@@ -648,11 +757,13 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	}
 
 	// Commit point. Stop the poller, then confirm with live reads that the
-	// trigger still exists and no cancel was requested. A read that keeps
-	// failing fails closed: the source keeps running and the snapshot goes
-	// Failed. Once past this check the commit completes on the parent context.
-	// A trigger deleted after this read is not seen; the commit completes
-	// and the snapshot goes Ready, which the orchestrator reads as a completed checkpoint.
+	// trigger still exists, no cancel was requested, and the job the archive
+	// is bound to still controls the trigger. A read that keeps failing
+	// fails closed: the source keeps running and the snapshot goes Failed.
+	// Once past this check the commit completes on the parent context. A
+	// trigger deleted after this read is not seen; the commit completes and
+	// the snapshot goes Ready, which the orchestrator reads as a completed
+	// checkpoint.
 	cancel(errCommitPoint)
 	<-pollerDone
 	if errors.Is(context.Cause(ctx), errCancelled) {
@@ -660,6 +771,7 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	}
 	var state workOrderState
 	var why string
+	var trigger *unstructured.Unstructured
 	err = retry.OnError(preCommitCheckBackoff,
 		// Forbidden won't fix itself, and a done parent means the agent is
 		// shutting down.
@@ -667,7 +779,7 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 		func() (err error) {
 			attempt, cancelAttempt := context.WithTimeout(parent, preCommitCheckTimeout)
 			defer cancelAttempt()
-			state, why, err = cancelCheck(attempt, r.liveReader(), key, true)
+			state, why, _, trigger, err = checkWorkOrder(attempt, r.liveReader(), key, true)
 			return err
 		})
 	if err != nil {
@@ -679,12 +791,87 @@ func (r *NodeSnapshotReconciler) run(parent context.Context, key types.Namespace
 	case workOrderFinished:
 		return fmt.Errorf("%w before commit", errFinished)
 	}
+	// The trigger by name, with no instance check: one that the same job
+	// created again (#262) still commits, taken over or not. Another job's
+	// restore would refuse this archive, so its source isn't stopped for it.
+	if trigger == nil {
+		return errors.New("the work order no longer names its trigger, so its PodMigrationJob can't be confirmed before commit; source container not stopped")
+	}
+	if controllingJob(trigger) != mf.JobUID {
+		return fmt.Errorf("another PodMigrationJob now controls trigger %s, and no restore would accept an archive bound to the job that controlled it before; source container not stopped", trigger.GetName())
+	}
 
 	// postCheckpoint: keep source frozen until deleted by eviction (C4, #148).
 	if hook, ok := r.Ops.(interface{ AfterCommit() }); ok {
 		hook.AfterCommit()
 	}
 	return nil
+}
+
+// signingUnavailable says why this agent can't sign an archive manifest, or
+// returns "" when it can.
+func (r *NodeSnapshotReconciler) signingUnavailable() string {
+	switch {
+	case r.Signer == nil:
+		return "archive signing key not configured on the node agent (see its log, #244)"
+	case r.ClusterUID == "":
+		return "the node agent doesn't know the cluster UID that archives are bound to (#244)"
+	}
+	return ""
+}
+
+// archiveBinding is what a manifest binds the archive to besides the work
+// order's own fields.
+type archiveBinding struct {
+	TriggerName, TriggerUID, JobUID string
+}
+
+// errTriggerNotTakenOver: the work order's trigger was created again (#262)
+// and the new instance hasn't taken the work order over yet.
+var errTriggerNotTakenOver = errors.New("the trigger was created again and hasn't taken the work order over")
+
+// readArchiveBinding reads, past the cache, the trigger the work order answers,
+// and takes the PodMigrationJob that controls it from its controller
+// reference, with the same live check as the commit point: a work order that
+// was withdrawn is errCancelled, and one that already has an outcome
+// errFinished. A trigger instance other than the one the work order answers
+// is errTriggerNotTakenOver, for the caller to read again. A work order that
+// names no trigger, or a trigger without a PodMigrationJob controller, binds
+// no job (JobUID "").
+func (r *NodeSnapshotReconciler) readArchiveBinding(ctx context.Context, key types.NamespacedName, spec snapshotSpec) (archiveBinding, error) {
+	b := archiveBinding{TriggerName: spec.TriggerName, TriggerUID: spec.TriggerUID}
+	state, why, ps, psmt, err := checkWorkOrder(ctx, r.liveReader(), key, true)
+	switch {
+	case err != nil:
+		return b, err
+	case state == workOrderCancelled:
+		return b, fmt.Errorf("%w while binding the archive (%s)", errCancelled, why)
+	case state == workOrderFinished:
+		return b, fmt.Errorf("%w while binding the archive", errFinished)
+	}
+	b.TriggerName, b.TriggerUID = snapshotTrigger(ps), workOrderString(ps, specTriggerUID)
+	if psmt == nil {
+		return b, nil // the work order names no trigger
+	}
+	if b.TriggerUID != "" && string(psmt.GetUID()) != b.TriggerUID {
+		return b, errTriggerNotTakenOver
+	}
+	b.JobUID = controllingJob(psmt)
+	return b, nil
+}
+
+// controllingJob returns the UID of the PodMigrationJob that is obj's
+// controller (the orchestrator sets it on the triggers it creates), or ""
+// when no PodMigrationJob is.
+func controllingJob(obj metav1.Object) string {
+	ref := metav1.GetControllerOf(obj)
+	if ref == nil || ref.Kind != contract.GVKPodMigrationJob.Kind {
+		return ""
+	}
+	if gv, err := schema.ParseGroupVersion(ref.APIVersion); err != nil || gv.Group != contract.GVKPodMigrationJob.Group {
+		return ""
+	}
+	return string(ref.UID)
 }
 
 // pollForCancel cancels ctx with errCancelled once the work order is

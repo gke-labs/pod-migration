@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,10 +49,15 @@ func main() {
 	var apiGroup string
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
+	var archiveKeysDir, archiveKeyID string
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8091", "health probe bind address (hostNetwork)")
 	flag.StringVar(&apiGroup, "api-group", contract.DefaultGroup, "API group of the snapshot engine CRDs; must match the engine controller's --api-group")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 20, "Kubernetes API client QPS limit")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 40, "Kubernetes API client burst limit")
+	flag.StringVar(&archiveKeysDir, "archive-signing-keys-dir", psengine.DefaultArchiveSigningKeysDir,
+		"directory of archive signing keys (a mounted Secret): each file is one key, named by its key ID (#244)")
+	flag.StringVar(&archiveKeyID, "archive-signing-key-id", "",
+		"key ID that signs new archive manifests; may be empty when the directory holds exactly one key")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -103,10 +109,22 @@ func main() {
 	store := psengine.NewGCSStore()
 	ops := &nodeOpsAdapter{n: nd}
 	cpuFam := node.PSEngineCPUFamily()
+
+	// Archive provenance (C10 R2, #244): the cluster UID every manifest
+	// binds, and the keys that sign and verify manifests.
+	ctx := ctrl.SetupSignalHandler()
+	clusterUID, err := psengine.ReadClusterUID(ctx, mgr.GetAPIReader(), clusterUIDBackoff)
+	if err != nil {
+		log.Error(err, "can't read the cluster UID that archive manifests are bound to; the agent needs get on the kube-system Namespace")
+		os.Exit(1)
+	}
+	keyring, signer := loadArchiveKeys(archiveKeysDir, archiveKeyID)
+
 	if err := (&psengine.NodeSnapshotReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
 		SourceNodeFacts: nd.PSEngineSourceNodeFacts,
+		Signer:          signer, ClusterUID: clusterUID,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node snapshot reconciler")
 		os.Exit(1)
@@ -115,11 +133,12 @@ func main() {
 		Client: mgr.GetClient(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
 		Recorder: mgr.GetEventRecorderFor("psengine-node-restore"),
+		Keyring:  keyring, ClusterUID: clusterUID,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node restore reconciler")
 		os.Exit(1)
 	}
-	log.Info("psengine node pipelines enabled", "node", nodeName, "cpuFamily", cpuFam)
+	log.Info("psengine node pipelines enabled", "node", nodeName, "cpuFamily", cpuFam, "clusterUID", clusterUID)
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		os.Exit(1)
@@ -128,10 +147,40 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("starting criu-engine node agent", "node", nodeName)
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		log.Error(err, "agent exited")
 		os.Exit(1)
 	}
+}
+
+// clusterUIDBackoff bounds how long the agent waits for the API server to
+// return the cluster UID at startup before it exits: six attempts, with
+// about 31 s of waits between them, each attempt bounded by
+// psengine.ReadClusterUIDAttemptTimeout (5 s), so about a minute at most.
+var clusterUIDBackoff = wait.Backoff{Steps: 6, Duration: time.Second, Factor: 2}
+
+// loadArchiveKeys loads the archive signing keys from dir, and picks the one
+// that signs (keyID, or the only key). It never fails the agent: without
+// keys, every checkpoint fails before it freezes its source and every
+// restore refuses its archive (cold start); without a signing key, only
+// checkpoints fail. Either is logged as an error.
+func loadArchiveKeys(dir, keyID string) (*psengine.Keyring, *psengine.Signer) {
+	log := ctrl.Log.WithName("setup")
+	keyring, err := psengine.LoadKeyring(dir)
+	if err != nil {
+		log.Error(err, "ARCHIVE SIGNING KEYS NOT LOADED: every checkpoint will fail before freezing its source, "+
+			"and every restore will refuse its archive and cold-start; create the pod-migrate-archive-signing-keys Secret (see the engine's README)",
+			"dir", dir)
+		return nil, nil
+	}
+	signer, err := keyring.Signer(keyID)
+	if err != nil {
+		log.Error(err, "NO ACTIVE ARCHIVE SIGNING KEY: every checkpoint will fail before freezing its source; restores still verify with the loaded keys. "+
+			"Set --archive-signing-key-id", "dir", dir, "keyIDs", keyring.KeyIDs())
+		return keyring, nil
+	}
+	log.Info("archive signing keys loaded", "dir", dir, "keyIDs", keyring.KeyIDs(), "signingKeyID", signer.KeyID())
+	return keyring, signer
 }
 
 // agentManagerOptions builds the controller-runtime manager options for the
