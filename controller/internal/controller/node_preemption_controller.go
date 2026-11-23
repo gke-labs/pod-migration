@@ -229,6 +229,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					"Snapshot engine %s can't migrate the pod: %s; skipping spot preemption migration", eng.Name(), verdict.Reason)
 			}
 			metrics.RecordSpotPreemptionSkipped("ineligible")
+			metrics.RecordMigrationSkipped(engine.ClassifyEligibilityVerdict(verdict), eng.Name())
 			r.processedPods.Store(pod.UID, time.Now())
 			continue
 		}
@@ -240,6 +241,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					"%s; skipping spot preemption migration", reason)
 			}
 			metrics.RecordSpotPreemptionSkipped("unfenced_engine")
+			metrics.RecordMigrationSkipped("unfenced_engine", eng.Name())
 			r.processedPods.Store(pod.UID, time.Now())
 			continue
 		}
@@ -258,6 +260,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					"Pod is opted into live migration, but no matching Ready manual+stop PodSnapshotPolicy was found; skipping spot preemption migration")
 			}
 			metrics.RecordSpotPreemptionSkipped("no_policy")
+			metrics.RecordMigrationSkipped("no_ready_policy", eng.Name())
 			r.processedPods.Store(pod.UID, time.Now())
 			continue
 		}
@@ -273,6 +276,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					"Pod has zero memory request and limit (BestEffort QoS); cannot budget spot preemption migration")
 			}
 			metrics.RecordSpotPreemptionSkipped("unknown_memory")
+			metrics.RecordMigrationSkipped("unknown_memory", eng.Name())
 			r.processedPods.Store(pod.UID, time.Now())
 			continue
 		}
@@ -295,6 +299,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 						"Pod is owned by operator %s/%s but has no resolvable replica identity key; skipping spot preemption migration", parentKind, parentName)
 				}
 				metrics.RecordSpotPreemptionSkipped("no_replica_key")
+				metrics.RecordMigrationSkipped("no_replica_key", eng.Name())
 				r.processedPods.Store(pod.UID, time.Now())
 				continue
 			}
@@ -312,6 +317,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 						"Operator-owned pod replica identity %q is shared with sibling pod %s; skipping spot preemption migration", replicaKey, siblingName)
 				}
 				metrics.RecordSpotPreemptionSkipped("ambiguous_replica_key")
+				metrics.RecordMigrationSkipped("ambiguous_replica_key", eng.Name())
 				r.processedPods.Store(pod.UID, time.Now())
 				continue
 			}
@@ -329,6 +335,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 						"Operator-owned pod replica identity %q is already in-flight under migration job %s; skipping spot preemption migration", replicaKey, existingPMJName)
 				}
 				metrics.RecordSpotPreemptionSkipped("ambiguous_replica_key")
+				metrics.RecordMigrationSkipped("ambiguous_replica_key", eng.Name())
 				r.processedPods.Store(pod.UID, time.Now())
 				continue
 			}
@@ -382,6 +389,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					util.FormatBytes(reqBytes), util.FormatBytes(remainingBudget), util.FormatBytes(totalBudget))
 			}
 			metrics.RecordSpotPreemptionSkipped("budget_exceeded")
+			metrics.RecordMigrationSkipped("budget_exceeded", cand.engine.Name())
 			// Remember skipped pod to avoid spamming duplicate warning events during the ~30s shutdown window
 			r.processedPods.Store(pod.UID, time.Now())
 			continue

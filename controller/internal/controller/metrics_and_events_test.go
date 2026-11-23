@@ -25,7 +25,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -798,5 +800,206 @@ func TestInvariantEngine_ReconcilerStrictAndObserveIntegration(t *testing.T) {
 	}
 	if updated.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
 		t.Errorf("Expected strict mode to transition non-terminal PMJ to PhaseFailed, got %s", updated.Status.Phase)
+	}
+}
+
+func TestMetrics_SkippedMigrations(t *testing.T) {
+	metrics.ResetCoverageForTest()
+
+	beforeNotOpted := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("not_opted_in", "none"))
+	beforeMultiContainer := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("multi_container", "criu"))
+	beforeNoPolicy := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_ready_policy", "gke-pod-snapshots"))
+
+	metrics.RecordMigrationSkipped("not_opted_in", "")
+	metrics.RecordMigrationSkipped("multi_container", "criu")
+	metrics.RecordMigrationSkipped("no_ready_policy", "gke-pod-snapshots")
+
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("not_opted_in", "none")); got != beforeNotOpted+1 {
+		t.Errorf("Expected SkippedMigrationsTotal[not_opted_in, none] to increment by 1, got %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("multi_container", "criu")); got != beforeMultiContainer+1 {
+		t.Errorf("Expected SkippedMigrationsTotal[multi_container, criu] to increment by 1, got %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_ready_policy", "gke-pod-snapshots")); got != beforeNoPolicy+1 {
+		t.Errorf("Expected SkippedMigrationsTotal[no_ready_policy, gke-pod-snapshots] to increment by 1, got %v", got)
+	}
+}
+
+func TestMetrics_PodMigrationCoverageObservability(t *testing.T) {
+	metrics.ResetCoverageForTest()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "test-coverage-ns"
+	configName := "pm-config"
+
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  namespace,
+			Name:       configName,
+			Generation: 1,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://test-bucket/path",
+			},
+		},
+	}
+
+	gvisorClass := "gvisor"
+	node1 := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+	}
+
+	// Pod 1: Running, opted-in, gvisor runtime -> covered
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-1-covered",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:         "node-1",
+			RuntimeClassName: &gvisorClass,
+			Containers: []corev1.Container{
+				{Name: "app", Image: "busybox"},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	// Pod 2: Running, NOT opted in -> not covered
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-2-not-opted",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+			Containers: []corev1.Container{
+				{Name: "web", Image: "nginx"},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	// Pod 3: Pending -> not counted in running pods
+	pod3 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-3-pending",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorClass,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+		},
+	}
+
+	// Pod 4: Running, opted-in, but unsupported runtime class
+	badClass := "unsupported-runtime"
+	pod4 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-4-bad-runtime",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:         "node-1",
+			RuntimeClassName: &badClass,
+			Containers: []corev1.Container{
+				{Name: "app", Image: "busybox"},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	// GKE Pod Snapshot Policy for pod 1
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	psp.SetName("test-policy")
+	psp.SetNamespace(namespace)
+	psp.Object["spec"] = map[string]interface{}{
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+		"selector": map[string]interface{}{
+			"matchLabels": map[string]interface{}{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+	}
+	psp.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	pssc := &unstructured.Unstructured{}
+	pssc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotStorageConfig",
+	})
+	pssc.SetName("test-pssc")
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config, node1, pod1, pod2, pod3, pod4, psp, pssc).
+		WithStatusSubresource(config, psp, pssc).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: configName}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// Pod 1, Pod 2, Pod 4 are running -> totalRunning = 3.
+	// Only Pod 1 is opted in with valid policy & gvisor runtime -> coveredRunning = 1.
+	// Coverage ratio = 1 / 3 = ~0.333333.
+	if got := testutil.ToFloat64(metrics.MigratableTotalRunningPods.WithLabelValues(namespace)); got != 3 {
+		t.Errorf("Expected MigratableTotalRunningPods = 3, got %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Errorf("Expected MigratableCoveredRunningPods = 1, got %v", got)
+	}
+	ratio := testutil.ToFloat64(metrics.MigratableCoverageRatio.WithLabelValues(namespace))
+	if ratio < 0.33 || ratio > 0.34 {
+		t.Errorf("Expected MigratableCoverageRatio ~ 0.333, got %v", ratio)
+	}
+
+	// Deletion cleanup clears coverage gauges
+	metrics.ClearNamespaceCoverage(namespace)
+	if got := testutil.ToFloat64(metrics.MigratableCoverageRatio.WithLabelValues(namespace)); got != 0 {
+		t.Errorf("Expected MigratableCoverageRatio to be deleted/0, got %v", got)
 	}
 }

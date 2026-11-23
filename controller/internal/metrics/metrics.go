@@ -149,6 +149,38 @@ var (
 		Buckets: prometheus.ExponentialBuckets(1, 2, 12),
 	}, []string{"outcome"})
 
+	// SkippedMigrationsTotal counts pods skipped for live migration by canonical
+	// skip reason and engine.
+	// Reasons: not_opted_in | unsupported_runtime | multi_container | host_network |
+	// node_not_ready | no_ready_policy | unfenced_engine | readiness_gates_unsatisfied |
+	// pdb_timed_out | no_replica_key | ambiguous_replica_key | already_restored |
+	// missing_command | unknown_memory | budget_exceeded | ineligible
+	// Engines: gke-pod-snapshots | criu | none
+	SkippedMigrationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_skipped_total",
+		Help: "Total number of pods skipped for live migration by canonical reason and engine.",
+	}, []string{"reason", "engine"})
+
+	// MigratableCoveredRunningPods tracks the number of running pods in a migratable
+	// namespace covered by a Ready migration policy and eligible runtime.
+	MigratableCoveredRunningPods = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pod_migration_covered_running_pods",
+		Help: "Number of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime.",
+	}, []string{"namespace"})
+
+	// MigratableTotalRunningPods tracks the total number of running pods in a migratable namespace.
+	MigratableTotalRunningPods = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pod_migration_total_running_pods",
+		Help: "Total number of running pods in a migratable namespace.",
+	}, []string{"namespace"})
+
+	// MigratableCoverageRatio tracks the fraction (0.0 to 1.0) of running pods in a
+	// migratable namespace covered by a Ready migration policy and eligible runtime.
+	MigratableCoverageRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pod_migration_coverage_ratio",
+		Help: "Share of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime (0.0 to 1.0).",
+	}, []string{"namespace"})
+
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
 )
@@ -168,7 +200,45 @@ func init() {
 		SourceFenceTotal,
 		SourceFencedSeconds,
 		RestoreVerdictsTotal,
+		SkippedMigrationsTotal,
+		MigratableCoveredRunningPods,
+		MigratableTotalRunningPods,
+		MigratableCoverageRatio,
 	)
+}
+
+// RecordMigrationSkipped increments the counter for skipped pod live migrations.
+func RecordMigrationSkipped(reason, engine string) {
+	if engine == "" {
+		engine = "none"
+	}
+	if reason != "" {
+		SkippedMigrationsTotal.WithLabelValues(reason, engine).Inc()
+	}
+}
+
+// RecordNamespaceCoverage sets the gauge metrics for running pod coverage in a migratable namespace.
+func RecordNamespaceCoverage(namespace string, covered, total int) {
+	if namespace == "" {
+		return
+	}
+	MigratableCoveredRunningPods.WithLabelValues(namespace).Set(float64(covered))
+	MigratableTotalRunningPods.WithLabelValues(namespace).Set(float64(total))
+	ratio := 0.0
+	if total > 0 {
+		ratio = float64(covered) / float64(total)
+	}
+	MigratableCoverageRatio.WithLabelValues(namespace).Set(ratio)
+}
+
+// ClearNamespaceCoverage removes the gauge metrics for a namespace that is no longer migratable.
+func ClearNamespaceCoverage(namespace string) {
+	if namespace == "" {
+		return
+	}
+	MigratableCoveredRunningPods.DeleteLabelValues(namespace)
+	MigratableTotalRunningPods.DeleteLabelValues(namespace)
+	MigratableCoverageRatio.DeleteLabelValues(namespace)
 }
 
 // RecordSourceFence increments the source fence counter for the given action.
@@ -295,4 +365,13 @@ func ResetActiveJobsForTest() {
 	defer activeJobsMu.Unlock()
 	activeJobs = make(map[string]struct{})
 	ActiveMigrations.Set(0)
+	ResetCoverageForTest()
+}
+
+// ResetCoverageForTest resets coverage and skipped metrics for unit tests.
+func ResetCoverageForTest() {
+	MigratableCoveredRunningPods.Reset()
+	MigratableTotalRunningPods.Reset()
+	MigratableCoverageRatio.Reset()
+	SkippedMigrationsTotal.Reset()
 }

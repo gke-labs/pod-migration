@@ -303,6 +303,10 @@ closeLoop:
 		t.Errorf("expected SpotPreemptionSkippedTotal[budget_exceeded] >= 1, got %v",
 			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("budget_exceeded")))
 	}
+	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("budget_exceeded", "gke-pod-snapshots")) < 1 {
+		t.Errorf("expected SkippedMigrationsTotal[budget_exceeded, gke-pod-snapshots] >= 1, got %v",
+			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("budget_exceeded", "gke-pod-snapshots")))
+	}
 }
 
 func TestNodePreemptionReconciler_PodEligibilityFiltering(t *testing.T) {
@@ -458,6 +462,14 @@ closeLoop:
 	if testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unknown_memory")) < 1 {
 		t.Errorf("expected SpotPreemptionSkippedTotal[unknown_memory] >= 1, got %v",
 			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unknown_memory")))
+	}
+	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_ready_policy", "gke-pod-snapshots")) < 1 {
+		t.Errorf("expected SkippedMigrationsTotal[no_ready_policy, gke-pod-snapshots] >= 1, got %v",
+			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_ready_policy", "gke-pod-snapshots")))
+	}
+	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("unknown_memory", "gke-pod-snapshots")) < 1 {
+		t.Errorf("expected SkippedMigrationsTotal[unknown_memory, gke-pod-snapshots] >= 1, got %v",
+			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("unknown_memory", "gke-pod-snapshots")))
 	}
 }
 
