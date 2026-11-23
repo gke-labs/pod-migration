@@ -193,6 +193,9 @@ To prevent unauthorized access or tampering with checkpoint archives:
    - The engine controller (`cmd/engine`) needs `storage.objects.create`, `storage.objects.get` and `storage.objects.delete`, for its storage probe and for archive garbage collection (#107). Without delete, archives are left behind, reported only by `ArchiveDeleteFailed` and `ArchiveDeleteAbandoned` events.
    - Avoid Default Compute Engine SA: In GKE, ensure nodes do not use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`), which often carries broad Project Editor permissions.
    - Enable Uniform Bucket-Level Access (UBLA) on the checkpoint GCS bucket to prevent ACL-based permission leakage.
+3. **Test-only storage override (`STORAGE_EMULATOR_HOST`)**:
+   - When this variable is set on the engine or the node agent, that component sends every archive read and write to the named endpoint instead of GCS, with no credentials (over plain HTTP for a bare `host:port`). Whoever runs that endpoint can do what a bucket writer can (R2): read, delete or corrupt every archive. Archive signing still keeps it from getting an archive of its own restored.
+   - It exists for the kind E2E with `fake-gcs-server` (`verification-suite/kind/up.sh`). The shipped manifests never set it, and setting it takes the same `update` on those workloads that already allows replacing their images. Each component logs a `WARNING` line at startup when it is set. Never set it on a real cluster.
 
 ### Encryption & CMEK
 
