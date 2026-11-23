@@ -149,6 +149,15 @@ var (
 		Buckets: prometheus.ExponentialBuckets(1, 2, 12),
 	}, []string{"outcome"})
 
+	// ApplicationDowntimeSeconds tracks the observed application downtime (pause duration)
+	// from source pod traffic stop to replacement pod Ready, by engine and outcome.
+	// Outcomes: RestoreVerified | RestoreInferred | ColdStart
+	ApplicationDowntimeSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "pod_migration_application_downtime_seconds",
+		Help:    "Application pause duration (traffic stopped on source until replacement became Ready) in seconds, by engine and restore outcome.",
+		Buckets: prometheus.ExponentialBuckets(0.25, 2, 11),
+	}, []string{"engine", "outcome"})
+
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
 )
@@ -168,7 +177,17 @@ func init() {
 		SourceFenceTotal,
 		SourceFencedSeconds,
 		RestoreVerdictsTotal,
+		ApplicationDowntimeSeconds,
 	)
+}
+
+// RecordApplicationDowntime records the observed application downtime in seconds
+// for a completed migration by engine and restore outcome (RestoreVerified,
+// RestoreInferred, ColdStart).
+func RecordApplicationDowntime(engine, outcome string, durationSeconds float64) {
+	if engine != "" && outcome != "" && durationSeconds >= 0 {
+		ApplicationDowntimeSeconds.WithLabelValues(engine, outcome).Observe(durationSeconds)
+	}
 }
 
 // RecordSourceFence increments the source fence counter for the given action.

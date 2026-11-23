@@ -36,6 +36,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
@@ -798,5 +799,144 @@ func TestInvariantEngine_ReconcilerStrictAndObserveIntegration(t *testing.T) {
 	}
 	if updated.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed {
 		t.Errorf("Expected strict mode to transition non-terminal PMJ to PhaseFailed, got %s", updated.Status.Phase)
+	}
+}
+
+func TestMetrics_ApplicationDowntime(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	now := time.Now().Truncate(time.Second)
+	trafficStop := metav1.NewTime(now.Add(-6 * time.Second))
+	readyTime := metav1.NewTime(now.Add(-2 * time.Second))
+
+	tests := []struct {
+		name          string
+		engine        string
+		verdict       engine.RestoreVerdict
+		isColdStart   bool
+		wantOutcome   string
+		wantDurationS float64
+	}{
+		{
+			name:          "warm restore confirmed (RestoreVerified)",
+			engine:        "gke-pod-snapshots",
+			verdict:       engine.RestoreVerdict{Outcome: engine.Restored, Confirmed: true, Evidence: "gVisor restore confirmed"},
+			wantOutcome:   "RestoreVerified",
+			wantDurationS: 4.0,
+		},
+		{
+			name:          "warm restore inferred (RestoreInferred)",
+			engine:        "gke-pod-snapshots",
+			verdict:       engine.RestoreVerdict{Outcome: engine.Restored, Confirmed: false, Evidence: "inferred from ready pod"},
+			wantOutcome:   "RestoreInferred",
+			wantDurationS: 4.0,
+		},
+		{
+			name:          "criu warm restore confirmed (RestoreVerified)",
+			engine:        "criu",
+			verdict:       engine.RestoreVerdict{Outcome: engine.Restored, Confirmed: true, Evidence: "criu dump restored"},
+			wantOutcome:   "RestoreVerified",
+			wantDurationS: 4.0,
+		},
+		{
+			name:          "cold start fallback (ColdStart)",
+			engine:        "gke-pod-snapshots",
+			verdict:       engine.RestoreVerdict{Outcome: engine.ColdStart, Reason: "Cold start fallback"},
+			isColdStart:   true,
+			wantOutcome:   "ColdStart",
+			wantDurationS: 4.0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job := &pmv1alpha1.PodMigrationJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "downtime-" + strings.ToLower(tt.wantOutcome) + "-" + tt.engine,
+					Namespace: "default",
+				},
+				Status: pmv1alpha1.PodMigrationJobStatus{
+					Phase:              pmv1alpha1.PodMigrationJobPhaseRestoring,
+					TrafficStoppedTime: &trafficStop,
+				},
+			}
+			replacementPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "replacement-" + strings.ToLower(tt.wantOutcome),
+					Namespace: "default",
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{
+							Type:               corev1.PodReady,
+							Status:             corev1.ConditionTrue,
+							LastTransitionTime: readyTime,
+						},
+					},
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(job, replacementPod).
+				WithStatusSubresource(job).
+				Build()
+
+			r := &PodMigrationJobReconciler{
+				Client:   fakeClient,
+				Scheme:   scheme,
+				Recorder: record.NewFakeRecorder(10),
+			}
+
+			hist := metrics.ApplicationDowntimeSeconds.WithLabelValues(tt.engine, tt.wantOutcome)
+			beforeCount := getHistogramSampleCount(hist)
+			beforeSum := getHistogramSampleSum(hist)
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job.Name}}
+			origJob := job.DeepCopy()
+
+			if tt.isColdStart {
+				if err := r.concludeWithoutRestore(context.Background(), job, origJob, replacementPod, tt.engine, tt.verdict); err != nil {
+					t.Fatalf("concludeWithoutRestore failed: %v", err)
+				}
+			} else {
+				if _, err := r.concludeRestored(context.Background(), req, job, origJob, replacementPod, tt.engine, tt.verdict); err != nil {
+					t.Fatalf("concludeRestored failed: %v", err)
+				}
+			}
+
+			// Verify metrics observation
+			afterCount := getHistogramSampleCount(hist)
+			if afterCount != beforeCount+1 {
+				t.Errorf("expected sample count for %s/%s to increment by 1, got %d (before: %d)", tt.engine, tt.wantOutcome, afterCount, beforeCount)
+			}
+			diffSum := getHistogramSampleSum(hist) - beforeSum
+			if diffSum < 3.9 || diffSum > 4.1 {
+				t.Errorf("expected observed downtime ~4.0s, got %v", diffSum)
+			}
+
+			// Verify status fields on job
+			var updated pmv1alpha1.PodMigrationJob
+			if err := fakeClient.Get(context.Background(), req.NamespacedName, &updated); err != nil {
+				t.Fatalf("failed to get updated PMJ: %v", err)
+			}
+
+			if updated.Status.TrafficStoppedTime == nil || !updated.Status.TrafficStoppedTime.Equal(&trafficStop) {
+				t.Errorf("expected TrafficStoppedTime %v, got %v", trafficStop, updated.Status.TrafficStoppedTime)
+			}
+			if updated.Status.ReplacementReadyTime == nil || !updated.Status.ReplacementReadyTime.Equal(&readyTime) {
+				t.Errorf("expected ReplacementReadyTime %v, got %v", readyTime, updated.Status.ReplacementReadyTime)
+			}
+			if updated.Status.ApplicationPauseDuration == nil {
+				t.Fatalf("expected ApplicationPauseDuration to be set, got nil")
+			}
+			expectedDur := 4 * time.Second
+			if updated.Status.ApplicationPauseDuration.Duration != expectedDur {
+				t.Errorf("expected ApplicationPauseDuration %v, got %v", expectedDur, updated.Status.ApplicationPauseDuration.Duration)
+			}
+		})
 	}
 }

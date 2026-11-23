@@ -568,6 +568,7 @@ The controller registers Prometheus metrics on the standard controller-runtime m
 | `pod_migration_spot_preemption_triggered_total` | Counter | None | Migrations started for Pods on a node that's being preempted. |
 | `pod_migration_spot_preemption_skipped_total` | Counter | `reason` (`ineligible`, `unfenced_engine`, `no_policy`, `unknown_memory`, `no_replica_key`, `ambiguous_replica_key`, `budget_exceeded`) | Pods on a node that's being preempted that were skipped for one of these reasons. Each skip also records a Warning event on the Pod, for example `MigrationSkippedIneligible` when the snapshot engine can't migrate the Pod. |
 | `pod_migration_source_fenced_seconds` | Histogram | `outcome` (`migrated`, `unfenced`) | Time a source spent fenced: until the migration moved on to restoring, or until a failed migration returned it to service. |
+| `pod_migration_application_downtime_seconds` | Histogram | `engine`, `outcome` (`RestoreVerified`, `RestoreInferred`, `ColdStart`) | Application pause duration (traffic stopped on source until replacement became Ready) in seconds, measuring actual service downtime. |
 
 ### High Availability (HA) Scraping Considerations
 

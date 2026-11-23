@@ -1444,6 +1444,9 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
 		now := metav1.Now()
 		job.Status.SnapshottingStartTime = &now
+		if job.Status.TrafficStoppedTime == nil {
+			job.Status.TrafficStoppedTime = &now
+		}
 		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -2256,6 +2259,13 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 	job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
 	now := metav1.Now()
 	job.Status.CompletionTime = &now
+	if job.Status.ApplicationPauseDuration == nil {
+		outcome := ""
+		if reason == ReasonFallbackToColdStart {
+			outcome = "ColdStart"
+		}
+		r.recordDowntimeMetricsAndStatus(job, nil, r.jobEngine(job).Name(), outcome)
+	}
 	meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 		Type:               "Restored",
 		Status:             metav1.ConditionFalse,

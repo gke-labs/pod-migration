@@ -77,6 +77,11 @@ spec:
           status:
             description: PodMigrationJobStatus defines the observed state.
             properties:
+              applicationPauseDuration:
+                description: |-
+                  ApplicationPauseDuration is the elapsed duration between when traffic stopped on the source
+                  pod and when the replacement pod first became Ready.
+                type: string
               completionTime:
                 description: CompletionTime is the timestamp when this job transitioned
                   to a terminal phase (Succeeded/Failed).
@@ -187,6 +192,11 @@ spec:
                 items:
                   type: string
                 type: array
+              replacementReadyTime:
+                description: ReplacementReadyTime is the timestamp when the replacement
+                  pod first transitioned to Ready.
+                format: date-time
+                type: string
               restoredPodName:
                 description: RestoredPodName stores the metadata.name of the replacement
                   pod that adopted this PMJ.
@@ -206,6 +216,12 @@ spec:
               snapshottingStartTime:
                 description: SnapshottingStartTime is the timestamp when this job
                   transitioned to the Snapshotting phase.
+                format: date-time
+                type: string
+              trafficStoppedTime:
+                description: |-
+                  TrafficStoppedTime is the timestamp when the source pod stopped serving traffic
+                  (either when it was fenced or when its checkpoint was initiated).
                 format: date-time
                 type: string
             type: object

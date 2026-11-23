@@ -77,6 +77,11 @@ drain_node_and_verify_single_hop() {
       exit 1
     fi
     echo "[+] Verified single-hop migration (1 PodMigrationJob for $pod_name)."
+    local pause_dur
+    pause_dur=$(kubectl get podmigrationjobs.podmigration.gke.io -o json | jq -r --arg p "$pod_name" '.items[] | select(.spec.podRef.name == $p) | .status.applicationPauseDuration // empty')
+    if [ -n "$pause_dur" ]; then
+      echo "[+] Measured application downtime (pause duration): $pause_dur"
+    fi
   fi
 }
 
