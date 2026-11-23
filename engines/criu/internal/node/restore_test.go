@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -612,6 +613,12 @@ func TestRestore_FailureCleansNetnsLock(t *testing.T) {
 		},
 		execRestoreFn: func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error) {
 			execRestoreCalled = true
+			// The bundle's criu first, then the host's runc, with /usr/local
+			// last so a node keeps the runc it found before /usr/local was added.
+			want := []string{"PATH=" + criuBundleDir + ":/usr/sbin:/usr/bin:/sbin:/bin:/home/kubernetes/bin:/usr/local/sbin:/usr/local/bin"}
+			if !reflect.DeepEqual(env, want) {
+				t.Errorf("runc restore env = %v, want %v", env, want)
+			}
 			// Simulate runc restore failure (e.g. CRIU failed with exit 1).
 			return "runc restore error: criu failed with code 1", errors.New("exit status 1")
 		},
@@ -2147,5 +2154,37 @@ func TestRestorer_IsRunning(t *testing.T) {
 	missing, err := rMissing.IsRunning(context.Background(), "missing-app")
 	if err != nil || missing {
 		t.Errorf("expected running=false, nil; got %v, %v", missing, err)
+	}
+}
+
+// Every runc call that manages the restored container looks runc up on the
+// same PATH as the restore, so a node with runc only in /usr/local/sbin (kind)
+// can signal, inspect and delete what it restored.
+func TestRestorer_RuncCallsUseHostRuncPATH(t *testing.T) {
+	var envs [][]string
+	r := &restorer{
+		pmRootDir: t.TempDir(),
+		execHost: func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+			if name == "runc" {
+				envs = append(envs, env)
+			}
+			return `{"status": "running", "pid": 1234}`, nil
+		},
+	}
+	ctx := context.Background()
+	if err := r.Signal(ctx, "ps-x", 15); err != nil {
+		t.Fatalf("Signal: %v", err)
+	}
+	if _, err := r.IsRunning(ctx, "ps-x"); err != nil {
+		t.Fatalf("IsRunning: %v", err)
+	}
+	_, _ = r.cleanup(ctx, "ps-x", "", "", false)
+	if len(envs) < 3 {
+		t.Fatalf("got %d runc calls, want kill, state and delete", len(envs))
+	}
+	for i, env := range envs {
+		if !reflect.DeepEqual(env, hostRuncEnv) {
+			t.Errorf("runc call %d env = %v, want %v", i, env, hostRuncEnv)
+		}
 	}
 }

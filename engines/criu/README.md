@@ -340,6 +340,11 @@ they start cold instead of being restored; also delete the
   deploy to production clusters until [#244](https://github.com/gke-labs/pod-migration/issues/244) lands.
 - **Linux kernel & runtime:** Nodes running `containerd` 2.x + `runc` with
   kubelet `ContainerCheckpoint` enabled and a kernel passing `criu check`.
+- **runc location:** the agent runs the node's own `runc` for restores, looked
+  up on `/usr/sbin:/usr/bin:/sbin:/bin:/home/kubernetes/bin:/usr/local/sbin:/usr/local/bin`
+  in that order. A node whose `runc` is elsewhere is still marked CRIU-ready,
+  but its restores fail and the replacements start cold. Nodes need no CRIU of
+  their own: the agent installs its bundled CRIU.
 - **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
   `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
   bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable
