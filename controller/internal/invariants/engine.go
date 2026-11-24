@@ -36,9 +36,9 @@ type Engine struct {
 
 	mu                   sync.Mutex
 	activeViolations     map[string]map[string]string    // scopeKey -> violationKey -> message
-	consecutiveCounts    map[string]map[string]int        // subjectKey -> invariantID -> consecutive count
-	consecutiveFirstSeen map[string]map[string]time.Time  // subjectKey -> invariantID -> first seen timestamp
-	consecutiveEscalated map[string]map[string]bool       // subjectKey -> invariantID -> whether escalation event was emitted
+	consecutiveCounts    map[string]map[string]int       // subjectKey -> invariantID -> consecutive count
+	consecutiveFirstSeen map[string]map[string]time.Time // subjectKey -> invariantID -> first seen timestamp
+	consecutiveEscalated map[string]map[string]bool      // subjectKey -> invariantID -> whether escalation event was emitted
 }
 
 // NewEngine constructs an invariant Engine with DefaultRules.
@@ -226,6 +226,23 @@ func violationThreshold(v Violation, r Rule) (int, time.Duration) {
 	return count, minDuration
 }
 
+// violationInScope reports whether v belongs to the job being reconciled: it
+// names that job, or it names no job. Only in-scope violations count toward
+// the debounce state of the reconciled object and can make Evaluate return
+// shouldFail, so strict mode never fails one job for another job's violation
+// (#198). A snapshot without a PrimaryPMJ has no job to protect, so every
+// violation is in scope there.
+func violationInScope(s *ReconcileSnapshot, v Violation) bool {
+	if s == nil || s.PrimaryPMJ == nil || v.PMJName == "" {
+		return true
+	}
+	job := s.PrimaryPMJ
+	if v.Namespace != "" && job.Namespace != "" && v.Namespace != job.Namespace {
+		return false
+	}
+	return v.PMJName == job.Name
+}
+
 func isDegraded(s *ReconcileSnapshot) bool {
 	return s != nil && (s.PodListFailed || s.PMJListFailed)
 }
@@ -233,6 +250,12 @@ func isDegraded(s *ReconcileSnapshot) bool {
 // Evaluate runs all registered invariant rules against s.
 // It returns all detected violations and a boolean indicating whether strict mode
 // requires failing the active migration job immediately.
+//
+// Every violation is recorded (metrics, logs, Events), but only violations that
+// name s.PrimaryPMJ or name no job (see violationInScope) count toward its
+// debounce state and can set shouldFail. When shouldFail is true, the violations
+// that caused it come first in the returned slice, so violations[0] always
+// belongs to the job being failed.
 func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violation, bool) {
 	if !e.Enabled() || s == nil {
 		return nil, false
@@ -325,9 +348,16 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 	// Debounce persistence tracking:
 	// Update consecutive counters for active invariants on non-terminal subjects.
 	// Invariants that evaluated clean on this sample are reset to 0, unless the sample is degraded.
+	// Only violations of the reconciled job (or of no job) are samples for its
+	// debounce state; another job's violations are counted when that job is
+	// reconciled, under its own key (#198).
+	inScope := make([]bool, len(violations))
 	activeInvIDs := make(map[string]bool, len(violations))
-	for _, v := range violations {
-		activeInvIDs[v.InvariantID] = true
+	for i, v := range violations {
+		inScope[i] = violationInScope(s, v)
+		if inScope[i] {
+			activeInvIDs[v.InvariantID] = true
+		}
 	}
 
 	subjCounts := e.consecutiveCounts[subjKey]
@@ -357,16 +387,22 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 	}
 
 	shouldFail := false
+	failing := make([]bool, len(violations))
 	countedThisReconcile := make(map[string]int, len(violations))
 	elapsedThisReconcile := make(map[string]time.Duration, len(violations))
 	var escalatingViolations []Violation
 
-	for _, v := range violations {
+	for i, v := range violations {
+		if !inScope[i] {
+			// Another job's violation: recorded below, never fails this job.
+			continue
+		}
 		thresholdCount, minDuration := violationThreshold(v, ruleByID[v.InvariantID])
 		if thresholdCount <= 1 && minDuration <= 0 {
 			// Immediate invariant: requires no debounce.
 			if e.Mode == ModeStrict {
 				shouldFail = true
+				failing[i] = true
 			}
 			continue
 		}
@@ -402,6 +438,7 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 		if thresholdMet {
 			if e.Mode == ModeStrict {
 				shouldFail = true
+				failing[i] = true
 			}
 			if !subjEscalated[v.InvariantID] {
 				subjEscalated[v.InvariantID] = true
@@ -417,6 +454,10 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 
 		count := countedThisReconcile[v.InvariantID]
 		thresholdCount, minDuration := violationThreshold(v, ruleByID[v.InvariantID])
+		if !violationInScope(s, v) {
+			// Not sampled for this subject, so there is no count to report.
+			count, thresholdCount, minDuration = 0, 1, 0
+		}
 
 		logger.Error(nil, "Invariant violation detected",
 			"invariant", v.InvariantID,
@@ -504,6 +545,23 @@ func (e *Engine) Evaluate(ctx context.Context, s *ReconcileSnapshot) ([]Violatio
 				}
 			}
 		}
+	}
+
+	if shouldFail {
+		// The PodMigrationJobReconciler copies violations[0] into the failed
+		// job's Ready message, so put the violations that failed it first.
+		ordered := make([]Violation, 0, len(violations))
+		for i, v := range violations {
+			if failing[i] {
+				ordered = append(ordered, v)
+			}
+		}
+		for i, v := range violations {
+			if !failing[i] {
+				ordered = append(ordered, v)
+			}
+		}
+		violations = ordered
 	}
 
 	return violations, shouldFail
