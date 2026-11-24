@@ -78,7 +78,7 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
 
 ### Blast Radius & Mitigations
 
-- **Compromise Impact**: If the `pod-migrate-agent` container is compromised, the attacker achieves root on the host node and access to local containerd sockets, and to the archive signing keys, so it can sign archives that any node restores (R2).
+- **Compromise Impact**: If the `pod-migrate-agent` container is compromised, the attacker achieves root on the host node and access to local containerd sockets, and to the archive signing keys, so it can sign archives that any node restores (R2). It also gets the agent's projected service account token, and with it bucket access as the agent: it can read, delete or corrupt archives (R5).
 - **Cluster RBAC Scope**: The agent uses a ClusterRole (`pod-migrate-psengine-agent`) granting cluster-wide permissions:
   - `nodes/checkpoint` (`create`): Triggers kubelet container checkpoints (cluster-wide scope in Kubernetes RBAC).
   - `nodes` (`get`, `patch`): Publishes readiness and capability annotations (`pod-migrate.io/criu-ready`, `pod-migrate.io/criu-version`), and the restore placement facts (#257): the `criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` labels and the `pod-migrate.io/criu-node-facts` and `pod-migrate.io/criu-node-cpu-features` annotations. They stay on the `Node` after the engine is uninstalled.
@@ -95,14 +95,14 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
   - `podsnapshotstorageconfigs`, `podsnapshotpolicies`, `podsnapshotmanualtriggers`, `podsnapshots` (`get`, `list`, `watch`, `create`) and `*/status` (`get`, `update`, `patch`) in `criu.podmigration.gke.io` (by default, #135).
   - `podsnapshots` (`update`, `patch`) in `criu.podmigration.gke.io`: adds and removes the `pod-migrate.io/archive-cleanup` finalizer (#107).
   - `pods`, `nodes` (`get`, `list`, `watch`) and `events` (`create`, `patch`).
-- **Network Ingress & Health Probes**: The agent listens on host TCP port `:8091` (`hostNetwork: true`) for kubelet liveness (`/healthz`) and readiness (`/readyz`) probes. It does not expose other network services; all other traffic is outbound to the Kubernetes API server, containerd unix sockets, or cloud storage APIs.
+- **Network Ingress & Health Probes**: The agent listens on host TCP port `:8091` (`hostNetwork: true`) for kubelet liveness (`/healthz`) and readiness (`/readyz`) probes. It does not expose other network services; all other traffic is outbound to the Kubernetes API server, containerd unix sockets, cloud storage APIs, or Google's Security Token Service, where it exchanges its service account token for bucket access (R5).
 - **Resource Constraints**: Default resource requests (`100m` CPU, `128Mi` memory) and memory limits (`512Mi`) prevent memory exhaustion from runaway agent operations.
 
 ---
 
 ## 3. Restore Path Security & Privilege Boundaries
 
-A central risk in process checkpoint and restore is **unauthorized privilege gain**: restoring an unprivileged container into a higher-privileged configuration, or an archive injecting malicious mounts, devices, or capabilities into a destination host. Process restoration is governed by strict boundaries (tracked in [#129](https://github.com/gke-labs/pod-migration/issues/129)):
+A central risk in process checkpoint and restore is **unauthorized privilege gain**: restoring an unprivileged container into a higher-privileged configuration, or an archive injecting malicious mounts, devices, or capabilities into a destination host. Process restoration is governed by strict boundaries (the security requirements of C10 in `docs/design/engine-contract.md`):
 
 ### R1. Authorization & Admission Validation
 
@@ -128,7 +128,7 @@ A central risk in process checkpoint and restore is **unauthorized privilege gai
 - **No Job, No Commit**: An archive that no restore would accept is never committed with its source kept frozen for eviction. Right before signing, the agent reads the work order and its trigger past the cache and takes the job from the trigger's controller reference. It reads again for a few seconds while a trigger that was created again takes the work order over (#262), cancels the checkpoint if the trigger or the work order is gone, and fails it before `manifest.json` is uploaded if no job can be bound. At the commit point it reads the trigger again by name and fails if another PodMigrationJob controls it by then. Each time, the source thaws.
 - **Residual Risks**:
   - Anyone who can read Secrets in `pod-migration-criu-system`, or who compromises a node agent, can sign an archive. With a MAC, every agent holds the key, so one compromised node can forge archives that any node restores.
-  - Anyone who can write to the bucket can still delete or corrupt archives (forcing cold starts) and read them, until R5 (dedicated storage credentials, #244) lands.
+  - Signing doesn't stop anyone from reading an archive. Only a bucket that only the CRIU engine uses, granting object access to its two service accounts alone, keeps others out (R5, section 4). Even then, whoever can get a token for either of them, has storage access through the project, or compromises a node, can read archives, and delete or corrupt them (forcing cold starts).
   - Archives written before signing are refused, and their replacements start cold.
   - The commit point reads the trigger once more, after `manifest.json` is uploaded. A trigger that passes to another PodMigrationJob after that read isn't seen: the snapshot goes Ready, and that job's restore refuses the archive (cold start).
 - **Archive Size Bounds**: Strict caps prevent denial-of-service via resource exhaustion:
@@ -136,7 +136,7 @@ A central risk in process checkpoint and restore is **unauthorized privilege gai
   - Archive payload (`checkpoint.tar`): Capped at 8 GiB.
 - **Safe Unpacking**: The filesystem layer (`rootfs-diff.tar`) is applied strictly via containerd's `archive.Apply` into a mounted, isolated snapshot root. Unpacking rejects directory traversal (`..`), path escapes, and tar-slip attempts (regular files and dirs only; sparse files rejected).
 
-### R3. OCI Spec Adaptation & Privilege Boundaries (Partial — see #129 R2/R5)
+### R3. OCI Spec Adaptation & Privilege Boundaries (Partial; R3 is still open, see C10 in `docs/design/engine-contract.md`)
 
 When restoring a process, security posture is governed at two layers:
 
@@ -150,7 +150,7 @@ When restoring a process, security posture is governed at two layers:
    - Container device rules (`Devices`)
    - Linux namespaces (`IPC`, `Network`, `UTS`, `PID`, `Cgroup`)
    - Volume mounts (restricted to destination pod's declared volumes)
-2. **CRIU Process State Inherent Privileges**: While `AdaptSpec` governs the OCI container spec, CRIU restores process credentials, capabilities, and seccomp state directly from the checkpoint image files (`core-*.img`). Nothing currently compares in-image process credentials against destination constraints. Signed manifests (R2, #244) mean that writing to the checkpoint GCS bucket no longer gets an attacker's process image restored. But **anyone who can read the archive signing keys (Secrets in `pod-migration-criu-system`) or compromise a node agent can sign an archive that gets root on a restoring node**, and until R5 (isolated storage credentials) lands, anyone who can write to the bucket (including workloads on nodes sharing the default GCE service account) can delete, corrupt or read archives.
+2. **CRIU Process State Inherent Privileges**: While `AdaptSpec` governs the OCI container spec, CRIU restores process credentials, capabilities, and seccomp state directly from the checkpoint image files (`core-*.img`). Nothing currently compares in-image process credentials against destination constraints. Signed manifests (R2, #244) mean that writing to the checkpoint GCS bucket no longer gets an attacker's process image restored. But **anyone who can read the archive signing keys (Secrets in `pod-migration-criu-system`) or compromise a node agent can sign an archive that gets root on a restoring node**. The engine uses the bucket as its own service accounts (R5, #244), not as the node's VM service account; on a bucket that only the CRIU engine uses and that grants object access to those two alone, a workload on a CRIU node doesn't reach the archives, as long as the node's service account has no storage access through the project either. Whoever can get a token for those service accounts, or compromises a node, can still delete, corrupt or read archives.
 
 - **Pending Host Network Refusal (#229)**: Refusal of pods declaring `hostNetwork: true` across all CRIU boundaries (`PSMTReconciler`, `injectHolder`, and `NodeRestoreReconciler.restore`) is implemented in [#229](https://github.com/gke-labs/pod-migration/pull/229) (pending merge).
 
@@ -178,24 +178,31 @@ When CRIU dumps a container, the resulting archive (`checkpoint.tar`) contains a
 
 **Security Classification**: All checkpoint archives in GCS must be treated with the **same classification as Kubernetes Secrets and cryptographic keys**.
 
-### Cloud Storage IAM Hardening & Workload Identity Limitation
+### Cloud Storage IAM & Storage Credentials (R5 for CRIU, on a CRIU-only bucket, #244)
 
-To prevent unauthorized access or tampering with checkpoint archives:
+To prevent unauthorized access or tampering with checkpoint archives, the engine uses the bucket as its own two identities, and R5 holds for a bucket that only the CRIU engine uses and that grants object access to those two alone:
 
-1. **Workload Identity hostNetwork Limitation & Node SA Exposure**:
-   - The node agent runs with `hostNetwork: true` to communicate with the local kubelet and manage network namespaces.
-   - **Workload Identity does not apply to `hostNetwork: true` pods** on GKE (they bypass the GKE metadata server's token interception and receive credentials from the underlying node's GCE service account).
-   - Because the agent uses the node's GCE service account, **"workloads must never get bucket access" is not achievable today on nodes where general workloads share the default node service account**.
-   - Until R5 (#244) lands (dedicated secret-mounted or sidecar storage credentials), clusters deploying the CRIU engine must run CRIU nodes in dedicated node pools using a dedicated GSA, isolated from untrusted workloads.
-2. **Bucket Permissions & Isolation**:
-   - Checkpointing nodes require `roles/storage.objectCreator` and `roles/storage.objectViewer`.
-   - Restoring nodes require `roles/storage.objectViewer`.
-   - The engine controller (`cmd/engine`) needs `storage.objects.create`, `storage.objects.get` and `storage.objects.delete`, for its storage probe and for archive garbage collection (#107). Without delete, archives are left behind, reported only by `ArchiveDeleteFailed` and `ArchiveDeleteAbandoned` events.
-   - Avoid Default Compute Engine SA: In GKE, ensure nodes do not use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`), which often carries broad Project Editor permissions.
+1. **The Node Agent's Own Service Account, Through STS**:
+   - The node agent runs with `hostNetwork: true` to communicate with the local kubelet and manage network namespaces. There, the GKE metadata server can't tell its requests from the node's and answers as the node's VM service account, which every workload on the node can use too. So the agent doesn't use it for the bucket.
+   - Its DaemonSet projects a token of its service account (`pod-migration-criu-system/pod-migrate-agent`), with the cluster's Workload Identity pool as its audience, read-only into the agent's container (mode `0400`); it lives an hour and the kubelet rotates it. The agent exchanges it at Google's Security Token Service for an access token of that service account's Workload Identity principal, scoped to `devstorage.read_write`, and reuses it until 5 minutes before it expires. No Google service account, no impersonation. The exchange never follows a redirect, which would resend the service account token.
+   - With `--gcs-credentials=workload-identity` (the default), an agent without a workload pool, an identity provider or a readable token, or with an install placeholder left in place, exits at startup: it never falls back to the node's service account. Before each checkpoint freezes its source, the agent gets a token that stays usable for 15 minutes; if it can't, the checkpoint fails with the source untouched. Errors carry STS's HTTP status and error, never a token.
+2. **The Engine Controller's Own Service Account, Through GKE Workload Identity**: `cmd/engine` doesn't run with `hostNetwork`, so the GKE metadata server serves it a token of its own service account (`pod-migration-criu-system/pod-migrate-psengine-controller`). Its node pool must run the GKE metadata server (`GKE_METADATA`).
+3. **A Bucket for the CRIU Engine Alone**:
+   - The bucket grants `roles/storage.objectUser` and `roles/storage.bucketViewer` to the two principals, `principal://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<PROJECT_ID>.svc.id.goog/subject/ns/pod-migration-criu-system/sa/<SERVICE_ACCOUNT>`, and object access to nobody else, not to the nodes' VM service account either. The engine controller needs object create, get and delete for its storage probe and archive garbage collection (#107); without delete, archives are left behind, reported only by `ArchiveDeleteFailed` and `ArchiveDeleteAbandoned` events.
+   - It can't be GKE Pod Snapshots' bucket: `patches/setup-storage.sh` grants that one to every service account in the `default` namespace and to the GKE service agent. A new bucket's default policy also grants the project's Owners, Editors and Viewers through the legacy convenience bindings (`projectOwner`/`projectEditor` on `roles/storage.legacyBucketOwner` and `roles/storage.legacyObjectOwner`, `projectViewer` on `roles/storage.legacyBucketReader` and `roles/storage.legacyObjectReader`).
+   - `patches/setup-criu-storage.sh` creates such a bucket, or first checks an existing one: if it grants anyone but the two principals and the legacy convenience bindings, the script lists them and exits without changing anything, so it never strips a shared bucket. Otherwise it grants the two principals, removes the legacy convenience bindings after printing them (leaving the one through which project Editors may change the bucket's policy for last), checks that nobody else is left, and warns about what the bucket's own policy can't keep out.
+   - Avoid Default Compute Engine SA: In GKE, ensure nodes do not use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`), which often carries broad Project Editor permissions: an Editor can create pods in `pod-migration-criu-system` through GKE IAM, as either of the engine's service accounts.
    - Enable Uniform Bucket-Level Access (UBLA) on the checkpoint GCS bucket to prevent ACL-based permission leakage.
-3. **Test-only storage override (`STORAGE_EMULATOR_HOST`)**:
-   - When this variable is set on the engine or the node agent, that component sends every archive read and write to the named endpoint instead of GCS, with no credentials (over plain HTTP for a bare `host:port`). Whoever runs that endpoint can do what a bucket writer can (R2): read, delete or corrupt every archive. Archive signing still keeps it from getting an archive of its own restored.
+4. **Test-only storage override (`STORAGE_EMULATOR_HOST`)**:
+   - When this variable is set on the engine or the node agent, that component sends every archive read and write to the named endpoint instead of GCS, with no credentials (over plain HTTP for a bare `host:port`), and the node agent skips the Workload Identity startup checks. Whoever runs that endpoint can do what a bucket writer can (R2): read, delete or corrupt every archive. Archive signing still keeps it from getting an archive of its own restored.
    - It exists for the kind E2E with `fake-gcs-server` (`verification-suite/kind/up.sh`). The shipped manifests never set it, and setting it takes the same `update` on those workloads that already allows replacing their images. Each component logs a `WARNING` line at startup when it is set. Never set it on a real cluster.
+5. **Residual Risks**:
+   - A namespace that both engines serve has one storage location for both, on a bucket that also grants GKE Pod Snapshots' workloads, so its CRIU archives can't meet R5 today: anyone that bucket grants can read them. A storage location per engine is a follow-up.
+   - Any other principal a bucket grants, such as `setup-storage.sh`'s `default` namespace and the GKE service agent, or the project's convenience bindings left in place, reaches the archives in it.
+   - Roles granted on the project, or above it, that carry `storage.objects` permissions (Storage Admin, the other `roles/storage.*` roles, custom roles) reach the archives whatever the bucket's own policy says. Without the convenience bindings, project Owners and Editors have no object access of their own, but an Owner can grant itself such a role, and Owners and Editors can create pods in `pod-migration-criu-system` through GKE IAM as either service account (next item). That includes the nodes' service account if it has such a role, which would let every workload on its nodes reach the archives. Run CRIU nodes as a service account without one.
+   - Whoever can get a token for either service account can use the bucket as it: anyone who can create pods, or workloads that create them, in `pod-migration-criu-system` (a pod can name either service account and project its token), whether through Kubernetes RBAC or through GKE IAM (project Owners and Editors can), exec into the agent's pods, or create `serviceaccounts/token` for them. Keep all of these away from workloads and tenants.
+   - Whoever compromises a node can read the agent's projected token there, and use the bucket until the tokens it took expire: an access token exchanged from it lasts up to an hour.
+   - `--gcs-credentials=node` brings back the node's VM service account, which every workload on the node can use. It is an explicit choice, logged at startup, and needs the node's service account granted on the bucket.
 
 ### Encryption & CMEK
 

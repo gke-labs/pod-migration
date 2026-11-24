@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-# WARNING: EXPERIMENTAL — FOR NON-PRODUCTION TEST CLUSTERS ONLY (#129, #244).
-# See https://github.com/gke-labs/pod-migration/issues/129 and #244 for the
-# security hardening tracker. Checkpoint archives now carry provenance (R2):
-# the node agent signs each manifest with a key from the
+# WARNING: EXPERIMENTAL — FOR NON-PRODUCTION TEST CLUSTERS ONLY: the security
+# requirements R1, R3, R4 and R6 are still open (C10 in
+# docs/design/engine-contract.md). Checkpoint archives carry provenance (R2,
+# #244): the node agent signs each manifest with a key from the
 # pod-migrate-archive-signing-keys Secret (create it before the agent starts,
 # see engines/criu/README.md) and refuses unsigned or misbound archives. The
-# hostNetwork agent still uses the node's GCE service account (R5, open), so
-# anyone who can write to the checkpoint GCS bucket can still delete or
-# corrupt archives (restores then fall back to a cold start), and anyone who
-# can read Secrets in pod-migration-criu-system or compromise a node agent can
-# sign an archive. The agent holds cluster-wide pods (update/patch) and nodes
-# (patch/checkpoint) RBAC, and a residual dual-start window exists if holder
-# fallback precedes restore. Never deploy to production clusters.
+# engine uses the bucket as its own service accounts (R5, #244): the
+# hostNetwork agent exchanges its projected service account token at Google
+# STS instead of using the node's VM service account. Give it a bucket that
+# only the CRIU engine uses and that grants object access to those two
+# service accounts alone (patches/setup-criu-storage.sh). Anyone who can get
+# a token for them, has storage access through the project, or compromises a
+# node can still read, delete or corrupt archives (restores then fall back to
+# a cold start), and anyone who can read Secrets in pod-migration-criu-system
+# or compromise a node agent can sign an archive. The agent holds
+# cluster-wide pods (update/patch) and nodes (patch/checkpoint) RBAC, and a
+# residual dual-start window exists if holder fallback precedes restore.
+# Never deploy to production clusters.
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,9 +33,11 @@
 
 # Deployment manifest for the CRIU snapshot engine (engines/criu).
 #
-# Replace <YOUR_CRIU_ENGINE_IMAGE>, <YOUR_CRIU_AGENT_IMAGE>, and
-# <YOUR_CRIU_HOLDER_IMAGE> before applying. Requires cert-manager in the
-# cluster for the restore-injection webhook certificate.
+# Replace <YOUR_CRIU_ENGINE_IMAGE>, <YOUR_CRIU_AGENT_IMAGE>,
+# <YOUR_CRIU_HOLDER_IMAGE>, <YOUR_WORKLOAD_POOL> and <YOUR_IDENTITY_PROVIDER>
+# before applying (see engines/criu/README.md). Requires cert-manager in the
+# cluster for the restore-injection webhook certificate, and Workload
+# Identity on the cluster for bucket access.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -297,6 +304,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Bucket credentials (#244): the agent exchanges its projected
+            # service account token (the gcs-token volume) at Google STS for
+            # an access token of its own Kubernetes service account. Replace
+            # both placeholders before applying (see engines/criu/README.md,
+            # Storage credentials); the agent doesn't start with either left.
+            - name: WORKLOAD_POOL
+              value: <YOUR_WORKLOAD_POOL>
+            - name: IDENTITY_PROVIDER
+              value: <YOUR_IDENTITY_PROVIDER>
           securityContext:
             privileged: true
           resources:
@@ -327,6 +343,11 @@ spec:
             - name: archive-signing-keys
               mountPath: /etc/pod-migrate/archive-signing
               readOnly: true
+            # The service account token the agent exchanges for bucket
+            # access (--gcs-token-file, #244).
+            - name: gcs-token
+              mountPath: /var/run/secrets/pod-migrate/gcs-token
+              readOnly: true
       volumes:
         # Create this Secret before the agent starts, and on an existing
         # install before you apply this file (see engines/criu/README.md);
@@ -337,6 +358,16 @@ spec:
             secretName: pod-migrate-archive-signing-keys
             optional: false
             defaultMode: 0400
+        # A token of the pod-migrate-agent service account for the
+        # cluster's Workload Identity pool, which the kubelet rotates.
+        - name: gcs-token
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken:
+                  audience: <YOUR_WORKLOAD_POOL>
+                  expirationSeconds: 3600
+                  path: token
         - name: pod-migrate
           hostPath:
             path: /var/lib/pod-migrate
