@@ -1,0 +1,18 @@
+name: PR code review
+title: "Code review: {{task_title}} ({{pr}})"
+body: |
+  Review the pull request diff (`git diff {{base_sha}}...HEAD` and `git diff --stat {{base_sha}}...HEAD`) for `gke-labs/pod-migration`.
+
+  Focus areas:
+  1. **Correctness & Edge Cases:** Logic bugs, nil/empty-slice handling, state transitions, Kubernetes API semantics (retry/conflict handling, idempotency, watch/cache consistency), and boundary conditions across `controller/`, `engines/`, `tools/`, `patches/`, and workflows.
+  2. **Go Concurrency & Race Bugs:** Shared state mutations without synchronization, goroutine leaks, context cancellation propagation, channel deadlocks, and unsafe map/slice sharing.
+  3. **Error Handling:** Swallowed errors, missing error wrapping/context, partial-failure state leaks, or failing open where the code must fail closed.
+  4. **Test Quality:** Verify tests execute the changed code paths with real assertions (no pre-seeded outcomes, no sleep-based flaky timing, and negative tests where failure paths are added).
+  5. **Security:** RBAC least privilege, webhook/admission validation bypasses, command/script injection in workflows or shell scripts, secret/credential handling, and open-source hygiene (no internal URLs or identifiers).
+  6. **API & Config Compatibility:** CRD schema compatibility (`controller/api/v1alpha1/`), CLI flag/annotation backwards compatibility, and generated manifest/deepcopy freshness.
+
+  Execution rules:
+  - **Check existing GitHub CI statuses first** (`grain pr status` / `grain ci list`) instead of running full test suites (`make -C controller test`, etc.)—at most run one narrowly targeted `go test` if needed to confirm a finding.
+  - **Findings-only output:** Record actionable bugs via `add_review_comment` (or `grain pr review-comment --path <file> --line <N>`) on the relevant lines, explaining the concrete failure scenario and fix. Do **not** post praise, non-actionable remarks, or general summaries via `add_review_comment` (any review comment triggers `human: on-findings`).
+  - **Clean verdict:** If nothing needs fixing, post **no** `add_review_comment` and finish with `comment_on_issue` saying `"No findings"` and what was checked.
+  - **Read-only review:** Do **not** push, commit, or open a PR.

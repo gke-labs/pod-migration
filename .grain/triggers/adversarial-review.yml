@@ -1,0 +1,10 @@
+on: pull_request
+paths:
+  - "controller/**"
+  - "engines/**"
+  - "patches/**"
+  - "verification-suite/**"
+template: pr-adversarial
+gate: true
+human: on-findings
+auto-approve: true

@@ -1,0 +1,7 @@
+on: pull_request
+paths:
+  - "**"
+template: pr-code-review
+gate: true
+human: on-findings
+auto-approve: true

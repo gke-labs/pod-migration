@@ -1,0 +1,17 @@
+name: Docs drift review
+title: "Docs drift review: {{task_title}} ({{pr}})"
+body: |
+  Read and execute the repository's `.agents/skills/review-docs-drift/SKILL.md` against the pull request diff (`git diff {{base_sha}}...HEAD` — use `{{base_sha}}` rather than `upstream/main`).
+
+  Check synchronization across every modified code or documentation area in `.agents/skills/review-docs-drift/SKILL.md`:
+  1. **CLI Flags & Startup Config:** `controller/cmd/main.go` vs `README.md` and `docs/invariants.md` (plus `engines/criu/cmd/` vs `engines/criu/README.md` when CRIU flags change).
+  2. **Annotations, Labels, Gates, CRDs & Manifests:** `controller/internal/util/`, `controller/internal/webhook/`, `controller/internal/engine/`, `controller/api/v1alpha1/`, `engines/criu/`, and deploy manifests vs `README.md`, `engines/criu/README.md`, `docs/threat-model-criu.md`, and `SECURITY.md`.
+  3. **Safety Invariants (`I1`–`I12`):** `controller/internal/invariants/` vs `docs/invariants.md` (triggers, grace periods, debouncing, severity/modes).
+  4. **Snapshot Engine Contract (`C1`–`C11`):** `controller/internal/engine/` and engine implementations vs `docs/design/engine-contract.md` (interface signatures, clause requirements, and per-engine status table).
+  5. **Metrics, Events, Release & License Docs:** Metrics/Event reasons vs `README.md` / `engines/criu/README.md`, and Dockerfile/`go.mod` changes vs `docs/third-party-licenses.md` and `docs/release-process.md`.
+
+  Execution rules:
+  - Verify claims directly against source files in `controller/` and `engines/criu/` rather than running full test suites.
+  - Record concrete drift findings via `add_review_comment` (or `grain pr review-comment --path <file> --line <N>`) naming both the source-of-truth code path and the canonical documentation section that needs updating. Do **not** post non-findings or summaries via `add_review_comment` (any review comment triggers `human: on-findings`).
+  - If synchronized, post **no** `add_review_comment` and finish with `comment_on_issue` saying `"No findings"` and what was checked.
+  - Do **not** push, commit, or open a PR.

@@ -1,0 +1,10 @@
+on: pull_request
+paths:
+  - "controller/**"
+  - "engines/**"
+  - "docs/**"
+  - "README.md"
+template: pr-docs-drift
+gate: true
+human: on-findings
+auto-approve: true

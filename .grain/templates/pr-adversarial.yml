@@ -1,0 +1,17 @@
+name: Adversarial review
+title: "Adversarial review: {{task_title}} ({{pr}})"
+body: |
+  Read and execute the repository's `.agents/skills/review-adversarial/SKILL.md` against the pull request diff (`git diff {{base_sha}}...HEAD` — use `{{base_sha}}` rather than `upstream/main`).
+
+  Check every applicable focus area from `.agents/skills/review-adversarial/SKILL.md` across touched paths (`controller/`, `engines/`, `patches/`, `verification-suite/`):
+  1. **State-Machine Wedges & Gate/Finalizer Cleanup (`I3`, `I5`):** Non-terminal phase stalls across `Pending -> Snapshotting -> Evicting -> Restoring -> Succeeded/Failed/SucceededWithoutRestore`, stranded `gke.io/pod-migration-gate` scheduling gates, leaked triggers/ephemeral resources across engine API groups, or finalizer deadlocks.
+  2. **Split-Brain / Dual-Writer Fencing Windows:** Origin pod unfenced while replacement pod runs, missing `pod-migration.gke.io/fenced: "true"` or `Ready=False` (`PodMigrationFenced`), unsafe pre-checkpoint abort unfencing, or concurrent re-migration collisions.
+  3. **Silent Cold-Start Regressions (`I2`):** Cold starts reported as `Phase=Succeeded`, engine restore annotation (`<engine-group>/ps-name`) mismatches or spoofable restore status annotations, or pod readiness mistaken for verified checkpoint restore.
+  4. **Container / OCI / RBAC Privilege Escalations & Host Boundaries:** Admission webhook security-context/capability mutations, CRIU engine/node-daemon host namespace or path traversal bugs, archive signing/verification bypasses, or overly broad RBAC/ValidatingAdmissionPolicy gaps.
+  5. **Two-Lane Invariant Governance (`I1`–`I12`) & False-Green Tests:** Weakened or bypassed runtime invariants, unauthorized co-changes to `controller/internal/invariants/**`, `.github/CODEOWNERS`, or `verification-suite/verify_invariant_governance.sh`, and tests that pass without exercising the changed branch.
+
+  Execution rules:
+  - Check existing GitHub CI statuses first (`grain pr status` / `grain ci list`) instead of running full test suites—at most run one narrowly targeted `go test` if needed to confirm a hypothesis.
+  - Record real, actionable findings via `add_review_comment` (or `grain pr review-comment --path <file> --line <N>`) on the relevant lines with the concrete failure/attack scenario and recommended fix. Do **not** post non-findings or summaries via `add_review_comment` (any review comment triggers `human: on-findings`).
+  - If clean, post **no** `add_review_comment` and finish with `comment_on_issue` saying `"No findings"` and what was checked.
+  - Do **not** push, commit, or open a PR.
