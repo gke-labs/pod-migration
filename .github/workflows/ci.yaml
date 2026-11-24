@@ -57,6 +57,17 @@ jobs:
     - name: Run GPL Source Packager Test
       run: make -C controller test-gpl-source-packager
 
+    - name: Run 100-Pod Scale Regression Gate
+      run: make -C controller test-scale-drain
+
+    - name: Upload Scale Gate Summary Artifact
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: scale-100-drain-summary
+        path: /tmp/scale-100-drain-summary.json
+        if-no-files-found: warn
+
   criu-engine:
     name: Verify & Test CRIU Engine
     runs-on: ubuntu-latest
