@@ -234,6 +234,12 @@ var (
 	preCommitCheckTimeout = 2 * time.Second
 )
 
+// warmTimeout bounds how long a work order waits for the bucket credentials
+// before its source is frozen (WarmObjectStore): one token fetch, which is
+// bounded at 10 s itself (stsTimeout, metadataTimeout), with room to spare.
+// A variable for tests.
+var warmTimeout = 15 * time.Second
+
 // errCancelled marks a pipeline that stopped because its work order was
 // withdrawn (trigger deleted).
 var errCancelled = errors.New("cancelled: the trigger was deleted")
@@ -474,6 +480,21 @@ func (r *NodeSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if why := r.signingUnavailable(); why != "" {
 		logger.Error(nil, "not checkpointing: the archive could not be signed", "why", why)
 		return ctrl.Result{}, r.finish(ctx, req, contract.ReasonFailed, why+"; the source container was not touched")
+	}
+
+	// Get the bucket credentials before the source is touched (#244): a
+	// store that can't authenticate fails the work order now, not after the
+	// freeze and the dump, and neither the first token nor the hourly
+	// refresh is fetched while the source is frozen.
+	if w, ok := r.Store.(WarmObjectStore); ok {
+		warmCtx, cancel := context.WithTimeout(ctx, warmTimeout)
+		err := w.Warm(warmCtx)
+		cancel()
+		if err != nil {
+			logger.Error(err, "not checkpointing: no credentials for the checkpoint bucket")
+			return ctrl.Result{}, r.finish(ctx, req, contract.ReasonFailed,
+				truncateMsg("no credentials for the checkpoint bucket: "+err.Error(), 1200)+"; the source container was not touched")
+		}
 	}
 
 	logger.Info("checkpoint pipeline start", "pod", spec.SourcePod, "uid", spec.SourcePodUID, "container", spec.Container,
