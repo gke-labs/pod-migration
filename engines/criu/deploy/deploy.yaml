@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # WARNING: EXPERIMENTAL — FOR NON-PRODUCTION TEST CLUSTERS ONLY (#129, #244).
 # See https://github.com/gke-labs/pod-migration/issues/129 and #244 for the
-# security hardening tracker: checkpoint archives in GCS do not yet carry
-# cryptographic provenance (R2) and the hostNetwork agent uses the node's
-# GCE service account (R5), so anyone who can write to the checkpoint GCS bucket
-# can get root on a restoring node until R2 and R5 land. The agent holds
-# cluster-wide pods (update/patch) and nodes (patch/checkpoint) RBAC, and a
-# residual dual-start window exists if holder fallback precedes restore. Never
-# deploy to production clusters.
+# security hardening tracker. Checkpoint archives now carry provenance (R2):
+# the node agent signs each manifest with a key from the
+# pod-migrate-archive-signing-keys Secret (create it before the agent starts,
+# see engines/criu/README.md) and refuses unsigned or misbound archives. The
+# hostNetwork agent still uses the node's GCE service account (R5, open), so
+# anyone who can write to the checkpoint GCS bucket can still delete or
+# corrupt archives (restores then fall back to a cold start), and anyone who
+# can read Secrets in pod-migration-criu-system or compromise a node agent can
+# sign an archive. The agent holds cluster-wide pods (update/patch) and nodes
+# (patch/checkpoint) RBAC, and a residual dual-start window exists if holder
+# fallback precedes restore. Never deploy to production clusters.
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -131,6 +135,12 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # The cluster UID that each archive manifest binds the archive to: the
+  # kube-system Namespace's UID, read once at startup (#244).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["kube-system"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -313,7 +323,20 @@ spec:
               mountPath: /etc/criu
             - name: host-sbin
               mountPath: /usr/local/sbin
+            # The archive signing keys (--archive-signing-keys-dir, #244).
+            - name: archive-signing-keys
+              mountPath: /etc/pod-migrate/archive-signing
+              readOnly: true
       volumes:
+        # Create this Secret before the agent starts, and on an existing
+        # install before you apply this file (see engines/criu/README.md);
+        # the agent's pods wait for it. Only the agent mounts it: workloads
+        # must never read it.
+        - name: archive-signing-keys
+          secret:
+            secretName: pod-migrate-archive-signing-keys
+            optional: false
+            defaultMode: 0400
         - name: pod-migrate
           hostPath:
             path: /var/lib/pod-migrate
@@ -425,21 +448,24 @@ webhooks:
         scope: Namespaced
 ---
 # The restore outcome on a pod (#233). The node agent records it once in
-# pod-migrate.io/psengine-restore: "restored" or "failed". The holder reads it to
-# continue as the restored process or to start cold, and the engine and the
-# orchestrator read it to judge the restore. So on an existing pod, only the
-# agent may write it, only once, and nobody may change or remove it afterwards.
+# pod-migrate.io/psengine-restore: "restored" or "failed", and, with failed,
+# why in pod-migrate.io/psengine-restore-reason (#244). The holder reads the
+# outcome to continue as the restored process or to start cold, and the engine
+# and the orchestrator read both to judge the restore and say why it failed.
+# So on an existing pod, only the agent may write them, only once (the reason
+# in the same update as the outcome, and only with failed), and nobody may
+# change or remove them afterwards.
 #
 # It is an admission policy, not a webhook: the API server evaluates it
 # itself, so it doesn't depend on the engine being up. matchConditions skip
-# every update that leaves the annotation as it is, the kubelet's status
+# every update that leaves both annotations as they are, the kubelet's status
 # writes included.
 #
 # The validation below names the node agent's service account, namespace
 # included. An install that renames the namespace or the service account must
 # change it there too, or the agent itself is denied.
 #
-# To edit the annotation by hand in an emergency, set the binding's
+# To edit the annotations by hand in an emergency, set the binding's
 # validationActions to ["Audit"], and back to ["Deny"] afterwards (see the
 # README). While it is Audit, no pod in the cluster is protected.
 apiVersion: admissionregistration.k8s.io/v1
@@ -467,21 +493,21 @@ spec:
             - pod-migration-system
             - pod-migration-criu-system
   matchConditions:
-    # True when the annotation is added, changed or removed.
-    - name: restore-status-changed
+    # True when the outcome or its reason is added, changed or removed.
+    - name: restore-outcome-changed
       expression: >-
+        ['pod-migrate.io/psengine-restore', 'pod-migrate.io/psengine-restore-reason'].exists(k,
         (has(object.metadata.annotations) &&
-        'pod-migrate.io/psengine-restore' in object.metadata.annotations)
+        k in object.metadata.annotations)
         !=
         (has(oldObject.metadata.annotations) &&
-        'pod-migrate.io/psengine-restore' in oldObject.metadata.annotations)
+        k in oldObject.metadata.annotations)
         ||
         (has(object.metadata.annotations) &&
-        'pod-migrate.io/psengine-restore' in object.metadata.annotations &&
+        k in object.metadata.annotations &&
         has(oldObject.metadata.annotations) &&
-        'pod-migrate.io/psengine-restore' in oldObject.metadata.annotations &&
-        object.metadata.annotations['pod-migrate.io/psengine-restore'] !=
-        oldObject.metadata.annotations['pod-migrate.io/psengine-restore'])
+        k in oldObject.metadata.annotations &&
+        object.metadata.annotations[k] != oldObject.metadata.annotations[k]))
   validations:
     # The node agent's service account: the namespace and name of the
     # pod-migrate-agent ServiceAccount in this file.
@@ -490,9 +516,12 @@ spec:
         'system:serviceaccount:pod-migration-criu-system:pod-migrate-agent'
       message: >-
         only the CRIU node agent may record a restore outcome
-        (pod-migrate.io/psengine-restore) on a pod
+        (pod-migrate.io/psengine-restore) or its reason
+        (pod-migrate.io/psengine-restore-reason) on a pod
       reason: Forbidden
-    # Written once: from unset (or empty) to restored or failed.
+    # Written once: from unset (or empty) to restored or failed. An update
+    # that changes the reason must be that one too, so the reason can't be
+    # changed or removed afterwards either.
     - expression: >-
         !(has(oldObject.metadata.annotations) &&
         'pod-migrate.io/psengine-restore' in oldObject.metadata.annotations &&
@@ -503,7 +532,19 @@ spec:
         object.metadata.annotations['pod-migrate.io/psengine-restore'] in ['restored', 'failed']
       message: >-
         pod-migrate.io/psengine-restore is written once, as "restored" or
-        "failed", and can't be changed or removed afterwards
+        "failed", with its reason (pod-migrate.io/psengine-restore-reason) in
+        the same update, and neither can be changed or removed afterwards
+      reason: Forbidden
+    # A reason says why a restore failed: it goes only with failed.
+    - expression: >-
+        !(has(object.metadata.annotations) &&
+        'pod-migrate.io/psengine-restore-reason' in object.metadata.annotations)
+        ||
+        ('pod-migrate.io/psengine-restore' in object.metadata.annotations &&
+        object.metadata.annotations['pod-migrate.io/psengine-restore'] == 'failed')
+      message: >-
+        pod-migrate.io/psengine-restore-reason is recorded only with
+        pod-migrate.io/psengine-restore: failed
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

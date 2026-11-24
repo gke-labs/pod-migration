@@ -548,7 +548,7 @@ Other updates of the Pod aren't affected, and a Pod without the `pod-migration.g
    kubectl get validatingadmissionpolicybinding pod-migration-restore-order -o jsonpath='{.spec.validationActions}'
    ```
 
-The CRIU engine protects its restore outcome (`pod-migrate.io/psengine-restore`) the same way, with the `pod-migrate-psengine-restore-status` policy and binding in `engines/criu/deploy/deploy.yaml`. The same steps apply to that binding.
+The CRIU engine protects its restore outcome (`pod-migrate.io/psengine-restore`, and a failure's reason in `pod-migrate.io/psengine-restore-reason`) the same way, with the `pod-migrate-psengine-restore-status` policy and binding in `engines/criu/deploy/deploy.yaml`. The same steps apply to that binding.
 
 **Custom namespace or service account:** each policy names the one identity it allows, as a literal: `system:serviceaccount:pod-migration-system:pod-migration-controller` in `controller/deploy.yaml`, and `system:serviceaccount:pod-migration-criu-system:pod-migrate-agent` in `engines/criu/deploy/deploy.yaml`. If you install into another namespace or rename a service account, change that line in the policy too. Otherwise the controller is denied whenever it orders a restore, and the node agent whenever it records an outcome.
 
