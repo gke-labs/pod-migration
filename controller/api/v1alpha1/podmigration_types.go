@@ -23,6 +23,14 @@ import (
 type StorageSpec struct {
 	// Location is the storage location URI (e.g. gs://bucket-name/prefix-path)
 	Location string `json:"location"`
+
+	// TokenSource specifies the identity provider for access to Cloud Storage.
+	// Supported values for GKE Pod Snapshots are "podKSA" (default: uses Workload Identity
+	// bindings on the pod's Kubernetes ServiceAccount) and "federatedP4SA" (multi-tenancy:
+	// uses short-lived, path-restricted tokens minted by the GKE node service account).
+	// +kubebuilder:validation:Enum=podKSA;federatedP4SA
+	// +optional
+	TokenSource string `json:"tokenSource,omitempty"`
 }
 
 // PodMigrationSpec defines the desired config.

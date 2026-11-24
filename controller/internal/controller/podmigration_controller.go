@@ -55,6 +55,7 @@ const (
 	StorageCleanupFinalizer                = util.StorageCleanupFinalizer
 	OwnerUIDLabelKey                       = engine.OwnerUIDLabel
 	ReasonDuplicatePodMigrationInNamespace = "DuplicatePodMigrationInNamespace"
+	ReasonConflictingStorageLocation       = "ConflictingStorageLocation"
 	maxDeletionDeferral                    = 10 * time.Minute
 
 	// ReasonManagedObjectTerminating: a policy or storage object rendered for
@@ -332,6 +333,84 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// Enforce storage location isolation across namespaces (#278):
+	// Snapshot storage must not be shared between distinct namespaces by path only.
+	// If another active PodMigration in another namespace claims a conflicting storage
+	// location (same bucket and path, or root of the bucket) and precedes this one,
+	// refuse reconciliation with ConflictingStorageLocation.
+	var allMigs pmv1alpha1.PodMigrationList
+	if err := r.List(ctx, &allMigs); err != nil {
+		logger.Error(err, "Failed to list cluster PodMigrations for storage conflict check")
+		return ctrl.Result{}, err
+	}
+	if conflict := util.FindConflictingStoragePodMigration(config, allMigs.Items); conflict != nil {
+		deferCleanup := false
+		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
+			inFlight, err := r.listInFlightMigrations(ctx, config)
+			if err != nil {
+				logger.Error(err, "Failed to list PodMigrationJobs during storage conflict cleanup")
+				return ctrl.Result{}, err
+			}
+			if len(inFlight) > 0 {
+				if deferralExpired(config) {
+					logger.Error(nil, "Storage conflict deferral exceeded maximum; forcing storage cleanup",
+						"name", config.Name,
+						"namespace", config.Namespace,
+						"inFlight", inFlight)
+					if r.Recorder != nil {
+						r.Recorder.Eventf(config, corev1.EventTypeWarning, "DeletionDeferralTimeout",
+							"Forcing cleanup after %s with %d migration(s) still in flight",
+							maxDeletionDeferral, len(inFlight))
+					}
+				} else {
+					logger.Info("Postponing storage resource cleanup on conflicting PodMigration: active migrations in flight",
+						"name", config.Name,
+						"namespace", config.Namespace,
+						"conflict", conflict.Namespace+"/"+conflict.Name,
+						"inFlightCount", len(inFlight),
+						"jobs", inFlight)
+					deferCleanup = true
+				}
+			}
+			if !deferCleanup {
+				if err := r.deleteNamespaceResources(ctx, config); err != nil {
+					logger.Error(err, "Failed to clean up storage resources on conflicting PodMigration")
+					return ctrl.Result{}, err
+				}
+				controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
+				if err := r.Update(ctx, config); err != nil {
+					logger.Error(err, "Failed to remove finalizer from conflicting PodMigration")
+					return ctrl.Result{}, err
+				}
+			}
+		}
+		msg := fmt.Sprintf("Storage location %q conflicts with active PodMigration %s/%s; shared storage locations across namespaces are refused for multi-tenant isolation",
+			config.Spec.Storage.Location, conflict.Namespace, conflict.Name)
+		logger.Info("Skipping reconciliation for conflicting storage location across namespaces",
+			"name", config.Name, "namespace", config.Namespace, "conflictingWith", conflict.Namespace+"/"+conflict.Name)
+		before := config.Status.DeepCopy()
+		changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonConflictingStorageLocation,
+			Message:            msg,
+			ObservedGeneration: config.Generation,
+		})
+		if changed {
+			if r.Recorder != nil {
+				r.Recorder.Event(config, corev1.EventTypeWarning, ReasonConflictingStorageLocation, msg)
+			}
+			if err := r.patchStatus(ctx, config, before); err != nil {
+				logger.Error(err, "Failed to update status on conflicting PodMigration")
+				return ctrl.Result{}, err
+			}
+		}
+		if deferCleanup || !conflict.DeletionTimestamp.IsZero() {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Ensure finalizer is present
@@ -768,21 +847,47 @@ func selectActivePodMigration(items []pmv1alpha1.PodMigration) *pmv1alpha1.PodMi
 }
 
 func (r *PodMigrationReconciler) enqueueNamespacePeers(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.enqueuePeers(ctx, obj)
+}
+
+func (r *PodMigrationReconciler) enqueuePeers(ctx context.Context, obj client.Object) []reconcile.Request {
 	var list pmv1alpha1.PodMigrationList
-	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {
+	if err := r.List(ctx, &list); err != nil {
 		return nil
 	}
+	pm, ok := obj.(*pmv1alpha1.PodMigration)
+	var objBucket string
+	if ok && pm != nil {
+		objBucket, _, _ = util.ParseStorageLocation(pm.Spec.Storage.Location)
+	}
+
 	var reqs []reconcile.Request
 	for _, item := range list.Items {
-		if item.Name == obj.GetName() {
+		if item.Namespace == obj.GetNamespace() && item.Name == obj.GetName() {
 			continue
 		}
-		reqs = append(reqs, reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Namespace: item.Namespace,
-				Name:      item.Name,
-			},
-		})
+		// Enqueue peers in the same namespace (for singleton election)
+		if item.Namespace == obj.GetNamespace() {
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: item.Namespace,
+					Name:      item.Name,
+				},
+			})
+			continue
+		}
+		// Enqueue peers in other namespaces that share the bucket (for storage conflict evaluation)
+		if objBucket != "" {
+			itemBucket, _, _ := util.ParseStorageLocation(item.Spec.Storage.Location)
+			if itemBucket == objBucket {
+				reqs = append(reqs, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: item.Namespace,
+						Name:      item.Name,
+					},
+				})
+			}
+		}
 	}
 	return reqs
 }
@@ -857,7 +962,7 @@ func (r *PodMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	logger := mgr.GetLogger().WithName("podmigration-setup")
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&pmv1alpha1.PodMigration{}).
-		Watches(&pmv1alpha1.PodMigration{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNamespacePeers))
+		Watches(&pmv1alpha1.PodMigration{}, handler.EnqueueRequestsFromMapFunc(r.enqueuePeers))
 
 	var groups []string
 	if registry, err := r.engines(); err == nil && registry != nil {

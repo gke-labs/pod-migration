@@ -130,13 +130,17 @@ Run the provided setup script to automatically create the GCS bucket, configure 
 
 ```bash
 chmod +x patches/setup-storage.sh
-./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]
+./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION] [MODE]
 ```
 
 *This script performs the following:*
-- Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access and soft-delete disabled.
-- Binds IAM roles `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and the GKE container engine robot service account.
-- Creates KSA `pm-test-ksa` in the `default` namespace.
+- Creates a GCS bucket `gs://<BUCKET_NAME>` with hierarchical namespaces enabled (`--enable-hierarchical-namespace`), uniform bucket-level access, and soft-delete disabled.
+- **Multi-Tenant Mode (default)**: Binds `roles/storage.admin` to the GKE node service account (`service-${PROJECT_NUMBER}@gcp-sa-gkenode.iam.gserviceaccount.com`) so the node agent mints path-restricted short-lived tokens on demand (`tokenSource: federatedP4SA`). Creates a managed folder for the namespace. Workload KSAs receive **zero bucket-wide permissions**, preventing cross-tenant checkpoint access.
+- **Single-Tenant Mode (`MODE=single-tenant`)**: Binds `roles/storage.objectUser` and `roles/storage.bucketViewer` to the namespace Workload Identity pool and uses `tokenSource: podKSA` for dedicated per-tenant buckets.
+- Binds IAM roles `roles/storage.objectUser` and `roles/storage.bucketViewer` to the GKE container engine robot service account.
+- Creates KSA `pm-test-ksa` in the target namespace.
+
+> **Multi-Tenancy Note**: For shared clusters hosting multiple tenant namespaces, review [Multi-Tenant Snapshot Storage Architecture & Guidance](docs/storage-multitenancy.md). The controller automatically enforces storage location isolation, refusing any `PodMigration` that attempts to share a bucket and path with another namespace (`ConflictingStorageLocation`).
 
 ### Step 2: Install CRDs
 Install the custom resource definitions for the pod migration controller:

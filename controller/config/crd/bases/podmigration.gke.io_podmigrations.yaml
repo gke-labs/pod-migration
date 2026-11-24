@@ -46,6 +46,16 @@ spec:
                   location:
                     description: Location is the storage location URI (e.g. gs://bucket-name/prefix-path)
                     type: string
+                  tokenSource:
+                    description: |-
+                      TokenSource specifies the identity provider for access to Cloud Storage.
+                      Supported values for GKE Pod Snapshots are "podKSA" (default: uses Workload Identity
+                      bindings on the pod's Kubernetes ServiceAccount) and "federatedP4SA" (multi-tenancy:
+                      uses short-lived, path-restricted tokens minted by the GKE node service account).
+                    enum:
+                    - podKSA
+                    - federatedP4SA
+                    type: string
                 required:
                 - location
                 type: object

@@ -1804,6 +1804,209 @@ func TestPodMigrationReconciler_SingletonPerNamespace_DemotionDeferralTimeoutFor
 	}
 }
 
+func TestPodMigrationReconciler_ConflictingStorageLocationAcrossNamespaces(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	t0 := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	t1 := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+
+	// Tenant A configures gs://shared-bucket/snapshots
+	configA := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-a",
+			Name:              "config-a",
+			UID:               "uid-a",
+			Generation:        1,
+			CreationTimestamp: t0,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://shared-bucket/snapshots",
+			},
+		},
+	}
+
+	// Tenant B configures identical gs://shared-bucket/snapshots (conflict!)
+	configB := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-b",
+			Name:              "config-b",
+			UID:               "uid-b",
+			Generation:        1,
+			CreationTimestamp: t1,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location: "gs://shared-bucket/snapshots",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(configA, configB).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+
+	fakeRecorder := record.NewFakeRecorder(10)
+	r := &PodMigrationReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: fakeRecorder,
+	}
+
+	// 1. Reconcile configA: should succeed (Ready=True, finalizer added)
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-a", Name: "config-a"},
+	}); err != nil {
+		t.Fatalf("Reconcile config-a failed: %v", err)
+	}
+	gotA := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-a", Name: "config-a"}, gotA); err != nil {
+		t.Fatalf("Get config-a failed: %v", err)
+	}
+	condA := meta.FindStatusCondition(gotA.Status.Conditions, "Ready")
+	if condA == nil || condA.Status != metav1.ConditionTrue || condA.Reason != "Reconciled" {
+		t.Fatalf("Expected config-a Ready=True (Reconciled), got: %+v", condA)
+	}
+
+	// 2. Reconcile configB: should be refused (Ready=False, Reason: ConflictingStorageLocation)
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-b", Name: "config-b"},
+	}); err != nil {
+		t.Fatalf("Reconcile config-b failed: %v", err)
+	}
+	gotB := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-b", Name: "config-b"}, gotB); err != nil {
+		t.Fatalf("Get config-b failed: %v", err)
+	}
+	condB := meta.FindStatusCondition(gotB.Status.Conditions, "Ready")
+	if condB == nil || condB.Status != metav1.ConditionFalse || condB.Reason != ReasonConflictingStorageLocation {
+		t.Fatalf("Expected config-b Ready=False (%s), got: %+v", ReasonConflictingStorageLocation, condB)
+	}
+	if !strings.Contains(condB.Message, "tenant-a/config-a") {
+		t.Errorf("Expected message to name conflicting PodMigration tenant-a/config-a, got: %s", condB.Message)
+	}
+	// Verify Warning event was emitted
+	select {
+	case ev := <-fakeRecorder.Events:
+		if !strings.Contains(ev, ReasonConflictingStorageLocation) {
+			t.Errorf("Expected %s event, got: %s", ReasonConflictingStorageLocation, ev)
+		}
+	default:
+		t.Errorf("Expected %s Warning event to be emitted", ReasonConflictingStorageLocation)
+	}
+
+	// 3. Delete configA from tenant-a: configB should now be unblocked and promote to Ready=True
+	if err := fakeClient.Delete(context.Background(), gotA); err != nil {
+		t.Fatalf("Delete config-a failed: %v", err)
+	}
+	// Run finalizer on config-a
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-a", Name: "config-a"},
+	}); err != nil {
+		t.Fatalf("Finalize config-a failed: %v", err)
+	}
+
+	// Reconcile configB again
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-b", Name: "config-b"},
+	}); err != nil {
+		t.Fatalf("Reconcile config-b after unblocking failed: %v", err)
+	}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-b", Name: "config-b"}, gotB); err != nil {
+		t.Fatalf("Get config-b failed: %v", err)
+	}
+	condBPromoted := meta.FindStatusCondition(gotB.Status.Conditions, "Ready")
+	if condBPromoted == nil || condBPromoted.Status != metav1.ConditionTrue || condBPromoted.Reason != "Reconciled" {
+		t.Fatalf("Expected config-b to promote to Ready=True, got: %+v", condBPromoted)
+	}
+}
+
+func TestPodMigrationReconciler_DistinctStorageLocationsAcrossNamespaces(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	t0 := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	t1 := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+
+	// Tenant A configures gs://shared-bucket/tenant-a
+	configA := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-a",
+			Name:              "config-a",
+			UID:               "uid-a",
+			Generation:        1,
+			CreationTimestamp: t0,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location:    "gs://shared-bucket/tenant-a",
+				TokenSource: "federatedP4SA",
+			},
+		},
+	}
+
+	// Tenant B configures distinct gs://shared-bucket/tenant-b
+	configB := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-b",
+			Name:              "config-b",
+			UID:               "uid-b",
+			Generation:        1,
+			CreationTimestamp: t1,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{
+				Location:    "gs://shared-bucket/tenant-b",
+				TokenSource: "federatedP4SA",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(configA, configB).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// Reconcile both: neither should conflict!
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-a", Name: "config-a"},
+	}); err != nil {
+		t.Fatalf("Reconcile config-a failed: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-b", Name: "config-b"},
+	}); err != nil {
+		t.Fatalf("Reconcile config-b failed: %v", err)
+	}
+
+	gotA := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-a", Name: "config-a"}, gotA); err != nil {
+		t.Fatalf("Get config-a failed: %v", err)
+	}
+	condA := meta.FindStatusCondition(gotA.Status.Conditions, "Ready")
+	if condA == nil || condA.Status != metav1.ConditionTrue {
+		t.Fatalf("Expected config-a Ready=True, got: %+v", condA)
+	}
+
+	gotB := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-b", Name: "config-b"}, gotB); err != nil {
+		t.Fatalf("Get config-b failed: %v", err)
+	}
+	condB := meta.FindStatusCondition(gotB.Status.Conditions, "Ready")
+	if condB == nil || condB.Status != metav1.ConditionTrue {
+		t.Fatalf("Expected config-b Ready=True, got: %+v", condB)
+	}
+}
+
 // The tests below cover syncResource (#102): a reconcile patches only the
 // fields this controller owns on the managed PodSnapshotStorageConfig and
 // PodSnapshotPolicy, and leaves metadata other components add alone.

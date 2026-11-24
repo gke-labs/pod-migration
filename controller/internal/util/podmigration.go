@@ -17,6 +17,8 @@ package util
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -43,13 +45,13 @@ func SelectActivePodMigration(items []pmv1alpha1.PodMigration) *pmv1alpha1.PodMi
 		candidate := &items[i]
 		if !candidate.DeletionTimestamp.IsZero() {
 			if controllerutil.ContainsFinalizer(candidate, StorageCleanupFinalizer) {
-				if deletingWithFinalizer == nil || podMigrationPrecedes(candidate, deletingWithFinalizer) {
+				if deletingWithFinalizer == nil || PodMigrationPrecedes(candidate, deletingWithFinalizer) {
 					deletingWithFinalizer = candidate
 				}
 			}
 			continue
 		}
-		if active == nil || podMigrationPrecedes(candidate, active) {
+		if active == nil || PodMigrationPrecedes(candidate, active) {
 			active = candidate
 		}
 	}
@@ -59,11 +61,120 @@ func SelectActivePodMigration(items []pmv1alpha1.PodMigration) *pmv1alpha1.PodMi
 	return active
 }
 
-func podMigrationPrecedes(a, b *pmv1alpha1.PodMigration) bool {
+// PodMigrationPrecedes reports whether a has precedence over b.
+// The oldest CreationTimestamp wins; ties are broken lexicographically by namespace,
+// then name.
+func PodMigrationPrecedes(a, b *pmv1alpha1.PodMigration) bool {
+	if a == nil {
+		return false
+	}
+	if b == nil {
+		return true
+	}
 	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
 		return a.CreationTimestamp.Before(&b.CreationTimestamp)
 	}
+	if a.Namespace != b.Namespace {
+		return a.Namespace < b.Namespace
+	}
 	return a.Name < b.Name
+}
+
+// ParseStorageLocation parses a storage location URI (e.g. gs://bucket/path) into
+// bucket and clean path without leading or trailing slashes. It returns an error if
+// the location does not start with gs:// or has an empty bucket name.
+func ParseStorageLocation(location string) (bucket, path string, err error) {
+	if !strings.HasPrefix(location, "gs://") {
+		return "", "", fmt.Errorf("invalid GCS location: %s (must start with gs://)", location)
+	}
+	trimmed := strings.TrimPrefix(location, "gs://")
+	parts := strings.SplitN(trimmed, "/", 2)
+	bucket = strings.TrimSpace(parts[0])
+	if bucket == "" {
+		return "", "", fmt.Errorf("invalid GCS location: %s (missing bucket name)", location)
+	}
+	if len(parts) > 1 {
+		path = strings.Trim(strings.TrimSpace(parts[1]), "/")
+	}
+	return bucket, path, nil
+}
+
+// StorageLocationsConflict reports whether two parsed GCS locations conflict.
+// Locations conflict if they use the same bucket and either:
+// 1. Both use the identical path (including both using the root bucket);
+// 2. Either location targets the entire bucket (empty path), encompassing all subpaths;
+// 3. One location is a parent/ancestor path of the other (e.g. "tenant-a" and "tenant-a/nested").
+func StorageLocationsConflict(bucketA, pathA, bucketB, pathB string) bool {
+	if bucketA == "" || bucketB == "" || bucketA != bucketB {
+		return false
+	}
+	if pathA == "" || pathB == "" {
+		return true
+	}
+	if pathA == pathB || strings.HasPrefix(pathB, pathA+"/") || strings.HasPrefix(pathA, pathB+"/") {
+		return true
+	}
+	return false
+}
+
+// FindConflictingStoragePodMigration finds an active PodMigration in items (across namespaces)
+// whose storage location conflicts with target and has precedence over target.
+// Returns the conflicting PodMigration that precedes target, or nil if target is the winner
+// or no conflict exists.
+func FindConflictingStoragePodMigration(target *pmv1alpha1.PodMigration, items []pmv1alpha1.PodMigration) *pmv1alpha1.PodMigration {
+	if target == nil {
+		return nil
+	}
+	tBucket, tPath, err := ParseStorageLocation(target.Spec.Storage.Location)
+	if err != nil {
+		return nil
+	}
+
+	// Group items by namespace to identify the active singleton per namespace
+	nsItems := make(map[string][]pmv1alpha1.PodMigration)
+	for i := range items {
+		ns := items[i].Namespace
+		nsItems[ns] = append(nsItems[ns], items[i])
+	}
+	activePerNS := make(map[string]*pmv1alpha1.PodMigration)
+	for ns, group := range nsItems {
+		activePerNS[ns] = SelectActivePodMigration(group)
+	}
+
+	var oldestPreceding *pmv1alpha1.PodMigration
+	for i := range items {
+		other := &items[i]
+		if (target.UID != "" && other.UID == target.UID) || (other.Namespace == target.Namespace && other.Name == target.Name) {
+			continue
+		}
+		// A candidate must either hold the StorageCleanupFinalizer or be the active singleton of its namespace.
+		// Duplicate/demoted PMs without finalizers are inactive and cannot block other namespaces.
+		isActive := false
+		if active := activePerNS[other.Namespace]; active != nil && active.Name == other.Name {
+			isActive = true
+		}
+		hasFinalizer := controllerutil.ContainsFinalizer(other, StorageCleanupFinalizer)
+		if !isActive && !hasFinalizer {
+			continue
+		}
+		// If other is deleting and doesn't hold the finalizer, it is effectively gone
+		if !other.DeletionTimestamp.IsZero() && !hasFinalizer {
+			continue
+		}
+
+		oBucket, oPath, err := ParseStorageLocation(other.Spec.Storage.Location)
+		if err != nil {
+			continue
+		}
+		if StorageLocationsConflict(tBucket, tPath, oBucket, oPath) {
+			if PodMigrationPrecedes(other, target) {
+				if oldestPreceding == nil || PodMigrationPrecedes(other, oldestPreceding) {
+					oldestPreceding = other
+				}
+			}
+		}
+	}
+	return oldestPreceding
 }
 
 // ActivePodMigration returns the active PodMigration of namespace, as
