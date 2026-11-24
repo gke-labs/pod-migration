@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -104,9 +103,10 @@ func TestSourceNodeFactsAllKnown(t *testing.T) {
 	if !reflect.DeepEqual(runcArgs, []string{"runc", "--version"}) {
 		t.Fatalf("runc probe ran %v", runcArgs)
 	}
-	// Same lookup PATH as the restore's runc, so both mean the same binary.
-	if len(runcEnv) != 1 || !strings.Contains(runcEnv[0], "/home/kubernetes/bin") {
-		t.Fatalf("runc probe env = %v, want the restore PATH", runcEnv)
+	// Same lookup PATH as the restore's runc, so both mean the same binary,
+	// with /usr/local last so a node keeps the runc it found before.
+	if want := []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin:/home/kubernetes/bin:/usr/local/sbin:/usr/local/bin"}; !reflect.DeepEqual(runcEnv, want) {
+		t.Fatalf("runc probe env = %v, want %v", runcEnv, want)
 	}
 }
 

@@ -394,6 +394,8 @@ You can run automated E2E pod migration verification for any of the 21 pre-confi
 ./verification-suite/run_app_validation.sh mysql
 ```
 
+The CRIU engine has its own E2E on kind, which needs no GKE cluster or cloud credentials and runs in CI on pull requests: see [End-to-end test on kind](engines/criu/README.md#end-to-end-test-on-kind).
+
 ---
 
 ## 6. Expected Verification Output

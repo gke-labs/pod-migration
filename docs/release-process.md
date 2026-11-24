@@ -40,7 +40,7 @@ cd ..
 Before publishing images, verify that third-party licensing disclosures remain up to date:
 
 1. Review `docs/third-party-licenses.md` against any newly introduced Go dependencies or base image updates.
-2. Ensure `engines/criu/build/agent/Dockerfile` continues to extract package copyright files from Debian trixie into `/opt/criu-bundle/licenses/`.
+2. Ensure `engines/criu/build/agent/Dockerfile` continues to extract package copyright files from Debian forky into `/opt/criu-bundle/licenses/`.
 3. Verify that all components in published images are properly categorized by license (Apache-2.0, MIT, BSD-3-Clause, GPL-2.0, LGPL-2.1).
 
 ---
@@ -103,11 +103,15 @@ docker push "${HOLDER_IMG}"
 
 Per GPL-2.0 Section 3, any release distributing the `pod-migration-criu-agent` container image must make the corresponding source code available.
 
-Run the automated packaging script to extract the matching Debian source packages and generate a release source archive:
+Run the automated packaging script to extract the matching Debian source packages and generate a release source archive. Pass the package versions recorded in the agent image you publish: its CRIU stage builds from Debian forky (testing), whose versions change from week to week, so without them the script can fetch sources that don't match the image.
 
 ```bash
 # Package matching source files into ./dist
-./tools/release/package_gpl_sources.sh --version "${VERSION}" --output-dir dist/
+cid="$(docker create "${AGENT_IMG}")"
+docker cp "${cid}:/opt/criu-bundle/licenses/package-versions.txt" /tmp/agent-package-versions.txt
+docker rm "${cid}" >/dev/null
+./tools/release/package_gpl_sources.sh --version "${VERSION}" --output-dir dist/ \
+  --package-versions /tmp/agent-package-versions.txt
 ```
 
 This generates:

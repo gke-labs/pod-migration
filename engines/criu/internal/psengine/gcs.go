@@ -34,11 +34,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // ObjectInfo is what the store learned about a written object — used for
@@ -84,17 +87,49 @@ type GCSStore struct {
 	tokenExp time.Time
 }
 
-// NewGCSStore returns a production-configured store.
+// StorageEmulatorHostEnv names a GCS emulator to use instead of GCS, as in
+// Google's client libraries: host:port, or a URL such as http://host:port.
+// For tests only (the kind E2E runs fake-gcs-server): the store then sends no
+// credentials, so whoever runs the emulator can read, delete or corrupt the
+// archives.
+const StorageEmulatorHostEnv = "STORAGE_EMULATOR_HOST"
+
+// NewGCSStore returns a production-configured store, or, when
+// STORAGE_EMULATOR_HOST is set, one that talks to that emulator without
+// credentials.
 func NewGCSStore() *GCSStore {
-	return &GCSStore{
+	s := &GCSStore{
 		HTTP:       &http.Client{Timeout: 10 * time.Minute}, // uploads scale with RSS
 		UploadBase: "https://storage.googleapis.com/upload/storage/v1",
 		APIBase:    "https://storage.googleapis.com/storage/v1",
 		TokenURL:   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
 	}
+	if host := os.Getenv(StorageEmulatorHostEnv); host != "" {
+		if !strings.Contains(host, "://") {
+			host = "http://" + host
+		}
+		host = strings.TrimSuffix(host, "/")
+		s.UploadBase = host + "/upload/storage/v1"
+		s.APIBase = host + "/storage/v1"
+		s.TokenURL = ""
+		ctrl.Log.WithName("gcs").Info("WARNING: using a GCS emulator instead of GCS, without credentials (tests only)", "env", StorageEmulatorHostEnv, "endpoint", host)
+	}
+	return s
 }
 
+// setBearer authorizes req with tok; an empty token (emulator) sends none.
+func setBearer(req *http.Request, tok string) {
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+}
+
+// bearer returns the access token, or "" when the store has no token
+// endpoint (a GCS emulator).
 func (g *GCSStore) bearer(ctx context.Context) (string, error) {
+	if g.TokenURL == "" {
+		return "", nil
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.token != "" && time.Now().Before(g.tokenExp.Add(-30*time.Second)) {
@@ -134,7 +169,7 @@ func (g *GCSStore) do(ctx context.Context, method, url string, body io.Reader) (
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearer(req, tok)
 	return g.HTTP.Do(req)
 }
 
@@ -178,7 +213,7 @@ func (g *GCSStore) GetRange(ctx context.Context, bucket, object string, start, e
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearer(req, tok)
 	wantStatus := http.StatusOK
 	if end >= 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
@@ -233,7 +268,7 @@ func (g *GCSStore) Compose(ctx context.Context, bucket, destination string, sour
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearer(req, tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := g.HTTP.Do(req)
 	if err != nil {

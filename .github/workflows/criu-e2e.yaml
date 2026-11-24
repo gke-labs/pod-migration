@@ -1,0 +1,79 @@
+# CRIU engine E2E on kind (#230): real containerd, runc and CRIU on two kind
+# workers, fake-gcs-server as the checkpoint bucket, the shipped manifests,
+# and a warm restore plus a failed restore with --invariant-mode=strict. No
+# cloud credentials. Run it locally with the same two scripts.
+name: CRIU E2E (kind)
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+    - 'engines/criu/**'
+    - 'controller/**'
+    - 'verification-suite/**'
+    - '.github/workflows/**'
+  push:
+    branches: [ main ]
+    paths:
+    - 'engines/criu/**'
+    - 'controller/**'
+    - 'verification-suite/**'
+    - '.github/workflows/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A new push to a PR replaces its run; runs on main all finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  criu-kind-e2e:
+    name: CRIU E2E on kind
+    # Pinned rather than ubuntu-latest: CRIU depends on the runner's kernel.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      LOG_DIR: /tmp/pm-e2e
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
+
+    - name: Install kind
+      run: |
+        echo "Runner kernel: $(uname -r)"
+        curl -fsSLo kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+        echo "${KIND_SHA256}  kind" | sha256sum -c -
+        sudo install -m 0755 kind /usr/local/bin/kind
+
+    - name: Bring up kind with the controller and the CRIU engine
+      run: verification-suite/kind/up.sh
+
+    - name: Run the CRIU E2E scenarios
+      run: verification-suite/run_criu_kind_e2e.sh
+
+    - name: Collect logs
+      if: failure() || cancelled()
+      run: |
+        mkdir -p "${LOG_DIR}"
+        # Per node: kubelet and containerd journals, and every pod's logs
+        # (controller, CRIU engine, CRIU agent).
+        kind export logs "${LOG_DIR}/kind" --name pm-e2e || true
+        kubectl get nodes,pods,podmigrations,podmigrationjobs,podsnapshots.criu.podmigration.gke.io -A -o yaml \
+          > "${LOG_DIR}/objects.yaml" || true
+        kubectl get events -A --sort-by=.lastTimestamp > "${LOG_DIR}/events.txt" || true
+        docker logs pm-e2e-gcs > "${LOG_DIR}/fake-gcs-server.log" 2>&1 || true
+
+    - name: Upload logs
+      if: failure() || cancelled()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: criu-kind-e2e-logs
+        path: /tmp/pm-e2e
+        retention-days: 7
