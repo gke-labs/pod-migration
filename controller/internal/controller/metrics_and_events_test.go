@@ -24,9 +24,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -1046,7 +1048,18 @@ func TestMetrics_ApplicationDowntime_MarkSucceededWithoutRestoreTimeoutNoReplace
 
 type failStatusPatchClient struct {
 	client.Client
-	failPatch bool
+	failPatch         bool
+	failPatchConflict bool
+	failGetPod        error
+}
+
+func (c *failStatusPatchClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if c.failGetPod != nil {
+		if _, ok := obj.(*corev1.Pod); ok {
+			return c.failGetPod
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
 }
 
 func (c *failStatusPatchClient) Status() client.SubResourceWriter {
@@ -1059,6 +1072,9 @@ type failStatusPatchWriter struct {
 }
 
 func (w *failStatusPatchWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if w.parent.failPatchConflict {
+		return apierrors.NewConflict(schema.GroupResource{Group: "podmigration.gke.io", Resource: "podmigrationjobs"}, obj.GetName(), errors.New("simulated optimistic lock conflict"))
+	}
 	if w.parent.failPatch {
 		return errors.New("simulated status patch failure")
 	}
@@ -1511,8 +1527,9 @@ func TestMetrics_ApplicationDowntime_ColdStartReconcileLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pass 2 Reconcile failed: %v", err)
 	}
-	if res2.RequeueAfter == 5*time.Second {
-		t.Errorf("pass 2: expected RequeueAfter to fall back to TTL GC, got 5s")
+	expectedTTL := 30*time.Minute - time.Since(compTime.Time)
+	if res2.RequeueAfter < expectedTTL-5*time.Second || res2.RequeueAfter > expectedTTL+5*time.Second {
+		t.Errorf("pass 2: expected RequeueAfter close to TTL %v, got %v", expectedTTL, res2.RequeueAfter)
 	}
 	var jobAfterPass2 pmv1alpha1.PodMigrationJob
 	if err := fakeClient.Get(context.Background(), req.NamespacedName, &jobAfterPass2); err != nil {
@@ -1533,8 +1550,9 @@ func TestMetrics_ApplicationDowntime_ColdStartReconcileLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pass 3 Reconcile failed: %v", err)
 	}
-	if res3.RequeueAfter == 5*time.Second {
-		t.Errorf("pass 3: expected RequeueAfter to fall back to TTL GC, got 5s")
+	expectedTTL = 30*time.Minute - time.Since(compTime.Time)
+	if res3.RequeueAfter < expectedTTL-5*time.Second || res3.RequeueAfter > expectedTTL+5*time.Second {
+		t.Errorf("pass 3: expected RequeueAfter close to TTL %v, got %v", expectedTTL, res3.RequeueAfter)
 	}
 	if got := getHistogramSampleCount(hist); got != beforeCount+1 {
 		t.Errorf("pass 3: expected 0 additional samples, got %d", got)
@@ -1808,16 +1826,54 @@ func TestMetrics_ApplicationDowntime_ColdStartBackfill_TransientRetryTiming(t *t
 		t.Errorf("expected *job = *orig restoration on failed patch, but ReplacementReadyTime was populated")
 	}
 
-	// Now simulated patch failure resolved
-	wrappingClient.failPatch = false
-	recheck2, err := r.backfillColdStartDowntime(context.Background(), job)
+	// Drive transient patch failure through Reconcile: turns (5s, err) into a 5s requeue
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: job.Namespace, Name: job.Name}}
+	resPatch, err := r.Reconcile(context.Background(), req)
 	if err != nil {
-		t.Fatalf("unexpected error after patch success: %v", err)
+		t.Fatalf("Reconcile returned unexpected error on handled patch failure: %v", err)
 	}
-	if recheck2 != 0 {
-		t.Errorf("expected 0 recheck on successful patch, got %v", recheck2)
+	if resPatch.RequeueAfter != 5*time.Second {
+		t.Errorf("expected Reconcile to requeue after 5s on transient patch error, got %v", resPatch.RequeueAfter)
 	}
-	if job.Status.ReplacementReadyTime == nil || !job.Status.ReplacementReadyTime.Equal(&readyTime) {
-		t.Errorf("expected ReplacementReadyTime %v, got %v", readyTime, job.Status.ReplacementReadyTime)
+
+	// Drive transient pod Get failure through Reconcile: pins Get-error 5s return path
+	wrappingClient.failPatch = false
+	wrappingClient.failGetPod = errors.New("transient apiserver connection reset")
+	resGet, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile returned unexpected error on handled Get error: %v", err)
+	}
+	if resGet.RequeueAfter != 5*time.Second {
+		t.Errorf("expected Reconcile to requeue after 5s on transient Get error, got %v", resGet.RequeueAfter)
+	}
+
+	// Drive status patch conflict through Reconcile: pins conflict 1s return path
+	wrappingClient.failGetPod = nil
+	wrappingClient.failPatchConflict = true
+	resConflict, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile returned unexpected error on handled conflict: %v", err)
+	}
+	if resConflict.RequeueAfter != 1*time.Second {
+		t.Errorf("expected Reconcile to requeue after 1s on patch conflict, got %v", resConflict.RequeueAfter)
+	}
+
+	// Now transient failures resolved: backfill succeeds and Reconcile falls back to TTL GC
+	wrappingClient.failPatchConflict = false
+	resSuccess, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile failed after transient errors cleared: %v", err)
+	}
+	expectedTTL := 30*time.Minute - time.Since(compTime.Time)
+	if resSuccess.RequeueAfter < expectedTTL-5*time.Second || resSuccess.RequeueAfter > expectedTTL+5*time.Second {
+		t.Errorf("expected TTL GC requeue after successful backfill, got %v", resSuccess.RequeueAfter)
+	}
+
+	var updatedJob pmv1alpha1.PodMigrationJob
+	if err := baseClient.Get(context.Background(), req.NamespacedName, &updatedJob); err != nil {
+		t.Fatalf("fetching job: %v", err)
+	}
+	if updatedJob.Status.ReplacementReadyTime == nil || !updatedJob.Status.ReplacementReadyTime.Equal(&readyTime) {
+		t.Errorf("expected ReplacementReadyTime %v, got %v", readyTime, updatedJob.Status.ReplacementReadyTime)
 	}
 }
