@@ -2,7 +2,7 @@
 
 ## Alerts Covered
 
-- **`PodMigrationSchedulingGateWedged`** (`severity: warning`): A pod has carried the scheduling gate `gke.io/pod-migration-gate` for more than 10 minutes without being released.
+- **`PodMigrationSchedulingGateWedged`** (`severity: warning`): A pod has carried the scheduling gate `gke.io/pod-migration-gate` (status reason `SchedulingGated`) for more than 10 minutes without being released.
 
 ---
 
@@ -18,12 +18,15 @@ Replacement pods injected with `gke.io/pod-migration-gate` are held in the Kuber
 
 ## 2. Root Cause Analysis
 
-A scheduling gate remains wedged due to one of four scenarios:
+A scheduling gate remains held due to one of several scenarios:
 
-1. **Controller Down or Informer Lag:** `pod-migration-controller` is crashing, partitioned, or experiencing massive API throttling (APF), delaying the `PodGateReconciler` run loop.
-2. **Abandoned PMJ:** A `PodMigrationJob` failed or timed out, but the status was not synced to the pod gate reconciler.
-3. **ReplicaSet Scale-Up Race:** During an active migration, the parent ReplicaSet scaled up. The mutating admission webhook injected `gke.io/pod-migration-gate` onto the new pod, but the pod has no assigned PMJ or was a race loser.
-4. **Deleted PMJ Without Reconciler Sweep:** A user or script forcefully deleted the `PodMigrationJob` object using `--grace-period=0` or while the controller was offline.
+1. **Legitimate Long Holds:** The gate is legitimately waiting for an active restore workflow:
+   - Snapshot upload/verification is still in flight on a large memory footprint.
+   - **No Compatible Node (#14):** The snapshot engine requires node-level hardware/kernel features (e.g. CRIU CPU capabilities or gVisor instance type), and no matching node is currently schedulable. The replacement is held until a node becomes available or the placement deadline elapses.
+   - **Terminating Consumer:** A previous pod instance is still terminating and unmounting volumes.
+2. **Controller Down or Informer Lag:** `pod-migration-controller` is crashing, partitioned, or experiencing API throttling, delaying `PodGateReconciler`.
+3. **Abandoned or Deleted PMJ:** A `PodMigrationJob` failed, timed out, or was deleted while the controller was offline.
+4. **ReplicaSet Scale-Up Race:** During an active migration, the parent ReplicaSet scaled up. The mutating admission webhook injected `gke.io/pod-migration-gate` onto the new pod, and the controller is resolving the race loser.
 
 ---
 
@@ -58,68 +61,71 @@ Check if the assigned PMJ exists:
 kubectl get pmj <assigned-pmj> -n <namespace>
 ```
 
-- **If PMJ exists and is active (`Snapshotting` / `Evicting`):** The pod gate is legitimately waiting for the source snapshot to finish. Inspect the PMJ using [pmj-phase-stuck.md](pmj-phase-stuck.md).
-- **If PMJ exists and is failed / succeeded / deleted:** The reconciler should have released the gate. Proceed to Section 4.
+- **If PMJ exists and is active (`Snapshotting` / `Evicting` / `Restoring`):** The pod gate is legitimately waiting for checkpoint completion or node placement. Inspect the PMJ using [pmj-phase-stuck.md](pmj-phase-stuck.md). Check if destination nodes satisfy engine placement constraints.
+- **If PMJ exists and is failed / succeeded:** The reconciler should release the gate. Check controller logs and leader election lease.
 - **If PMJ does not exist (`NotFound`):** The PMJ was deleted. Proceed to Section 4.
 
 ---
 
 ## 4. Safe Remediation Procedures
 
-### Critical Safety Invariant: Never Strip Gate Without Cold-Start Bypass!
+### Critical Safety Invariants
 
-> ⚠️ **CRITICAL WARNING:** When manually releasing `gke.io/pod-migration-gate` on GKE Pod Snapshots workloads, you **MUST NOT** simply delete the gate from `.spec.schedulingGates`.
-> If you remove the gate while leaving the pod un-annotated, the GKE Pod Snapshots admission webhook or kubelet runtime may implicitly attempt to restore the pod from any leftover or stale snapshot with a matching name ($I_2$ Silent Cold Start violation)!
+> ⚠️ **CRITICAL INVARIANT 1 (Never Strip Gate Directly):** When releasing `gke.io/pod-migration-gate` on GKE Pod Snapshots workloads, you **MUST NOT** simply delete the gate from `.spec.schedulingGates` without the cold-start bypass annotation (`podsnapshot.gke.io/ps-name: ""`). Leaving it un-annotated risks stale snapshot resurrection ($I_2$ Silent Cold Start violation).
 >
-> You must **simultaneously** inject the cold-start bypass annotation:
-> `podsnapshot.gke.io/ps-name: ""`
+> ⚠️ **CRITICAL INVARIANT 2 (Active PMJ Adoption Path, #25):** If you delete a gated replacement pod while its assigned `PodMigrationJob` is still active, the workload controller creates a replacement, the mutating webhook injects `gke.io/pod-migration-gate` again, and the adoption path from #25 re-adopts the active PMJ. Deleting the pod alone will NOT release the gate while the PMJ is active!
 
 ### Remediation Option 1: Let Controller Auto-Recover (Recommended)
 
-The `PodGateReconciler` contains logic to resolve orphaned gates:
+The `PodGateReconciler` automatically resolves orphaned gates:
 
 1. Verify that `pod-migration-controller` is running and healthy:
    ```bash
    kubectl rollout status deployment pod-migration-controller -n pod-migration-system
    ```
-2. If the PMJ is still around in `Failed` phase, deleting it triggers an immediate gate release:
+2. If the PMJ is wedged or failed, deleting the PMJ triggers immediate gate release:
    ```bash
    kubectl delete pmj <assigned-pmj> -n <namespace>
    ```
-3. Watch the pod: within 5 seconds, the controller will read the missing PMJ from the API server, annotate the pod with `podsnapshot.gke.io/ps-name: ""`, and strip `gke.io/pod-migration-gate`.
+3. Watch the pod: within seconds, the controller reads the missing PMJ from the API server, annotates the pod with `podsnapshot.gke.io/ps-name: ""`, and removes `gke.io/pod-migration-gate`.
 
-### Remediation Option 2: Delete the Gated Pod (Simplest Workload Recovery)
+### Remediation Option 2: Delete PMJ First, Then Delete Gated Pod
 
 If the pod belongs to a Deployment, ReplicaSet, or StatefulSet:
 
-```bash
-kubectl delete pod <pod-name> -n <namespace>
-```
+1. Delete the stuck PMJ to clear the active migration state:
+   ```bash
+   kubectl delete pmj <assigned-pmj> -n <namespace>
+   ```
+2. Delete the gated pod:
+   ```bash
+   kubectl delete pod <pod-name> -n <namespace>
+   ```
+3. Because the PMJ is gone, the newly created replica will not be gated, and it will schedule cleanly.
 
-The workload controller will immediately create a brand-new replica. Since no migration is in flight for the new replica, the webhook will not gate it, and it will schedule cleanly.
+### Remediation Option 3: Emergency Policy Audit Mode
 
-### Remediation Option 3: Manual Gate Release with Explicit Cold-Start Bypass
+If the controller is offline and you must manually un-gate a pod:
 
-If you must preserve the specific pod object (e.g. static pod or bare pod):
+> 🛑 **NOTE ON RESTORE ORDER POLICY:** Direct manual patching of `podsnapshot.gke.io/ps-name` by human operators is strictly blocked by the `pod-migration-restore-order` ValidatingAdmissionPolicy, which enforces that only the controller service account may write snapshot restore annotations.
 
-Apply a JSON patch that adds the cold-start bypass annotation and removes the scheduling gate in a single atomic update:
+To execute an emergency manual release:
 
-```bash
-# 1. Inspect the gate index in spec.schedulingGates
-kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.schedulingGates}'
-
-# 2. Apply atomic patch (injecting cold-start bypass and removing gate index 0)
-kubectl patch pod <pod-name> -n <namespace> --type=json -p '[
-  {"op": "add", "path": "/metadata/annotations/podsnapshot.gke.io~1ps-name", "value": ""},
-  {"op": "remove", "path": "/spec/schedulingGates/0"}
-]'
-```
-
-Verify that the pod transitions from `Pending` to `Scheduled`:
-
-```bash
-kubectl get pod <pod-name> -n <namespace>
-```
+1. Temporarily switch `pod-migration-restore-order` to Audit mode:
+   ```bash
+   kubectl patch validatingadmissionpolicybinding pod-migration-restore-order-binding --type=merge -p '{"spec":{"validationActions":["Audit"]}}'
+   ```
+2. Patch the pod with the cold-start bypass annotation and remove the scheduling gate:
+   ```bash
+   kubectl patch pod <pod-name> -n <namespace> --type=json -p '[
+     {"op": "add", "path": "/metadata/annotations/podsnapshot.gke.io~1ps-name", "value": ""},
+     {"op": "replace", "path": "/spec/schedulingGates", "value": []}
+   ]'
+   ```
+3. Immediately restore the policy binding back to `Deny`:
+   ```bash
+   kubectl patch validatingadmissionpolicybinding pod-migration-restore-order-binding --type=merge -p '{"spec":{"validationActions":["Deny"]}}'
+   ```
 
 ---
 
@@ -155,7 +161,7 @@ kubectl get pod <pod-name> -n <namespace>
    ```bash
    kubectl get pod test-orphaned-gate-pod -n default
    ```
-4. Observe Prometheus metric: `kube_pod_spec_scheduling_gate{gate_name="gke.io/pod-migration-gate"}` equals 1.
+4. Observe Prometheus metric: `kube_pod_status_reason{reason="SchedulingGated"}` equals 1.
 5. Restore controller:
    ```bash
    kubectl scale deployment pod-migration-controller -n pod-migration-system --replicas=1

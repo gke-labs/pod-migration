@@ -2,7 +2,7 @@
 
 ## Alerts Covered
 
-- **`PodMigrationHighColdFallbackRatio`** (`severity: warning`): Over 15% of pod migrations completed as cold-start fallbacks over the last 15 minutes.
+- **`PodMigrationHighColdFallbackRatio`** (`severity: warning`): Over 15% of completed pod migrations finished as cold-start fallbacks over the last 15 minutes.
 - **`PodMigrationRestoreCrashFallbackDetected`** (`severity: warning`): A replacement pod crashed during warm restore with a recognized gVisor/OCI restore error signature, triggering an automated fallback to cold start.
 - **`PodMigrationRestoreCrashSignatureDrift`** (`severity: info`): A replacement pod failed to start with container exit code 128 (`StartError`), but its error message did not match any known restore crash signature in the controller.
 
@@ -23,8 +23,8 @@ The primary value of live pod migration is preserving application memory, TCP co
 A cold fallback is triggered by one of several mechanisms:
 
 1. **Restore Crash Fallback:** The replacement pod scheduled and attempted to restore memory from the snapshot, but the container runtime (gVisor sandbox or CRIU daemon) crashed with an exit code 128 (`StartError`). The controller detected the crash signature, safely terminated the failing pod, and relaunched it cold.
-2. **Placement Timeout or Incompatible Nodes:** The snapshot engine has node-level hardware/kernel constraints (e.g. CRIU CPU flags, gVisor version), and no compatible destination node could schedule the pod before the placement deadline elapsed.
-3. **Snapshot Gone or Deleted:** The underlying snapshot in GCS or the node agent was garbage collected or deleted before the replacement pod was scheduled.
+2. **Placement Timeout or Incompatible Nodes (#14):** The snapshot engine has node-level hardware/kernel constraints (e.g. CRIU CPU flags, gVisor machine type), and no compatible destination node could schedule the pod before the placement deadline elapsed.
+3. **Snapshot Gone or Deleted (#265, #269):** The underlying snapshot in GCS was garbage collected or deleted before the replacement pod was scheduled.
 4. **Signature Drift:** Runtimes occasionally update their error strings (e.g. containerd or runsc version bumps). An unrecognized restore crash will leave the replacement pod stuck in a crash loop instead of triggering an automatic cold fallback.
 
 ---
@@ -33,10 +33,13 @@ A cold fallback is triggered by one of several mechanisms:
 
 ### Step 1: Breakdown Restore Verdicts by Engine
 
-Query Prometheus or the controller metrics endpoint directly:
+Query controller metrics via port-forward:
 
 ```bash
-kubectl exec -n pod-migration-system deployment/pod-migration-controller -c manager -- curl -s http://localhost:8080/metrics | grep -E "pod_migration_restore_verdicts_total|pod_migration_outcomes_total"
+kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+PF_PID=$!
+curl -s http://localhost:8080/metrics | grep -E "pod_migration_restore_verdicts_total|pod_migration_outcomes_total"
+kill $PF_PID
 ```
 
 Analyze the breakdown of verdicts:
@@ -61,11 +64,10 @@ Inspect the container termination message:
 kubectl get pod <replacement-pod> -n <namespace> -o jsonpath='{range .status.containerStatuses[*].lastState.terminated}{"ExitCode: "}{.exitCode}{"\tReason: "}{.reason}{"\tMessage: "}{.message}{"\n"}{end}'
 ```
 
-Common recognized signatures include:
+The controller matches gVisor restore failures defined in `controller/internal/restore/gvisor.go`:
 
-- `failed to restore container: ...`
-- `unable to restore process tree: ...`
-- `incompatible sandbox architecture: ...`
+- `"oci runtime restore failed"` (observed gVisor sentry restore error)
+- `"restore failed"` (generalized containerd/runc restore error)
 
 ### Step 3: Check Node Kernel and Runtime Homogeneity
 
@@ -88,7 +90,7 @@ If `verdict="no_compatible_node"` or `placement_timeout` is elevated:
 
 1. Ensure destination node pools have the required CRIU agent daemonset running:
    ```bash
-   kubectl get ds -A -l app=criu-node-agent
+   kubectl get ds -n pod-migration-criu-system -l app=pod-migrate-agent
    ```
 2. For GKE Pod Snapshots, verify that all target nodes are running the identical GKE node image and containerd version.
 3. Check node labels matching engine placement rules (`kubectl get nodes --show-labels`).
@@ -98,8 +100,8 @@ If `verdict="no_compatible_node"` or `placement_timeout` is elevated:
 If `PodMigrationRestoreCrashSignatureDrift` is firing:
 
 1. Extract the exact crash message from `.status.containerStatuses[*].lastState.terminated.message`.
-2. Compare against the signature table in `controller/internal/restore/crash_classifier.go`.
-3. If a runtime update modified the message format (e.g. new containerd release), file an issue or submit a PR updating `crash_classifier.go` with the new regex.
+2. Inspect the signature table in `controller/internal/restore/gvisor.go`.
+3. If a runtime update modified the message format (e.g. new containerd release), file an issue or submit a PR updating `gvisor.go` with the new substring.
 4. For immediate relief on stuck crash-looping replacement pods:
    Manually delete the replacement pod so its controller recreates it without the migration annotation.
 
@@ -109,29 +111,20 @@ If `PodMigrationRestoreCrashSignatureDrift` is firing:
 
 ### Test Case: Simulating a Restore Crash Fallback
 
-1. In a staging environment, create a pod with an intentionally invalid snapshot reference:
-   ```yaml
-   apiVersion: v1
-   kind: Pod
-   metadata:
-     name: test-restore-crash-pod
-     namespace: default
-     annotations:
-       podsnapshot.gke.io/ps-name: "invalid-corrupted-snapshot-fixture"
-   spec:
-     runtimeClassName: gvisor
-     containers:
-       - name: app
-         image: busybox
-         command: ["sh", "-c", "sleep 3600"]
-   ```
-2. Observe container startup failure in `kubectl describe pod test-restore-crash-pod`.
-3. Check controller logs:
+To test restore crash classification in a dev/staging cluster:
+
+1. Create a test workload with runtimeClass `gvisor`.
+2. Initiate a `PodMigrationJob` targeting the pod.
+3. Once the replacement pod is created, inject a mock container termination error matching `"oci runtime restore failed"` into the replacement pod's container status (or configure a mock runtime failure).
+4. Observe controller logs:
    ```bash
    kubectl logs -n pod-migration-system -l app=pod-migration-controller -c manager | grep "restore crash"
    ```
-4. Verify that `pod_migration_restore_crash_fallback_total` increments and `PodMigrationRestoreCrashFallbackDetected` fires.
-5. Clean up:
+5. Check controller metrics via port-forward:
    ```bash
-   kubectl delete pod test-restore-crash-pod -n default
+   kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+   PF_PID=$!
+   curl -s http://localhost:8080/metrics | grep pod_migration_restore_crash_fallback_total
+   kill $PF_PID
    ```
+6. Verify that `pod_migration_restore_crash_fallback_total` increments and `PodMigrationRestoreCrashFallbackDetected` fires.

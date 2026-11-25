@@ -6,19 +6,19 @@ This directory houses operational runbooks for `pod-migration-controller`. Each 
 
 ## 1. Alerting Catalog & Runbook Matrix
 
-| Alert Name                                         | Severity   | Primary Metric / Trigger                                                                    | Runbook Link                                               |
-| -------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| **`PodMigrationJobPhaseStuck`**                    | `warning`  | `pod_migration_phase_duration_seconds` (P95 > 300s)                                         | [pmj-phase-stuck.md](pmj-phase-stuck.md)                   |
-| **`PodMigrationJobTimeoutsHigh`**                  | `warning`  | `pod_migration_outcomes_total{outcome=~"timeout\|budget_timeout"}`                          | [pmj-phase-stuck.md](pmj-phase-stuck.md)                   |
-| **`PodMigrationBudgetExhaustedHigh`**              | `warning`  | `pod_migration_budget_checks_total{result="budget_exhausted"}`                              | [pmj-phase-stuck.md](pmj-phase-stuck.md)                   |
-| **`PodMigrationControllerDown`**                   | `critical` | `up{job="pod-migration-controller"} == 0`                                                   | [pmj-phase-stuck.md](pmj-phase-stuck.md)                   |
-| **`PodMigrationSchedulingGateWedged`**             | `warning`  | `kube_pod_spec_scheduling_gate{gate_name="gke.io/pod-migration-gate"}` (> 10m)              | [orphaned-scheduling-gate.md](orphaned-scheduling-gate.md) |
-| **`PodMigrationHighColdFallbackRatio`**            | `warning`  | `pod_migration_outcomes_total{outcome=~"fallback\|succeeded_without_restore"}` (> 15%)      | [high-cold-fallback-ratio.md](high-cold-fallback-ratio.md) |
-| **`PodMigrationRestoreCrashFallbackDetected`**     | `warning`  | `pod_migration_restore_crash_fallback_total` (> 0)                                          | [high-cold-fallback-ratio.md](high-cold-fallback-ratio.md) |
-| **`PodMigrationRestoreCrashSignatureDrift`**       | `info`     | `pod_migration_restore_crash_unmatched_total` (> 0)                                         | [high-cold-fallback-ratio.md](high-cold-fallback-ratio.md) |
-| **`PodMigrationSnapshotStorageErrors`**            | `warning`  | `pod_migration_restore_verdicts_total{verdict=~"snapshot_deleting\|snapshot_gone\|failed"}` | [snapshot-storage-errors.md](snapshot-storage-errors.md)   |
-| **`PodMigrationSnapshotStoragePermanentFailures`** | `critical` | `pod_migration_outcomes_total{outcome="failed"}`                                            | [snapshot-storage-errors.md](snapshot-storage-errors.md)   |
-| **`PodMigrationInvariantViolationDetected`**       | `critical` | `pod_migration_invariant_violations_total` (> 0)                                            | [invariant-violations.md](invariant-violations.md)         |
+| Alert Name                                     | Severity   | Primary Metric / Trigger                                                                     | Runbook Link                                               |
+| ---------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| **`PodMigrationPhaseDurationElevated`**        | `warning`  | `pod_migration_phase_duration_seconds` (P95 > 300s on completion)                            | [pmj-phase-stuck.md](pmj-phase-stuck.md)                   |
+| **`PodMigrationJobTimeoutsHigh`**              | `warning`  | `pod_migration_outcomes_total{outcome=~"timeout\|budget_timeout"}`                           | [pmj-phase-stuck.md](pmj-phase-stuck.md)                   |
+| **`PodMigrationBudgetExhaustedHigh`**          | `warning`  | `pod_migration_budget_checks_total{result="budget_exhausted"}`                               | [pmj-phase-stuck.md](pmj-phase-stuck.md)                   |
+| **`PodMigrationControllerDown`**               | `critical` | `up{job="pod-migration-controller"} == 0`                                                    | [pmj-phase-stuck.md](pmj-phase-stuck.md)                   |
+| **`PodMigrationSchedulingGateWedged`**         | `warning`  | `kube_pod_status_reason{reason="SchedulingGated"}` (> 10m)                                   | [orphaned-scheduling-gate.md](orphaned-scheduling-gate.md) |
+| **`PodMigrationHighColdFallbackRatio`**        | `warning`  | `pod_migration_outcomes_total{outcome=~"fallback\|succeeded_without_restore\|restore_lost"}` | [high-cold-fallback-ratio.md](high-cold-fallback-ratio.md) |
+| **`PodMigrationRestoreCrashFallbackDetected`** | `warning`  | `pod_migration_restore_crash_fallback_total` (> 0)                                           | [high-cold-fallback-ratio.md](high-cold-fallback-ratio.md) |
+| **`PodMigrationRestoreCrashSignatureDrift`**   | `info`     | `pod_migration_restore_crash_unmatched_total` (> 0)                                          | [high-cold-fallback-ratio.md](high-cold-fallback-ratio.md) |
+| **`PodMigrationSnapshotStorageErrors`**        | `warning`  | `pod_migration_restore_verdicts_total{verdict=~"snapshot_deleting\|snapshot_gone\|failed"}`  | [snapshot-storage-errors.md](snapshot-storage-errors.md)   |
+| **`PodMigrationJobFailuresHigh`**              | `warning`  | `pod_migration_outcomes_total{outcome="failed"}`                                             | [snapshot-storage-errors.md](snapshot-storage-errors.md)   |
+| **`PodMigrationInvariantViolationDetected`**   | `critical` | `pod_migration_invariant_violations_total` (> 0)                                             | [invariant-violations.md](invariant-violations.md)         |
 
 ---
 
@@ -29,6 +29,10 @@ The alerting rules are packaged as a Prometheus Operator `PrometheusRule` custom
 ### Installation via kubectl
 
 ```bash
+# 1. Apply metrics scrape Service and ServiceMonitor
+kubectl apply -f monitoring/prometheus-service.yaml
+
+# 2. Apply alert rules
 kubectl apply -f monitoring/prometheus-rules.yaml
 ```
 
@@ -42,9 +46,11 @@ kubectl get prometheusrule pod-migration-alerts -n pod-migration-system -o yaml
 
 The controller serves Prometheus metrics on `:8080/metrics` across all replicas. Note the following operational constraints:
 
+- **Scrape Job Configuration:** The alerting rules assume a Prometheus scrape job named `job="pod-migration-controller"` targeting port 8080. If your Prometheus scrape config names the job differently, update `job="pod-migration-controller"` in `monitoring/prometheus-rules.yaml`.
 - **Leader vs Standby:** Only the active leader replica reconciles migrations and updates in-memory gauges (`pod_migration_active`). Standby replicas return `pod_migration_active == 0`.
 - **Query Aggregation:** Always use `max(pod_migration_active)` when checking total active in-flight migrations.
 - **Counter Rates:** For counters and histograms, aggregate across controller pods using `sum(rate(...[5m]))`.
+- **Invariant Rules Flag:** Correctness invariant monitoring (`pod_migration_invariant_violations_total`) requires running the controller with `--invariant-mode=observe` (or `--invariant-mode=strict`). The flag defaults to `disabled` in production. Enabling `observe` evaluates safety predicates during reconciliation, which incurs small in-memory CPU and cached informer reads.
 
 ---
 
@@ -58,7 +64,7 @@ kubectl get pmj -A -o wide
 
 # 2. Check controller pods and leader election status
 kubectl get pods -n pod-migration-system -o wide
-kubectl get lease pod-migration-controller-lock -n pod-migration-system -o yaml
+kubectl get lease pod-migration-controller-leader -n pod-migration-system -o yaml
 
 # 3. Stream controller logs
 kubectl logs -n pod-migration-system -l app=pod-migration-controller -c manager --tail=200 -f
@@ -66,6 +72,10 @@ kubectl logs -n pod-migration-system -l app=pod-migration-controller -c manager 
 # 4. Check scheduling-gated replacement pods
 kubectl get pods -A -o jsonpath='{range .items[?(@.spec.schedulingGates)]}{.metadata.namespace}{"/"}{.metadata.name}{"\tGates: "}{range .spec.schedulingGates}{.name}{" "}{end}{"\tAssignedPMJ: "}{.metadata.annotations.pod-migration\.gke\.io/assigned-pmj}{"\n"}{end}'
 
-# 5. Query live controller metrics directly from pod
-kubectl exec -n pod-migration-system deployment/pod-migration-controller -c manager -- curl -s http://localhost:8080/metrics | grep pod_migration_
+# 5. Query live controller metrics directly via port-forward
+# (The controller runs on a distroless container without curl/shell; port-forward locally:)
+kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+PF_PID=$!
+curl -s http://localhost:8080/metrics | grep pod_migration_
+kill $PF_PID
 ```

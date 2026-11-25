@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pod-migration-controller-metrics
+  namespace: pod-migration-system
+  labels:
+    app: pod-migration-controller
+    app.kubernetes.io/name: pod-migration
+    app.kubernetes.io/component: controller
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: pod-migration-controller
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: pod-migration-controller
+  namespace: pod-migration-system
+  labels:
+    app.kubernetes.io/name: pod-migration
+    app.kubernetes.io/component: controller
+spec:
+  selector:
+    matchLabels:
+      app: pod-migration-controller
+  endpoints:
+    - port: metrics
+      interval: 15s
+      scrapeTimeout: 10s

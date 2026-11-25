@@ -18,6 +18,7 @@ package metrics_test
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -45,6 +46,14 @@ type prometheusRuleFile struct {
 	} `yaml:"spec"`
 }
 
+var (
+	metricRegex = regexp.MustCompile(`[a-zA-Z_:][a-zA-Z0-9_:]*`)
+	// labelMatcherRegex matches label matches like outcome=~"timeout|budget_timeout" or outcome="failed"
+	labelMatcherRegex = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|=|!=|!~)\s*"([^"]+)"`)
+	// labelFilterRegex matches expressions like metric_name{...}
+	labelFilterRegex = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{([^}]+)\}`)
+)
+
 func TestPrometheusRulesIntegrity(t *testing.T) {
 	rulePath := filepath.Join("..", "..", "..", "monitoring", "prometheus-rules.yaml")
 	data, err := os.ReadFile(rulePath)
@@ -67,21 +76,77 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 		t.Fatal("expected at least one rule group")
 	}
 
-	knownControllerMetrics := []string{
-		"pod_migration_active",
-		"pod_migration_outcomes_total",
-		"pod_migration_restore_verdicts_total",
-		"pod_migration_phase_duration_seconds",
-		"pod_migration_restore_crash_fallback_total",
-		"pod_migration_restore_crash_unmatched_total",
-		"pod_migration_invariant_violations_total",
-		"pod_migration_spot_preemption_triggered_total",
-		"pod_migration_spot_preemption_skipped_total",
-		"pod_migration_budget_checks_total",
-		"pod_migration_fence_webhook_requests_total",
-		"pod_migration_source_fence_total",
-		"pod_migration_source_fenced_seconds",
-		"pod_migration_application_downtime_seconds",
+	knownControllerMetrics := map[string]bool{
+		"pod_migration_active":                          true,
+		"pod_migration_outcomes_total":                  true,
+		"pod_migration_restore_verdicts_total":          true,
+		"pod_migration_phase_duration_seconds":          true,
+		"pod_migration_restore_crash_fallback_total":    true,
+		"pod_migration_restore_crash_unmatched_total":   true,
+		"pod_migration_invariant_violations_total":      true,
+		"pod_migration_spot_preemption_triggered_total": true,
+		"pod_migration_spot_preemption_skipped_total":   true,
+		"pod_migration_budget_checks_total":             true,
+		"pod_migration_fence_webhook_requests_total":    true,
+		"pod_migration_source_fence_total":              true,
+		"pod_migration_source_fenced_seconds":           true,
+		"pod_migration_application_downtime_seconds":    true,
+		"pod_migration_skipped_total":                   true,
+		"pod_migration_covered_running_pods":            true,
+		"pod_migration_total_running_pods":              true,
+		"pod_migration_coverage_ratio":                  true,
+	}
+
+	knownExternalMetrics := map[string]bool{
+		"up":                     true,
+		"kube_pod_status_reason": true,
+	}
+
+	knownLabelValues := map[string]map[string]bool{
+		"pod_migration_outcomes_total:outcome": {
+			"succeeded":                 true,
+			"failed":                    true,
+			"timeout":                   true,
+			"budget_timeout":            true,
+			"fallback":                  true,
+			"succeeded_without_restore": true,
+			"engine_not_registered":     true,
+			"restore_lost":              true,
+			"deleted":                   true,
+		},
+		"pod_migration_restore_verdicts_total:verdict": {
+			"confirmed":          true,
+			"inferred":           true,
+			"cold_start":         true,
+			"failed":             true,
+			"lost":               true,
+			"timeout":            true,
+			"no_compatible_node": true,
+			"placement_timeout":  true,
+			"snapshot_deleting":  true,
+			"snapshot_gone":      true,
+		},
+		"pod_migration_budget_checks_total:result": {
+			"allowed":          true,
+			"budget_exhausted": true,
+			"in_flight":        true,
+			"check_error":      true,
+		},
+		"pod_migration_source_fence_total:action": {
+			"fenced":   true,
+			"unfenced": true,
+			"kept":     true,
+			"refenced": true,
+		},
+		"pod_migration_phase_duration_seconds:phase": {
+			"pending":      true,
+			"snapshotting": true,
+			"evicting":     true,
+			"restoring":    true,
+		},
+		"kube_pod_status_reason:reason": {
+			"SchedulingGated": true,
+		},
 	}
 
 	validSeverities := map[string]bool{
@@ -90,7 +155,32 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 		"info":     true,
 	}
 
+	promqlKeywords := map[string]bool{
+		"sum":                true,
+		"rate":               true,
+		"histogram_quantile": true,
+		"by":                 true,
+		"without":            true,
+		"clamp_min":          true,
+		"clamp_max":          true,
+		"absent":             true,
+		"and":                true,
+		"or":                 true,
+		"unless":             true,
+		"on":                 true,
+		"ignoring":           true,
+		"group_left":         true,
+		"group_right":        true,
+		"bool":               true,
+		"count":              true,
+		"min":                true,
+		"max":                true,
+		"avg":                true,
+	}
+
 	totalRules := 0
+	foundControllerMetrics := make(map[string]int)
+
 	for _, group := range pr.Spec.Groups {
 		for _, rule := range group.Rules {
 			totalRules++
@@ -119,7 +209,6 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 				if runbookURL == "" {
 					t.Errorf("alert %q: missing runbook_url annotation", rule.Alert)
 				} else if strings.Contains(runbookURL, "docs/runbooks/") {
-					// Verify that the referenced markdown file actually exists on disk
 					idx := strings.Index(runbookURL, "docs/runbooks/")
 					relDoc := runbookURL[idx:]
 					fullDocPath := filepath.Join("..", "..", "..", relDoc)
@@ -128,22 +217,41 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 					}
 				}
 
-				// If the expr references a pod_migration_ metric, assert it is in our known list
-				for _, word := range strings.Fields(rule.Expr) {
-					clean := strings.Trim(word, "(){}[],=~><+/*0123456789.\"")
-					if strings.HasPrefix(clean, "pod_migration_") {
-						baseMetric := strings.TrimSuffix(clean, "_bucket")
+				// Extract and validate all metric identifiers in the PromQL expr
+				for _, match := range metricRegex.FindAllString(rule.Expr, -1) {
+					if promqlKeywords[match] {
+						continue
+					}
+					if strings.HasPrefix(match, "pod_migration_") {
+						baseMetric := strings.TrimSuffix(match, "_bucket")
 						baseMetric = strings.TrimSuffix(baseMetric, "_count")
 						baseMetric = strings.TrimSuffix(baseMetric, "_sum")
-						found := false
-						for _, known := range knownControllerMetrics {
-							if baseMetric == known {
-								found = true
-								break
-							}
+						if !knownControllerMetrics[baseMetric] {
+							t.Errorf("alert %q: expr references unknown pod_migration metric %q (base %q)", rule.Alert, match, baseMetric)
+						} else {
+							foundControllerMetrics[baseMetric]++
 						}
-						if !found {
-							t.Errorf("alert %q: expr references unknown pod_migration metric %q", rule.Alert, clean)
+					} else if knownExternalMetrics[match] {
+						// Known external metric
+					}
+				}
+
+				// Validate label selectors against known label values
+				for _, m := range labelFilterRegex.FindAllStringSubmatch(rule.Expr, -1) {
+					metricName := strings.TrimSuffix(m[1], "_bucket")
+					metricName = strings.TrimSuffix(metricName, "_count")
+					metricName = strings.TrimSuffix(metricName, "_sum")
+					for _, lm := range labelMatcherRegex.FindAllStringSubmatch(m[2], -1) {
+						lbl := lm[1]
+						val := lm[3]
+						key := metricName + ":" + lbl
+						if validVals, ok := knownLabelValues[key]; ok {
+							for _, subVal := range strings.Split(val, "|") {
+								subVal = strings.TrimSpace(subVal)
+								if subVal != "" && !validVals[subVal] {
+									t.Errorf("alert %q: metric %q has unknown label value %q for label %q", rule.Alert, metricName, subVal, lbl)
+								}
+							}
 						}
 					}
 				}
@@ -153,5 +261,9 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 
 	if totalRules < 10 {
 		t.Errorf("expected at least 10 alerts in prometheus-rules.yaml, got %d", totalRules)
+	}
+
+	if len(foundControllerMetrics) < 5 {
+		t.Errorf("expected at least 5 distinct pod_migration metrics verified in rules, found %d: %v", len(foundControllerMetrics), foundControllerMetrics)
 	}
 }

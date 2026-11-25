@@ -2,10 +2,10 @@
 
 ## Alerts Covered
 
-- **`PodMigrationJobPhaseStuck`** (`severity: warning`): A migration phase (`Pending`, `Snapshotting`, `Evicting`, or `Restoring`) has taken longer than 300 seconds (P95).
+- **`PodMigrationPhaseDurationElevated`** (`severity: warning`): A migration phase (`Pending`, `Snapshotting`, `Evicting`, or `Restoring`) took longer than 300 seconds (P95) upon completion. (Note: observed when jobs leave a phase; wedged migrations hitting ceilings alert on `PodMigrationJobTimeoutsHigh`).
 - **`PodMigrationJobTimeoutsHigh`** (`severity: warning`): PodMigrationJobs are failing with `timeout` or `budget_timeout` outcomes.
 - **`PodMigrationBudgetExhaustedHigh`** (`severity: warning`): Pre-checkpoint dry-run evictions are repeatedly blocked by PodDisruptionBudgets (`budget_exhausted`).
-- **`PodMigrationControllerDown`** (`severity: critical`): Controller manager process is unreachable or not serving metrics.
+- **`PodMigrationControllerDown`** (`severity: critical`): Controller manager process is unreachable or not serving metrics on `:8080/metrics`.
 
 ---
 
@@ -24,9 +24,9 @@
 
 ```bash
 # List all active jobs sorted by creation timestamp
-kubectl get pmj -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,SOURCE:.spec.sourcePod.name,REPLACEMENT:.status.replacementPod.name,AGE:.metadata.creationTimestamp'
+kubectl get pmj -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,SOURCE:.spec.podRef.name,REPLACEMENT:.status.restoredPodName,AGE:.metadata.creationTimestamp'
 
-# Get detailed status of the stuck job
+# Get detailed status and conditions of the stuck job
 kubectl describe pmj <pmj-name> -n <namespace>
 ```
 
@@ -42,8 +42,11 @@ Check whether a PodDisruptionBudget is preventing eviction:
 # Check PDBs in the target namespace
 kubectl get pdb -n <namespace>
 
-# Check dry-run budget metric counts
+# Check dry-run budget metric counts via port-forward
+kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+PF_PID=$!
 curl -s http://localhost:8080/metrics | grep pod_migration_budget_checks_total
+kill $PF_PID
 ```
 
 If `pod_migration_budget_checks_total{result="budget_exhausted"}` is rising, the workload owner configured a strict PDB (`maxUnavailable: 0` or `minAvailable: 100%`) that disallows eviction.
@@ -61,7 +64,7 @@ If `pod_migration_budget_checks_total{result="budget_exhausted"}` is rising, the
    kubectl get podsnapshotmanualtriggers -n <namespace>
 
    # CRIU engine
-   kubectl get pods -n <namespace> -l app=criu-node-agent
+   kubectl get pods -n pod-migration-criu-system -l app=pod-migrate-agent
    ```
 3. Check storage write path and disk errors in controller logs:
    ```bash
@@ -81,9 +84,9 @@ If `pod_migration_budget_checks_total{result="budget_exhausted"}` is rising, the
 
 #### D. If Phase == `Restoring` (Replacement Not Ready)
 
-1. Find replacement pod:
+1. Find replacement pod by annotation:
    ```bash
-   kubectl get pods -n <namespace> -l pod-migration.gke.io/assigned-pmj=<pmj-name>
+   kubectl get pods -n <namespace> -o jsonpath='{range .items[?(@.metadata.annotations.pod-migration\.gke\.io/assigned-pmj=="<pmj-name>")]}{.metadata.name}{"\n"}{end}'
    ```
 2. Check if scheduling gate is still present:
    ```bash
@@ -108,18 +111,27 @@ kubectl delete pmj <pmj-name> -n <namespace> --timeout=30s
 
 **Controller Safety Behavior on PMJ Deletion:**
 
-- If the source was fenced, the controller unfences it (`pod-migration.gke.io/fenced-`) so it resumes serving traffic.
+- **Source Fencing Invariant:** Once snapshotting has commenced, `decideSourceFence` keeps the source fenced and evicts it if the checkpoint completed or cannot be confirmed to prevent split-brain execution ($I_1$). The source will NOT be returned to service; the workload controller recreates a fresh cold replacement.
 - If a replacement pod was created with a scheduling gate, the `PodGateReconciler` detects PMJ deletion via direct API server read and releases the gate with an explicit cold-start bypass annotation (`podsnapshot.gke.io/ps-name: ""`), ensuring the replacement boots cold safely.
 
 ### Remediation B: Mitigate PDB Starvation
 
 If `PodMigrationBudgetExhaustedHigh` is firing during scheduled node drains:
 
-1. Contact the workload owner or temporarily patch the PDB to allow at least 1 unavailable pod:
+1. Inspect the PDB spec to determine whether it specifies `minAvailable` or `maxUnavailable`:
    ```bash
-   kubectl patch pdb <pdb-name> -n <namespace> --type=merge -p '{"spec":{"maxUnavailable":1}}'
+   kubectl get pdb <pdb-name> -n <namespace> -o yaml
    ```
-2. Once the migration completes, restore the original PDB specification.
+2. Patch the existing specification to permit at least 1 disruption (do NOT add `maxUnavailable` to a PDB specifying `minAvailable`, as the apiserver rejects mutually exclusive fields):
+   - For a PDB configured with `minAvailable: N`:
+     ```bash
+     kubectl patch pdb <pdb-name> -n <namespace> --type=merge -p '{"spec":{"minAvailable": <N-1>}}'
+     ```
+   - For a PDB configured with `maxUnavailable: 0`:
+     ```bash
+     kubectl patch pdb <pdb-name> -n <namespace> --type=merge -p '{"spec":{"maxUnavailable": 1}}'
+     ```
+3. Once the migration completes, restore the original PDB specification.
 
 ### Remediation C: Recover Controller Lease or Deadlock
 
@@ -131,7 +143,7 @@ If `PodMigrationControllerDown` is firing:
    ```
 2. Check leader election lease:
    ```bash
-   kubectl describe lease pod-migration-controller-lock -n pod-migration-system
+   kubectl describe lease pod-migration-controller-leader -n pod-migration-system
    ```
 3. If the active leader container OOMKilled or deadlocked on an external call:
    ```bash
@@ -146,7 +158,7 @@ To verify that the monitoring and alerting rules correctly detect stuck phases:
 
 ### Test Case: Simulating PDB Budget Timeout
 
-1. Deploy a single-replica StatefulSet with `maxUnavailable: 0`:
+1. Deploy a test workload with a strict PDB (`minAvailable: 1` on 1 replica):
    ```yaml
    apiVersion: policy/v1
    kind: PodDisruptionBudget
@@ -159,8 +171,13 @@ To verify that the monitoring and alerting rules correctly detect stuck phases:
        matchLabels:
          app: test-workload
    ```
-2. Trigger a `PodMigrationJob` for the pod:
+2. Annotate the test pod with a short migration timeout:
    ```bash
+   kubectl annotate pod test-workload-0 -n default pod-migration.gke.io/timeout="60s" --overwrite
+   ```
+3. Obtain the source pod's UID and trigger a `PodMigrationJob`:
+   ```bash
+   POD_UID=$(kubectl get pod test-workload-0 -n default -o jsonpath='{.metadata.uid}')
    kubectl apply -f - <<EOF
    apiVersion: podmigration.gke.io/v1alpha1
    kind: PodMigrationJob
@@ -168,17 +185,20 @@ To verify that the monitoring and alerting rules correctly detect stuck phases:
      name: test-stuck-budget-pmj
      namespace: default
    spec:
-     sourcePod:
+     podRef:
        name: test-workload-0
-     timeout: 60s
+     targetPodUID: "$POD_UID"
    EOF
    ```
-3. Observe controller metrics:
+4. Observe controller metrics via port-forward:
    ```bash
-   kubectl exec -n pod-migration-system deployment/pod-migration-controller -c manager -- curl -s http://localhost:8080/metrics | grep pod_migration_budget_checks_total
+   kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+   PF_PID=$!
+   curl -s http://localhost:8080/metrics | grep pod_migration_budget_checks_total
+   kill $PF_PID
    ```
-4. Verify that `pod_migration_budget_checks_total{result="budget_exhausted"}` increments and after 60s `pod_migration_outcomes_total{outcome="budget_timeout"}` increments, triggering `PodMigrationJobTimeoutsHigh`.
-5. Clean up:
+5. Verify that `pod_migration_budget_checks_total{result="budget_exhausted"}` increments and after 60s `pod_migration_outcomes_total{outcome="budget_timeout"}` increments, triggering `PodMigrationJobTimeoutsHigh`.
+6. Clean up:
    ```bash
    kubectl delete pmj test-stuck-budget-pmj -n default
    kubectl delete pdb test-strict-pdb -n default

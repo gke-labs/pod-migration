@@ -3,7 +3,7 @@
 ## Alerts Covered
 
 - **`PodMigrationSnapshotStorageErrors`** (`severity: warning`): A pod restore verdict completed with `snapshot_deleting`, `snapshot_gone`, or `failed` due to storage-layer failures.
-- **`PodMigrationSnapshotStoragePermanentFailures`** (`severity: critical`): Pod migration jobs are failing terminally (`outcome="failed"`), frequently driven by object storage authentication, quota, or network connectivity failures.
+- **`PodMigrationJobFailuresHigh`** (`severity: warning`): Pod migration jobs are failing terminally (`outcome="failed"`), driven by object storage authentication, quota, engine, or network connectivity failures.
 
 ---
 
@@ -32,8 +32,10 @@ Storage failures typically fall into four buckets:
 
 ### Step 1: Inspect Failed PMJ Storage Errors
 
+Query failed PMJs using `jsonpath` (field selectors on `status.phase` are not supported on custom resources):
+
 ```bash
-kubectl get pmj -A --field-selector status.phase=Failed -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,ERROR:.status.error,ENGINE:.spec.engine,LOCATION:.spec.storage.location'
+kubectl get pmj -A -o jsonpath='{range .items[?(@.status.phase=="Failed")]}{"Namespace: "}{.metadata.namespace}{"\tPMJ: "}{.metadata.name}{"\tPod: "}{.spec.podRef.name}{"\tConditions: "}{range .status.conditions}{.type}{"="}{.status}{" ("}{.reason}{": "}{.message}{") "}{end}{"\n"}{end}'
 ```
 
 Look for explicit storage error messages:
@@ -45,7 +47,7 @@ Look for explicit storage error messages:
 
 ### Step 2: Validate Storage Bucket Configuration
 
-Inspect the active `PodMigration` configuration in the affected namespace:
+Inspect the active `PodMigration` configuration in the affected namespace (`spec.storage.location` is configured on the `PodMigration` resource, which sets storage policies for all PMJs in that namespace):
 
 ```bash
 kubectl get podmigration -n <namespace> -o yaml
@@ -118,14 +120,19 @@ spec:
           port: 443
 ```
 
-### Remediation C: Purge Orphaned Snapshot Files
+### Remediation C: Manage Storage Lifecycle & Orphan Cleanup
 
-If active migrations failed but left stranded snapshots in the bucket:
+If failed migrations left stranded snapshots in object storage:
 
-```bash
-# List snapshots older than 24 hours under the cluster prefix
-gcloud storage rm --recursive gs://<bucket-name>/cluster-prefix/orphaned-pmj-*
-```
+> ⚠️ **DO NOT run bulk wildcard deletion (`gcloud storage rm gs://...`) during active operations!** Indiscriminate wildcard deletion risks deleting snapshots for migrations currently in flight.
+
+Use the controller's automated snapshot garbage collection and orphan sweep:
+
+- The controller runs an automated garbage collection sweep (`--snapshot-gc-interval`, default 1 hour) to safely delete snapshot triggers and storage objects for completed or failed migrations whose retention window has passed.
+- To trigger an immediate reconciler sweep, verify controller health:
+  ```bash
+  kubectl rollout status deployment pod-migration-controller -n pod-migration-system
+  ```
 
 ---
 
@@ -133,30 +140,25 @@ gcloud storage rm --recursive gs://<bucket-name>/cluster-prefix/orphaned-pmj-*
 
 ### Test Case: Simulating Storage Permission Revocation
 
-1. Create a test `PodMigrationJob` pointing to an inaccessible or non-existent bucket:
+1. Create a namespace with a `PodMigration` pointing to an inaccessible or non-existent bucket:
    ```yaml
    apiVersion: podmigration.gke.io/v1alpha1
-   kind: PodMigrationJob
+   kind: PodMigration
    metadata:
-     name: test-storage-perm-fault
+     name: test-storage-isolation
      namespace: default
    spec:
-     sourcePod:
-       name: test-workload-0
      storage:
-       location: gs://non-existent-permission-denied-bucket/fault
-     timeout: 30s
+       location: gs://non-existent-permission-denied-bucket/default/fault
    ```
-2. Apply the manifest and observe controller execution:
+2. Trigger a `PodMigrationJob` for a workload in that namespace.
+3. Observe controller execution:
    ```bash
-   kubectl apply -f test-storage-fault.yaml
+   kubectl describe pmj <pmj-name> -n default
    ```
-3. Check the PMJ error condition:
-   ```bash
-   kubectl describe pmj test-storage-perm-fault -n default
-   ```
-4. Verify that `pod_migration_outcomes_total{outcome="failed"}` increments and triggers `PodMigrationSnapshotStoragePermanentFailures`.
+4. Verify that `pod_migration_outcomes_total{outcome="failed"}` increments and triggers `PodMigrationJobFailuresHigh`.
 5. Clean up:
    ```bash
-   kubectl delete pmj test-storage-perm-fault -n default
+   kubectl delete pmj <pmj-name> -n default
+   kubectl delete podmigration test-storage-isolation -n default
    ```

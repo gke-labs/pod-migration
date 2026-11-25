@@ -25,7 +25,7 @@ The twelve safety invariants (`I1`–`I12`) guard against data corruption, split
 
 ---
 
-## 2. Invariant Execution Modes
+## 2. Invariant Execution Modes & Operational Overhead
 
 Check the controller's configured `--invariant-mode` flag:
 
@@ -33,7 +33,9 @@ Check the controller's configured `--invariant-mode` flag:
 kubectl get deployment pod-migration-controller -n pod-migration-system -o yaml | grep invariant-mode
 ```
 
+- **`disabled` Mode (Default):** Invariant checks are skipped during reconciliation to minimize CPU overhead. The alert will not fire unless the flag is explicitly enabled.
 - **`observe` Mode:** Violations log structured errors, increment the Prometheus counter `pod_migration_invariant_violations_total`, and emit a Kubernetes `Warning` Event (`Reason=InvariantViolation`). Active migrations continue.
+  - _Operational Cost:_ Small in-memory CPU overhead during reconcile passes to evaluate predicates against local informer caches, plus event emission to the apiserver upon violation.
 - **`strict` Mode:** The controller halts reconciliation, fails the violating `PodMigrationJob` with `Phase=Failed` (`Reason=InvariantViolation`), cleans up snapshot triggers, and releases gated replacement pods for a safe cold start. (Debounced rules `I10` and `I11` require 3 consecutive samples / 30s before aborting).
 
 ---
@@ -42,10 +44,13 @@ kubectl get deployment pod-migration-controller -n pod-migration-system -o yaml 
 
 ### Step 1: Identify Which Invariant Fired
 
-Query the metric directly from Prometheus or the controller:
+Query controller metrics via port-forward:
 
 ```bash
-kubectl exec -n pod-migration-system deployment/pod-migration-controller -c manager -- curl -s http://localhost:8080/metrics | grep pod_migration_invariant_violations_total
+kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+PF_PID=$!
+curl -s http://localhost:8080/metrics | grep pod_migration_invariant_violations_total
+kill $PF_PID
 ```
 
 Note the label value (e.g. `invariant="I1"`, `invariant="I3"`, `invariant="I11"`).
@@ -81,9 +86,15 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
      ```bash
      kubectl get pods -n <namespace> -o jsonpath='{range .items[?(@.metadata.annotations.podsnapshot\.gke\.io/ps-name)]}{.metadata.name}{": "}{.metadata.annotations.podsnapshot\.gke\.io/ps-name}{"\n"}{end}'
      ```
-   - If two running pods share the same snapshot name, determine which is the authorized replacement. Immediately terminate the duplicate replica:
+   - If two running pods share the same snapshot name, determine which is the authorized replacement.
+   - **DO NOT use `--grace-period=0 --force`!** Force-deleting removes the API object immediately while the container process may still be running on the node; for a StatefulSet, the workload controller would immediately recreate the same-name pod, exacerbating the split-brain.
+   - Perform a standard graceful deletion:
      ```bash
-     kubectl delete pod <unauthorized-pod> -n <namespace> --grace-period=0 --force
+     kubectl delete pod <unauthorized-pod> -n <namespace>
+     ```
+   - Confirm the container process has completely stopped on the node before proceeding:
+     ```bash
+     kubectl get pod <unauthorized-pod> -n <namespace>
      ```
 
 2. **For `I11` (Source Pod Unfenced During Migration):**
@@ -117,7 +128,7 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
 
 ### D. Stuck Deadlines (`I4`)
 
-1. If an active PMJ exceeded its 2-hour hard cap or effective timeout:
+1. If an active PMJ exceeded its timeout ceiling:
    ```bash
    kubectl delete pmj <pmj-name> -n <namespace>
    ```
@@ -128,7 +139,7 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
 
 ### Test Case: Simulating an Invariant Violation (`I5` Leaked Trigger)
 
-1. In a cluster with `--invariant-mode=observe`, complete a migration or create a dummy PMJ in `Phase=Succeeded`:
+1. In a cluster configured with `--invariant-mode=observe`, create a completed PMJ fixture:
    ```yaml
    apiVersion: podmigration.gke.io/v1alpha1
    kind: PodMigrationJob
@@ -136,8 +147,9 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
      name: test-i5-violation-pmj
      namespace: default
    spec:
-     sourcePod:
+     podRef:
        name: dummy-pod
+     targetPodUID: "dummy-uid-12345"
    ```
 2. Create an un-deleted `PodSnapshotManualTrigger` owned by the PMJ:
    ```yaml
@@ -153,9 +165,12 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
      snapshotName: dummy-snap
    ```
 3. Trigger reconciliation of `test-i5-violation-pmj`.
-4. Check controller metrics:
+4. Check controller metrics via port-forward:
    ```bash
-   kubectl exec -n pod-migration-system deployment/pod-migration-controller -c manager -- curl -s http://localhost:8080/metrics | grep pod_migration_invariant_violations_total
+   kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+   PF_PID=$!
+   curl -s http://localhost:8080/metrics | grep pod_migration_invariant_violations_total
+   kill $PF_PID
    ```
 5. Verify that `pod_migration_invariant_violations_total{invariant="I5"}` increments and `PodMigrationInvariantViolationDetected` fires immediately.
 6. Clean up:

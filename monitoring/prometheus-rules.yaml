@@ -11,15 +11,15 @@ spec:
   groups:
     - name: pod-migration-controller.rules
       rules:
-        - alert: PodMigrationJobPhaseStuck
+        - alert: PodMigrationPhaseDurationElevated
           expr: histogram_quantile(0.95, sum(rate(pod_migration_phase_duration_seconds_bucket[5m])) by (le, phase)) > 300
           for: 5m
           labels:
             severity: warning
             component: controller
           annotations:
-            summary: "PodMigrationJob phase latency is elevated (P95 > 300s)"
-            description: "Pod migration phase {{ $labels.phase }} P95 duration is elevated at {{ $value | humanizeDuration }} (> 300s). Check for stalled snapshotting, slow container eviction, or placement latency."
+            summary: "PodMigrationJob phase completion latency is elevated (P95 > 300s)"
+            description: "Pod migration phase {{ $labels.phase }} P95 duration on completion is elevated at {{ $value | humanizeDuration }} (> 300s). Check for slow snapshot upload, extended container eviction, or placement delays. (Note: observed when jobs leave a phase; wedged migrations hitting ceilings alert on PodMigrationJobTimeoutsHigh)."
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/pmj-phase-stuck.md"
 
         - alert: PodMigrationJobTimeoutsHigh
@@ -34,25 +34,25 @@ spec:
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/pmj-phase-stuck.md"
 
         - alert: PodMigrationSchedulingGateWedged
-          expr: sum by (namespace, pod) (kube_pod_spec_scheduling_gate{gate_name="gke.io/pod-migration-gate"}) > 0
+          expr: sum by (namespace, pod) (kube_pod_status_reason{reason="SchedulingGated"}) > 0
           for: 10m
           labels:
             severity: warning
             component: admission-gate
           annotations:
-            summary: "Pod scheduling gate 'gke.io/pod-migration-gate' is wedged"
-            description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been held by scheduling gate 'gke.io/pod-migration-gate' for more than 10 minutes. The assigned migration may be stuck or deleted, or the controller may be failing."
+            summary: "Pod scheduling gate is wedged"
+            description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been in SchedulingGated status for more than 10 minutes. If pod migration is enabled, this indicates an orphaned or held scheduling gate ('gke.io/pod-migration-gate'). The assigned migration may be stuck or deleted, or destination node placement may be waiting on a compatible node."
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/orphaned-scheduling-gate.md"
 
         - alert: PodMigrationHighColdFallbackRatio
-          expr: sum(rate(pod_migration_outcomes_total{outcome=~"fallback|succeeded_without_restore"}[15m])) / clamp_min(sum(rate(pod_migration_outcomes_total[15m])), 0.001) > 0.15
+          expr: (sum(rate(pod_migration_outcomes_total{outcome=~"fallback|succeeded_without_restore|restore_lost"}[15m])) / clamp_min(sum(rate(pod_migration_outcomes_total{outcome=~"succeeded|fallback|succeeded_without_restore|restore_lost"}[15m])), 0.001) > 0.15) and (sum(rate(pod_migration_outcomes_total{outcome=~"succeeded|fallback|succeeded_without_restore|restore_lost"}[15m])) > (2 / 900))
           for: 10m
           labels:
             severity: warning
             component: restore-engine
           annotations:
             summary: "High ratio of pod migrations completing as cold-start fallbacks"
-            description: "Cold-start fallback ratio is {{ $value | humanizePercentage }} (> 15% of migrations over 15m). Investigate node runtime compatibility, placement constraints, or snapshot corruption."
+            description: "Cold-start fallback ratio is {{ $value | humanizePercentage }} (> 15% of migrations over 15m across completed outcomes). Investigate node runtime compatibility, placement constraints, or snapshot corruption."
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/high-cold-fallback-ratio.md"
 
         - alert: PodMigrationRestoreCrashFallbackDetected
@@ -88,15 +88,15 @@ spec:
             description: 'Snapshot restore verdict ''{{ $labels.verdict }}'' occurred for engine ''{{ $labels.engine }}'' (rate: {{ $value | printf "%.4f" }}/s). Snapshots may be prematurely deleted or bucket permissions failed.'
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/snapshot-storage-errors.md"
 
-        - alert: PodMigrationSnapshotStoragePermanentFailures
-          expr: rate(pod_migration_outcomes_total{outcome="failed"}[15m]) > 0
+        - alert: PodMigrationJobFailuresHigh
+          expr: sum(rate(pod_migration_outcomes_total{outcome="failed"}[15m])) > (2 / 900)
           for: 10m
           labels:
-            severity: critical
+            severity: warning
             component: controller
           annotations:
-            summary: "Pod migration jobs failing permanently"
-            description: 'Rate of failed pod migration jobs is {{ $value | printf "%.4f" }}/s over 15m. Migrations are failing terminally; investigate storage buckets, engine health, and controller logs.'
+            summary: "Pod migration jobs failing repeatedly"
+            description: 'Pod migration jobs are encountering terminal failures (rate: {{ $value | printf "%.4f" }}/s over 15m). Investigate controller logs, storage bucket connectivity, and engine health.'
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/snapshot-storage-errors.md"
 
         - alert: PodMigrationInvariantViolationDetected
@@ -107,7 +107,7 @@ spec:
             component: invariant-engine
           annotations:
             summary: "Pod migration correctness invariant violation detected"
-            description: 'Correctness invariant ''{{ $labels.invariant }}'' was violated (rate: {{ $value | printf "%.4f" }}/s). Core safety guarantees have been breached! Immediate operator intervention required.'
+            description: 'Correctness invariant ''{{ $labels.invariant }}'' was violated (rate: {{ $value | printf "%.4f" }}/s). Requires controller configured with --invariant-mode=observe or strict (default is disabled). Core safety guarantees breached; immediate operator intervention required.'
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/invariant-violations.md"
 
         - alert: PodMigrationBudgetExhaustedHigh
@@ -129,5 +129,5 @@ spec:
             component: controller
           annotations:
             summary: "Pod migration controller is down"
-            description: "No pod-migration-controller instances are reporting healthy status to Prometheus for over 5 minutes. Active migrations will stall and replacement pod scheduling gates will remain wedged."
+            description: "No pod-migration-controller instances are reporting healthy status to Prometheus (assumes Prometheus scrape job 'pod-migration-controller' targeting port 8080; see monitoring/prometheus-service.yaml). Active migrations will stall and replacement pod scheduling gates will remain wedged."
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/pmj-phase-stuck.md"
