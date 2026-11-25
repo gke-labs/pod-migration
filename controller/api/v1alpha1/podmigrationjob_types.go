@@ -86,6 +86,17 @@ type PodMigrationJobStatus struct {
 	// +optional
 	RestoringStartTime *metav1.Time `json:"restoringStartTime,omitempty"`
 
+	// Deadline is the timestamp at which the reconciler will time out the job's
+	// current phase. Runs from creation while Pending, from snapshottingStartTime
+	// once Snapshotting, and from evictingStartTime once Evicting (subject to the
+	// MaxMigrationTimeout hard cap). Retained once the job reaches a terminal phase.
+	// External consumers coordinating with live migration should cap their wait at
+	// status.deadline plus a small margin and re-read it when the job changes. A
+	// missing field (from an older controller) should be treated with a local
+	// fallback, such as MaxMigrationTimeout plus a margin.
+	// +optional
+	Deadline *metav1.Time `json:"deadline,omitempty"`
+
 	// TrafficStoppedTime is the timestamp when the source pod stopped serving traffic
 	// (either when it was fenced or when its checkpoint was initiated).
 	// +optional
