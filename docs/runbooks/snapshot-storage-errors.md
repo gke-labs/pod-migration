@@ -2,8 +2,8 @@
 
 ## Alerts Covered
 
-- **`PodMigrationSnapshotStorageErrors`** (`severity: warning`): A pod restore verdict completed with `snapshot_deleting`, `snapshot_gone`, or `failed` due to storage-layer failures.
-- **`PodMigrationJobFailuresHigh`** (`severity: warning`): Pod migration jobs are failing terminally (`outcome="failed"`), driven by object storage authentication, quota, engine, or network connectivity failures.
+- **`PodMigrationSnapshotStorageErrors`** (`severity: warning`): A pod restore verdict completed with `snapshot_deleting`, `snapshot_gone`, or `failed` (where `failed` represents engine restore failure).
+- **`PodMigrationJobFailuresHigh`** (`severity: warning`): Pod migration jobs are failing terminally (`outcome="failed"`), driven by object storage authentication, quota, engine, PDB refusals, fence failures, or network connectivity failures.
 
 ---
 
@@ -126,12 +126,14 @@ If failed migrations left stranded snapshots in object storage:
 
 > ⚠️ **DO NOT run bulk wildcard deletion (`gcloud storage rm gs://...`) during active operations!** Indiscriminate wildcard deletion risks deleting snapshots for migrations currently in flight.
 
-Use the controller's automated snapshot garbage collection and orphan sweep:
+Use the controller's automated snapshot retention and orphan sweep:
 
-- The controller runs an automated garbage collection sweep (`--snapshot-gc-interval`, default 1 hour) to safely delete snapshot triggers and storage objects for completed or failed migrations whose retention window has passed.
-- To trigger an immediate reconciler sweep, verify controller health:
+- `--snapshot-retention` (default `0`): Controls how long a job that concluded `Succeeded` (restore verified or inferred) or `Failed` keeps the PodSnapshot its trigger created before the controller deletes it. A value of `0` deletes it as soon as nothing can restore from it. Jobs that concluded `SucceededWithoutRestore` keep their snapshot until they are garbage collected (30m after conclusion).
+- `--orphan-snapshot-sweep-interval` (default `10m`): Controls how often the leader controller sweeps orphaned PodSnapshots whose PodMigrationJob is gone and that no pod, trigger, or job references. Deleting a PodSnapshot directs its engine to delete the checkpoint archive.
+- `--orphan-snapshot-min-age` (default `15m`): Enforces a minimum age from creation before an orphaned snapshot is eligible for sweep deletion.
+- To trigger an immediate sweep cycle without waiting for the next periodic interval, restart the controller leader replica (the newly elected leader executes an initial orphan sweep upon startup):
   ```bash
-  kubectl rollout status deployment pod-migration-controller -n pod-migration-system
+  kubectl rollout restart deployment pod-migration-controller -n pod-migration-system
   ```
 
 ---

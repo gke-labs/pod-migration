@@ -2,7 +2,7 @@
 
 ## Alerts Covered
 
-- **`PodMigrationHighColdFallbackRatio`** (`severity: warning`): Over 15% of completed pod migrations finished as cold-start fallbacks over the last 15 minutes.
+- **`PodMigrationHighColdFallbackRatio`** (`severity: warning`): Over 15% of completed pod migrations finished as cold-start fallbacks over the last 15 minutes. Note on ratio sensitivity: with `rate[15m]` and `for: 10m`, 1 fallback out of 3 migrations will page (evaluated when total migration rate exceeds 2 / 900s). Note on restore timeouts: migrations completing as `SucceededWithoutRestore` due to timeouts share `outcome="timeout"` with failure timeouts, and are tracked separately under `PodMigrationJobTimeoutsHigh`.
 - **`PodMigrationRestoreCrashFallbackDetected`** (`severity: warning`): A replacement pod crashed during warm restore with a recognized gVisor/OCI restore error signature, triggering an automated fallback to cold start.
 - **`PodMigrationRestoreCrashSignatureDrift`** (`severity: info`): A replacement pod failed to start with container exit code 128 (`StartError`), but its error message did not match any known restore crash signature in the controller.
 
@@ -33,10 +33,11 @@ A cold fallback is triggered by one of several mechanisms:
 
 ### Step 1: Breakdown Restore Verdicts by Engine
 
-Query controller metrics via port-forward:
+Query controller metrics via port-forward to the leader replica:
 
 ```bash
-kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
 PF_PID=$!
 curl -s http://localhost:8080/metrics | grep -E "pod_migration_restore_verdicts_total|pod_migration_outcomes_total"
 kill $PF_PID
@@ -118,11 +119,12 @@ To test restore crash classification in a dev/staging cluster:
 3. Once the replacement pod is created, inject a mock container termination error matching `"oci runtime restore failed"` into the replacement pod's container status (or configure a mock runtime failure).
 4. Observe controller logs:
    ```bash
-   kubectl logs -n pod-migration-system -l app=pod-migration-controller -c manager | grep "restore crash"
+   kubectl logs -n pod-migration-system -l app=pod-migration-controller -c manager | grep "Restore crash detected"
    ```
-5. Check controller metrics via port-forward:
+5. Check controller metrics via port-forward to the leader pod:
    ```bash
-   kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+   LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+   kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
    PF_PID=$!
    curl -s http://localhost:8080/metrics | grep pod_migration_restore_crash_fallback_total
    kill $PF_PID

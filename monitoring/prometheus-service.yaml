@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: pod-migration-controller-metrics
+  name: pod-migration-controller
   namespace: pod-migration-system
   labels:
     app: pod-migration-controller
@@ -26,6 +26,7 @@ metadata:
     app.kubernetes.io/name: pod-migration
     app.kubernetes.io/component: controller
 spec:
+  jobLabel: app
   selector:
     matchLabels:
       app: pod-migration-controller

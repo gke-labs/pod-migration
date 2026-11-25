@@ -41,7 +41,7 @@ spec:
             component: admission-gate
           annotations:
             summary: "Pod scheduling gate is wedged"
-            description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been in SchedulingGated status for more than 10 minutes. If pod migration is enabled, this indicates an orphaned or held scheduling gate ('gke.io/pod-migration-gate'). The assigned migration may be stuck or deleted, or destination node placement may be waiting on a compatible node."
+            description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been in SchedulingGated status for more than 10 minutes (requires kube-state-metrics >= v2.19.0). If pod migration is enabled, this may indicate an orphaned or held scheduling gate ('gke.io/pod-migration-gate'). Note that this alert matches any gated pod (e.g. Kueue, Volcano); verify whether .spec.schedulingGates contains 'gke.io/pod-migration-gate' before remediating."
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/orphaned-scheduling-gate.md"
 
         - alert: PodMigrationHighColdFallbackRatio
@@ -52,7 +52,7 @@ spec:
             component: restore-engine
           annotations:
             summary: "High ratio of pod migrations completing as cold-start fallbacks"
-            description: "Cold-start fallback ratio is {{ $value | humanizePercentage }} (> 15% of migrations over 15m across completed outcomes). Investigate node runtime compatibility, placement constraints, or snapshot corruption."
+            description: "Cold-start fallback ratio is {{ $value | humanizePercentage }} (> 15% of migrations over 15m across completed outcomes). Investigate node runtime compatibility, placement constraints, or snapshot corruption. (Note: captures explicit warm-restore fallbacks and lost restores; restore timeouts share outcome='timeout' and alert on PodMigrationJobTimeoutsHigh)."
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/high-cold-fallback-ratio.md"
 
         - alert: PodMigrationRestoreCrashFallbackDetected
@@ -85,7 +85,7 @@ spec:
             component: snapshot-storage
           annotations:
             summary: "Snapshot storage or retrieval failure detected"
-            description: 'Snapshot restore verdict ''{{ $labels.verdict }}'' occurred for engine ''{{ $labels.engine }}'' (rate: {{ $value | printf "%.4f" }}/s). Snapshots may be prematurely deleted or bucket permissions failed.'
+            description: 'Snapshot restore verdict ''{{ $labels.verdict }}'' occurred for engine ''{{ $labels.engine }}'' (rate: {{ $value | printf "%.4f" }}/s). Snapshots may be prematurely deleted or bucket permissions failed (note: verdict=''failed'' indicates engine restore failure).'
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/snapshot-storage-errors.md"
 
         - alert: PodMigrationJobFailuresHigh
@@ -96,7 +96,7 @@ spec:
             component: controller
           annotations:
             summary: "Pod migration jobs failing repeatedly"
-            description: 'Pod migration jobs are encountering terminal failures (rate: {{ $value | printf "%.4f" }}/s over 15m). Investigate controller logs, storage bucket connectivity, and engine health.'
+            description: 'Pod migration jobs are encountering terminal failures (rate: {{ $value | printf "%.4f" }}/s over 15m across PDB refusals, fence failures, storage, or runtime errors). Investigate controller logs, storage bucket connectivity, and engine health.'
             runbook_url: "https://github.com/gke-labs/pod-migration/blob/main/docs/runbooks/snapshot-storage-errors.md"
 
         - alert: PodMigrationInvariantViolationDetected

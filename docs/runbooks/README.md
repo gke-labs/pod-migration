@@ -42,11 +42,13 @@ Verify that Prometheus Operator loaded the rule group:
 kubectl get prometheusrule pod-migration-alerts -n pod-migration-system -o yaml
 ```
 
-### Scraping Considerations (Multi-Replica HA)
+### Scraping Considerations (Multi-Replica HA & Prometheus Setup)
 
 The controller serves Prometheus metrics on `:8080/metrics` across all replicas. Note the following operational constraints:
 
-- **Scrape Job Configuration:** The alerting rules assume a Prometheus scrape job named `job="pod-migration-controller"` targeting port 8080. If your Prometheus scrape config names the job differently, update `job="pod-migration-controller"` in `monitoring/prometheus-rules.yaml`.
+- **Scrape Job Configuration:** The alerting rules assume a Prometheus scrape job named `job="pod-migration-controller"` targeting port 8080. `monitoring/prometheus-service.yaml` ships a Service and a `ServiceMonitor` with `jobLabel: app` to ensure the scraped `job` label matches `pod-migration-controller`.
+- **Prometheus Operator Selector Notice:** Default Helm installations of `kube-prometheus-stack` restrict `ServiceMonitor` discovery to objects carrying `release: <release-name>` (via `serviceMonitorSelectorNilUsesHelmValues: true`). If using `kube-prometheus-stack`, ensure you either add your release label to `monitoring/prometheus-service.yaml` or set `serviceMonitorSelectorNilUsesHelmValues: false`.
+- **Google Cloud Managed Service for Prometheus (GMP):** If running on GKE with Managed Prometheus enabled, GMP discovers scrape targets via `PodMonitoring` custom resources rather than `ServiceMonitor`. Convert `monitoring/prometheus-service.yaml` to a `PodMonitoring` resource targeting port `metrics` (8080).
 - **Leader vs Standby:** Only the active leader replica reconciles migrations and updates in-memory gauges (`pod_migration_active`). Standby replicas return `pod_migration_active == 0`.
 - **Query Aggregation:** Always use `max(pod_migration_active)` when checking total active in-flight migrations.
 - **Counter Rates:** For counters and histograms, aggregate across controller pods using `sum(rate(...[5m]))`.
@@ -70,11 +72,12 @@ kubectl get lease pod-migration-controller-leader -n pod-migration-system -o yam
 kubectl logs -n pod-migration-system -l app=pod-migration-controller -c manager --tail=200 -f
 
 # 4. Check scheduling-gated replacement pods
-kubectl get pods -A -o jsonpath='{range .items[?(@.spec.schedulingGates)]}{.metadata.namespace}{"/"}{.metadata.name}{"\tGates: "}{range .spec.schedulingGates}{.name}{" "}{end}{"\tAssignedPMJ: "}{.metadata.annotations.pod-migration\.gke\.io/assigned-pmj}{"\n"}{end}'
+kubectl get pods -A -o jsonpath='{range .items[?(@.spec.schedulingGates)]}{.metadata.namespace}{"/"}{.metadata.name}{"\tGates: "}{.spec.schedulingGates[*].name}{"\tAssignedPMJ: "}{.metadata.annotations.pod-migration\.gke\.io/assigned-pmj}{"\n"}{end}'
 
-# 5. Query live controller metrics directly via port-forward
-# (The controller runs on a distroless container without curl/shell; port-forward locally:)
-kubectl port-forward -n pod-migration-system deployment/pod-migration-controller 8080:8080 &
+# 5. Query live controller metrics directly via port-forward to the leader pod
+# (The controller runs on a distroless container without curl/shell; port-forward to the active leader:)
+LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
 PF_PID=$!
 curl -s http://localhost:8080/metrics | grep pod_migration_
 kill $PF_PID

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package metrics_test
+package metrics
 
 import (
 	"os"
@@ -22,7 +22,9 @@ import (
 	"strings"
 	"testing"
 
+	dto "github.com/prometheus/client_model/go"
 	"gopkg.in/yaml.v3"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 type prometheusRuleFile struct {
@@ -47,14 +49,36 @@ type prometheusRuleFile struct {
 }
 
 var (
-	metricRegex = regexp.MustCompile(`[a-zA-Z_:][a-zA-Z0-9_:]*`)
+	// metricSelectorRegex extracts metric names appearing before { or [
+	metricSelectorRegex = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(\{|\[)`)
 	// labelMatcherRegex matches label matches like outcome=~"timeout|budget_timeout" or outcome="failed"
 	labelMatcherRegex = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|=|!=|!~)\s*"([^"]+)"`)
 	// labelFilterRegex matches expressions like metric_name{...}
 	labelFilterRegex = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{([^}]+)\}`)
 )
 
+// initSampleMetrics touches all registered vectors with dummy label values so that
+// ctrlmetrics.Registry.Gather() collects their descriptors and label names.
+func initSampleMetrics() {
+	OutcomesTotal.WithLabelValues("succeeded")
+	RestoreVerdictsTotal.WithLabelValues("gke_pod_snapshots", "confirmed")
+	PhaseDurationSeconds.WithLabelValues("restoring")
+	InvariantViolationsTotal.WithLabelValues("I1")
+	SpotPreemptionSkippedTotal.WithLabelValues("not_eligible")
+	BudgetChecksTotal.WithLabelValues("allowed")
+	FenceWebhookRequestsTotal.WithLabelValues("admitted")
+	SourceFenceTotal.WithLabelValues("fenced")
+	SourceFencedSeconds.WithLabelValues("completed")
+	SkippedMigrationsTotal.WithLabelValues("not_migratable", "none")
+	MigratableCoveredRunningPods.WithLabelValues("default")
+	MigratableTotalRunningPods.WithLabelValues("default")
+	MigratableCoverageRatio.WithLabelValues("default")
+	ApplicationDowntimeSeconds.WithLabelValues("gke_pod_snapshots", "warm")
+}
+
 func TestPrometheusRulesIntegrity(t *testing.T) {
+	initSampleMetrics()
+
 	rulePath := filepath.Join("..", "..", "..", "monitoring", "prometheus-rules.yaml")
 	data, err := os.ReadFile(rulePath)
 	if err != nil {
@@ -76,30 +100,44 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 		t.Fatal("expected at least one rule group")
 	}
 
-	knownControllerMetrics := map[string]bool{
-		"pod_migration_active":                          true,
-		"pod_migration_outcomes_total":                  true,
-		"pod_migration_restore_verdicts_total":          true,
-		"pod_migration_phase_duration_seconds":          true,
-		"pod_migration_restore_crash_fallback_total":    true,
-		"pod_migration_restore_crash_unmatched_total":   true,
-		"pod_migration_invariant_violations_total":      true,
-		"pod_migration_spot_preemption_triggered_total": true,
-		"pod_migration_spot_preemption_skipped_total":   true,
-		"pod_migration_budget_checks_total":             true,
-		"pod_migration_fence_webhook_requests_total":    true,
-		"pod_migration_source_fence_total":              true,
-		"pod_migration_source_fenced_seconds":           true,
-		"pod_migration_application_downtime_seconds":    true,
-		"pod_migration_skipped_total":                   true,
-		"pod_migration_covered_running_pods":            true,
-		"pod_migration_total_running_pods":              true,
-		"pod_migration_coverage_ratio":                  true,
+	// Dynamically gather registered controller metrics and their label names from ctrlmetrics.Registry
+	mfs, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather from ctrlmetrics.Registry: %v", err)
 	}
 
-	knownExternalMetrics := map[string]bool{
-		"up":                     true,
-		"kube_pod_status_reason": true,
+	registryMetrics := make(map[string]map[string]bool)
+	for _, mf := range mfs {
+		if mf.Name == nil {
+			continue
+		}
+		mName := *mf.Name
+		if !strings.HasPrefix(mName, "pod_migration_") {
+			continue
+		}
+		labels := make(map[string]bool)
+		if len(mf.Metric) > 0 {
+			for _, l := range mf.Metric[0].Label {
+				if l.Name != nil {
+					labels[*l.Name] = true
+				}
+			}
+		}
+		if mf.GetType() == dto.MetricType_HISTOGRAM {
+			labels["le"] = true
+		}
+		registryMetrics[mName] = labels
+	}
+
+	knownExternalMetrics := map[string]map[string]bool{
+		"up": {
+			"job": true,
+		},
+		"kube_pod_status_reason": {
+			"reason":    true,
+			"namespace": true,
+			"pod":       true,
+		},
 	}
 
 	knownLabelValues := map[string]map[string]bool{
@@ -176,6 +214,7 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 		"min":                true,
 		"max":                true,
 		"avg":                true,
+		"le":                 true,
 	}
 
 	totalRules := 0
@@ -218,38 +257,57 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 				}
 
 				// Extract and validate all metric identifiers in the PromQL expr
-				for _, match := range metricRegex.FindAllString(rule.Expr, -1) {
-					if promqlKeywords[match] {
+				for _, match := range metricSelectorRegex.FindAllStringSubmatch(rule.Expr, -1) {
+					metricName := match[1]
+					if promqlKeywords[metricName] {
 						continue
 					}
-					if strings.HasPrefix(match, "pod_migration_") {
-						baseMetric := strings.TrimSuffix(match, "_bucket")
+					if strings.HasPrefix(metricName, "pod_migration_") {
+						baseMetric := strings.TrimSuffix(metricName, "_bucket")
 						baseMetric = strings.TrimSuffix(baseMetric, "_count")
 						baseMetric = strings.TrimSuffix(baseMetric, "_sum")
-						if !knownControllerMetrics[baseMetric] {
-							t.Errorf("alert %q: expr references unknown pod_migration metric %q (base %q)", rule.Alert, match, baseMetric)
+						if _, ok := registryMetrics[baseMetric]; !ok {
+							t.Errorf("alert %q: expr references unknown pod_migration metric %q (base %q) not registered in ctrlmetrics.Registry", rule.Alert, metricName, baseMetric)
 						} else {
 							foundControllerMetrics[baseMetric]++
 						}
-					} else if knownExternalMetrics[match] {
+					} else if _, ok := knownExternalMetrics[metricName]; ok {
 						// Known external metric
+					} else {
+						t.Errorf("alert %q: expr references unlisted external metric or unknown symbol %q", rule.Alert, metricName)
 					}
 				}
 
-				// Validate label selectors against known label values
+				// Validate label selectors against known label names from the registry and known label values
 				for _, m := range labelFilterRegex.FindAllStringSubmatch(rule.Expr, -1) {
-					metricName := strings.TrimSuffix(m[1], "_bucket")
-					metricName = strings.TrimSuffix(metricName, "_count")
-					metricName = strings.TrimSuffix(metricName, "_sum")
+					rawMetric := m[1]
+					baseMetric := strings.TrimSuffix(rawMetric, "_bucket")
+					baseMetric = strings.TrimSuffix(baseMetric, "_count")
+					baseMetric = strings.TrimSuffix(baseMetric, "_sum")
 					for _, lm := range labelMatcherRegex.FindAllStringSubmatch(m[2], -1) {
 						lbl := lm[1]
 						val := lm[3]
-						key := metricName + ":" + lbl
+
+						// Check label name validity against the live registry
+						if strings.HasPrefix(baseMetric, "pod_migration_") {
+							if validLabels, ok := registryMetrics[baseMetric]; ok {
+								if !validLabels[lbl] {
+									t.Errorf("alert %q: metric %q has unknown label name %q (valid labels from registry: %v)", rule.Alert, rawMetric, lbl, validLabels)
+								}
+							}
+						} else if validLabels, ok := knownExternalMetrics[baseMetric]; ok {
+							if !validLabels[lbl] {
+								t.Errorf("alert %q: external metric %q has unknown label name %q (valid labels: %v)", rule.Alert, rawMetric, lbl, validLabels)
+							}
+						}
+
+						// Check label values against known domain values
+						key := baseMetric + ":" + lbl
 						if validVals, ok := knownLabelValues[key]; ok {
 							for _, subVal := range strings.Split(val, "|") {
 								subVal = strings.TrimSpace(subVal)
 								if subVal != "" && !validVals[subVal] {
-									t.Errorf("alert %q: metric %q has unknown label value %q for label %q", rule.Alert, metricName, subVal, lbl)
+									t.Errorf("alert %q: metric %q has unknown label value %q for label %q", rule.Alert, baseMetric, subVal, lbl)
 								}
 							}
 						}

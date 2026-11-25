@@ -601,6 +601,8 @@ When running in multi-replica HA mode with leader election enabled:
 
 Reference Prometheus alerting rules are packaged in [`monitoring/prometheus-rules.yaml`](monitoring/prometheus-rules.yaml) and scrape configurations in [`monitoring/prometheus-service.yaml`](monitoring/prometheus-service.yaml). Operator troubleshooting runbooks for each alert are located in [`docs/runbooks/`](docs/runbooks/).
 
+> **Note on Prometheus Operator & GMP Scrape Selectors:** Default Helm installations of `kube-prometheus-stack` restrict ServiceMonitor discovery to resources matching `release: <name>` (unless `serviceMonitorSelectorNilUsesHelmValues: false`). On Google Cloud Managed Service for Prometheus (GMP), scrape targets should be configured using `PodMonitoring` custom resources.
+
 ## 9. Releases & Licensing
 
 - **Release Process**: Step-by-step instructions for building, validating, and publishing official releases are documented in [docs/release-process.md](docs/release-process.md).
