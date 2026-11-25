@@ -3,24 +3,31 @@
 This folder houses the E2E verification manifests, setup runbooks, patches, and
 automated driver scripts used to validate the compatibility of 30 common
 containerized applications under GKE's gVisor `onDelete` (Option A) runtime
-eviction.
+eviction. It also holds the CRIU engine's E2E on kind (`kind/up.sh`,
+`run_criu_kind_e2e.sh`), which needs none of the GKE prerequisites below.
 
---------------------------------------------------------------------------------
+---
 
 ## 1. Directory Structure
 
-*   `run_app_validation.sh`: The master CLI driver script to deploy, seed,
-    migrate, uncordon, and verify any of the supported workloads.
-*   `manifests/`: Cleaned, non-root, gVisor-compatible StatefulSet and Job
-    templates.
-*   `patches/`: Code patches, configuration tweaks, and runbooks addressing
-    specific application runtime gaps.
-*   `runbooks/`: Step-by-step text guides for manual verification.
-*   `demo/`: Interactive tools (e.g., streaming clients, websockets) to
-    demonstrate active state survival.
-*   `dashboard/`: Static web UI visualization showing test outcomes.
+- `run_app_validation.sh`: The master CLI driver script to deploy, seed,
+  migrate, uncordon, and verify any of the supported workloads.
+- `manifests/`: Cleaned, non-root, gVisor-compatible StatefulSet and Job
+  templates.
+- `patches/`: Code patches, configuration tweaks, and runbooks addressing
+  specific application runtime gaps.
+- `runbooks/`: Step-by-step text guides for manual verification.
+- `demo/`: Interactive tools (e.g., streaming clients, websockets) to
+  demonstrate active state survival.
+- `dashboard/`: Static web UI visualization showing test outcomes.
+- `run_scale_drain_gate.sh`: 100-pod concurrent drain scale regression gate
+  runner under strict invariant mode (#251).
+- `kind/up.sh` and `run_criu_kind_e2e.sh`: the CRIU engine E2E on a local
+  kind cluster that CI runs on pull requests (no GKE or cloud credentials
+  needed); see
+  [End-to-end test on kind](../engines/criu/README.md#end-to-end-test-on-kind).
 
---------------------------------------------------------------------------------
+---
 
 ## 2. Prerequisites
 
@@ -34,7 +41,7 @@ are met:
 3.  **Authentication**: Your local `kubectl` context pointing to the target
     evaluation cluster.
 
---------------------------------------------------------------------------------
+---
 
 ## 3. How to Run Validation Tests
 
@@ -51,14 +58,14 @@ To run the automated E2E migration check for any application:
 
 ### Supported Application Target Names:
 
-*   `redis`, `valkey`, `memcached`, `dragonfly`, `vault`, `etcd`, `consul`,
-    `nats`
-*   `mysql`, `mariadb`, `postgres`, `zookeeper`, `kafka`
-*   `nginx`, `haproxy`, `traefik`, `caddy`, `python`
-*   `go` (Job), `node` (Job)
-*   `multicontainer` (StatefulSet with initContainer, app, and sidecar — not yet verified end to end, pending bucket IAM on kyber-test)
+- `redis`, `valkey`, `memcached`, `dragonfly`, `vault`, `etcd`, `consul`,
+  `nats`
+- `mysql`, `mariadb`, `postgres`, `zookeeper`, `kafka`
+- `nginx`, `haproxy`, `traefik`, `caddy`, `python`
+- `go` (Job), `node` (Job)
+- `multicontainer` (StatefulSet with initContainer, app, and sidecar — not yet verified end to end, pending bucket IAM on kyber-test)
 
---------------------------------------------------------------------------------
+---
 
 ## 4. Key Workarounds Applied
 

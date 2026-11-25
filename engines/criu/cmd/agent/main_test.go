@@ -21,6 +21,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -131,6 +134,32 @@ func TestAgentManagerOptions_DisablesNodeInformerUnderGetPatchRBAC(t *testing.T)
 // fakeNodeWorker records what runNodeWorker starts.
 type fakeNodeWorker struct {
 	factsLoop chan [2]time.Duration
+}
+
+// loadArchiveKeys never fails the agent: it returns what it could load, and
+// leaves the signer nil whenever the key that signs isn't clear (#244).
+func TestLoadArchiveKeys(t *testing.T) {
+	writeKeys := func(t *testing.T, keys ...string) string {
+		dir := t.TempDir()
+		for _, id := range keys {
+			if err := os.WriteFile(filepath.Join(dir, id), []byte(strings.Repeat(id[:1], 40)+"\n"), 0o400); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+	if keyring, signer := loadArchiveKeys(writeKeys(t, "k1"), ""); keyring == nil || signer == nil || signer.KeyID() != "k1" {
+		t.Errorf("one key: keyring %v, signer %v; want both, signing with k1", keyring, signer)
+	}
+	if keyring, signer := loadArchiveKeys(writeKeys(t, "k1", "k2"), "k2"); keyring == nil || signer == nil || signer.KeyID() != "k2" {
+		t.Errorf("two keys, k2 chosen: keyring %v, signer %v; want both, signing with k2", keyring, signer)
+	}
+	if keyring, signer := loadArchiveKeys(writeKeys(t, "k1", "k2"), ""); keyring == nil || signer != nil {
+		t.Errorf("two keys, none chosen: keyring %v, signer %v; want the keyring to verify, and no signer", keyring, signer)
+	}
+	if keyring, signer := loadArchiveKeys(filepath.Join(t.TempDir(), "missing"), ""); keyring != nil || signer != nil {
+		t.Errorf("no keys: keyring %v, signer %v; want neither", keyring, signer)
+	}
 }
 
 func (f *fakeNodeWorker) Bootstrap(context.Context) error { return errors.New("bootstrap failed") }

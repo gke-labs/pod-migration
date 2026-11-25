@@ -15,18 +15,23 @@
 
 # criu-engine node agent image.
 #
-# Stage 1 bundles a self-contained criu >= 3.19 (3.16 hits the cgroup2 cgns
-# restore quirk; Ubuntu 24.04 dropped criu). Debian trixie ships criu 4.x; the
-# bundle carries the binary + all shared libs + its own ld-linux so it runs on
-# the GKE host without touching host libraries. CRIU stays an unmodified
-# external executable (exec-only subprocess).
-FROM debian:trixie AS criu
+# Stage 1 bundles a self-contained criu >= 4.2.1. Older CRIU can't dump a
+# container on newer kernels: on Linux >= 6.16 every TCP socket fails the dump
+# (SO_PASSCRED/SO_PASSSEC return EOPNOTSUPP), and on Linux >= 7.1, which removed
+# UDP-Lite, every dump fails; 3.16 also hits the cgroup2 cgns restore quirk.
+# Ubuntu 24.04 dropped criu and Debian trixie ships 4.1.1, so this takes Debian
+# forky's. The bundle carries the binary + all shared libs + its own ld-linux
+# so it runs on the GKE host without touching host libraries. CRIU stays an
+# unmodified external executable (exec-only subprocess).
+# licenses/package-versions.txt lists the source packages and versions, which
+# is what the GPL source release fetches (tools/release/package_gpl_sources.sh)
+# from forky or, once forky has moved on, from snapshot.debian.org.
+FROM debian:forky AS criu
 RUN apt-get update && apt-get install -y --no-install-recommends criu && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
     ver=$(criu --version | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?'); \
-    maj=${ver%%.*}; rest=${ver#*.}; min=${rest%%.*}; \
-    if [ "$maj" -lt 3 ] || { [ "$maj" -eq 3 ] && [ "$min" -lt 19 ]; }; then \
-      echo "criu $ver < 3.19 — refusing (cgroup2 cgns restore quirk)"; exit 1; fi; \
+    if [ "$(printf '%s\n' 4.2.1 "$ver" | sort -V | head -1)" != 4.2.1 ]; then \
+      echo "criu $ver < 4.2.1: refusing (it fails dumps on Linux >= 6.16)"; exit 1; fi; \
     mkdir -p /bundle /bundle/licenses; \
     cp /usr/sbin/criu /bundle/criu.bin; \
     for lib in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do cp -L "$lib" /bundle/ || true; done; \
@@ -40,11 +45,11 @@ RUN set -eux; \
       fi; \
     done; \
     { \
-      dpkg-query -W -f='${Package} ${Version}\n' criu; \
+      dpkg-query -W -f='${source:Package} ${source:Version}\n' criu; \
       for f in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do \
         dpkg -S "$(realpath "$f")" 2>/dev/null || echo "WARNING: dpkg -S failed for $f" >&2; \
       done | cut -d: -f1 | sort -u | while read -r pkg; do \
-        dpkg-query -W -f='${Package} ${Version}\n' "$pkg"; \
+        dpkg-query -W -f='${source:Package} ${source:Version}\n' "$pkg"; \
       done; \
     } | sort -u > /bundle/licenses/package-versions.txt; \
     criu --version | head -1 > /bundle/VERSION; \

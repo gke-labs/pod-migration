@@ -131,6 +131,27 @@ const (
 	RestoreStatusRestored   = "restored"
 	RestoreStatusFailed     = "failed"
 
+	// AnnotationRestoreReason says why a restore failed: the node agent
+	// stamps one of the RestoreReason* codes in the same write as
+	// AnnotationRestoreStatus=failed, and never with restored (#244). The
+	// orchestrator shows it in the PodMigrationJob's cold-start message.
+	AnnotationRestoreReason = "pod-migrate.io/psengine-restore-reason"
+	// RestoreReasonSigningKeyUnavailable: the agent has no archive signing
+	// keys to verify with.
+	RestoreReasonSigningKeyUnavailable = "ArchiveSigningKeyUnavailable"
+	// RestoreReasonSignatureInvalid: manifest.json is malformed, unsigned,
+	// signed with a key the agent doesn't hold, or its signature doesn't
+	// match.
+	RestoreReasonSignatureInvalid = "ArchiveSignatureInvalid"
+	// RestoreReasonBindingMismatch: the archive is genuine but bound to
+	// another snapshot, pod, location, job or cluster.
+	RestoreReasonBindingMismatch = "ArchiveBindingMismatch"
+	// RestoreReasonDigestMismatch: spec.json or checkpoint.tar doesn't match
+	// the digests in the signed manifest.
+	RestoreReasonDigestMismatch = "ArchiveDigestMismatch"
+	// RestoreReasonFailed: any other failure.
+	RestoreReasonFailed = "RestoreFailed"
+
 	// AnnotationSnapshot records the snapshot name restored into the pod, stamped
 	// by the node agent upon successful restore. Unlike */ps-name, which CompleteRestore
 	// clears to "" upon job success, this durable annotation survives for the lifetime

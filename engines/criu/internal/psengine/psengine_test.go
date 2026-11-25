@@ -95,6 +95,8 @@ func newClientWithInterceptor(t *testing.T, funcs interceptor.Funcs, objs ...cli
 	pmj := contract.New(contract.GVKPodMigrationJob)
 	pmj.SetNamespace("default")
 	pmj.SetName("test-pmj")
+	// The UID that signed test archives bind (testJobUID).
+	pmj.SetUID(types.UID(testJobUID))
 	_ = unstructured.SetNestedField(pmj.Object, "web-0", "spec", "podRef", "name")
 	_ = unstructured.SetNestedField(pmj.Object, "Restoring", "status", "phase")
 	_ = unstructured.SetNestedField(pmj.Object, "ps-web-0-deadbeef", "status", "snapshotRef")

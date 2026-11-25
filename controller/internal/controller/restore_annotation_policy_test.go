@@ -210,8 +210,8 @@ func TestRestoreOrderPolicy_MatchesTheControllerManifest(t *testing.T) {
 }
 
 // The restore status policy in the CRIU engine's manifest names the node
-// agent's service account, and the annotation and values that the controller
-// reads (#233).
+// agent's service account, and the annotations and values that the controller
+// reads: the outcome (#233) and the reason of a failure (#244).
 func TestRestoreStatusPolicy_MatchesTheCRIUManifest(t *testing.T) {
 	path := criuManifestPath()
 	policy, binding := admissionPolicy(t, path, restoreStatusPolicyName)
@@ -232,10 +232,18 @@ func TestRestoreStatusPolicy_MatchesTheCRIUManifest(t *testing.T) {
 			t.Errorf("the policy's validations don't allow the outcome %q:\n%s", value, validations)
 		}
 	}
+	// The policy also guards the reason that VerifyRestore puts in a cold
+	// start's evidence (#244). matchConditions are ANDed: each must notice a
+	// change to either annotation.
 	for _, mc := range policy.Spec.MatchConditions {
-		if !strings.Contains(mc.Expression, "'"+engine.CRIURestoreStatusAnnotation+"'") {
-			t.Errorf("matchCondition %s doesn't watch %s:\n%s", mc.Name, engine.CRIURestoreStatusAnnotation, mc.Expression)
+		for _, key := range []string{engine.CRIURestoreStatusAnnotation, engine.CRIURestoreReasonAnnotation} {
+			if !strings.Contains(mc.Expression, "'"+key+"'") {
+				t.Errorf("matchCondition %s doesn't watch %s:\n%s", mc.Name, key, mc.Expression)
+			}
 		}
+	}
+	if !strings.Contains(validations, "'"+engine.CRIURestoreReasonAnnotation+"'") {
+		t.Errorf("the policy's validations don't check %s:\n%s", engine.CRIURestoreReasonAnnotation, validations)
 	}
 
 	// Unlike the restore order, the outcome is the engine's own on any pod:

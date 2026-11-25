@@ -360,6 +360,7 @@ func TestPodGateInjector_ProtectsRestoreAnnotationsAcrossAllEnginesOnCreate(t *t
 					util.AnnotationAssignedPMJ:         "fake-pmj",
 					engine.CRIUInjectedAnnotation:      "true",
 					engine.CRIURestoreStatusAnnotation: "restored",
+					engine.CRIURestoreReasonAnnotation: "ArchiveSignatureInvalid",
 				},
 			},
 		}
@@ -382,7 +383,7 @@ func TestPodGateInjector_ProtectsRestoreAnnotationsAcrossAllEnginesOnCreate(t *t
 		if v, ok := got.Annotations[gkeAnn]; !ok || v != "" {
 			t.Errorf("%s = %q (ok=%t), want empty cold-start bypass", gkeAnn, v, ok)
 		}
-		for _, forbidden := range []string{util.AnnotationAssignedPMJ, engine.CRIUInjectedAnnotation, engine.CRIURestoreStatusAnnotation} {
+		for _, forbidden := range []string{util.AnnotationAssignedPMJ, engine.CRIUInjectedAnnotation, engine.CRIURestoreStatusAnnotation, engine.CRIURestoreReasonAnnotation} {
 			if _, exists := got.Annotations[forbidden]; exists {
 				t.Errorf("expected spoofed %s to be stripped, got %q", forbidden, got.Annotations[forbidden])
 			}
@@ -442,6 +443,7 @@ func TestPodGateInjector_ProtectsRestoreAnnotationsAcrossAllEnginesOnCreate(t *t
 					gkeAnn:                             "stale-template-snap",
 					engine.CRIUInjectedAnnotation:      "true",
 					engine.CRIURestoreStatusAnnotation: "restored",
+					engine.CRIURestoreReasonAnnotation: "ArchiveSignatureInvalid",
 				},
 			},
 			Spec: corev1.PodSpec{
@@ -464,7 +466,7 @@ func TestPodGateInjector_ProtectsRestoreAnnotationsAcrossAllEnginesOnCreate(t *t
 		if got.Annotations[util.AnnotationAssignedPMJ] != activeCRIUJob.Name {
 			t.Errorf("assigned-pmj = %q, want %q", got.Annotations[util.AnnotationAssignedPMJ], activeCRIUJob.Name)
 		}
-		for _, stripped := range []string{criuAnn, gkeAnn, engine.CRIUInjectedAnnotation, engine.CRIURestoreStatusAnnotation} {
+		for _, stripped := range []string{criuAnn, gkeAnn, engine.CRIUInjectedAnnotation, engine.CRIURestoreStatusAnnotation, engine.CRIURestoreReasonAnnotation} {
 			if _, exists := got.Annotations[stripped]; exists {
 				t.Errorf("expected %s to be stripped on gated replacement, got %q", stripped, got.Annotations[stripped])
 			}

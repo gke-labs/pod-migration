@@ -22,7 +22,7 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_GEN_VERSION)
 ENVTEST_K8S_VERSION ?= 1.36.2
 SETUP_ENVTEST_VERSION ?= v0.25.0
 SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest-$(SETUP_ENVTEST_VERSION)
-.PHONY: help generate verify-generate verify-invariant-governance verify-license-headers manifests fmt vet build run envtest test test-t1-invariants test-pmprofiler test-t2-guardrail test-scalesim test-t3-guardrail test-invariant-gen test-t5-guardrail test-gpl-source-packager install uninstall deploy undeploy docker-build docker-push controller-gen
+.PHONY: help generate verify-generate verify-invariant-governance verify-license-headers manifests fmt vet build run envtest test test-t1-invariants test-scale-drain test-pmprofiler test-t2-guardrail test-scalesim test-t3-guardrail test-invariant-gen test-t5-guardrail test-gpl-source-packager install uninstall deploy undeploy docker-build docker-push controller-gen
 
 VERIFY_ARTIFACTS := api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml deploy.yaml
 
@@ -122,6 +122,9 @@ test-t1-invariants: envtest ## Run T1 per-merge envtest fault-injection matrix u
 		exit 1; \
 	fi; \
 	KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test -v -race -count=1 ./internal/controller -run TestT1_EnvtestFaultInjectionMatrix
+
+test-scale-drain: envtest ## Run 100-pod concurrent drain scale regression gate under strict invariant mode (#251).
+	../verification-suite/run_scale_drain_gate.sh
 
 test-engine-conformance: ## Run snapshot engine contract conformance suite (#108).
 	go test -v -race -count=1 ./internal/engine/conformance/...
