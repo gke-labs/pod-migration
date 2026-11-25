@@ -60,7 +60,8 @@ func ptrTo[T any](v T) *T { return &v }
 //     in Pending for the budget (a 429 from a PodDisruptionBudget or a 403 from
 //     an admission policy) or while it's in Snapshotting. The job fails with
 //     PodNotFound, deletes its trigger, drops its finalizer, and the
-//     replacement is released cold.
+//     replacement is released cold, unless the checkpoint already completed:
+//     then the job waits for the snapshot and restores it.
 //   - The migration times out, or the final eviction is denied, in Snapshotting
 //     or Evicting after the engine may have stopped the source. The source
 //     stays fenced (FenceKept) and the controller retries its cold eviction
@@ -724,6 +725,46 @@ func TestT1_TerminationEdgeCases(t *testing.T) {
 		}
 		wantFailedPodNotFound(t, job, source)
 		wantColdReplacement(t, rs, job, "snapmid-replacement")
+	})
+
+	t.Run("ForcedDelete_SnapshottingAfterCheckpointCompleted", func(t *testing.T) {
+		ns := createTestNamespace(t, ctx, k8sClient, "t295-snap-upload")
+		rec := newJobReconciler()
+		rs := newReplicaSet(t, ns, "snapupload")
+		// The checkpoint completed (Checkpoint=True, C9), and its archive is
+		// still uploading.
+		job, source, snapName := startCheckpoint(t, rec, rs, "snapupload",
+			snapCond("Checkpoint", "True", "Dumped", time.Now()),
+			snapCond("StorageReplicated", "False", "InProgress", time.Now()))
+
+		// A source deleted now leaves a checkpoint that can still restore,
+		// so the job waits for it and keeps its trigger.
+		forceDelete(t, source)
+		for i := 0; i < 2; i++ {
+			reconcile(t, rec, ns, job.Name)
+		}
+		if got := getJob(t, ns, job.Name); got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+			t.Fatalf("a completed checkpoint was given up when its source was deleted: phase=%s reason=%q", got.Status.Phase, readyReason(got))
+		}
+		if !triggerExists(t, ns, source.Name, source.UID) {
+			t.Fatalf("the trigger of a completed checkpoint was deleted while it uploads")
+		}
+
+		// The upload finishes: the job goes on, finds the source gone, and
+		// restores the replacement.
+		setSnapshotConditions(t, ns, snapName,
+			snapCond("Checkpoint", "True", "Succeeded", time.Now()),
+			snapCond("Ready", "True", "AllSnapshotsAvailable", time.Now()))
+		for i := 0; i < 3; i++ {
+			reconcile(t, rec, ns, job.Name)
+		}
+		got := getJob(t, ns, job.Name)
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring || got.Status.SnapshotRef != snapName {
+			t.Fatalf("after the upload: phase=%s snapshotRef=%q reason=%q, want Restoring/%s", got.Status.Phase, got.Status.SnapshotRef, readyReason(got), snapName)
+		}
+		if controllerutil.ContainsFinalizer(got, SourceFenceFinalizer) {
+			t.Fatalf("the job still holds %s with its source gone", SourceFenceFinalizer)
+		}
 	})
 
 	// ---- 2. Timeout or denied final eviction -------------------------------

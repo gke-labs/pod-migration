@@ -422,13 +422,14 @@ func (r *PodMigrationJobReconciler) failSnapshotting(ctx context.Context, req ct
 }
 
 // failIfSourceGoneMidCheckpoint fails a Snapshotting job whose source is gone
-// (deleted, or replaced under its name) before its checkpoint is durable, with
+// (deleted, or replaced under its name) before its checkpoint completed, with
 // reason PodNotFound (#295). failSnapshotting deletes the trigger, so the
 // engine starts nothing for a pod that isn't there, and with no source left
 // there's no fence to settle, so the job drops its finalizer on the next
-// pass. A snapshot that's already Ready still goes on to Evicting, which
-// finds the source gone and restores; a failed, refused, deleting or gone
-// snapshot is left to the usual handling. The cache is read first, and a
+// pass. A snapshot that's already Ready, or whose checkpoint completed and
+// may still go Ready, still goes on to Evicting, which finds the source gone
+// and restores; a failed, refused, deleting or gone snapshot is left to the
+// usual handling. The cache is read first, and a
 // miss is confirmed against the API server.
 func (r *PodMigrationJobReconciler) failIfSourceGoneMidCheckpoint(ctx context.Context, req ctrl.Request, job, origJob *pmv1alpha1.PodMigrationJob) (ctrl.Result, bool, error) {
 	if pod, err := r.sourcePod(ctx, job, r.Client); err != nil || pod != nil {
@@ -447,6 +448,19 @@ func (r *PodMigrationJobReconciler) failIfSourceGoneMidCheckpoint(ctx context.Co
 	}
 	if gone, err := r.snapshotGone(ctx, job, st); err != nil || gone {
 		return ctrl.Result{}, false, err
+	}
+	// A checkpoint that completed may still upload and go Ready, and then
+	// restores the replacement, so the job waits for it as before, under the
+	// migration timeout. Only a checkpoint that hasn't completed fails now.
+	// Without the engine's checkpoint state, a snapshot that exists counts as
+	// one that may complete.
+	if reporter, ok := provider.(snapshot.CheckpointReporter); ok {
+		state, err := reporter.CheckpointState(ctx, job, job.Spec.PodRef.Name)
+		if err != nil || state.Completed {
+			return ctrl.Result{}, false, err
+		}
+	} else if st.SnapshotRef != "" {
+		return ctrl.Result{}, false, nil
 	}
 	res, err := r.failSnapshotting(ctx, req, job, origJob, "PodNotFound",
 		"The source pod was deleted or replaced before its checkpoint completed, so there's nothing left to migrate")

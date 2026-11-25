@@ -454,28 +454,42 @@ func TestFenceSource_NothingToFence(t *testing.T) {
 }
 
 // TestSourceGone_SnapshotOutcomeDecides: once the source is gone, only a
-// checkpoint still in progress fails the job with PodNotFound (#295). A
-// durable snapshot still goes on to Evicting, which restores it, and a failed
-// one keeps its own reason.
+// checkpoint that hasn't completed fails the job with PodNotFound (#295). A
+// completed one that's still uploading is waited for, a durable snapshot
+// still goes on to Evicting, which restores it, and a failed one keeps its
+// own reason.
 func TestSourceGone_SnapshotOutcomeDecides(t *testing.T) {
+	inProgress := snapshot.Status{Phase: snapshot.PhaseInProgress, Reason: "Snapshotting", SnapshotRef: "snap-1"}
 	for name, tc := range map[string]struct {
 		status     snapshot.Status
+		state      snapshot.CheckpointState
 		wantPhase  pmv1alpha1.PodMigrationJobPhase
 		wantReason string
 	}{
-		"in progress": {snapshot.Status{Phase: snapshot.PhaseInProgress, Reason: "Snapshotting"}, pmv1alpha1.PodMigrationJobPhaseFailed, "PodNotFound"},
-		"ready":       {snapshot.Status{Phase: snapshot.PhaseReady, SnapshotRef: "snap-1"}, pmv1alpha1.PodMigrationJobPhaseEvicting, "Evicting"},
-		"failed":      {snapshot.Status{Phase: snapshot.PhaseFailed, Reason: "SnapshotFailed", Message: "dump failed"}, pmv1alpha1.PodMigrationJobPhaseFailed, "SnapshotFailed"},
+		"in progress":          {inProgress, snapshot.CheckpointState{}, pmv1alpha1.PodMigrationJobPhaseFailed, "PodNotFound"},
+		"completed, uploading": {inProgress, snapshot.CheckpointState{Completed: true}, pmv1alpha1.PodMigrationJobPhaseSnapshotting, "Snapshotting"},
+		"ready":                {snapshot.Status{Phase: snapshot.PhaseReady, SnapshotRef: "snap-1"}, snapshot.CheckpointState{Completed: true, Settled: true}, pmv1alpha1.PodMigrationJobPhaseEvicting, "Evicting"},
+		"deleting":             {snapshot.Status{Phase: snapshot.PhaseInProgress, Reason: snapshot.ReasonSnapshotDeleting, SnapshotRef: "snap-1"}, snapshot.CheckpointState{}, pmv1alpha1.PodMigrationJobPhaseSnapshotting, ""},
+		"failed":               {snapshot.Status{Phase: snapshot.PhaseFailed, Reason: "SnapshotFailed", Message: "dump failed"}, snapshot.CheckpointState{}, pmv1alpha1.PodMigrationJobPhaseFailed, "SnapshotFailed"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSnapshottingJob())
 			st := tc.status
 			f.provider.status = &st
+			f.provider.state = tc.state
 			if _, err := f.reconcile(t); err != nil {
 				t.Fatalf("Reconcile: %v", err)
 			}
 			job := f.job(t)
 			ready := meta.FindStatusCondition(job.Status.Conditions, "Ready")
+			if tc.wantReason == "" {
+				// Left to the usual handling, which confirms a deleting
+				// snapshot live; the fake has none, so the job waits.
+				if job.Status.Phase != tc.wantPhase || (ready != nil && ready.Reason == "PodNotFound") {
+					t.Fatalf("phase=%s Ready=%+v, want %s and not PodNotFound", job.Status.Phase, ready, tc.wantPhase)
+				}
+				return
+			}
 			if job.Status.Phase != tc.wantPhase || ready == nil || ready.Reason != tc.wantReason {
 				t.Fatalf("phase=%s Ready=%+v, want %s/%s", job.Status.Phase, ready, tc.wantPhase, tc.wantReason)
 			}
