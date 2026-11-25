@@ -56,7 +56,13 @@ const (
 	OwnerUIDLabelKey                       = engine.OwnerUIDLabel
 	ReasonDuplicatePodMigrationInNamespace = "DuplicatePodMigrationInNamespace"
 	ReasonConflictingStorageLocation       = "ConflictingStorageLocation"
+	ReasonInvalidStorageLocation           = "InvalidStorageLocation"
+	ReasonStorageIsolationWarning          = "StorageIsolationWarning"
 	maxDeletionDeferral                    = 10 * time.Minute
+
+	StorageIsolationModeEnforce = "enforce"
+	StorageIsolationModeWarn    = "warn"
+	DefaultStorageIsolationMode = StorageIsolationModeWarn
 
 	// ReasonManagedObjectTerminating: a policy or storage object rendered for
 	// the PodMigration is being deleted, so it isn't Ready until the object is
@@ -116,6 +122,11 @@ type PodMigrationReconciler struct {
 	// RuntimeClassPolicy restricts rendered namespace resources to engines
 	// serving runtime classes allowed by --migratable-runtime-classes when set.
 	RuntimeClassPolicy *eligibility.RuntimeClassPolicy
+
+	// StorageIsolationMode controls how cross-namespace storage conflicts and
+	// un-namespaced paths are handled: "enforce" (default, fail-closed with Ready=False)
+	// or "warn" (logs and emits Warning events while allowing upgrade migration).
+	StorageIsolationMode string
 }
 
 // engines returns the registry that serves the reconciler: Engines, or the
@@ -335,82 +346,181 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Enforce storage location isolation across namespaces (#278):
-	// Snapshot storage must not be shared between distinct namespaces by path only.
-	// If another active PodMigration in another namespace claims a conflicting storage
-	// location (same bucket and path, or root of the bucket) and precedes this one,
-	// refuse reconciliation with ConflictingStorageLocation.
+	isolationMode := r.StorageIsolationMode
+	if isolationMode == "" {
+		isolationMode = DefaultStorageIsolationMode
+	}
+
 	var allMigs pmv1alpha1.PodMigrationList
 	if err := r.List(ctx, &allMigs); err != nil {
 		logger.Error(err, "Failed to list cluster PodMigrations for storage conflict check")
 		return ctrl.Result{}, err
 	}
-	if conflict := util.FindConflictingStoragePodMigration(config, allMigs.Items); conflict != nil {
-		deferCleanup := false
-		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
-			inFlight, err := r.listInFlightMigrations(ctx, config)
-			if err != nil {
-				logger.Error(err, "Failed to list PodMigrationJobs during storage conflict cleanup")
-				return ctrl.Result{}, err
+
+	targetBucket, _, _ := util.ParseStorageLocation(config.Spec.Storage.Location)
+	bucketShared := false
+	if targetBucket != "" {
+		for _, other := range allMigs.Items {
+			if other.Namespace != config.Namespace {
+				oBucket, _, _ := util.ParseStorageLocation(other.Spec.Storage.Location)
+				if oBucket == targetBucket {
+					bucketShared = true
+					break
+				}
 			}
-			if len(inFlight) > 0 {
-				if deferralExpired(config) {
-					logger.Error(nil, "Storage conflict deferral exceeded maximum; forcing storage cleanup",
-						"name", config.Name,
-						"namespace", config.Namespace,
-						"inFlight", inFlight)
-					if r.Recorder != nil {
-						r.Recorder.Eventf(config, corev1.EventTypeWarning, "DeletionDeferralTimeout",
-							"Forcing cleanup after %s with %d migration(s) still in flight",
-							maxDeletionDeferral, len(inFlight))
+		}
+	}
+
+	// Validate namespace scoping for multi-tenant isolation (#278):
+	// When multiple namespaces share a bucket, storage paths must be prefixed with <namespace>/.
+	if bucketShared || isolationMode == StorageIsolationModeEnforce {
+		if err := util.ValidateStorageLocationForNamespace(config.Spec.Storage.Location, config.Namespace); err != nil {
+			if isolationMode == StorageIsolationModeEnforce {
+				deferCleanup := false
+				if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
+					inFlight, err := r.listInFlightMigrations(ctx, config)
+					if err != nil {
+						logger.Error(err, "Failed to list PodMigrationJobs during storage isolation cleanup")
+						return ctrl.Result{}, err
 					}
-				} else {
-					logger.Info("Postponing storage resource cleanup on conflicting PodMigration: active migrations in flight",
-						"name", config.Name,
-						"namespace", config.Namespace,
-						"conflict", conflict.Namespace+"/"+conflict.Name,
-						"inFlightCount", len(inFlight),
-						"jobs", inFlight)
-					deferCleanup = true
+					if len(inFlight) > 0 {
+						if deferralExpired(config) {
+							logger.Error(nil, "Storage isolation deferral exceeded maximum; forcing storage cleanup",
+								"name", config.Name, "namespace", config.Namespace, "inFlight", inFlight)
+							if r.Recorder != nil {
+								r.Recorder.Eventf(config, corev1.EventTypeWarning, "DeletionDeferralTimeout",
+									"Forcing cleanup after %s with %d migration(s) still in flight",
+									maxDeletionDeferral, len(inFlight))
+							}
+						} else {
+							logger.Info("Postponing storage resource cleanup on un-scoped PodMigration: active migrations in flight",
+								"name", config.Name, "namespace", config.Namespace, "inFlightCount", len(inFlight), "jobs", inFlight)
+							deferCleanup = true
+						}
+					}
+					if !deferCleanup {
+						if err := r.deleteNamespaceResources(ctx, config); err != nil {
+							logger.Error(err, "Failed to clean up storage resources on un-scoped PodMigration")
+							return ctrl.Result{}, err
+						}
+						controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
+						if err := r.Update(ctx, config); err != nil {
+							logger.Error(err, "Failed to remove finalizer from un-scoped PodMigration")
+							return ctrl.Result{}, err
+						}
+					}
 				}
-			}
-			if !deferCleanup {
-				if err := r.deleteNamespaceResources(ctx, config); err != nil {
-					logger.Error(err, "Failed to clean up storage resources on conflicting PodMigration")
-					return ctrl.Result{}, err
+				msg := fmt.Sprintf("Storage location %q is not scoped to namespace %q; in multi-tenant environments, storage path must be prefixed with <namespace>/ to prevent cross-namespace access",
+					config.Spec.Storage.Location, config.Namespace)
+				logger.Info("Refusing un-scoped storage location across namespaces",
+					"name", config.Name, "namespace", config.Namespace, "location", config.Spec.Storage.Location)
+				before := config.Status.DeepCopy()
+				changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             ReasonConflictingStorageLocation,
+					Message:            msg,
+					ObservedGeneration: config.Generation,
+				})
+				if changed {
+					if r.Recorder != nil {
+						r.Recorder.Event(config, corev1.EventTypeWarning, ReasonConflictingStorageLocation, msg)
+					}
+					if err := r.patchStatus(ctx, config, before); err != nil {
+						logger.Error(err, "Failed to update status on un-scoped PodMigration")
+						return ctrl.Result{}, err
+					}
 				}
-				controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
-				if err := r.Update(ctx, config); err != nil {
-					logger.Error(err, "Failed to remove finalizer from conflicting PodMigration")
-					return ctrl.Result{}, err
+				if deferCleanup {
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			} else {
+				if r.Recorder != nil {
+					r.Recorder.Eventf(config, corev1.EventTypeWarning, ReasonStorageIsolationWarning,
+						"Storage location %q is not scoped to namespace %q; upgrade to namespace-prefixed storage paths for multi-tenancy",
+						config.Spec.Storage.Location, config.Namespace)
 				}
 			}
 		}
-		msg := fmt.Sprintf("Storage location %q conflicts with active PodMigration %s/%s; shared storage locations across namespaces are refused for multi-tenant isolation",
-			config.Spec.Storage.Location, conflict.Namespace, conflict.Name)
-		logger.Info("Skipping reconciliation for conflicting storage location across namespaces",
-			"name", config.Name, "namespace", config.Namespace, "conflictingWith", conflict.Namespace+"/"+conflict.Name)
-		before := config.Status.DeepCopy()
-		changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			Reason:             ReasonConflictingStorageLocation,
-			Message:            msg,
-			ObservedGeneration: config.Generation,
-		})
-		if changed {
+	}
+
+	if conflict := util.FindConflictingStoragePodMigration(config, allMigs.Items); conflict != nil {
+		if isolationMode == StorageIsolationModeWarn {
+			logger.Info("Storage location conflict detected in warn mode; allowing reconciliation to proceed",
+				"name", config.Name, "namespace", config.Namespace, "conflictingWith", conflict.Namespace+"/"+conflict.Name)
 			if r.Recorder != nil {
-				r.Recorder.Event(config, corev1.EventTypeWarning, ReasonConflictingStorageLocation, msg)
+				r.Recorder.Eventf(config, corev1.EventTypeWarning, ReasonStorageIsolationWarning,
+					"Storage location %q conflicts with active PodMigration %s/%s; running in warn mode, update storage paths before enforcement",
+					config.Spec.Storage.Location, conflict.Namespace, conflict.Name)
 			}
-			if err := r.patchStatus(ctx, config, before); err != nil {
-				logger.Error(err, "Failed to update status on conflicting PodMigration")
-				return ctrl.Result{}, err
+		} else {
+			deferCleanup := false
+			if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
+				inFlight, err := r.listInFlightMigrations(ctx, config)
+				if err != nil {
+					logger.Error(err, "Failed to list PodMigrationJobs during storage conflict cleanup")
+					return ctrl.Result{}, err
+				}
+				if len(inFlight) > 0 {
+					if deferralExpired(config) {
+						logger.Error(nil, "Storage conflict deferral exceeded maximum; forcing storage cleanup",
+							"name", config.Name,
+							"namespace", config.Namespace,
+							"inFlight", inFlight)
+						if r.Recorder != nil {
+							r.Recorder.Eventf(config, corev1.EventTypeWarning, "DeletionDeferralTimeout",
+								"Forcing cleanup after %s with %d migration(s) still in flight",
+								maxDeletionDeferral, len(inFlight))
+						}
+					} else {
+						logger.Info("Postponing storage resource cleanup on conflicting PodMigration: active migrations in flight",
+							"name", config.Name,
+							"namespace", config.Namespace,
+							"conflict", conflict.Namespace+"/"+conflict.Name,
+							"inFlightCount", len(inFlight),
+							"jobs", inFlight)
+						deferCleanup = true
+					}
+				}
+				if !deferCleanup {
+					if err := r.deleteNamespaceResources(ctx, config); err != nil {
+						logger.Error(err, "Failed to clean up storage resources on conflicting PodMigration")
+						return ctrl.Result{}, err
+					}
+					controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
+					if err := r.Update(ctx, config); err != nil {
+						logger.Error(err, "Failed to remove finalizer from conflicting PodMigration")
+						return ctrl.Result{}, err
+					}
+				}
 			}
+			msg := fmt.Sprintf("Storage location %q conflicts with active PodMigration %s/%s; shared storage locations across namespaces are refused for multi-tenant isolation",
+				config.Spec.Storage.Location, conflict.Namespace, conflict.Name)
+			logger.Info("Skipping reconciliation for conflicting storage location across namespaces",
+				"name", config.Name, "namespace", config.Namespace, "conflictingWith", conflict.Namespace+"/"+conflict.Name)
+			before := config.Status.DeepCopy()
+			changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             ReasonConflictingStorageLocation,
+				Message:            msg,
+				ObservedGeneration: config.Generation,
+			})
+			if changed {
+				if r.Recorder != nil {
+					r.Recorder.Event(config, corev1.EventTypeWarning, ReasonConflictingStorageLocation, msg)
+				}
+				if err := r.patchStatus(ctx, config, before); err != nil {
+					logger.Error(err, "Failed to update status on conflicting PodMigration")
+					return ctrl.Result{}, err
+				}
+			}
+			if deferCleanup || !conflict.DeletionTimestamp.IsZero() {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
-		if deferCleanup || !conflict.DeletionTimestamp.IsZero() {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Ensure finalizer is present

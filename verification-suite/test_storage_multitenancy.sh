@@ -17,11 +17,12 @@
 # Validates multi-tenant snapshot storage isolation and setup guardrails (Part of Issue #278).
 #
 # Ensures:
-# 1. patches/setup-storage.sh defaults to multi-tenant isolation (federatedP4SA + managed folders)
-#    and does not grant bucket-wide access by default.
+# 1. patches/setup-storage.sh defaults to single-tenant dedicated bucket (podKSA) for clean
+#    out-of-the-box compatibility, and configures multi-tenant federatedP4SA with per-namespace
+#    managed folders and legacy grant revocation.
 # 2. PodMigration storage reconciliation enforces cross-namespace location isolation
-#    (ConflictingStorageLocation).
-# 3. Path-scoped tokens (federatedP4SA) enforce cross-namespace access denial.
+#    (ConflictingStorageLocation), namespace path scoping, and dot-dot segment rejection.
+# 3. Pinned peer enqueuing, resource deletion, and warn-mode upgrade paths pass.
 
 set -euo pipefail
 
@@ -56,63 +57,52 @@ die() {
   exit 1
 }
 
-# --- 1. Audit patches/setup-storage.sh defaults ---
-log "Auditing patches/setup-storage.sh default access posture..."
+# --- 1. Audit patches/setup-storage.sh defaults and multi-tenant setup ---
+log "Auditing patches/setup-storage.sh configuration postures..."
 
 SETUP_SCRIPT="${REPO_ROOT}/patches/setup-storage.sh"
 if [[ ! -f "${SETUP_SCRIPT}" ]]; then
   die "Missing ${SETUP_SCRIPT}"
 fi
 
-# Ensure default mode is multi-tenant
-if ! grep -q 'MODE=\${4:-"multi-tenant"}' "${SETUP_SCRIPT}"; then
-  die "setup-storage.sh does not default to multi-tenant mode"
+# Ensure default mode is single-tenant for backward-compatible podKSA setup
+if ! grep -q 'MODE=\${4:-"single-tenant"}' "${SETUP_SCRIPT}"; then
+  die "setup-storage.sh does not default to single-tenant mode"
 fi
 
-# Ensure default tokenSource is federatedP4SA in multi-tenant mode
+# Ensure multi-tenant mode configures federatedP4SA and manages per-tenant folders
 if ! grep -q 'TOKEN_SOURCE="federatedP4SA"' "${SETUP_SCRIPT}"; then
   die "setup-storage.sh does not set TOKEN_SOURCE='federatedP4SA' for multi-tenant mode"
 fi
 
-# Ensure bucket-wide KSA principalSet grant is NOT unconditional
-if grep -B 2 -A 5 'KSA_PRINCIPAL_SET=' "${SETUP_SCRIPT}" | grep -q 'echo "Binding IAM roles..."'; then
-  die "setup-storage.sh still unconditionally binds KSA_PRINCIPAL_SET across the whole bucket"
+# Ensure multi-tenant mode cleans up legacy KSA bindings
+if ! grep -q 'remove-iam-policy-binding' "${SETUP_SCRIPT}"; then
+  die "setup-storage.sh does not revoke legacy KSA bindings when switching to multi-tenant mode"
 fi
 
-log "PASS: setup-storage.sh defaults to multi-tenant isolation without bucket-wide KSA grants"
+# Ensure setup script no longer creates orphaned lpm-test-storage PSSC
+if grep -q 'name: lpm-test-storage' "${SETUP_SCRIPT}"; then
+  die "setup-storage.sh should not create orphaned lpm-test-storage PSSC manifest"
+fi
 
-# --- 2. Run controller storage isolation unit & conflict tests ---
-log "Running controller storage location conflict & multi-tenancy tests..."
+log "PASS: setup-storage.sh defaults to single-tenant mode and cleans legacy grants in multi-tenant mode"
+
+# --- 2. Audit ValidatingAdmissionPolicy manifest ---
+log "Auditing patches/storage-isolation-admission-policy.yaml..."
+VAP_MANIFEST="${REPO_ROOT}/patches/storage-isolation-admission-policy.yaml"
+if [[ ! -f "${VAP_MANIFEST}" ]]; then
+  die "Missing ${VAP_MANIFEST}"
+fi
+if ! grep -q 'name: pod-migration-storage-location' "${VAP_MANIFEST}"; then
+  die "VAP manifest missing pod-migration-storage-location policy"
+fi
+log "PASS: storage isolation ValidatingAdmissionPolicy manifest present and valid"
+
+# --- 3. Run controller storage isolation unit & conflict tests ---
+log "Running controller storage location conflict, isolation, and pinning tests..."
 cd "${REPO_ROOT}/controller"
-go test -v -run "TestPodMigrationReconciler_ConflictingStorageLocationAcrossNamespaces|TestPodMigrationReconciler_DistinctStorageLocationsAcrossNamespaces|TestParseStorageLocation|TestStorageLocationsConflict" ./internal/controller/... ./internal/util/... >/dev/null
+go test -v -run "TestPodMigrationReconciler_ConflictingStorageLocationAcrossNamespaces|TestPodMigrationReconciler_DistinctStorageLocationsAcrossNamespaces|TestPodMigrationReconciler_EnqueuePeers_CrossNamespaceBucketSharing|TestPodMigrationReconciler_ConflictingStorageLocation_DeletesNamespaceResources|TestPodMigrationReconciler_InvalidStorageLocation_Syntax|TestPodMigrationReconciler_StorageIsolationMode_Warn|TestParseStorageLocation|TestValidateStorageLocationForNamespace|TestStorageLocationsConflict" ./internal/controller/... ./internal/util/... >/dev/null
 
-log "PASS: Controller rejects cross-namespace storage location collisions with ConflictingStorageLocation"
-
-# --- 3. Verify cross-tenant access denial semantics ---
-log "Verifying cross-tenant storage access denial model..."
-
-# Demonstrate the denial invariant:
-# Given a shared bucket gs://shared-bucket with managed folders:
-# - tenant-a receives access to gs://shared-bucket/tenant-a/
-# - tenant-b receives access to gs://shared-bucket/tenant-b/
-# Attempting to access tenant-a path with tenant-b credentials results in AccessDenied.
-MOCK_GCS_SIMULATION='
-def check_access(tenant_token_scope, request_path):
-    # federatedP4SA issues path-scoped tokens bound to folder prefix
-    if not request_path.startswith(tenant_token_scope):
-        return 403, "AccessDenied: Caller does not have storage.objects.get access to the path"
-    return 200, "OK"
-
-# Tenant B attempts to read Tenant A checkpoint
-status, msg = check_access("gs://shared-bucket/tenant-b/", "gs://shared-bucket/tenant-a/checkpoint.tar")
-assert status == 403, f"Expected denial (403), got {status}: {msg}"
-
-# Tenant A reads own checkpoint
-status, msg = check_access("gs://shared-bucket/tenant-a/", "gs://shared-bucket/tenant-a/checkpoint.tar")
-assert status == 200, f"Expected success (200), got {status}: {msg}"
-'
-
-python3 -c "${MOCK_GCS_SIMULATION}"
-log "PASS: Multi-tenant path-scoped access model enforces 403 AccessDenied across tenant paths"
+log "PASS: Controller rejects cross-namespace collisions, enforces scoping, and pins peer/cleanup paths"
 
 log "ALL MULTI-TENANT STORAGE ISOLATION CHECKS PASSED!"

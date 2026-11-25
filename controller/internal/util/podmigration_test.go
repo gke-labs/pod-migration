@@ -84,6 +84,13 @@ func TestParseStorageLocation(t *testing.T) {
 		{"gs://my-bucket/snapshots", "my-bucket", "snapshots", false},
 		{"gs://my-bucket/snapshots/", "my-bucket", "snapshots", false},
 		{"gs://my-bucket/tenant-a/subpath", "my-bucket", "tenant-a/subpath", false},
+		{"gs://my-bucket/.", "", "", true},
+		{"gs://my-bucket/..", "", "", true},
+		{"gs://my-bucket/tenant-a/.", "", "", true},
+		{"gs://my-bucket/tenant-a/..", "", "", true},
+		{"gs://my-bucket/tenant-a/../tenant-b", "", "", true},
+		{"gs://my-bucket/tenant-a/./sub", "", "", true},
+		{"gs://my-bucket/tenant-a//sub", "", "", true},
 		{"s3://my-bucket", "", "", true},
 		{"gs://", "", "", true},
 		{"gs:///path", "", "", true},
@@ -98,6 +105,33 @@ func TestParseStorageLocation(t *testing.T) {
 			}
 			if b != tc.wantBucket || p != tc.wantPath {
 				t.Errorf("ParseStorageLocation(%q) = (%q, %q), want (%q, %q)", tc.input, b, p, tc.wantBucket, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestValidateStorageLocationForNamespace(t *testing.T) {
+	tests := []struct {
+		name        string
+		location    string
+		namespace   string
+		expectError bool
+	}{
+		{"root bucket allowed", "gs://my-bucket", "tenant-a", false},
+		{"root bucket with trailing slash allowed", "gs://my-bucket/", "tenant-a", false},
+		{"exact namespace path", "gs://my-bucket/tenant-a", "tenant-a", false},
+		{"nested namespace path", "gs://my-bucket/tenant-a/snapshots", "tenant-a", false},
+		{"cross-namespace mismatch", "gs://my-bucket/tenant-b", "tenant-a", true},
+		{"cross-namespace nested mismatch", "gs://my-bucket/tenant-b/snapshots", "tenant-a", true},
+		{"partial name match mismatch", "gs://my-bucket/tenant-a-other", "tenant-a", true},
+		{"invalid syntax dot-dot", "gs://my-bucket/tenant-a/../tenant-b", "tenant-a", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateStorageLocationForNamespace(tc.location, tc.namespace)
+			if (err != nil) != tc.expectError {
+				t.Errorf("ValidateStorageLocationForNamespace(%q, %q) error = %v, expectError = %v", tc.location, tc.namespace, err, tc.expectError)
 			}
 		})
 	}

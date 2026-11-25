@@ -82,7 +82,8 @@ func PodMigrationPrecedes(a, b *pmv1alpha1.PodMigration) bool {
 
 // ParseStorageLocation parses a storage location URI (e.g. gs://bucket/path) into
 // bucket and clean path without leading or trailing slashes. It returns an error if
-// the location does not start with gs:// or has an empty bucket name.
+// the location does not start with gs://, has an empty bucket name, or contains
+// invalid path segments ('.', '..', or empty segments from consecutive slashes).
 func ParseStorageLocation(location string) (bucket, path string, err error) {
 	if !strings.HasPrefix(location, "gs://") {
 		return "", "", fmt.Errorf("invalid GCS location: %s (must start with gs://)", location)
@@ -94,9 +95,42 @@ func ParseStorageLocation(location string) (bucket, path string, err error) {
 		return "", "", fmt.Errorf("invalid GCS location: %s (missing bucket name)", location)
 	}
 	if len(parts) > 1 {
-		path = strings.Trim(strings.TrimSpace(parts[1]), "/")
+		rawPath := strings.Trim(strings.TrimSpace(parts[1]), "/")
+		if rawPath != "" {
+			segments := strings.Split(rawPath, "/")
+			cleanSegments := make([]string, 0, len(segments))
+			for _, seg := range segments {
+				s := strings.TrimSpace(seg)
+				if s == "" || s == "." || s == ".." {
+					return "", "", fmt.Errorf("invalid storage path %q: path segments must not be '.', '..', or empty", rawPath)
+				}
+				cleanSegments = append(cleanSegments, s)
+			}
+			path = strings.Join(cleanSegments, "/")
+		}
 	}
 	return bucket, path, nil
+}
+
+// ValidateStorageLocationForNamespace checks that the storage location path is
+// properly scoped to the given namespace for multi-tenant isolation.
+// When a path is specified, the first path segment must match the namespace
+// (e.g. gs://bucket/<namespace> or gs://bucket/<namespace>/...).
+// An empty path (targeting the root bucket) is only valid in single-tenant mode
+// where the entire bucket is dedicated to one namespace.
+func ValidateStorageLocationForNamespace(location, namespace string) error {
+	_, path, err := ParseStorageLocation(location)
+	if err != nil {
+		return err
+	}
+	if path == "" {
+		return nil
+	}
+	segments := strings.Split(path, "/")
+	if segments[0] != namespace {
+		return fmt.Errorf("storage location path %q is not scoped to namespace %q (first path segment must be %q)", path, namespace, namespace)
+	}
+	return nil
 }
 
 // StorageLocationsConflict reports whether two parsed GCS locations conflict.

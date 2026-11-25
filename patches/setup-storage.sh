@@ -16,11 +16,12 @@
 set -e
 set -o pipefail
 
-# Accept Project ID, Bucket Name, Region, and Mode as optional arguments
+# Accept Project ID, Bucket Name, Region, Mode, and Tenant Namespaces as optional arguments
 PROJECT_ID=${1:-$(gcloud config get-value project 2>/dev/null)}
 BUCKET_NAME=${2:-"${PROJECT_ID}-podsnapshots"}
 REGION=${3:-"us-central1"}
-MODE=${4:-"multi-tenant"} # "multi-tenant" (default, federatedP4SA + managed folders) or "single-tenant" (podKSA)
+MODE=${4:-"single-tenant"} # "single-tenant" (default, podKSA on dedicated bucket) or "multi-tenant" (federatedP4SA + managed folders)
+TENANT_NAMESPACES=${5:-"default"} # Comma-separated list of tenant namespaces for multi-tenant managed folders
 
 if [ -z "$PROJECT_ID" ]; then
   echo "Error: Project ID is required. Please set it via argument or configure gcloud: gcloud config set project <PROJECT_ID>" >&2
@@ -75,8 +76,25 @@ if [ "$MODE" = "multi-tenant" ]; then
     --role="roles/storage.admin" \
     --quiet
 
-  echo "Creating managed folder for namespace 'snapshots'..."
-  gcloud storage managed-folders create "gs://${BUCKET_NAME}/snapshots" --project="${PROJECT_ID}" 2>/dev/null || true
+  # Revoke legacy bucket-wide workload KSA bindings if present from prior single-tenant runs
+  KSA_PRINCIPAL_SET="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/namespace/default"
+  echo "Revoking legacy bucket-wide KSA IAM bindings if present..."
+  for role in "roles/storage.objectUser" "roles/storage.bucketViewer"; do
+    gcloud storage buckets remove-iam-policy-binding "gs://${BUCKET_NAME}" \
+      --member="${KSA_PRINCIPAL_SET}" \
+      --role="${role}" \
+      --quiet 2>/dev/null || true
+  done
+
+  # Create managed folders for each tenant namespace
+  IFS=',' read -ra NAMESPACES <<< "${TENANT_NAMESPACES}"
+  for ns in "${NAMESPACES[@]}"; do
+    ns_clean=$(echo "$ns" | tr -d ' ')
+    if [ -n "$ns_clean" ]; then
+      echo "Creating managed folder for namespace '${ns_clean}': gs://${BUCKET_NAME}/${ns_clean}..."
+      gcloud storage managed-folders create "gs://${BUCKET_NAME}/${ns_clean}" --project="${PROJECT_ID}" 2>/dev/null || true
+    fi
+  done
 
   TOKEN_SOURCE="federatedP4SA"
 else
@@ -98,19 +116,15 @@ fi
 echo "Creating Kubernetes Service Account pm-test-ksa..."
 kubectl create serviceaccount pm-test-ksa --namespace default --dry-run=client -o yaml | kubectl apply -f -
 
-# 3. Generate and apply the PodSnapshotStorageConfig manifest
-echo "Applying PodSnapshotStorageConfig with tokenSource: ${TOKEN_SOURCE}..."
-cat <<EOF | kubectl apply -f -
-apiVersion: podsnapshot.gke.io/v1
-kind: PodSnapshotStorageConfig
-metadata:
-  name: lpm-test-storage
-spec:
-  snapshotStorageConfig:
-    gcs:
-      bucket: ${BUCKET_NAME}
-      path: snapshots
-      tokenSource: ${TOKEN_SOURCE}
-EOF
-
 echo "Storage setup complete (${MODE} mode, tokenSource: ${TOKEN_SOURCE})!"
+if [ "$MODE" = "multi-tenant" ]; then
+  echo "Next steps for multi-tenancy:"
+  echo "1. Apply controller/deploy.yaml to deploy the controller."
+  echo "2. Configure PodMigration in each tenant namespace with:"
+  echo "     spec.storage.tokenSource: 'federatedP4SA'"
+  echo "     spec.storage.location: 'gs://${BUCKET_NAME}/<namespace>/snapshots'"
+else
+  echo "Next steps for single-tenant mode:"
+  echo "1. Apply controller/deploy.yaml to deploy the controller."
+  echo "2. Apply controller/podmigration-config.yaml configured with gs://${BUCKET_NAME}/default/snapshots."
+fi
