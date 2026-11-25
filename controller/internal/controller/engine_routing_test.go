@@ -828,6 +828,7 @@ func TestNodePreemptionReconciler_UnfencedEngineRequiresPodOptIn(t *testing.T) {
 			}
 
 			beforeSkipped := testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unfenced_engine"))
+			beforeGenSkipped := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("unfenced_engine", "routed"))
 			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "spot-node-fencing"}}); err != nil {
 				t.Fatalf("Reconcile: %v", err)
 			}
@@ -860,6 +861,9 @@ func TestNodePreemptionReconciler_UnfencedEngineRequiresPodOptIn(t *testing.T) {
 			}
 			if gotDiff := testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unfenced_engine")) - beforeSkipped; gotDiff != tt.wantSkippedDiff {
 				t.Errorf("SpotPreemptionSkippedTotal[unfenced_engine] diff = %v, want %v", gotDiff, tt.wantSkippedDiff)
+			}
+			if gotDiff := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("unfenced_engine", "routed")) - beforeGenSkipped; gotDiff != tt.wantSkippedDiff {
+				t.Errorf("SkippedMigrationsTotal[unfenced_engine, routed] diff = %v, want %v", gotDiff, tt.wantSkippedDiff)
 			}
 		})
 	}

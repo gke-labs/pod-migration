@@ -35,6 +35,7 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
+	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -144,6 +145,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	// Check if feature is enabled for this pod
 	if !util.IsPodMigrationEnabled(pod) {
 		logger.Info("Feature not enabled for pod, allowing eviction")
+		metrics.RecordMigrationSkipped("not_opted_in", "none")
 		return admission.Allowed("feature not enabled")
 	}
 
@@ -152,13 +154,25 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		runtimeClass := eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName)
 		logger.Info("Pod runtime class is not migratable, allowing eviction immediately",
 			"runtimeClass", runtimeClass, "migratableRuntimeClasses", a.Eligibility.String())
+		metrics.RecordMigrationSkipped("unsupported_runtime", "none")
 		return admission.Allowed(fmt.Sprintf("Pod runtime class %s is not migratable (allowed: %s), skipping migration",
 			runtimeClass, a.Eligibility.String()))
+	}
+
+	engineNameForPod := func() string {
+		pm, err := util.ActivePodMigration(ctx, a.Client, pod.Namespace)
+		if err == nil && pm != nil {
+			if eng, ok := a.engineFor(pod, pm); ok && eng != nil {
+				return eng.Name()
+			}
+		}
+		return "none"
 	}
 
 	// Check if this pod already had a migration that timed out waiting for PDB
 	if util.HasPDBEvictionTimedOut(pod) {
 		logger.Info("Prior migration for pod timed out on PDB budget, skipping re-snapshot and allowing eviction", "pod", req.Name)
+		metrics.RecordMigrationSkipped("pdb_timed_out", engineNameForPod())
 		return admission.Allowed("skipping migration: prior migration timed out on PDB budget")
 	}
 
@@ -246,6 +260,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	// lookup so an already-running migration is never interrupted.
 	if !util.AreReadinessGatesSatisfied(pod) {
 		logger.Info("Pod readiness gates are not satisfied, skipping migration and allowing eviction", "pod", req.Name)
+		metrics.RecordMigrationSkipped("readiness_gates_unsatisfied", engineNameForPod())
 		return admission.Allowed("skipping migration: pod readiness gates not satisfied")
 	}
 
@@ -262,6 +277,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	if !ok {
 		runtimeClass := eligibility.RuntimeClassLabel(pod.Spec.RuntimeClassName)
 		logger.Info("No snapshot engine serves the pod's runtime class, allowing eviction immediately", "runtimeClass", runtimeClass)
+		metrics.RecordMigrationSkipped("unsupported_runtime", "none")
 		return admission.Allowed(fmt.Sprintf("No snapshot engine serves runtime class %s, skipping migration", runtimeClass))
 	}
 	var sourceNode *corev1.Node
@@ -281,6 +297,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedIneligible",
 				"Snapshot engine %s can't migrate the pod: %s; allowing cold eviction", eng.Name(), verdict.Reason)
 		}
+		metrics.RecordMigrationSkipped(engine.ClassifyEligibilityVerdict(verdict), eng.Name())
 		return admission.Allowed(verdict.Reason)
 	}
 	if ok, reason := engine.AllowsFencing(pod, eng); !ok {
@@ -289,6 +306,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 		if a.Recorder != nil {
 			a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedUnfencedEngine", "%s; allowing cold eviction", reason)
 		}
+		metrics.RecordMigrationSkipped("unfenced_engine", eng.Name())
 		return admission.Allowed(fmt.Sprintf("skipping migration: %s", reason))
 	}
 
@@ -309,6 +327,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 				a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedNoReplicaKey",
 					"Pod is owned by operator %s/%s but has no resolvable replica identity key; allowing cold eviction", parentKind, parentName)
 			}
+			metrics.RecordMigrationSkipped("no_replica_key", eng.Name())
 			return admission.Allowed("skipping migration: operator-owned pod has no resolvable replica identity key")
 		}
 
@@ -324,6 +343,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 				a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedAmbiguousReplicaKey",
 					"Operator-owned pod replica identity %q is shared with sibling pod %s; refusing migration and allowing cold eviction", replicaKey, siblingName)
 			}
+			metrics.RecordMigrationSkipped("ambiguous_replica_key", eng.Name())
 			return admission.Allowed(fmt.Sprintf("skipping migration: operator-owned pod replica identity %q is ambiguous (shared with sibling pod %s)", replicaKey, siblingName))
 		}
 
@@ -339,6 +359,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 				a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedAmbiguousReplicaKey",
 					"Operator-owned pod replica identity %q is already in-flight under migration job %s; refusing migration and allowing cold eviction", replicaKey, existingPMJName)
 			}
+			metrics.RecordMigrationSkipped("ambiguous_replica_key", eng.Name())
 			return admission.Allowed(fmt.Sprintf("skipping migration: operator-owned pod replica identity %q already in flight on job %s", replicaKey, existingPMJName))
 		}
 	}
@@ -358,6 +379,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			a.Recorder.Event(pod, corev1.EventTypeWarning, "MigrationSkippedNoPolicy",
 				"Pod is opted into live migration, but no matching Ready manual+stop PodSnapshotPolicy was found; allowing cold eviction")
 		}
+		metrics.RecordMigrationSkipped("no_ready_policy", eng.Name())
 		return admission.Allowed("skipping migration: no valid manual+stop policy found")
 	}
 

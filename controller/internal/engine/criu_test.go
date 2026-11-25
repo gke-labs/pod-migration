@@ -127,20 +127,20 @@ func TestCRIU_Eligible(t *testing.T) {
 	if v := e.Eligible(singlePod, readyNode); !v.OK {
 		t.Errorf("Eligible(singlePod, readyNode) = %+v, want OK", v)
 	}
-	if v := e.Eligible(singlePod, nil); v.OK {
-		t.Errorf("Eligible(singlePod with NodeName, nil node) = %+v, want refused (fail-closed)", v)
+	if v := e.Eligible(singlePod, nil); v.OK || v.Code != "node_not_ready" {
+		t.Errorf("Eligible(singlePod with NodeName, nil node) = %+v, want refused with Code=node_not_ready", v)
 	}
-	if v := e.Eligible(unscheduledPod, nil); v.OK {
-		t.Errorf("Eligible(unscheduledPod, nil node) = %+v, want refused (fail-closed)", v)
+	if v := e.Eligible(unscheduledPod, nil); v.OK || v.Code != "node_not_ready" {
+		t.Errorf("Eligible(unscheduledPod, nil node) = %+v, want refused with Code=node_not_ready", v)
 	}
-	if v := e.Eligible(singlePod, unreadyNode); v.OK {
-		t.Errorf("Eligible(singlePod, unreadyNode) = %+v, want refused", v)
+	if v := e.Eligible(singlePod, unreadyNode); v.OK || v.Code != "node_not_ready" {
+		t.Errorf("Eligible(singlePod, unreadyNode) = %+v, want refused with Code=node_not_ready", v)
 	}
-	if v := e.Eligible(multiPod, readyNode); v.OK {
-		t.Errorf("Eligible(multiPod, readyNode) = %+v, want refused", v)
+	if v := e.Eligible(multiPod, readyNode); v.OK || v.Code != "multi_container" {
+		t.Errorf("Eligible(multiPod, readyNode) = %+v, want refused with Code=multi_container", v)
 	}
-	if v := e.Eligible(nativeSidecarPod, readyNode); v.OK {
-		t.Errorf("Eligible(nativeSidecarPod, readyNode) = %+v, want refused", v)
+	if v := e.Eligible(nativeSidecarPod, readyNode); v.OK || v.Code != "multi_container" {
+		t.Errorf("Eligible(nativeSidecarPod, readyNode) = %+v, want refused with Code=multi_container", v)
 	}
 }
 
@@ -174,12 +174,14 @@ func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
 		name       string
 		mutate     func(*corev1.Pod)
 		wantOK     bool
+		wantCode   string
 		wantReason string // a substring of the refusal
 	}{
 		{name: "plain single-container pod with a command", mutate: func(*corev1.Pod) {}, wantOK: true},
 		{
 			name:       "hostNetwork",
 			mutate:     func(p *corev1.Pod) { p.Spec.HostNetwork = true },
+			wantCode:   "host_network",
 			wantReason: "hostNetwork",
 		},
 		{
@@ -187,6 +189,7 @@ func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
 			mutate: func(p *corev1.Pod) {
 				p.Annotations = map[string]string{CRIURestoreStatusAnnotation: CRIURestoreStatusRestored}
 			},
+			wantCode:   "already_restored",
 			wantReason: "already restored or wrapped",
 		},
 		{
@@ -194,6 +197,7 @@ func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
 			mutate: func(p *corev1.Pod) {
 				p.Annotations = map[string]string{CRIURestoreStatusAnnotation: " " + CRIURestoreStatusRestored + "\n"}
 			},
+			wantCode:   "already_restored",
 			wantReason: "already restored or wrapped",
 		},
 		{
@@ -201,6 +205,7 @@ func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
 			mutate: func(p *corev1.Pod) {
 				p.Annotations = map[string]string{CRIUInjectedAnnotation: "true"}
 			},
+			wantCode:   "already_restored",
 			wantReason: "already restored or wrapped",
 		},
 		{
@@ -211,6 +216,7 @@ func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
 					CRIURestoreStatusAnnotation: CRIURestoreStatusFailed,
 				}
 			},
+			wantCode:   "already_restored",
 			wantReason: "already restored or wrapped",
 		},
 		{
@@ -229,6 +235,7 @@ func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
 		{
 			name:       "container without an explicit command",
 			mutate:     func(p *corev1.Pod) { p.Spec.Containers[0].Command = nil },
+			wantCode:   "missing_command",
 			wantReason: "explicit command",
 		},
 		{
@@ -237,6 +244,7 @@ func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
 				p.Spec.Containers[0].Command = []string{}
 				p.Spec.Containers[0].Args = []string{"--serve"}
 			},
+			wantCode:   "missing_command",
 			wantReason: "explicit command",
 		},
 	} {
@@ -246,6 +254,9 @@ func TestCRIU_EligibleMirrorsEngineRefusals(t *testing.T) {
 			got := e.Eligible(pod, readyNode)
 			if got.OK != tc.wantOK {
 				t.Fatalf("Eligible = %+v, want OK=%v", got, tc.wantOK)
+			}
+			if tc.wantCode != "" && got.Code != tc.wantCode {
+				t.Fatalf("Eligible Code = %q, want %q", got.Code, tc.wantCode)
 			}
 			if !tc.wantOK && !strings.Contains(got.Reason, tc.wantReason) {
 				t.Errorf("Eligible reason = %q, want it to contain %q", got.Reason, tc.wantReason)

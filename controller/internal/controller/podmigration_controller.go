@@ -44,6 +44,7 @@ import (
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/invariants"
+	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -187,6 +188,12 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			r.InvariantEngine.ForgetObject("PodMigrationReconciler", "mig", req.Namespace, req.Name)
+			var migList pmv1alpha1.PodMigrationList
+			if listErr := r.List(ctx, &migList, client.InNamespace(req.Namespace)); listErr == nil {
+				if selectActivePodMigration(migList.Items) == nil {
+					metrics.ClearNamespaceCoverage(req.Namespace)
+				}
+			}
 			logger.Info("PodMigration resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
@@ -250,6 +257,18 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				return ctrl.Result{}, err
 			}
 
+			var remainingList pmv1alpha1.PodMigrationList
+			if listErr := r.List(ctx, &remainingList, client.InNamespace(config.Namespace)); listErr == nil {
+				var activeCandidates []pmv1alpha1.PodMigration
+				for _, item := range remainingList.Items {
+					if item.Name != config.Name && item.DeletionTimestamp.IsZero() {
+						activeCandidates = append(activeCandidates, item)
+					}
+				}
+				if selectActivePodMigration(activeCandidates) == nil {
+					metrics.ClearNamespaceCoverage(config.Namespace)
+				}
+			}
 			controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
 			if err := r.Update(ctx, config); err != nil {
 				logger.Error(err, "Failed to remove finalizer from PodMigration")
@@ -433,7 +452,15 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	r.updateCoverageMetrics(ctx, config, registry)
+
 	return ctrl.Result{}, nil
+}
+
+func (r *PodMigrationReconciler) updateCoverageMetrics(ctx context.Context, config *pmv1alpha1.PodMigration, registry *engine.Registry) {
+	if err := ComputeCoverageForNamespace(ctx, r.Client, config, registry, r.RuntimeClassPolicy); err != nil {
+		log.FromContext(ctx).Error(err, "Skipping coverage metrics update on transient or list error", "namespace", config.Namespace)
+	}
 }
 
 // patchStatus writes the changes that this reconcile made to config's status
