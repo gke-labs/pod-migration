@@ -931,7 +931,7 @@ func TestPodMigrationReconciler_SkipsUnallowedRuntimeClassesAtRenderTime(t *test
 			Annotations: map[string]string{engine.AnnotationRuntimeClassEngines: "runc=criu"},
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://test-bucket/snaps"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://test-bucket/" + ns + "/snaps"},
 		},
 	}
 	cl := fake.NewClientBuilder().

@@ -1090,7 +1090,7 @@ func TestT1_EnvtestFaultInjectionMatrix(t *testing.T) {
 			},
 			Spec: pmv1alpha1.PodMigrationSpec{
 				Storage: pmv1alpha1.StorageSpec{
-					Location: "gs://test-bucket-s5/checkpoints",
+					Location: "gs://test-bucket-s5/" + ns + "/checkpoints",
 				},
 			},
 		}

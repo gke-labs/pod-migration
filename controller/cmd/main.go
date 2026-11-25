@@ -316,13 +316,13 @@ func main() {
 	logEngineRoutes(engines, runtimeClassPolicy, len(runtimeClassRoutes) == 0)
 
 	if err := (&controller.PodMigrationReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Recorder:             eventRecorder,
-		InvariantEngine:      invariantEngine,
-		Engines:              engines,
-		RuntimeClassPolicy:   runtimeClassPolicy,
-		StorageIsolationMode: storageIsolationMode,
+		Client:                 mgr.GetClient(),
+		Scheme:                 mgr.GetScheme(),
+		Recorder:               eventRecorder,
+		InvariantEngine:        invariantEngine,
+		Engines:                engines,
+		RuntimeClassPolicy:     runtimeClassPolicy,
+		StorageIsolationMode:   storageIsolationMode,
 		AllowBucketRootStorage: allowBucketRootStorage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")

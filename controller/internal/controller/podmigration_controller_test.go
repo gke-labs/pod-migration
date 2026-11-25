@@ -2468,9 +2468,13 @@ func newSyncTestClient(scheme *runtime.Scheme, objs ...client.Object) client.Wit
 // wantPSSCSpec and wantPSPSpec mirror the payloads Reconcile writes for
 // syncTestPodMigration.
 func wantPSSCSpec() map[string]interface{} {
+	return wantPSSCSpecFor("default")
+}
+
+func wantPSSCSpecFor(namespace string) map[string]interface{} {
 	return map[string]interface{}{
 		"snapshotStorageConfig": map[string]interface{}{
-			"gcs": map[string]interface{}{"bucket": "sync-bucket", "path": "default/snaps"},
+			"gcs": map[string]interface{}{"bucket": "sync-bucket", "path": namespace + "/snaps"},
 		},
 	}
 }

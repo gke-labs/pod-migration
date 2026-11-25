@@ -117,7 +117,7 @@ func TestPodMigrationReconciler_WatchesManagedObjects(t *testing.T) {
 	pmKey := types.NamespacedName{Namespace: namespace, Name: name}
 	pm := &pmv1alpha1.PodMigration{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Spec:       pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: "gs://sync-bucket/snaps"}},
+		Spec:       pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: "gs://sync-bucket/" + namespace + "/snaps"}},
 	}
 	if err := c.Create(ctx, pm); err != nil {
 		t.Fatalf("creating the PodMigration: %v", err)
@@ -136,7 +136,7 @@ func TestPodMigrationReconciler_WatchesManagedObjects(t *testing.T) {
 			kind:     "PodSnapshotStorageConfig",
 			gvk:      psscGVKForTest,
 			key:      psscKey,
-			wantSpec: wantPSSCSpec(),
+			wantSpec: wantPSSCSpecFor(namespace),
 			drift: func(spec map[string]interface{}) {
 				spec["snapshotStorageConfig"] = map[string]interface{}{
 					"gcs": map[string]interface{}{"bucket": "stale-bucket"},
@@ -448,7 +448,7 @@ func TestReconcilers_WatchCRIUAPIGroupManagedAndSnapshotObjects(t *testing.T) {
 	// 1. PodMigrationReconciler creates and watches CRIU PSP in criu.podmigration.gke.io.
 	pm := &pmv1alpha1.PodMigration{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mig"},
-		Spec:       pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: "gs://criu-watch-bucket/snaps"}},
+		Spec:       pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: "gs://criu-watch-bucket/" + ns + "/snaps"}},
 	}
 	if err := c.Create(ctx, pm); err != nil {
 		t.Fatalf("Create PodMigration: %v", err)
