@@ -44,7 +44,23 @@ spec:
                 description: StorageSpec defines the snapshot storage target configuration.
                 properties:
                   location:
-                    description: Location is the storage location URI (e.g. gs://bucket-name/prefix-path)
+                    description: |-
+                      Location is the storage location URI (e.g. gs://bucket-name/prefix-path).
+                      In multi-tenant environments, the location path must be scoped to the namespace
+                      (e.g. gs://bucket-name/<namespace>/...).
+                    type: string
+                  tokenSource:
+                    description: |-
+                      TokenSource specifies the identity provider for access to Cloud Storage.
+                      Note: TokenSource is GKE Pod Snapshots only (gke-pod-snapshots engine).
+                      Supported values are "podKSA" (default: uses Workload Identity bindings
+                      on the pod's Kubernetes ServiceAccount) and "federatedP4SA" (multi-tenancy:
+                      uses short-lived, path-restricted tokens minted by the GKE node service account).
+                      The CRIU engine uses node agent STS credentials (#290) and does not support
+                      tokenSource in its storage configurations.
+                    enum:
+                    - podKSA
+                    - federatedP4SA
                     type: string
                 required:
                 - location

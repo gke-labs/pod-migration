@@ -143,7 +143,7 @@ func gkeObjectExists(t *testing.T, c client.Client, kind, namespace, name string
 func TestPodMigrationReconciler_WithoutEnginesSyncsGKEPodSnapshotsResources(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = pmv1alpha1.AddToScheme(scheme)
-	config := engineTestPodMigration("gs://my-test-bucket/snapshots/path")
+	config := engineTestPodMigration("gs://my-test-bucket/default/snapshots/path")
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config).
 		WithStatusSubresource(&pmv1alpha1.PodMigration{}).Build()
 
@@ -176,12 +176,12 @@ func TestPodMigrationReconciler_WithoutEnginesSyncsGKEPodSnapshotsResources(t *t
 func TestPodMigrationReconciler_SyncsTheDefaultEngineResources(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = pmv1alpha1.AddToScheme(scheme)
-	config := engineTestPodMigration("not-a-gcs-location")
+	config := engineTestPodMigration("gs://my-test-bucket/default/snapshots")
 
 	storage := &unstructured.Unstructured{}
 	storage.SetGroupVersionKind(schema.GroupVersionKind{Group: "engine.example.com", Version: "v1", Kind: "StorageConfig"})
 	storage.SetName("storage-for-test-migration")
-	storage.Object["spec"] = map[string]interface{}{"location": "not-a-gcs-location"}
+	storage.Object["spec"] = map[string]interface{}{"location": "gs://my-test-bucket/default/snapshots"}
 	policy := &unstructured.Unstructured{}
 	policy.SetGroupVersionKind(schema.GroupVersionKind{Group: "engine.example.com", Version: "v1", Kind: "Policy"})
 	policy.SetName("policy-for-test-migration")
@@ -245,13 +245,13 @@ func TestPodMigrationReconciler_EngineRenderErrors(t *testing.T) {
 			registry: func(t *testing.T) *engine.Registry {
 				r := engine.NewRegistry("rendering-engine")
 				if err := r.Register(&renderingEngine{err: &engine.StorageLocationError{
-					Location: "gs://my-test-bucket", Message: "this engine can't use gs://my-test-bucket",
+					Location: "gs://my-test-bucket/default", Message: "this engine can't use gs://my-test-bucket/default",
 				}}); err != nil {
 					t.Fatalf("Register: %v", err)
 				}
 				return r
 			},
-			wantErr:    "this engine can't use gs://my-test-bucket",
+			wantErr:    "this engine can't use gs://my-test-bucket/default",
 			wantReason: "InvalidStorageLocation",
 		},
 		{
@@ -275,7 +275,7 @@ func TestPodMigrationReconciler_EngineRenderErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = pmv1alpha1.AddToScheme(scheme)
-			config := engineTestPodMigration("gs://my-test-bucket")
+			config := engineTestPodMigration("gs://my-test-bucket/default")
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config).
 				WithStatusSubresource(&pmv1alpha1.PodMigration{}).Build()
 
@@ -385,7 +385,7 @@ func TestPodMigrationReconciler_SyncsTheResourcesOfEveryRoutedEngine(t *testing.
 		t.Run(tt.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = pmv1alpha1.AddToScheme(scheme)
-			config := engineTestPodMigration("gs://my-test-bucket")
+			config := engineTestPodMigration("gs://my-test-bucket/default/snapshots")
 			if tt.podMigrationRoutes != "" {
 				config.Annotations = map[string]string{engine.AnnotationRuntimeClassEngines: tt.podMigrationRoutes}
 			}
@@ -470,7 +470,7 @@ func TestPodMigrationReconciler_ReportsInvalidEngineRoutes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = pmv1alpha1.AddToScheme(scheme)
-			config := engineTestPodMigration("gs://my-test-bucket")
+			config := engineTestPodMigration("gs://my-test-bucket/default/snapshots")
 			if tt.podMigrationRoutes != "" {
 				config.Annotations = map[string]string{engine.AnnotationRuntimeClassEngines: tt.podMigrationRoutes}
 			}

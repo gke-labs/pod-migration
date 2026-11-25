@@ -79,28 +79,31 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr           string
-		probeAddr             string
-		enableLeaderElection  bool
-		clientGoQPS           float64
-		clientGoBurst         int
-		maxConcurrent         int
-		migrationTimeout      time.Duration
-		invariantModeRaw      string
-		spotPreemptionBudget  int64
-		runtimeClassesRaw     string
-		fenceCap              time.Duration
-		fenceLateStopWatch    time.Duration
-		runtimeClassEngines   string
-		criuAPIGroup          string
-		restoreStabilization  time.Duration
-		restorePlacement      bool
-		placementDeadline     time.Duration
-		shortenReadinessDelay bool
-		snapshotRetention     time.Duration
-		orphanSweepInterval   time.Duration
-		orphanMinAge          time.Duration
-		showVersion           bool
+		metricsAddr             string
+		probeAddr               string
+		enableLeaderElection    bool
+		clientGoQPS             float64
+		clientGoBurst           int
+		maxConcurrent           int
+		migrationTimeout        time.Duration
+		invariantModeRaw        string
+		spotPreemptionBudget    int64
+		runtimeClassesRaw       string
+		fenceCap                time.Duration
+		fenceLateStopWatch      time.Duration
+		runtimeClassEngines     string
+		criuAPIGroup            string
+		restoreStabilization    time.Duration
+		restorePlacement        bool
+		placementDeadline       time.Duration
+		shortenReadinessDelay   bool
+		snapshotRetention       time.Duration
+		orphanSweepInterval     time.Duration
+		orphanMinAge            time.Duration
+		coverageRefreshInterval time.Duration
+		storageIsolationMode    string
+		allowBucketRootStorage  bool
+		showVersion             bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "")
@@ -123,6 +126,9 @@ func main() {
 	flag.DurationVar(&snapshotRetention, "snapshot-retention", 0, fmt.Sprintf("How long a job that concluded Succeeded (restore verified or inferred) or Failed keeps the PodSnapshot its trigger created before the controller deletes it, which tells the snapshot engine to delete the checkpoint archive (#107). 0 (the default) deletes it as soon as nothing can still restore from it. Jobs that concluded SucceededWithoutRestore keep their snapshot until they're garbage collected; then the orphan sweep (--orphan-snapshot-sweep-interval) may delete it. At most %s, so the deletion can still be retried before concluded jobs are garbage collected 30m after they concluded.", controller.MaxSnapshotRetention))
 	flag.DurationVar(&orphanSweepInterval, "orphan-snapshot-sweep-interval", controller.DefaultOrphanSnapshotSweepInterval, "How often the leader deletes orphaned PodSnapshots: ones our triggers created (gke-pod-snapshot-triggered-by is psmt-<pod>-<uid>) whose PodMigrationJob is gone, and that no pod, trigger or job references (#107). Deleting a PodSnapshot tells its snapshot engine to delete the checkpoint archive. 0 turns the sweep off; otherwise at least 1m.")
 	flag.DurationVar(&orphanMinAge, "orphan-snapshot-min-age", controller.DefaultOrphanSnapshotMinAge, fmt.Sprintf("How old an orphaned PodSnapshot must be, from its creation, before the sweep deletes it. When the sweep is on, at least --snapshot-retention plus %s.", controller.OrphanSnapshotMinAgeMargin))
+	flag.DurationVar(&coverageRefreshInterval, "coverage-refresh-interval", controller.DefaultCoverageRefreshInterval, "How often active PodMigration coverage metrics are refreshed without re-syncing managed resources. 0 turns periodic refresh off; otherwise at least 5s.")
+	flag.StringVar(&storageIsolationMode, "storage-isolation-mode", controller.DefaultStorageIsolationMode, "Multi-tenant storage isolation mode for cross-namespace conflicts when --allow-bucket-root-storage is enabled: warn (default, log and emit Warning events while permitting upgrade migration) or enforce (fail-closed on cross-namespace collision).")
+	flag.BoolVar(&allowBucketRootStorage, "allow-bucket-root-storage", false, "Allow PodMigration storage locations to target the bucket root (gs://bucket or gs://bucket/) without namespace path scoping. Intended only for single-tenant clusters where the entire bucket is dedicated to one namespace.")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -212,6 +218,11 @@ func main() {
 
 	if err := controller.ValidateRestorePlacementDeadline(placementDeadline, restoreStabilization); err != nil {
 		setupLog.Error(err, "invalid restore placement deadline flag")
+		os.Exit(1)
+	}
+
+	if err := controller.ValidateCoverageRefreshInterval(coverageRefreshInterval); err != nil {
+		setupLog.Error(err, "invalid coverage refresh interval flag")
 		os.Exit(1)
 	}
 
@@ -305,12 +316,14 @@ func main() {
 	logEngineRoutes(engines, runtimeClassPolicy, len(runtimeClassRoutes) == 0)
 
 	if err := (&controller.PodMigrationReconciler{
-		Client:             mgr.GetClient(),
-		Scheme:             mgr.GetScheme(),
-		Recorder:           eventRecorder,
-		InvariantEngine:    invariantEngine,
-		Engines:            engines,
-		RuntimeClassPolicy: runtimeClassPolicy,
+		Client:                 mgr.GetClient(),
+		Scheme:                 mgr.GetScheme(),
+		Recorder:               eventRecorder,
+		InvariantEngine:        invariantEngine,
+		Engines:                engines,
+		RuntimeClassPolicy:     runtimeClassPolicy,
+		StorageIsolationMode:   storageIsolationMode,
+		AllowBucketRootStorage: allowBucketRootStorage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")
 		os.Exit(1)
@@ -377,6 +390,19 @@ func main() {
 			MinAge:    orphanMinAge,
 		}); err != nil {
 			setupLog.Error(err, "unable to add the orphan PodSnapshot sweep")
+			os.Exit(1)
+		}
+	}
+
+	// Periodic migratable coverage refresh without full reconciliation overhead (#253). Leader only.
+	if coverageRefreshInterval > 0 {
+		if err := mgr.Add(&controller.CoverageRefresher{
+			Client:             mgr.GetClient(),
+			Engines:            engines,
+			RuntimeClassPolicy: runtimeClassPolicy,
+			Interval:           coverageRefreshInterval,
+		}); err != nil {
+			setupLog.Error(err, "unable to add the coverage refresher")
 			os.Exit(1)
 		}
 	}

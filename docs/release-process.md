@@ -40,7 +40,12 @@ cd ..
 Before publishing images, verify that third-party licensing disclosures remain up to date:
 
 1. Review `docs/third-party-licenses.md` against any newly introduced Go dependencies or base image updates.
-2. Ensure `engines/criu/build/agent/Dockerfile` continues to extract package copyright files from Debian forky into `/opt/criu-bundle/licenses/`.
+2. Ensure `engines/criu/build/agent/Dockerfile` continues to extract package copyright files from Debian forky into `/opt/criu-bundle/licenses/`. Its CRIU stage is pinned, so security fixes reach the bundle only when someone bumps the pin: check for one before each release. To bump it:
+   - Set the `debian:forky` digest to a newer image, and `DEBIAN_SNAPSHOT` to the snapshot that image was built from: `docker run --rm debian:forky@sha256:<digest> grep -m1 snapshot /etc/apt/sources.list.d/debian.sources`.
+   - Build the image. It fails until `engines/criu/build/agent/package-versions.lock` matches the bundle. To update the lock, run this from `engines/criu` and review the difference in git: `docker run --rm "$(docker build -q --target criu -f build/agent/Dockerfile .)" cat /bundle/licenses/package-versions.txt > build/agent/package-versions.lock`.
+   - If the bundled libraries changed, update them in `docs/third-party-licenses.md`.
+
+   The build fetches from snapshot.debian.org, so while that service is down, the agent image can't be built.
 3. Verify that all components in published images are properly categorized by license (Apache-2.0, MIT, BSD-3-Clause, GPL-2.0, LGPL-2.1).
 
 ---
@@ -103,7 +108,7 @@ docker push "${HOLDER_IMG}"
 
 Per GPL-2.0 Section 3, any release distributing the `pod-migration-criu-agent` container image must make the corresponding source code available.
 
-Run the automated packaging script to extract the matching Debian source packages and generate a release source archive. Pass the package versions recorded in the agent image you publish: its CRIU stage builds from Debian forky (testing), whose versions change from week to week, so without them the script can fetch sources that don't match the image.
+Run the automated packaging script to extract the matching Debian source packages and generate a release source archive. Pass the package versions recorded in the agent image you publish: its CRIU stage builds from Debian forky (testing) at the snapshot.debian.org timestamp that `engines/criu/build/agent/Dockerfile` pins (`DEBIAN_SNAPSHOT`), and that image's own list names exactly the versions it carries (the build checks it against `package-versions.lock`). Without the list, the script fetches whatever versions forky has that day.
 
 ```bash
 # Package matching source files into ./dist

@@ -323,7 +323,7 @@ EOF
 
 render_podmigration_manifest() {
   local ns="$1"
-  local storage_loc="${2:-${STORAGE_LOCATION:-gs://pod-migration-checkpoints/default}}"
+  local storage_loc="${2:-${STORAGE_LOCATION:-gs://pod-migration-checkpoints/${ns}}}"
   cat <<EOF
 apiVersion: podmigration.gke.io/v1alpha1
 kind: PodMigration
@@ -553,18 +553,31 @@ run_live() {
   # Resolve storage location if not provided
   if [[ -z "${STORAGE_LOCATION}" ]]; then
     local discovered_loc
-    discovered_loc="$(${KUBECTL_CMD} get podmigrations -A -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+    discovered_loc="$(${KUBECTL_CMD} get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+    if [[ -z "${discovered_loc}" ]]; then
+      discovered_loc="$(${KUBECTL_CMD} get podmigrations -A -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+    fi
+    local bucket=""
     if [[ -n "${discovered_loc}" ]]; then
-      log "Discovered storage location from existing cluster PodMigration: ${discovered_loc}"
-      STORAGE_LOCATION="${discovered_loc}"
+      local trimmed="${discovered_loc#gs://}"
+      bucket="${trimmed%%/*}"
     else
-      discovered_loc="$(${KUBECTL_CMD} get podsnapshotstorageconfig -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
-      if [[ -n "${discovered_loc}" ]]; then
-        local pssc_path
-        pssc_path="$(${KUBECTL_CMD} get podsnapshotstorageconfig -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
-        STORAGE_LOCATION="gs://${discovered_loc}/${pssc_path#/}"
-        log "Discovered storage location from cluster PodSnapshotStorageConfig: ${STORAGE_LOCATION}"
-      fi
+      bucket="$(${KUBECTL_CMD} get podsnapshotstorageconfig -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
+    fi
+    if [[ -n "${bucket}" ]]; then
+      STORAGE_LOCATION="gs://${bucket}/${NAMESPACE}/snapshots"
+      log "Discovered storage bucket '${bucket}'; configured scoped storage location: ${STORAGE_LOCATION}"
+    fi
+  else
+    # In multi-tenant clusters, PodMigration storage paths must be scoped to ${NAMESPACE}
+    local trimmed="${STORAGE_LOCATION#gs://}"
+    local bucket="${trimmed%%/*}"
+    local path="${trimmed#"$bucket"}"
+    path="${path#/}"
+    local first_seg="${path%%/*}"
+    if [[ -z "${first_seg}" || "${first_seg}" != "${NAMESPACE}" ]]; then
+      STORAGE_LOCATION="gs://${bucket}/${NAMESPACE}/snapshots"
+      log "Scoped provided storage location to namespace '${NAMESPACE}': ${STORAGE_LOCATION}"
     fi
   fi
 

@@ -1470,9 +1470,15 @@ func TestPodMigrationJobReconciler_Snapshotting(t *testing.T) {
 			},
 		}
 
+		// The source is still running mid-checkpoint.
+		source := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: podName, UID: types.UID(podUID)},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(pmj, trigger, newSnapshot, staleSnapshot).
+			WithObjects(pmj, source, trigger, newSnapshot, staleSnapshot).
 			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
 			Build()
 

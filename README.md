@@ -27,6 +27,7 @@ The controller is implemented as a custom Operator consisting of the following c
 
 ### 2. Reconcilers
 - **`PodMigration` (Config) Reconciler**: Watches `PodMigration` resources. It automatically provisions the required GKE `PodSnapshotStorageConfig` (PSSC) and manual `PodSnapshotPolicy` (PSP) resources with `postCheckpoint: stop` in the target namespace. It also watches those two objects. If someone edits their spec, it changes it back right away. If someone deletes one, it recreates it right away. If one is stuck being deleted, for example because another component's finalizer holds it, the controller doesn't touch it and sets the PodMigration's `Ready` condition to `False` with reason `ManagedObjectTerminating`. Once the object is gone, the controller recreates it (#144).
+  - **Storage Isolation & Scoping**: Automatically enforces cross-namespace storage location isolation. The controller always requires storage paths to be scoped to the namespace (`gs://<bucket>/<namespace>/...`); un-scoped locations or bucket root paths are refused (`Ready=False`, `UnscopedStorageLocation`), unless the bucket root is explicitly enabled via `--allow-bucket-root-storage` (off by default). When cross-namespace conflicts occur under `--allow-bucket-root-storage`, `--storage-isolation-mode` controls handling (`warn` logs and emits `StorageIsolationWarning` events, while `enforce` fails closed with `Ready=False`, `ConflictingStorageLocation`).
 - **`PodMigrationJob` (Execution) Reconciler**: Coordinates the active migration loop:
   1. Records the source Pod's node on the job (`status.originNodeName`). While the job is `Pending`, before the budget check and the fence, it also records that node's machine type (its `node.kubernetes.io/instance-type` label) in `status.originNodeInstanceType`, and its kubelet version, which on GKE is the node's GKE version, in `status.originNodeKubeletVersion`. A snapshot only restores on a compatible node, and the source node can be gone by the time the replacement is released, so these are captured first. They're written with the rest of the job's status, which by default only the controller can write. This is best effort: if the node can't be read or doesn't carry a value, that field stays empty and the migration goes ahead. A recorded value is never replaced. With `--restore-placement` (on by default), the Pod Gate Reconciler places a replacement that its ReplicaSet or StatefulSet would recreate by the machine type (see below, #14).
   2. Fences the source Pod (see [Source fence](#3-source-fence)), then creates a `PodSnapshotManualTrigger` (PSMT) targeting it to initiate snapshotting and container termination.
@@ -131,13 +132,13 @@ Run the provided setup script to automatically create the GCS bucket, configure 
 
 ```bash
 chmod +x patches/setup-storage.sh
-./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]
+./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION] [MODE] [TENANT_NAMESPACES]
 ```
 
 *This script performs the following:*
-- Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access and soft-delete disabled.
-- Binds IAM roles `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and the GKE container engine robot service account.
-- Creates KSA `pm-test-ksa` in the `default` namespace.
+- Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access, hierarchical namespaces enabled, and soft-delete disabled.
+- **Single-Tenant Mode (`MODE=single-tenant`, default)**: Configures dedicated bucket storage (`tokenSource: podKSA`). Binds `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and to the GKE container engine robot service account. Creates KSA `pm-test-ksa` in the `default` namespace.
+- **Multi-Tenant Mode (`MODE=multi-tenant`)**: Configures shared-bucket storage with path-restricted tokens (`tokenSource: federatedP4SA`). Binds `roles/storage.admin` to the GKE node service account (`service-${PROJECT_NUMBER}@gcp-sa-gkenode.iam.gserviceaccount.com`), creates per-namespace managed folders, and grants workload KSAs zero bucket-wide permissions. Pass a comma-separated list of namespaces as the 5th argument (e.g. `"tenant-a,tenant-b"`). See [Multi-Tenant Snapshot Storage Architecture & Guidance](docs/storage-multitenancy.md).
 
 This bucket is for GKE Pod Snapshots. The experimental CRIU engine needs a bucket of its own, which grants object access to its two service accounts and to nobody else: an archive is a full memory dump. Set one up with `./patches/setup-criu-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]`, and point only the `PodMigration`s of namespaces that only CRIU serves at it (see "Storage credentials" in `engines/criu/README.md`).
 
@@ -161,8 +162,15 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
     ```yaml
     spec:
       storage:
-        location: gs://<YOUR_BUCKET_NAME>/snapshots
+        location: gs://<YOUR_BUCKET_NAME>/default/snapshots
     ```
+
+    > [!WARNING]
+    > **Upgrade Action Required: Mandatory Storage Namespace Scoping**:
+    > The controller strictly enforces cross-namespace storage isolation in all modes. Storage locations (`spec.storage.location`) must be scoped to the namespace (`gs://<bucket>/<namespace>/...`).
+    > - **What breaks**: Existing single-namespace clusters configured with legacy un-scoped paths like `gs://<bucket>/snapshots` (or an empty root path `gs://<bucket>`) fail scoping validation on upgrade. The `PodMigration` transitions to `Ready=False` with reason `UnscopedStorageLocation`. In-flight migrations drain, after which the controller deletes the managed `PodSnapshotStorageConfig` (PSSC) and `PodSnapshotPolicy` (PSP). The eviction webhook then finds no `Ready` policy and allows cold evictions (`eviction_webhook.go:380`), causing live migration to quietly stop.
+    > - **How to tell**: Run `kubectl get podmigrations -A` (look for `READY: False`, reason `UnscopedStorageLocation`) or inspect events with `kubectl get events -A --field-selector reason=UnscopedStorageLocation`.
+    > - **How to fix**: Update `spec.storage.location` in each `PodMigration` to begin with its namespace: e.g. `gs://<bucket>/default/snapshots`. The controller immediately reconciles, recreates storage objects, and restores `Ready=True`. (Alternatively, `--allow-bucket-root-storage=true` can be passed to the controller for single-tenant clusters dedicated to a single namespace).
 
 3.  **Deploy the Controller:**
     Apply the manifests by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:
@@ -510,6 +518,7 @@ When migrating single-replica workloads (such as a `StatefulSet` with `replicas:
   - **Fewer dry runs:** a Ready pod covered by one PDB whose status in the controller's cache allows no disruption waits without sending a dry run, until the cache shows the budget freed.
   - **Faster wake-up:** a waiting job checks again right away when a PDB in its namespace gains healthy pods or allowed disruptions, or is deleted, instead of waiting out its backed-off recheck.
 - **PDB-Safe Eviction Fallback:** The controller respects Kubernetes PDB constraints by issuing eviction requests through the official Kubernetes eviction subresource (`policy/v1 Eviction`) and retrying on `429 Too Many Requests` / `409 Conflict`. This covers the window between the budget check and the eviction.
+  - Spot preemption (any job the node preemption controller starts, which includes GKE host maintenance signalled by the `cloud.google.com/impending-node-termination` taint or `cloud.google.com/active-node-maintenance=ONGOING`) removes the checkpointed source with a direct `DELETE` instead (1 s grace period, with the source's UID as a precondition so a pod that reused the name, such as a StatefulSet replacement, is never deleted). An admission webhook or `ValidatingAdmissionPolicy` on `pods/eviction`, such as a disruption window, would otherwise deny the eviction even after node shutdown terminated the pod, and the job could time out on its 2-minute Spot deadline and start the replacement cold despite a saved checkpoint (#305). Every other trigger still goes through the eviction subresource, so budgets and admission on evictions apply.
 - **Timeout & Churn Protection:** If the PDB budget does not recover within the 10-minute active migration timeout, the PMJ concludes with status `SucceededWithoutRestore` (Reason: `PDBEvictionTimeout`), and the controller marks the pod with `pod-migration.gke.io/pdb-eviction-timeout: "true"` to prevent repeated snapshot loops during ongoing drain retries.
 - **Operator Intervention & Re-arming Migration:** Draining nodes hosting `minAvailable=1` single-replica workloads requires operator intervention (e.g. temporarily updating or relaxing the PDB budget, scaling up the workload, or deleting the pod). Once the PDB is relaxed, to re-arm live migration on the existing pod instance without recreating it, remove the timeout annotation:
   ```bash

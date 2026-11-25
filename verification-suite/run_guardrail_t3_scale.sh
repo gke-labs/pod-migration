@@ -462,44 +462,62 @@ backup_preexisting_podmigrations() {
 }
 
 resolve_gcs_bucket() {
+  local candidate=""
   if [[ -n "${GCS_BUCKET}" ]]; then
-    return 0
-  fi
-  local existing=""
-  if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
-    existing="$(jq -r '.items[0].spec.storage.location // empty' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)"
+    candidate="${GCS_BUCKET}"
   else
-    local err_file
-    err_file="$(mktemp)"
-    local raw_json
-    if ! raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>"${err_file}")"; then
-      local err_msg
-      err_msg="$(cat "${err_file}")"
-      rm -f "${err_file}"
-      die "Cannot inspect PodMigrations in ${NAMESPACE} for GCS bucket resolution (kubectl get failed: ${err_msg:-${raw_json}})"
-    fi
-    rm -f "${err_file}"
-    if ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
-      die "Cannot parse PodMigrations list output in ${NAMESPACE} as JSON for GCS bucket resolution"
-    fi
-    existing="$(jq -r '.items[0].spec.storage.location // empty' <<<"${raw_json}")"
-  fi
-  if [[ -n "${existing}" ]]; then
-    GCS_BUCKET="${existing}"
-    return 0
-  fi
-  local pssc_bucket pssc_path
-  pssc_bucket="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
-  pssc_path="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
-  if [[ -n "${pssc_bucket}" ]]; then
-    if [[ -n "${pssc_path}" ]]; then
-      GCS_BUCKET="gs://${pssc_bucket}/${pssc_path#/}"
+    local existing=""
+    if [[ -f "${PREEXISTING_PODMIGRATIONS_BACKUP}" ]]; then
+      existing="$(jq -r '.items[0].spec.storage.location // empty' "${PREEXISTING_PODMIGRATIONS_BACKUP}" 2>/dev/null || true)"
     else
-      GCS_BUCKET="gs://${pssc_bucket}"
+      local err_file
+      err_file="$(mktemp)"
+      local raw_json
+      if ! raw_json="$(kubectl get podmigrations.podmigration.gke.io -n "${NAMESPACE}" -o json 2>"${err_file}")"; then
+        local err_msg
+        err_msg="$(cat "${err_file}")"
+        rm -f "${err_file}"
+        die "Cannot inspect PodMigrations in ${NAMESPACE} for GCS bucket resolution (kubectl get failed: ${err_msg:-${raw_json}})"
+      fi
+      rm -f "${err_file}"
+      if ! echo "${raw_json}" | jq -e . >/dev/null 2>&1; then
+        die "Cannot parse PodMigrations list output in ${NAMESPACE} as JSON for GCS bucket resolution"
+      fi
+      existing="$(jq -r '.items[0].spec.storage.location // empty' <<<"${raw_json}")"
     fi
-    return 0
+    if [[ -n "${existing}" ]]; then
+      candidate="${existing}"
+    else
+      local pssc_bucket pssc_path
+      pssc_bucket="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
+      pssc_path="$(kubectl get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
+      if [[ -n "${pssc_bucket}" ]]; then
+        if [[ -n "${pssc_path}" ]]; then
+          candidate="gs://${pssc_bucket}/${pssc_path#/}"
+        else
+          candidate="gs://${pssc_bucket}"
+        fi
+      fi
+    fi
   fi
-  die "No GCS bucket could be resolved: pass --gcs-bucket <gs://bucket/path>, set GCS_BUCKET, or ensure a PodMigration / PodSnapshotStorageConfig (.spec.snapshotStorageConfig.gcs.{bucket,path}) exists on the cluster"
+
+  if [[ -z "${candidate}" ]]; then
+    die "No GCS bucket could be resolved: pass --gcs-bucket <gs://bucket/path>, set GCS_BUCKET, or ensure a PodMigration / PodSnapshotStorageConfig (.spec.snapshotStorageConfig.gcs.{bucket,path}) exists on the cluster"
+  fi
+
+  # In multi-tenant clusters, PodMigration storage paths must be scoped to ${NAMESPACE}
+  # (gs://<bucket>/<namespace>/...). When creating a PodMigration in ${NAMESPACE}, ensure
+  # unscoped paths, bucket roots, or paths copied from another namespace's PSSC are scoped.
+  local trimmed="${candidate#gs://}"
+  local bucket="${trimmed%%/*}"
+  local path="${trimmed#"$bucket"}"
+  path="${path#/}"
+  local first_seg="${path%%/*}"
+  if [[ -z "${first_seg}" || "${first_seg}" != "${NAMESPACE}" ]]; then
+    GCS_BUCKET="gs://${bucket}/${NAMESPACE}/snapshots"
+  else
+    GCS_BUCKET="${candidate}"
+  fi
 }
 
 clean_stale_migration_resources() {
@@ -1868,7 +1886,7 @@ EOF
         return 0
       fi
       if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.path}"* ]]; then
-        printf "/pssc-path"
+        printf "/${NAMESPACE}/pssc-path"
         return 0
       fi
       return 0
@@ -1877,8 +1895,35 @@ EOF
     echo "${GCS_BUCKET}"
   )" || die "Self-test failure: resolve_gcs_bucket failed when resolving from PodSnapshotStorageConfig with stderr noise"
 
-  if [[ "${resolved_pssc_bucket}" != "gs://pssc-bucket/pssc-path" ]]; then
-    die "Self-test failure: expected 'gs://pssc-bucket/pssc-path' from PodSnapshotStorageConfig, got '${resolved_pssc_bucket}'"
+  if [[ "${resolved_pssc_bucket}" != "gs://pssc-bucket/${NAMESPACE}/pssc-path" ]]; then
+    die "Self-test failure: expected 'gs://pssc-bucket/${NAMESPACE}/pssc-path' from PodSnapshotStorageConfig, got '${resolved_pssc_bucket}'"
+  fi
+
+  # Also verify resolve_gcs_bucket scopes unscoped or bucket-root PSSC to ${NAMESPACE}/snapshots
+  local scoped_unscoped_bucket
+  scoped_unscoped_bucket="$(
+    GCS_BUCKET=""
+    PREEXISTING_PODMIGRATIONS_BACKUP="${test_stderr_noise_dir}/nonexistent.json"
+    kubectl() {
+      if [[ "$*" == *"get podmigrations"* ]]; then
+        echo '{"apiVersion":"v1","kind":"List","items":[]}'
+        return 0
+      fi
+      if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.bucket}"* ]]; then
+        printf "pssc-bucket"
+        return 0
+      fi
+      if [[ "$*" == *"get podsnapshotstorageconfigs -o jsonpath={.items[0].spec.snapshotStorageConfig.gcs.path}"* ]]; then
+        printf ""
+        return 0
+      fi
+      return 0
+    }
+    resolve_gcs_bucket >/dev/null 2>&1
+    echo "${GCS_BUCKET}"
+  )" || die "Self-test failure: resolve_gcs_bucket failed on root PSSC"
+  if [[ "${scoped_unscoped_bucket}" != "gs://pssc-bucket/${NAMESPACE}/snapshots" ]]; then
+    die "Self-test failure: expected 'gs://pssc-bucket/${NAMESPACE}/snapshots' for root PSSC, got '${scoped_unscoped_bucket}'"
   fi
 
   if (
@@ -1905,7 +1950,7 @@ EOF
     kubectl() {
       if [[ "$*" == *"get podmigrations"* ]]; then
         echo "Warning: admission webhook warning" >&2
-        echo '{"apiVersion":"v1","kind":"List","items":[{"spec":{"storage":{"location":"gs://custom-bucket/snaps"}}}]}'
+        echo "{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[{\"spec\":{\"storage\":{\"location\":\"gs://custom-bucket/${NAMESPACE}/snaps\"}}}]}"
         return 0
       fi
       command kubectl "$@"
@@ -1914,8 +1959,8 @@ EOF
     echo "${GCS_BUCKET}"
   )" || die "Self-test failure: resolve_gcs_bucket failed on existing policy with stderr noise"
 
-  if [[ "${resolved_custom_bucket}" != "gs://custom-bucket/snaps" ]]; then
-    die "Self-test failure: expected 'gs://custom-bucket/snaps', got '${resolved_custom_bucket}'"
+  if [[ "${resolved_custom_bucket}" != "gs://custom-bucket/${NAMESPACE}/snaps" ]]; then
+    die "Self-test failure: expected 'gs://custom-bucket/${NAMESPACE}/snaps', got '${resolved_custom_bucket}'"
   fi
   log "PASS [self-test]: resolve_gcs_bucket extracts custom bucket with stderr noise"
 

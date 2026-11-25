@@ -414,27 +414,49 @@ cleanup_on_exit() {
 trap cleanup_on_exit EXIT
 
 resolve_gcs_bucket() {
+  local candidate=""
   if [[ -n "${GCS_BUCKET}" ]]; then
-    return 0
-  fi
-  local existing
-  existing="$("${KUBECTL_CMD}" get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
-  if [[ -n "${existing}" ]]; then
-    GCS_BUCKET="${existing}"
-    return 0
-  fi
-  local pssc_bucket pssc_path
-  pssc_bucket="$("${KUBECTL_CMD}" get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
-  pssc_path="$("${KUBECTL_CMD}" get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
-  if [[ -n "${pssc_bucket}" ]]; then
-    if [[ -n "${pssc_path}" ]]; then
-      GCS_BUCKET="gs://${pssc_bucket}/${pssc_path#/}"
+    candidate="${GCS_BUCKET}"
+  else
+    local existing
+    existing="$("${KUBECTL_CMD}" get podmigrations -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.storage.location}' 2>/dev/null || true)"
+    if [[ -n "${existing}" ]]; then
+      candidate="${existing}"
     else
-      GCS_BUCKET="gs://${pssc_bucket}"
+      local pssc_bucket pssc_path
+      pssc_bucket="$("${KUBECTL_CMD}" get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.bucket}' 2>/dev/null || true)"
+      pssc_path="$("${KUBECTL_CMD}" get podsnapshotstorageconfigs -o jsonpath='{.items[0].spec.snapshotStorageConfig.gcs.path}' 2>/dev/null || true)"
+      if [[ -n "${pssc_bucket}" ]]; then
+        if [[ -n "${pssc_path}" ]]; then
+          candidate="gs://${pssc_bucket}/${pssc_path#/}"
+        else
+          candidate="gs://${pssc_bucket}"
+        fi
+      fi
     fi
-    return 0
   fi
-  die "No GCS bucket could be resolved: pass --gcs-bucket <gs://bucket/path>, set GCS_BUCKET, or ensure a PodMigration / PodSnapshotStorageConfig (.spec.snapshotStorageConfig.gcs.{bucket,path}) exists on the cluster"
+
+  if [[ -z "${candidate}" ]]; then
+    die "No GCS bucket could be resolved: pass --gcs-bucket <gs://bucket/path>, set GCS_BUCKET, or ensure a PodMigration / PodSnapshotStorageConfig (.spec.snapshotStorageConfig.gcs.{bucket,path}) exists on the cluster"
+  fi
+
+  # In multi-tenant clusters, PodMigration storage paths must be scoped to ${NAMESPACE}
+  # (gs://<bucket>/<namespace>/...). When creating a PodMigration in ${NAMESPACE}, ensure
+  # unscoped paths, bucket roots, or paths copied from another namespace's PSSC are scoped.
+  if [[ "${SKIP_PODMIGRATION_CREATE:-false}" != "true" ]]; then
+    local trimmed="${candidate#gs://}"
+    local bucket="${trimmed%%/*}"
+    local path="${trimmed#"$bucket"}"
+    path="${path#/}"
+    local first_seg="${path%%/*}"
+    if [[ -z "${first_seg}" || "${first_seg}" != "${NAMESPACE}" ]]; then
+      GCS_BUCKET="gs://${bucket}/${NAMESPACE}/snapshots"
+    else
+      GCS_BUCKET="${candidate}"
+    fi
+  else
+    GCS_BUCKET="${candidate}"
+  fi
 }
 
 clean_stale_migration_resources() {
