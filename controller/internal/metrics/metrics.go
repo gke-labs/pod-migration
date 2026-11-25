@@ -198,6 +198,9 @@ var (
 
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
+
+	coverageNamespacesMu sync.Mutex
+	coverageNamespaces   = make(map[string]struct{})
 )
 
 func init() {
@@ -238,6 +241,10 @@ func RecordNamespaceCoverage(namespace string, covered, total int) {
 	if namespace == "" {
 		return
 	}
+	coverageNamespacesMu.Lock()
+	coverageNamespaces[namespace] = struct{}{}
+	coverageNamespacesMu.Unlock()
+
 	MigratableCoveredRunningPods.WithLabelValues(namespace).Set(float64(covered))
 	MigratableTotalRunningPods.WithLabelValues(namespace).Set(float64(total))
 	ratio := 0.0
@@ -252,9 +259,24 @@ func ClearNamespaceCoverage(namespace string) {
 	if namespace == "" {
 		return
 	}
+	coverageNamespacesMu.Lock()
+	delete(coverageNamespaces, namespace)
+	coverageNamespacesMu.Unlock()
+
 	MigratableCoveredRunningPods.DeleteLabelValues(namespace)
 	MigratableTotalRunningPods.DeleteLabelValues(namespace)
 	MigratableCoverageRatio.DeleteLabelValues(namespace)
+}
+
+// CoverageNamespaces returns a slice of all namespaces currently carrying coverage metrics.
+func CoverageNamespaces() []string {
+	coverageNamespacesMu.Lock()
+	defer coverageNamespacesMu.Unlock()
+	res := make([]string, 0, len(coverageNamespaces))
+	for ns := range coverageNamespaces {
+		res = append(res, ns)
+	}
+	return res
 }
 
 // RecordApplicationDowntime records the observed application downtime in seconds
@@ -394,6 +416,10 @@ func ResetActiveJobsForTest() {
 
 // ResetCoverageForTest resets coverage and skipped metrics for unit tests.
 func ResetCoverageForTest() {
+	coverageNamespacesMu.Lock()
+	coverageNamespaces = make(map[string]struct{})
+	coverageNamespacesMu.Unlock()
+
 	MigratableCoveredRunningPods.Reset()
 	MigratableTotalRunningPods.Reset()
 	MigratableCoverageRatio.Reset()

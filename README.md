@@ -577,13 +577,14 @@ The controller registers Prometheus metrics on the standard controller-runtime m
 | `pod_migration_skipped_total` | Counter | `reason`, `engine` | Total number of migration trigger evaluations that skipped live migration (by decision), labeled by canonical reason (`not_opted_in`, `unsupported_runtime`, `multi_container`, `host_network`, `node_not_ready`, `no_ready_policy`, `unfenced_engine`, `readiness_gates_unsatisfied`, `pdb_timed_out`, `no_replica_key`, `ambiguous_replica_key`, `budget_exceeded`, `unknown_memory`, `already_restored`, `missing_command`, `ineligible`) and engine. Counts evaluations per trigger event (decisions): repeated drain attempts retried every 5s on a PDB block or spot preemptions are counted on each decision, and non-opted-in pods evicted in user namespaces count under `not_opted_in`. Terminal jobs and unreadable pods fail open or cold-evict without moving this counter. |
 | `pod_migration_covered_running_pods` | Gauge | `namespace` | Number of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime. |
 | `pod_migration_total_running_pods` | Gauge | `namespace` | Total number of running pods in a migratable namespace. |
-| `pod_migration_coverage_ratio` | Gauge | `namespace` | Share of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime (0.0 to 1.0). Evaluated periodically (default 30s, flag `--coverage-refresh-interval`); "covered" checks workload opt-in, running status, supported runtime class, engine eligibility, and fencing allowance (readiness gates and replica-key ambiguity are evaluated at trigger time). |
+| `pod_migration_coverage_ratio` | Gauge | `namespace` | Share of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime (0.0 to 1.0). Evaluated periodically (default 30s, flag `--coverage-refresh-interval`; 0 turns refresh off, otherwise at least 5s); "covered" checks workload opt-in, running status, supported runtime class, engine eligibility, and fencing allowance (readiness gates and replica-key ambiguity are evaluated at trigger time). |
 
 ### High Availability (HA) Scraping Considerations
 
 When running in multi-replica HA mode with leader election enabled:
 - The `/metrics` endpoint is served by all controller replicas.
 - Only the **leader replica** reconciles migrations and updates `pod_migration_active` in memory; standby replicas serve `pod_migration_active == 0`.
+- Coverage gauges (`pod_migration_covered_running_pods`, `pod_migration_total_running_pods`, and `pod_migration_coverage_ratio`) are evaluated by a leader-elected runner and only exist on the leader replica; alert and query on `max by (namespace) (pod_migration_coverage_ratio)`.
 - Prometheus scrape jobs should scrape per-pod endpoints and use `max(pod_migration_active)` when querying or alerting on active in-flight migrations across the cluster.
 - For counter and histogram metrics, use `sum(rate(pod_migration_outcomes_total[5m])) by (outcome)` and `sum(rate(pod_migration_phase_duration_seconds_sum[5m])) by (phase) / sum(rate(pod_migration_phase_duration_seconds_count[5m])) by (phase)`.
 

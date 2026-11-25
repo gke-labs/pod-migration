@@ -1092,17 +1092,14 @@ func TestMetrics_MigratableCoverage_DuplicateLoserDoesNotClearActiveCoverage(t *
 		Build()
 
 	r := &PodMigrationReconciler{
-		Client:                  fakeClient,
-		Scheme:                  scheme,
-		CoverageRequeueInterval: 30 * time.Second,
+		Client: fakeClient,
+		Scheme: scheme,
 	}
 
 	// 1. Reconcile active configA -> gauges populated
 	reqA := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mig-a"}}
-	if res, err := r.Reconcile(context.Background(), reqA); err != nil {
+	if _, err := r.Reconcile(context.Background(), reqA); err != nil {
 		t.Fatalf("Reconciling active mig-a failed: %v", err)
-	} else if res.RequeueAfter != 30*time.Second {
-		t.Errorf("Expected active reconcile to requeue after 30s to keep gauges fresh, got %v", res.RequeueAfter)
 	}
 
 	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {

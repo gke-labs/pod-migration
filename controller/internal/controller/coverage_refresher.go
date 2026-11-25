@@ -18,6 +18,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,6 +40,25 @@ import (
 // migratable coverage metrics across active namespaces.
 const DefaultCoverageRefreshInterval = 30 * time.Second
 
+// MinCoverageRefreshInterval is the minimum allowable non-zero interval for
+// periodic coverage calculation, guarding against excessive uncached API server list loops.
+const MinCoverageRefreshInterval = 5 * time.Second
+
+// ValidateCoverageRefreshInterval checks that interval is either 0 (disabled)
+// or at least MinCoverageRefreshInterval.
+func ValidateCoverageRefreshInterval(interval time.Duration) error {
+	if interval < 0 {
+		return fmt.Errorf("coverage-refresh-interval %v must not be negative", interval)
+	}
+	if interval == 0 {
+		return nil
+	}
+	if interval < MinCoverageRefreshInterval {
+		return fmt.Errorf("coverage-refresh-interval %v must be 0 (off) or at least %v", interval, MinCoverageRefreshInterval)
+	}
+	return nil
+}
+
 // CoverageRefresher periodically recalculates migratable coverage metrics
 // for active PodMigration configurations without triggering full reconciliation
 // of managed resources (PSSC/PSP) or invariant validation.
@@ -47,6 +67,9 @@ type CoverageRefresher struct {
 	Engines            *engine.Registry
 	RuntimeClassPolicy *eligibility.RuntimeClassPolicy
 	Interval           time.Duration
+
+	mu                sync.Mutex
+	trackedNamespaces map[string]struct{}
 }
 
 // NeedLeaderElection ensures only the leader replica updates coverage metrics in memory.
@@ -74,6 +97,8 @@ func (c *CoverageRefresher) Start(ctx context.Context) error {
 }
 
 // RefreshOnce evaluates all active namespaces and updates their coverage metrics.
+// The refresher owns the label set: each tick it clears series for any namespace
+// that is no longer in that tick's active set.
 func (c *CoverageRefresher) RefreshOnce(ctx context.Context) {
 	var pmList pmv1alpha1.PodMigrationList
 	if err := c.Client.List(ctx, &pmList); err != nil {
@@ -84,19 +109,40 @@ func (c *CoverageRefresher) RefreshOnce(ctx context.Context) {
 	byNamespace := make(map[string][]pmv1alpha1.PodMigration)
 	for i := range pmList.Items {
 		pm := pmList.Items[i]
-		if pm.DeletionTimestamp.IsZero() {
-			byNamespace[pm.Namespace] = append(byNamespace[pm.Namespace], pm)
+		byNamespace[pm.Namespace] = append(byNamespace[pm.Namespace], pm)
+	}
+
+	activeByNamespace := make(map[string]*pmv1alpha1.PodMigration)
+	for ns, items := range byNamespace {
+		active := selectActivePodMigration(items)
+		if active != nil {
+			activeByNamespace[ns] = active
 		}
 	}
 
-	for ns, items := range byNamespace {
-		active := selectActivePodMigration(items)
-		if active == nil {
-			continue
+	c.mu.Lock()
+	if c.trackedNamespaces == nil {
+		c.trackedNamespaces = make(map[string]struct{})
+	}
+	for _, ns := range metrics.CoverageNamespaces() {
+		c.trackedNamespaces[ns] = struct{}{}
+	}
+	for ns := range c.trackedNamespaces {
+		if _, ok := activeByNamespace[ns]; !ok {
+			metrics.ClearNamespaceCoverage(ns)
+			delete(c.trackedNamespaces, ns)
 		}
+	}
+	c.mu.Unlock()
+
+	for ns, active := range activeByNamespace {
 		if err := ComputeCoverageForNamespace(ctx, c.Client, active, c.Engines, c.RuntimeClassPolicy); err != nil {
 			log.FromContext(ctx).Error(err, "Periodic coverage refresh failed", "namespace", ns)
+			continue
 		}
+		c.mu.Lock()
+		c.trackedNamespaces[ns] = struct{}{}
+		c.mu.Unlock()
 	}
 }
 

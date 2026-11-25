@@ -116,14 +116,7 @@ type PodMigrationReconciler struct {
 	// RuntimeClassPolicy restricts rendered namespace resources to engines
 	// serving runtime classes allowed by --migratable-runtime-classes when set.
 	RuntimeClassPolicy *eligibility.RuntimeClassPolicy
-
-	// CoverageRequeueInterval is how often active PodMigrations are requeued to keep coverage gauges fresh.
-	// When 0, successful reconciles do not requeue automatically.
-	CoverageRequeueInterval time.Duration
 }
-
-// DefaultCoverageResyncInterval is how often an active PodMigration reconciles to refresh coverage gauges.
-const DefaultCoverageResyncInterval = 30 * time.Second
 
 // engines returns the registry that serves the reconciler: Engines, or the
 // registry of a stock deployment.
@@ -461,9 +454,6 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	r.updateCoverageMetrics(ctx, config, registry)
 
-	if r.CoverageRequeueInterval > 0 {
-		return ctrl.Result{RequeueAfter: r.CoverageRequeueInterval}, nil
-	}
 	return ctrl.Result{}, nil
 }
 

@@ -427,8 +427,8 @@ func TestEvictionGate_SkippedMigrationMetrics_OperatorReplicaKeysAndEngineResolu
 			UID:             types.UID("uid-ambig-1"),
 			OwnerReferences: []metav1.OwnerReference{ownerRef},
 			Labels: map[string]string{
-				"pod-migration.gke.io/enabled":     "true",
-				util.LabelReplicaKey:              "shard-0",
+				"pod-migration.gke.io/enabled": "true",
+				util.LabelReplicaKey:           "shard-0",
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -443,8 +443,8 @@ func TestEvictionGate_SkippedMigrationMetrics_OperatorReplicaKeysAndEngineResolu
 			UID:             types.UID("uid-ambig-2"),
 			OwnerReferences: []metav1.OwnerReference{ownerRef},
 			Labels: map[string]string{
-				"pod-migration.gke.io/enabled":     "true",
-				util.LabelReplicaKey:              "shard-0",
+				"pod-migration.gke.io/enabled": "true",
+				util.LabelReplicaKey:           "shard-0",
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -497,6 +497,40 @@ func TestEvictionGate_SkippedMigrationMetrics_OperatorReplicaKeysAndEngineResolu
 		},
 	}
 
+	// 5. Operator-owned pod with active in-flight PMJ for the same replica key
+	podPMJInFlight := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       "default",
+			Name:            "pod-ambig-pmj",
+			UID:             types.UID("uid-ambig-pmj"),
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				util.LabelReplicaKey:           "shard-unique",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	pmjExisting := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pmj-in-flight-existing",
+			Labels: map[string]string{
+				util.LabelParentName: "custom-parent",
+				util.LabelParentKind: "CustomOperator",
+			},
+			Annotations: map[string]string{
+				util.AnnotationReplicaIdentityKey: "shard-unique",
+			},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
 	pm := &pmv1alpha1.PodMigration{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         "default",
@@ -510,7 +544,7 @@ func TestEvictionGate_SkippedMigrationMetrics_OperatorReplicaKeysAndEngineResolu
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pm, podNoKey, podAmbiguous1, podAmbiguous2, podPDB, podGate).
+		WithObjects(pm, podNoKey, podAmbiguous1, podAmbiguous2, podPDB, podGate, podPMJInFlight, pmjExisting).
 		WithStatusSubresource(pm).
 		Build()
 
@@ -581,5 +615,14 @@ func TestEvictionGate_SkippedMigrationMetrics_OperatorReplicaKeysAndEngineResolu
 	}
 	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("readiness_gates_unsatisfied", "test-operator-eng")); got != 1 {
 		t.Errorf("expected SkippedMigrationsTotal[readiness_gates_unsatisfied, test-operator-eng] = 1, got %v", got)
+	}
+
+	// 5. Ambiguous replica key with active in-flight PMJ
+	resp = callGate("pod-ambig-pmj")
+	if !resp.Allowed {
+		t.Fatalf("expected allowed for pod-ambig-pmj, got %v", resp)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("ambiguous_replica_key", "test-operator-eng")); got != 2 {
+		t.Errorf("expected SkippedMigrationsTotal[ambiguous_replica_key, test-operator-eng] = 2, got %v", got)
 	}
 }
