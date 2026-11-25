@@ -5,13 +5,11 @@
 name: CRIU E2E (kind)
 
 on:
+  # Every pull request, so that this check can be required: GitHub leaves a
+  # required check that a path filter skipped pending, which blocks the PR. The
+  # job itself skips the E2E when the PR touches none of the push paths below.
   pull_request:
     branches: [ main ]
-    paths:
-    - 'engines/criu/**'
-    - 'controller/**'
-    - 'verification-suite/**'
-    - '.github/workflows/**'
   push:
     branches: [ main ]
     paths:
@@ -31,6 +29,8 @@ concurrency:
 
 jobs:
   criu-kind-e2e:
+    # Once this is a required check, renaming it leaves every PR waiting for a
+    # check that never reports.
     name: CRIU E2E on kind
     # Pinned rather than ubuntu-latest: CRIU depends on the runner's kernel.
     runs-on: ubuntu-24.04
@@ -44,8 +44,37 @@ jobs:
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
+        # A PR's merge commit and its first parent, the base, to diff below.
+        fetch-depth: 2
 
+    # The same paths as the push trigger. A PR that touches none of them
+    # passes without the E2E. A push starts this workflow only when it touches
+    # one, and then runs the E2E, as a manual run does.
+    - name: Check the changed paths
+      id: changes
+      run: |
+        run=true
+        if [[ "${GITHUB_EVENT_NAME}" == pull_request ]]; then
+          # git diff --quiet exits 1 when something under the paths changed.
+          # With --no-renames, moving a file out of them counts too.
+          rc=0
+          git diff --quiet --no-renames HEAD^1 HEAD -- \
+            engines/criu controller verification-suite .github/workflows || rc=$?
+          case "${rc}" in
+            0)
+              echo "::notice::This PR changes nothing under engines/criu/, controller/, verification-suite/ or .github/workflows/, so the E2E is skipped."
+              run=false
+              ;;
+            1) ;;
+            *) exit "${rc}" ;;
+          esac
+        fi
+        echo "run=${run}" >> "${GITHUB_OUTPUT}"
+
+    # "!= 'false'" rather than "== 'true'": if the output is ever missing, the
+    # E2E runs instead of passing unseen.
     - name: Install kind
+      if: steps.changes.outputs.run != 'false'
       run: |
         echo "Runner kernel: $(uname -r)"
         curl -fsSLo kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
@@ -53,9 +82,11 @@ jobs:
         sudo install -m 0755 kind /usr/local/bin/kind
 
     - name: Bring up kind with the controller and the CRIU engine
+      if: steps.changes.outputs.run != 'false'
       run: verification-suite/kind/up.sh
 
     - name: Run the CRIU E2E scenarios
+      if: steps.changes.outputs.run != 'false'
       run: verification-suite/run_criu_kind_e2e.sh
 
     - name: Collect logs

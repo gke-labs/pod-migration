@@ -1037,15 +1037,24 @@ docker build -f build/holder/Dockerfile -t <YOUR_CRIU_HOLDER_IMAGE> .
 
 ### End-to-end test on kind
 
-CI runs real migrations on a local kind cluster for pull requests and pushes
-to `main` that touch `engines/criu/`, `controller/`, `verification-suite/` or
-`.github/workflows/` (`.github/workflows/criu-e2e.yaml`,
-[#230](https://github.com/gke-labs/pod-migration/issues/230)). The kind
+CI runs real migrations on a local kind cluster
+(`.github/workflows/criu-e2e.yaml`,
+[#230](https://github.com/gke-labs/pod-migration/issues/230)). The job runs for
+every pull request to `main`, so that it can be a required check, but it brings
+up the cluster only when the pull request touches `engines/criu/`,
+`controller/`, `verification-suite/` or `.github/workflows/`; otherwise it
+passes within seconds. Pushes to `main` that touch those paths run it too, and
+so does a manual run. The kind
 workers run real containerd, runc and CRIU, and `fake-gcs-server` stands in
 for the bucket. Two stateful pods, each in its own namespace, are drained to
 the other worker: the first must be restored warm; the second holds a file on
 an emptyDir, which doesn't move, so its restore must fail and its replacement
 must start cold and serve.
+
+A failed run isn't retried. Whether to rerun it is a maintainer's decision:
+the job checks correctness, and a pass on a second try can hide a real race.
+A failed run uploads the `criu-kind-e2e-logs` artifact (node journals, every
+pod's log, the migration objects and events) and keeps it for 7 days.
 
 To run it locally you need an x86-64 Linux host whose kernel passes
 `criu check`, with Docker, kind v0.33.0 (the version CI pins), kubectl, make,
