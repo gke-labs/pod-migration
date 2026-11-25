@@ -44,6 +44,7 @@ kubectl get pdb -n <namespace>
 
 # Check dry-run budget metric counts via port-forward to the leader pod
 LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+LEADER_POD="${LEADER_POD%%_*}"
 kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
 PF_PID=$!
 curl -s http://localhost:8080/metrics | grep pod_migration_budget_checks_total
@@ -194,6 +195,7 @@ To verify that the monitoring and alerting rules correctly detect stuck phases:
 4. Observe controller metrics via port-forward to the leader pod:
    ```bash
    LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+   LEADER_POD="${LEADER_POD%%_*}"
    kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
    PF_PID=$!
    curl -s http://localhost:8080/metrics | grep pod_migration_budget_checks_total

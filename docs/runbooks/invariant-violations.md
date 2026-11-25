@@ -48,6 +48,7 @@ Query controller metrics via port-forward to the current leader replica:
 
 ```bash
 LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+LEADER_POD="${LEADER_POD%%_*}"
 kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
 PF_PID=$!
 curl -s http://localhost:8080/metrics | grep pod_migration_invariant_violations_total
@@ -62,10 +63,10 @@ Note the label value (e.g. `invariant="I1"`, `invariant="I3"`, `invariant="I11"`
 kubectl logs -n pod-migration-system -l app=pod-migration-controller -c manager --tail=500 | grep "Invariant violation detected"
 ```
 
-The log entry records the exact invariant ID, invariant name, reconciled object, namespace, and predicate reason:
+The log entry records the exact invariant ID, invariant name, reconciled object, namespace, predicate reason code, and detailed violation message:
 
 ```
-ERROR Invariant violation detected {"invariant": "I1", "name": "AtMostOnceRestore", "namespace": "default", "pmj": "pmj-redis-0", "reason": "Multiple replacement pods carry snapshot ps-redis-0"}
+ERROR Invariant violation detected {"invariant": "I1", "name": "AtMostOnceRestore", "namespace": "default", "pmj": "pmj-redis-0", "reason": "AtMostOnceRestoreViolation", "detail": "Multiple replacement pods carry snapshot ps-redis-0"}
 ```
 
 ### Step 3: Check Kubernetes Warning Events in Target Namespace
@@ -140,7 +141,7 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
 
 ### Test Case: Simulating an Invariant Violation (`I5` Leaked Trigger)
 
-1. In a cluster configured with `--invariant-mode=observe`, create a completed PMJ fixture in `Succeeded` phase:
+1. In a cluster configured with `--invariant-mode=observe`, create a test PMJ fixture:
    ```yaml
    apiVersion: podmigration.gke.io/v1alpha1
    kind: PodMigrationJob
@@ -151,10 +152,12 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
      podRef:
        name: dummy-pod
      targetPodUID: "12345678-0000-0000-0000-000000000000"
-   status:
-     phase: Succeeded
    ```
-2. Create an un-deleted `PodSnapshotManualTrigger` named `psmt-<pod>-<shortUID>` matching the PMJ target:
+2. Transition the PMJ status to `Succeeded` via the status subresource (the PMJ CRD defines a status subresource, so status blocks are dropped on initial apply):
+   ```bash
+   kubectl patch pmj test-i5-violation-pmj -n default --subresource=status --type=merge -p '{"status":{"phase":"Succeeded"}}'
+   ```
+3. Create an un-deleted `PodSnapshotManualTrigger` named `psmt-<pod>-<shortUID>` matching the PMJ target:
    ```yaml
    apiVersion: podsnapshot.gke.io/v1alpha1
    kind: PodSnapshotManualTrigger
@@ -164,17 +167,21 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
    spec:
      targetPod: dummy-pod
    ```
-3. Trigger reconciliation of `test-i5-violation-pmj`.
-4. Check controller metrics via port-forward to the leader pod:
+4. Trigger reconciliation of `test-i5-violation-pmj` by annotating the PMJ:
+   ```bash
+   kubectl annotate pmj test-i5-violation-pmj -n default test.trigger="$(date +%s)" --overwrite
+   ```
+5. Check controller metrics via port-forward to the leader pod:
    ```bash
    LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+   LEADER_POD="${LEADER_POD%%_*}"
    kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
    PF_PID=$!
    curl -s http://localhost:8080/metrics | grep pod_migration_invariant_violations_total
    kill $PF_PID
    ```
-5. Verify that `pod_migration_invariant_violations_total{invariant="I5"}` increments and `PodMigrationInvariantViolationDetected` fires immediately.
-6. Clean up:
+6. Verify that `pod_migration_invariant_violations_total{invariant="I5"}` increments and `PodMigrationInvariantViolationDetected` fires immediately.
+7. Clean up:
    ```bash
    kubectl delete podsnapshotmanualtrigger psmt-dummy-pod-12345678 -n default
    kubectl delete pmj test-i5-violation-pmj -n default

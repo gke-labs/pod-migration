@@ -37,6 +37,7 @@ Query controller metrics via port-forward to the leader replica:
 
 ```bash
 LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+LEADER_POD="${LEADER_POD%%_*}"
 kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
 PF_PID=$!
 curl -s http://localhost:8080/metrics | grep -E "pod_migration_restore_verdicts_total|pod_migration_outcomes_total"
@@ -124,6 +125,7 @@ To test restore crash classification in a dev/staging cluster:
 5. Check controller metrics via port-forward to the leader pod:
    ```bash
    LEADER_POD=$(kubectl get lease pod-migration-controller-leader -n pod-migration-system -o jsonpath='{.spec.holderIdentity}')
+   LEADER_POD="${LEADER_POD%%_*}"
    kubectl port-forward -n pod-migration-system pod/$LEADER_POD 8080:8080 &
    PF_PID=$!
    curl -s http://localhost:8080/metrics | grep pod_migration_restore_crash_fallback_total

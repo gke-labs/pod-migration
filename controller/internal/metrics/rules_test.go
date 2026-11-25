@@ -51,6 +51,8 @@ type prometheusRuleFile struct {
 var (
 	// metricSelectorRegex extracts metric names appearing before { or [
 	metricSelectorRegex = regexp.MustCompile(`([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(\{|\[)`)
+	// podMigrationTokenRegex matches any pod_migration metric identifier, even without { or [
+	podMigrationTokenRegex = regexp.MustCompile(`\b(pod_migration_[a-zA-Z0-9_]+)\b`)
 	// labelMatcherRegex matches label matches like outcome=~"timeout|budget_timeout" or outcome="failed"
 	labelMatcherRegex = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|=|!=|!~)\s*"([^"]+)"`)
 	// labelFilterRegex matches expressions like metric_name{...}
@@ -275,6 +277,17 @@ func TestPrometheusRulesIntegrity(t *testing.T) {
 						// Known external metric
 					} else {
 						t.Errorf("alert %q: expr references unlisted external metric or unknown symbol %q", rule.Alert, metricName)
+					}
+				}
+
+				// Also check any standalone pod_migration_* identifiers (even without { or [)
+				for _, match := range podMigrationTokenRegex.FindAllStringSubmatch(rule.Expr, -1) {
+					metricName := match[1]
+					baseMetric := strings.TrimSuffix(metricName, "_bucket")
+					baseMetric = strings.TrimSuffix(baseMetric, "_count")
+					baseMetric = strings.TrimSuffix(baseMetric, "_sum")
+					if _, ok := registryMetrics[baseMetric]; !ok {
+						t.Errorf("alert %q: expr contains bare unknown pod_migration metric %q (base %q) not registered in ctrlmetrics.Registry", rule.Alert, metricName, baseMetric)
 					}
 				}
 

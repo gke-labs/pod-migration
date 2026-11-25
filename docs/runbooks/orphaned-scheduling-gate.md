@@ -87,7 +87,7 @@ The `PodGateReconciler` automatically resolves orphaned gates:
    ```bash
    kubectl delete pmj <assigned-pmj> -n <namespace>
    ```
-3. Watch the pod: within seconds, the controller reads the missing PMJ from the API server, annotates the pod with `podsnapshot.gke.io/ps-name: ""`, and removes `gke.io/pod-migration-gate`.
+3. Watch the pod: within seconds, the controller reads the missing PMJ from the API server, annotates the pod with the cold-start bypass annotation (`podsnapshot.gke.io/ps-name: ""` for GKE Pod Snapshots or `<criu-api-group>/ps-name: ""` for CRIU), and removes `gke.io/pod-migration-gate`.
 
 ### Remediation Option 2: Delete PMJ First, Then Delete Gated Pod
 
@@ -111,15 +111,22 @@ If the controller is offline and you must manually un-gate a pod:
 
 To execute an emergency manual release:
 
-1. Temporarily switch `pod-migration-restore-order` binding to Audit mode:
+1. Determine which snapshot engine serves the pod and what API group is configured:
+   - Check the pod's `spec.runtimeClassName`:
+     ```bash
+     kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.runtimeClassName}'
+     ```
+   - Check the controller's `--runtime-class-engines` flag (e.g. `gvisor=gke-pod-snapshots,criu=criu`) or the namespace's `pod-migration.gke.io/runtime-class-engines` annotation on its `PodMigration`. Unset routes default to `gke-pod-snapshots`.
+   - If the pod routes to CRIU, check the controller's `--criu-api-group` flag (defaults to `criu.podmigration.gke.io`, but can be customized to e.g. `podsnapshot.gke.io` for single-group installs).
+2. Temporarily switch `pod-migration-restore-order` binding to Audit mode:
    ```bash
    kubectl patch validatingadmissionpolicybinding pod-migration-restore-order --type=merge -p '{"spec":{"validationActions":["Audit"]}}'
    ```
-2. Find the index of `gke.io/pod-migration-gate` so other controllers' gates (e.g. Kueue, Volcano) are preserved:
+3. Find the index of `gke.io/pod-migration-gate` so other controllers' gates (e.g. Kueue, Volcano) are preserved:
    ```bash
    GATE_INDEX=$(kubectl get pod <pod-name> -n <namespace> -o json | jq '.spec.schedulingGates | map(.name == "gke.io/pod-migration-gate") | index(true)')
    ```
-3. Patch the pod with the cold-start bypass annotation and remove only the `gke.io/pod-migration-gate`:
+4. Patch the pod with the cold-start bypass annotation and remove only the `gke.io/pod-migration-gate`:
    - **For GKE Pod Snapshots:**
      ```bash
      kubectl patch pod <pod-name> -n <namespace> --type=json -p "[
@@ -127,14 +134,16 @@ To execute an emergency manual release:
        {\"op\": \"remove\", \"path\": \"/spec/schedulingGates/${GATE_INDEX}\"}
      ]"
      ```
-   - **For CRIU Engine:**
+   - **For CRIU Engine (using configured `<criu-api-group>`, default `criu.podmigration.gke.io`):**
      ```bash
+     CRIU_GROUP="criu.podmigration.gke.io" # replace if --criu-api-group is non-default
+     CRIU_ESC=$(echo "$CRIU_GROUP" | sed 's/\//~1/g')
      kubectl patch pod <pod-name> -n <namespace> --type=json -p "[
-       {\"op\": \"add\", \"path\": \"/metadata/annotations/criu.podmigration.gke.io~1ps-name\", \"value\": \"\"},
+       {\"op\": \"add\", \"path\": \"/metadata/annotations/${CRIU_ESC}~1ps-name\", \"value\": \"\"},
        {\"op\": \"remove\", \"path\": \"/spec/schedulingGates/${GATE_INDEX}\"}
      ]"
      ```
-4. Immediately restore the policy binding back to `Deny`:
+5. Immediately restore the policy binding back to `Deny`:
    ```bash
    kubectl patch validatingadmissionpolicybinding pod-migration-restore-order --type=merge -p '{"spec":{"validationActions":["Deny"]}}'
    ```

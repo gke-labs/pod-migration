@@ -96,7 +96,7 @@ For GKE Workload Identity environments:
    ```
 2. For quick development/testing cluster fixes, rerun the bundled setup script:
    ```bash
-   ./patches/setup-storage.sh <bucket-name>
+   ./patches/setup-storage.sh <PROJECT_ID> [bucket-name]
    ```
 
 ### Remediation B: Address NetworkPolicy Egress Blocks
@@ -129,12 +129,8 @@ If failed migrations left stranded snapshots in object storage:
 Use the controller's automated snapshot retention and orphan sweep:
 
 - `--snapshot-retention` (default `0`): Controls how long a job that concluded `Succeeded` (restore verified or inferred) or `Failed` keeps the PodSnapshot its trigger created before the controller deletes it. A value of `0` deletes it as soon as nothing can restore from it. Jobs that concluded `SucceededWithoutRestore` keep their snapshot until they are garbage collected (30m after conclusion).
-- `--orphan-snapshot-sweep-interval` (default `10m`): Controls how often the leader controller sweeps orphaned PodSnapshots whose PodMigrationJob is gone and that no pod, trigger, or job references. Deleting a PodSnapshot directs its engine to delete the checkpoint archive.
-- `--orphan-snapshot-min-age` (default `15m`): Enforces a minimum age from creation before an orphaned snapshot is eligible for sweep deletion.
-- To trigger an immediate sweep cycle without waiting for the next periodic interval, restart the controller leader replica (the newly elected leader executes an initial orphan sweep upon startup):
-  ```bash
-  kubectl rollout restart deployment pod-migration-controller -n pod-migration-system
-  ```
+- `--orphan-snapshot-sweep-interval` (default `10m`): Controls how often the leader controller sweeps orphaned PodSnapshots whose PodMigrationJob is gone and that no pod, trigger, or job references. Deleting a PodSnapshot directs its engine to delete the checkpoint archive. Note that the sweeper ticker runs its first pass one interval (10m) after becoming leader.
+- `--orphan-snapshot-min-age` (default `1h`): Enforces a minimum age from creation before an orphaned snapshot is eligible for sweep deletion (must be at least `--snapshot-retention` plus `10m`).
 
 ---
 
