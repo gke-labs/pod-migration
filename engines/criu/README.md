@@ -1037,21 +1037,38 @@ docker build -f build/holder/Dockerfile -t <YOUR_CRIU_HOLDER_IMAGE> .
 
 ### End-to-end test on kind
 
-CI runs real migrations on a local kind cluster for pull requests and pushes
-to `main` that touch `engines/criu/`, `controller/`, `verification-suite/` or
-`.github/workflows/` (`.github/workflows/criu-e2e.yaml`,
-[#230](https://github.com/gke-labs/pod-migration/issues/230)). The kind
+CI runs real migrations on a local kind cluster
+(`.github/workflows/criu-e2e.yaml`,
+[#230](https://github.com/gke-labs/pod-migration/issues/230)). The job runs for
+every pull request to `main`, so that it can be a required check, but it brings
+up the cluster only when the pull request touches `engines/criu/`,
+`controller/`, `verification-suite/` or `.github/workflows/`; otherwise it
+passes within seconds. Pushes to `main` that touch those paths run it too, and
+so does a manual run. The kind
 workers run real containerd, runc and CRIU, and `fake-gcs-server` stands in
 for the bucket. Two stateful pods, each in its own namespace, are drained to
 the other worker: the first must be restored warm; the second holds a file on
 an emptyDir, which doesn't move, so its restore must fail and its replacement
 must start cold and serve.
 
+A failed run isn't retried. Whether to rerun it is a maintainer's decision:
+the job checks correctness, and a pass on a second try can hide a real race.
+A failed run uploads the `criu-kind-e2e-logs` artifact (node journals, every
+pod's log, the migration objects and events) and keeps it for 7 days.
+
 To run it locally you need an x86-64 Linux host whose kernel passes
 `criu check`, with Docker, kind v0.33.0 (the version CI pins), kubectl, make,
-jq and openssl. `up.sh` first deletes any kind cluster named `pm-e2e`, and
+curl, jq and openssl. `up.sh` first deletes any kind cluster named `pm-e2e`, and
 creates the archive signing key Secret with a random key before it applies
-the engine's manifest (see [Archive signing](#archive-signing)).
+the engine's manifest (see [Archive signing](#archive-signing)). It pins the
+kind node image, `fake-gcs-server`, the counter's busybox image and
+cert-manager's manifest by digest or checksum (see the top of `up.sh` to change
+one). It doesn't pin cert-manager's own images, which that manifest names by
+tag, or most of what goes into the four images it builds (base images by tag,
+packages from live archives), and CI runs on GitHub's `ubuntu-24.04` runner
+image, kernel included, so a run can also fail on a tree that didn't change.
+`run_criu_kind_e2e.sh` reads `BUCKET`, `CLUSTER` and `WORKLOAD_IMAGE` too:
+export them for both scripts.
 
 ```bash
 verification-suite/kind/up.sh
