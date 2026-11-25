@@ -66,6 +66,11 @@ func ptrTo[T any](v T) *T { return &v }
 //     or Evicting after the engine may have stopped the source. The source
 //     stays fenced (FenceKept) and the controller retries its cold eviction
 //     until it's allowed, so it's never left fenced with nothing evicting it.
+//   - A Spot preemption job in Evicting while an admission policy denies every
+//     eviction (#305). It deletes its source directly, running or terminated
+//     by node shutdown, and warm-restores within its deadline; the delete's
+//     UID precondition spares a pod that reused the source's name. A non-Spot
+//     job still goes through the eviction subresource and waits.
 //   - The controller's webhooks can't be reached. The fence webhook fails
 //     closed (failurePolicy Fail) and the eviction webhook fails open (Ignore).
 //     Neither leaves a source fenced with nothing driving it.
@@ -957,6 +962,300 @@ func TestT1_TerminationEdgeCases(t *testing.T) {
 		}
 	})
 
+	// ---- 2b. Spot preemption: the final removal isn't an eviction (#305) ----
+
+	// evictingSpotSource creates a fenced source, a durable (Ready) snapshot,
+	// and a job in Evicting well within its deadline, its evicting-since
+	// already stamped so the next pass removes the source. A Spot job carries
+	// the trigger-source label and annotation the node preemption controller
+	// sets. nodeName, phase and finalizers shape the source: a source the
+	// kubelet's graceful node shutdown terminated is Failed on a node that's
+	// gone.
+	type spotSource struct {
+		nodeName   string
+		failed     bool
+		finalizers []string
+	}
+	evictingSpotSource := func(t *testing.T, rs *appsv1.ReplicaSet, leg string, spot bool, shape spotSource) (*pmv1alpha1.PodMigrationJob, *corev1.Pod, string) {
+		t.Helper()
+		source := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:       rs.Namespace,
+				Name:            leg + "-source",
+				Labels:          map[string]string{"app": rs.Labels["app"], "pod-migration.gke.io/enabled": "true", util.LabelFenced: "true"},
+				OwnerReferences: ownedBy(rs),
+				Finalizers:      shape.finalizers,
+			},
+			Spec: corev1.PodSpec{NodeName: shape.nodeName, Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+		}
+		if err := k8sClient.Create(ctx, source); err != nil {
+			t.Fatalf("create source: %v", err)
+		}
+		source.Status = corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{
+				Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: util.ReasonPodMigrationFenced, LastTransitionTime: metav1.Now(),
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "app", Image: "busybox", ImageID: "busybox", ContainerID: "containerd://" + source.Name,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+			}},
+		}
+		if shape.failed {
+			source.Status.Phase = corev1.PodFailed
+			source.Status.Reason = "Terminated"
+			source.Status.Message = "Pod was terminated in response to imminent node shutdown."
+			source.Status.Conditions = append(source.Status.Conditions, corev1.PodCondition{
+				Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue, Reason: "TerminationByKubelet", LastTransitionTime: metav1.Now(),
+			})
+			source.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "Error"}}
+		}
+		if err := k8sClient.Status().Update(ctx, source); err != nil {
+			t.Fatalf("update source status: %v", err)
+		}
+
+		snapName := leg + "-snap"
+		snap := &unstructured.Unstructured{}
+		snap.SetGroupVersionKind(snapshot.PodSnapshotGVK(group))
+		snap.SetNamespace(rs.Namespace)
+		snap.SetName(snapName)
+		if err := k8sClient.Create(ctx, snap); err != nil {
+			t.Fatalf("create snapshot: %v", err)
+		}
+		setSnapshotConditions(t, rs.Namespace, snapName,
+			snapCond("Checkpoint", "True", "Succeeded", time.Now()),
+			snapCond("Ready", "True", "AllSnapshotsAvailable", time.Now()))
+
+		snapStart := metav1.NewTime(time.Now().Add(-20 * time.Second))
+		evictStart := metav1.NewTime(time.Now().Add(-5 * time.Second))
+		ann := map[string]string{
+			util.AnnotationEvictingSince: evictStart.Format(time.RFC3339Nano),
+			util.AnnotationFenceBaseline: `{"containers":{"app":{"id":"containerd://` + source.Name + `","restarts":0}}}`,
+		}
+		if spot {
+			ann[util.AnnotationTriggerSource] = util.TriggerSourceSpotPreemption
+		}
+		job := newJob(t, rs, source, leg+"-pmj", ann, func(s *pmv1alpha1.PodMigrationJobStatus) {
+			s.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
+			s.SnapshotRef = snapName
+			s.SnapshottingStartTime = &snapStart
+			s.EvictingStartTime = &evictStart
+			s.OriginNodeName = shape.nodeName
+			s.Conditions = []metav1.Condition{{
+				Type: ConditionSourceFenced, Status: metav1.ConditionTrue, Reason: util.ReasonFenced,
+				Message: "fenced", LastTransitionTime: snapStart,
+			}}
+		})
+		got := getJob(t, rs.Namespace, job.Name)
+		controllerutil.AddFinalizer(got, SourceFenceFinalizer)
+		if spot {
+			got.Labels[util.LabelTriggerSource] = util.TriggerSourceSpotPreemption
+		}
+		if err := k8sClient.Update(ctx, got); err != nil {
+			t.Fatalf("add finalizer: %v", err)
+		}
+		pod, _ := getPod(t, rs.Namespace, source.Name)
+		return getJob(t, rs.Namespace, job.Name), pod, snapName
+	}
+	// wantWarmReplacement creates the replacement the workload controller
+	// would create, gated and assigned to job, and checks that the pod gate
+	// orders the restore of snapName.
+	wantWarmReplacement := func(t *testing.T, rs *appsv1.ReplicaSet, job *pmv1alpha1.PodMigrationJob, name, snapName string) {
+		t.Helper()
+		repl := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:       rs.Namespace,
+				Name:            name,
+				Labels:          map[string]string{"app": rs.Labels["app"], "pod-migration.gke.io/enabled": "true"},
+				Annotations:     map[string]string{util.AnnotationAssignedPMJ: job.Name},
+				OwnerReferences: ownedBy(rs),
+			},
+			Spec: corev1.PodSpec{
+				SchedulingGates: []corev1.PodSchedulingGate{{Name: MigrationGateName}},
+				Containers:      []corev1.Container{{Name: "app", Image: "busybox"}},
+			},
+		}
+		if err := k8sClient.Create(ctx, repl); err != nil {
+			t.Fatalf("create replacement: %v", err)
+		}
+		// The gate reads the job's snapshot through its engine, so it needs
+		// the registry to look in the CRIU group.
+		warmGate := &PodGateReconciler{
+			Client:          k8sClient,
+			APIReader:       k8sClient,
+			Scheme:          scheme,
+			Recorder:        recorder,
+			InvariantEngine: invEngine,
+			Engines:         registry,
+		}
+		if _, err := warmGate.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: rs.Namespace, Name: name}}); err != nil {
+			t.Fatalf("PodGateReconciler.Reconcile(%s): %v", name, err)
+		}
+		got, _ := getPod(t, rs.Namespace, name)
+		if podHasMigrationGate(got) {
+			t.Fatalf("the replacement is still gated after its job reached Restoring: %v", got.Spec.SchedulingGates)
+		}
+		if order := got.Annotations[engine.RestoreAnnotation(group)]; order != snapName {
+			t.Fatalf("the replacement's restore order is %q, want the checkpoint %q", order, snapName)
+		}
+	}
+	// spotRemovesSourceDespiteDeniedEviction runs a Spot job in Evicting
+	// while every eviction in its namespace is denied, and checks that it
+	// still removes its source and warm-restores within its deadline.
+	spotRemovesSourceDespiteDeniedEviction := func(t *testing.T, ns, leg string, shape spotSource) {
+		t.Helper()
+		rec := newJobReconciler()
+		rs := newReplicaSet(t, ns, leg)
+		job, source, snapName := evictingSpotSource(t, rs, leg, true, shape)
+		denyEvictions(t, ns, source)
+
+		if shape.nodeName != "" && !shape.failed {
+			// A running, scheduled source: the delete starts its 1 s grace
+			// period, and the job waits for the kubelet to finish it.
+			reconcile(t, rec, ns, job.Name)
+			pod, ok := getPod(t, ns, source.Name)
+			if !ok || pod.DeletionTimestamp == nil || pod.DeletionGracePeriodSeconds == nil || *pod.DeletionGracePeriodSeconds != postCheckpointEvictionGracePeriodSeconds {
+				t.Fatalf("the Spot job didn't delete its running source with a %ds grace period while evictions are denied (exists=%t)", postCheckpointEvictionGracePeriodSeconds, ok)
+			}
+			reconcile(t, rec, ns, job.Name)
+			if got := getJob(t, ns, job.Name); got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+				t.Fatalf("phase=%s while the source terminates, want Evicting", got.Status.Phase)
+			}
+			// The kubelet confirms the sandbox is gone.
+			forceDelete(t, pod)
+		}
+		for i := 0; i < 4; i++ {
+			reconcile(t, rec, ns, job.Name)
+			if got := getJob(t, ns, job.Name); got.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
+				break
+			}
+		}
+		if _, ok := getPod(t, ns, source.Name); ok {
+			t.Fatalf("the Spot job didn't remove its checkpointed source while evictions are denied")
+		}
+		got := getJob(t, ns, job.Name)
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring || got.Status.SnapshotRef != snapName {
+			t.Fatalf("after removing the source: phase=%s snapshotRef=%q reason=%q, want Restoring/%s", got.Status.Phase, got.Status.SnapshotRef, readyReason(got), snapName)
+		}
+		if controllerutil.ContainsFinalizer(got, SourceFenceFinalizer) {
+			t.Fatalf("the job still holds %s with its source gone", SourceFenceFinalizer)
+		}
+		wantWarmReplacement(t, rs, got, leg+"-replacement", snapName)
+	}
+
+	t.Run("Spot_EvictingDeletesRunningSourceDespiteDeniedEviction", func(t *testing.T) {
+		ns := createTestNamespace(t, ctx, k8sClient, "t305-spot-running")
+		spotRemovesSourceDespiteDeniedEviction(t, ns, "spotrun", spotSource{nodeName: "t305-spot-node"})
+	})
+
+	t.Run("Spot_EvictingDeletesShutdownTerminatedSourceDespiteDeniedEviction", func(t *testing.T) {
+		// The kubelet's graceful node shutdown terminated the source, and the
+		// node is gone. The eviction API skips budgets for a terminal pod, but
+		// not admission policies.
+		ns := createTestNamespace(t, ctx, k8sClient, "t305-spot-shutdown")
+		spotRemovesSourceDespiteDeniedEviction(t, ns, "spotdown", spotSource{nodeName: "t305-preempted-node", failed: true})
+	})
+
+	t.Run("NonSpot_EvictingStillUsesTheEvictionSubresource", func(t *testing.T) {
+		ns := createTestNamespace(t, ctx, k8sClient, "t305-nonspot")
+		rec := newJobReconciler()
+		rs := newReplicaSet(t, ns, "nonspot")
+		job, source, _ := evictingSpotSource(t, rs, "nonspot", false, spotSource{})
+		denyEvictions(t, ns, source)
+
+		for i := 0; i < 3; i++ {
+			_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: job.Name}})
+			if err == nil || !apierrors.IsForbidden(err) {
+				t.Fatalf("pass %d: err=%v, want the policy's 403 on the eviction subresource", i, err)
+			}
+			pod, ok := getPod(t, ns, source.Name)
+			if !ok || pod.DeletionTimestamp != nil {
+				t.Fatalf("pass %d: a non-Spot job removed its source around a denied eviction", i)
+			}
+			if got := getJob(t, ns, job.Name); got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+				t.Fatalf("pass %d: phase=%s, want Evicting while the eviction is denied", i, got.Status.Phase)
+			}
+		}
+	})
+
+	// A source already terminating on its full grace period: a Spot job
+	// shortens it with a direct delete; a non-Spot job's shortening still
+	// goes through the eviction subresource, which the policy denies.
+	for _, tc := range []struct {
+		leg       string
+		spot      bool
+		wantGrace int64
+	}{
+		{leg: "spotgrace", spot: true, wantGrace: postCheckpointEvictionGracePeriodSeconds},
+		{leg: "nonspotgrace", spot: false, wantGrace: 30},
+	} {
+		t.Run("EvictingShortensTerminatingSource_"+tc.leg, func(t *testing.T) {
+			ns := createTestNamespace(t, ctx, k8sClient, "t305-"+tc.leg)
+			rec := newJobReconciler()
+			rs := newReplicaSet(t, ns, tc.leg)
+			const hold = "t305.pod-migration.gke.io/hold"
+			job, source, _ := evictingSpotSource(t, rs, tc.leg, tc.spot, spotSource{nodeName: "t305-node", finalizers: []string{hold}})
+			t.Cleanup(func() {
+				if pod, ok := getPod(t, ns, source.Name); ok {
+					controllerutil.RemoveFinalizer(pod, hold)
+					_ = k8sClient.Update(ctx, pod)
+				}
+			})
+			denyEvictions(t, ns, source)
+			if err := k8sClient.Delete(ctx, source, client.GracePeriodSeconds(30)); err != nil {
+				t.Fatalf("start the source's graceful termination: %v", err)
+			}
+			if pod, _ := getPod(t, ns, source.Name); pod.DeletionGracePeriodSeconds == nil || *pod.DeletionGracePeriodSeconds != 30 {
+				t.Fatalf("source grace period = %s, want 30", fmtGrace(pod.DeletionGracePeriodSeconds))
+			}
+			reconcile(t, rec, ns, job.Name)
+			pod, ok := getPod(t, ns, source.Name)
+			if !ok {
+				t.Fatalf("the held source vanished")
+			}
+			if pod.DeletionGracePeriodSeconds == nil || *pod.DeletionGracePeriodSeconds != tc.wantGrace {
+				t.Fatalf("source grace period = %s, want %d", fmtGrace(pod.DeletionGracePeriodSeconds), tc.wantGrace)
+			}
+		})
+	}
+
+	t.Run("Spot_EvictingDeleteSparesSameNameReplacement", func(t *testing.T) {
+		// A StatefulSet recreated the source's name after the controller read
+		// the source: the controller's (stale) view still shows the source,
+		// and the delete must not remove the pod that now has the name.
+		ns := createTestNamespace(t, ctx, k8sClient, "t305-spot-stale")
+		rs := newReplicaSet(t, ns, "spotstale")
+		job, source, _ := evictingSpotSource(t, rs, "spotstale", true, spotSource{})
+		stale := source.DeepCopy()
+		forceDelete(t, source)
+		repl := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:       ns,
+				Name:            source.Name,
+				Labels:          map[string]string{"app": rs.Labels["app"], "pod-migration.gke.io/enabled": "true"},
+				OwnerReferences: ownedBy(rs),
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+		}
+		if err := k8sClient.Create(ctx, repl); err != nil {
+			t.Fatalf("create same-name replacement: %v", err)
+		}
+		rec := newJobReconciler()
+		rec.Client = &staleSourceClient{Client: k8sClient, stale: stale}
+		// The precondition's Conflict means the source is gone: no error,
+		// and the next pass, on a fresh view, moves on.
+		if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: job.Name}}); err != nil {
+			t.Fatalf("Reconcile on a stale view: %v, want the UID precondition's Conflict treated as the source being gone", err)
+		}
+		got, ok := getPod(t, ns, source.Name)
+		if !ok || got.UID != repl.UID || got.DeletionTimestamp != nil {
+			t.Fatalf("the Spot job's delete removed the replacement that reused its source's name (exists=%t)", ok)
+		}
+		if j := getJob(t, ns, job.Name); j.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+			t.Fatalf("phase=%s after the stale pass, want Evicting", j.Status.Phase)
+		}
+	})
+
 	// ---- 3. Webhooks unreachable -------------------------------------------
 
 	t.Run("WebhookDown_FenceWebhookFailsClosedAtTheFence", func(t *testing.T) {
@@ -1101,4 +1400,26 @@ func TestT1_TerminationEdgeCases(t *testing.T) {
 			t.Fatalf("leg B: the job still holds %s after its kept source was evicted", SourceFenceFinalizer)
 		}
 	})
+}
+
+// staleSourceClient serves a stale copy of one pod on Get, as an informer
+// cache that hasn't seen the pod's deletion and recreation yet does.
+type staleSourceClient struct {
+	client.Client
+	stale *corev1.Pod
+}
+
+func (c *staleSourceClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if pod, ok := obj.(*corev1.Pod); ok && key == client.ObjectKeyFromObject(c.stale) {
+		c.stale.DeepCopyInto(pod)
+		return nil
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func fmtGrace(p *int64) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprint(*p)
 }
