@@ -106,6 +106,13 @@ func (c EvictionBudgetChecker) Check(ctx context.Context, job *pmv1alpha1.PodMig
 // Spot preemption is an involuntary disruption, which budgets don't cover,
 // and the node goes away whatever the budget says.
 func skipsDisruptionBudgetCheck(job *pmv1alpha1.PodMigrationJob) bool {
+	return isSpotPreemptionJob(job)
+}
+
+// isSpotPreemptionJob reports whether the node preemption controller created
+// job for a Spot preemption. Only the controller creates and labels jobs; no
+// tenant role is granted write access to PodMigrationJobs.
+func isSpotPreemptionJob(job *pmv1alpha1.PodMigrationJob) bool {
 	return job.Labels[util.LabelTriggerSource] == util.TriggerSourceSpotPreemption ||
 		job.Annotations[util.AnnotationTriggerSource] == util.TriggerSourceSpotPreemption
 }
