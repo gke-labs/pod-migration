@@ -23,15 +23,49 @@
 # forky's. The bundle carries the binary + all shared libs + its own ld-linux
 # so it runs on the GKE host without touching host libraries. CRIU stays an
 # unmodified external executable (exec-only subprocess).
+# Forky is Debian testing, whose packages change from week to week, so the
+# stage pins its inputs: the base image by digest, and apt to the
+# snapshot.debian.org timestamp that image was built from (its
+# /etc/apt/sources.list.d/debian.sources names it). The build then checks the
+# bundle against package-versions.lock. Testing gets no Debian security
+# support, and the pinned snapshot gets no fixes until someone bumps the
+# digest, DEBIAN_SNAPSHOT and the lock together (docs/release-process.md).
 # licenses/package-versions.txt lists the source packages and versions, which
 # is what the GPL source release fetches (tools/release/package_gpl_sources.sh)
 # from forky or, once forky has moved on, from snapshot.debian.org.
-FROM debian:forky AS criu
-RUN apt-get update && apt-get install -y --no-install-recommends criu && rm -rf /var/lib/apt/lists/*
+FROM debian:forky@sha256:f3671d5a279b1ae356c7318ce6cdb84c600c2063d708ee97d3cce607bebfb85a AS criu
+ARG DEBIAN_SNAPSHOT=20261123T000000Z
+# Plain http, since the base image has no CA certificates: apt still checks the
+# signed indexes against the archive keyring. Snapshot indexes are past their
+# Valid-Until date by design, so apt can't tell an older snapshot from this
+# one; the lock check below compares the versions instead.
 RUN set -eux; \
+    printf '%s\n' \
+      'Types: deb' \
+      "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \
+      'Suites: forky forky-updates' \
+      'Components: main' \
+      'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
+      'Check-Valid-Until: no' \
+      '' \
+      'Types: deb' \
+      "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}" \
+      'Suites: forky-security' \
+      'Components: main' \
+      'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
+      'Check-Valid-Until: no' \
+      >/etc/apt/sources.list.d/debian.sources; \
+    apt-get update --error-on=any; \
+    apt-get install -y --no-install-recommends criu; \
+    rm -rf /var/lib/apt/lists/*
+# min is the oldest CRIU the bundle may carry. Keep it equal to
+# MinContainerdCRIUVersion in internal/node/containerd_readiness.go, the
+# minimum the agent's readiness check accepts on containerd's path.
+RUN set -eux; \
+    min=4.2.1; \
     ver=$(criu --version | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?'); \
-    if [ "$(printf '%s\n' 4.2.1 "$ver" | sort -V | head -1)" != 4.2.1 ]; then \
-      echo "criu $ver < 4.2.1: refusing (it fails dumps on Linux >= 6.16)"; exit 1; fi; \
+    if [ "$(printf '%s\n' "$min" "$ver" | sort -V | head -1)" != "$min" ]; then \
+      echo "criu $ver < $min: refusing (it fails dumps on Linux >= 6.16)"; exit 1; fi; \
     mkdir -p /bundle /bundle/licenses; \
     cp /usr/sbin/criu /bundle/criu.bin; \
     for lib in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do cp -L "$lib" /bundle/ || true; done; \
@@ -56,6 +90,15 @@ RUN set -eux; \
     printf '#!/bin/sh\nexec /var/lib/pod-migrate/criu-bundle/ld-linux-x86-64.so.2 --library-path /var/lib/pod-migrate/criu-bundle /var/lib/pod-migrate/criu-bundle/criu.bin "$@"\n' > /bundle/criu; \
     chmod +x /bundle/criu; ls -l /bundle; cat /bundle/VERSION
 
+# Fails if the bundle's source package versions differ from the lock, as they
+# do after a new base image or snapshot, and almost surely would if an older
+# snapshot were served in place of this one. To update the lock with the pin,
+# build only the stage above (--target criu) and copy its
+# /bundle/licenses/package-versions.txt (docs/release-process.md).
+FROM criu AS criu-locked
+COPY build/agent/package-versions.lock /package-versions.lock
+RUN diff -u /package-versions.lock /bundle/licenses/package-versions.txt
+
 FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -69,6 +112,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /agent ./cmd
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends util-linux ca-certificates iptables && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /licenses && dpkg-query -W -f='${Package} ${Version}\n' | sort -u > /licenses/runtime-package-versions.txt
-COPY --from=criu /bundle /opt/criu-bundle
+COPY --from=criu-locked /bundle /opt/criu-bundle
 COPY --from=build /agent /agent
 ENTRYPOINT ["/agent"]
