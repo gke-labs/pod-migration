@@ -215,4 +215,4 @@ echo "  List the project-level grants with:" >&2
 echo "  gcloud projects get-iam-policy ${PROJECT_ID} --flatten='bindings[].members' --format='table(bindings.role,bindings.members)' --filter='bindings.role~^roles/(owner|editor|storage[.]|container[.])'" >&2
 
 echo "CRIU storage setup complete. Point the PodMigration of each namespace that only CRIU serves at it, for example"
-echo "spec.storage.location: gs://${BUCKET_NAME}/snapshots (see engines/criu/README.md, Storage credentials)."
+echo "spec.storage.location: gs://${BUCKET_NAME}/<namespace>/snapshots (see engines/criu/README.md, Storage credentials)."

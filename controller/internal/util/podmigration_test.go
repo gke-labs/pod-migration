@@ -71,3 +71,208 @@ func TestActivePodMigration(t *testing.T) {
 		}
 	})
 }
+
+func TestParseStorageLocation(t *testing.T) {
+	tests := []struct {
+		input       string
+		wantBucket  string
+		wantPath    string
+		expectError bool
+	}{
+		{"gs://my-bucket", "my-bucket", "", false},
+		{"gs://my-bucket/", "my-bucket", "", false},
+		{"gs://my-bucket/snapshots", "my-bucket", "snapshots", false},
+		{"gs://my-bucket/snapshots/", "my-bucket", "snapshots", false},
+		{"gs://my-bucket/tenant-a/subpath", "my-bucket", "tenant-a/subpath", false},
+		{"gs://my-bucket/.", "", "", true},
+		{"gs://my-bucket/..", "", "", true},
+		{"gs://my-bucket/tenant-a/.", "", "", true},
+		{"gs://my-bucket/tenant-a/..", "", "", true},
+		{"gs://my-bucket/tenant-a/../tenant-b", "", "", true},
+		{"gs://my-bucket/tenant-a/./sub", "", "", true},
+		{"gs://my-bucket/tenant-a//sub", "", "", true},
+		{"gs://b/ a /x", "", "", true},
+		{"gs://b//ns", "", "", true},
+		{"gs://b///ns", "", "", true},
+		{"gs://b/foo /bar", "", "", true},
+		{"gs://b/foo/ bar", "", "", true},
+		{"gs:// b/foo", "", "", true},
+		{"s3://my-bucket", "", "", true},
+		{"gs://", "", "", true},
+		{"gs:///path", "", "", true},
+		{"not-a-url", "", "", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			b, p, err := ParseStorageLocation(tc.input)
+			if (err != nil) != tc.expectError {
+				t.Fatalf("ParseStorageLocation(%q) error = %v, expectError = %v", tc.input, err, tc.expectError)
+			}
+			if b != tc.wantBucket || p != tc.wantPath {
+				t.Errorf("ParseStorageLocation(%q) = (%q, %q), want (%q, %q)", tc.input, b, p, tc.wantBucket, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestValidateStorageLocationForNamespace(t *testing.T) {
+	tests := []struct {
+		name            string
+		location        string
+		namespace       string
+		allowBucketRoot bool
+		expectError     bool
+	}{
+		{"root bucket rejected without opt-in", "gs://my-bucket", "tenant-a", false, true},
+		{"root bucket with trailing slash rejected without opt-in", "gs://my-bucket/", "tenant-a", false, true},
+		{"root bucket allowed with opt-in", "gs://my-bucket", "tenant-a", true, false},
+		{"root bucket with trailing slash allowed with opt-in", "gs://my-bucket/", "tenant-a", true, false},
+		{"exact namespace path", "gs://my-bucket/tenant-a", "tenant-a", false, false},
+		{"nested namespace path", "gs://my-bucket/tenant-a/snapshots", "tenant-a", false, false},
+		{"cross-namespace mismatch", "gs://my-bucket/tenant-b", "tenant-a", false, true},
+		{"cross-namespace nested mismatch", "gs://my-bucket/tenant-b/snapshots", "tenant-a", false, true},
+		{"partial name match mismatch", "gs://my-bucket/tenant-a-other", "tenant-a", false, true},
+		{"invalid syntax dot-dot", "gs://my-bucket/tenant-a/../tenant-b", "tenant-a", false, true},
+		{"invalid whitespace inside segment", "gs://my-bucket/ tenant-a /snapshots", "tenant-a", false, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateStorageLocationForNamespace(tc.location, tc.namespace, tc.allowBucketRoot)
+			if (err != nil) != tc.expectError {
+				t.Errorf("ValidateStorageLocationForNamespace(%q, %q, %v) error = %v, expectError = %v", tc.location, tc.namespace, tc.allowBucketRoot, err, tc.expectError)
+			}
+		})
+	}
+}
+
+func TestStorageLocationsConflict(t *testing.T) {
+	tests := []struct {
+		name     string
+		bA, pA   string
+		bB, pB   string
+		conflict bool
+	}{
+		{"different buckets", "bucket-a", "path", "bucket-b", "path", false},
+		{"identical bucket and path", "bucket-a", "snapshots", "bucket-a", "snapshots", true},
+		{"identical bucket root", "bucket-a", "", "bucket-a", "", true},
+		{"root claims subpath", "bucket-a", "", "bucket-a", "tenant-b", true},
+		{"subpath claims root", "bucket-a", "tenant-a", "bucket-a", "", true},
+		{"distinct subpaths in same bucket", "bucket-a", "tenant-a", "bucket-a", "tenant-b", false},
+		{"distinct nested subpaths", "bucket-a", "tenants/a", "bucket-a", "tenants/b", false},
+		{"nested ancestor subpath conflict (A encompasses B)", "bucket-a", "tenant-a", "bucket-a", "tenant-a/nested", true},
+		{"nested descendant subpath conflict (B encompasses A)", "bucket-a", "tenant-a/nested", "bucket-a", "tenant-a", true},
+		{"nested prefix with partial name match is not conflict", "bucket-a", "tenant-a", "bucket-a", "tenant-a-other", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := StorageLocationsConflict(tc.bA, tc.pA, tc.bB, tc.pB)
+			if got != tc.conflict {
+				t.Errorf("StorageLocationsConflict(%q, %q, %q, %q) = %v, want %v", tc.bA, tc.pA, tc.bB, tc.pB, got, tc.conflict)
+			}
+		})
+	}
+}
+
+func TestFindConflictingStoragePodMigration(t *testing.T) {
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	older := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "tenant-a", Name: "mig", CreationTimestamp: metav1.NewTime(created.Add(-time.Hour)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket"},
+		},
+	}
+	newer := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "tenant-b", Name: "mig", CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket"},
+		},
+	}
+	distinctPath := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "tenant-c", Name: "mig", CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://other-bucket/tenant-c"},
+		},
+	}
+
+	items := []pmv1alpha1.PodMigration{*older, *newer, *distinctPath}
+
+	// For newer, older is a conflicting PM with precedence (with allowBucketRoot=true since paths are "snapshots" not tenant-prefixed)
+	conflict := FindConflictingStoragePodMigration(newer, items, true)
+	if conflict == nil || conflict.Namespace != "tenant-a" {
+		t.Errorf("FindConflictingStoragePodMigration(newer) = %v, want tenant-a", conflict)
+	}
+
+	// For older, newer does NOT precede older, so older has no conflict
+	if conflict := FindConflictingStoragePodMigration(older, items, true); conflict != nil {
+		t.Errorf("FindConflictingStoragePodMigration(older) = %v, want nil", conflict)
+	}
+
+	// For distinctPath, different subpath in bucket -> no conflict
+	if conflict := FindConflictingStoragePodMigration(distinctPath, items, true); conflict != nil {
+		t.Errorf("FindConflictingStoragePodMigration(distinctPath) = %v, want nil", conflict)
+	}
+
+	// Inactive duplicate in another namespace without finalizer cannot DoS a valid PM
+	inactiveDuplicate := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-d",
+			Name:              "mig-duplicate",
+			CreationTimestamp: metav1.NewTime(created.Add(-2 * time.Hour)), // older timestamp!
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/snapshots"},
+		},
+	}
+	activeInTenantD := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-d",
+			Name:              "mig-active",
+			CreationTimestamp: metav1.NewTime(created.Add(-3 * time.Hour)), // elected active
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://other-bucket/snapshots"},
+		},
+	}
+
+	itemsWithDuplicate := []pmv1alpha1.PodMigration{*activeInTenantD, *inactiveDuplicate, *newer}
+	// newer should NOT be blocked by inactiveDuplicate because inactiveDuplicate is demoted in tenant-d and lacks finalizer
+	if conflict := FindConflictingStoragePodMigration(newer, itemsWithDuplicate, true); conflict != nil {
+		t.Errorf("FindConflictingStoragePodMigration(newer) = %v, expected nil because tenant-d duplicate is inactive", conflict)
+	}
+
+	// Point 2 verification: An unscoped older candidate in tenant-a (gs://shared-bucket/tenant-b)
+	// must NOT block a valid candidate in tenant-b (gs://shared-bucket/tenant-b).
+	unscopedOlder := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-a",
+			Name:              "mig-unscoped-older",
+			CreationTimestamp: metav1.NewTime(created.Add(-5 * time.Hour)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/tenant-b/snapshots"},
+		},
+	}
+	validTenantB := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-b",
+			Name:              "mig-valid-b",
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/tenant-b/snapshots"},
+		},
+	}
+	itemsWithUnscopedOlder := []pmv1alpha1.PodMigration{*unscopedOlder, *validTenantB}
+	if conflict := FindConflictingStoragePodMigration(validTenantB, itemsWithUnscopedOlder, false); conflict != nil {
+		t.Errorf("FindConflictingStoragePodMigration(validTenantB) = %v, expected nil because tenant-a candidate is unscoped", conflict)
+	}
+}

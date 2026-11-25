@@ -847,7 +847,7 @@ func TestMetrics_PodMigrationCoverageObservability(t *testing.T) {
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
 			Storage: pmv1alpha1.StorageSpec{
-				Location: "gs://test-bucket/path",
+				Location: "gs://test-bucket/" + namespace + "/path",
 			},
 		},
 	}
@@ -1026,7 +1026,7 @@ func TestMetrics_MigratableCoverage_DuplicateLoserDoesNotClearActiveCoverage(t *
 			CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute)),
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-a/snapshots"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-a/" + namespace + "/snapshots"},
 		},
 	}
 
@@ -1038,7 +1038,7 @@ func TestMetrics_MigratableCoverage_DuplicateLoserDoesNotClearActiveCoverage(t *
 			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-b/snapshots"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-b/" + namespace + "/snapshots"},
 		},
 	}
 
@@ -1172,7 +1172,7 @@ func TestCoverageMetrics_TransientPSPListError_PreservesExistingCoverage(t *test
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://my-bucket/snapshots"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://my-bucket/" + namespace + "/snapshots"},
 		},
 	}
 
@@ -1278,7 +1278,7 @@ func TestCoverageMetrics_DeleteActiveWhileLoserRemains(t *testing.T) {
 			Finalizers:        []string{StorageCleanupFinalizer},
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-a/snapshots"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-a/" + namespace + "/snapshots"},
 		},
 	}
 	configB := &pmv1alpha1.PodMigration{
@@ -1289,7 +1289,7 @@ func TestCoverageMetrics_DeleteActiveWhileLoserRemains(t *testing.T) {
 			CreationTimestamp: t1,
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-b/snapshots"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-b/" + namespace + "/snapshots"},
 		},
 	}
 
@@ -1409,7 +1409,7 @@ func TestCoverageMetrics_CRIUAPIGroupResolution(t *testing.T) {
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://my-bucket/snapshots"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://my-bucket/" + namespace + "/snapshots"},
 		},
 	}
 

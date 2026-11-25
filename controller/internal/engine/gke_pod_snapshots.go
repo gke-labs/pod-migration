@@ -216,18 +216,30 @@ func (*GKEPodSnapshots) NamespaceResources(pm *pmv1alpha1.PodMigration) ([]*unst
 		return nil, errors.New("rendering namespace resources for a nil PodMigration")
 	}
 	location := pm.Spec.Storage.Location
-	if !strings.HasPrefix(location, "gs://") {
+	bucket, path, err := util.ParseStorageLocation(location)
+	if err != nil {
 		return nil, &StorageLocationError{
 			Location: location,
-			Message:  fmt.Sprintf("invalid GCS location: %s (must start with gs://)", location),
+			Message:  err.Error(),
 		}
 	}
-	parts := strings.SplitN(strings.TrimPrefix(location, "gs://"), "/", 2)
 	gcs := map[string]interface{}{
-		"bucket": parts[0],
+		"bucket": bucket,
 	}
-	if len(parts) > 1 && parts[1] != "" {
-		gcs["path"] = parts[1]
+	if path != "" {
+		gcs["path"] = path
+	}
+	if pm.Spec.Storage.TokenSource != "" {
+		tokenSource := strings.TrimSpace(pm.Spec.Storage.TokenSource)
+		switch tokenSource {
+		case "podKSA", "federatedP4SA":
+			gcs["tokenSource"] = tokenSource
+		default:
+			return nil, &StorageLocationError{
+				Location: location,
+				Message:  fmt.Sprintf("invalid tokenSource: %q (must be podKSA or federatedP4SA)", tokenSource),
+			}
+		}
 	}
 
 	storageConfigName := PodSnapshotStorageConfigName(pm.Namespace, pm.Name)

@@ -231,26 +231,18 @@ func (e *CRIU) NamespaceResources(pm *pmv1alpha1.PodMigration) ([]*unstructured.
 		return nil, errors.New("rendering namespace resources for a nil PodMigration")
 	}
 	location := pm.Spec.Storage.Location
-	if !strings.HasPrefix(location, "gs://") {
+	bucket, path, err := util.ParseStorageLocation(location)
+	if err != nil {
 		return nil, &StorageLocationError{
 			Location: location,
-			Message:  fmt.Sprintf("invalid GCS location: %s (must start with gs://)", location),
-		}
-	}
-	parts := strings.SplitN(strings.TrimPrefix(location, "gs://"), "/", 2)
-	if strings.TrimSpace(parts[0]) == "" {
-		// gs://, gs:///path or a blank bucket name: a storage config without
-		// a bucket could never store a checkpoint (#233).
-		return nil, &StorageLocationError{
-			Location: location,
-			Message:  fmt.Sprintf("invalid GCS location: %s (missing bucket name)", location),
+			Message:  err.Error(),
 		}
 	}
 	gcs := map[string]interface{}{
-		"bucket": parts[0],
+		"bucket": bucket,
 	}
-	if len(parts) > 1 && parts[1] != "" {
-		gcs["path"] = parts[1]
+	if path != "" {
+		gcs["path"] = path
 	}
 
 	group := e.APIGroup()
