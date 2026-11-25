@@ -27,6 +27,7 @@ The controller is implemented as a custom Operator consisting of the following c
 
 ### 2. Reconcilers
 - **`PodMigration` (Config) Reconciler**: Watches `PodMigration` resources. It automatically provisions the required GKE `PodSnapshotStorageConfig` (PSSC) and manual `PodSnapshotPolicy` (PSP) resources with `postCheckpoint: stop` in the target namespace. It also watches those two objects. If someone edits their spec, it changes it back right away. If someone deletes one, it recreates it right away. If one is stuck being deleted, for example because another component's finalizer holds it, the controller doesn't touch it and sets the PodMigration's `Ready` condition to `False` with reason `ManagedObjectTerminating`. Once the object is gone, the controller recreates it (#144).
+  - **Storage Isolation & Scoping**: Automatically enforces cross-namespace storage location isolation. The controller always requires storage paths to be scoped to the namespace (`gs://<bucket>/<namespace>/...`); un-scoped locations or bucket root paths are refused (`Ready=False`, `ConflictingStorageLocation`), unless the bucket root is explicitly enabled via `--allow-bucket-root-storage` (off by default). When cross-namespace conflicts occur (e.g. root bucket sharing), `--storage-isolation-mode` controls handling (`warn` logs and emits `StorageIsolationWarning` events allowing upgrades to proceed, while `enforce` fails closed with `Ready=False`).
 - **`PodMigrationJob` (Execution) Reconciler**: Coordinates the active migration loop:
   1. Records the source Pod's node on the job (`status.originNodeName`). While the job is `Pending`, before the budget check and the fence, it also records that node's machine type (its `node.kubernetes.io/instance-type` label) in `status.originNodeInstanceType`, and its kubelet version, which on GKE is the node's GKE version, in `status.originNodeKubeletVersion`. A snapshot only restores on a compatible node, and the source node can be gone by the time the replacement is released, so these are captured first. They're written with the rest of the job's status, which by default only the controller can write. This is best effort: if the node can't be read or doesn't carry a value, that field stays empty and the migration goes ahead. A recorded value is never replaced. With `--restore-placement` (on by default), the Pod Gate Reconciler places a replacement that its ReplicaSet or StatefulSet would recreate by the machine type (see below, #14).
   2. Fences the source Pod (see [Source fence](#3-source-fence)), then creates a `PodSnapshotManualTrigger` (PSMT) targeting it to initiate snapshotting and container termination.
@@ -130,13 +131,13 @@ Run the provided setup script to automatically create the GCS bucket, configure 
 
 ```bash
 chmod +x patches/setup-storage.sh
-./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]
+./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION] [MODE] [TENANT_NAMESPACES]
 ```
 
 *This script performs the following:*
-- Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access and soft-delete disabled.
-- Binds IAM roles `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and the GKE container engine robot service account.
-- Creates KSA `pm-test-ksa` in the `default` namespace.
+- Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access, hierarchical namespaces enabled, and soft-delete disabled.
+- **Single-Tenant Mode (`MODE=single-tenant`, default)**: Configures dedicated bucket storage (`tokenSource: podKSA`). Binds `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and to the GKE container engine robot service account. Creates KSA `pm-test-ksa` in the `default` namespace.
+- **Multi-Tenant Mode (`MODE=multi-tenant`)**: Configures shared-bucket storage with path-restricted tokens (`tokenSource: federatedP4SA`). Binds `roles/storage.objectAdmin` to the GKE node service account (`service-${PROJECT_NUMBER}@gcp-sa-gkenode.iam.gserviceaccount.com`), creates per-namespace managed folders, and grants workload KSAs zero bucket-wide permissions. Pass a comma-separated list of namespaces as the 5th argument (e.g. `"tenant-a,tenant-b"`). See [Multi-Tenant Snapshot Storage Architecture & Guidance](docs/storage-multitenancy.md).
 
 This bucket is for GKE Pod Snapshots. The experimental CRIU engine needs a bucket of its own, which grants object access to its two service accounts and to nobody else: an archive is a full memory dump. Set one up with `./patches/setup-criu-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]`, and point only the `PodMigration`s of namespaces that only CRIU serves at it (see "Storage credentials" in `engines/criu/README.md`).
 
@@ -160,8 +161,12 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
     ```yaml
     spec:
       storage:
-        location: gs://<YOUR_BUCKET_NAME>/snapshots
+        location: gs://<YOUR_BUCKET_NAME>/default/snapshots
     ```
+
+    > [!IMPORTANT]
+    > **Storage Path Scoping & Existing Installs**:
+    > The controller requires storage locations to be scoped to the namespace (`gs://<bucket>/<namespace>/...`). Existing single-namespace clusters using the legacy sample path `gs://<bucket>/snapshots` must be updated to `gs://<bucket>/default/snapshots`. If targeting the bucket root without a path (`gs://<bucket>`), the controller must be run with `--allow-bucket-root-storage=true`. Without `--allow-bucket-root-storage`, un-scoped paths transition to `Ready=False` and clean up rendered storage resources once in-flight migrations finish.
 
 3.  **Deploy the Controller:**
     Apply the manifests by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:

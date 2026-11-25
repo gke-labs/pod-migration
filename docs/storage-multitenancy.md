@@ -48,18 +48,18 @@ When deploying a single shared GCS bucket across multiple tenants, GCS **hierarc
 - **Token Source**: `spec.storage.tokenSource: "federatedP4SA"`. (Note: `tokenSource` is GKE Pod Snapshots only; the CRIU engine uses node agent STS credentials, see below).
 - **IAM Setup**:
   1. **Zero Bucket-Wide Workload Grants**: Workload Service Accounts (`KSA`) are **never** granted bucket-level IAM roles (`roles/storage.objectUser` or `roles/storage.bucketViewer`) on the shared bucket.
-  2. **GKE Node Agent Role**: The GKE node service account is granted `roles/storage.admin` on the bucket:
+  2. **GKE Node Agent Role**: The GKE node service account is granted `roles/storage.objectAdmin` on the bucket (providing full object lifecycle control without permission to alter bucket IAM):
      ```bash
      gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
        --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-gkenode.iam.gserviceaccount.com" \
-       --role="roles/storage.admin"
+       --role="roles/storage.objectAdmin"
      ```
-  3. **Per-Namespace Managed Folders**: A managed folder is created for each tenant namespace:
+  3. **Per-Namespace Managed Folders**: Managed folders are created best-effort for each tenant namespace (creation errors are swallowed, and folders receive no folder-level IAM bindings):
      ```bash
      gcloud storage managed-folders create "gs://${BUCKET_NAME}/tenant-a"
      gcloud storage managed-folders create "gs://${BUCKET_NAME}/tenant-b"
      ```
-  4. **Path-Restricted Tokens**: At checkpoint/restore time, the GKE node agent mints a short-lived token restricted specifically to the tenant's managed folder path (`gs://${BUCKET_NAME}/${TENANT_NAMESPACE}/`).
+  4. **Path-Restricted Tokens**: At checkpoint/restore time, "token restricted to the managed folder" rests entirely on GKE's `federatedP4SA` scoping to the PSSC path: the GKE node agent mints a short-lived token restricted specifically to the tenant's configured storage location prefix (`gs://${BUCKET_NAME}/${TENANT_NAMESPACE}/`).
   5. Containers running in `tenant-b` cannot read, list, or overwrite checkpoints under `tenant-a`'s prefix because their issued credentials lack permission outside their own path.
 
 ---
@@ -70,9 +70,9 @@ The CRIU snapshot engine (`engines/criu`) operates with dedicated node agent cre
 
 1. **Node Agent STS Identity (#290)**: The CRIU daemonset agent obtains scoped Cloud Storage access via STS credentials bound to the CRIU engine service account.
 2. **Namespace Path Scoping**: Storage path isolation within the shared bucket is enforced server-side:
-   - `util.ParseStorageLocation` rejects dot-dot (`..`), dot (`.`), and empty (`//`) path segments.
+   - `util.ParseStorageLocation` rejects dot-dot (`..`), dot (`.`), and empty (`//`) path segments, as well as whitespace inside path segments.
    - The controller and `pod-migration-storage-location` ValidatingAdmissionPolicy require `spec.storage.location` paths to be scoped to the namespace (`gs://<bucket>/<namespace>/...`).
-   - The CRIU agent structures checkpoint archive keys as `<path>/<pmj-name>/...`, confining objects to the tenant's namespace prefix.
+   - The CRIU agent structures checkpoint archive keys as `<path>/<snapshot-name>/...`, confining objects to the tenant's namespace prefix.
 3. **Cross-Namespace Restore Guardrail (#287)**: The `pod-migrate-psengine-restore-status` ValidatingAdmissionPolicy blocks unauthorized mutations to restore annotations (`pod-migrate.io/psengine-restore`), ensuring workloads in namespace B cannot trigger or spoof restores from namespace A checkpoints.
 
 ---
@@ -81,27 +81,28 @@ The CRIU snapshot engine (`engines/criu`) operates with dedicated node agent cre
 
 The `PodMigrationReconciler` automatically enforces cross-namespace storage location isolation:
 
-1. **Namespace Scoping**: When a storage path is specified, the first path segment must match `metadata.namespace` (`gs://<bucket>/<namespace>/...`). Specifying a path belonging to another namespace is refused with condition `Ready=False` and reason `ConflictingStorageLocation`.
+1. **Namespace Scoping (Always Enforced)**: The controller always requires the storage location's first path segment to match `metadata.namespace` (`gs://<bucket>/<namespace>/...`) and have a non-empty path. Specifying a path belonging to another namespace, or targeting the bucket root without explicit operator opt-in (`--allow-bucket-root-storage`), is refused with condition `Ready=False` and reason `ConflictingStorageLocation` (or `InvalidStorageLocation` for syntax errors).
 2. **Exact & Prefix Collision Refusal**: If two `PodMigration` resources in different namespaces specify conflicting paths in the same bucket, the younger CR is refused:
    - Identical path: `gs://shared-bucket/snapshots` and `gs://shared-bucket/snapshots`.
    - Prefix containment: `gs://shared-bucket/team-a` and `gs://shared-bucket/team-a/nested`.
    - Bucket root: `gs://shared-bucket` and any subpath in `gs://shared-bucket`.
-   - Status: `Ready=False`
+   - Status: `Ready=False` (in `enforce` mode) or `Ready=True` with a `StorageIsolationWarning` event (in `warn` mode).
    - Reason: `ConflictingStorageLocation`
    - Event: A `Warning` event with reason `ConflictingStorageLocation` is emitted on the refused `PodMigration`.
-3. **Deterministic Singleton Precedence**: Only active singleton `PodMigration`s (or ones holding `StorageCleanupFinalizer` during teardown) can block another namespace. Demoted duplicates without finalizers in other namespaces cannot cause cross-namespace denial of service.
+3. **Deterministic Singleton Precedence & Scoping Protection**: Only active singleton `PodMigration`s (or ones holding `StorageCleanupFinalizer` during teardown) that pass their own namespace check can block another namespace. An un-scoped or invalid PodMigration in namespace A cannot cause denial of service against namespace B. Demoted duplicates without finalizers in other namespaces cannot cause cross-namespace denial of service.
 4. **Automatic Re-Evaluation**: When an older conflicting `PodMigration` is deleted or changes its storage location, blocked peer `PodMigration`s in other namespaces that share the bucket are automatically re-enqueued and re-evaluated, promoting to `Ready=True`.
 
 ---
 
 ## Upgrade Considerations & Storage Isolation Mode
 
-When upgrading an existing cluster where multiple namespaces historically configured an un-namespaced shared path (e.g. the legacy README sample `gs://<bucket>/snapshots`):
+When upgrading an existing cluster:
 
-- **Default Migration Window (`--storage-isolation-mode=warn`)**: Operators upgrading existing clusters with legacy shared paths can rely on `--storage-isolation-mode=warn` (the default). In `warn` mode:
-  - Conflicts and un-namespaced paths log warnings and emit Kubernetes `Warning` events with reason `StorageIsolationWarning`.
-  - Reconciler does not mark `Ready=False` or delete storage configs, allowing existing workloads to migrate while operators update `PodMigration` manifests to namespace-prefixed paths (`gs://<bucket>/<namespace>/snapshots`).
-- **Strict Enforcement (`--storage-isolation-mode=enforce`)**: To fail closed immediately against all un-scoped paths and cross-namespace conflicts, configure `--storage-isolation-mode=enforce`. Newer or conflicting `PodMigration` resources transition to `Ready=False` with `ConflictingStorageLocation` and tear down rendered storage resources once in-flight migrations finish.
+- **Namespace Scoping**: The controller always requires paths to begin with `<namespace>/`. Single-namespace installs using legacy paths like `gs://<bucket>/snapshots` in namespace `default` must be updated to `gs://<bucket>/default/snapshots`. If targeting the bucket root without a path prefix (`gs://<bucket>`), the operator must explicitly pass `--allow-bucket-root-storage=true`.
+- **Conflict Handling Window (`--storage-isolation-mode=warn`)**: Operators upgrading existing clusters with legacy shared conflicting paths can rely on `--storage-isolation-mode=warn` (the default). In `warn` mode:
+  - Conflicts between valid locations log warnings and emit Kubernetes `Warning` events with reason `StorageIsolationWarning`.
+  - Reconciler does not mark `Ready=False` or delete storage configs, allowing existing workloads to migrate while operators update `PodMigration` manifests.
+- **Strict Enforcement (`--storage-isolation-mode=enforce`)**: To fail closed immediately against all cross-namespace conflicts, configure `--storage-isolation-mode=enforce`. Newer conflicting `PodMigration` resources transition to `Ready=False` with `ConflictingStorageLocation` and tear down rendered storage resources once in-flight migrations finish.
 
 ---
 

@@ -82,29 +82,34 @@ func PodMigrationPrecedes(a, b *pmv1alpha1.PodMigration) bool {
 
 // ParseStorageLocation parses a storage location URI (e.g. gs://bucket/path) into
 // bucket and clean path without leading or trailing slashes. It returns an error if
-// the location does not start with gs://, has an empty bucket name, or contains
-// invalid path segments ('.', '..', or empty segments from consecutive slashes).
+// the location does not start with gs://, has an empty bucket name, contains whitespace,
+// or contains invalid path segments ('.', '..', or empty segments from consecutive slashes).
 func ParseStorageLocation(location string) (bucket, path string, err error) {
 	if !strings.HasPrefix(location, "gs://") {
 		return "", "", fmt.Errorf("invalid GCS location: %s (must start with gs://)", location)
 	}
 	trimmed := strings.TrimPrefix(location, "gs://")
 	parts := strings.SplitN(trimmed, "/", 2)
-	bucket = strings.TrimSpace(parts[0])
-	if bucket == "" {
-		return "", "", fmt.Errorf("invalid GCS location: %s (missing bucket name)", location)
+	bucket = parts[0]
+	if bucket == "" || strings.ContainsAny(bucket, " 	\r\n") {
+		return "", "", fmt.Errorf("invalid GCS location: %s (missing or invalid bucket name)", location)
 	}
 	if len(parts) > 1 {
-		rawPath := strings.Trim(strings.TrimSpace(parts[1]), "/")
+		if strings.HasPrefix(parts[1], "/") || strings.Contains(parts[1], "//") {
+			return "", "", fmt.Errorf("invalid storage path %q: path segments must not be '.', '..', or empty", parts[1])
+		}
+		if strings.ContainsAny(parts[1], " 	\r\n") {
+			return "", "", fmt.Errorf("invalid storage path %q: path segments must not contain whitespace", parts[1])
+		}
+		rawPath := strings.Trim(parts[1], "/")
 		if rawPath != "" {
 			segments := strings.Split(rawPath, "/")
 			cleanSegments := make([]string, 0, len(segments))
 			for _, seg := range segments {
-				s := strings.TrimSpace(seg)
-				if s == "" || s == "." || s == ".." {
+				if seg == "" || seg == "." || seg == ".." {
 					return "", "", fmt.Errorf("invalid storage path %q: path segments must not be '.', '..', or empty", rawPath)
 				}
-				cleanSegments = append(cleanSegments, s)
+				cleanSegments = append(cleanSegments, seg)
 			}
 			path = strings.Join(cleanSegments, "/")
 		}
@@ -114,17 +119,18 @@ func ParseStorageLocation(location string) (bucket, path string, err error) {
 
 // ValidateStorageLocationForNamespace checks that the storage location path is
 // properly scoped to the given namespace for multi-tenant isolation.
-// When a path is specified, the first path segment must match the namespace
-// (e.g. gs://bucket/<namespace> or gs://bucket/<namespace>/...).
-// An empty path (targeting the root bucket) is only valid in single-tenant mode
-// where the entire bucket is dedicated to one namespace.
-func ValidateStorageLocationForNamespace(location, namespace string) error {
+// The first path segment must match the namespace (e.g. gs://bucket/<namespace> or gs://bucket/<namespace>/...).
+// An empty path (targeting the root bucket) is only allowed when allowBucketRoot is true (explicit operator opt-in).
+func ValidateStorageLocationForNamespace(location, namespace string, allowBucketRoot bool) error {
 	_, path, err := ParseStorageLocation(location)
 	if err != nil {
 		return err
 	}
 	if path == "" {
-		return nil
+		if allowBucketRoot {
+			return nil
+		}
+		return fmt.Errorf("storage location %q targets the bucket root without a path; storage paths must be scoped to namespace %q (e.g. gs://<bucket>/%s) unless --allow-bucket-root-storage is enabled", location, namespace, namespace)
 	}
 	segments := strings.Split(path, "/")
 	if segments[0] != namespace {
@@ -153,9 +159,10 @@ func StorageLocationsConflict(bucketA, pathA, bucketB, pathB string) bool {
 
 // FindConflictingStoragePodMigration finds an active PodMigration in items (across namespaces)
 // whose storage location conflicts with target and has precedence over target.
+// Candidates that fail their own namespace check or have invalid syntax are skipped.
 // Returns the conflicting PodMigration that precedes target, or nil if target is the winner
 // or no conflict exists.
-func FindConflictingStoragePodMigration(target *pmv1alpha1.PodMigration, items []pmv1alpha1.PodMigration) *pmv1alpha1.PodMigration {
+func FindConflictingStoragePodMigration(target *pmv1alpha1.PodMigration, items []pmv1alpha1.PodMigration, allowBucketRoot bool) *pmv1alpha1.PodMigration {
 	if target == nil {
 		return nil
 	}
@@ -198,6 +205,10 @@ func FindConflictingStoragePodMigration(target *pmv1alpha1.PodMigration, items [
 
 		oBucket, oPath, err := ParseStorageLocation(other.Spec.Storage.Location)
 		if err != nil {
+			continue
+		}
+		// Skip candidates that fail their own namespace check
+		if err := ValidateStorageLocationForNamespace(other.Spec.Storage.Location, other.Namespace, allowBucketRoot); err != nil {
 			continue
 		}
 		if StorageLocationsConflict(tBucket, tPath, oBucket, oPath) {

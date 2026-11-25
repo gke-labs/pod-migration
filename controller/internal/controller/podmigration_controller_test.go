@@ -62,7 +62,7 @@ func TestPodMigrationReconciler_RouteRejectUncoveringEngine(t *testing.T) {
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
 			Storage: pmv1alpha1.StorageSpec{
-				Location: "gs://my-test-bucket",
+				Location: "gs://my-test-bucket/default/snapshots",
 			},
 		},
 	}
@@ -124,7 +124,7 @@ func TestPodMigrationReconciler_Reconcile_Success(t *testing.T) {
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
 			Storage: pmv1alpha1.StorageSpec{
-				Location: "gs://my-test-bucket/snapshots/path",
+				Location: "gs://my-test-bucket/default/snapshots/path",
 			},
 		},
 	}
@@ -215,8 +215,8 @@ func TestPodMigrationReconciler_Reconcile_Success(t *testing.T) {
 	if gcs["bucket"] != "my-test-bucket" {
 		t.Errorf("Expected bucket my-test-bucket, got %v", gcs["bucket"])
 	}
-	if gcs["path"] != "snapshots/path" {
-		t.Errorf("Expected path snapshots/path, got %v", gcs["path"])
+	if gcs["path"] != "default/snapshots/path" {
+		t.Errorf("Expected path default/snapshots/path, got %v", gcs["path"])
 	}
 
 	// Verify PodSnapshotPolicy (PSP) was created
@@ -319,8 +319,9 @@ func TestPodMigrationReconciler_Reconcile_BucketOnly(t *testing.T) {
 		Build()
 
 	r := &PodMigrationReconciler{
-		Client: fakeClient,
-		Scheme: scheme,
+		Client:                 fakeClient,
+		Scheme:                 scheme,
+		AllowBucketRootStorage: true,
 	}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -435,7 +436,7 @@ func TestPodMigrationReconciler_Finalizer_AddedOnReconcile(t *testing.T) {
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
 			Storage: pmv1alpha1.StorageSpec{
-				Location: "gs://my-test-bucket/snapshots",
+				Location: "gs://my-test-bucket/default/snapshots",
 			},
 		},
 	}
@@ -1224,7 +1225,7 @@ func TestPodMigrationReconciler_SingletonPerNamespace(t *testing.T) {
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
 			Storage: pmv1alpha1.StorageSpec{
-				Location: "gs://bucket-primary/snapshots",
+				Location: "gs://bucket-primary/default/snapshots",
 			},
 		},
 	}
@@ -1239,7 +1240,7 @@ func TestPodMigrationReconciler_SingletonPerNamespace(t *testing.T) {
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
 			Storage: pmv1alpha1.StorageSpec{
-				Location: "gs://bucket-duplicate/snapshots",
+				Location: "gs://bucket-duplicate/default/snapshots",
 			},
 		},
 	}
@@ -1254,7 +1255,7 @@ func TestPodMigrationReconciler_SingletonPerNamespace(t *testing.T) {
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
 			Storage: pmv1alpha1.StorageSpec{
-				Location: "gs://bucket-other/snapshots",
+				Location: "gs://bucket-other/other-ns/snapshots",
 			},
 		},
 	}
@@ -1851,10 +1852,11 @@ func TestPodMigrationReconciler_ConflictingStorageLocationAcrossNamespaces(t *te
 
 	fakeRecorder := record.NewFakeRecorder(10)
 	r := &PodMigrationReconciler{
-		Client:               fakeClient,
-		Scheme:               scheme,
-		Recorder:             fakeRecorder,
-		StorageIsolationMode: StorageIsolationModeEnforce,
+		Client:                 fakeClient,
+		Scheme:                 scheme,
+		Recorder:               fakeRecorder,
+		StorageIsolationMode:   StorageIsolationModeEnforce,
+		AllowBucketRootStorage: true,
 	}
 
 	// 1. Reconcile configA: should succeed (Ready=True, finalizer added)
@@ -2190,18 +2192,27 @@ func TestPodMigrationReconciler_InvalidStorageLocation_Syntax(t *testing.T) {
 }
 
 // TestPodMigrationReconciler_StorageIsolationMode_Warn asserts that in warn mode,
-// un-namespaced or conflicting paths log and emit Warning events without failing Ready=False.
+// cross-namespace conflicting paths log and emit Warning events without failing Ready=False.
 func TestPodMigrationReconciler_StorageIsolationMode_Warn(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = pmv1alpha1.AddToScheme(scheme)
 
+	t0 := metav1.Now()
 	configA := &pmv1alpha1.PodMigration{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "config-warn"},
-		Spec:       pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/unscoped-path"}},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-a",
+			Name:              "config-a",
+			CreationTimestamp: metav1.NewTime(t0.Add(-time.Hour)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket"}},
 	}
 	configB := &pmv1alpha1.PodMigration{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-b", Name: "config-b"},
-		Spec:       pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/tenant-b"}},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-b",
+			Name:              "config-warn",
+			CreationTimestamp: t0,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/tenant-b"}},
 	}
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -2210,25 +2221,26 @@ func TestPodMigrationReconciler_StorageIsolationMode_Warn(t *testing.T) {
 		Build()
 	fakeRecorder := record.NewFakeRecorder(10)
 	r := &PodMigrationReconciler{
-		Client:               fakeClient,
-		Scheme:               scheme,
-		Recorder:             fakeRecorder,
-		StorageIsolationMode: StorageIsolationModeWarn,
+		Client:                 fakeClient,
+		Scheme:                 scheme,
+		Recorder:               fakeRecorder,
+		StorageIsolationMode:   StorageIsolationModeWarn,
+		AllowBucketRootStorage: true,
 	}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Namespace: "tenant-a", Name: "config-warn"},
+		NamespacedName: types.NamespacedName{Namespace: "tenant-b", Name: "config-warn"},
 	}); err != nil {
 		t.Fatalf("Reconcile in warn mode failed: %v", err)
 	}
 
 	got := &pmv1alpha1.PodMigration{}
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-a", Name: "config-warn"}, got); err != nil {
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-b", Name: "config-warn"}, got); err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
 	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
 	if cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("Expected Ready=True in warn mode, got %+v", cond)
+		t.Fatalf("Expected Ready=True in warn mode on conflict, got %+v", cond)
 	}
 
 	// Verify StorageIsolationWarning event was emitted
@@ -2239,6 +2251,179 @@ func TestPodMigrationReconciler_StorageIsolationMode_Warn(t *testing.T) {
 		}
 	default:
 		t.Errorf("Expected %s Warning event in warn mode", ReasonStorageIsolationWarning)
+	}
+}
+
+// TestPodMigrationReconciler_ConflictingStorageLocation_DeletesNamespaceResources_ConflictBranch
+// pins deleteNamespaceResources in the conflict != nil branch under enforce mode.
+func TestPodMigrationReconciler_ConflictingStorageLocation_DeletesNamespaceResources_ConflictBranch(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	t0 := metav1.Now()
+	configB := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-b",
+			Name:              "config-b",
+			UID:               "uid-b",
+			Generation:        1,
+			CreationTimestamp: t0,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/tenant-b"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(configB).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+	fakeRecorder := record.NewFakeRecorder(10)
+	r := &PodMigrationReconciler{
+		Client:                 fakeClient,
+		Scheme:                 scheme,
+		Recorder:               fakeRecorder,
+		StorageIsolationMode:   StorageIsolationModeEnforce,
+		AllowBucketRootStorage: true,
+	}
+
+	// 1. Initial reconcile: valid and ready, renders PSSC and PSP
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-b", Name: "config-b"},
+	}); err != nil {
+		t.Fatalf("Initial reconcile failed: %v", err)
+	}
+
+	// Verify PSSC was created
+	psscList := &unstructured.UnstructuredList{}
+	psscList.SetGroupVersionKind(psscGVKForTest)
+	if err := fakeClient.List(context.Background(), psscList); err != nil {
+		t.Fatalf("List PSSCs failed: %v", err)
+	}
+	if len(psscList.Items) != 1 {
+		t.Fatalf("Expected 1 PSSC created, got %d", len(psscList.Items))
+	}
+
+	// 2. Add older conflicting configA (bucket root)
+	configA := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-a",
+			Name:              "config-a",
+			UID:               "uid-a",
+			Generation:        1,
+			CreationTimestamp: metav1.NewTime(t0.Add(-time.Hour)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket"},
+		},
+	}
+	if err := fakeClient.Create(context.Background(), configA); err != nil {
+		t.Fatalf("Create configA failed: %v", err)
+	}
+
+	// Reconcile configB: hits conflict branch, deletes PSSC, removes finalizer, Ready=False
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-b", Name: "config-b"},
+	}); err != nil {
+		t.Fatalf("Reconcile on conflicting path failed: %v", err)
+	}
+
+	// Verify PSSC was DELETED by deleteNamespaceResources in the conflict branch
+	psscListAfter := &unstructured.UnstructuredList{}
+	psscListAfter.SetGroupVersionKind(psscGVKForTest)
+	if err := fakeClient.List(context.Background(), psscListAfter); err != nil {
+		t.Fatalf("List PSSCs after conflict failed: %v", err)
+	}
+	if len(psscListAfter.Items) != 0 {
+		t.Fatalf("Expected 0 PSSCs after conflict cleanup, got %d (deleteNamespaceResources in conflict branch was skipped!)", len(psscListAfter.Items))
+	}
+
+	gotB := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-b", Name: "config-b"}, gotB); err != nil {
+		t.Fatalf("Get config-b failed: %v", err)
+	}
+	condB := meta.FindStatusCondition(gotB.Status.Conditions, "Ready")
+	if condB == nil || condB.Status != metav1.ConditionFalse || condB.Reason != ReasonConflictingStorageLocation {
+		t.Fatalf("Expected Ready=False (%s), got %+v", ReasonConflictingStorageLocation, condB)
+	}
+}
+
+// TestPodMigrationReconciler_UnscopedOlderCandidate_DoesNotBlockValidOwner verifies Point 2:
+// an older PodMigration refused for its own scoping error does NOT block a valid candidate in another namespace.
+func TestPodMigrationReconciler_UnscopedOlderCandidate_DoesNotBlockValidOwner(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	t0 := metav1.Now()
+	// Older PodMigration in tenant-a with tenant-b's path (unscoped for tenant-a)
+	configA := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-a",
+			Name:              "config-a",
+			UID:               "uid-a",
+			Generation:        1,
+			CreationTimestamp: metav1.NewTime(t0.Add(-time.Hour)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/tenant-b/snapshots"},
+		},
+	}
+	// Younger PodMigration in tenant-b with its own valid path
+	configB := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "tenant-b",
+			Name:              "config-b",
+			UID:               "uid-b",
+			Generation:        1,
+			CreationTimestamp: t0,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://shared-bucket/tenant-b/snapshots"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(configA, configB).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+	fakeRecorder := record.NewFakeRecorder(10)
+	r := &PodMigrationReconciler{
+		Client:               fakeClient,
+		Scheme:               scheme,
+		Recorder:             fakeRecorder,
+		StorageIsolationMode: StorageIsolationModeEnforce,
+	}
+
+	// 1. Reconcile configA: fails namespace scoping
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-a", Name: "config-a"},
+	}); err != nil {
+		t.Fatalf("Reconcile configA failed: %v", err)
+	}
+	gotA := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-a", Name: "config-a"}, gotA); err != nil {
+		t.Fatalf("Get configA failed: %v", err)
+	}
+	condA := meta.FindStatusCondition(gotA.Status.Conditions, "Ready")
+	if condA == nil || condA.Status != metav1.ConditionFalse || condA.Reason != ReasonConflictingStorageLocation {
+		t.Fatalf("Expected configA Ready=False, got %+v", condA)
+	}
+
+	// 2. Reconcile configB: must NOT be blocked by configA because configA failed its own namespace check
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-b", Name: "config-b"},
+	}); err != nil {
+		t.Fatalf("Reconcile configB failed: %v", err)
+	}
+	gotB := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-b", Name: "config-b"}, gotB); err != nil {
+		t.Fatalf("Get configB failed: %v", err)
+	}
+	condB := meta.FindStatusCondition(gotB.Status.Conditions, "Ready")
+	if condB == nil || condB.Status != metav1.ConditionTrue {
+		t.Fatalf("Expected configB Ready=True, got %+v", condB)
 	}
 }
 
@@ -2261,7 +2446,7 @@ func syncTestPodMigration(namespace, name string) *pmv1alpha1.PodMigration {
 			Finalizers: []string{StorageCleanupFinalizer},
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://sync-bucket/snaps"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://sync-bucket/" + namespace + "/snaps"},
 		},
 	}
 }
@@ -2285,7 +2470,7 @@ func newSyncTestClient(scheme *runtime.Scheme, objs ...client.Object) client.Wit
 func wantPSSCSpec() map[string]interface{} {
 	return map[string]interface{}{
 		"snapshotStorageConfig": map[string]interface{}{
-			"gcs": map[string]interface{}{"bucket": "sync-bucket", "path": "snaps"},
+			"gcs": map[string]interface{}{"bucket": "sync-bucket", "path": "default/snaps"},
 		},
 	}
 }

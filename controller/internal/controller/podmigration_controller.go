@@ -123,10 +123,15 @@ type PodMigrationReconciler struct {
 	// serving runtime classes allowed by --migratable-runtime-classes when set.
 	RuntimeClassPolicy *eligibility.RuntimeClassPolicy
 
-	// StorageIsolationMode controls how cross-namespace storage conflicts and
-	// un-namespaced paths are handled: "enforce" (default, fail-closed with Ready=False)
-	// or "warn" (logs and emits Warning events while allowing upgrade migration).
+	// StorageIsolationMode controls how cross-namespace storage conflicts are handled:
+	// "warn" (default, logs and emits Warning events while allowing upgrade migration)
+	// or "enforce" (fail-closed with Ready=False).
 	StorageIsolationMode string
+
+	// AllowBucketRootStorage allows PodMigration storage locations to target the bucket
+	// root (gs://bucket or gs://bucket/) without namespace path scoping. Intended only for
+	// single-tenant clusters where the entire bucket is dedicated to one namespace.
+	AllowBucketRootStorage bool
 }
 
 // engines returns the registry that serves the reconciler: Engines, or the
@@ -351,101 +356,86 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		isolationMode = DefaultStorageIsolationMode
 	}
 
+	// 1. Validate namespace scoping for multi-tenant isolation (#278):
+	// The controller always requires the first path segment to equal the namespace and a non-empty path,
+	// with the bucket root only allowed through an explicit operator opt-in (--allow-bucket-root-storage).
+	if err := util.ValidateStorageLocationForNamespace(config.Spec.Storage.Location, config.Namespace, r.AllowBucketRootStorage); err != nil {
+		deferCleanup := false
+		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
+			inFlight, err := r.listInFlightMigrations(ctx, config)
+			if err != nil {
+				logger.Error(err, "Failed to list PodMigrationJobs during storage isolation cleanup")
+				return ctrl.Result{}, err
+			}
+			if len(inFlight) > 0 {
+				if deferralExpired(config) {
+					logger.Error(nil, "Storage isolation deferral exceeded maximum; forcing storage cleanup",
+						"name", config.Name, "namespace", config.Namespace, "inFlight", inFlight)
+					if r.Recorder != nil {
+						r.Recorder.Eventf(config, corev1.EventTypeWarning, "DeletionDeferralTimeout",
+							"Forcing cleanup after %s with %d migration(s) still in flight",
+							maxDeletionDeferral, len(inFlight))
+					}
+				} else {
+					logger.Info("Postponing storage resource cleanup on un-scoped PodMigration: active migrations in flight",
+						"name", config.Name, "namespace", config.Namespace, "inFlightCount", len(inFlight), "jobs", inFlight)
+					deferCleanup = true
+				}
+			}
+			if !deferCleanup {
+				if err := r.deleteNamespaceResources(ctx, config); err != nil {
+					logger.Error(err, "Failed to clean up storage resources on un-scoped PodMigration")
+					return ctrl.Result{}, err
+				}
+				controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
+				if err := r.Update(ctx, config); err != nil {
+					logger.Error(err, "Failed to remove finalizer from un-scoped PodMigration")
+					return ctrl.Result{}, err
+				}
+			}
+		}
+		var locationErr *engine.StorageLocationError
+		reason := ReasonConflictingStorageLocation
+		if errors.As(err, &locationErr) || strings.Contains(err.Error(), "invalid storage path") || strings.Contains(err.Error(), "invalid GCS location") {
+			reason = ReasonInvalidStorageLocation
+		}
+		msg := fmt.Sprintf("Storage location %q is not scoped to namespace %q: %v",
+			config.Spec.Storage.Location, config.Namespace, err)
+		logger.Info("Refusing un-scoped storage location",
+			"name", config.Name, "namespace", config.Namespace, "location", config.Spec.Storage.Location, "reason", reason)
+		before := config.Status.DeepCopy()
+		changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             reason,
+			Message:            msg,
+			ObservedGeneration: config.Generation,
+		})
+		if changed {
+			if r.Recorder != nil {
+				r.Recorder.Event(config, corev1.EventTypeWarning, reason, msg)
+			}
+			if err := r.patchStatus(ctx, config, before); err != nil {
+				logger.Error(err, "Failed to update status on un-scoped PodMigration")
+				return ctrl.Result{}, err
+			}
+		}
+		if reason == ReasonInvalidStorageLocation {
+			return ctrl.Result{}, err
+		}
+		if deferCleanup {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	var allMigs pmv1alpha1.PodMigrationList
 	if err := r.List(ctx, &allMigs); err != nil {
 		logger.Error(err, "Failed to list cluster PodMigrations for storage conflict check")
 		return ctrl.Result{}, err
 	}
 
-	targetBucket, _, _ := util.ParseStorageLocation(config.Spec.Storage.Location)
-	bucketShared := false
-	if targetBucket != "" {
-		for _, other := range allMigs.Items {
-			if other.Namespace != config.Namespace {
-				oBucket, _, _ := util.ParseStorageLocation(other.Spec.Storage.Location)
-				if oBucket == targetBucket {
-					bucketShared = true
-					break
-				}
-			}
-		}
-	}
-
-	// Validate namespace scoping for multi-tenant isolation (#278):
-	// When multiple namespaces share a bucket, storage paths must be prefixed with <namespace>/.
-	if bucketShared || isolationMode == StorageIsolationModeEnforce {
-		if err := util.ValidateStorageLocationForNamespace(config.Spec.Storage.Location, config.Namespace); err != nil {
-			if isolationMode == StorageIsolationModeEnforce {
-				deferCleanup := false
-				if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
-					inFlight, err := r.listInFlightMigrations(ctx, config)
-					if err != nil {
-						logger.Error(err, "Failed to list PodMigrationJobs during storage isolation cleanup")
-						return ctrl.Result{}, err
-					}
-					if len(inFlight) > 0 {
-						if deferralExpired(config) {
-							logger.Error(nil, "Storage isolation deferral exceeded maximum; forcing storage cleanup",
-								"name", config.Name, "namespace", config.Namespace, "inFlight", inFlight)
-							if r.Recorder != nil {
-								r.Recorder.Eventf(config, corev1.EventTypeWarning, "DeletionDeferralTimeout",
-									"Forcing cleanup after %s with %d migration(s) still in flight",
-									maxDeletionDeferral, len(inFlight))
-							}
-						} else {
-							logger.Info("Postponing storage resource cleanup on un-scoped PodMigration: active migrations in flight",
-								"name", config.Name, "namespace", config.Namespace, "inFlightCount", len(inFlight), "jobs", inFlight)
-							deferCleanup = true
-						}
-					}
-					if !deferCleanup {
-						if err := r.deleteNamespaceResources(ctx, config); err != nil {
-							logger.Error(err, "Failed to clean up storage resources on un-scoped PodMigration")
-							return ctrl.Result{}, err
-						}
-						controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
-						if err := r.Update(ctx, config); err != nil {
-							logger.Error(err, "Failed to remove finalizer from un-scoped PodMigration")
-							return ctrl.Result{}, err
-						}
-					}
-				}
-				msg := fmt.Sprintf("Storage location %q is not scoped to namespace %q; in multi-tenant environments, storage path must be prefixed with <namespace>/ to prevent cross-namespace access",
-					config.Spec.Storage.Location, config.Namespace)
-				logger.Info("Refusing un-scoped storage location across namespaces",
-					"name", config.Name, "namespace", config.Namespace, "location", config.Spec.Storage.Location)
-				before := config.Status.DeepCopy()
-				changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
-					Type:               "Ready",
-					Status:             metav1.ConditionFalse,
-					Reason:             ReasonConflictingStorageLocation,
-					Message:            msg,
-					ObservedGeneration: config.Generation,
-				})
-				if changed {
-					if r.Recorder != nil {
-						r.Recorder.Event(config, corev1.EventTypeWarning, ReasonConflictingStorageLocation, msg)
-					}
-					if err := r.patchStatus(ctx, config, before); err != nil {
-						logger.Error(err, "Failed to update status on un-scoped PodMigration")
-						return ctrl.Result{}, err
-					}
-				}
-				if deferCleanup {
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-				}
-				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-			} else {
-				if r.Recorder != nil {
-					r.Recorder.Eventf(config, corev1.EventTypeWarning, ReasonStorageIsolationWarning,
-						"Storage location %q is not scoped to namespace %q; upgrade to namespace-prefixed storage paths for multi-tenancy",
-						config.Spec.Storage.Location, config.Namespace)
-				}
-			}
-		}
-	}
-
-	if conflict := util.FindConflictingStoragePodMigration(config, allMigs.Items); conflict != nil {
+	if conflict := util.FindConflictingStoragePodMigration(config, allMigs.Items, r.AllowBucketRootStorage); conflict != nil {
 		if isolationMode == StorageIsolationModeWarn {
 			logger.Info("Storage location conflict detected in warn mode; allowing reconciliation to proceed",
 				"name", config.Name, "namespace", config.Namespace, "conflictingWith", conflict.Namespace+"/"+conflict.Name)

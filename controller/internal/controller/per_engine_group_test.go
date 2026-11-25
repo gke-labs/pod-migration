@@ -90,7 +90,7 @@ func TestPodMigrationReconciler_SideBySideSyncsAndDeletesBothAPIGroups(t *testin
 			Generation: 1,
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://dual-bucket/checkpoints"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://dual-bucket/" + ns + "/checkpoints"},
 		},
 	}
 
@@ -174,7 +174,7 @@ func TestPodMigrationReconciler_AddonOffNoMatchOnGKEGroupFinalizesCRIUCleanly(t 
 			Generation: 1,
 		},
 		Spec: pmv1alpha1.PodMigrationSpec{
-			Storage: pmv1alpha1.StorageSpec{Location: "gs://criu-only-bucket/checkpoints"},
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://criu-only-bucket/" + ns + "/checkpoints"},
 		},
 	}
 

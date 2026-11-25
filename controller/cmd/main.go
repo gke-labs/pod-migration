@@ -101,6 +101,7 @@ func main() {
 		orphanSweepInterval   time.Duration
 		orphanMinAge          time.Duration
 		storageIsolationMode  string
+		allowBucketRootStorage bool
 		showVersion           bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -124,7 +125,8 @@ func main() {
 	flag.DurationVar(&snapshotRetention, "snapshot-retention", 0, fmt.Sprintf("How long a job that concluded Succeeded (restore verified or inferred) or Failed keeps the PodSnapshot its trigger created before the controller deletes it, which tells the snapshot engine to delete the checkpoint archive (#107). 0 (the default) deletes it as soon as nothing can still restore from it. Jobs that concluded SucceededWithoutRestore keep their snapshot until they're garbage collected; then the orphan sweep (--orphan-snapshot-sweep-interval) may delete it. At most %s, so the deletion can still be retried before concluded jobs are garbage collected 30m after they concluded.", controller.MaxSnapshotRetention))
 	flag.DurationVar(&orphanSweepInterval, "orphan-snapshot-sweep-interval", controller.DefaultOrphanSnapshotSweepInterval, "How often the leader deletes orphaned PodSnapshots: ones our triggers created (gke-pod-snapshot-triggered-by is psmt-<pod>-<uid>) whose PodMigrationJob is gone, and that no pod, trigger or job references (#107). Deleting a PodSnapshot tells its snapshot engine to delete the checkpoint archive. 0 turns the sweep off; otherwise at least 1m.")
 	flag.DurationVar(&orphanMinAge, "orphan-snapshot-min-age", controller.DefaultOrphanSnapshotMinAge, fmt.Sprintf("How old an orphaned PodSnapshot must be, from its creation, before the sweep deletes it. When the sweep is on, at least --snapshot-retention plus %s.", controller.OrphanSnapshotMinAgeMargin))
-	flag.StringVar(&storageIsolationMode, "storage-isolation-mode", controller.DefaultStorageIsolationMode, "Multi-tenant storage isolation mode: warn (default, log and emit Warning events while permitting upgrade migration) or enforce (fail-closed on cross-namespace collision or un-scoped paths).")
+	flag.StringVar(&storageIsolationMode, "storage-isolation-mode", controller.DefaultStorageIsolationMode, "Multi-tenant storage isolation mode for cross-namespace conflicts: warn (default, log and emit Warning events while permitting upgrade migration) or enforce (fail-closed on cross-namespace collision).")
+	flag.BoolVar(&allowBucketRootStorage, "allow-bucket-root-storage", false, "Allow PodMigration storage locations to target the bucket root (gs://bucket or gs://bucket/) without namespace path scoping. Intended only for single-tenant clusters where the entire bucket is dedicated to one namespace.")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -314,6 +316,7 @@ func main() {
 		Engines:              engines,
 		RuntimeClassPolicy:   runtimeClassPolicy,
 		StorageIsolationMode: storageIsolationMode,
+		AllowBucketRootStorage: allowBucketRootStorage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")
 		os.Exit(1)
