@@ -18,8 +18,10 @@ package psengine
 // GCS data path for the criu-snapshot-engine: the PSSC names a bucket;
 // archives must be durable there before a PodSnapshot goes Ready, because the
 // source container is stopped right after. Implemented against the GCS JSON
-// API with a metadata-server token — deliberately without a cloud SDK
-// dependency so the module dependency tree stays lean.
+// API with an access token from a TokenSource (the metadata server, or a
+// Google STS exchange of the pod's own service account token, sts.go) —
+// deliberately without a cloud SDK dependency so the module dependency tree
+// stays lean.
 
 import (
 	"bytes"
@@ -34,11 +36,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // ObjectInfo is what the store learned about a written object — used for
@@ -69,60 +74,198 @@ type RangeObjectStore interface {
 	GetRange(ctx context.Context, bucket, object string, start, end int64) (io.ReadCloser, error)
 }
 
-// GCSStore talks to the GCS JSON API using the GCE metadata server's default
-// service account token (note: because the node agent runs with hostNetwork,
-// GKE Workload Identity does not intercept metadata requests; dedicated
-// credentials are tracked in #129 R5). Base URLs are injectable for tests.
+// WarmObjectStore is an ObjectStore that can get its credentials ready ahead
+// of use. The checkpoint pipeline warms it before it freezes a source, so a
+// store that can't authenticate fails the work order with the source
+// untouched (#244).
+type WarmObjectStore interface {
+	ObjectStore
+	Warm(ctx context.Context) error
+}
+
+// GCSStore talks to the GCS JSON API with access tokens from Tokens, or, when
+// Tokens is nil, from the GCE metadata server at TokenURL. The engine
+// controller uses the metadata server, where GKE Workload Identity serves it
+// a token of its own Kubernetes service account. The node agent can't: it
+// runs with hostNetwork, where the metadata server answers as the node's VM
+// service account, so it uses an STSTokenSource instead (#244 R5). Base URLs
+// are injectable for tests.
 type GCSStore struct {
 	HTTP       *http.Client
 	UploadBase string // default https://storage.googleapis.com/upload/storage/v1
 	APIBase    string // default https://storage.googleapis.com/storage/v1
-	TokenURL   string // default GCE metadata server token endpoint
+	TokenURL   string // default GCE metadata server token endpoint, used when Tokens is nil
+	// Tokens fetches access tokens. Nil means the metadata server at
+	// TokenURL.
+	Tokens TokenSource
 
-	mu       sync.Mutex
-	token    string
-	tokenExp time.Time
+	// mu serializes token fetches: concurrent callers wait for one fetch
+	// and share its token.
+	mu        sync.Mutex
+	token     string
+	refreshAt time.Time
+	now       func() time.Time // nil means time.Now; tests set it
 }
 
-// NewGCSStore returns a production-configured store.
+// StorageEmulatorHostEnv names a GCS emulator to use instead of GCS, as in
+// Google's client libraries: host:port, or a URL such as http://host:port.
+// For tests only (the kind E2E runs fake-gcs-server): the store then sends no
+// credentials, so whoever runs the emulator can read, delete or corrupt the
+// archives.
+const StorageEmulatorHostEnv = "STORAGE_EMULATOR_HOST"
+
+// NewGCSStore returns a production-configured store, or, when
+// STORAGE_EMULATOR_HOST is set, one that talks to that emulator without
+// credentials.
 func NewGCSStore() *GCSStore {
-	return &GCSStore{
+	s := &GCSStore{
 		HTTP:       &http.Client{Timeout: 10 * time.Minute}, // uploads scale with RSS
 		UploadBase: "https://storage.googleapis.com/upload/storage/v1",
 		APIBase:    "https://storage.googleapis.com/storage/v1",
 		TokenURL:   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
 	}
+	if host := os.Getenv(StorageEmulatorHostEnv); host != "" {
+		if !strings.Contains(host, "://") {
+			host = "http://" + host
+		}
+		host = strings.TrimSuffix(host, "/")
+		s.UploadBase = host + "/upload/storage/v1"
+		s.APIBase = host + "/storage/v1"
+		s.TokenURL = ""
+		ctrl.Log.WithName("gcs").Info("WARNING: using a GCS emulator instead of GCS, without credentials (tests only)", "env", StorageEmulatorHostEnv, "endpoint", host)
+	}
+	return s
 }
 
+// setBearer authorizes req with tok; an empty token (emulator) sends none.
+func setBearer(req *http.Request, tok string) {
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+}
+
+// bearer returns the access token from Tokens, or from the metadata server
+// at TokenURL when Tokens is nil. A store with neither has no credentials
+// (a GCS emulator): bearer then returns "" without asking anybody, and its
+// requests carry no Authorization header.
 func (g *GCSStore) bearer(ctx context.Context) (string, error) {
+	if g.Tokens == nil && g.TokenURL == "" {
+		return "", nil
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.token != "" && time.Now().Before(g.tokenExp.Add(-30*time.Second)) {
+	if g.token != "" && g.clock().Before(g.refreshAt) {
 		return g.token, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.TokenURL, nil)
+	return g.fetchLocked(ctx)
+}
+
+// warmValidity is how long the token must stay usable when Warm returns.
+// Warm runs before a checkpoint freezes its source, and refreshes a token
+// that would reach its refresh time sooner, so neither the first token nor
+// the hourly refresh is fetched while the source is frozen. A frozen window
+// lasts at most about as long as the orchestrator waits for the checkpoint
+// (its --migration-timeout, 10 min by default): the kubelet's dump (up to
+// 150 s), the upload and the commit checks. 15 minutes outlasts that, as
+// long as --migration-timeout stays at about 15 minutes or less; past that,
+// a refresh can fall inside the frozen window again (it is still bounded,
+// and a failed one fails the checkpoint). A source whose tokens are reused
+// for less than 15 minutes can't meet it: Warm then makes one fetch and
+// returns, as for the metadata server's tokens near their expiry.
+const warmValidity = 15 * time.Minute
+
+// Warm makes sure the store holds a token that stays usable for at least
+// warmValidity, fetching a new one if it doesn't. A store without
+// credentials (no Tokens and no TokenURL, as for a GCS emulator) has nothing
+// to warm.
+func (g *GCSStore) Warm(ctx context.Context) error {
+	if g.Tokens == nil && g.TokenURL == "" {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.token != "" && g.clock().Add(warmValidity).Before(g.refreshAt) {
+		return nil
+	}
+	_, err := g.fetchLocked(ctx)
+	return err
+}
+
+// fetchLocked gets a new token from the store's source and caches it until
+// the source's refresh time. A failed fetch leaves the cache as it was:
+// bearer never uses a token past its refresh time, and one that Warm tried
+// to refresh early stays usable until then. g.mu must be held.
+func (g *GCSStore) fetchLocked(ctx context.Context) (string, error) {
+	src := g.Tokens
+	if src == nil {
+		src = metadataTokens{url: g.TokenURL, now: g.clock}
+	}
+	tok, refreshAt, err := src.Token(ctx)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Metadata-Flavor", "Google")
-	resp, err := g.HTTP.Do(req)
+	g.token, g.refreshAt = tok, refreshAt
+	return g.token, nil
+}
+
+func (g *GCSStore) clock() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
+}
+
+// TokenSource fetches access tokens for the GCS JSON API. GCSStore calls it
+// under its mutex and caches the token until refreshAt, which the source
+// sets a margin before the token expires.
+type TokenSource interface {
+	Token(ctx context.Context) (token string, refreshAt time.Time, err error)
+}
+
+// metadataTimeout bounds each token fetch from the metadata server, which
+// the store makes holding its mutex: every other bucket call waits behind
+// it, so it doesn't get the 10-minute upload client. A variable for tests.
+var metadataTimeout = 10 * time.Second
+
+// metadataClient fetches the metadata server's tokens, each bounded by
+// metadataTimeout.
+var metadataClient = &http.Client{}
+
+// metadataTokens is the GCE metadata server's token for the pod's service
+// account under GKE Workload Identity, or else the node's. It is refreshed
+// 30 s before it expires.
+type metadataTokens struct {
+	url string
+	now func() time.Time
+}
+
+func (m metadataTokens) Token(ctx context.Context) (string, time.Time, error) {
+	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.url, nil)
 	if err != nil {
-		return "", fmt.Errorf("metadata token: %w", err)
+		return "", time.Time{}, err
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	resp, err := metadataClient.Do(req)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("metadata token: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("metadata token: HTTP %d", resp.StatusCode)
+		return "", time.Time{}, fmt.Errorf("metadata token: HTTP %d", resp.StatusCode)
 	}
 	var tok struct {
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	g.token = tok.AccessToken
-	g.tokenExp = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
-	return g.token, nil
+	if tok.AccessToken == "" {
+		return "", time.Time{}, fmt.Errorf("metadata token: the response has no access_token")
+	}
+	return tok.AccessToken, m.now().Add(time.Duration(tok.ExpiresIn)*time.Second - 30*time.Second), nil
 }
 
 func (g *GCSStore) do(ctx context.Context, method, url string, body io.Reader) (*http.Response, error) {
@@ -134,7 +277,7 @@ func (g *GCSStore) do(ctx context.Context, method, url string, body io.Reader) (
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearer(req, tok)
 	return g.HTTP.Do(req)
 }
 
@@ -178,7 +321,7 @@ func (g *GCSStore) GetRange(ctx context.Context, bucket, object string, start, e
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearer(req, tok)
 	wantStatus := http.StatusOK
 	if end >= 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
@@ -233,7 +376,7 @@ func (g *GCSStore) Compose(ctx context.Context, bucket, destination string, sour
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearer(req, tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := g.HTTP.Do(req)
 	if err != nil {

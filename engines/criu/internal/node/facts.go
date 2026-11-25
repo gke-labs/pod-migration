@@ -39,10 +39,16 @@ import (
 // exec and the containerd version call).
 const defaultFactsProbeTimeout = 5 * time.Second
 
-// runcProbeEnv is the PATH the runc probe looks runc up on: the one the
-// sandbox-sibling restore runs runc with (restore.go), so the source fact and
-// the restore agree on which runc they mean.
-var runcProbeEnv = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin:/home/kubernetes/bin"}
+// hostRuncPATH is the PATH the agent looks runc up on in the host mount
+// namespace, for the sandbox-sibling restore (restore.go), the runc calls that
+// manage the restored container, and the runc probe, so all of them mean the
+// same runc: the distro directories, COS's /home/kubernetes/bin, and last
+// /usr/local, where kind and containerd's install guide put runc.
+const hostRuncPATH = "/usr/sbin:/usr/bin:/sbin:/bin:/home/kubernetes/bin:/usr/local/sbin:/usr/local/bin"
+
+// hostRuncEnv is the environment of every runc the agent runs on the host,
+// except the restore, which also puts the CRIU bundle first.
+var hostRuncEnv = []string{"PATH=" + hostRuncPATH}
 
 // factsProbe gathers SourceNodeFacts. Its fields are the seams tests replace.
 type factsProbe struct {
@@ -122,7 +128,7 @@ func (p factsProbe) gather(ctx context.Context) contract.SourceNodeFacts {
 	}
 	if p.execHost != nil {
 		pctx, cancel := context.WithTimeout(ctx, timeout)
-		out, err := p.execHost(pctx, runcProbeEnv, "runc", "--version")
+		out, err := p.execHost(pctx, hostRuncEnv, "runc", "--version")
 		cancel()
 		if err == nil {
 			f.RuncVersion = parseRuncVersion(out)

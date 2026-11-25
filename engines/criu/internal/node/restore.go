@@ -781,7 +781,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		imagePath = in.CheckpointDir
 	}
 	pidFile := filepath.Join(bundleDir, "pid")
-	env := []string{"PATH=" + criuBundleDir + ":/usr/sbin:/usr/bin:/sbin:/bin:/home/kubernetes/bin"}
+	env := []string{"PATH=" + criuBundleDir + ":" + hostRuncPATH}
 	baseArgs := []string{
 		"--root", runcStateRoot, "restore",
 		"--bundle", bundleDir,
@@ -819,7 +819,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		if vi == len(variants)-1 || ctx.Err() != nil || !strings.Contains(lastOut, "cgroup") {
 			break // not cgroup-shaped or final variant — cannot retry
 		}
-		_, _ = r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id)
+		_, _ = r.execHost(ctx, hostRuncEnv, "runc", "--root", runcStateRoot, "delete", "-f", id)
 		if netnsFile != nil {
 			if netNotes := r.cleanNetnsLock(ctx, netnsFile); len(netNotes) > 0 {
 				out.Notes = append(out.Notes, netNotes...)
@@ -936,7 +936,7 @@ func (r *restorer) cleanup(ctx context.Context, migrationName, checkpointDir, ta
 				return notes, fmt.Errorf("runc delete: %w", err)
 			}
 		} else if r.execHost != nil {
-			if out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "delete", "-f", id); err != nil {
+			if out, err := r.execHost(ctx, hostRuncEnv, "runc", "--root", runcStateRoot, "delete", "-f", id); err != nil {
 				if !strings.Contains(out, "does not exist") && !strings.Contains(out, "no such container") {
 					return notes, fmt.Errorf("runc delete: %s", truncate(out, 200))
 				}
@@ -1006,7 +1006,7 @@ func (r *restorer) Signal(ctx context.Context, migrationName string, sig int) er
 		return r.runcSignalFn(ctx, id, sig)
 	}
 	sigStr := strconv.Itoa(sig)
-	out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "kill", id, sigStr)
+	out, err := r.execHost(ctx, hostRuncEnv, "runc", "--root", runcStateRoot, "kill", id, sigStr)
 	if err != nil {
 		if strings.Contains(out, "does not exist") || strings.Contains(out, "not running") || strings.Contains(out, "no such container") {
 			return nil
@@ -1022,7 +1022,7 @@ func (r *restorer) IsRunning(ctx context.Context, migrationName string) (bool, e
 	if r.runcStateFn != nil {
 		return r.runcStateFn(ctx, id)
 	}
-	out, err := r.execHost(ctx, nil, "runc", "--root", runcStateRoot, "state", id)
+	out, err := r.execHost(ctx, hostRuncEnv, "runc", "--root", runcStateRoot, "state", id)
 	if err != nil {
 		if strings.Contains(out, "does not exist") || strings.Contains(out, "no such container") {
 			return false, nil

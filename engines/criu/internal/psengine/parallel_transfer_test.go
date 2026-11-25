@@ -32,6 +32,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -201,7 +202,7 @@ func TestParallelUpload_MultiStreamCompositeAndRestoreDownload(t *testing.T) {
 	// 3. Test parallel download via restore reconciler fetch
 	tmpDir := t.TempDir()
 	dstFile := filepath.Join(tmpDir, "downloaded.tar")
-	nr := &NodeRestoreReconciler{
+	nr := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID,
 		Store: store,
 	}
 
@@ -271,7 +272,7 @@ func TestParallelUpload_FetchEnforcesMaxBytes(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	dstFile := filepath.Join(tmpDir, "downloaded.tar")
-	nr := &NodeRestoreReconciler{
+	nr := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID,
 		Store: store,
 	}
 
@@ -307,7 +308,7 @@ func TestParallelUpload_FetchEnforcesSHA(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	dstFile := filepath.Join(tmpDir, "downloaded.tar")
-	nr := &NodeRestoreReconciler{
+	nr := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID,
 		Store: store,
 	}
 
@@ -374,7 +375,13 @@ func TestParallelUpload_ComposedSizeMismatchFails(t *testing.T) {
 
 func TestNodePipeline_ParallelUploadAndRestoreEndToEnd(t *testing.T) {
 	ps := workOrderSnapshot("ps-web-0-deadbeef")
-	c := newClient(t, ps)
+	// The work order answers a trigger of newClient's test-pmj, so the
+	// archive is bound to the job that restores it (#244).
+	_ = unstructured.SetNestedField(ps.Object, cancelTrigger, "spec", specTriggerName)
+	_ = unstructured.SetNestedField(ps.Object, "trigger-uid-1", "spec", specTriggerUID)
+	trigger := psmtWithUID("web-0", "trigger-uid-1")
+	trigger.SetOwnerReferences([]metav1.OwnerReference{testJobControllerRef()})
+	c := newClient(t, ps, trigger)
 	payload := strings.Repeat("PARALLEL_DATA_1234567890", 100) // 2400 bytes
 	ops := &fakeNodeOps{tarContent: payload, t: t}
 	store := newMemStore()
@@ -383,7 +390,7 @@ func TestNodePipeline_ParallelUploadAndRestoreEndToEnd(t *testing.T) {
 		MinPartSize:    200,
 		MaxConcurrency: 4,
 	}
-	r := &NodeSnapshotReconciler{
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID,
 		Client:               c,
 		NodeName:             "node-a",
 		Ops:                  ops,
@@ -425,7 +432,7 @@ func TestNodePipeline_ParallelUploadAndRestoreEndToEnd(t *testing.T) {
 	c = newClient(t, ps, pod)
 
 	restoreOps := &fakeRestoreOps{}
-	nr := &NodeRestoreReconciler{
+	nr := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID,
 		Client:               c,
 		NodeName:             "node-a",
 		Ops:                  restoreOps,

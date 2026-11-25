@@ -71,11 +71,11 @@ The project publishes four container images across its controllers and the CRIU 
   - `ca-certificates`: `MPL-2.0`, `GPL-2.0-or-later`
   - `coreutils`, `bash`: `GPL-3.0-or-later`
   - `libc6` (glibc runtime): `LGPL-2.1-or-later`
-- **Bundled Pre-compiled Binaries & Libraries (`/opt/criu-bundle/` from Debian trixie)**:
-  - `criu.bin` (version 4.1.x): `GPL-2.0-only` (with Linux syscall exception)
+- **Bundled Pre-compiled Binaries & Libraries (`/opt/criu-bundle/` from Debian forky)**:
+  - `criu.bin` (version >= 4.2.1; `/opt/criu-bundle/licenses/package-versions.txt` lists the exact version of every bundled package): `GPL-2.0-only` (with Linux syscall exception)
   - `ld-linux-x86-64.so.2` (dynamic linker): `LGPL-2.1-or-later`
   - `libc.so.6`: `LGPL-2.1-or-later`
-  - `libnet.so.1`: `BSD-2-Clause` / `GPL-2.0-or-later`
+  - `libnet.so.9`: `BSD-2-Clause` / `GPL-2.0-or-later`
   - `libnl-3.so.200`, `libnl-route-3.so.200`: `LGPL-2.1-only`
   - `libprotobuf-c.so.1`: `BSD-2-Clause`
   - `libbsd.so.0`: `BSD-3-Clause`, `BSD-4-Clause`, `MIT`
@@ -126,9 +126,9 @@ In compliance with the GNU General Public License Version 2.0 (GPL-2.0) and GNU 
 
 ### 4.2 Distribution Package Source Repositories
 
-The bundled binaries are built from Debian trixie distribution packages, while runtime utilities derive from Ubuntu 24.04:
+The bundled binaries are built from Debian forky distribution packages, while runtime utilities derive from Ubuntu 24.04:
 
-- **Debian Trixie Archive**: `http://deb.debian.org/debian/pool/`
+- **Debian Forky Archive**: `http://deb.debian.org/debian/pool/`
 - **Ubuntu 24.04 Archive**: `http://archive.ubuntu.com/ubuntu/pool/`
 
 _Note on package archival_: Live distribution pools periodically drop superseded package versions when minor updates are published. For superseded Debian package versions, exact matching source archives (`.dsc`, `.orig.tar.xz`, and `.debian.tar.xz`) are permanently archived and downloadable from the Debian Snapshot service:

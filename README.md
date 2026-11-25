@@ -142,6 +142,8 @@ chmod +x patches/setup-storage.sh
 
 > **Multi-Tenancy Note**: For shared clusters hosting multiple tenant namespaces, review [Multi-Tenant Snapshot Storage Architecture & Guidance](docs/storage-multitenancy.md). The controller automatically enforces storage location isolation, refusing any `PodMigration` that attempts to share a bucket and path with another namespace (`ConflictingStorageLocation`).
 
+This bucket is for GKE Pod Snapshots. The experimental CRIU engine needs a bucket of its own, which grants object access to its two service accounts and to nobody else: an archive is a full memory dump. Set one up with `./patches/setup-criu-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]`, and point only the `PodMigration`s of namespaces that only CRIU serves at it (see "Storage credentials" in `engines/criu/README.md`).
+
 ### Step 2: Install CRDs
 Install the custom resource definitions for the pod migration controller:
 ```bash
@@ -398,6 +400,8 @@ You can run automated E2E pod migration verification for any of the 21 pre-confi
 ./verification-suite/run_app_validation.sh mysql
 ```
 
+The CRIU engine has its own E2E on kind, which needs no GKE cluster or cloud credentials and runs in CI on pull requests: see [End-to-end test on kind](engines/criu/README.md#end-to-end-test-on-kind).
+
 ---
 
 ## 6. Expected Verification Output
@@ -552,9 +556,9 @@ Other updates of the Pod aren't affected, and a Pod without the `pod-migration.g
    kubectl get validatingadmissionpolicybinding pod-migration-restore-order -o jsonpath='{.spec.validationActions}'
    ```
 
-The CRIU engine protects its restore outcome (`pod-migrate.io/psengine-restore`) the same way, with the `pod-migrate-psengine-restore-status` policy and binding in `engines/criu/deploy/deploy.yaml`. The same steps apply to that binding.
+The CRIU engine protects its restore outcome (`pod-migrate.io/psengine-restore`, and a failure's reason in `pod-migrate.io/psengine-restore-reason`) the same way, with the `pod-migrate-psengine-restore-status` policy and binding in `engines/criu/deploy/deploy.yaml`. The same steps apply to that binding.
 
-**Custom namespace or service account:** each policy names the one identity it allows, as a literal: `system:serviceaccount:pod-migration-system:pod-migration-controller` in `controller/deploy.yaml`, and `system:serviceaccount:pod-migration-criu-system:pod-migrate-agent` in `engines/criu/deploy/deploy.yaml`. If you install into another namespace or rename a service account, change that line in the policy too. Otherwise the controller is denied whenever it orders a restore, and the node agent whenever it records an outcome.
+**Custom namespace or service account:** each policy names the one identity it allows, as a literal: `system:serviceaccount:pod-migration-system:pod-migration-controller` in `controller/deploy.yaml`, and `system:serviceaccount:pod-migration-criu-system:pod-migrate-agent` in `engines/criu/deploy/deploy.yaml`. If you install into another namespace or rename a service account, change that line in the policy too. Otherwise the controller is denied whenever it orders a restore, and the node agent whenever it records an outcome. The CRIU engine's bucket names its namespace and service accounts too: it grants `principal://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<PROJECT_ID>.svc.id.goog/subject/ns/<NAMESPACE>/sa/<SERVICE_ACCOUNT>` for the node agent's and the engine controller's service accounts (`pod-migration-criu-system`, `pod-migrate-agent` and `pod-migrate-psengine-controller` by default). Grant the ones your install uses: `patches/setup-criu-storage.sh` takes them in `CRIU_NAMESPACE`, `CRIU_AGENT_SA` and `CRIU_CONTROLLER_SA`.
 
 ## 8. Monitoring & Prometheus Metrics
 

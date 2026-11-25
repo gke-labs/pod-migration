@@ -50,7 +50,8 @@ const (
 var cancelSnapshotKey = types.NamespacedName{Namespace: "default", Name: cancelSnapshot}
 
 // cancelFixture runs the controller half against a live trigger, so the
-// PodSnapshot work order exists exactly as production creates it.
+// PodSnapshot work order exists exactly as production creates it: for a
+// trigger of newClient's test-pmj, which the archive is bound to (#244).
 func cancelFixture(t *testing.T) client.Client {
 	t.Helper()
 	c := newClient(t,
@@ -58,10 +59,18 @@ func cancelFixture(t *testing.T) client.Client {
 		readyEnginePSP(t, "psp-criu", "default", "pssc-x"),
 		sourcePod("web-0", 1, "node-a"),
 		criuNode("node-a", true),
-		psmtFor("web-0"),
+		jobPSMT("web-0"),
 	)
 	reconcilePSMT(t, c, nil, cancelTrigger)
 	return c
+}
+
+// jobPSMT is psmtFor controlled by newClient's test-pmj, as the orchestrator
+// creates a job's trigger.
+func jobPSMT(pod string) *unstructured.Unstructured {
+	u := psmtFor(pod)
+	u.SetOwnerReferences([]metav1.OwnerReference{testJobControllerRef()})
+	return u
 }
 
 // deleteTriggerErr is what the orchestrator does when it gives up on a job in
@@ -200,7 +209,7 @@ func TestCancelTriggerDeletedBeforeAgentStarts(t *testing.T) {
 
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := newMemStore()
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store})
 
 	if len(ops.events) != 0 {
 		t.Fatalf("a cancelled work order must not start: %v", ops.events)
@@ -220,7 +229,7 @@ func TestCancelAgentSeesDeletedTriggerBeforeStart(t *testing.T) {
 	deleteTrigger(t, c, false)
 
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore()})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore()})
 
 	if len(ops.events) != 0 {
 		t.Fatalf("a work order whose trigger is gone must not start: %v", ops.events)
@@ -237,7 +246,7 @@ func TestCancelAfterUploadSkipsStop(t *testing.T) {
 			c := cancelFixture(t)
 			ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 			store := &hookStore{memStore: newMemStore(), object: "manifest.json", onPut: func() { deleteTrigger(t, c, controllerUp) }}
-			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
+			runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
 
 			if len(ops.stopped) != 0 {
 				t.Fatalf("source stopped after its trigger was deleted: events %v", ops.events)
@@ -259,7 +268,7 @@ func TestTriggerDeletedDuringStopStaysReady(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := cancelFixture(t)
 			ops := &fakeNodeOps{tarContent: "TARBYTES", t: t, beforeStop: func() { deleteTrigger(t, c, controllerUp) }}
-			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Millisecond})
+			runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Millisecond})
 			if len(ops.stopped) != 1 {
 				t.Fatalf("want the committed stop: events %v", ops.events)
 			}
@@ -276,7 +285,7 @@ func TestCancelAfterCheckpointSkipsUploadAndStop(t *testing.T) {
 	c := cancelFixture(t)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t, afterCheckpoint: func() { deleteTrigger(t, c, true) }}
 	store := newMemStore()
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
 
 	if len(ops.stopped) != 0 {
 		t.Fatalf("source stopped after its trigger was deleted: events %v", ops.events)
@@ -319,7 +328,7 @@ func TestCancelDuringCheckpointWaitsForTheCall(t *testing.T) {
 		close(release)
 		errs <- err
 	}()
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: 5 * time.Millisecond})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: 5 * time.Millisecond})
 	if err := <-errs; err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +374,7 @@ func TestCancelInterruptsUpload(t *testing.T) {
 		<-store.started
 		errs <- deleteTriggerErr(c, true)
 	}()
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: 5 * time.Millisecond})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: 5 * time.Millisecond})
 	if err := <-errs; err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +397,7 @@ func TestCancelNormalPathStillStops(t *testing.T) {
 	c := cancelFixture(t)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := newMemStore()
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Millisecond})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Millisecond})
 
 	if got := strings.Join(ops.events, ","); got != "freeze,checkpoint,sourceinfo,commit" {
 		t.Fatalf("event order: %s", got)
@@ -408,7 +417,7 @@ func TestRecreatedTriggerRevokesCancelRequest(t *testing.T) {
 	c := cancelFixture(t)
 	deleteTrigger(t, c, true)
 	requireCancelRequested(t, c)
-	if err := c.Create(context.Background(), psmtFor("web-0")); err != nil {
+	if err := c.Create(context.Background(), jobPSMT("web-0")); err != nil {
 		t.Fatal(err)
 	}
 	reconcilePSMT(t, c, nil, cancelTrigger)
@@ -416,7 +425,7 @@ func TestRecreatedTriggerRevokesCancelRequest(t *testing.T) {
 		t.Fatalf("want the request replaced by Pending, got %+v", cond)
 	}
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore()})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore()})
 	if len(ops.stopped) != 1 || !contract.IsSnapshotReady(getSnapshot(t, c, cancelSnapshot)) {
 		t.Fatalf("want the normal path for the new trigger: events %v", ops.events)
 	}
@@ -444,7 +453,7 @@ func TestPSMTBeingDeletedRequestsCancel(t *testing.T) {
 // cleanup: the snapshot must stay Ready, since the replacement restores it.
 func TestPSMTDeletionKeepsReadySnapshot(t *testing.T) {
 	c := cancelFixture(t)
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore()})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore()})
 	deleteTrigger(t, c, true)
 	if ps := getSnapshot(t, c, cancelSnapshot); !contract.IsSnapshotReady(ps) {
 		t.Fatalf("a Ready snapshot must survive its trigger's deletion: %+v", contract.Conditions(ps))
@@ -480,7 +489,7 @@ func TestCancelCheckErrorBeforeStopLeavesSourceRunning(t *testing.T) {
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	reader := &flakyReader{Reader: c}
 	store := &hookStore{memStore: newMemStore(), object: "manifest.json", onPut: func() { reader.fail = true }}
-	runAgent(t, &NodeSnapshotReconciler{Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
 
 	if len(ops.stopped) != 0 {
 		t.Fatalf("source stopped although the trigger check failed: events %v", ops.events)
@@ -537,7 +546,7 @@ func TestStaleReadAfterReadyDoesNotRerunOrCancel(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := cancelFixture(t)
 			stale := getSnapshot(t, c, cancelSnapshot).DeepCopy()
-			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore()})
+			runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore()})
 			if deleted {
 				deleteTrigger(t, c, true)
 			}
@@ -545,7 +554,7 @@ func TestStaleReadAfterReadyDoesNotRerunOrCancel(t *testing.T) {
 			before := outcomeCount(contract.ReasonCancelled)
 
 			ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
-			runAgent(t, &NodeSnapshotReconciler{
+			runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID,
 				Client:    &staleSnapshotClient{Client: c, key: cancelSnapshotKey, stale: stale},
 				APIReader: c, NodeName: "node-a", Ops: ops, Store: newMemStore(),
 			})
@@ -573,7 +582,7 @@ func TestOutcomeBeforeStopSkipsStop(t *testing.T) {
 			t.Fatal(err)
 		}
 	}}
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour})
 	if len(ops.stopped) != 0 {
 		t.Fatalf("source stopped although the snapshot already had an outcome: events %v", ops.events)
 	}
@@ -587,7 +596,7 @@ func TestOutcomeBeforeStopSkipsStop(t *testing.T) {
 func TestFinishKeepsExistingOutcome(t *testing.T) {
 	outcomes := map[string]func(t *testing.T, c client.Client){
 		"Ready": func(t *testing.T, c client.Client) {
-			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore()})
+			runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore()})
 		},
 		contract.ReasonRefused: func(t *testing.T, c client.Client) {
 			if err := (&PSMTReconciler{Client: c}).setSnapshotTerminal(context.Background(), "default", cancelSnapshot, contract.ReasonRefused, "policy"); err != nil {
@@ -596,7 +605,7 @@ func TestFinishKeepsExistingOutcome(t *testing.T) {
 		},
 		contract.ReasonCancelled: func(t *testing.T, c client.Client) {
 			deleteTrigger(t, c, true)
-			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{t: t}, Store: newMemStore()})
+			runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeNodeOps{t: t}, Store: newMemStore()})
 		},
 	}
 	for name, setup := range outcomes {
@@ -606,7 +615,7 @@ func TestFinishKeepsExistingOutcome(t *testing.T) {
 				setup(t, c)
 				want := contract.Conditions(getSnapshot(t, c, cancelSnapshot))
 				before := outcomeCount(reason)
-				r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a"}
+				r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a"}
 				if err := r.finish(context.Background(), ctrl.Request{NamespacedName: cancelSnapshotKey}, reason, "late"); err != nil {
 					t.Fatal(err)
 				}
@@ -632,7 +641,7 @@ func TestAgentLeavesBucketlessWorkOrderToController(t *testing.T) {
 	c := newClient(t, ps)
 	for _, node := range []string{"node-a", "node-b"} {
 		ops := &fakeNodeOps{t: t}
-		runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: node, Ops: ops, Store: newMemStore()})
+		runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: node, Ops: ops, Store: newMemStore()})
 		if len(ops.events) != 0 {
 			t.Fatalf("agent on %s acted on a work order without a bucket: %v", node, ops.events)
 		}
@@ -716,7 +725,7 @@ func runWithPreStopReader(t *testing.T, ctx context.Context, onGet func(context.
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	reader := &scriptedReader{Reader: c, onGet: onGet}
 	store := &hookStore{memStore: newMemStore(), object: "manifest.json", onPut: func() { reader.armed = true }}
-	_, _ = (&NodeSnapshotReconciler{Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour}).
+	_, _ = (&NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour}).
 		Reconcile(ctx, ctrl.Request{NamespacedName: cancelSnapshotKey})
 	return c, ops, reader
 }
@@ -826,7 +835,7 @@ func TestCheckpointTimeoutLeavesSnapshotUnsettled(t *testing.T) {
 			if cancelPending {
 				ops.afterCheckpoint = func() { deleteTrigger(t, c, true) }
 			}
-			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Hour})
+			runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CancelPollInterval: time.Hour})
 			if len(ops.unfrozen) != 0 {
 				t.Fatalf("source container was unfrozen after a timed-out checkpoint: %v", ops.events)
 			}
@@ -837,7 +846,7 @@ func TestCheckpointTimeoutLeavesSnapshotUnsettled(t *testing.T) {
 
 			// Nothing works the snapshot again: not the agent ...
 			again := &fakeNodeOps{tarContent: "TARBYTES", t: t}
-			runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: again, Store: newMemStore()})
+			runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: again, Store: newMemStore()})
 			if len(again.events) != 0 {
 				t.Fatalf("a timed-out snapshot was worked again: %v", again.events)
 			}
@@ -1049,7 +1058,7 @@ func TestAgentShutdownWritesNoOutcome(t *testing.T) {
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := &failingStore{memStore: newMemStore(), failSubstr: "checkpoint.tar"}
 	store.onFail = cancel
-	_, _ = (&NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour}).
+	_, _ = (&NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CancelPollInterval: time.Hour}).
 		Reconcile(ctx, ctrl.Request{NamespacedName: cancelSnapshotKey})
 	if ps := getSnapshot(t, c, cancelSnapshot); hasOutcome(ps) {
 		t.Fatalf("an outcome was written on shutdown: %+v", contract.Conditions(ps))
@@ -1066,10 +1075,20 @@ func TestAgentShutdownWritesNoOutcome(t *testing.T) {
 // or Refused one says nothing about this attempt.
 
 // psmtWithUID is psmtFor with the UID the API server gives each trigger, so a
-// trigger created again under the same name is a different instance.
+// trigger created again under the same name is a different instance. Like
+// every trigger the orchestrator creates, it's controlled by a PodMigrationJob:
+// one of its own (job-of-<uid>), whose UID the archive is bound to (#244).
 func psmtWithUID(pod, uid string) *unstructured.Unstructured {
 	u := psmtFor(pod)
 	u.SetUID(types.UID(uid))
+	controller := true
+	u.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: contract.GVKPodMigrationJob.GroupVersion().String(),
+		Kind:       contract.GVKPodMigrationJob.Kind,
+		Name:       "pmj-of-" + uid,
+		UID:        types.UID("job-of-" + uid),
+		Controller: &controller,
+	}})
 	return u
 }
 
@@ -1099,7 +1118,7 @@ func staleFixture(t *testing.T, ops *fakeNodeOps, store ObjectStore) client.Clie
 	)
 	dropFixtureJob(t, c)
 	reconcilePSMT(t, c, nil, cancelTrigger)
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store})
 	deleteTrigger(t, c, true)
 	return c
 }
@@ -1167,7 +1186,7 @@ func TestRecreatedTriggerGetsNewCheckpointNotEarlierReady(t *testing.T) {
 	}
 
 	ops := &fakeNodeOps{tarContent: "SECOND", t: t}
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store})
 	if !contract.IsSnapshotReady(getSnapshot(t, c, cancelSnapshot)) || len(ops.events) == 0 || ops.events[0] != "freeze" {
 		t.Fatalf("want a new checkpoint for the new trigger: events %v, conditions %+v", ops.events, contract.Conditions(getSnapshot(t, c, cancelSnapshot)))
 	}
@@ -1192,7 +1211,7 @@ func TestSameTriggerKeepsItsReadyWorkOrder(t *testing.T) {
 		psmtWithUID("web-0", "trigger-1"),
 	)
 	reconcilePSMT(t, c, nil, cancelTrigger)
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "T", t: t}, Store: newMemStore()})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "T", t: t}, Store: newMemStore()})
 	reconcilePSMT(t, c, nil, cancelTrigger)
 	ps := getSnapshot(t, c, cancelSnapshot)
 	if !contract.IsSnapshotReady(ps) || ps.GetDeletionTimestamp() != nil || triggerAnswer(t, c) != cancelSnapshot {
@@ -1280,7 +1299,7 @@ func TestRecreatedTriggerTakesOverUnfinishedWorkOrder(t *testing.T) {
 	if got := workOrderString(getSnapshot(t, c, cancelSnapshot), specTriggerUID); got != "trigger-2" {
 		t.Fatalf("work order %s = %q, want trigger-2 after the take-over", specTriggerUID, got)
 	}
-	runAgent(t, &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "T", t: t}, Store: newMemStore()})
+	runAgent(t, &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "T", t: t}, Store: newMemStore()})
 	reconcilePSMT(t, c, nil, cancelTrigger)
 	ps := getSnapshot(t, c, cancelSnapshot)
 	if !contract.IsSnapshotReady(ps) || ps.GetDeletionTimestamp() != nil || triggerAnswer(t, c) != cancelSnapshot {

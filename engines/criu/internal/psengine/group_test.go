@@ -386,7 +386,7 @@ func TestSetGroupReachesTheWebhookPreflightAndRestore(t *testing.T) {
 		}
 		c := newClient(t, ps, pod)
 		ops := &fakeRestoreOps{}
-		r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir()}
+		r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir()}
 		key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
 		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
 			t.Fatal(err)
