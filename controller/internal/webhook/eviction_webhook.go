@@ -159,10 +159,20 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 			runtimeClass, a.Eligibility.String()))
 	}
 
+	engineNameForPod := func() string {
+		pm, err := util.ActivePodMigration(ctx, a.Client, pod.Namespace)
+		if err == nil && pm != nil {
+			if eng, ok := a.engineFor(pod, pm); ok && eng != nil {
+				return eng.Name()
+			}
+		}
+		return "none"
+	}
+
 	// Check if this pod already had a migration that timed out waiting for PDB
 	if util.HasPDBEvictionTimedOut(pod) {
 		logger.Info("Prior migration for pod timed out on PDB budget, skipping re-snapshot and allowing eviction", "pod", req.Name)
-		metrics.RecordMigrationSkipped("pdb_timed_out", "none")
+		metrics.RecordMigrationSkipped("pdb_timed_out", engineNameForPod())
 		return admission.Allowed("skipping migration: prior migration timed out on PDB budget")
 	}
 
@@ -250,7 +260,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	// lookup so an already-running migration is never interrupted.
 	if !util.AreReadinessGatesSatisfied(pod) {
 		logger.Info("Pod readiness gates are not satisfied, skipping migration and allowing eviction", "pod", req.Name)
-		metrics.RecordMigrationSkipped("readiness_gates_unsatisfied", "none")
+		metrics.RecordMigrationSkipped("readiness_gates_unsatisfied", engineNameForPod())
 		return admission.Allowed("skipping migration: pod readiness gates not satisfied")
 	}
 

@@ -32,7 +32,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -149,21 +148,7 @@ func ClassifyEligibilityVerdict(v Verdict) string {
 	if v.Code != "" {
 		return v.Code
 	}
-	r := strings.ToLower(v.Reason)
-	switch {
-	case strings.Contains(r, "container"):
-		return "multi_container"
-	case strings.Contains(r, "hostnetwork"):
-		return "host_network"
-	case strings.Contains(r, "node") || strings.Contains(r, "criu-ready"):
-		return "node_not_ready"
-	case strings.Contains(r, "already restored") || strings.Contains(r, "wrapped"):
-		return "already_restored"
-	case strings.Contains(r, "command"):
-		return "missing_command"
-	default:
-		return "ineligible"
-	}
+	return "ineligible"
 }
 
 // PolicyRef names the policy object that serves a pod.

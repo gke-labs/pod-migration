@@ -1007,6 +1007,142 @@ func TestMetrics_PodMigrationCoverageObservability(t *testing.T) {
 	}
 }
 
+func TestMetrics_MigratableCoverage_DuplicateLoserDoesNotClearActiveCoverage(t *testing.T) {
+	metrics.ResetCoverageForTest()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "test-ns-peers"
+	now := time.Now().Truncate(time.Second)
+
+	// Active (older creationTimestamp)
+	configA := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "mig-a",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-a/snapshots"},
+		},
+	}
+
+	// Newer duplicate loser
+	configB := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "mig-b",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-b/snapshots"},
+		},
+	}
+
+	gvisor := "gvisor"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "running-pod",
+			Namespace: namespace,
+			Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisor,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "podsnapshot.gke.io",
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	psp.SetName("test-policy")
+	psp.SetNamespace(namespace)
+	psp.Object["spec"] = map[string]interface{}{
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+		"selector": map[string]interface{}{
+			"matchLabels": map[string]interface{}{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+	}
+	psp.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(configA, configB, pod, psp).
+		WithStatusSubresource(configA, configB, psp).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client:                  fakeClient,
+		Scheme:                  scheme,
+		CoverageRequeueInterval: 30 * time.Second,
+	}
+
+	// 1. Reconcile active configA -> gauges populated
+	reqA := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mig-a"}}
+	if res, err := r.Reconcile(context.Background(), reqA); err != nil {
+		t.Fatalf("Reconciling active mig-a failed: %v", err)
+	} else if res.RequeueAfter != 30*time.Second {
+		t.Errorf("Expected active reconcile to requeue after 30s to keep gauges fresh, got %v", res.RequeueAfter)
+	}
+
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Fatalf("Expected 1 covered pod after active reconcile, got %v", got)
+	}
+
+	// 2. Reconcile duplicate loser configB -> MUST NOT clear active coverage
+	reqB := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mig-b"}}
+	if _, err := r.Reconcile(context.Background(), reqB); err != nil {
+		t.Fatalf("Reconciling loser mig-b failed: %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Errorf("Loser reconcile incorrectly wiped active coverage: expected 1, got %v", got)
+	}
+
+	// 3. Delete loser configB and reconcile NotFound for B -> MUST NOT clear active coverage
+	if err := fakeClient.Delete(context.Background(), configB); err != nil {
+		t.Fatalf("deleting mig-b: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), reqB); err != nil {
+		t.Fatalf("NotFound reconcile for mig-b failed: %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Errorf("Deleting loser mig-b incorrectly wiped active coverage: expected 1, got %v", got)
+	}
+
+	// 4. Delete active configA and reconcile NotFound for A -> coverage cleared
+	if err := fakeClient.Delete(context.Background(), configA); err != nil {
+		t.Fatalf("deleting mig-a: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), reqA); err != nil {
+		t.Fatalf("NotFound reconcile for mig-a failed: %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 0 {
+		t.Errorf("Deleting active mig-a should clear coverage: expected 0, got %v", got)
+	}
+}
+
 func TestMetrics_ApplicationDowntime(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)

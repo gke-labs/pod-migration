@@ -285,3 +285,100 @@ func TestEvictionGate_EngineSkippedMigrationMetrics(t *testing.T) {
 		t.Errorf("expected SkippedMigrationsTotal[host_network, criu] = 1, got %v", got)
 	}
 }
+
+func TestEvictionGate_SkippedMigrationMetrics_NoPolicyAndUnfenced(t *testing.T) {
+	metrics.ResetCoverageForTest()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	runtimeClass := "custom-runtime"
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}
+
+	// Pod with no matching policy
+	podNoPolicy := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod-no-policy",
+			UID:       types.UID("uid-no-policy"),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:         "node-1",
+			RuntimeClassName: &runtimeClass,
+		},
+	}
+
+	// Pod with unfenced engine and no allow-unfenced annotation
+	podUnfenced := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod-unfenced",
+			UID:       types.UID("uid-unfenced"),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:         "node-1",
+			RuntimeClassName: &runtimeClass,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, podNoPolicy, podUnfenced).
+		Build()
+
+	testEng := &evictionTestEngine{
+		name:       "test-unfenced",
+		classes:    []string{runtimeClass},
+		verdict:    engine.Verdict{OK: true},
+		guarantees: &engine.Guarantees{Fencing: engine.FencingNone},
+	}
+	reg := engine.NewRegistry(testEng.Name())
+	_ = reg.Register(testEng)
+
+	el, _ := eligibility.ParseRuntimeClassPolicy(runtimeClass)
+	gate := &EvictionGate{
+		Client:      fakeClient,
+		APIReader:   fakeClient,
+		Eligibility: el,
+		Engines:     reg,
+	}
+
+	// 1. Unfenced engine refusal
+	resp := gate.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   "default",
+			Name:        "pod-unfenced",
+			SubResource: "eviction",
+		},
+	})
+	if !resp.Allowed {
+		t.Fatalf("expected allowed, got %v", resp)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("unfenced_engine", "test-unfenced")); got != 1 {
+		t.Errorf("expected SkippedMigrationsTotal[unfenced_engine, test-unfenced] = 1, got %v", got)
+	}
+
+	// 2. Allow fencing, but policy is nil -> no_ready_policy
+	testEng.guarantees = &engine.Guarantees{Fencing: engine.FencingStopped}
+	testEng.policy = nil
+	resp = gate.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   "default",
+			Name:        "pod-no-policy",
+			SubResource: "eviction",
+		},
+	})
+	if !resp.Allowed {
+		t.Fatalf("expected allowed, got %v", resp)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_ready_policy", "test-unfenced")); got != 1 {
+		t.Errorf("expected SkippedMigrationsTotal[no_ready_policy, test-unfenced] = 1, got %v", got)
+	}
+}

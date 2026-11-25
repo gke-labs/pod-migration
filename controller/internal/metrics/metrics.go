@@ -265,6 +265,7 @@ func RecordApplicationDowntime(engine, outcome string, durationSeconds float64) 
 		ApplicationDowntimeSeconds.WithLabelValues(engine, outcome).Observe(durationSeconds)
 	}
 }
+
 // RecordSourceFence increments the source fence counter for the given action.
 func RecordSourceFence(action string) {
 	if action != "" {
@@ -389,7 +390,6 @@ func ResetActiveJobsForTest() {
 	defer activeJobsMu.Unlock()
 	activeJobs = make(map[string]struct{})
 	ActiveMigrations.Set(0)
-	ResetCoverageForTest()
 }
 
 // ResetCoverageForTest resets coverage and skipped metrics for unit tests.

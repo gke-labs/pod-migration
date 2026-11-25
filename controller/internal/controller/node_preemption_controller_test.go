@@ -36,6 +36,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -930,5 +931,55 @@ func TestNodePreemptionReconciler_OperatorOwned_InFlightPMJ_Refused(t *testing.T
 		}
 	default:
 		t.Errorf("Expected MigrationSkippedAmbiguousReplicaKey event, but none was recorded")
+	}
+}
+
+func TestNodePreemptionReconciler_IneligibleVerdictMetrics(t *testing.T) {
+	metrics.ResetCoverageForTest()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	node := createTestNode("spot-node-ineligible", true, "taint-gke")
+	psp := createTestPSP("psp-default", "default")
+	pod := createTestPod("pod-ineligible", "default", "spot-node-ineligible", "1Gi", "uid-inel")
+
+	testEng := &routedEngine{
+		name:    "ineligible-engine",
+		classes: []string{"gvisor"},
+		verdict: engine.Verdict{OK: false, Code: "ineligible", Reason: "unsupported configuration"},
+	}
+	reg := registryOf(t, testEng)
+
+	recorder := record.NewFakeRecorder(10)
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(node, psp, pod).
+		Build()
+
+	r := &NodePreemptionReconciler{
+		Client:                  cl,
+		Scheme:                  scheme,
+		Recorder:                recorder,
+		Engines:                 reg,
+		DefaultMigrationTimeout: 10 * time.Minute,
+		SpotPreemptionBudget:    15 * 1024 * 1024 * 1024,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "spot-node-ineligible"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	if testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("ineligible")) < 1 {
+		t.Errorf("expected SpotPreemptionSkippedTotal[ineligible] >= 1, got %v",
+			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("ineligible")))
+	}
+	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("ineligible", "ineligible-engine")) < 1 {
+		t.Errorf("expected SkippedMigrationsTotal[ineligible, ineligible-engine] >= 1, got %v",
+			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("ineligible", "ineligible-engine")))
 	}
 }

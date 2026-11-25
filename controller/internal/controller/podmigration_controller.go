@@ -116,7 +116,14 @@ type PodMigrationReconciler struct {
 	// RuntimeClassPolicy restricts rendered namespace resources to engines
 	// serving runtime classes allowed by --migratable-runtime-classes when set.
 	RuntimeClassPolicy *eligibility.RuntimeClassPolicy
+
+	// CoverageRequeueInterval is how often active PodMigrations are requeued to keep coverage gauges fresh.
+	// When 0, successful reconciles do not requeue automatically.
+	CoverageRequeueInterval time.Duration
 }
+
+// DefaultCoverageResyncInterval is how often an active PodMigration reconciles to refresh coverage gauges.
+const DefaultCoverageResyncInterval = 30 * time.Second
 
 // engines returns the registry that serves the reconciler: Engines, or the
 // registry of a stock deployment.
@@ -188,7 +195,12 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			r.InvariantEngine.ForgetObject("PodMigrationReconciler", "mig", req.Namespace, req.Name)
-			metrics.ClearNamespaceCoverage(req.Namespace)
+			var migList pmv1alpha1.PodMigrationList
+			if listErr := r.List(ctx, &migList, client.InNamespace(req.Namespace)); listErr == nil {
+				if selectActivePodMigration(migList.Items) == nil {
+					metrics.ClearNamespaceCoverage(req.Namespace)
+				}
+			}
 			logger.Info("PodMigration resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
@@ -252,7 +264,18 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				return ctrl.Result{}, err
 			}
 
-			metrics.ClearNamespaceCoverage(config.Namespace)
+			var remainingList pmv1alpha1.PodMigrationList
+			if listErr := r.List(ctx, &remainingList, client.InNamespace(config.Namespace)); listErr == nil {
+				var activeCandidates []pmv1alpha1.PodMigration
+				for _, item := range remainingList.Items {
+					if item.Name != config.Name && item.DeletionTimestamp.IsZero() {
+						activeCandidates = append(activeCandidates, item)
+					}
+				}
+				if selectActivePodMigration(activeCandidates) == nil {
+					metrics.ClearNamespaceCoverage(config.Namespace)
+				}
+			}
 			controllerutil.RemoveFinalizer(config, StorageCleanupFinalizer)
 			if err := r.Update(ctx, config); err != nil {
 				logger.Error(err, "Failed to remove finalizer from PodMigration")
@@ -271,7 +294,6 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	if active := selectActivePodMigration(migList.Items); active != nil && active.Name != config.Name {
-		metrics.ClearNamespaceCoverage(config.Namespace)
 		deferCleanup := false
 		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
 			inFlight, err := r.listInFlightMigrations(ctx, config)
@@ -439,7 +461,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	r.updateCoverageMetrics(ctx, config, registry)
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: r.CoverageRequeueInterval}, nil
 }
 
 func (r *PodMigrationReconciler) updateCoverageMetrics(ctx context.Context, config *pmv1alpha1.PodMigration, registry *engine.Registry) {
@@ -448,6 +470,25 @@ func (r *PodMigrationReconciler) updateCoverageMetrics(ctx context.Context, conf
 		log.FromContext(ctx).Error(err, "Failed to list pods to compute migratable coverage metrics", "namespace", config.Namespace)
 		return
 	}
+
+	// Pre-fetch PSPs for each group once per namespace to avoid N uncached API server list calls.
+	gkePSPList := &unstructured.UnstructuredList{}
+	gkePSPList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   engine.DefaultAPIGroup,
+		Version: "v1",
+		Kind:    "PodSnapshotPolicyList",
+	})
+	_ = r.Client.List(ctx, gkePSPList, client.InNamespace(config.Namespace))
+
+	criuPSPList := &unstructured.UnstructuredList{}
+	criuPSPList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   engine.CRIUAPIGroup,
+		Version: "v1",
+		Kind:    "PodSnapshotPolicyList",
+	})
+	_ = r.Client.List(ctx, criuPSPList, client.InNamespace(config.Namespace))
+
+	nodeCache := make(map[string]*corev1.Node)
 
 	totalRunning := 0
 	coveredRunning := 0
@@ -472,16 +513,40 @@ func (r *PodMigrationReconciler) updateCoverageMetrics(ctx context.Context, conf
 			continue
 		}
 
-		policy, err := eng.ResolvePolicy(ctx, pod)
-		if err != nil || policy == nil {
+		var policy *unstructured.Unstructured
+		switch eng.Name() {
+		case engine.CRIUName:
+			policy = util.MatchLatestReadyManualStopPSP(
+				criuPSPList.Items,
+				pod.Labels,
+				map[string]string{util.LabelSnapshotEngine: engine.CRIUName},
+				"",
+			)
+			if policy == nil {
+				policy = util.MatchLatestReadyManualStopPSP(
+					gkePSPList.Items,
+					pod.Labels,
+					map[string]string{util.LabelSnapshotEngine: engine.CRIUName},
+					"",
+				)
+			}
+		default:
+			policy = util.MatchLatestReadyManualStopPSP(gkePSPList.Items, pod.Labels, nil, "criu")
+		}
+		if policy == nil {
 			continue
 		}
 
 		var node *corev1.Node
 		if pod.Spec.NodeName != "" {
-			n := &corev1.Node{}
-			if err := r.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, n); err == nil {
+			if n, ok := nodeCache[pod.Spec.NodeName]; ok {
 				node = n
+			} else {
+				n := &corev1.Node{}
+				if err := r.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, n); err == nil {
+					nodeCache[pod.Spec.NodeName] = n
+					node = n
+				}
 			}
 		}
 
