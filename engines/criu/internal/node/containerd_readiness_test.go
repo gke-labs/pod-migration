@@ -60,6 +60,7 @@ func TestParseCRIUVersionCode(t *testing.T) {
 		{input: "Version: 4.0", want: 40000},
 		{input: "Version: 4.0-2", want: 40000},
 		{input: "Version: 3.19", want: 31900},
+		{input: "Version: 4.2.1", want: 40201},
 		{input: "3.16.0", want: 31600},
 		{input: "3.16.1", want: 31601},
 		{input: "3.15.2", want: 31502},
@@ -727,7 +728,7 @@ func TestCheckContainerdReadiness_FakeContainerd(t *testing.T) {
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0\n",
+			criuVersionOut: "Version: 4.2.1\n",
 		}
 		ok, reason, remediation, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
@@ -745,7 +746,7 @@ func TestCheckContainerdReadiness_FakeContainerd(t *testing.T) {
 				"PATH=/usr/bin:/bin",
 			},
 			files:          map[string]fs.FileMode{},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		ok, reason, remediation, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
@@ -771,7 +772,7 @@ func TestCheckContainerdReadiness_FakeContainerd(t *testing.T) {
 			files: map[string]fs.FileMode{
 				"/home/kubernetes/bin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		ok, reason, _, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
@@ -799,7 +800,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		ok, reason, remediation, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
@@ -831,7 +832,7 @@ version = 2
 				"/opt/containerd/bin/criu": 0o755,
 				"/usr/bin/criu":            0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		ok, reason, _, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
@@ -856,7 +857,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755, // on daemon PATH, but not in shim PATH!
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		ok, reason, _, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
@@ -879,7 +880,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 3.15.2\n",
+			criuVersionOut: "Version: 4.1.1\n",
 		}
 		ok, reason, remediation, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
@@ -888,11 +889,49 @@ version = 2
 		if ok {
 			t.Fatal("expected ok=false for outdated CRIU version")
 		}
-		if !strings.Contains(reason, "older than minimum supported version 3.16.0") {
+		if !strings.Contains(reason, "older than minimum supported version 4.2.1") {
 			t.Fatalf("unexpected reason: %q", reason)
 		}
 		if remediation != RemediationUpgradeCRIUVersion {
 			t.Fatalf("expected remediation %q, got %q", RemediationUpgradeCRIUVersion, remediation)
+		}
+	})
+
+	// The agent's bundle is built with CRIU >= 4.2.1, and older CRIU fails
+	// dumps on Linux 6.16 and later: containerd's own 3.16 isn't enough.
+	t.Run("minimum CRIU version is the bundle's 4.2.1", func(t *testing.T) {
+		if code, err := parseCRIUVersionCode(minContainerdCRIUVersionText); err != nil || code != MinContainerdCRIUVersion {
+			t.Fatalf("parseCRIUVersionCode(%q) = %d, %v; want %d", minContainerdCRIUVersionText, code, err, MinContainerdCRIUVersion)
+		}
+		for _, tc := range []struct {
+			version string
+			ok      bool
+		}{
+			{"Version: 3.19\n", false},
+			{"Version: 4.1.1\n", false},
+			{"Version: 4.2\n", false},
+			{"Version: 4.2.1\n", true},
+			{"Version: 4.2.1\nGitID: v4.2.1\n", true},
+			{"Version: 4.3\n", true},
+		} {
+			env := &fakeContainerdEnv{
+				pid:            1001,
+				environ:        []string{"PATH=/usr/local/sbin"},
+				files:          map[string]fs.FileMode{"/usr/local/sbin/criu": 0o755},
+				criuVersionOut: tc.version,
+			}
+			ok, reason, remediation, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
+			if err != nil {
+				t.Fatalf("%q: unexpected error: %v", tc.version, err)
+			}
+			if ok != tc.ok {
+				t.Errorf("%q: ok = %v, want %v (reason %q)", tc.version, ok, tc.ok, reason)
+				continue
+			}
+			// A version that doesn't parse is refused too, with another reason.
+			if !ok && (!strings.Contains(reason, "older than minimum supported version 4.2.1") || remediation != RemediationUpgradeCRIUVersion) {
+				t.Errorf("%q: reason %q, remediation %q; want the minimum version's", tc.version, reason, remediation)
+			}
 		}
 	})
 
@@ -903,7 +942,7 @@ version = 2
 				"PATH=/usr/local/sbin",
 			},
 			files:          map[string]fs.FileMode{},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		insp := env.toInspector()
 		insp.StatContainerdFile = nil
@@ -1057,7 +1096,7 @@ func TestDefaultContainerdInspector_ProductionWiring(t *testing.T) {
 		if name != "/isolated/bin/criu" {
 			t.Fatalf("expected execHost on /isolated/bin/criu, got %q", name)
 		}
-		return "Version: 4.0", nil
+		return "Version: 4.2.1", nil
 	}
 
 	insp := NewDefaultContainerdInspector(fakeExecHost)
@@ -1230,7 +1269,7 @@ func fakeReadyInspector() *ContainerdReadinessInspector {
 			return nil, os.ErrNotExist
 		},
 		GetCRIUVersion: func(ctx context.Context, criuPath string) (string, error) {
-			return "Version: 4.0\n", nil
+			return "Version: 4.2.1\n", nil
 		},
 	}
 }
@@ -1286,7 +1325,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		nd, _, installCalls := setupNode(env)
 
@@ -1334,7 +1373,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		nd, _, _ := setupNode(env)
 
@@ -1370,7 +1409,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		insp := env.toInspector()
 		insp.GetPID = func(sockPath string) (int, error) {
@@ -1435,7 +1474,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		insp := env.toInspector()
 		insp.GetPID = func(sockPath string) (int, error) {
@@ -1510,7 +1549,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		insp := env.toInspector()
 		insp.GetPID = func(sockPath string) (int, error) {
@@ -1641,7 +1680,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		nd, _, installCalls := setupNode(env)
 
@@ -1694,14 +1733,14 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		insp := env.toInspector()
 		insp.GetCRIUVersion = func(ctx context.Context, criuPath string) (string, error) {
 			if failExec.Load() {
 				return "", errors.New("transient host exec failure")
 			}
-			return "Version: 4.0", nil
+			return "Version: 4.2.1", nil
 		}
 
 		nd, _, installCalls := setupNode(env)
@@ -1738,7 +1777,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.0",
+			criuVersionOut: "Version: 4.2.1",
 		}
 		nd, _, installCalls := setupNode(env)
 		// Mock host kernel check failing
