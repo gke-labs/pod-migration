@@ -1109,6 +1109,21 @@ func TestT1_TerminationEdgeCases(t *testing.T) {
 		job, source, snapName := evictingSpotSource(t, rs, leg, true, shape)
 		denyEvictions(t, ns, source)
 
+		if shape.nodeName != "" && !shape.failed {
+			// A running, scheduled source: the delete starts its 1 s grace
+			// period, and the job waits for the kubelet to finish it.
+			reconcile(t, rec, ns, job.Name)
+			pod, ok := getPod(t, ns, source.Name)
+			if !ok || pod.DeletionTimestamp == nil || pod.DeletionGracePeriodSeconds == nil || *pod.DeletionGracePeriodSeconds != postCheckpointEvictionGracePeriodSeconds {
+				t.Fatalf("the Spot job didn't delete its running source with a %ds grace period while evictions are denied (exists=%t)", postCheckpointEvictionGracePeriodSeconds, ok)
+			}
+			reconcile(t, rec, ns, job.Name)
+			if got := getJob(t, ns, job.Name); got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+				t.Fatalf("phase=%s while the source terminates, want Evicting", got.Status.Phase)
+			}
+			// The kubelet confirms the sandbox is gone.
+			forceDelete(t, pod)
+		}
 		for i := 0; i < 4; i++ {
 			reconcile(t, rec, ns, job.Name)
 			if got := getJob(t, ns, job.Name); got.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
@@ -1130,7 +1145,7 @@ func TestT1_TerminationEdgeCases(t *testing.T) {
 
 	t.Run("Spot_EvictingDeletesRunningSourceDespiteDeniedEviction", func(t *testing.T) {
 		ns := createTestNamespace(t, ctx, k8sClient, "t305-spot-running")
-		spotRemovesSourceDespiteDeniedEviction(t, ns, "spotrun", spotSource{})
+		spotRemovesSourceDespiteDeniedEviction(t, ns, "spotrun", spotSource{nodeName: "t305-spot-node"})
 	})
 
 	t.Run("Spot_EvictingDeletesShutdownTerminatedSourceDespiteDeniedEviction", func(t *testing.T) {
@@ -1227,10 +1242,17 @@ func TestT1_TerminationEdgeCases(t *testing.T) {
 		}
 		rec := newJobReconciler()
 		rec.Client = &staleSourceClient{Client: k8sClient, stale: stale}
-		_, _ = rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: job.Name}})
+		// The precondition's Conflict means the source is gone: no error,
+		// and the next pass, on a fresh view, moves on.
+		if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: job.Name}}); err != nil {
+			t.Fatalf("Reconcile on a stale view: %v, want the UID precondition's Conflict treated as the source being gone", err)
+		}
 		got, ok := getPod(t, ns, source.Name)
 		if !ok || got.UID != repl.UID || got.DeletionTimestamp != nil {
 			t.Fatalf("the Spot job's delete removed the replacement that reused its source's name (exists=%t)", ok)
+		}
+		if j := getJob(t, ns, job.Name); j.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+			t.Fatalf("phase=%s after the stale pass, want Evicting", j.Status.Phase)
 		}
 	})
 

@@ -110,7 +110,8 @@ func skipsDisruptionBudgetCheck(job *pmv1alpha1.PodMigrationJob) bool {
 }
 
 // isSpotPreemptionJob reports whether the node preemption controller created
-// job for a Spot preemption. Only the controller creates and labels jobs; no
+// job, for a Spot preemption or a GKE host maintenance event
+// (util.IsNodePreempting): either way the node goes away. Only the controller creates and labels jobs; no
 // tenant role is granted write access to PodMigrationJobs.
 func isSpotPreemptionJob(job *pmv1alpha1.PodMigrationJob) bool {
 	return job.Labels[util.LabelTriggerSource] == util.TriggerSourceSpotPreemption ||
