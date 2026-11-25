@@ -295,7 +295,7 @@ func (r *PodMigrationJobReconciler) concludeWithoutRestore(
 	// source node gets its own reason, and its message the fields that name
 	// the engine, the fact that didn't match and both nodes (#294). It's
 	// still a cold start for the metrics and the downtime.
-	incompatible := verdict.Outcome == engine.ColdStart && verdict.IncompatibleFact != ""
+	incompatible := verdict.Outcome == engine.ColdStart && validSignalValue(verdict.IncompatibleFact)
 	if incompatible {
 		reason = ReasonRestoreIncompatibleNode
 		node := ""

@@ -209,3 +209,38 @@ func TestPlacementSignal(t *testing.T) {
 		}
 	}
 }
+
+// A record of the added constraints that doesn't fit the pod is ignored,
+// without a panic: with the engine's constraints, all of those are named;
+// without them, none.
+func TestAddedPlacementRequirements_MalformedRecord(t *testing.T) {
+	reqs := criuplacement.Requirements(criuSourceFacts)
+	for _, value := range []string{"x", "-1", "99", "1,1", "", " 1"} {
+		pod := criuStuckPod()
+		pod.Annotations[RestorePlacementAddedAnnotation] = value
+		if got := addedPlacementRequirements(pod, nil); got != nil {
+			t.Errorf("record %q without the engine's constraints = %v, want none", value, got)
+		}
+		if got := addedPlacementRequirements(pod, reqs); !reflect.DeepEqual(got, reqs) {
+			t.Errorf("record %q with the engine's constraints = %v, want all of them", value, got)
+		}
+	}
+	pod := criuStuckPod()
+	delete(pod.Annotations, RestorePlacementAddedAnnotation)
+	if got := addedPlacementRequirements(pod, nil); got != nil {
+		t.Errorf("no record, no engine constraints = %v, want none", got)
+	}
+	if got := addedPlacementRequirements(criuStuckPod(), nil); !reflect.DeepEqual(got, reqs) {
+		t.Errorf("a valid record without the engine's constraints = %v, want the recorded ones", got)
+	}
+}
+
+func TestValidSignalValue(t *testing.T) {
+	for v, want := range map[string]bool{
+		"cpu-model": true, "kubernetes.io/arch": true, "": false, "cpu model": false, "a:b": false, "x\n": false,
+	} {
+		if got := validSignalValue(v); got != want {
+			t.Errorf("validSignalValue(%q) = %t, want %t", v, got, want)
+		}
+	}
+}

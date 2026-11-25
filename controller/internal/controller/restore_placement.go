@@ -339,6 +339,26 @@ func recordAddedRequirements(pod *corev1.Pod, added []int) {
 // an earlier version, for one. Each appended requirement must be one of
 // reqs.
 func addedRequirements(pod *corev1.Pod, terms []corev1.NodeSelectorTerm, reqs []corev1.NodeSelectorRequirement) (added []int, ok bool) {
+	added, ok = recordedAddedCounts(pod, terms)
+	if !ok {
+		return nil, false
+	}
+	for i, n := range added {
+		exprs := terms[i].MatchExpressions
+		for _, expr := range exprs[len(exprs)-n:] {
+			if !hasNodeSelectorRequirement(reqs, expr) {
+				return nil, false
+			}
+		}
+	}
+	return added, true
+}
+
+// recordedAddedCounts parses pod's RestorePlacementAddedAnnotation: how
+// many requirements were appended to each of terms, pod's terms. ok is
+// false when pod has no record, or one that doesn't fit terms: a count for
+// each term, each a number from 0 to the number of the term's requirements.
+func recordedAddedCounts(pod *corev1.Pod, terms []corev1.NodeSelectorTerm) (added []int, ok bool) {
 	value, found := pod.Annotations[RestorePlacementAddedAnnotation]
 	if !found {
 		return nil, false
@@ -350,14 +370,8 @@ func addedRequirements(pod *corev1.Pod, terms []corev1.NodeSelectorTerm, reqs []
 	added = make([]int, len(parts))
 	for i, part := range parts {
 		n, err := strconv.Atoi(part)
-		exprs := terms[i].MatchExpressions
-		if err != nil || n < 0 || n > len(exprs) {
+		if err != nil || n < 0 || n > len(terms[i].MatchExpressions) {
 			return nil, false
-		}
-		for _, expr := range exprs[len(exprs)-n:] {
-			if !hasNodeSelectorRequirement(reqs, expr) {
-				return nil, false
-			}
 		}
 		added[i] = n
 	}

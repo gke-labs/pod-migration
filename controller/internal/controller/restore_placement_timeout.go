@@ -18,8 +18,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -271,6 +269,12 @@ func (r *PodMigrationJobReconciler) failedPlacementKeys(ctx context.Context, job
 		log.FromContext(ctx).V(1).Info("Couldn't list nodes; naming every constraint the pod gate added", "job", job.Name, "err", err.Error())
 		return keys(added)
 	}
+	selectors := make([]labels.Selector, len(added))
+	for j, req := range added {
+		if selector, ok := labelSelectorFor([]corev1.NodeSelectorRequirement{req}); ok {
+			selectors[j] = selector
+		}
+	}
 	met := make([]bool, len(added))
 	candidates := 0
 	for i := range nodes.Items {
@@ -279,8 +283,8 @@ func (r *PodMigrationJobReconciler) failedPlacementKeys(ctx context.Context, job
 			continue
 		}
 		candidates++
-		for j, req := range added {
-			if selector, ok := labelSelectorFor([]corev1.NodeSelectorRequirement{req}); ok && selector.Matches(labels.Set(node.Labels)) {
+		for j, selector := range selectors {
+			if selector != nil && selector.Matches(labels.Set(node.Labels)) {
 				met[j] = true
 			}
 		}
@@ -317,17 +321,11 @@ func addedPlacementRequirements(pod *corev1.Pod, reqs []corev1.NodeSelectorRequi
 		}
 		counts = added
 	} else {
-		parts := strings.Split(pod.Annotations[RestorePlacementAddedAnnotation], ",")
-		if _, found := pod.Annotations[RestorePlacementAddedAnnotation]; !found || len(parts) != len(terms) {
+		added, ok := recordedAddedCounts(pod, terms)
+		if !ok {
 			return nil
 		}
-		for i, part := range parts {
-			n, err := strconv.Atoi(part)
-			if err != nil || n < 0 || n > len(terms[i].MatchExpressions) {
-				return nil
-			}
-			counts = append(counts, n)
-		}
+		counts = added
 	}
 	var out []corev1.NodeSelectorRequirement
 	for i, n := range counts {

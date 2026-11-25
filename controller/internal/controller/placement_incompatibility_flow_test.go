@@ -234,6 +234,20 @@ func TestCRIURestoreOtherFailureStaysFallbackToColdStart(t *testing.T) {
 	}
 }
 
+// An IncompatibleFact that would break the message format (a space or a
+// colon) is ignored: the job concludes FallbackToColdStart.
+func TestConcludeWithoutRestore_MalformedIncompatibleFact(t *testing.T) {
+	f := newPlacementFlowFor(t, incompatibleNodePod(time.Now().Add(-5*time.Second)), incompatibleNodeJob())
+	job := f.job()
+	verdict := engine.RestoreVerdict{Outcome: engine.ColdStart, Reason: "cold", IncompatibleFact: "cpu model: x"}
+	if err := f.jobs.concludeWithoutRestore(context.Background(), job, job.DeepCopy(), f.pod(), engine.CRIUName, verdict); err != nil {
+		t.Fatalf("concludeWithoutRestore: %v", err)
+	}
+	if cond := meta.FindStatusCondition(f.job().Status.Conditions, "Restored"); cond == nil || cond.Reason != ReasonFallbackToColdStart {
+		t.Errorf("Restored = %+v, want %s", cond, ReasonFallbackToColdStart)
+	}
+}
+
 // A job that concluded RestoreIncompatibleNode before its cold-started
 // replacement was Ready gets its downtime backfilled, as for
 // FallbackToColdStart.

@@ -59,6 +59,18 @@ func incompatibleNodeSignal(engineName, fact, node, sourceNode string) string {
 	return "engine=" + engineName + " fact=" + fact + " node=" + node + " sourceNode=" + sourceNode
 }
 
+// signalValuePattern matches a field value that an engine supplies, such
+// as RestoreVerdict.IncompatibleFact: a non-empty token without a space or
+// a colon, so that the format holds.
+var signalValuePattern = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+
+// validSignalValue reports whether v can be a field value that an engine
+// supplies. A verdict whose IncompatibleFact isn't concludes as any other
+// cold start, FallbackToColdStart.
+func validSignalValue(v string) bool {
+	return signalValuePattern.MatchString(v)
+}
+
 // withSignal prefixes text with signal's fields.
 func withSignal(signal, text string) string {
 	return signal + ": " + text
