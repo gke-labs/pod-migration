@@ -880,7 +880,7 @@ version = 2
 			files: map[string]fs.FileMode{
 				"/usr/local/sbin/criu": 0o755,
 			},
-			criuVersionOut: "Version: 4.1.1\n",
+			criuVersionOut: "Version: 4.1.1\nGitID: v4.1.1\n",
 		}
 		ok, reason, remediation, err := CheckContainerdReadiness(ctx, env.toInspector(), "/run/containerd/containerd.sock")
 		if err != nil {
@@ -889,8 +889,9 @@ version = 2
 		if ok {
 			t.Fatal("expected ok=false for outdated CRIU version")
 		}
-		if !strings.Contains(reason, "older than minimum supported version 4.2.1") {
-			t.Fatalf("unexpected reason: %q", reason)
+		// One line, without the GitID: it becomes the criu-reason annotation.
+		if want := "criu version 4.1.1 on containerd PATH is older than minimum supported version 4.2.1"; reason != want {
+			t.Fatalf("reason = %q, want %q", reason, want)
 		}
 		if remediation != RemediationUpgradeCRIUVersion {
 			t.Fatalf("expected remediation %q, got %q", RemediationUpgradeCRIUVersion, remediation)

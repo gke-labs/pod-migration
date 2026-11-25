@@ -32,13 +32,13 @@ import (
 const (
 	// MinContainerdCRIUVersion is the oldest CRIU the agent accepts on
 	// containerd's lookup path: 4.2.1, the minimum its own bundle is built with
-	// (build/agent/Dockerfile), although containerd itself takes 3.16. Older
-	// CRIU can't dump a container with a TCP socket on Linux 6.16 and later, or
-	// any container in its own network namespace on 7.1 and later. This is a
-	// floor, not a match: a newer CRIU that containerd finds ahead of the
-	// agent's /usr/local/sbin/criu still passes, and then dumps with a
-	// different CRIU than the bundle that restores. In go-criu's
-	// major*10000 + minor*100 + patch form.
+	// (min= in build/agent/Dockerfile; keep the two equal), although
+	// containerd itself takes 3.16. Older CRIU can't dump a container with a
+	// TCP socket on Linux 6.16 and later, or any container in its own network
+	// namespace on 7.1 and later. This is a floor, not a match: a newer CRIU
+	// that containerd finds ahead of the agent's /usr/local/sbin/criu still
+	// passes, and then dumps with a different CRIU than the bundle that
+	// restores. In go-criu's major*10000 + minor*100 + patch form.
 	MinContainerdCRIUVersion = 40201
 	// minContainerdCRIUVersionText is MinContainerdCRIUVersion as a version.
 	minContainerdCRIUVersionText = "4.2.1"
@@ -490,7 +490,10 @@ func CheckContainerdReadiness(ctx context.Context, inspector *ContainerdReadines
 	}
 
 	if code < MinContainerdCRIUVersion {
-		return false, fmt.Sprintf("criu version %s on containerd PATH is older than minimum supported version %s", strings.TrimSpace(verStr), minContainerdCRIUVersionText), RemediationUpgradeCRIUVersion, nil
+		// The parsed version rather than the raw output, which can carry a
+		// GitID line, so the criu-reason annotation stays on one line.
+		return false, fmt.Sprintf("criu version %d.%d.%d on containerd PATH is older than minimum supported version %s",
+			code/10000, code/100%100, code%100, minContainerdCRIUVersionText), RemediationUpgradeCRIUVersion, nil
 	}
 
 	return true, "", "", nil

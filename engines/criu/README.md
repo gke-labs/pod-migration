@@ -376,6 +376,28 @@ they start cold instead of being restored; also delete the
   Otherwise the agent marks the node `pod-migrate.io/criu-ready: false`, and
   its `pod-migrate.io/criu-reason` ends in "older than minimum supported
   version 4.2.1".
+
+  **Upgrading.** An agent from before this requirement accepted any CRIU from
+  3.16 on. After the upgrade, a node where containerd finds its own CRIU 3.16
+  to 4.2.0 first turns `criu-ready: false`, with a `criu-reason` like this:
+
+  ```text
+  criu version 4.1.1 on containerd PATH is older than minimum supported version 4.2.1
+  ```
+
+  The controller then stops migrating that node's pods with CRIU, so a drain
+  evicts them cold; checkpoints already running and restores aren't affected.
+  To list such nodes:
+
+  ```bash
+  kubectl get nodes -o custom-columns='NODE:.metadata.name,REASON:.metadata.annotations.pod-migrate\.io/criu-reason' \
+    | grep 'older than minimum supported version 4.2.1'
+  ```
+
+  To fix a node, make containerd find the agent's `/usr/local/sbin/criu`
+  first (put `/usr/local/sbin` earlier on containerd's `PATH`, or on the shim
+  `PATH` if one is set) or remove the node's own CRIU, then restart
+  containerd. The agent notices the restart and checks the node again.
 - **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
   `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
   bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable

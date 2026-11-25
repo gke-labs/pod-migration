@@ -58,10 +58,14 @@ RUN set -eux; \
     apt-get update --error-on=any; \
     apt-get install -y --no-install-recommends criu; \
     rm -rf /var/lib/apt/lists/*
+# min is the oldest CRIU the bundle may carry. Keep it equal to
+# MinContainerdCRIUVersion in internal/node/containerd_readiness.go, the
+# minimum the agent's readiness check accepts on containerd's path.
 RUN set -eux; \
+    min=4.2.1; \
     ver=$(criu --version | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?'); \
-    if [ "$(printf '%s\n' 4.2.1 "$ver" | sort -V | head -1)" != 4.2.1 ]; then \
-      echo "criu $ver < 4.2.1: refusing (it fails dumps on Linux >= 6.16)"; exit 1; fi; \
+    if [ "$(printf '%s\n' "$min" "$ver" | sort -V | head -1)" != "$min" ]; then \
+      echo "criu $ver < $min: refusing (it fails dumps on Linux >= 6.16)"; exit 1; fi; \
     mkdir -p /bundle /bundle/licenses; \
     cp /usr/sbin/criu /bundle/criu.bin; \
     for lib in $(ldd /usr/sbin/criu | grep -oE '/[^ ]+\.so[^ ]*'); do cp -L "$lib" /bundle/ || true; done; \
