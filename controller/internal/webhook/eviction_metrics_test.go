@@ -18,6 +18,7 @@ package webhook
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -380,5 +381,205 @@ func TestEvictionGate_SkippedMigrationMetrics_NoPolicyAndUnfenced(t *testing.T) 
 	}
 	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_ready_policy", "test-unfenced")); got != 1 {
 		t.Errorf("expected SkippedMigrationsTotal[no_ready_policy, test-unfenced] = 1, got %v", got)
+	}
+}
+
+func TestEvictionGate_SkippedMigrationMetrics_OperatorReplicaKeysAndEngineResolution(t *testing.T) {
+	metrics.ResetCoverageForTest()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	runtimeClass := "gvisor"
+	trueVal := true
+	ownerRef := metav1.OwnerReference{
+		APIVersion: "custom.io/v1",
+		Kind:       "CustomOperator",
+		Name:       "custom-parent",
+		UID:        types.UID("parent-uid-123"),
+		Controller: &trueVal,
+	}
+
+	// 1. Operator-owned pod without replica key
+	podNoKey := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       "default",
+			Name:            "pod-no-replica-key",
+			GenerateName:    "custom-parent-",
+			UID:             types.UID("uid-no-key"),
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	// 2. Operator-owned pods sharing ambiguous replica key
+	podAmbiguous1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       "default",
+			Name:            "pod-ambiguous-1",
+			UID:             types.UID("uid-ambig-1"),
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled":     "true",
+				util.LabelReplicaKey:              "shard-0",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	podAmbiguous2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       "default",
+			Name:            "pod-ambiguous-2",
+			UID:             types.UID("uid-ambig-2"),
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled":     "true",
+				util.LabelReplicaKey:              "shard-0",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	// 3. Pod with PDB eviction timeout annotation
+	podPDB := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod-pdb",
+			UID:       types.UID("uid-pdb"),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			Annotations: map[string]string{
+				util.AnnotationPDBEvictionTimeout: "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	// 4. Pod with unsatisfied readiness gates
+	gateType := corev1.PodConditionType("snapshot.workspaces.gke.io/active")
+	podGate := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod-gate",
+			UID:       types.UID("uid-gate"),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+			ReadinessGates: []corev1.PodReadinessGate{
+				{ConditionType: gateType},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: gateType, Status: corev1.ConditionFalse},
+			},
+		},
+	}
+
+	pm := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              "test-migration",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://test-bucket/snapshots"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pm, podNoKey, podAmbiguous1, podAmbiguous2, podPDB, podGate).
+		WithStatusSubresource(pm).
+		Build()
+
+	testEng := &evictionTestEngine{
+		name:       "test-operator-eng",
+		classes:    []string{runtimeClass},
+		verdict:    engine.Verdict{OK: true},
+		guarantees: &engine.Guarantees{Fencing: engine.FencingStopped},
+		policy:     &engine.PolicyRef{Group: "podsnapshot.gke.io", Kind: "PodSnapshotPolicy", Name: "psp"},
+	}
+	reg := engine.NewRegistry(testEng.Name())
+	_ = reg.Register(testEng)
+
+	el, _ := eligibility.ParseRuntimeClassPolicy(runtimeClass)
+	gate := &EvictionGate{
+		Client:      fakeClient,
+		APIReader:   fakeClient,
+		Eligibility: el,
+		Engines:     reg,
+	}
+
+	callGate := func(name string) admission.Response {
+		var p corev1.Pod
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: name}, &p)
+		pName, pKind, _, pErr := util.ResolveParentWorkload(context.Background(), fakeClient, &p)
+		rKey, hasKey := util.ResolveOperatorReplicaKey(&p, pKind)
+		t.Logf("Pod %s: parentKind=%q, parentName=%q, pErr=%v, hasKey=%v, rKey=%q", name, pKind, pName, pErr, hasKey, rKey)
+		return gate.Handle(context.Background(), admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				Namespace:   "default",
+				Name:        name,
+				SubResource: "eviction",
+			},
+		})
+	}
+
+	// 1. No replica key
+	resp := callGate("pod-no-replica-key")
+	if !resp.Allowed {
+		t.Fatalf("expected allowed for no-replica-key pod, got %v", resp)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_replica_key", "test-operator-eng")); got != 1 {
+		t.Errorf("expected SkippedMigrationsTotal[no_replica_key, test-operator-eng] = 1, got %v", got)
+	}
+
+	// 2. Ambiguous replica key
+	resp = callGate("pod-ambiguous-1")
+	if !resp.Allowed {
+		t.Fatalf("expected allowed for ambiguous-replica-key pod, got %v", resp)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("ambiguous_replica_key", "test-operator-eng")); got != 1 {
+		t.Errorf("expected SkippedMigrationsTotal[ambiguous_replica_key, test-operator-eng] = 1, got %v", got)
+	}
+
+	// 3. PDB timed out with engine resolved
+	resp = callGate("pod-pdb")
+	if !resp.Allowed {
+		t.Fatalf("expected allowed for pod-pdb, got %v", resp)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("pdb_timed_out", "test-operator-eng")); got != 1 {
+		t.Errorf("expected SkippedMigrationsTotal[pdb_timed_out, test-operator-eng] = 1, got %v", got)
+	}
+
+	// 4. Readiness gates unsatisfied with engine resolved
+	resp = callGate("pod-gate")
+	if !resp.Allowed {
+		t.Fatalf("expected allowed for pod-gate, got %v", resp)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("readiness_gates_unsatisfied", "test-operator-eng")); got != 1 {
+		t.Errorf("expected SkippedMigrationsTotal[readiness_gates_unsatisfied, test-operator-eng] = 1, got %v", got)
 	}
 }

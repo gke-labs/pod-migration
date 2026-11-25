@@ -1139,8 +1139,407 @@ func TestMetrics_MigratableCoverage_DuplicateLoserDoesNotClearActiveCoverage(t *
 		t.Fatalf("NotFound reconcile for mig-a failed: %v", err)
 	}
 
+	if count := testutil.CollectAndCount(metrics.MigratableCoveredRunningPods); count != 0 {
+		t.Errorf("Deleting active mig-a should remove gauge series completely: expected 0, got %d", count)
+	}
+}
+
+type errorListClient struct {
+	client.Client
+	failGroup string
+	err       error
+}
+
+func (c *errorListClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if uList, ok := list.(*unstructured.UnstructuredList); ok {
+		if c.failGroup != "" && uList.GroupVersionKind().Group == c.failGroup {
+			return c.err
+		}
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+func TestCoverageMetrics_TransientPSPListError_PreservesExistingCoverage(t *testing.T) {
+	metrics.ResetCoverageForTest()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "test-transient-psp-error"
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "mig-1",
+			UID:               "uid-1",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://my-bucket/snapshots"},
+		},
+	}
+
+	gvisor := "gvisor"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "opted-pod-1",
+			Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisor,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   engine.DefaultAPIGroup,
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	psp.SetName("test-psp")
+	psp.SetNamespace(namespace)
+	psp.Object["spec"] = map[string]interface{}{
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+		"selector": map[string]interface{}{
+			"matchLabels": map[string]interface{}{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+	}
+	psp.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config, pod, psp).
+		WithStatusSubresource(config, psp).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mig-1"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Initial reconcile failed: %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Fatalf("Expected 1 covered pod initially, got %v", got)
+	}
+
+	// 2. Next reconcile: API server returns 429 TooManyRequests on PSP list
+	errClient := &errorListClient{
+		Client:    fakeClient,
+		failGroup: engine.DefaultAPIGroup,
+		err:       apierrors.NewTooManyRequests("APF throttled request", 1),
+	}
+	r.Client = errClient
+
+	// Reconcile: should fail coverage calculation safely without resetting gauges to 0
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile with transient error failed: %v", err)
+	}
+
+	// Crucial invariant: coverage gauge must NOT drop to 0 on transient API server error (#253)!
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Errorf("Transient PSP list error wiped coverage metric to 0: expected 1, got %v", got)
+	}
+}
+
+func TestCoverageMetrics_DeleteActiveWhileLoserRemains(t *testing.T) {
+	metrics.ResetCoverageForTest()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "test-delete-active-with-loser"
+	t0 := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	t1 := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+
+	configA := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "mig-a",
+			UID:               "uid-a",
+			CreationTimestamp: t0,
+			Finalizers:        []string{StorageCleanupFinalizer},
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-a/snapshots"},
+		},
+	}
+	configB := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "mig-b",
+			UID:               "uid-b",
+			CreationTimestamp: t1,
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://bucket-b/snapshots"},
+		},
+	}
+
+	gvisor := "gvisor"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pod-1",
+			Labels:    map[string]string{"pod-migration.gke.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisor,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	psp := &unstructured.Unstructured{}
+	psp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   engine.DefaultAPIGroup,
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	psp.SetName("test-psp")
+	psp.SetNamespace(namespace)
+	psp.Object["spec"] = map[string]interface{}{
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+		"selector": map[string]interface{}{
+			"matchLabels": map[string]interface{}{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+	}
+	psp.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(configA, configB, pod, psp).
+		WithStatusSubresource(configA, configB, psp).
+		Build()
+
+	r := &PodMigrationReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	// 1. Initial reconcile on A: becomes active, populates coverage
+	reqA := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mig-a"}}
+	if _, err := r.Reconcile(context.Background(), reqA); err != nil {
+		t.Fatalf("Reconcile mig-a failed: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Fatalf("Expected 1 covered pod, got %v", got)
+	}
+
+	// 2. Mark configA under deletion (with Delete, which sets DeletionTimestamp because it has finalizers)
+	curA := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: "mig-a"}, curA); err != nil {
+		t.Fatalf("getting fresh mig-a: %v", err)
+	}
+	if err := fakeClient.Delete(context.Background(), curA); err != nil {
+		t.Fatalf("deleting mig-a with finalizers: %v", err)
+	}
+
+	// Reconcile deletion of A: configB still remains, so coverage series MUST NOT be wiped!
+	if _, err := r.Reconcile(context.Background(), reqA); err != nil {
+		t.Fatalf("Reconciling deletion of mig-a failed: %v", err)
+	}
+	if count := testutil.CollectAndCount(metrics.MigratableCoveredRunningPods); count != 1 {
+		t.Errorf("Coverage series was wiped while loser mig-b still existed in namespace: expected 1, got %d", count)
+	}
+
+	// 3. Reconcile B: now promotes to active, keeps coverage
+	reqB := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mig-b"}}
+	if _, err := r.Reconcile(context.Background(), reqB); err != nil {
+		t.Fatalf("Reconciling mig-b failed: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Errorf("Expected 1 covered pod after promoting mig-b, got %v", got)
+	}
+
+	// 4. Delete B as well -> now 0 PodMigrations remain, so coverage series is completely deleted
+	if err := fakeClient.Delete(context.Background(), configB); err != nil {
+		t.Fatalf("deleting mig-b: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), reqB); err != nil {
+		t.Fatalf("Reconciling NotFound mig-b failed: %v", err)
+	}
+	if count := testutil.CollectAndCount(metrics.MigratableCoveredRunningPods); count != 0 {
+		t.Errorf("Expected 0 coverage series after all PodMigrations deleted: expected 0, got %d", count)
+	}
+}
+
+func TestCoverageMetrics_CRIUAPIGroupResolution(t *testing.T) {
+	metrics.ResetCoverageForTest()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "test-criu-apigroup"
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              "mig-criu",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
+		},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://my-bucket/snapshots"},
+		},
+	}
+
+	runc := "runc"
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "criu-node",
+			Annotations: map[string]string{
+				engine.CRIUNodeReadyAnnotation: "true",
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "criu-pod",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runc,
+			NodeName:         "criu-node",
+			Containers: []corev1.Container{
+				{Name: "c1", Command: []string{"sleep", "3600"}},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	// 1. Create a CRIU-labeled PSP in GKE group (podsnapshot.gke.io).
+	// CRIU engine in criu.example.com MUST NOT match this!
+	strayPSP := &unstructured.Unstructured{}
+	strayPSP.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   engine.DefaultAPIGroup,
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	strayPSP.SetName("stray-criu-psp")
+	strayPSP.SetNamespace(namespace)
+	strayPSP.SetLabels(map[string]string{
+		util.LabelSnapshotEngine: engine.CRIUName,
+	})
+	strayPSP.Object["spec"] = map[string]interface{}{
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+		"selector": map[string]interface{}{
+			"matchLabels": map[string]interface{}{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+	}
+	strayPSP.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{"type": "Ready", "status": "True"},
+		},
+	}
+
+	// 2. Create proper CRIU PSP in custom group criu.example.com
+	customGroup := "criu.example.com"
+	customPSP := &unstructured.Unstructured{}
+	customPSP.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   customGroup,
+		Version: "v1",
+		Kind:    "PodSnapshotPolicy",
+	})
+	customPSP.SetName("custom-criu-psp")
+	customPSP.SetNamespace(namespace)
+	customPSP.SetLabels(map[string]string{
+		util.LabelSnapshotEngine: engine.CRIUName,
+	})
+	customPSP.Object["spec"] = map[string]interface{}{
+		"triggerConfig": map[string]interface{}{
+			"type":           "manual",
+			"postCheckpoint": "stop",
+		},
+		"selector": map[string]interface{}{
+			"matchLabels": map[string]interface{}{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+	}
+	customPSP.Object["status"] = map[string]interface{}{
+		"conditions": []interface{}{
+			map[string]interface{}{"type": "Ready", "status": "True"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config, node, pod, strayPSP).
+		WithStatusSubresource(config, strayPSP).
+		Build()
+
+	criuEng, err := engine.NewCRIU(fakeClient, scheme, customGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	registry := engine.NewRegistry(engine.CRIUName)
+	if err := registry.Register(criuEng); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Test Repro A: only strayPSP exists in podsnapshot.gke.io.
+	// CRIU.ResolvePolicy searches criu.example.com, finding nothing.
+	// Coverage MUST return covered=0 (not 1 from stray PSP!).
+	if err := ComputeCoverageForNamespace(context.Background(), fakeClient, config, registry, nil); err != nil {
+		t.Fatalf("ComputeCoverageForNamespace failed: %v", err)
+	}
 	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 0 {
-		t.Errorf("Deleting active mig-a should clear coverage: expected 0, got %v", got)
+		t.Errorf("Stray PSP in podsnapshot.gke.io gave covered=%v, want 0", got)
+	}
+
+	// Test Repro B: add customPSP in criu.example.com.
+	// Coverage MUST find it in criu.example.com and return covered=1!
+	if err := fakeClient.Create(context.Background(), customPSP); err != nil {
+		t.Fatalf("creating customPSP: %v", err)
+	}
+	if err := ComputeCoverageForNamespace(context.Background(), fakeClient, config, registry, nil); err != nil {
+		t.Fatalf("ComputeCoverageForNamespace with customPSP failed: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.MigratableCoveredRunningPods.WithLabelValues(namespace)); got != 1 {
+		t.Errorf("Custom group PSP in %s gave covered=%v, want 1", customGroup, got)
 	}
 }
 

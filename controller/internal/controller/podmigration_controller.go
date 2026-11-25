@@ -461,107 +461,16 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	r.updateCoverageMetrics(ctx, config, registry)
 
-	return ctrl.Result{RequeueAfter: r.CoverageRequeueInterval}, nil
+	if r.CoverageRequeueInterval > 0 {
+		return ctrl.Result{RequeueAfter: r.CoverageRequeueInterval}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *PodMigrationReconciler) updateCoverageMetrics(ctx context.Context, config *pmv1alpha1.PodMigration, registry *engine.Registry) {
-	var podList corev1.PodList
-	if err := r.Client.List(ctx, &podList, client.InNamespace(config.Namespace)); err != nil {
-		log.FromContext(ctx).Error(err, "Failed to list pods to compute migratable coverage metrics", "namespace", config.Namespace)
-		return
+	if err := ComputeCoverageForNamespace(ctx, r.Client, config, registry, r.RuntimeClassPolicy); err != nil {
+		log.FromContext(ctx).Error(err, "Skipping coverage metrics update on transient or list error", "namespace", config.Namespace)
 	}
-
-	// Pre-fetch PSPs for each group once per namespace to avoid N uncached API server list calls.
-	gkePSPList := &unstructured.UnstructuredList{}
-	gkePSPList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   engine.DefaultAPIGroup,
-		Version: "v1",
-		Kind:    "PodSnapshotPolicyList",
-	})
-	_ = r.Client.List(ctx, gkePSPList, client.InNamespace(config.Namespace))
-
-	criuPSPList := &unstructured.UnstructuredList{}
-	criuPSPList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   engine.CRIUAPIGroup,
-		Version: "v1",
-		Kind:    "PodSnapshotPolicyList",
-	})
-	_ = r.Client.List(ctx, criuPSPList, client.InNamespace(config.Namespace))
-
-	nodeCache := make(map[string]*corev1.Node)
-
-	totalRunning := 0
-	coveredRunning := 0
-
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		if pod.Status.Phase != corev1.PodRunning || !pod.DeletionTimestamp.IsZero() {
-			continue
-		}
-		totalRunning++
-
-		if !util.IsPodMigrationEnabled(pod) {
-			continue
-		}
-
-		if r.RuntimeClassPolicy != nil && !r.RuntimeClassPolicy.Allows(pod.Spec.RuntimeClassName) {
-			continue
-		}
-
-		eng, ok := registry.ForPod(pod, config)
-		if !ok || eng == nil {
-			continue
-		}
-
-		var policy *unstructured.Unstructured
-		switch eng.Name() {
-		case engine.CRIUName:
-			policy = util.MatchLatestReadyManualStopPSP(
-				criuPSPList.Items,
-				pod.Labels,
-				map[string]string{util.LabelSnapshotEngine: engine.CRIUName},
-				"",
-			)
-			if policy == nil {
-				policy = util.MatchLatestReadyManualStopPSP(
-					gkePSPList.Items,
-					pod.Labels,
-					map[string]string{util.LabelSnapshotEngine: engine.CRIUName},
-					"",
-				)
-			}
-		default:
-			policy = util.MatchLatestReadyManualStopPSP(gkePSPList.Items, pod.Labels, nil, "criu")
-		}
-		if policy == nil {
-			continue
-		}
-
-		var node *corev1.Node
-		if pod.Spec.NodeName != "" {
-			if n, ok := nodeCache[pod.Spec.NodeName]; ok {
-				node = n
-			} else {
-				n := &corev1.Node{}
-				if err := r.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, n); err == nil {
-					nodeCache[pod.Spec.NodeName] = n
-					node = n
-				}
-			}
-		}
-
-		if verdict := eng.Eligible(pod, node); !verdict.OK {
-			continue
-		}
-
-		if ok, _ := engine.AllowsFencing(pod, eng); !ok {
-			continue
-		}
-
-		coveredRunning++
-	}
-
-	metrics.RecordNamespaceCoverage(config.Namespace, coveredRunning, totalRunning)
 }
 
 // patchStatus writes the changes that this reconcile made to config's status

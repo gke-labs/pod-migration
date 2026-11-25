@@ -155,8 +155,8 @@ var (
 		Buckets: prometheus.ExponentialBuckets(1, 2, 12),
 	}, []string{"outcome"})
 
-	// SkippedMigrationsTotal counts pods skipped for live migration by canonical
-	// skip reason and engine.
+	// SkippedMigrationsTotal counts migration trigger evaluations that skipped
+	// live migration by canonical reason and engine (by decision).
 	// Reasons: not_opted_in | unsupported_runtime | multi_container | host_network |
 	// node_not_ready | no_ready_policy | unfenced_engine | readiness_gates_unsatisfied |
 	// pdb_timed_out | no_replica_key | ambiguous_replica_key | already_restored |
@@ -164,7 +164,7 @@ var (
 	// Engines: gke-pod-snapshots | criu | none
 	SkippedMigrationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pod_migration_skipped_total",
-		Help: "Total number of pods skipped for live migration by canonical reason and engine.",
+		Help: "Total number of migration trigger evaluations that skipped live migration (by decision), labeled by canonical reason and engine.",
 	}, []string{"reason", "engine"})
 
 	// MigratableCoveredRunningPods tracks the number of running pods in a migratable
