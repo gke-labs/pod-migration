@@ -17,7 +17,6 @@ package psengine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -49,11 +48,11 @@ var testSnapshotReq = ctrl.Request{NamespacedName: types.NamespacedName{Namespac
 // status (readable by the orchestrator without GCS access), in the same
 // status write that marks it Ready.
 func TestNodePipelineRecordsSourceNodeFacts(t *testing.T) {
-	c := newClient(t, workOrderSnapshot("ps-web-0-deadbeef"))
+	c := newClient(t, jobWorkOrderObjects("ps-web-0-deadbeef")...)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := newMemStore()
 	var gathered int
-	r := &NodeSnapshotReconciler{
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID,
 		Client: c, NodeName: "node-a", Ops: ops, Store: store,
 		SourceNodeFacts: func(context.Context) contract.SourceNodeFacts {
 			gathered++
@@ -71,10 +70,7 @@ func TestNodePipelineRecordsSourceNodeFacts(t *testing.T) {
 		t.Fatalf("facts gathered %d times, want 1", gathered)
 	}
 
-	var mf Manifest
-	if err := json.Unmarshal(store.objects["bkt/snaps/ps-web-0-deadbeef/manifest.json"], &mf); err != nil {
-		t.Fatal(err)
-	}
+	mf := openManifest(t, store, "bkt/snaps/ps-web-0-deadbeef/manifest.json")
 	if mf.SourceNode == nil || !reflect.DeepEqual(*mf.SourceNode, testSourceFacts) {
 		t.Fatalf("manifest sourceNode = %+v, want %+v", mf.SourceNode, testSourceFacts)
 	}
@@ -97,9 +93,9 @@ func TestNodePipelineWithoutSourceNodeFacts(t *testing.T) {
 		"nothing known": func(context.Context) contract.SourceNodeFacts { return contract.SourceNodeFacts{} },
 	} {
 		t.Run(name, func(t *testing.T) {
-			c := newClient(t, workOrderSnapshot("ps-web-0-deadbeef"))
+			c := newClient(t, jobWorkOrderObjects("ps-web-0-deadbeef")...)
 			store := newMemStore()
-			r := &NodeSnapshotReconciler{
+			r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID,
 				Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: store,
 				SourceNodeFacts: fn,
 			}
@@ -113,7 +109,12 @@ func TestNodePipelineWithoutSourceNodeFacts(t *testing.T) {
 			if _, ok := contract.GetSourceNodeFacts(got); ok {
 				t.Fatal("status.sourceNode written with nothing known")
 			}
-			if strings.Contains(string(store.objects["bkt/snaps/ps-web-0-deadbeef/manifest.json"]), "sourceNode") {
+			// The manifest is the signed envelope's payload.
+			payload, _, err := testArchiveKeyring.Open(store.objects["bkt/snaps/ps-web-0-deadbeef/manifest.json"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(payload), "sourceNode") {
 				t.Fatal("manifest carries an empty sourceNode")
 			}
 		})
@@ -123,7 +124,7 @@ func TestNodePipelineWithoutSourceNodeFacts(t *testing.T) {
 // A failed checkpoint doesn't publish facts: there is nothing to restore.
 func TestNodePipelineFailureRecordsNoSourceNodeFacts(t *testing.T) {
 	c := newClient(t, workOrderSnapshot("ps-web-0-deadbeef"))
-	r := &NodeSnapshotReconciler{
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID,
 		Client: c, NodeName: "node-a", Ops: &fakeNodeOps{failDump: true, t: t}, Store: newMemStore(),
 		SourceNodeFacts: func(context.Context) contract.SourceNodeFacts { return testSourceFacts },
 	}
@@ -153,8 +154,8 @@ func TestNodePipelineSourceNodeFactsInReadyWrite(t *testing.T) {
 			}
 			return cl.SubResource(sub).Update(ctx, obj, opts...)
 		},
-	}, workOrderSnapshot("ps-web-0-deadbeef"))
-	r := &NodeSnapshotReconciler{
+	}, jobWorkOrderObjects("ps-web-0-deadbeef")...)
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID,
 		Client: c, NodeName: "node-a", Ops: &fakeNodeOps{tarContent: "TARBYTES", t: t}, Store: newMemStore(),
 		SourceNodeFacts: func(context.Context) contract.SourceNodeFacts { return testSourceFacts },
 	}
@@ -173,7 +174,7 @@ func TestFinishWithLeavesExistingOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := newClient(t, ps)
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a"}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a"}
 	if err := r.finishWith(context.Background(), testSnapshotReq, contract.ReasonSucceeded, "late",
 		func(u *unstructured.Unstructured) error { return contract.SetSourceNodeFacts(u, testSourceFacts) }); err != nil {
 		t.Fatal(err)
@@ -190,7 +191,7 @@ func TestFinishWithLeavesExistingOutcome(t *testing.T) {
 // Facts are best effort: a setStatus error never holds back the outcome.
 func TestFinishWithSetStatusErrorStillWritesOutcome(t *testing.T) {
 	c := newClient(t, workOrderSnapshot("ps-web-0-deadbeef"))
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a"}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a"}
 	if err := r.finishWith(context.Background(), testSnapshotReq, contract.ReasonSucceeded, "ok",
 		func(*unstructured.Unstructured) error { return errors.New("boom") }); err != nil {
 		t.Fatal(err)

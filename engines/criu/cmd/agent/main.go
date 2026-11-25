@@ -18,12 +18,15 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,10 +51,16 @@ func main() {
 	var apiGroup string
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
+	var archiveKeysDir, archiveKeyID string
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8091", "health probe bind address (hostNetwork)")
 	flag.StringVar(&apiGroup, "api-group", contract.DefaultGroup, "API group of the snapshot engine CRDs; must match the engine controller's --api-group")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 20, "Kubernetes API client QPS limit")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 40, "Kubernetes API client burst limit")
+	flag.StringVar(&archiveKeysDir, "archive-signing-keys-dir", psengine.DefaultArchiveSigningKeysDir,
+		"directory of archive signing keys (a mounted Secret): each file is one key, named by its key ID (#244)")
+	flag.StringVar(&archiveKeyID, "archive-signing-key-id", "",
+		"key ID that signs new archive manifests; may be empty when the directory holds exactly one key")
+	gcs := bindGCSFlags(flag.CommandLine, os.Getenv)
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -68,6 +77,16 @@ func main() {
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
 		log.Error(nil, "NODE_NAME env (downward API spec.nodeName) is required")
+		os.Exit(1)
+	}
+
+	// Bucket credentials (C10 R5, #244): the agent's own service account,
+	// unless --gcs-credentials=node says otherwise. Never a silent fallback
+	// to the node's.
+	ctx := ctrl.SetupSignalHandler()
+	store, _, err := setUpAgentStore(ctx, gcs, os.Getenv)
+	if err != nil {
+		log.Error(err, "can't set up the agent's checkpoint bucket credentials; not starting, and not falling back to the node's service account (see the engine's README, Storage credentials)")
 		os.Exit(1)
 	}
 
@@ -100,13 +119,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	store := psengine.NewGCSStore()
 	ops := &nodeOpsAdapter{n: nd}
 	cpuFam := node.PSEngineCPUFamily()
+
+	// Archive provenance (C10 R2, #244): the cluster UID every manifest
+	// binds, and the keys that sign and verify manifests.
+	clusterUID, err := psengine.ReadClusterUID(ctx, mgr.GetAPIReader(), clusterUIDBackoff)
+	if err != nil {
+		log.Error(err, "can't read the cluster UID that archive manifests are bound to; the agent needs get on the kube-system Namespace")
+		os.Exit(1)
+	}
+	keyring, signer := loadArchiveKeys(archiveKeysDir, archiveKeyID)
+
 	if err := (&psengine.NodeSnapshotReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
 		SourceNodeFacts: nd.PSEngineSourceNodeFacts,
+		Signer:          signer, ClusterUID: clusterUID,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node snapshot reconciler")
 		os.Exit(1)
@@ -115,11 +144,12 @@ func main() {
 		Client: mgr.GetClient(), NodeName: nodeName,
 		Ops: ops, Store: store, CPUFamily: cpuFam,
 		Recorder: mgr.GetEventRecorderFor("psengine-node-restore"),
+		Keyring:  keyring, ClusterUID: clusterUID,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up psengine node restore reconciler")
 		os.Exit(1)
 	}
-	log.Info("psengine node pipelines enabled", "node", nodeName, "cpuFamily", cpuFam)
+	log.Info("psengine node pipelines enabled", "node", nodeName, "cpuFamily", cpuFam, "clusterUID", clusterUID)
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		os.Exit(1)
@@ -128,10 +158,192 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("starting criu-engine node agent", "node", nodeName)
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		log.Error(err, "agent exited")
 		os.Exit(1)
 	}
+}
+
+// clusterUIDBackoff bounds how long the agent waits for the API server to
+// return the cluster UID at startup before it exits: six attempts, with
+// about 31 s of waits between them, each attempt bounded by
+// psengine.ReadClusterUIDAttemptTimeout (5 s), so about a minute at most.
+var clusterUIDBackoff = wait.Backoff{Steps: 6, Duration: time.Second, Factor: 2}
+
+// The values of --gcs-credentials.
+const (
+	// gcsCredentialsWorkloadIdentity: the agent's own Kubernetes service
+	// account, through a Google STS token exchange (the default).
+	gcsCredentialsWorkloadIdentity = "workload-identity"
+	// gcsCredentialsNode: the node's VM service account, from the metadata
+	// server, as before #244.
+	gcsCredentialsNode = "node"
+)
+
+// gcsFlags say how the agent authenticates to the checkpoint bucket.
+type gcsFlags struct {
+	credentials, workloadPool, identityProvider, tokenFile string
+}
+
+// bindGCSFlags registers the bucket credential flags on fs. Each defaults to
+// an environment variable, which the agent's DaemonSet sets, and then to a
+// built-in default where there is one.
+func bindGCSFlags(fs *flag.FlagSet, getenv func(string) string) *gcsFlags {
+	envOr := func(key, def string) string {
+		if v := getenv(key); v != "" {
+			return v
+		}
+		return def
+	}
+	f := &gcsFlags{}
+	fs.StringVar(&f.credentials, "gcs-credentials", envOr("GCS_CREDENTIALS", gcsCredentialsWorkloadIdentity),
+		"how the agent authenticates to the checkpoint bucket: workload-identity (its own Kubernetes service account, through a Google STS token exchange) "+
+			"or node (the node's VM service account, which every workload on the node can use too) (env GCS_CREDENTIALS)")
+	fs.StringVar(&f.workloadPool, "workload-pool", getenv("WORKLOAD_POOL"),
+		"the cluster's Workload Identity pool, <PROJECT_ID>.svc.id.goog (env WORKLOAD_POOL)")
+	fs.StringVar(&f.identityProvider, "identity-provider", getenv("IDENTITY_PROVIDER"),
+		"the cluster's identity provider, https://container.googleapis.com/v1/projects/<PROJECT_ID>/locations/<LOCATION>/clusters/<CLUSTER> (env IDENTITY_PROVIDER)")
+	fs.StringVar(&f.tokenFile, "gcs-token-file", envOr("GCS_TOKEN_FILE", psengine.DefaultGCSTokenFile),
+		"the projected service account token, with the Workload Identity pool as its audience, that the agent exchanges for bucket access (env GCS_TOKEN_FILE)")
+	return f
+}
+
+// tokenSource checks the flags and returns the agent's STS token source, or
+// nil with --gcs-credentials=node, which means the metadata server. With
+// workload-identity, an empty value, a value still holding deploy.yaml's
+// placeholder, or a token file the agent can't read is an error: the agent
+// then exits rather than use the node's service account.
+func (f *gcsFlags) tokenSource() (*psengine.STSTokenSource, error) {
+	switch f.credentials {
+	case gcsCredentialsNode:
+		return nil, nil
+	case gcsCredentialsWorkloadIdentity:
+	default:
+		return nil, fmt.Errorf("--gcs-credentials (env GCS_CREDENTIALS) is %q: want %s or %s", f.credentials, gcsCredentialsWorkloadIdentity, gcsCredentialsNode)
+	}
+	pool, provider := strings.TrimSpace(f.workloadPool), strings.TrimSpace(f.identityProvider)
+	for _, v := range []struct{ name, value, format string }{
+		{"--workload-pool (env WORKLOAD_POOL)", pool, "<PROJECT_ID>.svc.id.goog"},
+		{"--identity-provider (env IDENTITY_PROVIDER)", provider, "https://container.googleapis.com/v1/projects/<PROJECT_ID>/locations/<LOCATION>/clusters/<CLUSTER>"},
+	} {
+		switch {
+		case v.value == "":
+			return nil, fmt.Errorf("%s is empty: set it to %s", v.name, v.format)
+		case strings.ContainsAny(v.value, "<>"):
+			return nil, fmt.Errorf("%s is still a placeholder (%s): substitute it in deploy.yaml, as %s", v.name, v.value, v.format)
+		}
+	}
+	if _, err := psengine.ReadSubjectToken(f.tokenFile); err != nil {
+		return nil, fmt.Errorf("--gcs-token-file (env GCS_TOKEN_FILE): %w (the agent's DaemonSet must project a service account token there)", err)
+	}
+	return &psengine.STSTokenSource{TokenFile: f.tokenFile, WorkloadPool: pool, IdentityProvider: provider}, nil
+}
+
+// newAgentStore returns the agent's GCS store with the credentials that the
+// flags ask for, and logs which: its own service account through STS
+// (workload-identity), or the node's (node). An error means the agent must
+// not start.
+//
+// With STORAGE_EMULATOR_HOST set, a test-only mode, the store sends its
+// requests to that emulator's GCS JSON API instead of GCS (plain HTTP for a
+// bare host:port), with no credentials at all: no Authorization header, and
+// no request to the metadata server or STS. It skips the workload-identity
+// checks, since a test cluster has no Workload Identity pool.
+func newAgentStore(f *gcsFlags, getenv func(string) string) (*psengine.GCSStore, error) {
+	log := ctrl.Log.WithName("setup")
+	store := psengine.NewGCSStore()
+	if host := getenv(psengine.StorageEmulatorHostEnv); host != "" {
+		endpoint := host
+		if !strings.Contains(endpoint, "://") {
+			endpoint = "http://" + endpoint
+		}
+		endpoint = strings.TrimSuffix(endpoint, "/")
+		store.UploadBase, store.APIBase = endpoint+"/upload/storage/v1", endpoint+"/storage/v1"
+		store.Tokens, store.TokenURL = nil, ""
+		log.Info("WARNING: "+psengine.StorageEmulatorHostEnv+" is set: the agent uses that GCS emulator instead of GCS, sends no credentials, "+
+			"and skips the workload-identity checks. For tests only: whoever runs that endpoint controls the archives", "endpoint", endpoint)
+		return store, nil
+	}
+	// NewGCSStore reads os.Getenv directly; when a test injects getenv
+	// without STORAGE_EMULATOR_HOST, restore production defaults if os.Getenv
+	// happened to be set.
+	store.UploadBase = "https://storage.googleapis.com/upload/storage/v1"
+	store.APIBase = "https://storage.googleapis.com/storage/v1"
+	store.TokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+	sts, err := f.tokenSource()
+	if err != nil {
+		return nil, err
+	}
+	if sts == nil {
+		log.Info("WARNING: --gcs-credentials=node: the agent uses the node's VM service account for the checkpoint bucket, " +
+			"and every workload on the node can use that account too; see the engine's README (Storage credentials)")
+		return store, nil
+	}
+	store.Tokens = sts
+	log.Info("checkpoint bucket credentials: the agent's own Kubernetes service account, through a Google STS token exchange",
+		"workloadPool", sts.WorkloadPool, "identityProvider", sts.IdentityProvider, "tokenFile", sts.TokenFile)
+	return store, nil
+}
+
+// startupWarmTimeout bounds the agent's first token fetch.
+const startupWarmTimeout = 30 * time.Second
+
+// setUpAgentStore returns the agent's store (newAgentStore) and starts
+// getting its first token in the background (warmAtStartup), whose outcome
+// the returned channel carries.
+func setUpAgentStore(ctx context.Context, f *gcsFlags, getenv func(string) string) (*psengine.GCSStore, <-chan error, error) {
+	store, err := newAgentStore(f, getenv)
+	if err != nil {
+		return nil, nil, err
+	}
+	warmed := make(chan error, 1)
+	go func() { warmed <- warmAtStartup(ctx, store) }()
+	return store, warmed, nil
+}
+
+// warmAtStartup gets the agent's first bucket token, so that credentials
+// that don't work show in its log before the first migration, and logs the
+// outcome. It never stops the agent: an STS outage must not crash-loop every
+// agent, and each checkpoint gets a token before it freezes its source
+// anyway.
+func warmAtStartup(ctx context.Context, store *psengine.GCSStore) error {
+	if store.Tokens == nil && store.TokenURL == "" {
+		return nil // a GCS emulator: no credentials to get
+	}
+	log := ctrl.Log.WithName("setup")
+	ctx, cancel := context.WithTimeout(ctx, startupWarmTimeout)
+	defer cancel()
+	if err := store.Warm(ctx); err != nil {
+		log.Error(err, "CHECKPOINT BUCKET CREDENTIALS DON'T WORK: every checkpoint will fail before freezing its source until they do; "+
+			"see the engine's README (Storage credentials)")
+		return err
+	}
+	log.Info("checkpoint bucket credentials work: got an access token")
+	return nil
+}
+
+// loadArchiveKeys loads the archive signing keys from dir, and picks the one
+// that signs (keyID, or the only key). It never fails the agent: without
+// keys, every checkpoint fails before it freezes its source and every
+// restore refuses its archive (cold start); without a signing key, only
+// checkpoints fail. Either is logged as an error.
+func loadArchiveKeys(dir, keyID string) (*psengine.Keyring, *psengine.Signer) {
+	log := ctrl.Log.WithName("setup")
+	keyring, err := psengine.LoadKeyring(dir)
+	if err != nil {
+		log.Error(err, "ARCHIVE SIGNING KEYS NOT LOADED: every checkpoint will fail before freezing its source, "+
+			"and every restore will refuse its archive and cold-start; create the pod-migrate-archive-signing-keys Secret (see the engine's README)",
+			"dir", dir)
+		return nil, nil
+	}
+	signer, err := keyring.Signer(keyID)
+	if err != nil {
+		log.Error(err, "NO ACTIVE ARCHIVE SIGNING KEY: every checkpoint will fail before freezing its source; restores still verify with the loaded keys. "+
+			"Set --archive-signing-key-id", "dir", dir, "keyIDs", keyring.KeyIDs())
+		return keyring, nil
+	}
+	log.Info("archive signing keys loaded", "dir", dir, "keyIDs", keyring.KeyIDs(), "signingKeyID", signer.KeyID())
+	return keyring, signer
 }
 
 // agentManagerOptions builds the controller-runtime manager options for the

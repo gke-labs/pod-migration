@@ -232,11 +232,10 @@ func workOrderSnapshot(name string) *unstructured.Unstructured {
 }
 
 func TestNodePipelineHappyPath(t *testing.T) {
-	ps := workOrderSnapshot("ps-web-0-deadbeef")
-	c := newClient(t, ps)
+	c := newClient(t, jobWorkOrderObjects("ps-web-0-deadbeef")...)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CPUFamily: "Intel(R) Xeon(R) test"}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CPUFamily: "Intel(R) Xeon(R) test"}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
@@ -289,7 +288,7 @@ func TestNodePipelineFailureLeavesSourceRunning(t *testing.T) {
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{failDump: true, t: t}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
@@ -315,7 +314,7 @@ func TestNodePipelineUploadFailureLeavesSourceRunning(t *testing.T) {
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := &failingStore{memStore: newMemStore(), failSubstr: "checkpoint.tar"}
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
@@ -344,7 +343,7 @@ func TestNodePipelineIgnoresOtherNodesAndForeignSnapshots(t *testing.T) {
 	foreign.SetLabels(nil)
 	c := newClient(t, other, foreign)
 	ops := &fakeNodeOps{t: t}
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore()}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore()}
 
 	for _, name := range []string{"ps-other-node", "ps-foreign"} {
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: name}}); err != nil {
@@ -378,7 +377,7 @@ func TestPipeline_RecordSourceFrozenBeforePause(t *testing.T) {
 		}
 	}
 
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +398,7 @@ func TestPipeline_FailedThawLeavesSourceFrozenAndRetries(t *testing.T) {
 		t:           t,
 	}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
 	if err != nil {
@@ -453,7 +452,7 @@ func TestPipeline_FailedFreezeThawsSource(t *testing.T) {
 		t:         t,
 	}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
@@ -484,7 +483,7 @@ func TestPipeline_ShutdownCallsUnfreeze(t *testing.T) {
 	cancel()
 	store := newMemStore()
 
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
@@ -515,7 +514,7 @@ func TestPipeline_ErrFinishedThawsSourceIfNotReady(t *testing.T) {
 		_ = c.Status().Update(context.Background(), snap)
 	}
 
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +552,7 @@ func TestPipeline_ErrFinishedFailedThawRetriesAndThaws(t *testing.T) {
 		_ = c.Status().Update(context.Background(), snap)
 	}
 
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
 	if err != nil {
 		t.Fatalf("expected nil error on failed unfreeze for errFinished to preserve 2s requeue, got: %v", err)
@@ -648,12 +647,13 @@ func TestPipeline_ErrFinishedLiveGetErrorRequeues(t *testing.T) {
 			Reason: contract.ReasonRefused,
 		})
 		_ = c.Status().Update(context.Background(), snap)
-		// Next read is pre-commit cancelCheck (must succeed to return errFinished).
-		// The read after that is liveReader().Get in errFinished handling: make it fail.
+		// The next read binds the archive (readArchiveBinding, #244), which
+		// sees the outcome and returns errFinished. The read after that is
+		// liveReader().Get in errFinished handling: make it fail.
 		reader.failOnCall = reader.calls + 2
 	}
 
-	r := &NodeSnapshotReconciler{Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
 	if err != nil {
@@ -686,7 +686,7 @@ func TestPipeline_ErrFinishedReadySnapshotKeptFrozen(t *testing.T) {
 		_ = c.Status().Update(context.Background(), snap)
 	}
 
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -711,7 +711,7 @@ func TestPipeline_FailedFreezeFailedThawLeavesSourceFrozenAndRequeues(t *testing
 		t:           t,
 	}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
 	if err != nil {
@@ -762,7 +762,7 @@ func TestPipeline_ThawedSourceClearsSourceFrozenWithExistingOutcome(t *testing.T
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{t: t}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
@@ -797,7 +797,7 @@ func TestPipeline_FailedThawOnCancelLeavesSourceFrozenAndRequeues(t *testing.T) 
 		t:           t,
 	}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
 	if err != nil {
@@ -847,7 +847,7 @@ func TestPipeline_ThawPassesSourcePodUID(t *testing.T) {
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{t: t}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}}); err != nil {
 		t.Fatal(err)
@@ -871,7 +871,7 @@ func (m *fakeManagerWithAdd) Add(r manager.Runnable) error {
 // TestSetupWithManagerRegistersStartupSweep pins that SetupWithManager registers
 // the startup sweep Runnable with the manager.
 func TestSetupWithManagerRegistersStartupSweep(t *testing.T) {
-	r := &NodeSnapshotReconciler{NodeName: "node-a"}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, NodeName: "node-a"}
 	mgr := &fakeManagerWithAdd{addErr: errors.New("registration failed")}
 	err := r.SetupWithManager(mgr)
 	if err == nil || !strings.Contains(err.Error(), "registration failed") {
@@ -908,7 +908,7 @@ func TestPipeline_StaleCacheDoesNotThawJustCheckpointedReadySource(t *testing.T)
 	}
 	ops := &fakeNodeOps{t: t}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID,
 		Client:    cachedClient,
 		APIReader: liveClient,
 		NodeName:  "node-a",
@@ -955,7 +955,7 @@ func TestPipeline_OutcomeBeforeRecordSourceFrozenStopsBeforeFreeze(t *testing.T)
 		injectOnGet:   3,
 	}
 
-	r := &NodeSnapshotReconciler{Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store}
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, APIReader: reader, NodeName: "node-a", Ops: ops, Store: store}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-web-0-deadbeef"}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -996,7 +996,7 @@ func TestPipeline_NotFoundOnLiveGetInLeftoverThawsDirectly(t *testing.T) {
 	}
 	ops := &fakeNodeOps{t: t}
 	store := newMemStore()
-	r := &NodeSnapshotReconciler{
+	r := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID,
 		Client:    cachedClient,
 		APIReader: liveClient,
 		NodeName:  "node-a",

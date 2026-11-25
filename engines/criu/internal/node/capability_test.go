@@ -18,6 +18,7 @@ package node
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -63,8 +64,11 @@ func TestInstallCRIUBundle_SkipsSubdirectories(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dstDir, "libdummy.so")); err != nil {
 		t.Errorf("dstDir missing libdummy.so: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(confDir, "runc.conf")); err != nil {
+	if conf, err := os.ReadFile(filepath.Join(confDir, "runc.conf")); err != nil {
 		t.Errorf("confDir missing runc.conf: %v", err)
+	} else if !strings.Contains(string(conf), "network-lock iptables\n") {
+		// cleanNetnsLock only removes iptables locks (#126).
+		t.Errorf("runc.conf must pin network-lock iptables, got %q", conf)
 	}
 	if _, err := os.Stat(filepath.Join(binDir, "criu")); err != nil {
 		t.Errorf("binDir missing wrapper: %v", err)
