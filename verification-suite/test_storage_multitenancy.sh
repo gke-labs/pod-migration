@@ -93,15 +93,86 @@ VAP_MANIFEST="${REPO_ROOT}/patches/storage-isolation-admission-policy.yaml"
 if [[ ! -f "${VAP_MANIFEST}" ]]; then
   die "Missing ${VAP_MANIFEST}"
 fi
-if ! grep -q 'name: pod-migration-storage-location' "${VAP_MANIFEST}"; then
-  die "VAP manifest missing pod-migration-storage-location policy"
-fi
-log "PASS: storage isolation ValidatingAdmissionPolicy manifest present and valid"
+
+python3 -c "
+import yaml, sys
+
+with open('${VAP_MANIFEST}') as f:
+    docs = list(yaml.safe_load_all(f))
+
+vap = next((d for d in docs if d.get('kind') == 'ValidatingAdmissionPolicy'), None)
+binding = next((d for d in docs if d.get('kind') == 'ValidatingAdmissionPolicyBinding'), None)
+
+if not vap:
+    sys.exit('VAP manifest missing ValidatingAdmissionPolicy')
+if not binding:
+    sys.exit('VAP manifest missing ValidatingAdmissionPolicyBinding')
+if vap.get('metadata', {}).get('name') != 'pod-migration-storage-location':
+    sys.exit('VAP name is not pod-migration-storage-location')
+if vap.get('spec', {}).get('failurePolicy') != 'Fail':
+    sys.exit('VAP failurePolicy must be Fail')
+
+rules = vap.get('spec', {}).get('matchConstraints', {}).get('resourceRules', [])
+if not any('podmigrations' in r.get('resources', []) for r in rules):
+    sys.exit('VAP missing podmigrations in resourceRules')
+if not any('podmigration.gke.io' in r.get('apiGroups', []) for r in rules):
+    sys.exit('VAP missing podmigration.gke.io in apiGroups')
+
+if binding.get('spec', {}).get('policyName') != 'pod-migration-storage-location':
+    sys.exit('Binding policyName is not pod-migration-storage-location')
+if 'Deny' not in binding.get('spec', {}).get('validationActions', []):
+    sys.exit('Binding validationActions must include Deny')
+
+expr = vap.get('spec', {}).get('validations', [{}])[0].get('expression', '')
+required_clauses = [
+    \"startsWith('gs://')\",
+    r\"!object.spec.storage.location.substring(5).contains('//')\",
+    r\"!object.spec.storage.location.substring(5).contains(' ')\",
+    r\"!object.spec.storage.location.substring(5).contains('\t')\",
+    r\"split('/')[1] == object.metadata.namespace\",
+    r\"exists(seg, seg == '.' || seg == '..')\"
+]
+for clause in required_clauses:
+    if clause not in expr:
+        sys.exit(f'Missing required CEL clause in VAP expression: {clause}')
+
+def eval_cel_expr(loc, ns):
+    if loc is None: return True
+    if not loc.startswith('gs://'): return False
+    sub = loc[5:]
+    if '//' in sub or ' ' in sub or '\t' in sub: return False
+    parts = sub.split('/')
+    if len(parts) < 2 or parts[0] == '' or parts[1] != ns: return False
+    if any(seg == '.' or seg == '..' for seg in parts): return False
+    return True
+
+test_cases = [
+    ('gs://my-bucket/tenant-a', 'tenant-a', True),
+    ('gs://my-bucket/tenant-a/snapshots', 'tenant-a', True),
+    ('gs://my-bucket/tenant-a/nested/path', 'tenant-a', True),
+    ('gs://my-bucket/tenant-b', 'tenant-a', False),
+    ('gs://my-bucket', 'tenant-a', False),
+    ('gs://my-bucket/', 'tenant-a', False),
+    ('gs://my-bucket/tenant-a/..', 'tenant-a', False),
+    ('gs://my-bucket/tenant-a/.', 'tenant-a', False),
+    ('gs://my-bucket//tenant-a', 'tenant-a', False),
+    ('gs://my-bucket/ tenant-a /snaps', 'tenant-a', False),
+    ('gs://my-bucket/\ttenant-a/snaps', 'tenant-a', False),
+    ('s3://my-bucket/tenant-a/snaps', 'tenant-a', False),
+]
+
+for loc, ns, expected in test_cases:
+    res = eval_cel_expr(loc, ns)
+    if res != expected:
+        sys.exit(f'CEL simulation failed for {loc} in {ns}: got {res}, expected {expected}')
+" || die "ValidatingAdmissionPolicy manifest audit failed"
+
+log "PASS: storage isolation ValidatingAdmissionPolicy manifest structure and CEL rules verified"
 
 # --- 3. Run controller storage isolation unit & conflict tests ---
 log "Running controller storage location conflict, isolation, and pinning tests..."
 cd "${REPO_ROOT}/controller"
-go test -v -run "TestPodMigrationReconciler_ConflictingStorageLocationAcrossNamespaces|TestPodMigrationReconciler_DistinctStorageLocationsAcrossNamespaces|TestPodMigrationReconciler_EnqueuePeers_CrossNamespaceBucketSharing|TestPodMigrationReconciler_ConflictingStorageLocation_DeletesNamespaceResources|TestPodMigrationReconciler_InvalidStorageLocation_Syntax|TestPodMigrationReconciler_StorageIsolationMode_Warn|TestParseStorageLocation|TestValidateStorageLocationForNamespace|TestStorageLocationsConflict" ./internal/controller/... ./internal/util/... >/dev/null
+go test -v -run "TestPodMigrationReconciler_ConflictingStorageLocationAcrossNamespaces|TestPodMigrationReconciler_DistinctStorageLocationsAcrossNamespaces|TestPodMigrationReconciler_EnqueuePeers_CrossNamespaceBucketSharing|TestPodMigrationReconciler_ConflictingStorageLocation_DeletesNamespaceResources|TestPodMigrationReconciler_InvalidStorageLocation_Syntax|TestPodMigrationReconciler_StorageIsolationMode_Warn|TestPodMigrationReconciler_RootBucketStorage|TestParseStorageLocation|TestValidateStorageLocationForNamespace|TestStorageLocationsConflict" ./internal/controller/... ./internal/util/... >/dev/null
 
 log "PASS: Controller rejects cross-namespace collisions, enforces scoping, and pins peer/cleanup paths"
 

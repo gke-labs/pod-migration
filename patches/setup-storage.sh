@@ -65,15 +65,16 @@ done
 
 if [ "$MODE" = "multi-tenant" ]; then
   echo "Configuring multi-tenant storage isolation (federatedP4SA + managed folders)..."
-  # In multi-tenant mode, grant storage.objectAdmin to the GKE node service account.
-  # The node service account mints short-lived, path-restricted tokens on demand for the exact folder path,
-  # ensuring workloads in one namespace cannot access or overwrite checkpoints belonging to another namespace.
+  # In multi-tenant mode, grant storage.admin to the GKE node service account.
+  # Per official GKE Pod Snapshots documentation ("Prepare for Pod snapshots"), federatedP4SA
+  # requires roles/storage.admin for the GKE node service agent (gcp-sa-gkenode) on the bucket
+  # to manage bucket metadata and mint path-restricted session tokens for workloads.
   # Workload KSAs receive NO bucket-wide IAM grants.
   GKE_NODE_SA="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-gkenode.iam.gserviceaccount.com"
-  echo "Granting roles/storage.objectAdmin to GKE node service account (${GKE_NODE_SA})..."
+  echo "Granting roles/storage.admin to GKE node service account (${GKE_NODE_SA})..."
   gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
     --member="${GKE_NODE_SA}" \
-    --role="roles/storage.objectAdmin" \
+    --role="roles/storage.admin" \
     --quiet
 
   # Revoke legacy bucket-wide workload KSA bindings if present from prior single-tenant runs

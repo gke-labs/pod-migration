@@ -530,7 +530,8 @@ for last the one through which project Editors may change the bucket's IAM
 policy), checks that the bucket grants nobody else, and warns about what the
 bucket's own policy can't keep out (below). Run it as a project Owner or
 Storage Admin. Then point the PodMigration of each namespace that only CRIU
-serves at the bucket (`spec.storage.location: gs://<BUCKET_NAME>/<PATH>`).
+serves at the bucket (`spec.storage.location: gs://<BUCKET_NAME>/<namespace>/snapshots`
+or another path starting with `<namespace>/`, as required by the controller's multi-tenant scoping guardrails).
 
 A namespace that both engines serve (its runtime classes routed partly to
 `gke-pod-snapshots` and partly to `criu`) has one storage location for both
@@ -1146,7 +1147,8 @@ kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent
 ```
 
 Then point the PodMigration of each namespace that only CRIU serves at that
-bucket (`spec.storage.location: gs://<BUCKET_NAME>/<PATH>`).
+bucket (`spec.storage.location: gs://<BUCKET_NAME>/<namespace>/snapshots`
+or another path starting with `<namespace>/`).
 
 When creating `PodSnapshotStorageConfig` and `PodSnapshotPolicy` resources for
 this engine, label them with `pod-migrate.io/engine: criu` so `cmd/engine`

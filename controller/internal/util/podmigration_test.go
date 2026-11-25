@@ -92,6 +92,8 @@ func TestParseStorageLocation(t *testing.T) {
 		{"gs://my-bucket/tenant-a/./sub", "", "", true},
 		{"gs://my-bucket/tenant-a//sub", "", "", true},
 		{"gs://b/ a /x", "", "", true},
+		{"gs://b//ns", "", "", true},
+		{"gs://b///ns", "", "", true},
 		{"gs://b/foo /bar", "", "", true},
 		{"gs://b/foo/ bar", "", "", true},
 		{"gs:// b/foo", "", "", true},

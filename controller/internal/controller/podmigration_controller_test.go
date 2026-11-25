@@ -2137,8 +2137,8 @@ func TestPodMigrationReconciler_ConflictingStorageLocation_DeletesNamespaceResou
 		t.Fatalf("Get config-a failed: %v", err)
 	}
 	condA := meta.FindStatusCondition(gotA.Status.Conditions, "Ready")
-	if condA == nil || condA.Status != metav1.ConditionFalse || condA.Reason != ReasonConflictingStorageLocation {
-		t.Fatalf("Expected Ready=False (%s), got %+v", ReasonConflictingStorageLocation, condA)
+	if condA == nil || condA.Status != metav1.ConditionFalse || condA.Reason != ReasonUnscopedStorageLocation {
+		t.Fatalf("Expected Ready=False (%s), got %+v", ReasonUnscopedStorageLocation, condA)
 	}
 }
 
@@ -2407,8 +2407,8 @@ func TestPodMigrationReconciler_UnscopedOlderCandidate_DoesNotBlockValidOwner(t 
 		t.Fatalf("Get configA failed: %v", err)
 	}
 	condA := meta.FindStatusCondition(gotA.Status.Conditions, "Ready")
-	if condA == nil || condA.Status != metav1.ConditionFalse || condA.Reason != ReasonConflictingStorageLocation {
-		t.Fatalf("Expected configA Ready=False, got %+v", condA)
+	if condA == nil || condA.Status != metav1.ConditionFalse || condA.Reason != ReasonUnscopedStorageLocation {
+		t.Fatalf("Expected configA Ready=False (%s), got %+v", ReasonUnscopedStorageLocation, condA)
 	}
 
 	// 2. Reconcile configB: must NOT be blocked by configA because configA failed its own namespace check
@@ -2424,6 +2424,90 @@ func TestPodMigrationReconciler_UnscopedOlderCandidate_DoesNotBlockValidOwner(t 
 	condB := meta.FindStatusCondition(gotB.Status.Conditions, "Ready")
 	if condB == nil || condB.Status != metav1.ConditionTrue {
 		t.Fatalf("Expected configB Ready=True, got %+v", condB)
+	}
+}
+
+// TestPodMigrationReconciler_RootBucketStorage_RefusedWithoutOptIn pins at the reconcile
+// level that targeting the bucket root without a path prefix is refused (Ready=False,
+// ReasonUnscopedStorageLocation) when AllowBucketRootStorage is false (default).
+func TestPodMigrationReconciler_RootBucketStorage_RefusedWithoutOptIn(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "config-root"},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://my-bucket"},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+	fakeRecorder := record.NewFakeRecorder(10)
+	r := &PodMigrationReconciler{
+		Client:                 fakeClient,
+		Scheme:                 scheme,
+		Recorder:               fakeRecorder,
+		AllowBucketRootStorage: false,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-a", Name: "config-root"},
+	}); err != nil {
+		t.Fatalf("Reconcile returned unexpected error: %v", err)
+	}
+
+	got := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-a", Name: "config-root"}, got); err != nil {
+		t.Fatalf("Get config-root failed: %v", err)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonUnscopedStorageLocation {
+		t.Fatalf("Expected Ready=False (%s), got %+v", ReasonUnscopedStorageLocation, cond)
+	}
+}
+
+// TestPodMigrationReconciler_RootBucketStorage_AllowedWithOptIn pins at the reconcile
+// level that targeting the bucket root without a path prefix is admitted and Ready=True
+// when the operator explicitly passes AllowBucketRootStorage=true.
+func TestPodMigrationReconciler_RootBucketStorage_AllowedWithOptIn(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	config := &pmv1alpha1.PodMigration{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "config-root"},
+		Spec: pmv1alpha1.PodMigrationSpec{
+			Storage: pmv1alpha1.StorageSpec{Location: "gs://my-bucket"},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(config).
+		WithStatusSubresource(&pmv1alpha1.PodMigration{}).
+		Build()
+	fakeRecorder := record.NewFakeRecorder(10)
+	r := &PodMigrationReconciler{
+		Client:                 fakeClient,
+		Scheme:                 scheme,
+		Recorder:               fakeRecorder,
+		AllowBucketRootStorage: true,
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant-a", Name: "config-root"},
+	}); err != nil {
+		t.Fatalf("Reconcile returned unexpected error: %v", err)
+	}
+
+	got := &pmv1alpha1.PodMigration{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: "tenant-a", Name: "config-root"}, got); err != nil {
+		t.Fatalf("Get config-root failed: %v", err)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Expected Ready=True with AllowBucketRootStorage=true, got %+v", cond)
 	}
 }
 

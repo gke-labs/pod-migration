@@ -57,6 +57,7 @@ const (
 	OwnerUIDLabelKey                       = engine.OwnerUIDLabel
 	ReasonDuplicatePodMigrationInNamespace = "DuplicatePodMigrationInNamespace"
 	ReasonConflictingStorageLocation       = "ConflictingStorageLocation"
+	ReasonUnscopedStorageLocation          = "UnscopedStorageLocation"
 	ReasonInvalidStorageLocation           = "InvalidStorageLocation"
 	ReasonStorageIsolationWarning          = "StorageIsolationWarning"
 	maxDeletionDeferral                    = 10 * time.Minute
@@ -414,7 +415,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			}
 		}
 		var locationErr *engine.StorageLocationError
-		reason := ReasonConflictingStorageLocation
+		reason := ReasonUnscopedStorageLocation
 		if errors.As(err, &locationErr) || strings.Contains(err.Error(), "invalid storage path") || strings.Contains(err.Error(), "invalid GCS location") {
 			reason = ReasonInvalidStorageLocation
 		}
