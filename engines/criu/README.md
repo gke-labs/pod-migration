@@ -119,7 +119,8 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      `pod-migration.gke.io/engine: criu` so other engines' pods are never touched).
 2. **`cmd/agent` (privileged node DaemonSet):**
    - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 4.2.1
-     bundle (older CRIU fails dumps on Linux >= 6.16)
+     bundle (older CRIU fails dumps on Linux >= 6.16; the image builds it from
+     Debian forky pinned to a snapshot.debian.org timestamp)
      into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
      writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
      `nsenter`, verifies containerd readiness (inspecting containerd's process
@@ -127,11 +128,14 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      before declaring the node ready), and stamps `pod-migrate.io/criu-ready` and
      `pod-migrate.io/criu-version` on the `Node`.
      If containerd cannot resolve CRIU on its PATH/shim PATH, or CRIU is disabled
-     by configuration, or containerd cached a failed CRIU lookup, the agent marks
+     by configuration, or containerd cached a failed CRIU lookup, or the CRIU
+     containerd resolves is older than 4.2.1 (the bundle's minimum: older CRIU
+     fails dumps on Linux >= 6.16), the agent marks
      the node `pod-migrate.io/criu-ready: false` with reason and remediation
      annotations (`pod-migrate.io/criu-reason` and `pod-migrate.io/criu-remediation`).
      This prevents orchestrators from dispatching checkpoints to nodes where containerd
-     would poison its CRIU lookup cache (#130).
+     would poison its CRIU lookup cache (#130), or dump with a CRIU too old for
+     the kernel.
      Containerd inspection reads containerd's primary configuration file (from
      `--config` / `-c` or default `/etc/containerd/config.toml`) and does not follow
      multi-file `imports` / `conf.d` drop-ins.
@@ -366,6 +370,34 @@ they start cold instead of being restored; also delete the
   in that order. A node whose `runc` is elsewhere is still marked CRIU-ready,
   but its restores fail and the replacements start cold. Nodes need no CRIU of
   their own: the agent installs its bundled CRIU.
+- **CRIU on containerd's path:** if a node has its own CRIU and containerd
+  finds it before the agent's `/usr/local/sbin/criu` (earlier on containerd's
+  `PATH`, or on the shim `PATH` when one is set), it must be 4.2.1 or newer.
+  Otherwise the agent marks the node `pod-migrate.io/criu-ready: false`, and
+  its `pod-migrate.io/criu-reason` ends in "older than minimum supported
+  version 4.2.1".
+
+  **Upgrading.** An agent from before this requirement accepted any CRIU from
+  3.16 on. After the upgrade, a node where containerd finds its own CRIU 3.16
+  to 4.2.0 first turns `criu-ready: false`, with a `criu-reason` like this:
+
+  ```text
+  criu version 4.1.1 on containerd PATH is older than minimum supported version 4.2.1
+  ```
+
+  The controller then stops migrating that node's pods with CRIU, so a drain
+  evicts them cold; checkpoints already running and restores aren't affected.
+  To list such nodes:
+
+  ```bash
+  kubectl get nodes -o custom-columns='NODE:.metadata.name,REASON:.metadata.annotations.pod-migrate\.io/criu-reason' \
+    | grep 'older than minimum supported version 4.2.1'
+  ```
+
+  To fix a node, make containerd find the agent's `/usr/local/sbin/criu`
+  first (put `/usr/local/sbin` earlier on containerd's `PATH`, or on the shim
+  `PATH` if one is set) or remove the node's own CRIU, then restart
+  containerd. The agent notices the restart and checks the node again.
 - **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
   `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
   bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable

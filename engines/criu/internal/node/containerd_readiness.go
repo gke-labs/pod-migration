@@ -30,9 +30,18 @@ import (
 )
 
 const (
-	// MinContainerdCRIUVersion is the minimum CRIU version required by containerd (3.16.0).
-	// Represented as major*10000 + minor*100 + patch = 31600, matching go-criu's PodCriuVersion.
-	MinContainerdCRIUVersion = 31600
+	// MinContainerdCRIUVersion is the oldest CRIU the agent accepts on
+	// containerd's lookup path: 4.2.1, the minimum its own bundle is built with
+	// (min= in build/agent/Dockerfile; keep the two equal), although
+	// containerd itself takes 3.16. Older CRIU can't dump a container with a
+	// TCP socket on Linux 6.16 and later, or any container in its own network
+	// namespace on 7.1 and later. This is a floor, not a match: a newer CRIU
+	// that containerd finds ahead of the agent's /usr/local/sbin/criu still
+	// passes, and then dumps with a different CRIU than the bundle that
+	// restores. In go-criu's major*10000 + minor*100 + patch form.
+	MinContainerdCRIUVersion = 40201
+	// minContainerdCRIUVersionText is MinContainerdCRIUVersion as a version.
+	minContainerdCRIUVersionText = "4.2.1"
 
 	// ReasonCRIUDisabledByConfig indicates containerd has enable_criu = false.
 	ReasonCRIUDisabledByConfig = "criu support is disabled in containerd configuration (enable_criu = false)"
@@ -45,7 +54,8 @@ const (
 	RemediationInstallCRIUOnContainerdPath = "install criu wrapper on containerd PATH or configure shim PATH, and restart containerd"
 
 	// RemediationUpgradeCRIUVersion provides guidance to update an outdated CRIU binary.
-	RemediationUpgradeCRIUVersion = "upgrade CRIU binary to >= 3.16.0 and restart containerd"
+	RemediationUpgradeCRIUVersion = "make containerd find CRIU >= " + minContainerdCRIUVersionText +
+		" first (the agent installs it as /usr/local/sbin/criu) and restart containerd"
 
 	maxSymlinks = 40
 )
@@ -405,7 +415,7 @@ func parseCRIUVersionCode(verStr string) (int, error) {
 // It verifies that:
 // 1. containerd configuration does not disable CRIU (enable_criu != false).
 // 2. containerd can resolve an executable CRIU binary according to its lookup rules (shim PATH or process PATH).
-// 3. the resolved CRIU binary meets the minimum version required by containerd (>= 3.16.0).
+// 3. the resolved CRIU binary is at least MinContainerdCRIUVersion (4.2.1, the bundle's minimum).
 func CheckContainerdReadiness(ctx context.Context, inspector *ContainerdReadinessInspector, sockPath string) (ok bool, reason, remediation string, err error) {
 	if inspector == nil {
 		return false, "", "", errors.New("inspector is nil")
@@ -480,7 +490,10 @@ func CheckContainerdReadiness(ctx context.Context, inspector *ContainerdReadines
 	}
 
 	if code < MinContainerdCRIUVersion {
-		return false, fmt.Sprintf("criu version %s on containerd PATH is older than minimum supported version 3.16.0", strings.TrimSpace(verStr)), RemediationUpgradeCRIUVersion, nil
+		// The parsed version rather than the raw output, which can carry a
+		// GitID line, so the criu-reason annotation stays on one line.
+		return false, fmt.Sprintf("criu version %d.%d.%d on containerd PATH is older than minimum supported version %s",
+			code/10000, code/100%100, code%100, minContainerdCRIUVersionText), RemediationUpgradeCRIUVersion, nil
 	}
 
 	return true, "", "", nil
