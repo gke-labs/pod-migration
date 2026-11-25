@@ -460,6 +460,65 @@ func TestCRIU_RestoreOrdersAndVerifyRestore(t *testing.T) {
 	}
 }
 
+// A failed CRIU restore's verdict says why, when the node agent recorded a
+// reason (#244), and is the same cold start either way: only the evidence
+// changes, so metrics and invariants that read Outcome and Reason don't.
+func TestCRIU_VerifyRestoreRecordsTheFailureReason(t *testing.T) {
+	e, err := NewCRIU(nil, nil, CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	failedWith := func(anns map[string]string) RestoreVerdict {
+		t.Helper()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			CRIUInjectedAnnotation:      "true",
+			CRIURestoreStatusAnnotation: CRIURestoreStatusFailed,
+		}}}
+		for k, v := range anns {
+			pod.Annotations[k] = v
+		}
+		verdict, err := e.VerifyRestore(context.Background(), nil, pod)
+		if err != nil {
+			t.Fatalf("VerifyRestore: %v", err)
+		}
+		return verdict
+	}
+
+	without := failedWith(nil)
+	if without.Outcome != ColdStart || without.Reason != criuColdStartReason || without.Confirmed {
+		t.Fatalf("VerifyRestore(failed) = %+v, want an unconfirmed ColdStart", without)
+	}
+	if want := "annotation pod-migrate.io/psengine-restore=failed"; without.Evidence != want {
+		t.Fatalf("evidence without a reason = %q, want %q", without.Evidence, want)
+	}
+
+	with := failedWith(map[string]string{CRIURestoreReasonAnnotation: "ArchiveSignatureInvalid"})
+	if want := "annotation pod-migrate.io/psengine-restore=failed (reason ArchiveSignatureInvalid)"; with.Evidence != want {
+		t.Fatalf("evidence = %q, want %q", with.Evidence, want)
+	}
+	if with.Outcome != without.Outcome || with.Reason != without.Reason || with.Confirmed != without.Confirmed {
+		t.Fatalf("a reason changed more than the evidence: %+v vs %+v", with, without)
+	}
+
+	if blank := failedWith(map[string]string{CRIURestoreReasonAnnotation: "  "}); blank.Evidence != without.Evidence {
+		t.Fatalf("a blank reason: evidence = %q, want %q", blank.Evidence, without.Evidence)
+	}
+
+	// A reason next to anything but failed says nothing (the engine's
+	// admission policy doesn't let one be written there).
+	restored, err := e.VerifyRestore(context.Background(), nil, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			CRIUInjectedAnnotation:      "true",
+			CRIURestoreStatusAnnotation: CRIURestoreStatusRestored,
+			CRIURestoreReasonAnnotation: "ArchiveSignatureInvalid",
+		}},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+	})
+	if err != nil || restored.Outcome != Restored || strings.Contains(restored.Evidence, "ArchiveSignatureInvalid") {
+		t.Fatalf("VerifyRestore(restored, with a reason) = %+v, %v; want Restored without the reason", restored, err)
+	}
+}
+
 func TestRegistry_SideBySideGroupsAndRestoreAnnotations(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(testScheme()).Build()
 

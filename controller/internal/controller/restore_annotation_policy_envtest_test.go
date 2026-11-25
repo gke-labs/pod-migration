@@ -138,6 +138,8 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 	gkeOrder := engine.RestoreAnnotation(engine.DefaultAPIGroup)
 	criuOrder := engine.RestoreAnnotation(engine.DefaultCRIUAPIGroup)
 	const status = engine.CRIURestoreStatusAnnotation
+	// The reason of a failed restore (#244), guarded by the same policy.
+	const reason = engine.CRIURestoreReasonAnnotation
 
 	newPod := func(t *testing.T, namespace, name string, labels, annotations map[string]string) *corev1.Pod {
 		t.Helper()
@@ -504,6 +506,91 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 		t.Run("excluded namespaces are left alone", func(t *testing.T) {
 			system := newPod(t, "kube-system", "status-system", nil, nil)
 			wantAllowed(t, patch(t, tenant, system, set(status, "anything")), "the annotation in kube-system")
+		})
+
+		// The reason of a failure (#244): the agent writes it with failed, in
+		// the same update, and nobody changes or removes it afterwards.
+		const why = "ArchiveSignatureInvalid"
+		injected := func(t *testing.T, name string, extra map[string]string) *corev1.Pod {
+			t.Helper()
+			anns := map[string]string{criuOrder: "snap-a", engine.CRIUInjectedAnnotation: "true"}
+			for k, v := range extra {
+				anns[k] = v
+			}
+			return newPod(t, ns, name, optedIn, anns)
+		}
+		failWith := func(r string) func(*corev1.Pod) {
+			return func(p *corev1.Pod) {
+				set(status, engine.CRIURestoreStatusFailed)(p)
+				set(reason, r)(p)
+			}
+		}
+
+		t.Run("the node agent records a failure's reason with it, once", func(t *testing.T) {
+			pod := injected(t, "reason-agent", nil)
+			wantAllowed(t, update(t, agent, pod, failWith(why)), "the agent recording failed with its reason")
+			if v, _ := annotation(t, pod, reason); v != why {
+				t.Fatalf("%s = %q, want %s", reason, v, why)
+			}
+
+			wantDenied(t, update(t, agent, pod, set(reason, "ArchiveBindingMismatch")), restoreStatusPolicyName, "the agent changing the reason later")
+			wantDenied(t, update(t, agent, pod, unset(reason)), restoreStatusPolicyName, "the agent removing the reason")
+			wantDenied(t, patch(t, tenant, pod, set(reason, "RestoreFailed")), restoreStatusPolicyName, "a tenant changing the reason")
+			wantDenied(t, patch(t, tenant, pod, unset(reason)), restoreStatusPolicyName, "a tenant removing the reason")
+			wantDenied(t, patch(t, admin, pod, set(reason, "RestoreFailed")), restoreStatusPolicyName, "an admin changing the reason")
+			wantDenied(t, patchStatus(t, statusWriter, pod, set(reason, "RestoreFailed")), restoreStatusPolicyName, "changing the reason through pods/status")
+			if v, _ := annotation(t, pod, reason); v != why {
+				t.Errorf("%s = %q after the denials, want %s", reason, v, why)
+			}
+			// Updates that leave both alone still go through.
+			wantAllowed(t, update(t, agent, pod, set("pod-migrate.io/note", "x")), "the agent's later update that leaves the reason")
+			wantAllowed(t, patch(t, tenant, pod, set("example.com/owner", "team-a")), "a tenant adding another annotation")
+		})
+
+		t.Run("nobody else records a reason", func(t *testing.T) {
+			fresh := newPod(t, ns, "reason-others", optedIn, nil)
+			failed := newPod(t, ns, "reason-others-failed", optedIn, map[string]string{status: engine.CRIURestoreStatusFailed})
+			for who, c := range map[string]client.Client{
+				"a tenant":       tenant,
+				"the controller": controller,
+				"an admin":       admin,
+				"the CRIU engine controller's service account":       engineController,
+				"a same-named service account in a tenant namespace": controllerImpostor,
+			} {
+				wantDenied(t, patch(t, c, fresh, set(reason, why)), restoreStatusPolicyName, who+" recording a reason")
+				wantDenied(t, patch(t, c, fresh, failWith(why)), restoreStatusPolicyName, who+" recording failed with a reason")
+				wantDenied(t, patch(t, c, failed, set(reason, why)), restoreStatusPolicyName, who+" adding a reason to a failed outcome")
+			}
+			wantDenied(t, patchStatus(t, statusWriter, fresh, set(reason, why)), restoreStatusPolicyName, "recording a reason through pods/status")
+			if v, ok := annotation(t, fresh, reason); ok {
+				t.Errorf("%s = %q after the denials, want it unset", reason, v)
+			}
+		})
+
+		t.Run("a reason goes only with failed, in the same update", func(t *testing.T) {
+			pod := injected(t, "reason-values", nil)
+			wantDenied(t, update(t, agent, pod, func(p *corev1.Pod) {
+				set(status, engine.CRIURestoreStatusRestored)(p)
+				set(reason, why)(p)
+			}), restoreStatusPolicyName, "the agent recording restored with a reason")
+			wantDenied(t, update(t, agent, pod, set(reason, why)), restoreStatusPolicyName, "the agent recording a reason without an outcome")
+			if _, ok := annotation(t, pod, reason); ok {
+				t.Errorf("%s set after the denials", reason)
+			}
+
+			// Recorded without a reason, the outcome can't get one later.
+			wantAllowed(t, update(t, agent, pod, set(status, engine.CRIURestoreStatusFailed)), "the agent recording failed without a reason")
+			wantDenied(t, update(t, agent, pod, set(reason, why)), restoreStatusPolicyName, "the agent adding a reason after the outcome")
+		})
+
+		t.Run("the node agent drops a reason the pod was created with when it records restored", func(t *testing.T) {
+			pod := injected(t, "reason-created-with", map[string]string{reason: why})
+			wantDenied(t, update(t, agent, pod, set(status, engine.CRIURestoreStatusRestored)), restoreStatusPolicyName,
+				"the agent recording restored next to a reason")
+			wantAllowed(t, update(t, agent, pod, func(p *corev1.Pod) {
+				p.Annotations[status] = engine.CRIURestoreStatusRestored
+				delete(p.Annotations, reason)
+			}), "the agent recording restored and dropping the reason")
 		})
 	})
 

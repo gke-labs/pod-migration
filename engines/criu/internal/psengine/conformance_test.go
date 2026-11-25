@@ -27,7 +27,6 @@ package psengine
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"strings"
 	"testing"
 
@@ -37,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -142,8 +142,11 @@ func TestConformanceFullHandshake(t *testing.T) {
 
 	// Phase 2 — the orchestrator creates a PSMT exactly like ensureTrigger
 	// (podmigrationjob_controller.go:504-558: name psmt-<pod>-<uid8>,
-	// spec.targetPod).
+	// spec.targetPod), controlled by its PodMigrationJob (gke_provider.go
+	// EnsureTrigger: SetControllerReference), which the archive is bound to.
 	psmt := psmtFor("web-0")
+	psmt.SetUID("trigger-uid-1")
+	psmt.SetOwnerReferences([]metav1.OwnerReference{testJobControllerRef()})
 	if err := c.Create(ctx, psmt); err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +170,7 @@ func TestConformanceFullHandshake(t *testing.T) {
 	// Phase 3 — node pipeline executes the work order.
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := newMemStore()
-	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CPUFamily: "fam-A"}
+	nr := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CPUFamily: "fam-A"}
 	if _, err := nr.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: snapName}}); err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +184,18 @@ func TestConformanceFullHandshake(t *testing.T) {
 	if !contract.IsSourceFrozen(ps) {
 		t.Fatal("ready snapshot must record SourceFrozen=True")
 	}
+	// The manifest is signed and bound to the trigger, its job and the cluster.
+	payload, _, err := testArchiveKeyring.Open(store.objects["bkt/snaps/"+snapName+"/manifest.json"])
+	if err != nil {
+		t.Fatalf("manifest.json doesn't verify: %v", err)
+	}
+	var mf Manifest
+	if err := json.Unmarshal(payload, &mf); err != nil {
+		t.Fatal(err)
+	}
+	if mf.TriggerName != "psmt-web-0-deadbeef" || mf.TriggerUID != "trigger-uid-1" || mf.JobUID != testJobUID || mf.ClusterUID != testClusterUID {
+		t.Fatalf("manifest bindings: trigger %q (%q), job %q, cluster %q", mf.TriggerName, mf.TriggerUID, mf.JobUID, mf.ClusterUID)
+	}
 
 	// Phase 4 — the pod gate controller stamps ps-name on the replacement
 	// pod and removes the gate (pod_gate_controller.go:121-130); our
@@ -191,7 +206,7 @@ func TestConformanceFullHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	rops := &fakeRestoreOps{}
-	rr := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: rops, Store: store, WorkDir: t.TempDir(), CPUFamily: "fam-A"}
+	rr := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: rops, Store: store, WorkDir: t.TempDir(), CPUFamily: "fam-A"}
 	if _, err := rr.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -244,22 +259,20 @@ func TestConformanceCPUFamilyGuard(t *testing.T) {
 	c := newClient(t, ps, pod)
 
 	store := newMemStore()
-	// Archive recorded on a different CPU family.
-	specJSON := []byte(`{"ociVersion":"1.1.0"}`)
-	tar := []byte("TARBYTES")
-	specSHA, _, _ := SHA256Reader(strReader(specJSON))
-	tarSHA, _, _ := SHA256Reader(strReader(tar))
-	mfJSON, _ := json.Marshal(Manifest{Snapshot: "ps-web-0-deadbeef", SourcePodUID: "src-uid",
-		TarSHA256: tarSHA, SpecSHA256: specSHA, CPUFamily: "Intel C3 Sapphire Rapids", EngineVersion: engineVersion})
-	store.objects["bkt/snaps/ps-web-0-deadbeef/manifest.json"] = mfJSON
-	store.objects["bkt/snaps/ps-web-0-deadbeef/spec.json"] = specJSON
-	store.objects["bkt/snaps/ps-web-0-deadbeef/checkpoint.tar"] = tar
+	// A genuine archive, recorded on a different CPU family.
+	mf := boundManifest("ps-web-0-deadbeef")
+	mf.CPUFamily = "Intel C3 Sapphire Rapids"
+	putArchive(t, store, mf, []byte(`{"ociVersion":"1.1.0"}`), []byte("TARBYTES"))
 
 	rops := &fakeRestoreOps{}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: rops, Store: store,
-		WorkDir: t.TempDir(), CPUFamily: "AMD EPYC"}
+	rec := record.NewFakeRecorder(10)
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: rops, Store: store,
+		WorkDir: t.TempDir(), CPUFamily: "AMD EPYC", Recorder: rec}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatal(err)
+	}
+	if ev := <-rec.Events; !strings.Contains(ev, "cpu family mismatch") {
+		t.Fatalf("event = %q, want the cpu family refusal", ev)
 	}
 	if len(rops.restored) != 0 {
 		t.Fatal("cross-family restore must be refused")
@@ -268,6 +281,10 @@ func TestConformanceCPUFamilyGuard(t *testing.T) {
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "web-1"}, got)
 	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
 		t.Fatal("cross-family refusal must stamp failed (cold-start fall-through)")
+	}
+	// The archive verified: the CPU family guard refused it, not its provenance.
+	if reason := got.Annotations[contract.AnnotationRestoreReason]; reason != contract.RestoreReasonFailed {
+		t.Fatalf("%s = %q, want %s", contract.AnnotationRestoreReason, reason, contract.RestoreReasonFailed)
 	}
 }
 
@@ -343,8 +360,6 @@ func TestPreflightCRDOwnership(t *testing.T) {
 	})
 }
 
-func strReader(b []byte) io.Reader { return strings.NewReader(string(b)) }
-
 // TestConformanceInjectedUploadFailureThawsSource verifies the C4 fencing acceptance
 // invariant (#148): an injected upload failure leaves the source thawed and serving.
 func TestConformanceInjectedUploadFailureThawsSource(t *testing.T) {
@@ -353,7 +368,7 @@ func TestConformanceInjectedUploadFailureThawsSource(t *testing.T) {
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
 	store := &failingStore{memStore: newMemStore(), failSubstr: "checkpoint.tar"}
-	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, CPUFamily: "fam-A"}
+	nr := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, CPUFamily: "fam-A"}
 
 	if _, err := nr.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-upload-fail"}}); err != nil {
 		t.Fatal(err)
@@ -387,7 +402,7 @@ func TestConformanceRestartAfterFreezeThawsOnCancel(t *testing.T) {
 	_ = contract.SetSourceFrozen(ps, true, contract.ReasonFrozen, "source frozen before restart")
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{tarContent: "TARBYTES", t: t}
-	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
+	nr := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
 
 	// Trigger is absent in client, so cancelCheck reports workOrderCancelled.
 	if _, err := nr.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ps-restart-cancel"}}); err != nil {
@@ -460,7 +475,7 @@ func TestConformanceStartupSweepThawsUnreadySnapshots(t *testing.T) {
 
 	c := newClient(t, psFailed, psCancelled, psInProgress, psReady, psOtherNode, psTimedOut)
 	ops := &fakeNodeOps{t: t}
-	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
+	nr := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
 
 	if err := nr.SweepFrozenSources(ctx); err != nil {
 		t.Fatalf("SweepFrozenSources failed: %v", err)
@@ -507,7 +522,7 @@ func TestConformanceSweepSkipsInflightCheckpoint(t *testing.T) {
 
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{t: t}
-	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
+	nr := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
 
 	// Simulate an active in-flight checkpoint reconcile for ps-busy
 	key := types.NamespacedName{Namespace: "default", Name: "ps-busy"}
@@ -540,7 +555,7 @@ func TestConformanceCheckpointTimedOutKeepsSourceFrozen(t *testing.T) {
 
 	c := newClient(t, ps)
 	ops := &fakeNodeOps{t: t}
-	nr := &NodeSnapshotReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
+	nr := &NodeSnapshotReconciler{Signer: testArchiveSigner, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: newMemStore(), CPUFamily: "fam-A"}
 
 	// 1. Sweep skips CheckpointTimedOut
 	if err := nr.SweepFrozenSources(ctx); err != nil {

@@ -1,7 +1,7 @@
 # CRIU Snapshot Engine (`engines/criu`)
 
 > [!WARNING]
-> **EXPERIMENTAL — FOR NON-PRODUCTION TEST CLUSTERS ONLY ([#129](https://github.com/gke-labs/pod-migration/issues/129), [#244](https://github.com/gke-labs/pod-migration/issues/244)).**
+> **EXPERIMENTAL — FOR NON-PRODUCTION TEST CLUSTERS ONLY: the security requirements R1, R3, R4 and R6 are still open (C10 in [`docs/design/engine-contract.md`](../../docs/design/engine-contract.md)).**
 > `engines/criu` runs a privileged node DaemonSet (`hostPID`, `hostNetwork`,
 > host containerd/kubelet mounts). It serves its own dedicated
 > `criu.podmigration.gke.io` CRD group so it can coexist alongside the managed
@@ -12,31 +12,51 @@
 > Never apply `deploy/crds.yaml` or `deploy/deploy.yaml` to a production
 > cluster.
 >
-> **What remains unverified until [#129](https://github.com/gke-labs/pod-migration/issues/129) lands:**
+> **Security status:** archive provenance (R2) and archive handling (R5) are
+> in place, with the residual risks in the first item below. The other items
+> are open.
 >
-> - **Archive provenance (`R2`) & dedicated GCS credentials (`R5`):** Checkpoint
->   archives in GCS (`manifest.json`, `spec.json`, `checkpoint.tar`) are SHA-256
->   and MD5 integrity-checked against accidental corruption, and restore binds
->   the OCI runtime security posture (`Capabilities`, `User`, `Seccomp`,
->   `MaskedPaths`, `ReadonlyPaths`, `Devices`, `Mounts`, and canonical sandbox
->   `Namespaces`) to the kubelet-created destination container spec. However,
->   CRIU also restores process credentials and seccomp state from the checkpoint
->   image files themselves, archives are **not yet cryptographically signed**,
->   and the `hostNetwork` node agent uses the node's default GCE service account
->   (Workload Identity does not apply to `hostNetwork` pods). Consequently,
->   **anyone who can write to the checkpoint GCS bucket (including workloads on
->   nodes sharing the default GCE service account) can get root on a restoring
->   node** until `R2` (archive provenance) and `R5` (dedicated GCS credentials)
->   land.
+> - **Archive provenance (`R2`) & dedicated GCS credentials (`R5`) ([#244](https://github.com/gke-labs/pod-migration/issues/244)):**
+>   Checkpoint archives in GCS (`manifest.json`, `spec.json`, `checkpoint.tar`)
+>   are SHA-256 and MD5 integrity-checked, and restore binds the OCI runtime
+>   security posture (`Capabilities`, `User`, `Seccomp`, `MaskedPaths`,
+>   `ReadonlyPaths`, `Devices`, `Mounts`, and canonical sandbox `Namespaces`)
+>   to the kubelet-created destination container spec. The node agent signs
+>   each archive's manifest with a key from the
+>   `pod-migrate-archive-signing-keys` Secret, which only the agent mounts, and
+>   binds the archive to its snapshot, pod, location, PodMigrationJob and
+>   cluster; a restoring agent refuses an archive that doesn't verify, and
+>   the replacement cold-starts (see [Archive signing](#archive-signing)). So
+>   writing to the checkpoint bucket no longer gets a restoring node to run an
+>   attacker's process image. CRIU still restores process credentials and
+>   seccomp state from the checkpoint image files themselves, though, so
+>   **anyone who can read Secrets in `pod-migration-criu-system`, or who
+>   compromises a node agent, can sign an archive that gets root on a
+>   restoring node**. The engine uses the bucket as its own two Kubernetes
+>   service accounts: the `hostNetwork` node agent exchanges its own
+>   projected service account token at Google's Security Token Service
+>   instead of using the node's VM service account. R5 holds only for a
+>   bucket that only the CRIU engine uses and that grants object access to
+>   those two alone (`patches/setup-criu-storage.sh`, see
+>   [Storage credentials](#storage-credentials)). A namespace that both
+>   engines serve has one storage location for both, on a bucket that also
+>   grants GKE Pod Snapshots' workloads, so its CRIU archives don't meet R5.
+>   Even on a CRIU-only bucket, anyone who can get a token for either service
+>   account (create pods, or workloads that create them, in
+>   `pod-migration-criu-system`, exec into the agent's pods, or create
+>   `serviceaccounts/token` for them), who has storage access through the
+>   project, or who compromises a node, can still read archives, and delete
+>   or corrupt them to force cold starts.
 > - **Agent RBAC Breadth (`pod-migrate-psengine-agent`):** The node DaemonSet holds
 >   cluster-wide `pods` (`get`, `list`, `watch`, `update`, `patch`), `nodes` (`get`,
 >   `patch`), and `nodes/checkpoint` (`create`) permissions to annotate restored pods
->   with `pod-migrate.io/psengine-restore` and trigger Kubelet container checkpoints.
+>   with `pod-migrate.io/psengine-restore` (and, on a failure,
+>   `pod-migrate.io/psengine-restore-reason`) and trigger Kubelet container checkpoints.
 > - **Residual Dual-Start Window:** If the holder container downward-API poll times out
 >   or falls through to cold-start execution before sibling restore initiates, a residual
 >   dual-start race window exists where both cold-started app processes and restored CRIU
 >   processes could execute concurrently.
-> - **Known follow-ups tracked in [#129](https://github.com/gke-labs/pod-migration/issues/129):**
+> - **Known follow-ups:**
 >   - `cmd/holder`: downward-API volume propagation lag after gate removal can
 >     exceed the initial 2s `ps-name` poll window and trigger a cold-start
 >     fallback before the annotation projects into `/pminfo/annotations`.
@@ -98,8 +118,9 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      with zero API reads, then reading the assigned `PodMigrationJob` to verify
      `pod-migration.gke.io/engine: criu` so other engines' pods are never touched).
 2. **`cmd/agent` (privileged node DaemonSet):**
-   - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 3.19
-     bundle into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
+   - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 4.2.1
+     bundle (older CRIU fails dumps on Linux >= 6.16)
+     into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
      writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
      `nsenter`, verifies containerd readiness (inspecting containerd's process
      PATH or shim PATH and ensuring `enable_criu != false` in containerd configuration
@@ -123,8 +144,10 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      (contract clause C4, #148). Pauses (freezes) the source container task via
      containerd before the checkpoint and records `SourceFrozen=True` on the
      `PodSnapshot`. Drives the kubelet `ContainerCheckpoint` API, captures the
-     source container's OCI spec, uploads `spec.json`, `checkpoint.tar`, and
-     `manifest.json` to GCS with MD5/size verification, and marks the
+     source container's OCI spec, uploads `spec.json`, `checkpoint.tar`, and a
+     signed `manifest.json` (see [Archive signing](#archive-signing)) to GCS
+     as its own service account (see [Storage credentials](#storage-credentials))
+     with MD5/size verification, and marks the
      `PodSnapshot` `Ready=True` while keeping the source container frozen for
      cold eviction by the controller (eliminating lost acknowledged writes and
      empty-state restarts). Note: the controller does not read `SourceFrozen` yet
@@ -196,16 +219,20 @@ The CRIU snapshot engine consists of three binaries built from this Go module
    - Publishes its own node's facts on the `Node`, as labels for restore
      placement and annotations for people (see [Restore placement](#restore-placement)).
    - Reconciles replacement pods on its node carrying the restore order,
-     `<group>/ps-name` (`psengine.NodeRestoreReconciler`): downloads
-     and SHA-256 verifies the archive from GCS, checks CPU family compatibility,
+     `<group>/ps-name` (`psengine.NodeRestoreReconciler`): downloads the
+     archive's `manifest.json` from GCS and verifies its signature and
+     bindings before anything else (see [Archive signing](#archive-signing)),
+     then downloads and SHA-256 verifies the rest of the archive, checks CPU family compatibility,
      prepares an overlayfs rootfs with `rootfs-diff.tar`, rewrites the OCI spec
      (`node.AdaptSpec`), restores the process tree as a sibling `runc` container
      joining the holder's network/IPC/UTS namespaces, and stamps
-     `pod-migrate.io/psengine-restore: restored` (or `failed`).
-     On an existing pod, only the agent may write this annotation, and only
+     `pod-migrate.io/psengine-restore: restored` (or `failed`, with why in
+     `pod-migrate.io/psengine-restore-reason`, in the same update).
+     On an existing pod, only the agent may write these annotations, and only
      once: the `pod-migrate-psengine-restore-status`
      `ValidatingAdmissionPolicy` in `deploy/deploy.yaml` denies every other
-     write, change or removal (#233). To edit it by hand, set the
+     write, change or removal (#233), and a reason next to anything but
+     `failed` (#244). To edit them by hand, set the
      `validationActions` of the `ValidatingAdmissionPolicyBinding` of the
      same name to `["Audit"]`, and back to `["Deny"]` afterwards; while it
      is `Audit`, no pod in the cluster is protected. Don't apply
@@ -323,9 +350,22 @@ they start cold instead of being restored; also delete the
   Snapshots addon when using the default `criu.podmigration.gke.io` group
   (startup preflight still refuses if `--api-group=podsnapshot.gke.io` is used
   on an addon-enabled cluster, or if CRDs are missing/foreign-owned). Never
-  deploy to production clusters until [#244](https://github.com/gke-labs/pod-migration/issues/244) lands.
+  deploy to production clusters until the remaining security requirements
+  R1, R3, R4 and R6 (C10 in `docs/design/engine-contract.md`) are met.
+- **Workload Identity and a CRIU-only bucket (bucket access):** Workload
+  Identity enabled on the cluster, the GKE metadata server
+  (`--workload-metadata=GKE_METADATA`) on the node pool that runs the engine
+  controller, and a checkpoint bucket that only the CRIU engine uses. The
+  node agent and the engine controller use the bucket as their own
+  Kubernetes service accounts, never as the nodes' VM service account (see
+  [Storage credentials](#storage-credentials)).
 - **Linux kernel & runtime:** Nodes running `containerd` 2.x + `runc` with
   kubelet `ContainerCheckpoint` enabled and a kernel passing `criu check`.
+- **runc location:** the agent runs the node's own `runc` for restores, looked
+  up on `/usr/sbin:/usr/bin:/sbin:/bin:/home/kubernetes/bin:/usr/local/sbin:/usr/local/bin`
+  in that order. A node whose `runc` is elsewhere is still marked CRIU-ready,
+  but its restores fail and the replacements start cold. Nodes need no CRIU of
+  their own: the agent installs its bundled CRIU.
 - **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
   `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
   bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable
@@ -377,16 +417,366 @@ until the node is replaced.
 
 Because CRIU checkpoint archives contain complete, unencrypted process address spaces (including in-memory tokens, TLS keys, and credentials), storage backends must be secured with the same rigor as Kubernetes Secrets:
 
-1. **Workload Identity hostNetwork Limitation & Node SA Exposure:** The node agent runs with `hostNetwork: true` to communicate with the local kubelet and manage network namespaces. On GKE, **Workload Identity does not apply to `hostNetwork: true` pods** (they bypass metadata-server token redirection and inherit the underlying node's GCE service account). Consequently, isolating bucket access from cluster workloads is not achievable today if workloads share nodes with the default node service account. Until R5 ([#129](https://github.com/gke-labs/pod-migration/issues/129)) lands (dedicated secret-mounted or sidecar credentials), run CRIU node pools under a dedicated GSA, isolated from untrusted workloads.
-2. **Least Privilege Bucket IAM:**
-   - Source node agents: `roles/storage.objectCreator`, `roles/storage.objectViewer`
-   - Target node agents: `roles/storage.objectViewer`
-   - Engine controller (`cmd/engine`): `storage.objects.create`, `storage.objects.get` and `storage.objects.delete`, for its storage probe and archive garbage collection (#107). Without delete, archives are left behind, reported only by events.
-   - Avoid Default Compute Engine SA: Do **not** use the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`).
+1. **A Bucket for the CRIU Engine Alone:** Use a checkpoint bucket that only the CRIU engine uses, and that grants object access to the engine's two Kubernetes service accounts and to nobody else, not to the nodes' VM service account either (see [Storage credentials](#storage-credentials); `patches/setup-criu-storage.sh` sets one up). Don't share GKE Pod Snapshots' bucket, which grants its workloads' service accounts. The engine controller needs object create, get and delete for its storage probe and archive garbage collection (#107); without delete, archives are left behind, reported only by events.
+2. **Avoid the Default Compute Engine SA:** Do **not** run nodes as the default Compute Engine service account (`<project-number>-compute@developer.gserviceaccount.com`), which often carries broad Project Editor permissions, and don't grant it, or any other node service account, on the bucket.
 3. **CMEK Encryption:** Configure Cloud KMS Customer-Managed Encryption Keys (CMEK) on the checkpoint bucket.
 4. **Lifecycle Retention:** Apply GCS Object Lifecycle Management rules to automatically delete checkpoint archives after **1 to 7 days**, preventing cold archives from lingering. The engine deletes a job's archive when its `PodSnapshot` is deleted (see Archive garbage collection below); keep the rule as a backstop for archives it leaves behind (including temporary composite upload parts matching `checkpoint.tar.part-*`).
 
 For full threat analysis, blast radius documentation, and restore path verification details, see [Threat Model and Security Guidance for the CRIU Engine](../../docs/threat-model-criu.md) and [SECURITY.md](../../SECURITY.md).
+
+## Storage credentials
+
+The node agent runs with `hostNetwork: true`, where the GKE metadata server
+can't tell its requests from the node's and answers as the node's VM service
+account, which every workload on the node can use too. So the agent doesn't
+get its bucket credentials from the metadata server (contract clause C10 R5,
+#244):
+
+- Its DaemonSet projects a token of its own service account,
+  `pod-migration-criu-system/pod-migrate-agent`, with the cluster's Workload
+  Identity pool as its audience, at
+  `/var/run/secrets/pod-migrate/gcs-token/token`. The token lives an hour,
+  and the kubelet rotates it.
+- When it needs an access token, the agent reads that file again and
+  exchanges the token at Google's Security Token Service
+  (`https://sts.googleapis.com/v1/token`) for an access token of that service
+  account's Workload Identity principal, scoped to
+  `https://www.googleapis.com/auth/devstorage.read_write`. It reuses the
+  access token until 5 minutes before it expires: a request authenticates
+  once, when it starts, so 5 minutes covers clock skew and the request's
+  trip with room to spare, for about one exchange an hour. There's no Google
+  service account and no impersonation: the bucket grants the principal
+  itself.
+- The engine controller doesn't run with `hostNetwork`, so it keeps getting
+  its token from the metadata server, where GKE Workload Identity serves it
+  a token of its own service account,
+  `pod-migration-criu-system/pod-migrate-psengine-controller`.
+
+**Requirements.** Workload Identity enabled on the cluster, the GKE metadata
+server (`--workload-metadata=GKE_METADATA`) on the node pool that runs the
+engine controller, and a bucket for the CRIU engine alone (below). On a node
+pool without the GKE metadata server, the controller gets its node's
+credentials instead, which the bucket shouldn't grant.
+
+**Install substitutions.** Replace these in `deploy/deploy.yaml`, along with
+the images (see [Installing on a Test Cluster](#installing-on-a-test-cluster)):
+
+| Placeholder | Value |
+| ----------- | ----- |
+| `<YOUR_WORKLOAD_POOL>` | The cluster's Workload Identity pool: `<PROJECT_ID>.svc.id.goog` |
+| `<YOUR_IDENTITY_PROVIDER>` | The cluster's identity provider: `https://container.googleapis.com/v1/projects/<PROJECT_ID>/locations/<LOCATION>/clusters/<CLUSTER>` |
+
+`<YOUR_WORKLOAD_POOL>` appears twice, as the agent's `WORKLOAD_POOL` and as
+the audience of its projected token, which must be the same.
+
+**A bucket for the CRIU engine alone.** Each archive is a full memory dump of
+the migrated container, so the bucket must give object access to the
+engine's two service accounts and to nobody else. Signing stops a tampered
+archive from being restored (see [Archive signing](#archive-signing)), but
+not anyone from reading one. That rules out:
+
+- GKE Pod Snapshots' bucket, as `patches/setup-storage.sh` sets it up: it
+  grants every service account in the `default` namespace, and the GKE
+  service agent.
+- A new bucket's default policy, which grants the project's Owners and
+  Editors (`roles/storage.legacyBucketOwner` and
+  `roles/storage.legacyObjectOwner`) and its Viewers
+  (`roles/storage.legacyBucketReader` and `roles/storage.legacyObjectReader`)
+  through the project convenience values.
+
+`patches/setup-criu-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]` sets one
+up. It creates the bucket (by default `<PROJECT_ID>-criu-snapshots`, with
+uniform bucket-level access and no soft delete), or checks an existing one
+first: if that bucket doesn't use uniform bucket-level access (object ACLs
+could still grant access), or grants anyone but the two principals below and
+the legacy convenience bindings, such as a namespace's service accounts, the
+GKE service agent or the nodes' service account, the script says why, prints
+what would fix it, and exits without changing anything. It
+never strips a shared bucket. Otherwise it grants the two principals,
+removes the four legacy convenience bindings after printing them (leaving
+for last the one through which project Editors may change the bucket's IAM
+policy), checks that the bucket grants nobody else, and warns about what the
+bucket's own policy can't keep out (below). Run it as a project Owner or
+Storage Admin. Then point the PodMigration of each namespace that only CRIU
+serves at the bucket (`spec.storage.location: gs://<BUCKET_NAME>/<PATH>`).
+
+A namespace that both engines serve (its runtime classes routed partly to
+`gke-pod-snapshots` and partly to `criu`) has one storage location for both
+engines, on a bucket that has to grant GKE Pod Snapshots' workloads too. So
+its CRIU archives can't meet R5 today: anyone that bucket grants can read
+them. Serve such a namespace with one engine, or accept that risk until each
+engine can have a storage location of its own (a follow-up).
+
+**Bucket principals.** Grant each of them `roles/storage.objectUser` and
+`roles/storage.bucketViewer` on the CRIU bucket (`patches/setup-criu-storage.sh`
+does this), with `<PROJECT_NUMBER>` the number of the project that hosts the
+cluster:
+
+- `principal://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<PROJECT_ID>.svc.id.goog/subject/ns/pod-migration-criu-system/sa/pod-migrate-agent`
+- `principal://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<PROJECT_ID>.svc.id.goog/subject/ns/pod-migration-criu-system/sa/pod-migrate-psengine-controller`
+
+An install in another namespace, or with other service account names, grants
+those instead (the script takes `CRIU_NAMESPACE`, `CRIU_AGENT_SA` and
+`CRIU_CONTROLLER_SA`). The nodes' VM service account needs no access to the
+bucket.
+
+**What the bucket's own policy can't keep out.** Roles granted on the
+project, or above it, that carry `storage.objects` permissions (Storage
+Admin, the other `roles/storage.*` roles, custom roles) reach the archives
+whatever the bucket's policy says. Once the convenience bindings are gone,
+project Owners and Editors have no object access of their own, but they still
+have ways in: an Owner can grant itself such a role, and Owners and Editors
+can create pods in `pod-migration-criu-system` through GKE IAM, and a pod can
+run as either of the engine's service accounts and get its token. The same
+goes for anyone with Kubernetes RBAC to create pods, or workloads that create
+them, in that namespace, and for the nodes' service account if it has such a
+role: the default Compute Engine service account often has Editor. Run CRIU
+nodes as a service account without one.
+
+**Flags.** Each falls back to the environment variable in parentheses:
+
+- `--gcs-credentials` (`GCS_CREDENTIALS`): `workload-identity`, the default,
+  or `node`. With `node`, the agent uses the node's VM service account from
+  the metadata server, as it did before, and logs a warning at startup.
+- `--workload-pool` (`WORKLOAD_POOL`) and `--identity-provider`
+  (`IDENTITY_PROVIDER`): the values above. The DaemonSet sets both.
+- `--gcs-token-file` (`GCS_TOKEN_FILE`): the projected token, by default
+  `/var/run/secrets/pod-migrate/gcs-token/token`.
+
+With `workload-identity`, an agent whose workload pool or identity provider
+is empty or still a placeholder, or that can't read its token file, logs why
+and exits at startup: it never falls back to the node's service account. It
+then gets a first access token in the background, and logs
+`checkpoint bucket credentials work: got an access token`, or why not; a
+failure doesn't stop it, so an STS outage doesn't crash-loop every agent.
+Before each checkpoint freezes its source, the agent makes sure it holds a
+token that stays usable for 15 minutes, longer than the orchestrator waits
+for a checkpoint (`--migration-timeout`, 10 minutes by default), so no
+token is fetched while the source is frozen. If it can't get one, the
+checkpoint fails with STS's HTTP status and error in its message, never a
+token, and `the source container was not touched`.
+
+`STORAGE_EMULATOR_HOST` is for tests only (the kind E2E runs
+`fake-gcs-server`). It names a GCS emulator: `host:port`, as Google's client
+libraries take it, or a URL such as `http://host:port`. With it set, the
+agent sends its bucket requests to that emulator's GCS JSON API
+(`<endpoint>/upload/storage/v1` and `<endpoint>/storage/v1`, over plain HTTP
+for a bare `host:port`) instead of GCS, with no credentials at all: no
+`Authorization` header, and no request to the metadata server or STS. It
+skips the `workload-identity` checks, since a test cluster has no Workload
+Identity pool, and logs a `WARNING` at startup. Whoever runs that endpoint
+controls the archives, so never set it on a real cluster.
+
+**Upgrading.** On a cluster where the agent used the node's VM service
+account, move the CRIU engine to a new bucket:
+
+1. Let in-flight CRIU migrations finish.
+2. Set up a bucket for the CRIU engine alone with
+   `patches/setup-criu-storage.sh`. For a bucket that only the CRIU engine
+   already uses, you can grant the two principals yourself instead, and
+   remove its legacy convenience bindings as the script does:
+   ```bash
+   for sa in pod-migrate-agent pod-migrate-psengine-controller; do
+     for role in roles/storage.objectUser roles/storage.bucketViewer; do
+       gcloud storage buckets add-iam-policy-binding gs://<BUCKET_NAME> --role="${role}" --condition=None \
+         --member="principal://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<PROJECT_ID>.svc.id.goog/subject/ns/pod-migration-criu-system/sa/${sa}"
+     done
+   done
+   ```
+   Make sure the engine controller's node pool runs the GKE metadata server.
+3. Point the PodMigration of each namespace that only CRIU serves at the
+   bucket (`spec.storage.location`).
+4. Apply the new `deploy/deploy.yaml` with both substitutions, and wait for
+   `kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent`.
+5. Check that the new bucket works. It grants neither the nodes nor anyone
+   else, so only the engine's own identities can use it:
+   - each agent logs `checkpoint bucket credentials work: got an access token`
+     at startup, so STS accepted its token;
+   - a test migration in a namespace that only CRIU serves checkpoints and
+     restores, so the agents read and write the new bucket;
+   - once that migration's PodSnapshot is deleted (after the controller's
+     `--snapshot-retention`), no `ArchiveDeleteFailed` event follows, so the
+     engine controller deletes from the new bucket too.
+6. Delete the CRIU archives left in the old bucket by hand. Before the
+   switch, list the CRIU PodSnapshots and delete only their prefixes,
+   `gs://<OLD_BUCKET>/<OLD_PATH>/<SNAPSHOT>/`: GKE Pod Snapshots' archives
+   can share `<OLD_PATH>`. The
+   engine deletes an archive from the bucket that its work order recorded,
+   as the engine controller, which the old bucket may not grant: the
+   archives of PodSnapshots from before the switch can stay behind, and each
+   is a memory dump.
+7. Only then remove the nodes' access to the bucket the agent used before:
+   for each role that `gcloud storage buckets get-iam-policy gs://<OLD_BUCKET>`
+   shows for the nodes' service account, run
+   `gcloud storage buckets remove-iam-policy-binding gs://<OLD_BUCKET> --member=serviceAccount:<NODE_SERVICE_ACCOUNT> --role=<ROLE> --all`.
+
+## Archive signing
+
+Anyone who can write to the checkpoint bucket could otherwise replace an
+archive and its manifest together, or copy a genuine archive into another
+snapshot's prefix, and have it restored as root on a node. So the node agent
+signs each archive's manifest with a key that workloads can't read, and binds
+the archive to the restore it belongs to (contract clause C10 R2, #244):
+
+- `manifest.json` is a [DSSE](https://github.com/secure-systems-lab/dsse)
+  envelope (payload type
+  `application/vnd.gke-labs.pod-migration.criu-manifest.v1+json`). Its payload
+  is the manifest, and its signature is an HMAC-SHA256 over DSSE's
+  pre-authentication encoding of the payload, with the key that `keyid` names.
+- The manifest carries the SHA-256 and size of `checkpoint.tar` and the
+  SHA-256 of `spec.json`, and binds the archive to the snapshot, its
+  namespace, the source pod's name and UID, the container, the bucket and
+  path, the UID of the PodMigrationJob that controls the work order's
+  trigger, and the cluster (the UID of its `kube-system` Namespace, which the
+  agent reads at startup; it exits if it can't). It also records the trigger
+  (name and UID), which the restore doesn't check: the job UID ties the
+  archive to its job, and a job that creates its trigger again takes its own
+  work order over (#262).
+- An agent that can't sign fails a work order before it freezes the source:
+  `Checkpoint=False`, reason `Failed`, with a message that says why
+  (`archive signing key not configured on the node agent`, or that the agent
+  doesn't know the cluster UID) and ends `the source container was not
+  touched`. The migration then falls back as for any failed checkpoint.
+- The agent never commits an archive that no restore would accept. Right
+  before it signs the manifest, it reads the work order and its trigger past
+  the cache, and takes the job from the trigger's controller reference. A
+  trigger or work order that was deleted, or is being deleted, cancels the
+  checkpoint (`Cancelled`). A trigger created again under the same name that
+  hasn't taken the work order over yet is read again for a few seconds,
+  while the take-over lands (#262). If no job can be bound (the trigger has
+  no PodMigrationJob controller, or the take-over never lands), the
+  checkpoint fails before `manifest.json` is uploaded. At the commit point,
+  the agent reads the trigger again by name: if another PodMigrationJob
+  controls it by then, the checkpoint fails rather than commit. A trigger
+  that the same job created again commits, taken over or not. Each failure
+  or cancel thaws the source.
+- The restoring agent downloads `manifest.json` first and verifies its
+  signature with its keys. It then compares every binding with its own work
+  order, with the PodMigrationJob that the replacement is assigned to
+  (`pod-migration.gke.io/assigned-pmj`), and with its own cluster. Only then
+  does it download `spec.json` and `checkpoint.tar`, which must match the
+  signed digests. An envelope with more than 8 signatures is refused as
+  malformed, before any signature is checked.
+
+**Creating the key.** Create it when you install the engine (see
+[Installing on a Test Cluster](#installing-on-a-test-cluster)), and before
+you apply a `deploy/deploy.yaml` with archive signing to an existing install
+(see Upgrading below):
+
+```bash
+kubectl create secret generic pod-migrate-archive-signing-keys \
+  -n pod-migration-criu-system \
+  --from-literal=k1="$(openssl rand -base64 48)"
+```
+
+Each entry of the Secret is one key. Its name is the key ID (letters, digits,
+`.`, `_` and `-`, up to 63 characters, starting with a letter or digit), and
+its value, without surrounding whitespace, is the key: at least 32 bytes. The
+DaemonSet mounts the Secret read-only at `/etc/pod-migrate/archive-signing`
+(`--archive-signing-keys-dir`), and the agent's pods don't start without it.
+The agent signs with the key that `--archive-signing-key-id` names, or with
+the only key when the flag is empty (the default), and verifies with every
+key. It reads the keys once, at startup: restart the agents after you change
+the Secret. Every agent of the cluster shares the keys, so any node can
+restore a checkpoint from any other. Only the agent mounts the Secret; keep
+`get` on Secrets in `pod-migration-criu-system` away from workloads and
+tenants.
+
+**Setting the signing key ID.** The agent's container in `deploy/deploy.yaml`
+has no `command` or `args`, and the agent image's entrypoint is the agent
+binary (`ENTRYPOINT ["/agent"]`), so arguments you add go to the agent. Set
+the flag with a JSON patch, which rolls the DaemonSet (the `add` operation
+replaces `args` if there are any, so include any other flags you pass), then
+wait for the rollout:
+
+```bash
+kubectl -n pod-migration-criu-system patch daemonset pod-migrate-agent --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args","value":["--archive-signing-key-id=k1"]}]'
+kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent
+```
+
+If the flag names a key that isn't in the Secret, the agent still verifies
+archives with the keys it has, but it has none to sign with: it logs
+`NO ACTIVE ARCHIVE SIGNING KEY` and fails every checkpoint before it freezes
+the source (`archive signing key not configured on the node agent`). So does
+an agent that starts with several keys and no `--archive-signing-key-id`.
+
+**Rotating the key.** Since the agent reads the keys only at startup, do these
+steps in order, and wait for
+`kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent` to
+finish after each one:
+
+1. Pin the current key: set `--archive-signing-key-id=k1` as above, which rolls
+   the agents.
+2. Add the new key and restart the agents. Each then holds both keys, and
+   still signs with `k1`:
+   ```bash
+   kubectl -n pod-migration-criu-system patch secret pod-migrate-archive-signing-keys \
+     --type=merge -p "{\"stringData\":{\"k2\":\"$(openssl rand -base64 48)\"}}"
+   kubectl -n pod-migration-criu-system rollout restart ds/pod-migrate-agent
+   ```
+3. Switch the flag to the new key, which rolls the agents. Every agent already
+   holds both keys, so restores keep working while it rolls. The `replace`
+   operation overwrites the whole `args` list, so add any other flags you pass
+   to the agent (such as `--api-group`) to `value`:
+   ```bash
+   kubectl -n pod-migration-criu-system patch daemonset pod-migrate-agent --type=json \
+     -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--archive-signing-key-id=k2"]}]'
+   ```
+4. Once archives signed with `k1` have expired (their migrations have
+   finished, or the bucket's lifecycle rule has deleted them), remove `k1`
+   and restart the agents:
+   ```bash
+   kubectl -n pod-migration-criu-system patch secret pod-migrate-archive-signing-keys \
+     --type=json -p='[{"op":"remove","path":"/data/k1"}]'
+   kubectl -n pod-migration-criu-system rollout restart ds/pod-migrate-agent
+   ```
+
+**What a refused archive looks like.** The replacement starts cold. The agent
+stamps `pod-migrate.io/psengine-restore: failed` and, in the same update,
+`pod-migrate.io/psengine-restore-reason`, records a Warning `RestoreFailed`
+event on the pod with the reason and the details (`kubectl describe pod`), and
+the PodMigrationJob concludes `SucceededWithoutRestore` with the reason
+`FallbackToColdStart` and a message such as
+`CRIU snapshot restore failed; replacement fell back to cold start (annotation pod-migrate.io/psengine-restore=failed (reason ArchiveSignatureInvalid))`.
+Neither the event nor the annotation names key IDs or cluster UIDs; the
+agent's log does. The reasons:
+
+| Reason | Meaning |
+| ------ | ------- |
+| `ArchiveSigningKeyUnavailable` | The restoring agent has no archive signing keys (see its log). |
+| `ArchiveSignatureInvalid` | `manifest.json` is malformed, unsigned (for example written by an agent from before archive signing), signed with a key the agent doesn't hold, or its signature doesn't match. |
+| `ArchiveBindingMismatch` | A genuine archive, bound to another snapshot, pod, location, job or cluster. |
+| `ArchiveDigestMismatch` | `spec.json` or `checkpoint.tar` doesn't match the digests in the signed manifest. |
+| `RestoreFailed` | Any other failure. |
+
+**Upgrading.** An agent from before archive signing can't read a signed
+manifest, and an agent with it refuses an unsigned one, so a migration whose
+checkpoint and restore run on agents of different versions starts cold, and
+so does every restore from an archive written before the upgrade. On an
+existing install:
+
+1. Let in-flight migrations finish, and don't drain CRIU nodes or start CRIU
+   migrations until step 4 is done.
+2. Create the `pod-migrate-archive-signing-keys` Secret (see Creating the key)
+   before you apply the new `deploy/deploy.yaml`. The agent's pods don't start
+   without it, so otherwise the rolling update replaces the agent on the first
+   node with a pod that waits for the Secret, and stops there, leaving that
+   node without an agent.
+3. Apply the new `deploy/deploy.yaml`.
+4. Wait for `kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent`.
+
+**What it doesn't cover.** Anyone who can read Secrets in
+`pod-migration-criu-system`, or who compromises a node agent (each agent holds
+the keys), can sign an archive. Signing doesn't stop anyone from reading an
+archive, either: that takes a bucket that only the CRIU engine uses and that
+grants object access to its two service accounts alone (see
+[Storage credentials](#storage-credentials)). Even then, anyone who can get a
+token for either of them (create pods, or workloads that create them, in
+`pod-migration-criu-system`, exec into the agent's pods, or create
+`serviceaccounts/token` for them), who has storage access through the
+project, or who compromises a node, can still read archives, and delete or
+corrupt them, which forces cold starts.
 
 ## Archive garbage collection
 
@@ -645,18 +1035,69 @@ docker build -f build/agent/Dockerfile  -t <YOUR_CRIU_AGENT_IMAGE> .
 docker build -f build/holder/Dockerfile -t <YOUR_CRIU_HOLDER_IMAGE> .
 ```
 
-## Installing on a Test Cluster
+### End-to-end test on kind
 
-Apply the `criu.podmigration.gke.io` CRDs and deploy the engine, agent, and
-webhook:
+CI runs real migrations on a local kind cluster for pull requests and pushes
+to `main` that touch `engines/criu/`, `controller/`, `verification-suite/` or
+`.github/workflows/` (`.github/workflows/criu-e2e.yaml`,
+[#230](https://github.com/gke-labs/pod-migration/issues/230)). The kind
+workers run real containerd, runc and CRIU, and `fake-gcs-server` stands in
+for the bucket. Two stateful pods, each in its own namespace, are drained to
+the other worker: the first must be restored warm; the second holds a file on
+an emptyDir, which doesn't move, so its restore must fail and its replacement
+must start cold and serve.
+
+To run it locally you need an x86-64 Linux host whose kernel passes
+`criu check`, with Docker, kind v0.33.0 (the version CI pins), kubectl, make,
+jq and openssl. `up.sh` first deletes any kind cluster named `pm-e2e`, and
+creates the archive signing key Secret with a random key before it applies
+the engine's manifest (see [Archive signing](#archive-signing)).
 
 ```bash
+verification-suite/kind/up.sh
+verification-suite/run_criu_kind_e2e.sh    # or name scenarios: warm-restore restore-failure
+kind delete cluster --name pm-e2e && docker rm -f pm-e2e-gcs    # tear down
+```
+
+The engine and the agent use the GCS emulator named by
+`STORAGE_EMULATOR_HOST` instead of GCS when it is set: `host:port`, as
+Google's client libraries take it (plain HTTP), or a URL such as
+`http://host:port`. They then send no credentials and log a `WARNING` line at
+startup. `up.sh` sets it; the shipped manifests never do. It is for tests
+only: never set it on a real cluster, where whoever runs the emulator could
+read, delete or corrupt the checkpoint archives.
+
+## Installing on a Test Cluster
+
+Apply the `criu.podmigration.gke.io` CRDs, create the archive signing key
+(see [Archive signing](#archive-signing)), then deploy the engine, agent, and
+webhook. On a fresh install, the order of the last two doesn't matter, since
+the agent's pods wait for the key. On an existing install, create the key
+first (see Upgrading under [Archive signing](#archive-signing)). Set up a
+bucket for the CRIU engine alone, which grants the engine's two service
+accounts and nobody else, and set `WORKLOAD_POOL` and `IDENTITY_PROVIDER` to
+your cluster's values (see [Storage credentials](#storage-credentials)):
+
+```bash
+./patches/setup-criu-storage.sh <PROJECT_ID> <BUCKET_NAME> <REGION>
+WORKLOAD_POOL="<PROJECT_ID>.svc.id.goog"
+IDENTITY_PROVIDER="https://container.googleapis.com/v1/projects/<PROJECT_ID>/locations/<LOCATION>/clusters/<CLUSTER>"
 kubectl apply -f engines/criu/deploy/crds.yaml
+kubectl create namespace pod-migration-criu-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic pod-migrate-archive-signing-keys \
+  -n pod-migration-criu-system \
+  --from-literal=k1="$(openssl rand -base64 48)"
 sed -e "s|<YOUR_CRIU_ENGINE_IMAGE>|${ENGINE_IMG}|g" \
     -e "s|<YOUR_CRIU_AGENT_IMAGE>|${AGENT_IMG}|g" \
     -e "s|<YOUR_CRIU_HOLDER_IMAGE>|${HOLDER_IMG}|g" \
+    -e "s|<YOUR_WORKLOAD_POOL>|${WORKLOAD_POOL}|g" \
+    -e "s|<YOUR_IDENTITY_PROVIDER>|${IDENTITY_PROVIDER}|g" \
     engines/criu/deploy/deploy.yaml | kubectl apply -f -
+kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent
 ```
+
+Then point the PodMigration of each namespace that only CRIU serves at that
+bucket (`spec.storage.location: gs://<BUCKET_NAME>/<PATH>`).
 
 When creating `PodSnapshotStorageConfig` and `PodSnapshotPolicy` resources for
 this engine, label them with `pod-migrate.io/engine: criu` so `cmd/engine`

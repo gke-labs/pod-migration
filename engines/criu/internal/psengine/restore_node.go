@@ -18,15 +18,18 @@ package psengine
 // Node-side restore: when a replacement pod lands on this node carrying a
 // non-empty restore order (contract.AnnotationPSName, <group>/ps-name) and
 // our webhook's holder wiring, the agent pulls the archive from
-// GCS, verifies it against the manifest, and performs the sandbox-sibling runc
+// GCS, verifies the manifest's signature and bindings (C10 R2, #244) and then
+// the archive against the manifest, and performs the sandbox-sibling runc
 // restore into the holder's namespaces. The outcome is stamped back as an
-// annotation so the holder wrapper can fall through to a cold start on failure.
+// annotation so the holder wrapper can fall through to a cold start on
+// failure, with the failure's reason in a second annotation.
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -93,6 +96,12 @@ type NodeRestoreReconciler struct {
 	// family is refused (cross-family restores can crash glibc-heavy apps).
 	// Empty disables the guard (both sides honest-absent).
 	CPUFamily string
+	// Keyring verifies each archive's signed manifest (C10 R2, #244). Nil
+	// refuses every archive, so every restore falls back to a cold start.
+	Keyring *Keyring
+	// ClusterUID is this cluster's UID (ReadClusterUID); an archive bound to
+	// another cluster, or to none, is refused.
+	ClusterUID string
 
 	ParallelUploadConfig ParallelUploadConfig
 
@@ -116,6 +125,8 @@ func (r *NodeRestoreReconciler) parallelConfig() ParallelUploadConfig {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;patch
 // +kubebuilder:rbac:groups="",resources=nodes/checkpoint,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// The cluster UID that archive manifests bind (ReadClusterUID, #244):
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get,resourceNames=kube-system
 
 // resolveSnapshot extracts the snapshot name for a pod, checking the durable
 // engine-owned AnnotationSnapshot, the controller's restore-completed annotation,
@@ -239,17 +250,22 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	err := r.restore(ctx, pod, psName)
 	status := contract.RestoreStatusRestored
+	reason := ""
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctrl.Result{}, ctx.Err()
 		}
-		logger.Error(err, "psengine restore failed; holder will cold-start")
 		status = contract.RestoreStatusFailed
+		reason = restoreFailureReason(err)
+		logger.Error(err, "psengine restore failed; holder will cold-start", "reason", reason)
 	} else {
 		logger.Info("psengine restore complete", "snapshot", psName)
 	}
 
 	// Stamp the outcome — the holder wrapper reads it via the downward API.
+	// A failure's reason goes in the same write, so nobody sees one without
+	// the other (the admission policy also lets the reason be written only
+	// with failed, and only once).
 	latest := &corev1.Pod{}
 	if gerr := r.Get(ctx, req.NamespacedName, latest); gerr != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(gerr)
@@ -260,6 +276,11 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	latest.Annotations[contract.AnnotationRestoreStatus] = status
 	if status == contract.RestoreStatusRestored {
 		latest.Annotations[contract.AnnotationSnapshot] = psName
+		// A reason is only ever stamped with failed: drop one the pod was
+		// created with, which the policy would refuse next to restored.
+		delete(latest.Annotations, contract.AnnotationRestoreReason)
+	} else {
+		latest.Annotations[contract.AnnotationRestoreReason] = reason
 	}
 	if uerr := r.Update(ctx, latest); uerr != nil {
 		return ctrl.Result{}, uerr
@@ -267,7 +288,7 @@ func (r *NodeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	restoreOutcomes.WithLabelValues(status).Inc()
 	if status == contract.RestoreStatusFailed && r.Recorder != nil {
-		msg := fmt.Sprintf("psengine restore failed; falling back to a cold start: %v", err)
+		msg := fmt.Sprintf("psengine restore failed (%s); falling back to a cold start: %v", reason, err)
 		if len(msg) > 950 {
 			cut := 947
 			for cut > 0 && !utf8.RuneStart(msg[cut]) {
@@ -330,6 +351,11 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 	if !contract.IsSnapshotReady(ps) {
 		return fmt.Errorf("PodSnapshot %s is not Ready; refusing to restore an unverified archive", psName)
 	}
+	// Every archive must verify (C10 R2, #244): without keys, refuse it
+	// before downloading anything.
+	if r.Keyring == nil {
+		return fmt.Errorf("%w: the node agent has no archive signing keys (see its log); refusing to restore an unverified archive", ErrSigningKeyUnavailable)
+	}
 
 	dir := filepath.Join(r.workDir(), psName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -346,13 +372,34 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 	prefix := ArchivePrefix(spec.Path, psName)
 
 	// manifest first — it is the upload-complete marker and integrity record.
-	mfBytes, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "manifest.json"), filepath.Join(dir, "manifest.json"), "", 0, maxMetadataBytes)
+	// Nothing else is downloaded until its signature and its bindings verify;
+	// its fields are used only after that.
+	envelope, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "manifest.json"), filepath.Join(dir, "manifest.json"), "", 0, maxMetadataBytes)
 	if err != nil {
 		return fmt.Errorf("fetch manifest: %w", err)
 	}
+	payload, keyID, err := r.Keyring.Open(envelope)
+	if err != nil {
+		// Key IDs go to the log only: the error reaches an event on the pod.
+		log.FromContext(ctx).Info("archive manifest didn't verify", "snapshot", psName,
+			"envelopeKeyIDs", EnvelopeKeyIDs(envelope), "agentKeyIDs", r.Keyring.KeyIDs())
+		return fmt.Errorf("verify manifest.json: %w", err)
+	}
 	var mf Manifest
-	if err := json.Unmarshal(mfBytes, &mf); err != nil {
+	if err := json.Unmarshal(payload, &mf); err != nil {
 		return fmt.Errorf("manifest decode: %w", err)
+	}
+	want := &Manifest{
+		Snapshot: psName, Namespace: pod.Namespace,
+		SourcePod: spec.SourcePod, SourcePodUID: spec.SourcePodUID, Container: spec.Container,
+		Bucket: spec.Bucket, Path: spec.Path,
+		JobUID: string(pmj.GetUID()), ClusterUID: r.ClusterUID,
+	}
+	if err := checkBindings(&mf, want); err != nil {
+		// The cluster UIDs go to the log only, like the key IDs.
+		log.FromContext(ctx).Info("archive bindings don't match this restore", "snapshot", psName, "signedWithKey", keyID,
+			"manifestClusterUID", mf.ClusterUID, "clusterUID", want.ClusterUID, "manifestJobUID", mf.JobUID, "jobUID", want.JobUID)
+		return err
 	}
 	if mf.SpecSHA256 == "" || mf.TarSHA256 == "" {
 		return fmt.Errorf("manifest missing required sha256 digests (specSha256=%q, tarSha256=%q)", mf.SpecSHA256, mf.TarSHA256)
@@ -387,6 +434,63 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 		CheckpointDir: extracted, SpecJSON: specJSON, ImageName: mf.ImageName,
 	})
 	return err
+}
+
+// Restore failures with a reason of their own (restoreFailureReason).
+var (
+	errArchiveBindingMismatch = errors.New("archive is bound to another restore")
+	errArchiveDigestMismatch  = errors.New("archive doesn't match its signed manifest")
+)
+
+// checkBindings compares what a verified manifest binds its archive to with
+// what this restore expects (C10 R2, #244). The job and cluster UIDs must
+// also be set: an archive bound to no job or no cluster is never restored.
+// The trigger is recorded but not compared: the job UID already ties the
+// archive to its job, and a job that creates its trigger again takes its own
+// work order over (#262), which would otherwise refuse its own archive. The
+// error doesn't echo cluster UIDs: it reaches an event on the pod.
+func checkBindings(got, want *Manifest) error {
+	var bad []string
+	check := func(field, g, w string, required, redact bool) {
+		switch {
+		case required && g == "":
+			bad = append(bad, field+" missing")
+		case g != w && redact:
+			bad = append(bad, field+" doesn't match")
+		case g != w:
+			bad = append(bad, fmt.Sprintf("%s %q (want %q)", field, clip(g), clip(w)))
+		}
+	}
+	check("snapshot", got.Snapshot, want.Snapshot, false, false)
+	check("namespace", got.Namespace, want.Namespace, false, false)
+	check("sourcePod", got.SourcePod, want.SourcePod, false, false)
+	check("sourcePodUID", got.SourcePodUID, want.SourcePodUID, false, false)
+	check("container", got.Container, want.Container, false, false)
+	check("bucket", got.Bucket, want.Bucket, false, false)
+	check("path", got.Path, want.Path, false, false)
+	check("jobUID", got.JobUID, want.JobUID, true, false)
+	check("clusterUID", got.ClusterUID, want.ClusterUID, true, true)
+	if len(bad) > 0 {
+		return fmt.Errorf("%w: %s", errArchiveBindingMismatch, strings.Join(bad, ", "))
+	}
+	return nil
+}
+
+// restoreFailureReason is the contract.AnnotationRestoreReason code of a
+// failed restore.
+func restoreFailureReason(err error) string {
+	switch {
+	case errors.Is(err, ErrSigningKeyUnavailable):
+		return contract.RestoreReasonSigningKeyUnavailable
+	case errors.Is(err, ErrSignatureInvalid):
+		return contract.RestoreReasonSignatureInvalid
+	case errors.Is(err, errArchiveBindingMismatch):
+		return contract.RestoreReasonBindingMismatch
+	case errors.Is(err, errArchiveDigestMismatch):
+		return contract.RestoreReasonDigestMismatch
+	default:
+		return contract.RestoreReasonFailed
+	}
 }
 
 // fetch downloads bucket/object to dst, verifying sha256 when expected != "".
@@ -426,7 +530,7 @@ func (r *NodeRestoreReconciler) fetch(ctx context.Context, bucket, object, dst, 
 	}
 	if expectedSHA != "" {
 		if got := hex.EncodeToString(h.Sum(nil)); got != expectedSHA {
-			return nil, fmt.Errorf("%s: sha256 %s != manifest %s (%d bytes)", object, got, expectedSHA, n)
+			return nil, fmt.Errorf("%w: %s: sha256 %s != manifest %s (%d bytes)", errArchiveDigestMismatch, object, got, expectedSHA, n)
 		}
 	}
 	return small.bytes, nil
@@ -505,7 +609,9 @@ func (r *NodeRestoreReconciler) parallelFetch(ctx context.Context, s RangeObject
 			}
 			if n != c.size {
 				cancelFetch()
-				errCh <- fmt.Errorf("fetch range %d-%d: expected %d bytes, got %d", c.offset, c.offset+c.size-1, c.size, n)
+				// The signed manifest's size is authentic: an object of
+				// another size isn't the archive it signed.
+				errCh <- fmt.Errorf("%w: fetch range %d-%d: expected %d bytes, got %d", errArchiveDigestMismatch, c.offset, c.offset+c.size-1, c.size, n)
 				return
 			}
 		}(c)
@@ -528,7 +634,7 @@ func (r *NodeRestoreReconciler) parallelFetch(ctx context.Context, s RangeObject
 		}
 		actualSHA := hex.EncodeToString(h.Sum(nil))
 		if actualSHA != expectedSHA {
-			return nil, fmt.Errorf("%s: sha256 %s != manifest %s (%d bytes)", object, actualSHA, expectedSHA, totalBytes)
+			return nil, fmt.Errorf("%w: %s: sha256 %s != manifest %s (%d bytes)", errArchiveDigestMismatch, object, actualSHA, expectedSHA, totalBytes)
 		}
 	}
 
