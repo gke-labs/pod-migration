@@ -187,6 +187,10 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 				delete(pod.Annotations, engine.CRIURestoreStatusAnnotation)
 				scrubbed = true
 			}
+			if _, ok := pod.Annotations[engine.CRIURestoreReasonAnnotation]; ok {
+				delete(pod.Annotations, engine.CRIURestoreReasonAnnotation)
+				scrubbed = true
+			}
 			for _, ann := range a.restoreAnnotations() {
 				if ann == gkeRestoreAnnotationKey && preserveGKEPSName {
 					continue
@@ -246,6 +250,10 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		}
 		if _, ok := pod.Annotations[engine.CRIURestoreStatusAnnotation]; ok {
 			delete(pod.Annotations, engine.CRIURestoreStatusAnnotation)
+			scrubbed = true
+		}
+		if _, ok := pod.Annotations[engine.CRIURestoreReasonAnnotation]; ok {
+			delete(pod.Annotations, engine.CRIURestoreReasonAnnotation)
 			scrubbed = true
 		}
 	}

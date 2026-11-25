@@ -16,7 +16,7 @@
 #
 # Packages corresponding GPL/LGPL source archives for third-party components
 # bundled in published container images (specifically CRIU and bundled libraries
-# from Debian trixie in build/agent/Dockerfile, plus Ubuntu runtime base utilities).
+# from Debian forky in build/agent/Dockerfile, plus Ubuntu runtime base utilities).
 #
 # Produces:
 #   <output-dir>/criu-gpl-source-<version>.tar.gz
@@ -350,7 +350,7 @@ This archive contains corresponding source code and distribution patches for all
 software licensed under the GNU General Public License (GPL) and GNU Lesser
 General Public License (LGPL) that is redistributed in pod-migration container images.
 
-1. BUNDLED CRIU STAGE (Debian trixie):
+1. BUNDLED CRIU STAGE (Debian forky):
 $(printf ' - %s\n' "${DEBIAN_PACKAGES[@]}")
 
 Primary source archives: http://deb.debian.org/debian/pool/
@@ -416,7 +416,7 @@ printf '%s\n' "${DEBIAN_PACKAGES[@]}" > "${TMP_DIR}/sources/debian/packages.txt"
 ${SUDO_PREFIX} "${DOCKER_BIN}" run --rm \
   -v "${TMP_DIR}/sources/debian:/out" \
   -v "${SCRIPT_DIR}:/scripts:ro" \
-  debian:trixie bash -c "
+  debian:forky bash -c "
     set -eux
     sed -i 's/Types: deb/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
     apt-get update

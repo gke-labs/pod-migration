@@ -263,3 +263,65 @@ func TestGCSStore_ComposeAndGetRange(t *testing.T) {
 		t.Fatalf("expected error mentioning HTTP 200, got: %v", err)
 	}
 }
+
+// Without STORAGE_EMULATOR_HOST the store talks to GCS with a metadata token.
+// With it, the store sends the same JSON API calls to the emulator, without
+// credentials (the kind E2E runs fake-gcs-server).
+func TestNewGCSStore_Emulator(t *testing.T) {
+	t.Setenv(StorageEmulatorHostEnv, "")
+	if s := NewGCSStore(); s.APIBase != "https://storage.googleapis.com/storage/v1" || s.TokenURL == "" {
+		t.Fatalf("default store = %q with token URL %q, want GCS with a metadata token", s.APIBase, s.TokenURL)
+	}
+
+	var mu sync.Mutex
+	objects := map[string][]byte{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			t.Errorf("%s %s sent Authorization %q to the emulator", r.Method, r.URL.Path, auth)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/upload/storage/v1/b/bkt/o":
+			data, _ := io.ReadAll(r.Body)
+			objects[r.URL.Query().Get("name")] = data
+			sum := md5.Sum(data) //nolint:gosec
+			_ = json.NewEncoder(w).Encode(map[string]string{"size": fmt.Sprint(len(data)), "md5Hash": base64.StdEncoding.EncodeToString(sum[:])})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/storage/v1/b/bkt/o/"):
+			data, ok := objects[strings.TrimPrefix(r.URL.Path, "/storage/v1/b/bkt/o/")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(data)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/compose"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"size": "10"})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	// host:port as the client libraries take it, and a URL with a trailing slash.
+	for _, host := range []string{strings.TrimPrefix(srv.URL, "http://"), srv.URL + "/"} {
+		t.Setenv(StorageEmulatorHostEnv, host)
+		store := NewGCSStore()
+		ctx := context.Background()
+		if _, err := VerifiedPut(ctx, store, "bkt", "snaps/ps-x/spec.json", strings.NewReader("hello-spec")); err != nil {
+			t.Fatalf("%s: VerifiedPut: %v", host, err)
+		}
+		rc, err := store.Get(ctx, "bkt", "snaps/ps-x/spec.json")
+		if err != nil {
+			t.Fatalf("%s: Get: %v", host, err)
+		}
+		got, _ := io.ReadAll(rc)
+		rc.Close()
+		if string(got) != "hello-spec" {
+			t.Fatalf("%s: round trip = %q", host, got)
+		}
+		if _, err := store.Compose(ctx, "bkt", "snaps/ps-x/checkpoint.tar", []string{"snaps/ps-x/spec.json"}); err != nil {
+			t.Fatalf("%s: Compose: %v", host, err)
+		}
+	}
+}

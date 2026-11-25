@@ -292,6 +292,13 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 					job.Status.RestoredPodUID != "" &&
 					string(pod.UID) != "" &&
 					string(pod.UID) != job.Status.RestoredPodUID {
+					// The rebound pod is the one about to restore the consumed
+					// snapshot, so report against the job it is attached to when
+					// it has one; strict mode fails only the job a violation names (#198).
+					owner := job.Name
+					if pod.Annotations != nil && pod.Annotations[AnnotationAssignedPMJ] != "" {
+						owner = pod.Annotations[AnnotationAssignedPMJ]
+					}
 					violations = append(violations, Violation{
 						InvariantID:   "I1",
 						InvariantName: "AtMostOnceRestore",
@@ -299,7 +306,7 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 						Message: fmt.Sprintf("PMJ %s/%s already released gate for consumer UID %q on snapshot %q, but pod %s (UID %q) is bound to the same snapshot",
 							job.Namespace, job.Name, job.Status.RestoredPodUID, job.Status.SnapshotRef, pod.Name, pod.UID),
 						Namespace: job.Namespace,
-						PMJName:   job.Name,
+						PMJName:   owner,
 						PodName:   pod.Name,
 					})
 				}

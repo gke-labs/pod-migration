@@ -3,7 +3,8 @@
 This folder houses the E2E verification manifests, setup runbooks, patches, and
 automated driver scripts used to validate the compatibility of 30 common
 containerized applications under GKE's gVisor `onDelete` (Option A) runtime
-eviction.
+eviction. It also holds the CRIU engine's E2E on kind (`kind/up.sh`,
+`run_criu_kind_e2e.sh`), which needs none of the GKE prerequisites below.
 
 --------------------------------------------------------------------------------
 
@@ -19,6 +20,10 @@ eviction.
 *   `demo/`: Interactive tools (e.g., streaming clients, websockets) to
     demonstrate active state survival.
 *   `dashboard/`: Static web UI visualization showing test outcomes.
+*   `kind/up.sh` and `run_criu_kind_e2e.sh`: the CRIU engine E2E on a local
+    kind cluster that CI runs on pull requests (no GKE or cloud credentials
+    needed); see
+    [End-to-end test on kind](../engines/criu/README.md#end-to-end-test-on-kind).
 
 --------------------------------------------------------------------------------
 

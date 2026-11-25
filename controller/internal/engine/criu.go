@@ -58,6 +58,12 @@ const (
 	CRIURestoreStatusRestored   = "restored"
 	CRIURestoreStatusFailed     = "failed"
 
+	// CRIURestoreReasonAnnotation says why the CRIU node agent's restore
+	// failed: a short code (for example ArchiveSignatureInvalid) that the
+	// agent stamps in the same update as CRIURestoreStatusAnnotation=failed
+	// (#244). VerifyRestore puts it in the cold start's evidence.
+	CRIURestoreReasonAnnotation = "pod-migrate.io/psengine-restore-reason"
+
 	criuColdStartReason           = "CRIU snapshot restore failed; replacement fell back to cold start"
 	criuUninjectedColdStartReason = "Replacement pod was not wired by the CRIU restore webhook and started cold"
 )
@@ -334,7 +340,8 @@ func (e *CRIU) InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string, coldSta
 
 // VerifyRestore implements RestoreVerifier using the CRIU node agent's positive
 // outcome annotation (pod-migrate.io/psengine-restore):
-//   - "failed": ColdStart verdict immediately;
+//   - "failed": ColdStart verdict immediately, with the agent's reason
+//     (pod-migrate.io/psengine-restore-reason) in the evidence when it set one;
 //   - missing pod-migrate.io/psengine-injected=true + pod Ready: ColdStart
 //     verdict (replacement was not wired by the CRIU restore webhook, even if
 //     psengine-restore=restored is present);
@@ -346,10 +353,14 @@ func (*CRIU) VerifyRestore(_ context.Context, _ *pmv1alpha1.PodMigrationJob, pod
 		return RestoreVerdict{}, errors.New("verifying the restore of a nil pod")
 	}
 	if strings.TrimSpace(pod.Annotations[CRIURestoreStatusAnnotation]) == CRIURestoreStatusFailed {
+		evidence := fmt.Sprintf("annotation %s=%s", CRIURestoreStatusAnnotation, CRIURestoreStatusFailed)
+		if reason := strings.TrimSpace(pod.Annotations[CRIURestoreReasonAnnotation]); reason != "" {
+			evidence += fmt.Sprintf(" (reason %s)", reason)
+		}
 		return RestoreVerdict{
 			Outcome:  ColdStart,
 			Reason:   criuColdStartReason,
-			Evidence: fmt.Sprintf("annotation %s=%s", CRIURestoreStatusAnnotation, CRIURestoreStatusFailed),
+			Evidence: evidence,
 		}, nil
 	}
 	if pod.Annotations[CRIUInjectedAnnotation] != "true" {

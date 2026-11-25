@@ -104,9 +104,17 @@ func TestDeployManifestRestoreStatusPolicyMatchesTheAgent(t *testing.T) {
 	if len(policy.Spec.MatchConditions) == 0 {
 		t.Fatal("the policy has no matchConditions: it would be evaluated for every pod update")
 	}
+	// matchConditions are ANDed: each must notice a change to either
+	// annotation, or a change to the reason alone would skip the policy.
 	for _, mc := range policy.Spec.MatchConditions {
-		if !strings.Contains(mc.Expression, "'"+contract.AnnotationRestoreStatus+"'") {
-			t.Errorf("matchCondition %s doesn't watch %s:\n%s", mc.Name, contract.AnnotationRestoreStatus, mc.Expression)
+		for _, key := range []string{contract.AnnotationRestoreStatus, contract.AnnotationRestoreReason} {
+			if !strings.Contains(mc.Expression, "'"+key+"'") {
+				t.Errorf("matchCondition %s doesn't watch %s:\n%s", mc.Name, key, mc.Expression)
+			}
 		}
+	}
+	// The reason goes only with failed (#244).
+	if !strings.Contains(validations.String(), "'"+contract.AnnotationRestoreReason+"'") {
+		t.Errorf("the policy's validations don't check %s:\n%s", contract.AnnotationRestoreReason, validations.String())
 	}
 }

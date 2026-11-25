@@ -283,24 +283,47 @@ func (f *fakeRestoreOps) SignalHolder(_ context.Context, in RestoreInputs, sig i
 	return nil
 }
 
+// boundManifest is the manifest of a genuine archive of
+// workOrderSnapshot(snapshot) (whose work order names no trigger), taken for
+// newClient's test-pmj in the test cluster. putArchive fills in the digests.
+func boundManifest(snapshot string) Manifest {
+	return Manifest{
+		Snapshot: snapshot, Namespace: "default",
+		SourcePod: "web-0", SourcePodUID: "deadbeef-0000-1111", Container: "app",
+		Node: "node-a", ImageName: "redis:7",
+		Bucket: "bkt", Path: "snaps",
+		JobUID: testJobUID, ClusterUID: testClusterUID,
+		EngineVersion: engineVersion,
+	}
+}
+
+// putArchive stores an archive where mf says it belongs: spec.json,
+// checkpoint.tar, and mf (with their digests) signed with the test key as
+// manifest.json.
+func putArchive(t *testing.T, store *memStore, mf Manifest, specJSON, tar []byte) {
+	t.Helper()
+	mf.SpecSHA256, _, _ = SHA256Reader(bytes.NewReader(specJSON))
+	mf.TarSHA256, mf.TarBytes, _ = SHA256Reader(bytes.NewReader(tar))
+	payload, err := json.Marshal(mf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := testArchiveSigner.Sign(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := mf.Bucket + "/" + ArchivePrefix(mf.Path, mf.Snapshot) + "/"
+	store.objects[prefix+"manifest.json"] = envelope
+	store.objects[prefix+"spec.json"] = specJSON
+	store.objects[prefix+"checkpoint.tar"] = tar
+}
+
 // readySnapshotWithArchive stages a Ready PodSnapshot + a consistent archive
 // in the store.
 func readySnapshotWithArchive(t *testing.T, store *memStore) *memStore {
 	t.Helper()
-	specJSON := []byte(`{"ociVersion":"1.1.0","annotations":{"io.kubernetes.cri.sandbox-id":"src-sb"}}`)
-	tar := []byte("TARBYTES")
-	specSHA, _, _ := SHA256Reader(strings.NewReader(string(specJSON)))
-	tarSHA, _, _ := SHA256Reader(strings.NewReader(string(tar)))
-	mf := Manifest{
-		Snapshot: "ps-web-0-deadbeef", SourcePod: "web-0", SourcePodUID: "src-uid",
-		Container: "app", Node: "node-a", ImageName: "redis:7",
-		TarSHA256: tarSHA, TarBytes: int64(len(tar)), SpecSHA256: specSHA, EngineVersion: engineVersion,
-	}
-	mfJSON, _ := json.Marshal(mf)
-	prefix := "snaps/ps-web-0-deadbeef/"
-	store.objects["bkt/"+prefix+"manifest.json"] = mfJSON
-	store.objects["bkt/"+prefix+"spec.json"] = specJSON
-	store.objects["bkt/"+prefix+"checkpoint.tar"] = tar
+	putArchive(t, store, boundManifest("ps-web-0-deadbeef"),
+		[]byte(`{"ociVersion":"1.1.0","annotations":{"io.kubernetes.cri.sandbox-id":"src-sb"}}`), []byte("TARBYTES"))
 	return store
 }
 
@@ -329,7 +352,7 @@ func TestNodeRestoreHappyPath(t *testing.T) {
 	c := newClient(t, ps, pod)
 	store := readySnapshotWithArchive(t, newMemStore())
 	ops := &fakeRestoreOps{}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatal(err)
@@ -339,7 +362,7 @@ func TestNodeRestoreHappyPath(t *testing.T) {
 		t.Fatalf("restore calls: %d", len(ops.restored))
 	}
 	in := ops.restored[0]
-	if in.TargetPod != "web-1" || in.SourcePodUID != "src-uid" || in.TargetPodUID != "tgt-uid" ||
+	if in.TargetPod != "web-1" || in.SourcePodUID != "deadbeef-0000-1111" || in.TargetPodUID != "tgt-uid" ||
 		in.ImageName != "redis:7" || in.ContainerName != "app" || filepath.Base(in.CheckpointDir) != "extracted" {
 		t.Fatalf("restore inputs: %+v", in)
 	}
@@ -365,7 +388,7 @@ func TestNodeRestore_TearsDownOnPodDeletion(t *testing.T) {
 
 	c := newClient(t, pod)
 	ops := &fakeRestoreOps{siblingRunning: true}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
 	if err != nil {
@@ -427,7 +450,7 @@ func TestNodeRestore_TearsDownOnPodDeletion_AfterCompleteRestore(t *testing.T) {
 
 	ops := &fakeRestoreOps{siblingRunning: false}
 	c := newClient(t, pod)
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
@@ -454,7 +477,7 @@ func TestNodeRestore_SignalTransientFailureRetries(t *testing.T) {
 
 	c := newClient(t, pod)
 	ops := &fakeRestoreOps{siblingRunning: true, signalErr: errors.New("transient signal error")}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	// 1st reconcile: Signal fails
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
@@ -505,7 +528,7 @@ func TestNodeRestore_DeadlinePassedTearsDownEvenIfSiblingRunning(t *testing.T) {
 
 	c := newClient(t, pod)
 	ops := &fakeRestoreOps{siblingRunning: true}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
 	if err != nil {
@@ -529,7 +552,7 @@ func TestNodeRestore_NilOrZeroGracePeriodTearsDownImmediately(t *testing.T) {
 
 	c := newClient(t, pod)
 	ops := &fakeRestoreOps{siblingRunning: true}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
 	if err != nil {
@@ -552,7 +575,7 @@ func TestNodeRestore_CleanupFailureRetries(t *testing.T) {
 
 	c := newClient(t, pod)
 	ops := &fakeRestoreOps{failCleanup: true, siblingRunning: false}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}})
 	if err == nil {
@@ -570,7 +593,7 @@ func TestNodeRestore_LivePodDoesNotTriggerCleanup(t *testing.T) {
 
 	c := newClient(t, pod)
 	ops := &fakeRestoreOps{}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, WorkDir: t.TempDir()}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
@@ -586,7 +609,7 @@ func TestNodeRestoreFailureStampsFailed(t *testing.T) {
 	pod := replacementPodOnNode("ps-web-0-deadbeef")
 	c := newClient(t, ps, pod)
 	rec := record.NewFakeRecorder(10)
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{failIt: true},
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{failIt: true},
 		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
@@ -616,7 +639,7 @@ func TestNodeRestore_CancelledContextDoesNotEmitRestoreFailed(t *testing.T) {
 	pod := replacementPodOnNode("ps-web-0-deadbeef")
 	c := newClient(t, ps, pod)
 	rec := record.NewFakeRecorder(10)
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{failIt: true},
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{failIt: true},
 		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -649,7 +672,7 @@ func TestNodeRestore_RefusesHostNetworkPod(t *testing.T) {
 	pod.Spec.HostNetwork = true
 	c := newClient(t, ps, pod)
 	rec := record.NewFakeRecorder(10)
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{},
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: &fakeRestoreOps{},
 		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir(), Recorder: rec}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
@@ -675,7 +698,7 @@ func TestNodeRestoreRefusesUnreadySnapshot(t *testing.T) {
 	pod := replacementPodOnNode("ps-web-0-deadbeef")
 	c := newClient(t, ps, pod)
 	ops := &fakeRestoreOps{}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops,
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops,
 		Store: readySnapshotWithArchive(t, newMemStore()), WorkDir: t.TempDir()}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
@@ -699,7 +722,7 @@ func TestNodeRestoreCorruptTarDetected(t *testing.T) {
 	store := readySnapshotWithArchive(t, newMemStore())
 	store.objects["bkt/snaps/ps-web-0-deadbeef/checkpoint.tar"] = []byte("CORRUPTED")
 	ops := &fakeRestoreOps{}
-	r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatal(err)
@@ -832,7 +855,7 @@ func TestNodeRestoreRefusesUnassignedOrMismatchedPMJ(t *testing.T) {
 				WithObjects(ps, pod, pmj).
 				Build()
 			ops := &fakeRestoreOps{}
-			r := &NodeRestoreReconciler{
+			r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID,
 				Client:   c,
 				NodeName: "node-a",
 				Ops:      ops,
@@ -878,7 +901,7 @@ func TestNodeRestoreAcceptsSucceededPhaseWhenBoundToThisPod(t *testing.T) {
 	}
 
 	ops := &fakeRestoreOps{}
-	r := &NodeRestoreReconciler{
+	r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID,
 		Client:   c,
 		NodeName: "node-a",
 		Ops:      ops,
@@ -1044,6 +1067,20 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	if !hasRule(agentRole, "", "events", "create", "patch") {
 		t.Errorf("pod-migrate-psengine-agent ClusterRole missing create/patch on core/events")
 	}
+	// The cluster UID that archive manifests bind (#244): get on the
+	// kube-system Namespace only, never on every namespace.
+	var namespaceRules []rbacv1.PolicyRule
+	for _, rule := range agentRole.Rules {
+		for _, res := range rule.Resources {
+			if res == "namespaces" {
+				namespaceRules = append(namespaceRules, rule)
+			}
+		}
+	}
+	if len(namespaceRules) != 1 || strings.Join(namespaceRules[0].APIGroups, ",") != "" ||
+		strings.Join(namespaceRules[0].Verbs, ",") != "get" || strings.Join(namespaceRules[0].ResourceNames, ",") != "kube-system" {
+		t.Errorf("pod-migrate-psengine-agent ClusterRole must grant exactly get on core/namespaces named kube-system, got %+v", namespaceRules)
+	}
 	if !hasRule(controllerRole, contract.GVKStorageConfig.Group, "podsnapshotstorageconfigs", "get", "list", "watch") {
 		t.Errorf("pod-migrate-psengine-controller ClusterRole missing get/list/watch on %s/podsnapshotstorageconfigs", contract.GVKStorageConfig.Group)
 	}
@@ -1062,6 +1099,9 @@ func TestDeployManifestRBACMatchesContractGVKs(t *testing.T) {
 	wantMarker := "+kubebuilder:rbac:groups=" + contract.GVKPodMigrationJob.Group + ",resources=podmigrationjobs"
 	if !strings.Contains(string(rnBytes), wantMarker) {
 		t.Fatalf("restore_node.go missing %q marker", wantMarker)
+	}
+	if want := `+kubebuilder:rbac:groups="",resources=namespaces,verbs=get,resourceNames=kube-system`; !strings.Contains(string(rnBytes), want) {
+		t.Fatalf("restore_node.go missing %q marker", want)
 	}
 
 	rwBytes, err := os.ReadFile("restore_webhook.go")
@@ -1109,7 +1149,7 @@ func TestNodeRestore_RejectsOversizedMetadata(t *testing.T) {
 		store.objects["bkt/"+prefix+"checkpoint.tar"] = []byte("TARBYTES")
 
 		ops := &fakeRestoreOps{}
-		r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
+		r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
 
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 			t.Fatal(err)
@@ -1141,23 +1181,11 @@ func TestNodeRestore_RejectsOversizedMetadata(t *testing.T) {
 		c := newClient(t, ps, pod)
 
 		store := &trackingStore{memStore: newMemStore()}
-		oversizedSpec := make([]byte, (4<<20)+1)
-		specSHA, _, _ := SHA256Reader(bytes.NewReader(oversizedSpec))
-		tar := []byte("TARBYTES")
-		tarSHA, _, _ := SHA256Reader(bytes.NewReader(tar))
-
-		mf := Manifest{
-			Snapshot: "ps-web-0-deadbeef", SourcePod: "web-0", SourcePodUID: "src-uid",
-			Container: "app", Node: "node-a", ImageName: "redis:7",
-			TarSHA256: tarSHA, TarBytes: int64(len(tar)), SpecSHA256: specSHA, EngineVersion: engineVersion,
-		}
-		mfJSON, _ := json.Marshal(mf)
-		store.objects["bkt/"+prefix+"manifest.json"] = mfJSON
-		store.objects["bkt/"+prefix+"spec.json"] = oversizedSpec
-		store.objects["bkt/"+prefix+"checkpoint.tar"] = tar
+		// A genuine, signed archive whose spec.json is too big.
+		putArchive(t, store.memStore, boundManifest("ps-web-0-deadbeef"), make([]byte, (4<<20)+1), []byte("TARBYTES"))
 
 		ops := &fakeRestoreOps{}
-		r := &NodeRestoreReconciler{Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
+		r := &NodeRestoreReconciler{Keyring: testArchiveKeyring, ClusterUID: testClusterUID, Client: c, NodeName: "node-a", Ops: ops, Store: store, WorkDir: t.TempDir()}
 
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 			t.Fatal(err)
@@ -1172,6 +1200,10 @@ func TestNodeRestore_RejectsOversizedMetadata(t *testing.T) {
 			t.Fatalf("restore status: %q, want %q", got.Annotations[contract.AnnotationRestoreStatus], contract.RestoreStatusFailed)
 		}
 
+		// It got past the manifest's signature and bindings to spec.json.
+		if !strings.Contains(strings.Join(store.gets, ","), "spec.json") {
+			t.Fatalf("spec.json was never fetched (fetched %v): the size limit wasn't what refused it", store.gets)
+		}
 		for _, fetched := range store.gets {
 			if strings.Contains(fetched, "checkpoint.tar") {
 				t.Fatalf("checkpoint.tar was fetched (%s); oversized spec.json must abort before fetching tar", fetched)
