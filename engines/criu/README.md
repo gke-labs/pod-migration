@@ -119,7 +119,8 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      `pod-migration.gke.io/engine: criu` so other engines' pods are never touched).
 2. **`cmd/agent` (privileged node DaemonSet):**
    - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 4.2.1
-     bundle (older CRIU fails dumps on Linux >= 6.16)
+     bundle (older CRIU fails dumps on Linux >= 6.16; the image builds it from
+     Debian forky pinned to a snapshot.debian.org timestamp)
      into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
      writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
      `nsenter`, verifies containerd readiness (inspecting containerd's process
