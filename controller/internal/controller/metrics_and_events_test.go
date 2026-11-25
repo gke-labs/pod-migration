@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1384,7 +1385,18 @@ func TestMetrics_ApplicationDowntime_MarkSucceededWithoutRestoreTimeoutNoReplace
 
 type failStatusPatchClient struct {
 	client.Client
-	failPatch bool
+	failPatch         bool
+	failPatchConflict bool
+	failGetPod        error
+}
+
+func (c *failStatusPatchClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if c.failGetPod != nil {
+		if _, ok := obj.(*corev1.Pod); ok {
+			return c.failGetPod
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
 }
 
 func (c *failStatusPatchClient) Status() client.SubResourceWriter {
@@ -1397,6 +1409,9 @@ type failStatusPatchWriter struct {
 }
 
 func (w *failStatusPatchWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if w.parent.failPatchConflict {
+		return apierrors.NewConflict(schema.GroupResource{Group: "podmigration.gke.io", Resource: "podmigrationjobs"}, obj.GetName(), errors.New("simulated optimistic lock conflict"))
+	}
 	if w.parent.failPatch {
 		return errors.New("simulated status patch failure")
 	}
@@ -1738,5 +1753,464 @@ func TestMetrics_ApplicationDowntime_FenceSourceSetsTrafficStoppedTime(t *testin
 	if !updated.Status.TrafficStoppedTime.Equal(&fencedCond.LastTransitionTime) {
 		t.Errorf("expected TrafficStoppedTime %v to equal ConditionSourceFenced transition time %v",
 			updated.Status.TrafficStoppedTime, fencedCond.LastTransitionTime)
+	}
+}
+
+func TestMetrics_ApplicationDowntime_ColdStartReconcileLifecycle(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	now := time.Now().Truncate(time.Second)
+	compTime := metav1.NewTime(now)
+	trafficStop := metav1.NewTime(now.Add(-10 * time.Second))
+	readyTime := metav1.NewTime(now.Add(-2 * time.Second))
+
+	job := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "downtime-cold-reconcile",
+			Namespace: "default",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:              pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime:     &compTime,
+			TrafficStoppedTime: &trafficStop,
+			RestoredPodName:    "replacement-cold-pod",
+			RestoredPodUID:     "cold-uid-123",
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Restored",
+					Status:             metav1.ConditionFalse,
+					Reason:             ReasonFallbackToColdStart,
+					LastTransitionTime: compTime,
+				},
+				{
+					Type:               ConditionSnapshotReleased,
+					Status:             metav1.ConditionTrue,
+					Reason:             ReasonSnapshotDeleted,
+					LastTransitionTime: compTime,
+				},
+			},
+		},
+	}
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "replacement-cold-pod",
+			Namespace: "default",
+			UID:       types.UID("cold-uid-123"),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionFalse,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(job, replacementPod).
+		WithStatusSubresource(job).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	hist := metrics.ApplicationDowntimeSeconds.WithLabelValues("gke-pod-snapshots", metrics.OutcomeColdStart)
+	beforeCount := getHistogramSampleCount(hist)
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job.Name}}
+
+	// Pass 1: replacement pod is not Ready -> Reconcile folds 5s coldStartRecheck into RequeueAfter
+	res1, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("pass 1 Reconcile failed: %v", err)
+	}
+	if res1.RequeueAfter != 5*time.Second {
+		t.Errorf("pass 1: expected RequeueAfter 5s, got %v", res1.RequeueAfter)
+	}
+	var jobAfterPass1 pmv1alpha1.PodMigrationJob
+	if err := fakeClient.Get(context.Background(), req.NamespacedName, &jobAfterPass1); err != nil {
+		t.Fatalf("fetching job after pass 1: %v", err)
+	}
+	if jobAfterPass1.Status.ReplacementReadyTime != nil {
+		t.Errorf("pass 1: expected ReplacementReadyTime to remain nil, got %v", jobAfterPass1.Status.ReplacementReadyTime)
+	}
+	if got := getHistogramSampleCount(hist); got != beforeCount {
+		t.Errorf("pass 1: expected 0 histogram samples, got %d", got)
+	}
+
+	// Transition replacement pod to Ready
+	replacementPod.Status.Conditions = []corev1.PodCondition{
+		{
+			Type:               corev1.PodReady,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: readyTime,
+		},
+	}
+	if err := fakeClient.Status().Update(context.Background(), replacementPod); err != nil {
+		t.Fatalf("updating pod status to Ready: %v", err)
+	}
+
+	// Pass 2: replacement pod is Ready -> backfill patches status and observes 1 sample
+	res2, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("pass 2 Reconcile failed: %v", err)
+	}
+	expectedTTL := 30*time.Minute - time.Since(compTime.Time)
+	if res2.RequeueAfter < expectedTTL-5*time.Second || res2.RequeueAfter > expectedTTL+5*time.Second {
+		t.Errorf("pass 2: expected RequeueAfter close to TTL %v, got %v", expectedTTL, res2.RequeueAfter)
+	}
+	var jobAfterPass2 pmv1alpha1.PodMigrationJob
+	if err := fakeClient.Get(context.Background(), req.NamespacedName, &jobAfterPass2); err != nil {
+		t.Fatalf("fetching job after pass 2: %v", err)
+	}
+	if jobAfterPass2.Status.ReplacementReadyTime == nil || !jobAfterPass2.Status.ReplacementReadyTime.Equal(&readyTime) {
+		t.Errorf("pass 2: expected ReplacementReadyTime %v, got %v", readyTime, jobAfterPass2.Status.ReplacementReadyTime)
+	}
+	if jobAfterPass2.Status.ApplicationPauseDuration == nil || jobAfterPass2.Status.ApplicationPauseDuration.Duration != 8*time.Second {
+		t.Errorf("pass 2: expected ApplicationPauseDuration 8s, got %v", jobAfterPass2.Status.ApplicationPauseDuration)
+	}
+	if got := getHistogramSampleCount(hist); got != beforeCount+1 {
+		t.Errorf("pass 2: expected exactly 1 histogram sample, got %d (before: %d)", got, beforeCount)
+	}
+
+	// Pass 3: already backfilled -> 0 new samples and normal TTL requeue
+	res3, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("pass 3 Reconcile failed: %v", err)
+	}
+	expectedTTL = 30*time.Minute - time.Since(compTime.Time)
+	if res3.RequeueAfter < expectedTTL-5*time.Second || res3.RequeueAfter > expectedTTL+5*time.Second {
+		t.Errorf("pass 3: expected RequeueAfter close to TTL %v, got %v", expectedTTL, res3.RequeueAfter)
+	}
+	if got := getHistogramSampleCount(hist); got != beforeCount+1 {
+		t.Errorf("pass 3: expected 0 additional samples, got %d", got)
+	}
+}
+
+func TestMetrics_ApplicationDowntime_ColdStartBackfill_UIDMismatch(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	now := time.Now().Truncate(time.Second)
+	compTime := metav1.NewTime(now)
+	trafficStop := metav1.NewTime(now.Add(-10 * time.Second))
+	readyTime := metav1.NewTime(now.Add(-2 * time.Second))
+
+	job := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "downtime-cold-uid-mismatch",
+			Namespace: "default",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:              pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime:     &compTime,
+			TrafficStoppedTime: &trafficStop,
+			RestoredPodName:    "replacement-cold-pod",
+			RestoredPodUID:     "expected-uid",
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Restored",
+					Status:             metav1.ConditionFalse,
+					Reason:             ReasonFallbackToColdStart,
+					LastTransitionTime: compTime,
+				},
+				{
+					Type:               ConditionSnapshotReleased,
+					Status:             metav1.ConditionTrue,
+					Reason:             ReasonSnapshotDeleted,
+					LastTransitionTime: compTime,
+				},
+			},
+		},
+	}
+
+	// Pod with different UID
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "replacement-cold-pod",
+			Namespace: "default",
+			UID:       types.UID("different-uid"),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:               corev1.PodReady,
+					Status:             corev1.ConditionTrue,
+					LastTransitionTime: readyTime,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(job, replacementPod).
+		WithStatusSubresource(job).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	hist := metrics.ApplicationDowntimeSeconds.WithLabelValues("gke-pod-snapshots", metrics.OutcomeColdStart)
+	beforeCount := getHistogramSampleCount(hist)
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job.Name}}
+	res, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter == 5*time.Second {
+		t.Errorf("UID mismatch should not request 5s recheck, got %v", res.RequeueAfter)
+	}
+	if got := getHistogramSampleCount(hist); got != beforeCount {
+		t.Errorf("UID mismatch should not emit histogram samples, got %d", got)
+	}
+
+	var updated pmv1alpha1.PodMigrationJob
+	if err := fakeClient.Get(context.Background(), req.NamespacedName, &updated); err != nil {
+		t.Fatalf("fetching job: %v", err)
+	}
+	if updated.Status.ReplacementReadyTime != nil {
+		t.Errorf("expected ReplacementReadyTime nil on UID mismatch, got %v", updated.Status.ReplacementReadyTime)
+	}
+}
+
+func TestMetrics_ApplicationDowntime_ColdStartBackfill_ExpiredTimeout(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	now := time.Now().Truncate(time.Second)
+	// Completed 6 minutes ago (exceeding 5m restoreTimeout)
+	compTime := metav1.NewTime(now.Add(-6 * time.Minute))
+	trafficStop := metav1.NewTime(now.Add(-7 * time.Minute))
+	readyTime := metav1.NewTime(now.Add(-10 * time.Second))
+
+	job := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "downtime-cold-expired",
+			Namespace: "default",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:              pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime:     &compTime,
+			TrafficStoppedTime: &trafficStop,
+			RestoredPodName:    "replacement-cold-pod",
+			RestoredPodUID:     "cold-uid",
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Restored",
+					Status:             metav1.ConditionFalse,
+					Reason:             ReasonFallbackToColdStart,
+					LastTransitionTime: compTime,
+				},
+				{
+					Type:               ConditionSnapshotReleased,
+					Status:             metav1.ConditionTrue,
+					Reason:             ReasonSnapshotDeleted,
+					LastTransitionTime: compTime,
+				},
+			},
+		},
+	}
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "replacement-cold-pod",
+			Namespace: "default",
+			UID:       types.UID("cold-uid"),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:               corev1.PodReady,
+					Status:             corev1.ConditionTrue,
+					LastTransitionTime: readyTime,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(job, replacementPod).
+		WithStatusSubresource(job).
+		Build()
+
+	r := &PodMigrationJobReconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	hist := metrics.ApplicationDowntimeSeconds.WithLabelValues("gke-pod-snapshots", metrics.OutcomeColdStart)
+	beforeCount := getHistogramSampleCount(hist)
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job.Name}}
+	res, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.RequeueAfter == 5*time.Second {
+		t.Errorf("expired job (>5m) should not request 5s recheck, got %v", res.RequeueAfter)
+	}
+	if got := getHistogramSampleCount(hist); got != beforeCount {
+		t.Errorf("expired job should not emit histogram samples, got %d", got)
+	}
+
+	var updated pmv1alpha1.PodMigrationJob
+	if err := fakeClient.Get(context.Background(), req.NamespacedName, &updated); err != nil {
+		t.Fatalf("fetching job: %v", err)
+	}
+	if updated.Status.ReplacementReadyTime != nil {
+		t.Errorf("expected ReplacementReadyTime nil on expired job, got %v", updated.Status.ReplacementReadyTime)
+	}
+}
+
+func TestMetrics_ApplicationDowntime_ColdStartBackfill_TransientRetryTiming(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	now := time.Now().Truncate(time.Second)
+	compTime := metav1.NewTime(now)
+	trafficStop := metav1.NewTime(now.Add(-10 * time.Second))
+	readyTime := metav1.NewTime(now.Add(-2 * time.Second))
+
+	job := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "downtime-cold-transient-retry",
+			Namespace: "default",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase:              pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore,
+			CompletionTime:     &compTime,
+			TrafficStoppedTime: &trafficStop,
+			RestoredPodName:    "replacement-cold-pod",
+			RestoredPodUID:     "cold-uid",
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Restored",
+					Status:             metav1.ConditionFalse,
+					Reason:             ReasonFallbackToColdStart,
+					LastTransitionTime: compTime,
+				},
+				{
+					Type:               ConditionSnapshotReleased,
+					Status:             metav1.ConditionTrue,
+					Reason:             ReasonSnapshotDeleted,
+					LastTransitionTime: compTime,
+				},
+			},
+		},
+	}
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "replacement-cold-pod",
+			Namespace: "default",
+			UID:       types.UID("cold-uid"),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:               corev1.PodReady,
+					Status:             corev1.ConditionTrue,
+					LastTransitionTime: readyTime,
+				},
+			},
+		},
+	}
+
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(job, replacementPod).
+		WithStatusSubresource(job).
+		Build()
+
+	wrappingClient := &failStatusPatchClient{Client: baseClient, failPatch: true}
+	r := &PodMigrationJobReconciler{
+		Client:   wrappingClient,
+		Scheme:   scheme,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	// On transient patch failure, backfillColdStartDowntime returns (5s, err) and restores *job = *orig
+	recheck, err := r.backfillColdStartDowntime(context.Background(), job)
+	if err == nil {
+		t.Fatalf("expected error on simulated patch failure")
+	}
+	if recheck != 5*time.Second {
+		t.Errorf("expected 5s recheck on transient failure, got %v", recheck)
+	}
+	if job.Status.ReplacementReadyTime != nil {
+		t.Errorf("expected *job = *orig restoration on failed patch, but ReplacementReadyTime was populated")
+	}
+
+	// Drive transient patch failure through Reconcile: turns (5s, err) into a 5s requeue
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: job.Namespace, Name: job.Name}}
+	resPatch, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile returned unexpected error on handled patch failure: %v", err)
+	}
+	if resPatch.RequeueAfter != 5*time.Second {
+		t.Errorf("expected Reconcile to requeue after 5s on transient patch error, got %v", resPatch.RequeueAfter)
+	}
+
+	// Drive transient pod Get failure through Reconcile: pins Get-error 5s return path
+	wrappingClient.failPatch = false
+	wrappingClient.failGetPod = errors.New("transient apiserver connection reset")
+	resGet, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile returned unexpected error on handled Get error: %v", err)
+	}
+	if resGet.RequeueAfter != 5*time.Second {
+		t.Errorf("expected Reconcile to requeue after 5s on transient Get error, got %v", resGet.RequeueAfter)
+	}
+
+	// Drive status patch conflict through Reconcile: pins conflict 1s return path
+	wrappingClient.failGetPod = nil
+	wrappingClient.failPatchConflict = true
+	resConflict, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile returned unexpected error on handled conflict: %v", err)
+	}
+	if resConflict.RequeueAfter != 1*time.Second {
+		t.Errorf("expected Reconcile to requeue after 1s on patch conflict, got %v", resConflict.RequeueAfter)
+	}
+
+	// Now transient failures resolved: backfill succeeds and Reconcile falls back to TTL GC
+	wrappingClient.failPatchConflict = false
+	resSuccess, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile failed after transient errors cleared: %v", err)
+	}
+	expectedTTL := 30*time.Minute - time.Since(compTime.Time)
+	if resSuccess.RequeueAfter < expectedTTL-5*time.Second || resSuccess.RequeueAfter > expectedTTL+5*time.Second {
+		t.Errorf("expected TTL GC requeue after successful backfill, got %v", resSuccess.RequeueAfter)
+	}
+
+	var updatedJob pmv1alpha1.PodMigrationJob
+	if err := baseClient.Get(context.Background(), req.NamespacedName, &updatedJob); err != nil {
+		t.Fatalf("fetching job: %v", err)
+	}
+	if updatedJob.Status.ReplacementReadyTime == nil || !updatedJob.Status.ReplacementReadyTime.Equal(&readyTime) {
+		t.Errorf("expected ReplacementReadyTime %v, got %v", readyTime, updatedJob.Status.ReplacementReadyTime)
 	}
 }
