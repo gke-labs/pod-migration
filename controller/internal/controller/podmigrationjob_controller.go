@@ -2327,7 +2327,7 @@ func (r *PodMigrationJobReconciler) backfillColdStartDowntime(
 		if apierrors.IsNotFound(err) {
 			return 0, nil
 		}
-		return 0, err
+		return 5 * time.Second, err
 	}
 	if job.Status.RestoredPodUID != "" && string(pod.UID) != job.Status.RestoredPodUID {
 		return 0, nil
@@ -2351,7 +2351,11 @@ func (r *PodMigrationJobReconciler) backfillColdStartDowntime(
 	job.Status.ApplicationPauseDuration = &metav1.Duration{Duration: pauseDuration}
 
 	if err := r.patchStatus(ctx, job, orig, client.MergeFromWithOptimisticLock{}); err != nil {
-		return 0, err
+		*job = *orig
+		if apierrors.IsConflict(err) {
+			return time.Second, nil
+		}
+		return 5 * time.Second, err
 	}
 	metrics.RecordApplicationDowntime(r.jobEngine(job).Name(), metrics.OutcomeColdStart, pauseDuration.Seconds())
 	return 0, nil
