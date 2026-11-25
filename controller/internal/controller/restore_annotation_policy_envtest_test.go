@@ -547,6 +547,20 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 			wantAllowed(t, patch(t, tenant, pod, set("example.com/owner", "team-a")), "a tenant adding another annotation")
 		})
 
+		// The incompatible-node reason (#294) is a new value: the policy
+		// lists none, so the agent records it as any other, and it's as
+		// protected afterwards.
+		t.Run("the node agent records the incompatible-node reason without a policy change", func(t *testing.T) {
+			pod := injected(t, "reason-incompatible", nil)
+			wantAllowed(t, update(t, agent, pod, failWith(engine.CRIURestoreReasonIncompatibleNode)), "the agent recording failed with "+engine.CRIURestoreReasonIncompatibleNode)
+			if v, _ := annotation(t, pod, reason); v != engine.CRIURestoreReasonIncompatibleNode {
+				t.Fatalf("%s = %q, want %s", reason, v, engine.CRIURestoreReasonIncompatibleNode)
+			}
+			wantDenied(t, patch(t, tenant, pod, set(reason, "RestoreFailed")), restoreStatusPolicyName, "a tenant changing the reason")
+			fresh := newPod(t, ns, "reason-incompatible-forged", optedIn, nil)
+			wantDenied(t, patch(t, tenant, fresh, failWith(engine.CRIURestoreReasonIncompatibleNode)), restoreStatusPolicyName, "a tenant forging the reason")
+		})
+
 		t.Run("nobody else records a reason", func(t *testing.T) {
 			fresh := newPod(t, ns, "reason-others", optedIn, nil)
 			failed := newPod(t, ns, "reason-others-failed", optedIn, map[string]string{status: engine.CRIURestoreStatusFailed})

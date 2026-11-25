@@ -748,7 +748,20 @@ agent's log does. The reasons:
 | `ArchiveSignatureInvalid` | `manifest.json` is malformed, unsigned (for example written by an agent from before archive signing), signed with a key the agent doesn't hold, or its signature doesn't match. |
 | `ArchiveBindingMismatch` | A genuine archive, bound to another snapshot, pod, location, job or cluster. |
 | `ArchiveDigestMismatch` | `spec.json` or `checkpoint.tar` doesn't match the digests in the signed manifest. |
+| `RestoreIncompatibleNode` | A genuine archive, refused because this node's CPU model (`model name` in `/proc/cpuinfo`) isn't the one recorded in its manifest (#294). The PodMigrationJob concludes with this reason instead of `FallbackToColdStart`; see below. |
 | `RestoreFailed` | Any other failure. |
+
+For `RestoreIncompatibleNode` only, the PodMigrationJob's `Restored`
+condition takes the reason too, and the controller records
+`RestoreIncompatibleNode` Warning events on the job and on the pod whose
+message starts with
+`engine=criu fact=cpu-model node=<node> sourceNode=<node>: `, for
+controllers that place workloads to read (see [Signals for external
+controllers](../../README.md#signals-for-external-controllers)). The agent's
+own `RestoreFailed` event on the pod names both CPU models. The replacement
+still starts cold, as for any refusal. The admission policy on
+`pod-migrate.io/psengine-restore-reason` doesn't list values, so this reason
+needed no policy change, and is as protected as the others.
 
 **Upgrading.** An agent from before archive signing can't read a signed
 manifest, and an agent with it refuses an unsigned one, so a migration whose
@@ -942,6 +955,15 @@ source versions isn't placed there; it can't restore a CRIU checkpoint
 anyway. The engine's readiness on the target (`pod-migrate.io/criu-ready`) isn't
 a constraint yet: a node whose agent reports `criu-ready=false` still meets
 them, and its restore falls back to a cold start as before.
+
+**When no compatible node takes the replacement.** The job concludes
+`PlacementTimeout`, as described in the main README, and its condition and
+Warning events start with `engine=criu requirements=<keys>: `, naming the
+label keys above that the nodes that could take the replacement fail: for
+example `criu.pod-migrate.io/kernel-version-code` for a node with an older
+kernel, or `missing-cpu.criu.pod-migrate.io/avx512f` for one without AVX-512.
+More than 8 flag keys are listed as `missing-cpu.criu.pod-migrate.io/*`
+(#294).
 
 **Limits.** Node labels only exist once the agent has published them, so:
 

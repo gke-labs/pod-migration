@@ -271,8 +271,15 @@ func TestConformanceCPUFamilyGuard(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "web-1"}}); err != nil {
 		t.Fatal(err)
 	}
-	if ev := <-rec.Events; !strings.Contains(ev, "cpu family mismatch") {
+	ev := <-rec.Events
+	if !strings.Contains(ev, "cpu family mismatch") {
 		t.Fatalf("event = %q, want the cpu family refusal", ev)
+	}
+	// The event names both CPU models and the reason code (#294).
+	for _, want := range []string{"Intel C3 Sapphire Rapids", "AMD EPYC", contract.RestoreReasonIncompatibleNode} {
+		if !strings.Contains(ev, want) {
+			t.Errorf("event = %q, want it to name %q", ev, want)
+		}
 	}
 	if len(rops.restored) != 0 {
 		t.Fatal("cross-family restore must be refused")
@@ -282,9 +289,10 @@ func TestConformanceCPUFamilyGuard(t *testing.T) {
 	if got.Annotations[contract.AnnotationRestoreStatus] != contract.RestoreStatusFailed {
 		t.Fatal("cross-family refusal must stamp failed (cold-start fall-through)")
 	}
-	// The archive verified: the CPU family guard refused it, not its provenance.
-	if reason := got.Annotations[contract.AnnotationRestoreReason]; reason != contract.RestoreReasonFailed {
-		t.Fatalf("%s = %q, want %s", contract.AnnotationRestoreReason, reason, contract.RestoreReasonFailed)
+	// The archive verified: the CPU family guard refused it, not its
+	// provenance, and the reason says the node is incompatible (#294).
+	if reason := got.Annotations[contract.AnnotationRestoreReason]; reason != contract.RestoreReasonIncompatibleNode {
+		t.Fatalf("%s = %q, want %s", contract.AnnotationRestoreReason, reason, contract.RestoreReasonIncompatibleNode)
 	}
 }
 

@@ -2296,7 +2296,8 @@ func (r *PodMigrationJobReconciler) markSucceededWithoutRestore(ctx context.Cont
 }
 
 // backfillColdStartDowntime checks if a SucceededWithoutRestore job that concluded
-// with ReasonFallbackToColdStart still needs its ReplacementReadyTime and ApplicationPauseDuration
+// with ReasonFallbackToColdStart or ReasonRestoreIncompatibleNode (a cold start
+// too) still needs its ReplacementReadyTime and ApplicationPauseDuration
 // populated. If the replacement pod (RestoredPodName) is now Ready, it patches status and records
 // the ColdStart downtime histogram sample. If not ready yet and within restoreTimeout since
 // completion, it returns a 5s requeue duration.
@@ -2311,7 +2312,7 @@ func (r *PodMigrationJobReconciler) backfillColdStartDowntime(
 		return 0, nil
 	}
 	cond := meta.FindStatusCondition(job.Status.Conditions, "Restored")
-	if cond == nil || cond.Reason != ReasonFallbackToColdStart {
+	if cond == nil || (cond.Reason != ReasonFallbackToColdStart && cond.Reason != ReasonRestoreIncompatibleNode) {
 		return 0, nil
 	}
 	if job.Status.CompletionTime == nil || time.Since(job.Status.CompletionTime.Time) > restoreTimeout {

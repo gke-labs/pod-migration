@@ -243,6 +243,14 @@ type RestoreVerdict struct {
 	// from the absence of failure signals, and never makes the job's restore
 	// RestoreVerified (C6).
 	Confirmed bool
+	// IncompatibleFact, on a ColdStart verdict, says that the engine refused
+	// the restore because the replacement's node isn't compatible with the
+	// checkpoint's source node, and names the node fact that didn't match,
+	// as a short token without spaces (for CRIU, cpu-model). The controller
+	// then concludes the job with reason RestoreIncompatibleNode instead of
+	// FallbackToColdStart, and records Warning events that name the engine
+	// and the fact (#294). Empty for any other cold start.
+	IncompatibleFact string
 }
 
 // RestoreVerifier is an optional capability (C6): the engine reports the

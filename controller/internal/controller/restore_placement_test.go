@@ -1673,7 +1673,7 @@ func newPlacementFlowFor(t *testing.T, pod *corev1.Pod, job *pmv1alpha1.PodMigra
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(withReadySnapshots(append([]client.Object{pod, job}, nodes...))...).
+		WithObjects(withReadySnapshots(append([]client.Object{pod, job}, nodes...), engine.DefaultAPIGroup, engine.CRIUAPIGroup)...).
 		Build()
 	recorder := record.NewFakeRecorder(100)
 	checks := invariants.NewEngine(invariants.ModeObserve, recorder)

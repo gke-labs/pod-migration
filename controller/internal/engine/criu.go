@@ -63,6 +63,16 @@ const (
 	// agent stamps in the same update as CRIURestoreStatusAnnotation=failed
 	// (#244). VerifyRestore puts it in the cold start's evidence.
 	CRIURestoreReasonAnnotation = "pod-migrate.io/psengine-restore-reason"
+	// CRIURestoreReasonIncompatibleNode is the CRIURestoreReasonAnnotation
+	// code with which the node agent refuses a verified archive because the
+	// node's CPU model isn't the one it was checkpointed on (#294). It
+	// mirrors contract.RestoreReasonIncompatibleNode in engines/criu.
+	CRIURestoreReasonIncompatibleNode = "RestoreIncompatibleNode"
+	// CRIUIncompatibleFactCPUModel is the fact that VerifyRestore names
+	// (RestoreVerdict.IncompatibleFact) for CRIURestoreReasonIncompatibleNode:
+	// the node agent compares the CPU model ("model name" in /proc/cpuinfo)
+	// recorded in the archive's manifest with its node's.
+	CRIUIncompatibleFactCPUModel = "cpu-model"
 
 	criuColdStartReason           = "CRIU snapshot restore failed; replacement fell back to cold start"
 	criuUninjectedColdStartReason = "Replacement pod was not wired by the CRIU restore webhook and started cold"
@@ -342,6 +352,8 @@ func (e *CRIU) InspectRestoreOrder(pod *corev1.Pod) (snapshotRef string, coldSta
 // outcome annotation (pod-migrate.io/psengine-restore):
 //   - "failed": ColdStart verdict immediately, with the agent's reason
 //     (pod-migrate.io/psengine-restore-reason) in the evidence when it set one;
+//     for RestoreIncompatibleNode, the verdict names the mismatched fact
+//     (IncompatibleFact, cpu-model);
 //   - missing pod-migrate.io/psengine-injected=true + pod Ready: ColdStart
 //     verdict (replacement was not wired by the CRIU restore webhook, even if
 //     psengine-restore=restored is present);
@@ -354,14 +366,19 @@ func (*CRIU) VerifyRestore(_ context.Context, _ *pmv1alpha1.PodMigrationJob, pod
 	}
 	if strings.TrimSpace(pod.Annotations[CRIURestoreStatusAnnotation]) == CRIURestoreStatusFailed {
 		evidence := fmt.Sprintf("annotation %s=%s", CRIURestoreStatusAnnotation, CRIURestoreStatusFailed)
-		if reason := strings.TrimSpace(pod.Annotations[CRIURestoreReasonAnnotation]); reason != "" {
+		reason := strings.TrimSpace(pod.Annotations[CRIURestoreReasonAnnotation])
+		if reason != "" {
 			evidence += fmt.Sprintf(" (reason %s)", reason)
 		}
-		return RestoreVerdict{
+		verdict := RestoreVerdict{
 			Outcome:  ColdStart,
 			Reason:   criuColdStartReason,
 			Evidence: evidence,
-		}, nil
+		}
+		if reason == CRIURestoreReasonIncompatibleNode {
+			verdict.IncompatibleFact = CRIUIncompatibleFactCPUModel
+		}
+		return verdict, nil
 	}
 	if pod.Annotations[CRIUInjectedAnnotation] != "true" {
 		if !podReady(pod) {

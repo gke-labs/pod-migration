@@ -134,13 +134,13 @@ func criuNodeLabels(f criuplacement.Facts) map[string]string {
 }
 
 // criuNode returns a Ready node named name whose CRIU agent published the
-// labels for facts f.
-func criuNode(name string, f criuplacement.Facts) *corev1.Node {
-	return placementNode(name, "n2-standard-4", func(n *corev1.Node) {
+// labels for facts f, changed by mutate.
+func criuNode(name string, f criuplacement.Facts, mutate ...func(*corev1.Node)) *corev1.Node {
+	return placementNode(name, "n2-standard-4", append([]func(*corev1.Node){func(n *corev1.Node) {
 		for k, v := range criuNodeLabels(f) {
 			n.Labels[k] = v
 		}
-	})
+	}}, mutate...)...)
 }
 
 func olderKernel() criuplacement.Facts {
@@ -295,6 +295,9 @@ func TestPodMigrationJobReconciler_CRIUPlacementTimeout(t *testing.T) {
 		if run.podExists {
 			t.Error("replacement still exists, want it deleted for its owner to recreate cold")
 		}
+		// The messages name the engine and the one constraint the node
+		// that could take it fails (#294).
+		signalled(t, run, "engine=criu requirements="+criuplacement.LabelKernelVersion+": ")
 	})
 
 	t.Run("only compatible nodes, all full: deleting couldn't help, so it waits", func(t *testing.T) {
