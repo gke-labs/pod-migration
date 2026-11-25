@@ -84,6 +84,8 @@ type ScaleDrainSLOGates struct {
 	MaxGateHoldP95Seconds  float64 `json:"maxGateHoldP95Seconds"`
 	MaxMigrationP95Seconds float64 `json:"maxMigrationP95Seconds"`
 	MaxHeapAllocBytes      uint64  `json:"maxHeapAllocBytes"`
+	MaxHeapIncreaseBytes   int64   `json:"maxHeapIncreaseBytes"`
+	MaxUncachedGetCalls    int64   `json:"maxUncachedGetCalls"`
 	MaxUncachedListCalls   int64   `json:"maxUncachedListCalls"`
 }
 
@@ -91,6 +93,7 @@ type ScaleDrainResults struct {
 	DurationSeconds          float64 `json:"durationSeconds"`
 	ThroughputPodsPerSec     float64 `json:"throughputPodsPerSec"`
 	HeapAllocBytes           uint64  `json:"heapAllocBytes"`
+	HeapIncreaseBytes        int64   `json:"heapIncreaseBytes"`
 	HeapSysBytes             uint64  `json:"heapSysBytes"`
 	NumGC                    uint32  `json:"numGC"`
 	UncachedGetCalls         int64   `json:"uncachedGetCalls"`
@@ -135,6 +138,9 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS not set; skipping 100-pod scale drain envtest")
 	}
+	if os.Getenv("RUN_SCALE_DRAIN_GATE") == "" {
+		t.Skip("RUN_SCALE_DRAIN_GATE not set; skipping 100-pod scale drain envtest")
+	}
 
 	podCount := 100
 	if envCount := os.Getenv("SCALE_DRAIN_POD_COUNT"); envCount != "" {
@@ -142,6 +148,51 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 			podCount = c
 		}
 	}
+
+	const (
+		maxDurationSeconds     = 25.0
+		maxGateHoldP95Seconds  = 12.0
+		maxMigrationP95Seconds = 18.0
+		maxHeapBytes           = uint64(64 * 1024 * 1024)
+		maxHeapIncreaseBytes   = int64(32 * 1024 * 1024)
+	)
+	maxUncachedGets := int64(podCount + 10)
+	maxUncachedLists := int64(podCount + 10)
+
+	reportPath := os.Getenv("SCALE_SUMMARY_PATH")
+	if reportPath == "" {
+		reportPath = "/tmp/scale-100-drain-summary.json"
+	}
+	_ = os.Remove(reportPath)
+
+	summary := &ScaleDrainSummary{
+		TestName:      "100-Pod Concurrent Drain Scale Regression Gate",
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+		PodCount:      podCount,
+		Concurrency:   50,
+		InvariantMode: "strict",
+		SLOGates: ScaleDrainSLOGates{
+			MaxDurationSeconds:     maxDurationSeconds,
+			MaxGateHoldP95Seconds:  maxGateHoldP95Seconds,
+			MaxMigrationP95Seconds: maxMigrationP95Seconds,
+			MaxHeapAllocBytes:      maxHeapBytes,
+			MaxHeapIncreaseBytes:   maxHeapIncreaseBytes,
+			MaxUncachedGetCalls:    maxUncachedGets,
+			MaxUncachedListCalls:   maxUncachedLists,
+		},
+		Passed: false,
+	}
+
+	defer func() {
+		summary.Passed = !t.Failed()
+		if summaryData, err := json.MarshalIndent(summary, "", "  "); err == nil {
+			if writeErr := os.WriteFile(reportPath, summaryData, 0644); writeErr == nil {
+				t.Logf("Emitted structured scale summary artifact to %s (passed=%v)", reportPath, summary.Passed)
+			} else {
+				t.Logf("Failed to write summary to %s: %v", reportPath, writeErr)
+			}
+		}
+	}()
 
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{"../../config/crd/bases"},
@@ -173,10 +224,22 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 	}
 	k8sClient := &envtestIndexedClient{Client: rawClient}
 	trackedReader := &trackedScaleAPIReader{reader: rawClient}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
 
 	ns := createTestNamespace(t, ctx, k8sClient, "scale-100-drain")
 	recorder := record.NewFakeRecorder(4096)
+	stopRecorderDrain := make(chan struct{})
+	defer close(stopRecorderDrain)
+	go func() {
+		for {
+			select {
+			case <-stopRecorderDrain:
+				return
+			case <-recorder.Events:
+			}
+		}
+	}()
 	invEngine := invariants.NewEngine(invariants.ModeStrict, recorder)
 
 	// Step 1: Create nodes to represent multi-node drain topology
@@ -452,6 +515,19 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 	var memAfter runtime.MemStats
 	runtime.ReadMemStats(&memAfter)
 
+	netHeapAlloc := int64(memAfter.HeapAlloc) - int64(memBefore.HeapAlloc)
+	actualGets := trackedReader.getCount.Load()
+	actualLists := trackedReader.listCount.Load()
+
+	summary.Results.DurationSeconds = math.Round(totalElapsed.Seconds()*1000) / 1000
+	summary.Results.ThroughputPodsPerSec = math.Round((float64(podCount)/totalElapsed.Seconds())*100) / 100
+	summary.Results.HeapAllocBytes = memAfter.HeapAlloc
+	summary.Results.HeapIncreaseBytes = netHeapAlloc
+	summary.Results.HeapSysBytes = memAfter.HeapSys
+	summary.Results.NumGC = memAfter.NumGC
+	summary.Results.UncachedGetCalls = actualGets
+	summary.Results.UncachedListCalls = actualLists
+
 	// Step 8: Assertions & Hard SLO Gates
 	t.Logf("100-pod concurrent drain completed in %v. Verifying hard SLO gates...", totalElapsed)
 
@@ -467,6 +543,7 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 			wedgedCount++
 		}
 	}
+	summary.Results.WedgedGatesCount = wedgedCount
 	if wedgedCount > 0 {
 		t.Fatalf("SLO Breach: %d/%d replacement pods have wedged scheduling gates", wedgedCount, podCount)
 	}
@@ -493,32 +570,6 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 	sort.Float64s(gateHoldDurations)
 	sort.Float64s(migrationDurations)
 
-	// SLO 3: Invariant Violations must be 0
-	violations := totalInvariantViolations() - beforeViolations
-	if violations > 0 {
-		t.Fatalf("SLO Breach: invariant engine reported %v violations in strict mode during 100-pod drain", violations)
-	}
-
-	// SLO 4: Wall-clock completion budget (< 45s for 100 pods)
-	const maxDurationSeconds = 45.0
-	if totalElapsed.Seconds() > maxDurationSeconds {
-		t.Fatalf("SLO Breach: total duration %.2fs exceeded hard ceiling %.2fs", totalElapsed.Seconds(), maxDurationSeconds)
-	}
-
-	// SLO 5: Memory footprint (< 256 MiB heap alloc)
-	const maxHeapBytes uint64 = 256 * 1024 * 1024
-	if memAfter.HeapAlloc > maxHeapBytes {
-		t.Fatalf("SLO Breach: heap allocated %d bytes exceeded ceiling %d bytes", memAfter.HeapAlloc, maxHeapBytes)
-	}
-
-	// SLO 6: Zero uncached List calls (reads must use informer cache)
-	maxUncachedLists := int64(podCount + 20)
-	actualLists := trackedReader.listCount.Load()
-	if actualLists > maxUncachedLists {
-		t.Fatalf("SLO Breach: uncached API list calls %d exceeded ceiling %d", actualLists, maxUncachedLists)
-	}
-
-	// Step 9: Emit Structured Scale Summary Artifact
 	p50Gate := percentile(gateHoldDurations, 0.50)
 	p90Gate := percentile(gateHoldDurations, 0.90)
 	p95Gate := percentile(gateHoldDurations, 0.95)
@@ -529,54 +580,68 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 	p95Mig := percentile(migrationDurations, 0.95)
 	maxMig := migrationDurations[len(migrationDurations)-1]
 
-	summary := ScaleDrainSummary{
-		TestName:      "100-Pod Concurrent Drain Scale Regression Gate",
-		Timestamp:     time.Now().UTC().Format(time.RFC3339),
-		PodCount:      podCount,
-		Concurrency:   pmjWorkers,
-		InvariantMode: "strict",
-		SLOGates: ScaleDrainSLOGates{
-			MaxDurationSeconds:     maxDurationSeconds,
-			MaxGateHoldP95Seconds:  60.0,
-			MaxMigrationP95Seconds: 180.0,
-			MaxHeapAllocBytes:      maxHeapBytes,
-			MaxUncachedListCalls:   maxUncachedLists,
-		},
-		Results: ScaleDrainResults{
-			DurationSeconds:          math.Round(totalElapsed.Seconds()*1000) / 1000,
-			ThroughputPodsPerSec:     math.Round((float64(podCount)/totalElapsed.Seconds())*100) / 100,
-			HeapAllocBytes:           memAfter.HeapAlloc,
-			HeapSysBytes:             memAfter.HeapSys,
-			NumGC:                    memAfter.NumGC,
-			UncachedGetCalls:         trackedReader.getCount.Load(),
-			UncachedListCalls:        actualLists,
-			WedgedGatesCount:         wedgedCount,
-			InvariantViolationsTotal: violations,
-			GateHoldP50Seconds:       math.Round(p50Gate*1000) / 1000,
-			GateHoldP90Seconds:       math.Round(p90Gate*1000) / 1000,
-			GateHoldP95Seconds:       math.Round(p95Gate*1000) / 1000,
-			GateHoldMaxSeconds:       math.Round(maxGate*1000) / 1000,
-			MigrationP50Seconds:      math.Round(p50Mig*1000) / 1000,
-			MigrationP90Seconds:      math.Round(p90Mig*1000) / 1000,
-			MigrationP95Seconds:      math.Round(p95Mig*1000) / 1000,
-			MigrationMaxSeconds:      math.Round(maxMig*1000) / 1000,
-		},
-		Passed: true,
+	violations := totalInvariantViolations() - beforeViolations
+
+	summary.Results = ScaleDrainResults{
+		DurationSeconds:          math.Round(totalElapsed.Seconds()*1000) / 1000,
+		ThroughputPodsPerSec:     math.Round((float64(podCount)/totalElapsed.Seconds())*100) / 100,
+		HeapAllocBytes:           memAfter.HeapAlloc,
+		HeapIncreaseBytes:        netHeapAlloc,
+		HeapSysBytes:             memAfter.HeapSys,
+		NumGC:                    memAfter.NumGC,
+		UncachedGetCalls:         actualGets,
+		UncachedListCalls:        actualLists,
+		WedgedGatesCount:         wedgedCount,
+		InvariantViolationsTotal: violations,
+		GateHoldP50Seconds:       math.Round(p50Gate*1000) / 1000,
+		GateHoldP90Seconds:       math.Round(p90Gate*1000) / 1000,
+		GateHoldP95Seconds:       math.Round(p95Gate*1000) / 1000,
+		GateHoldMaxSeconds:       math.Round(maxGate*1000) / 1000,
+		MigrationP50Seconds:      math.Round(p50Mig*1000) / 1000,
+		MigrationP90Seconds:      math.Round(p90Mig*1000) / 1000,
+		MigrationP95Seconds:      math.Round(p95Mig*1000) / 1000,
+		MigrationMaxSeconds:      math.Round(maxMig*1000) / 1000,
 	}
 
-	reportPath := os.Getenv("SCALE_SUMMARY_PATH")
-	if reportPath == "" {
-		reportPath = "/tmp/scale-100-drain-summary.json"
-	}
-	if summaryData, err := json.MarshalIndent(summary, "", "  "); err == nil {
-		if writeErr := os.WriteFile(reportPath, summaryData, 0644); writeErr == nil {
-			t.Logf("Emitted structured scale summary artifact to %s", reportPath)
-		} else {
-			t.Logf("Failed to write summary to %s: %v", reportPath, writeErr)
-		}
+	// SLO 3: Invariant Violations must be 0
+	if violations > 0 {
+		t.Fatalf("SLO Breach: invariant engine reported %v violations in strict mode during 100-pod drain", violations)
 	}
 
-	t.Logf("Scale Regression Gate PASSED: %d pods in %.2fs (%.1f pods/sec), heap=%dMB, uncachedLists=%d, violations=0",
+	// SLO 4: Wall-clock completion budget (< 25s for 100 pods)
+	if totalElapsed.Seconds() > maxDurationSeconds {
+		t.Fatalf("SLO Breach: total duration %.2fs exceeded hard ceiling %.2fs", totalElapsed.Seconds(), maxDurationSeconds)
+	}
+
+	// SLO 5: Gate Hold P95 latency (< 12s)
+	if p95Gate > maxGateHoldP95Seconds {
+		t.Fatalf("SLO Breach: gate hold P95 latency %.2fs exceeded hard ceiling %.2fs", p95Gate, maxGateHoldP95Seconds)
+	}
+
+	// SLO 6: Migration P95 latency (< 18s)
+	if p95Mig > maxMigrationP95Seconds {
+		t.Fatalf("SLO Breach: migration P95 latency %.2fs exceeded hard ceiling %.2fs", p95Mig, maxMigrationP95Seconds)
+	}
+
+	// SLO 7: Memory footprint (< 64 MiB heap alloc, < 32 MiB net heap increase)
+	if memAfter.HeapAlloc > maxHeapBytes {
+		t.Fatalf("SLO Breach: heap allocated %d bytes exceeded ceiling %d bytes", memAfter.HeapAlloc, maxHeapBytes)
+	}
+	if netHeapAlloc > maxHeapIncreaseBytes {
+		t.Fatalf("SLO Breach: net heap increase %d bytes exceeded ceiling %d bytes", netHeapAlloc, maxHeapIncreaseBytes)
+	}
+
+	// SLO 8: Zero uncached API storms (APIReader Get/List bounds)
+	if actualGets > maxUncachedGets {
+		t.Fatalf("SLO Breach: uncached API get calls %d exceeded ceiling %d", actualGets, maxUncachedGets)
+	}
+	if actualLists > maxUncachedLists {
+		t.Fatalf("SLO Breach: uncached API list calls %d exceeded ceiling %d", actualLists, maxUncachedLists)
+	}
+
+	t.Logf("Scale Regression Gate PASSED: %d pods in %.2fs (%.1f pods/sec), heap=%dMB (net=+%dMB), uncachedGets=%d, uncachedLists=%d, gateP95=%.2fs, migP95=%.2fs, violations=0",
 		podCount, summary.Results.DurationSeconds, summary.Results.ThroughputPodsPerSec,
-		summary.Results.HeapAllocBytes/(1024*1024), summary.Results.UncachedListCalls)
+		summary.Results.HeapAllocBytes/(1024*1024), summary.Results.HeapIncreaseBytes/(1024*1024),
+		summary.Results.UncachedGetCalls, summary.Results.UncachedListCalls,
+		summary.Results.GateHoldP95Seconds, summary.Results.MigrationP95Seconds)
 }

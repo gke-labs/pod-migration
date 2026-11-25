@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 permissions:
   contents: read
@@ -14,59 +14,59 @@ jobs:
     name: Verify & Test
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      with:
-        persist-credentials: false
-        fetch-depth: 0
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
 
-    - name: Set up Go
-      uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
-      with:
-        go-version-file: 'controller/go.mod'
-        check-latest: false
-        cache-dependency-path: |
-          controller/go.sum
-          tools/pmprofiler/go.sum
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: "controller/go.mod"
+          check-latest: false
+          cache-dependency-path: |
+            controller/go.sum
+            tools/pmprofiler/go.sum
 
-    - name: Verify Invariant Governance (T0)
-      env:
-        ALLOW_INVARIANT_COCHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'allow-invariant-cochange') }}
-      run: make -C controller verify-invariant-governance
+      - name: Verify Invariant Governance (T0)
+        env:
+          ALLOW_INVARIANT_COCHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'allow-invariant-cochange') }}
+        run: make -C controller verify-invariant-governance
 
-    - name: Verify License Headers
-      run: make -C controller verify-license-headers
+      - name: Verify License Headers
+        run: make -C controller verify-license-headers
 
-    - name: Verify Generated Code Freshness
-      run: make -C controller verify-generate
+      - name: Verify Generated Code Freshness
+        run: make -C controller verify-generate
 
-    - name: Run Unit Tests
-      run: make -C controller test
+      - name: Run Unit Tests
+        run: make -C controller test
 
-    - name: Run pmprofiler & T2 Guardrail Self-Test
-      run: make -C controller test-t2-guardrail
+      - name: Run pmprofiler & T2 Guardrail Self-Test
+        run: make -C controller test-t2-guardrail
 
-    - name: Run T3 SLO Guardrail & scalesim Capacity Model Self-Test
-      run: make -C controller test-t3-guardrail
+      - name: Run T3 SLO Guardrail & scalesim Capacity Model Self-Test
+        run: make -C controller test-t3-guardrail
 
-    - name: Run T5 Invariant Evolution Pipeline Self-Test
-      env:
-        ALLOW_INVARIANT_COCHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'allow-invariant-cochange') }}
-      run: make -C controller test-t5-guardrail
+      - name: Run T5 Invariant Evolution Pipeline Self-Test
+        env:
+          ALLOW_INVARIANT_COCHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'allow-invariant-cochange') }}
+        run: make -C controller test-t5-guardrail
 
-    - name: Run GPL Source Packager Test
-      run: make -C controller test-gpl-source-packager
+      - name: Run GPL Source Packager Test
+        run: make -C controller test-gpl-source-packager
 
-    - name: Run 100-Pod Scale Regression Gate
-      run: make -C controller test-scale-drain
+      - name: Run 100-Pod Scale Regression Gate
+        run: make -C controller test-scale-drain
 
-    - name: Upload Scale Gate Summary Artifact
-      if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-      with:
-        name: scale-100-drain-summary
-        path: /tmp/scale-100-drain-summary.json
-        if-no-files-found: warn
+      - name: Upload Scale Gate Summary Artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scale-100-drain-summary
+          path: /tmp/scale-100-drain-summary.json
+          if-no-files-found: warn
 
   criu-engine:
     name: Verify & Test CRIU Engine
@@ -75,23 +75,23 @@ jobs:
       run:
         working-directory: engines/criu
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      with:
-        persist-credentials: false
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
-    - name: Set up Go
-      uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
-      with:
-        go-version-file: 'engines/criu/go.mod'
-        check-latest: false
-        cache-dependency-path: engines/criu/go.sum
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: "engines/criu/go.mod"
+          check-latest: false
+          cache-dependency-path: engines/criu/go.sum
 
-    - name: Vet CRIU Engine
-      run: go vet ./...
+      - name: Vet CRIU Engine
+        run: go vet ./...
 
-    - name: Build CRIU Engine
-      run: go build ./...
+      - name: Build CRIU Engine
+        run: go build ./...
 
-    - name: Test CRIU Engine
-      run: go test -race ./...
+      - name: Test CRIU Engine
+        run: go test -race ./...

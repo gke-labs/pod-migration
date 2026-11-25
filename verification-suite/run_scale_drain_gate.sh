@@ -46,11 +46,15 @@ fi
 
 export SCALE_SUMMARY_PATH="${SUMMARY_PATH}"
 export SCALE_DRAIN_POD_COUNT="${POD_COUNT}"
+export RUN_SCALE_DRAIN_GATE=1
+
+# Clean up stale summary file from previous runs
+rm -f "${SUMMARY_PATH}"
 
 # Run the envtest scale regression test
 (
   cd "${CONTROLLER_DIR}"
-  go test -v -count=1 -run TestScale100PodConcurrentDrain ./internal/controller/...
+  go test -v -timeout 120s -count=1 -run TestScale100PodConcurrentDrain ./internal/controller/...
 )
 
 if [[ ! -f "${SUMMARY_PATH}" ]]; then
