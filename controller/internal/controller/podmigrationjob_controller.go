@@ -1480,6 +1480,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 			return r.handleStatusError(ctx, err, "Failed to fence the source before its checkpoint")
 		}
+		// A source deleted outright, for example force-deleted by a drain
+		// past its timeout, or replaced under its name, has nothing left to
+		// checkpoint (#295). Fail now, as for a source that finished, rather
+		// than wait out the migration timeout with the replacement gated.
+		if res, failed, err := r.failIfSourceGoneMidCheckpoint(ctx, req, job, origJob); failed || err != nil {
+			return res, err
+		}
 		// Note: a same-IP engine (such as CRIU) must wait for EndpointSlice
 		// serving: false before checkpointing (#146 C4), so in-flight traffic drains.
 		res, err := r.getSnapshotProvider(job).EnsureTrigger(ctx, job, podName)

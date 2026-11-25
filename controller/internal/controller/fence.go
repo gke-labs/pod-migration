@@ -421,6 +421,38 @@ func (r *PodMigrationJobReconciler) failSnapshotting(ctx context.Context, req ct
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// failIfSourceGoneMidCheckpoint fails a Snapshotting job whose source is gone
+// (deleted, or replaced under its name) before its checkpoint is durable, with
+// reason PodNotFound (#295). failSnapshotting deletes the trigger, so the
+// engine starts nothing for a pod that isn't there, and with no source left
+// there's no fence to settle, so the job drops its finalizer on the next
+// pass. A snapshot that's already Ready still goes on to Evicting, which
+// finds the source gone and restores; a failed, refused, deleting or gone
+// snapshot is left to the usual handling. The cache is read first, and a
+// miss is confirmed against the API server.
+func (r *PodMigrationJobReconciler) failIfSourceGoneMidCheckpoint(ctx context.Context, req ctrl.Request, job, origJob *pmv1alpha1.PodMigrationJob) (ctrl.Result, bool, error) {
+	if pod, err := r.sourcePod(ctx, job, r.Client); err != nil || pod != nil {
+		return ctrl.Result{}, false, err
+	}
+	if pod, err := r.sourcePod(ctx, job, r.liveReader()); err != nil || pod != nil {
+		return ctrl.Result{}, false, err
+	}
+	provider := r.getSnapshotProvider(job)
+	st, err := provider.CheckStatus(ctx, job, job.Spec.PodRef.Name)
+	if err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if st.Phase != snapshot.PhaseInProgress || st.Reason == snapshot.ReasonSnapshotDeleting {
+		return ctrl.Result{}, false, nil
+	}
+	if gone, err := r.snapshotGone(ctx, job, st); err != nil || gone {
+		return ctrl.Result{}, false, err
+	}
+	res, err := r.failSnapshotting(ctx, req, job, origJob, "PodNotFound",
+		"The source pod was deleted or replaced before its checkpoint completed, so there's nothing left to migrate")
+	return res, true, err
+}
+
 // resolveSourceFence settles the fence of a job that fenced its source and
 // then concluded without a restore. It returns handled=true while there's work
 // left, so the caller requeues instead of garbage-collecting the job.
