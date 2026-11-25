@@ -36,6 +36,7 @@ import (
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
@@ -303,6 +304,10 @@ closeLoop:
 		t.Errorf("expected SpotPreemptionSkippedTotal[budget_exceeded] >= 1, got %v",
 			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("budget_exceeded")))
 	}
+	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("budget_exceeded", "gke-pod-snapshots")) < 1 {
+		t.Errorf("expected SkippedMigrationsTotal[budget_exceeded, gke-pod-snapshots] >= 1, got %v",
+			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("budget_exceeded", "gke-pod-snapshots")))
+	}
 }
 
 func TestNodePreemptionReconciler_PodEligibilityFiltering(t *testing.T) {
@@ -458,6 +463,14 @@ closeLoop:
 	if testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unknown_memory")) < 1 {
 		t.Errorf("expected SpotPreemptionSkippedTotal[unknown_memory] >= 1, got %v",
 			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("unknown_memory")))
+	}
+	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_ready_policy", "gke-pod-snapshots")) < 1 {
+		t.Errorf("expected SkippedMigrationsTotal[no_ready_policy, gke-pod-snapshots] >= 1, got %v",
+			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("no_ready_policy", "gke-pod-snapshots")))
+	}
+	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("unknown_memory", "gke-pod-snapshots")) < 1 {
+		t.Errorf("expected SkippedMigrationsTotal[unknown_memory, gke-pod-snapshots] >= 1, got %v",
+			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("unknown_memory", "gke-pod-snapshots")))
 	}
 }
 
@@ -918,5 +931,55 @@ func TestNodePreemptionReconciler_OperatorOwned_InFlightPMJ_Refused(t *testing.T
 		}
 	default:
 		t.Errorf("Expected MigrationSkippedAmbiguousReplicaKey event, but none was recorded")
+	}
+}
+
+func TestNodePreemptionReconciler_IneligibleVerdictMetrics(t *testing.T) {
+	metrics.ResetCoverageForTest()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	node := createTestNode("spot-node-ineligible", true, "taint-gke")
+	psp := createTestPSP("psp-default", "default")
+	pod := createTestPod("pod-ineligible", "default", "spot-node-ineligible", "1Gi", "uid-inel")
+
+	testEng := &routedEngine{
+		name:    "ineligible-engine",
+		classes: []string{"gvisor"},
+		verdict: engine.Verdict{OK: false, Code: "ineligible", Reason: "unsupported configuration"},
+	}
+	reg := registryOf(t, testEng)
+
+	recorder := record.NewFakeRecorder(10)
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(node, psp, pod).
+		Build()
+
+	r := &NodePreemptionReconciler{
+		Client:                  cl,
+		Scheme:                  scheme,
+		Recorder:                recorder,
+		Engines:                 reg,
+		DefaultMigrationTimeout: 10 * time.Minute,
+		SpotPreemptionBudget:    15 * 1024 * 1024 * 1024,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "spot-node-ineligible"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	if testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("ineligible")) < 1 {
+		t.Errorf("expected SpotPreemptionSkippedTotal[ineligible] >= 1, got %v",
+			testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("ineligible")))
+	}
+	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("ineligible", "ineligible-engine")) < 1 {
+		t.Errorf("expected SkippedMigrationsTotal[ineligible, ineligible-engine] >= 1, got %v",
+			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("ineligible", "ineligible-engine")))
 	}
 }

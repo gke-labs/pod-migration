@@ -144,39 +144,39 @@ func (*CRIU) RuntimeClasses() []string {
 // fails closed so no PodMigrationJob is spawned for an unverified node.
 func (*CRIU) Eligible(pod *corev1.Pod, node *corev1.Node) Verdict {
 	if pod == nil {
-		return Verdict{Reason: "no pod to migrate"}
+		return Verdict{Code: "ineligible", Reason: "no pod to migrate"}
 	}
 	if len(pod.Spec.Containers) != 1 {
-		return Verdict{Reason: fmt.Sprintf("CRIU engine requires a single-container pod (got %d containers)", len(pod.Spec.Containers))}
+		return Verdict{Code: "multi_container", Reason: fmt.Sprintf("CRIU engine requires a single-container pod (got %d containers)", len(pod.Spec.Containers))}
 	}
 	for i := range pod.Spec.InitContainers {
 		ic := &pod.Spec.InitContainers[i]
 		if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
-			return Verdict{Reason: "CRIU engine does not support sidecar initContainers (restartPolicy=Always)"}
+			return Verdict{Code: "multi_container", Reason: "CRIU engine does not support sidecar initContainers (restartPolicy=Always)"}
 		}
 	}
 	if pod.Spec.HostNetwork {
-		return Verdict{Reason: "CRIU engine does not support hostNetwork pods"}
+		return Verdict{Code: "host_network", Reason: "CRIU engine does not support hostNetwork pods"}
 	}
 	if strings.TrimSpace(pod.Annotations[CRIURestoreStatusAnnotation]) == CRIURestoreStatusRestored ||
 		pod.Annotations[CRIUInjectedAnnotation] == "true" {
-		return Verdict{Reason: fmt.Sprintf(
+		return Verdict{Code: "already_restored", Reason: fmt.Sprintf(
 			"CRIU engine does not checkpoint a pod it already restored or wrapped (%s=%s or %s=true)",
 			CRIURestoreStatusAnnotation, CRIURestoreStatusRestored, CRIUInjectedAnnotation)}
 	}
 	if len(pod.Spec.Containers[0].Command) == 0 {
-		return Verdict{Reason: fmt.Sprintf(
+		return Verdict{Code: "missing_command", Reason: fmt.Sprintf(
 			"CRIU engine requires an explicit command on container %s: its replacement could not be restored and would start cold",
 			pod.Spec.Containers[0].Name)}
 	}
 	if node == nil {
 		if pod.Spec.NodeName != "" {
-			return Verdict{Reason: fmt.Sprintf("source node %s not found; cannot verify %s=true", pod.Spec.NodeName, CRIUNodeReadyAnnotation)}
+			return Verdict{Code: "node_not_ready", Reason: fmt.Sprintf("source node %s not found; cannot verify %s=true", pod.Spec.NodeName, CRIUNodeReadyAnnotation)}
 		}
-		return Verdict{Reason: fmt.Sprintf("pod is not scheduled on a CRIU-ready node (missing %s=true)", CRIUNodeReadyAnnotation)}
+		return Verdict{Code: "node_not_ready", Reason: fmt.Sprintf("pod is not scheduled on a CRIU-ready node (missing %s=true)", CRIUNodeReadyAnnotation)}
 	}
 	if node.Annotations[CRIUNodeReadyAnnotation] != "true" {
-		return Verdict{Reason: fmt.Sprintf("source node %s is not CRIU-ready (missing %s=true)", node.Name, CRIUNodeReadyAnnotation)}
+		return Verdict{Code: "node_not_ready", Reason: fmt.Sprintf("source node %s is not CRIU-ready (missing %s=true)", node.Name, CRIUNodeReadyAnnotation)}
 	}
 	return Verdict{OK: true}
 }

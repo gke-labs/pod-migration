@@ -36,6 +36,8 @@ set -euo pipefail
 
 BUCKET="${BUCKET:-pm-e2e}"
 CLUSTER="${CLUSTER:-pm-e2e}"
+# The counter's image, as up.sh loaded it into kind: by tag, so any @digest is
+# dropped. The counter never pulls it, so a missing image fails the run.
 WORKLOAD_IMAGE="${WORKLOAD_IMAGE:-busybox:1.36}"
 TIMEOUT="${TIMEOUT:-300}"
 GATE="gke.io/pod-migration-gate"
@@ -98,7 +100,8 @@ spec:
       terminationGracePeriodSeconds: 5
       containers:
       - name: counter
-        image: ${WORKLOAD_IMAGE}
+        image: ${WORKLOAD_IMAGE%@*}
+        imagePullPolicy: Never
         command: ["/bin/sh", "-c"]
         args:
         - |
