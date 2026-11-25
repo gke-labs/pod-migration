@@ -1058,9 +1058,17 @@ pod's log, the migration objects and events) and keeps it for 7 days.
 
 To run it locally you need an x86-64 Linux host whose kernel passes
 `criu check`, with Docker, kind v0.33.0 (the version CI pins), kubectl, make,
-jq and openssl. `up.sh` first deletes any kind cluster named `pm-e2e`, and
+curl, jq and openssl. `up.sh` first deletes any kind cluster named `pm-e2e`, and
 creates the archive signing key Secret with a random key before it applies
-the engine's manifest (see [Archive signing](#archive-signing)).
+the engine's manifest (see [Archive signing](#archive-signing)). It pins the
+kind node image, `fake-gcs-server`, the counter's busybox image and
+cert-manager's manifest by digest or checksum (see the top of `up.sh` to change
+one). It doesn't pin cert-manager's own images, which that manifest names by
+tag, or most of what goes into the four images it builds (base images by tag,
+packages from live archives), and CI runs on GitHub's `ubuntu-24.04` runner
+image, kernel included, so a run can also fail on a tree that didn't change.
+`run_criu_kind_e2e.sh` reads `BUCKET`, `CLUSTER` and `WORKLOAD_IMAGE` too:
+export them for both scripts.
 
 ```bash
 verification-suite/kind/up.sh

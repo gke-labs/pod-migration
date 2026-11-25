@@ -24,20 +24,33 @@
 # Then:      verification-suite/run_criu_kind_e2e.sh
 # Tear down: kind delete cluster --name pm-e2e && docker rm -f pm-e2e-gcs
 #
-# Needs docker, kind, kubectl, make and openssl. What the E2E changes in the
-# shipped manifests is in deploy_controller and deploy_criu_engine.
+# Needs docker, kind, kubectl, make, curl and openssl. What the E2E changes in
+# the shipped manifests is in deploy_controller and deploy_criu_engine.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLUSTER="${CLUSTER:-pm-e2e}"
+# The images and the cert-manager manifest this script pulls are pinned by
+# digest or checksum, so a re-pushed tag or release asset can't change them.
+# Not pinned: cert-manager's own images, which its manifest names by tag, and
+# most of what goes into the four images built from this checkout (base images
+# by tag, packages from live archives). Override a version together with its
+# digest or checksum.
+#
 # kind v0.33.0 node images ship containerd 2.3.4: older kind releases ship a
 # containerd that the CRIU agent refuses (CheckContainerdVersion).
 NODE_IMAGE="${NODE_IMAGE:-kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.21.3}"
-FAKE_GCS_IMAGE="${FAKE_GCS_IMAGE:-fsouza/fake-gcs-server:1.56.1}"
+# sha256 of that release's cert-manager.yaml.
+CERT_MANAGER_SHA256="${CERT_MANAGER_SHA256:-c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74}"
+FAKE_GCS_IMAGE="${FAKE_GCS_IMAGE:-fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef}"
 BUCKET="${BUCKET:-pm-e2e}"
-WORKLOAD_IMAGE="${WORKLOAD_IMAGE:-busybox:1.36}"
+# The counter's image. It's pulled by digest and loaded into kind under its tag
+# alone, which is what the counter names and never pulls: a pod that names a
+# digest pulls from the registry instead of using the loaded image.
+# run_criu_kind_e2e.sh reads WORKLOAD_IMAGE too, so export it for both scripts.
+WORKLOAD_IMAGE="${WORKLOAD_IMAGE:-busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662}"
 LOG_DIR="${LOG_DIR:-/tmp/${CLUSTER}}"
 GCS_CONTAINER="${CLUSTER}-gcs"
 IMAGES=(controller criu-engine criu-agent criu-holder)
@@ -162,6 +175,13 @@ main() {
     pids+=("$!")
   done
   docker pull -q "${WORKLOAD_IMAGE}" >/dev/null
+  docker tag "${WORKLOAD_IMAGE}" "${WORKLOAD_IMAGE%@*}"
+  curl -fsSLo "${WORK_DIR}/cert-manager.yaml" \
+    "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+  echo "${CERT_MANAGER_SHA256}  ${WORK_DIR}/cert-manager.yaml" | sha256sum --quiet -c - || {
+    echo "cert-manager ${CERT_MANAGER_VERSION}'s cert-manager.yaml doesn't match CERT_MANAGER_SHA256" >&2
+    exit 1
+  }
 
   log "Creating kind cluster ${CLUSTER}"
   kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
@@ -179,7 +199,7 @@ main() {
     curl -fsS -X POST "http://${gcs_host}/storage/v1/b" -d "{\"name\":\"${BUCKET}\"}"
 
   log "Installing cert-manager ${CERT_MANAGER_VERSION}"
-  kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml" >/dev/null
+  kubectl apply -f "${WORK_DIR}/cert-manager.yaml" >/dev/null
   kubectl -n cert-manager wait --for=condition=Available deployment --all --timeout=180s
 
   log "Waiting for the image builds"
@@ -190,7 +210,7 @@ main() {
   for name in "${IMAGES[@]}"; do
     refs+=("pm-e2e/${name}:e2e")
   done
-  kind load docker-image --name "${CLUSTER}" "${refs[@]}" "${WORKLOAD_IMAGE}"
+  kind load docker-image --name "${CLUSTER}" "${refs[@]}" "${WORKLOAD_IMAGE%@*}"
 
   log "Deploying the controller and the CRIU engine"
   deploy_controller "${WORK_DIR}"
