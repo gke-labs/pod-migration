@@ -597,6 +597,12 @@ When running in multi-replica HA mode with leader election enabled:
 - Prometheus scrape jobs should scrape per-pod endpoints and use `max(pod_migration_active)` when querying or alerting on active in-flight migrations across the cluster.
 - For counter and histogram metrics, use `sum(rate(pod_migration_outcomes_total[5m])) by (outcome)` and `sum(rate(pod_migration_phase_duration_seconds_sum[5m])) by (phase) / sum(rate(pod_migration_phase_duration_seconds_count[5m])) by (phase)`.
 
+### Alerting Rules & Operator Runbooks
+
+Reference Prometheus alerting rules are packaged in [`monitoring/prometheus-rules.yaml`](monitoring/prometheus-rules.yaml) and scrape configurations in [`monitoring/prometheus-service.yaml`](monitoring/prometheus-service.yaml). Operator troubleshooting runbooks for each alert are located in [`docs/runbooks/`](docs/runbooks/).
+
+> **Note on Prometheus Operator & GMP Scrape Selectors:** Default Helm installations of `kube-prometheus-stack` restrict ServiceMonitor discovery to resources matching `release: <name>` (unless `serviceMonitorSelectorNilUsesHelmValues: false`). On Google Cloud Managed Service for Prometheus (GMP), scrape targets should be configured using `PodMonitoring` custom resources.
+
 ## 9. Releases & Licensing
 
 - **Release Process**: Step-by-step instructions for building, validating, and publishing official releases are documented in [docs/release-process.md](docs/release-process.md).
