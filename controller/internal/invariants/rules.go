@@ -565,9 +565,11 @@ func snapshotProgressForJob(s *ReconcileSnapshot, job *pmv1alpha1.PodMigrationJo
 // without transitioning to a terminal phase, and a deleting PodMigration CR with
 // StorageCleanupFinalizer must not remain un-finalized past MaxMigrationDuration (10m).
 // The PMJ deadline runs from creation while Pending and from Status.SnapshottingStartTime after.
-// Healthy progressing Snapshotting jobs (with a non-empty Status.SnapshotRef and Ready or recent
-// LastProgressTime) and Evicting jobs within their phase budget are tolerated up to the 2h
-// MaxMigrationTimeout hard cap.
+// Healthy progressing Snapshotting jobs (with a non-empty Status.SnapshotRef, and a
+// LastProgressTime within the effective timeout plus 30s, or a Ready snapshot that
+// doesn't report one) and Evicting jobs within their phase budget are tolerated up
+// to the 2h MaxMigrationTimeout hard cap. A Ready snapshot's LastProgressTime is when
+// it became Ready (#231).
 func EvaluateI4(s *ReconcileSnapshot) []Violation {
 	var violations []Violation
 	now := time.Now()
@@ -598,12 +600,20 @@ func EvaluateI4(s *ReconcileSnapshot) []Violation {
 			// During Snapshotting, the reconciler extends the deadline while the snapshot
 			// is actively progressing (Ready, or non-zero LastProgressTime within the
 			// effective timeout), bounded by the hard MaxMigrationTimeout (2h) wall-clock cap.
+			// A Ready snapshot's LastProgressTime, when reported, is when it became Ready.
+			// The reconciler moves the job to Evicting as soon as it sees it Ready, so a
+			// job still here more than the budget after that is stuck (#231). A Ready
+			// snapshot that doesn't report that time is tolerated up to the cap.
+			var readySince time.Time
 			if job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSnapshotting &&
 				job.Status.SnapshotRef != "" &&
 				(anchor.IsZero() || now.Sub(anchor) <= util.MaxMigrationTimeout+progressGraceSlack) {
 				if prog, ok := snapshotProgressForJob(s, &job, now); ok && !prog.Failed {
-					if prog.Ready || (!prog.LastProgressTime.IsZero() && now.Sub(prog.LastProgressTime) <= budget) {
+					if (prog.Ready && prog.LastProgressTime.IsZero()) || (!prog.LastProgressTime.IsZero() && now.Sub(prog.LastProgressTime) <= budget) {
 						continue
+					}
+					if prog.Ready {
+						readySince = prog.LastProgressTime
 					}
 				}
 			}
@@ -633,12 +643,17 @@ func EvaluateI4(s *ReconcileSnapshot) []Violation {
 			if !anchor.IsZero() && now.Sub(anchor) > budget {
 				// Static message string (without dynamic now.Sub elapsed duration) so
 				// client-go EventRecorder and Engine deduplication aggregate cleanly.
+				// When the snapshot became Ready is fixed too.
+				detail := fmt.Sprintf("%s at %s", anchorLabel, anchor.UTC().Format(time.RFC3339))
+				if !readySince.IsZero() {
+					detail += ", snapshot Ready since " + readySince.UTC().Format(time.RFC3339)
+				}
 				violations = append(violations, Violation{
 					InvariantID:   "I4",
 					InvariantName: "TerminalProgress",
 					Reason:        "ActivePMJExceededDeadline",
-					Message: fmt.Sprintf("PMJ %s/%s remained in non-terminal phase %q beyond its %s deadline (%s at %s)",
-						job.Namespace, job.Name, job.Status.Phase, effectiveTimeout, anchorLabel, anchor.UTC().Format(time.RFC3339)),
+					Message: fmt.Sprintf("PMJ %s/%s remained in non-terminal phase %q beyond its %s deadline (%s)",
+						job.Namespace, job.Name, job.Status.Phase, effectiveTimeout, detail),
 					Namespace: job.Namespace,
 					PMJName:   job.Name,
 				})
