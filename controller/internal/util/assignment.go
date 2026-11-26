@@ -40,6 +40,7 @@ const (
 	LabelControllerRevisionHash      = appsv1.ControllerRevisionHashLabelKey
 	LabelJobCompletionIndex          = batchv1.JobCompletionIndexAnnotation
 	LabelOriginPodName               = "pod-migration.gke.io/origin-pod-name"
+	LabelPodMigrationEnabled         = "pod-migration.gke.io/enabled"
 	AnnotationAssignedPMJ            = "pod-migration.gke.io/assigned-pmj"
 	AnnotationColdStartBypassJob     = "pod-migration.gke.io/cold-start-bypass-job"
 	AnnotationRestoreCompleted       = "pod-migration.gke.io/restore-completed"
@@ -607,6 +608,77 @@ func FindUnassignedActivePMJ(
 	return "", nil
 }
 
+// MatchesPMJWorkload checks whether a replacement pod belongs to the same parent workload
+// and matches the replica identity criteria recorded on the PodMigrationJob.
+func MatchesPMJWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, parentName, parentKind, parentUID string) bool {
+	if pod == nil || job == nil {
+		return false
+	}
+
+	jobParentName := job.Labels[LabelParentName]
+	jobParentKind := job.Labels[LabelParentKind]
+	jobParentUID := job.Labels[LabelParentUID]
+
+	// If the job does not declare a parent workload, it matches if the pod name matches the target pod,
+	// or in uncontested/synthetic fixtures where no parent was declared.
+	if jobParentName == "" {
+		if job.Spec.PodRef.Name != "" && pod.Name == job.Spec.PodRef.Name {
+			return true
+		}
+		return parentName == ""
+	}
+
+	// For managed workloads, parent name and kind must match.
+	if parentName != jobParentName || parentKind != jobParentKind {
+		return false
+	}
+
+	// If parent UID is recorded on the job, it must match.
+	if jobParentUID != "" && parentUID != "" && parentUID != jobParentUID {
+		return false
+	}
+
+	// Deployment: pod-template-hash must match.
+	if jobParentKind == "Deployment" {
+		podTemplateHash := ""
+		if pod.Labels != nil {
+			podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+		}
+		if jobTemplateHash := job.Labels[LabelPodTemplateHash]; jobTemplateHash != "" && podTemplateHash != jobTemplateHash {
+			return false
+		}
+	}
+
+	// Job: completion index must match when present.
+	if jobParentKind == "Job" {
+		jobCompletionIndex := ""
+		if pod.Labels != nil {
+			jobCompletionIndex = pod.Labels[LabelJobCompletionIndex]
+		}
+		if jobCompIdx := job.Labels[LabelJobCompletionIndex]; jobCompIdx != "" && jobCompletionIndex != jobCompIdx {
+			return false
+		}
+	}
+
+	// StatefulSet: pod name must match.
+	if jobParentKind == "StatefulSet" {
+		if pod.Name != job.Spec.PodRef.Name {
+			return false
+		}
+	}
+
+	// Custom operator: replica key must match.
+	if !IsBuiltInWorkloadKind(jobParentKind) {
+		replicaKey, _ := ResolveOperatorReplicaKey(pod, jobParentKind)
+		jobKey := JobReplicaIdentityKey(job)
+		if replicaKey != "" && jobKey != "" && replicaKey != jobKey {
+			return false
+		}
+	}
+
+	return true
+}
+
 // ResolveCollision deterministically resolves PMJ assignment races.
 // Returns: (correctedPMJ, changed, error)
 func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, assignedPMJ, parentName, parentKind, parentUID string) (string, bool, error) {
@@ -622,6 +694,13 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 			return assignedPMJ, false, nil
 		}
 		return "", false, err
+	}
+
+	// If the job records a parent workload, the pod must match that workload lineage.
+	if job.Labels != nil && job.Labels[LabelParentName] != "" {
+		if !MatchesPMJWorkload(ctx, c, pod, job, parentName, parentKind, parentUID) {
+			return "", true, nil // Ineligible contender: clear assignment for cold-start bypass
+		}
 	}
 
 	// Contenders are exactly the pods indexed under this PMJ name; a
@@ -642,11 +721,41 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		if string(p.UID) == job.Spec.TargetPodUID {
 			continue
 		}
+		// Contenders must match workload lineage if the job specifies a parent workload
+		if job.Labels != nil && job.Labels[LabelParentName] != "" {
+			pParentName, pParentKind, pParentUID, err := ResolveParentWorkload(ctx, c, p)
+			if err != nil && !apierrors.IsNotFound(err) {
+				return "", false, err
+			}
+			if !MatchesPMJWorkload(ctx, c, p, job, pParentName, pParentKind, pParentUID) {
+				continue
+			}
+		}
 		contenders = append(contenders, p)
 	}
 
 	if len(contenders) <= 1 {
 		return assignedPMJ, false, nil // No collision
+	}
+
+	// If any contender is opted in (pod-migration.gke.io/enabled: "true"),
+	// un-opted-in pods cannot compete in the collision.
+	var optedIn []*corev1.Pod
+	for _, p := range contenders {
+		if p.Labels != nil && p.Labels[LabelPodMigrationEnabled] == "true" {
+			optedIn = append(optedIn, p)
+		}
+	}
+	if len(optedIn) > 0 {
+		contenders = optedIn
+	}
+
+	if len(contenders) <= 1 {
+		winner := contenders[0]
+		if winner.UID == pod.UID {
+			return assignedPMJ, false, nil // Sole eligible winner
+		}
+		return "", true, nil // Loser (un-opted-in or collided): clear assignment
 	}
 
 	// Sort contenders deterministically by creation timestamp, then alphabetically by name
