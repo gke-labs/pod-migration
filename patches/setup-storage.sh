@@ -94,6 +94,7 @@ if [ "$MODE" = "multi-tenant" ]; then
     if [ -n "$ns_clean" ]; then
       echo "Creating managed folder for namespace '${ns_clean}': gs://${BUCKET_NAME}/${ns_clean}..."
       gcloud storage managed-folders create "gs://${BUCKET_NAME}/${ns_clean}" --project="${PROJECT_ID}" 2>/dev/null || true
+      kubectl label namespace "${ns_clean}" pod-migration.gke.io/managed="true" --overwrite 2>/dev/null || true
     fi
   done
 
@@ -110,6 +111,7 @@ else
       --role="${role}" \
       --quiet
   done
+  kubectl label namespace default pod-migration.gke.io/managed="true" --overwrite 2>/dev/null || true
   TOKEN_SOURCE="podKSA"
 fi
 

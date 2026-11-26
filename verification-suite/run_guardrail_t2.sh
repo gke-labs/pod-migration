@@ -780,6 +780,7 @@ spec:
   storage:
     location: ${GCS_BUCKET}
 EOF
+  "${KUBECTL_CMD}" label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite >/dev/null 2>&1 || true
   "${KUBECTL_CMD}" wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null
   preflight_snapshot_policy
 }

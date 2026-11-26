@@ -547,6 +547,7 @@ run_live() {
   else
     log "Creating dedicated test namespace ${NAMESPACE}..."
     ${KUBECTL_CMD} create namespace "${NAMESPACE}"
+    ${KUBECTL_CMD} label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true"
     OWNED_NAMESPACE="true"
   fi
 
