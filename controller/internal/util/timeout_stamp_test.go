@@ -76,6 +76,12 @@ func TestBuildPMJLabelsAndAnnotations_AlwaysStampsEffectiveTimeout(t *testing.T)
 		"Spot base": {
 			pod: podWith("", ""), base: PreemptionDefaultTimeout, want: "2m0s",
 		},
+		// The Spot controller keeps a pod's own annotation, so a malformed one
+		// leaves this value in place. Before #330 such a job had no
+		// annotation and ran on --migration-timeout.
+		"Spot base, malformed pod annotation": {
+			pod: podWith("soon", ""), base: PreemptionDefaultTimeout, want: "2m0s",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, ann := BuildPMJLabelsAndAnnotationsForPolicy(tc.pod, "web", "ReplicaSet", "rs-uid", "", tc.base, TriggerSourceEviction)
