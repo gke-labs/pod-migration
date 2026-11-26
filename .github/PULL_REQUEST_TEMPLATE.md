@@ -31,4 +31,4 @@ Closes #
   - Findings: <!-- None / detail docs updated -->
 
 ---
-<!-- If AI-assisted, add attribution here, e.g.: Generated with the help of Jetski (Gemini). / Generated with the help of Claude Code. -->
+<!-- If AI-assisted, add attribution here, e.g.: Generated with the help of Gemini. / Generated with the help of Claude Code. -->
