@@ -126,3 +126,41 @@ func TestShouldRegisterCRIU(t *testing.T) {
 		t.Error("shouldRegisterCRIU(false, withCRIU) = false, want true when --runtime-class-engines names criu")
 	}
 }
+
+func TestMainLogsDeprecationOnStorageIsolationMode(t *testing.T) {
+	if os.Getenv("TEST_SUBPROCESS_MAIN") == "1" {
+		os.Args = []string{"manager", "--storage-isolation-mode=enforce", "--criu-api-group=invalid_no_dot"}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainLogsDeprecationOnStorageIsolationMode$")
+	cmd.Env = append(os.Environ(), "TEST_SUBPROCESS_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got err=%v output=%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "--storage-isolation-mode is deprecated") {
+		t.Errorf("expected output to contain '--storage-isolation-mode is deprecated', got: %s", string(out))
+	}
+}
+
+func TestMainDoesNotLogDeprecationWhenStorageIsolationModeUnset(t *testing.T) {
+	if os.Getenv("TEST_SUBPROCESS_MAIN") == "1" {
+		os.Args = []string{"manager", "--criu-api-group=invalid_no_dot"}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainDoesNotLogDeprecationWhenStorageIsolationModeUnset$")
+	cmd.Env = append(os.Environ(), "TEST_SUBPROCESS_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got err=%v output=%s", err, string(out))
+	}
+	if strings.Contains(string(out), "--storage-isolation-mode is deprecated") {
+		t.Errorf("expected output NOT to contain '--storage-isolation-mode is deprecated', got: %s", string(out))
+	}
+}
