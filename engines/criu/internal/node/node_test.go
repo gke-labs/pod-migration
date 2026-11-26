@@ -517,6 +517,107 @@ func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
 				execCalls, fc.getCalls.Load()-getsAfterBootstrap, fc.patchCalls.Load()-patchesAfterBootstrap)
 		}
 	})
+
+	t.Run("canned criu check with optional features missing reaches ready=true and annotates reason", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+		fc := &flakyNodeClient{Client: base}
+
+		cannedOutput := `Warn  (criu/kerndat.c:1904): ioctl(PAGEMAP_SCAN) doesn't support PAGE_IS_GUARD flag. CRIU dump will fail if dumped processes use madvise(MADV_GUARD_INSTALL). Please, consider updating your kernel.
+Warn: feature timer_cr_ids is not supported
+Looks good but some kernel features are missing
+which, depending on your process tree, may cause
+dump or restore failure.
+`
+		nd := &Node{
+			Client:          fc,
+			NodeName:        "test-node",
+			SocketPath:      "/run/containerd/containerd.sock",
+			Inspector:       fakeReadyInspector(),
+			statSocketFn:    func(string) (uint64, error) { return 4344, nil },
+			installBundleFn: func() (string, error) { return "v4.2.1", nil },
+			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+				return cannedOutput, errors.New("exit status 1")
+			},
+		}
+
+		if err := nd.Bootstrap(ctx); err != nil {
+			t.Fatalf("Bootstrap error: %v", err)
+		}
+		if !nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == true when only optional features are missing")
+		}
+
+		var cur corev1.Node
+		if err := fc.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "true" {
+			t.Fatalf("expected criu-ready=true, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+		wantReason := "missing optional CRIU features: pagemap_scan_guard_pages, timer_cr_ids"
+		if cur.Annotations[NodeAnnotationCRIUReason] != wantReason {
+			t.Fatalf("expected criu-reason=%q, got %q", wantReason, cur.Annotations[NodeAnnotationCRIUReason])
+		}
+		if remediation, exists := cur.Annotations[NodeAnnotationCRIURemediation]; exists {
+			t.Fatalf("expected no criu-remediation on ready node, got %q", remediation)
+		}
+	})
+
+	t.Run("canned criu check with required feature missing marks node false and annotates reason", func(t *testing.T) {
+		nodeObj := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+			Status: corev1.NodeStatus{
+				NodeInfo: corev1.NodeSystemInfo{ContainerRuntimeVersion: "containerd://2.2.7"},
+			},
+		}
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeObj).Build()
+		fc := &flakyNodeClient{Client: base}
+
+		cannedOutput := `Warn  (criu/cr-check.c:1232): UFFD is not supported
+Looks good but some kernel features are missing
+which, depending on your process tree, may cause
+dump or restore failure.
+`
+		nd := &Node{
+			Client:          fc,
+			NodeName:        "test-node",
+			SocketPath:      "/run/containerd/containerd.sock",
+			Inspector:       fakeReadyInspector(),
+			statSocketFn:    func(string) (uint64, error) { return 4345, nil },
+			installBundleFn: func() (string, error) { return "v4.2.1", nil },
+			execHostFn: func(context.Context, []string, string, ...string) (string, error) {
+				return cannedOutput, errors.New("exit status 1")
+			},
+		}
+
+		if err := nd.Bootstrap(ctx); err != nil {
+			t.Fatalf("Bootstrap error: %v", err)
+		}
+		if nd.IsReady() {
+			t.Fatal("expected nd.IsReady() == false when required feature is missing")
+		}
+
+		var cur corev1.Node
+		if err := fc.Get(ctx, types.NamespacedName{Name: "test-node"}, &cur); err != nil {
+			t.Fatalf("get node: %v", err)
+		}
+		if cur.Annotations[NodeAnnotationCRIUReady] != "false" {
+			t.Fatalf("expected criu-ready=false, got %q", cur.Annotations[NodeAnnotationCRIUReady])
+		}
+		wantReason := "criu check --all missing required features: uffd"
+		if cur.Annotations[NodeAnnotationCRIUReason] != wantReason {
+			t.Fatalf("expected criu-reason=%q, got %q", wantReason, cur.Annotations[NodeAnnotationCRIUReason])
+		}
+		if cur.Annotations[NodeAnnotationCRIURemediation] != "check host kernel support for CRIU" {
+			t.Fatalf("expected remediation 'check host kernel support for CRIU', got %q", cur.Annotations[NodeAnnotationCRIURemediation])
+		}
+	})
 }
 
 func TestNode_TransientAPIErrorsRetryAndConvergeWithoutContainerdRestart(t *testing.T) {

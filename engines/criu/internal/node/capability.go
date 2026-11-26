@@ -16,13 +16,14 @@
 package node
 
 import (
-	"strconv"
-
 	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +37,8 @@ const (
 	NodeAnnotationCRIUReady = "pod-migrate.io/criu-ready"
 	// NodeAnnotationCRIUVersion records the installed CRIU binary version on the node.
 	NodeAnnotationCRIUVersion = "pod-migrate.io/criu-version"
-	// NodeAnnotationCRIUReason records why the node is unready for CRIU operations.
+	// NodeAnnotationCRIUReason records why the node is unready for CRIU operations,
+	// or what optional CRIU features are missing on an otherwise ready node.
 	NodeAnnotationCRIUReason = "pod-migrate.io/criu-reason"
 	// NodeAnnotationCRIURemediation records actionable remediation instructions for operators.
 	NodeAnnotationCRIURemediation = "pod-migrate.io/criu-remediation"
@@ -117,21 +119,210 @@ func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir str
 	return strings.TrimSpace(string(v)), nil
 }
 
+// knownOptionalFeatures lists optional CRIU kernel features that are checked by
+// `criu check --all` but are not required for standard container checkpoint and restore.
+// A node lacking only these optional features reaches criu-ready=true, with the missing
+// features recorded in pod-migrate.io/criu-reason.
+var knownOptionalFeatures = []string{
+	"pagemap_scan_guard_pages",
+	"timer_cr_ids",
+}
+
+type featurePattern struct {
+	name  string
+	regex *regexp.Regexp
+}
+
+var knownFeaturePatterns = func() []featurePattern {
+	knownFeatures := []string{
+		"uffd_noncoop",
+		"uffd",
+		"cgroupns",
+		"aio_remap",
+		"seccomp_suspend",
+		"seccomp_filters",
+		"mem_dirty_track",
+		"posix_timers",
+		"timerfd",
+		"tun_ns",
+		"tun",
+		"userns",
+		"fdinfo_lock",
+		"tcp_half_closed",
+		"tcp_window",
+		"compat_cr",
+		"can_map_vdso",
+		"sk_unix_file",
+		"sk_ns",
+		"net_diag_raw",
+		"link_nsid",
+		"nsid",
+		"kcmp_epoll",
+		"timens",
+		"external_net_ns",
+		"clone3_set_tid",
+		"newifindex",
+		"network_lock_nftables",
+		"nftables",
+		"has_ipt_legacy",
+		"pidfd_store",
+		"ns_pid",
+		"apparmor_stacking",
+		"sockopt_buf_lock",
+		"memfd_hugetlb",
+		"move_mount_set_group",
+		"openat2",
+		"get_rseq_conf",
+		"ipv6_freebind",
+		"pagemap_scan",
+		"overlayfs_maps",
+		"autofs",
+	}
+	patterns := make([]featurePattern, len(knownFeatures))
+	for i, feat := range knownFeatures {
+		patterns[i] = featurePattern{
+			name:  feat,
+			regex: regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(feat) + `\b`),
+		}
+	}
+	return patterns
+}()
+
 // verifyCRIU runs `criu check --all` on the host (host kernel context) via
-// nsenter and returns the raw output. PODMIG_CRIU_CHECK=core relaxes the gate
-// to plain `criu check` (core C/R features only) for kernels where `--all`
-// reports optional/experimental feature warnings while core dump/restore works.
-func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, string, ...string) (string, error)) (ok bool, raw string) {
+// nsenter and returns the capability verdict, reason, and raw output.
+// PODMIG_CRIU_CHECK=core relaxes the gate to plain `criu check` (core C/R features only)
+// for kernels where `--all` reports optional/experimental feature warnings while core dump/restore works.
+// When `--all` reports missing features, if only known optional features are missing
+// (e.g. pagemap_scan_guard_pages, timer_cr_ids), verifyCRIU returns ok=true and records the missing
+// features in reason so they can be published on the node.
+func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, string, ...string) (string, error)) (ok bool, reason string, raw string) {
+	checkMode := os.Getenv("PODMIG_CRIU_CHECK")
 	args := []string{"check", "--all"}
-	if os.Getenv("PODMIG_CRIU_CHECK") == "core" {
+	if checkMode == "core" {
 		args = []string{"check"}
 	}
 	out, err := execHost(ctx, nil, criuBundleDir+"/criu", args...)
 	raw = strings.TrimSpace(out)
-	if err != nil {
-		return false, raw + " (err: " + err.Error() + ")"
+	if err != nil && raw == "" {
+		return false, "criu check failed: " + err.Error(), "(err: " + err.Error() + ")"
 	}
-	return strings.Contains(raw, "Looks good"), raw
+	ok, reason = parseCRIUCheckOutput(raw, checkMode)
+	return ok, reason, raw
+}
+
+// parseCRIUCheckOutput evaluates the stdout/stderr from `criu check` or `criu check --all`.
+// When checkMode is "core", it only checks for the core "Looks good" confirmation.
+// When checkMode is "all" (or empty default), it distinguishes between:
+//   - Clean pass: "Looks good." with no feature warnings -> ok=true, reason=""
+//   - Optional-only missing features: "Looks good but some kernel features are missing" with only known
+//     optional features missing -> ok=true, reason="missing optional CRIU features: ..."
+//   - Required missing features: "Looks good but some kernel features are missing" with features the engine needs missing -> ok=false, reason="criu check --all missing required features: ..."
+//   - Core check failure: does not contain "Looks good" or contains "Does not look good" -> ok=false, reason="criu check --all failed"
+func parseCRIUCheckOutput(raw string, checkMode string) (bool, string) {
+	if checkMode == "core" {
+		if strings.Contains(raw, "Looks good") && !strings.Contains(raw, "Does not look good") {
+			return true, ""
+		}
+		return false, "criu check failed"
+	}
+
+	if !strings.Contains(raw, "Looks good") || strings.Contains(raw, "Does not look good") {
+		return false, "criu check --all failed"
+	}
+
+	if !strings.Contains(raw, "Looks good but some kernel features are missing") {
+		return true, ""
+	}
+
+	var missingOptional []string
+	var missingRequired []string
+	seenOptional := make(map[string]bool)
+	seenRequired := make(map[string]bool)
+
+	lines := strings.Split(raw, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "Looks good") ||
+			strings.Contains(line, "which, depending on your process tree") ||
+			strings.Contains(line, "dump or restore failure.") ||
+			strings.HasPrefix(line, "(err: ") ||
+			strings.HasPrefix(line, "Version:") ||
+			strings.HasPrefix(line, "Running on") ||
+			strings.HasPrefix(line, "File ") {
+			continue
+		}
+
+		lower := strings.ToLower(line)
+		isWarning := strings.Contains(lower, "warn") ||
+			strings.Contains(lower, "error") ||
+			strings.Contains(lower, "not supported") ||
+			strings.Contains(lower, "missing") ||
+			strings.Contains(lower, "doesn't support") ||
+			strings.Contains(lower, "does not support") ||
+			strings.Contains(lower, "is off") ||
+			strings.Contains(lower, "failed")
+
+		if !isWarning {
+			continue
+		}
+
+		if strings.Contains(lower, "pagemap_scan_guard_pages") ||
+			strings.Contains(lower, "page_is_guard") ||
+			strings.Contains(lower, "madv_guard") {
+			if !seenOptional["pagemap_scan_guard_pages"] {
+				seenOptional["pagemap_scan_guard_pages"] = true
+				missingOptional = append(missingOptional, "pagemap_scan_guard_pages")
+			}
+			continue
+		}
+
+		if strings.Contains(lower, "timer_cr_ids") ||
+			strings.Contains(lower, "timer_create_restore_ids") {
+			if !seenOptional["timer_cr_ids"] {
+				seenOptional["timer_cr_ids"] = true
+				missingOptional = append(missingOptional, "timer_cr_ids")
+			}
+			continue
+		}
+
+		feat := extractFeatureName(line)
+		if !seenRequired[feat] {
+			seenRequired[feat] = true
+			missingRequired = append(missingRequired, feat)
+		}
+	}
+
+	if len(missingRequired) > 0 {
+		sort.Strings(missingRequired)
+		return false, "criu check --all missing required features: " + strings.Join(missingRequired, ", ")
+	}
+
+	if len(missingOptional) > 0 {
+		sort.Strings(missingOptional)
+		return true, "missing optional CRIU features: " + strings.Join(missingOptional, ", ")
+	}
+
+	return false, "criu check --all missing unspecified features"
+}
+
+// extractFeatureName extracts a canonical or clean feature identifier from a CRIU check warning line.
+func extractFeatureName(line string) string {
+	for _, p := range knownFeaturePatterns {
+		if p.regex.MatchString(line) {
+			return p.name
+		}
+	}
+
+	cleaned := line
+	if idx := strings.Index(cleaned, "): "); idx != -1 {
+		cleaned = strings.TrimSpace(cleaned[idx+3:])
+	} else if idx := strings.Index(cleaned, ": "); idx != -1 {
+		cleaned = strings.TrimSpace(cleaned[idx+2:])
+	}
+	return cleaned
 }
 
 // annotateNode publishes the node's CRIU capability verdict, version, and optional reason/remediation.
@@ -152,7 +343,11 @@ func annotateNode(ctx context.Context, c client.Client, nodeName, version, reaso
 		node.Annotations[NodeAnnotationCRIUVersion] = version
 	}
 	if ready {
-		delete(node.Annotations, NodeAnnotationCRIUReason)
+		if reason != "" {
+			node.Annotations[NodeAnnotationCRIUReason] = reason
+		} else {
+			delete(node.Annotations, NodeAnnotationCRIUReason)
+		}
 		delete(node.Annotations, NodeAnnotationCRIURemediation)
 	} else {
 		if reason != "" {
