@@ -14,14 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Joint gke-labs/workload-class × pod-migration End-to-End Verification Suite (Issue #296).
+# Joint gke-labs/workload-class × pod-migration Verification Suite Scaffold (Part of #296).
 #
-# Validates interoperability between gke-labs/workload-class (disruption windows,
-# per-pod PDB leasing, and Spot placement) and gke-labs/pod-migration (live pod
-# migration, snapshot gating, and checkpoint/restore orchestration) under
-# --invariant-mode=strict (0 invariant violations).
+# Scaffolds scenario definitions, manifest generation, offline schema and contract
+# self-testing, and cluster dispatch entry points for validating interoperability
+# between gke-labs/workload-class (disruption windows, per-pod PDB leasing, and Spot
+# placement) and gke-labs/pod-migration (live pod migration, snapshot gating, and
+# checkpoint/restore orchestration) under --invariant-mode=strict.
 #
-# Covers Scenarios 1–12:
+# Live execution of the full scenario matrix depends on in-flight and upstream features:
+#   - WorkloadClass liveMigration spec field (upstream)
+#   - #292: Eviction interception, deferral, and active disruption window replacement
+#   - #294: Placement compatibility, engine requirements, and cold fallback
+#   - #298: Pod age preservation across warm moves via origin-start-time
+#   - #303 / #308: Namespace managed opt-in and replacement pod gating
+#   - In-cluster CRIU runtime environment and fault injection harnesses
+#
+# Scenarios Scaffolded:
 #   1.  Drain outside disruption window (webhook 403 Forbidden, 0 storage writes)
 #   2.  Drain when window opens (warm migration with memory intact)
 #   3.  Dry run blocked by per-pod PDB (429 DisruptionBudget in Pending)
@@ -46,8 +55,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CLUSTER="${CLUSTER:-pm-e2e}"
 BUCKET="${BUCKET:-pm-e2e}"
 TIMEOUT="${TIMEOUT:-180}"
-WORKLOAD_IMAGE="${WORKLOAD_IMAGE:-busybox:1.36}"
-WORKLOAD_CLASS_INSTALL_URL="${WORKLOAD_CLASS_INSTALL_URL:-https://raw.githubusercontent.com/gke-labs/workload-class/main/dist/install.yaml}"
+WORKLOAD_IMAGE="${WORKLOAD_IMAGE:-busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662}"
+WORKLOAD_CLASS_COMMIT="${WORKLOAD_CLASS_COMMIT:-b0fd295f14f147fb933ae75498bd95701bcf5d9f}"
+WORKLOAD_CLASS_INSTALL_URL="${WORKLOAD_CLASS_INSTALL_URL:-https://raw.githubusercontent.com/gke-labs/workload-class/${WORKLOAD_CLASS_COMMIT}/dist/install.yaml}"
 GATE="gke.io/pod-migration-gate"
 
 SELF_TEST="false"
@@ -55,10 +65,64 @@ INSTALL_WORKLOAD_CLASS="false"
 SKIP_UNSUPPORTED="true"
 SELECTED_SCENARIOS=()
 
+PASSED_COUNT=0
+SKIPPED_COUNT=0
+FAILED_COUNT=0
+
+ALL_SCENARIOS=(
+  s1_drain_outside_window
+  s2_drain_when_window_opens
+  s3_dry_run_blocked_by_per_pod_pdb
+  s4_window_closes_mid_checkpoint
+  s5_spoofed_fenced_outside_window
+  s6_checkpoint_timeout
+  s7_allowed_caller_outside_window
+  s8_spot_preemption_reclaim
+  s9_incompatible_node_shape
+  s10_opt_out_missing_storage
+  s11_webhook_outage_forced_deletion
+  s12_pod_age_origin_start_time
+)
+
 log() { printf '\033[1;36m[%s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
-fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
-skip() { printf '\033[1;35m[SKIP]\033[0m %s\n' "$*"; }
+fail() {
+  printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2
+  FAILED_COUNT=$((FAILED_COUNT + 1))
+  exit 1
+}
+skip() {
+  printf '\033[1;35m[SKIP]\033[0m %s\n' "$*"
+  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+}
+pass() {
+  printf '\033[1;32m[PASS]\033[0m %s\n' "$*"
+  PASSED_COUNT=$((PASSED_COUNT + 1))
+}
+
+skip_or_fail_dependency() {
+  local scenario=$1 blocker=$2
+  if [[ "${SKIP_UNSUPPORTED}" == "true" ]]; then
+    skip "${scenario}: ${blocker}"
+  else
+    fail "${scenario} failed: blocked by ${blocker} (--no-skip-unsupported specified)"
+  fi
+}
+
+get_closed_window_day() {
+  local current_day
+  current_day="$(date -u +%A)"
+  case "${current_day}" in
+    Monday) echo "Wednesday" ;;
+    Tuesday) echo "Thursday" ;;
+    Wednesday) echo "Friday" ;;
+    Thursday) echo "Saturday" ;;
+    Friday) echo "Sunday" ;;
+    Saturday) echo "Monday" ;;
+    Sunday) echo "Tuesday" ;;
+    *) echo "Saturday" ;;
+  esac
+}
 
 # --- Argument Parsing ---
 while [[ $# -gt 0 ]]; do
@@ -230,7 +294,7 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
       - name: app
-        image: ${WORKLOAD_IMAGE%@*}
+        image: "${WORKLOAD_IMAGE}"
         imagePullPolicy: IfNotPresent
         command: ["/bin/sh", "-c"]
         args:
@@ -254,15 +318,17 @@ run_self_test() {
   log "Validating scenario YAML generation..."
   local tmp_yaml
   tmp_yaml="$(mktemp)"
-  trap 'rm -f "${tmp_yaml}"' EXIT
+  trap 'rm -f "${tmp_yaml:-}"' EXIT
 
-  render_workload_class_guardrail > "${tmp_yaml}"
-  echo "---" >> "${tmp_yaml}"
-  render_workload_class "test-wc" "test-ns" "Saturday,Sunday" "00:00" "04:00" "test-sa" >> "${tmp_yaml}"
-  echo "---" >> "${tmp_yaml}"
-  render_pod_migration_storage "test-ns" >> "${tmp_yaml}"
-  echo "---" >> "${tmp_yaml}"
-  render_workload_deployment "test-app" "test-ns" "test-wc" "true" >> "${tmp_yaml}"
+  {
+    render_workload_class_guardrail
+    echo "---"
+    render_workload_class "test-wc" "test-ns" "Saturday,Sunday" "00:00" "04:00" "test-sa"
+    echo "---"
+    render_pod_migration_storage "test-ns"
+    echo "---"
+    render_workload_deployment "test-app" "test-ns" "test-wc" "true"
+  } > "${tmp_yaml}"
 
   python3 -c "
 import yaml, sys
@@ -285,11 +351,12 @@ assert pm['spec']['storage']['location'].startswith('gs://')
 
 deploy = next(d for d in docs if d.get('kind') == 'Deployment')
 assert deploy['spec']['template']['metadata']['labels']['pod-migration.gke.io/enabled'] == 'true'
+assert '@sha256:' in deploy['spec']['template']['spec']['containers'][0]['image'] or ':' in deploy['spec']['template']['spec']['containers'][0]['image'], 'Image must retain tag or digest'
 " || fail "Generated scenario YAML failed structure validation"
   log "  ok: Scenario YAML structures and schemas validated"
 
-  # 2. Verify controller admission policy and webhook scoping compatibility
-  log "Validating controller deploy.yaml admission and namespace scoping..."
+  # 2. Verify controller admission policy and webhook namespace scoping
+  log "Validating controller deploy.yaml webhooks and namespace scoping..."
   local deploy_yaml="${REPO_ROOT}/controller/deploy.yaml"
   if [[ -f "${deploy_yaml}" ]]; then
     python3 -c "
@@ -304,46 +371,40 @@ vwc = next((d for d in docs if d.get('kind') == 'ValidatingWebhookConfiguration'
 assert mwc is not None, 'Missing MutatingWebhookConfiguration in controller deploy.yaml'
 assert vwc is not None, 'Missing ValidatingWebhookConfiguration in controller deploy.yaml'
 
-# Ensure veviction and mpodgate exist and are configured
+# Ensure veviction and mpodgate exist and verify namespaceSelector excludes kube-system
 veviction = next((w for w in vwc.get('webhooks', []) if 'veviction' in w.get('name', '')), None)
 assert veviction is not None, 'veviction must exist in ValidatingWebhookConfiguration'
 assert veviction.get('failurePolicy') == 'Ignore', 'veviction failurePolicy must be Ignore'
+v_ns = veviction.get('namespaceSelector', {})
+v_exprs = v_ns.get('matchExpressions', [])
+v_excluded = next((e.get('values', []) for e in v_exprs if e.get('key') == 'kubernetes.io/metadata.name' and e.get('operator') == 'NotIn'), [])
+assert 'kube-system' in v_excluded, f'veviction namespaceSelector must exclude kube-system, found {v_excluded}'
 
 mpodgate = next((w for w in mwc.get('webhooks', []) if 'mpodgate' in w.get('name', '')), None)
 assert mpodgate is not None, 'mpodgate must exist in MutatingWebhookConfiguration'
+m_ns = mpodgate.get('namespaceSelector', {})
+m_exprs = m_ns.get('matchExpressions', [])
+m_excluded = next((e.get('values', []) for e in m_exprs if e.get('key') == 'kubernetes.io/metadata.name' and e.get('operator') == 'NotIn'), [])
+assert 'kube-system' in m_excluded, f'mpodgate namespaceSelector must exclude kube-system, found {m_excluded}'
 " || fail "Controller deploy.yaml failed webhook namespace scoping check"
-    log "  ok: Controller webhook namespace scoping confirmed"
+    log "  ok: Controller webhook namespace scoping confirmed (veviction & mpodgate exclude kube-system)"
   fi
 
   # 3. Verify scenario matrix completeness
-  local scenarios=(
-    s1_drain_outside_window
-    s2_drain_when_window_opens
-    s3_dry_run_blocked_by_per_pod_pdb
-    s4_window_closes_mid_checkpoint
-    s5_spoofed_fenced_outside_window
-    s6_checkpoint_timeout
-    s7_allowed_caller_outside_window
-    s8_spot_preemption_reclaim
-    s9_incompatible_node_shape
-    s10_opt_out_missing_storage
-    s11_webhook_outage_forced_deletion
-    s12_pod_age_origin_start_time
-  )
   log "Checking 12/12 scenario dispatch functions..."
-  for s in "${scenarios[@]}"; do
+  for s in "${ALL_SCENARIOS[@]}"; do
     if ! declare -F "${s}" >/dev/null; then
       fail "Missing scenario handler: ${s}"
     fi
   done
-  log "  ok: All 12 scenarios implemented and mapped"
+  log "  ok: All 12 scenario dispatch functions declared and mapped"
 
   # 4. Check invariant governance (T0)
   log "Checking invariant governance posture..."
   "${REPO_ROOT}/verification-suite/verify_invariant_governance.sh" --self-test >/dev/null
   log "  ok: Invariant governance self-test passed"
 
-  log "PASS: run_workload_class_e2e self-test verified (12/12 scenarios validated)"
+  log "PASS: run_workload_class_e2e --self-test completed (manifest generation, webhook namespace scoping, scenario dispatch mapping, and invariant governance validated)"
   exit 0
 }
 
@@ -351,17 +412,27 @@ assert mpodgate is not None, 'mpodgate must exist in MutatingWebhookConfiguratio
 
 check_cluster() {
   sleep 2 # Let asynchronous events propagate
-  local violations gated restarts
-  violations="$(kubectl get events -A --field-selector reason=InvariantViolation -o json 2>/dev/null |
-    jq -r '.items[] | "\(.involvedObject.namespace)/\(.involvedObject.name): \(.message)"' || true)"
+  local events_json pods_json controller_pods_json
+
+  if ! events_json="$(kubectl get events -A --field-selector reason=InvariantViolation -o json 2>&1)"; then
+    fail "check_cluster failed querying InvariantViolation events: ${events_json}"
+  fi
+  local violations
+  violations="$(jq -r '.items[] | "\(.involvedObject.namespace)/\(.involvedObject.name): \(.message)"' <<<"${events_json}")"
   [[ -z "${violations}" ]] || fail "invariant violations detected:"$'\n'"${violations}"
 
-  gated="$(kubectl get pods -A -o json 2>/dev/null |
-    jq -r --arg g "${GATE}" '.items[] | select(any(.spec.schedulingGates[]?; .name == $g)) | "\(.metadata.namespace)/\(.metadata.name)"' || true)"
+  if ! pods_json="$(kubectl get pods -A -o json 2>&1)"; then
+    fail "check_cluster failed querying pods: ${pods_json}"
+  fi
+  local gated
+  gated="$(jq -r --arg g "${GATE}" '.items[] | select(any(.spec.schedulingGates[]?; .name == $g)) | "\(.metadata.namespace)/\(.metadata.name)"' <<<"${pods_json}")"
   [[ -z "${gated}" ]] || fail "pods still held by ${GATE}: ${gated}"
 
-  restarts="$(kubectl get pods -A -l 'app.kubernetes.io/name=pod-migration' -o json 2>/dev/null |
-    jq -r '.items[] | select(any(.status.containerStatuses[]?; .restartCount > 0)) | "\(.metadata.namespace)/\(.metadata.name)"' || true)"
+  if ! controller_pods_json="$(kubectl get pods -A -l 'app=pod-migration-controller' -o json 2>&1)"; then
+    fail "check_cluster failed querying controller pods: ${controller_pods_json}"
+  fi
+  local restarts
+  restarts="$(jq -r '.items[] | select(any(.status.containerStatuses[]?; .restartCount > 0)) | "\(.metadata.namespace)/\(.metadata.name)"' <<<"${controller_pods_json}")"
   [[ -z "${restarts}" ]] || fail "controller containers restarted during test: ${restarts}"
 }
 
@@ -396,7 +467,7 @@ setup_test_namespace() {
   local ns=$1
   kubectl delete namespace "${ns}" --ignore-not-found --wait --timeout="${TIMEOUT}s" >/dev/null 2>&1 || true
   kubectl create namespace "${ns}" >/dev/null
-  # Enforce opt-in managed namespace label (#303)
+  # Enforce opt-in managed namespace label (#303 / #308)
   kubectl label namespace "${ns}" pod-migration.gke.io/managed="true" --overwrite >/dev/null
   render_pod_migration_storage "${ns}" | kubectl apply -f - >/dev/null
 }
@@ -413,37 +484,9 @@ s1_drain_outside_window() {
     return 0
   fi
 
-  setup_test_namespace "${ns}"
-  # Window set to a day/time outside now (e.g. Saturday only)
-  render_workload_class "s1-wc" "${ns}" "Saturday" "01:00" "02:00" | kubectl apply -f - >/dev/null
-  render_workload_deployment "s1-app" "${ns}" "s1-wc" | kubectl apply -f - >/dev/null
-
-  kubectl -n "${ns}" rollout status deployment/s1-app --timeout="${TIMEOUT}s" >/dev/null
-  local pod_name node_name
-  pod_name="$(kubectl -n "${ns}" get pod -l app=s1-app -o jsonpath='{.items[0].metadata.name}')"
-  node_name="$(kubectl -n "${ns}" get pod "${pod_name}" -o jsonpath='{.spec.nodeName}')"
-
-  log "Attempting eviction of ${pod_name} outside disruption window..."
-  local evict_res
-  evict_res="$(kubectl create --raw "/api/v1/namespaces/${ns}/pods/${pod_name}/eviction" \
-    -f - <<<"{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":{\"name\":\"${pod_name}\",\"namespace\":\"${ns}\"}}" 2>&1 || true)"
-
-  if [[ "${evict_res}" =~ 403|Forbidden|outside\ of\ allowed\ disruption\ windows ]]; then
-    log "  ok: Eviction blocked by WorkloadClass disruption webhook: ${evict_res}"
-  else
-    if [[ "${SKIP_UNSUPPORTED}" == "true" ]]; then
-      skip "Scenario 1: Eviction response did not match expected 403: ${evict_res}"
-      return 0
-    else
-      fail "Scenario 1 failed: eviction outside window was not blocked with 403: ${evict_res}"
-    fi
-  fi
-
-  # Assert pod is untouched and running
-  local phase
-  phase="$(kubectl -n "${ns}" get pod "${pod_name}" -o jsonpath='{.status.phase}')"
-  [[ "${phase}" == "Running" ]] || fail "Scenario 1: Pod ${pod_name} is in phase ${phase}, expected Running"
-  log "  ok: Pod ${pod_name} remained running untouched on ${node_name}"
+  # Upstream WorkloadClass controller does not yet expose liveMigration field, and
+  # pod-migration eviction interception/deferral is pending #292.
+  skip_or_fail_dependency "Scenario 1" "WorkloadClass liveMigration support and eviction deferral (#292)"
 }
 
 # Scenario 2: Drain when the window opens
@@ -456,20 +499,7 @@ s2_drain_when_window_opens() {
     return 0
   fi
 
-  setup_test_namespace "${ns}"
-  # Window set to active (covering all days, 00:00 to 23:59 UTC)
-  render_workload_class "s2-wc" "${ns}" "Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday" "00:00" "23:59" | kubectl apply -f - >/dev/null
-  render_workload_deployment "s2-app" "${ns}" "s2-wc" | kubectl apply -f - >/dev/null
-
-  kubectl -n "${ns}" rollout status deployment/s2-app --timeout="${TIMEOUT}s" >/dev/null
-  local pod_name
-  pod_name="$(kubectl -n "${ns}" get pod -l app=s2-app -o jsonpath='{.items[0].metadata.name}')"
-
-  log "Evicting ${pod_name} within active window..."
-  kubectl create --raw "/api/v1/namespaces/${ns}/pods/${pod_name}/eviction" \
-    -f - <<<"{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":{\"name\":\"${pod_name}\",\"namespace\":\"${ns}\"}}" >/dev/null
-
-  log "  ok: Eviction admitted within active window"
+  skip_or_fail_dependency "Scenario 2" "warm migration with state carry-over requires CRIU runtime class and #292 active window replacement"
 }
 
 # Scenario 3: Dry run blocked only by the per-pod PDB
@@ -482,23 +512,7 @@ s3_dry_run_blocked_by_per_pod_pdb() {
     return 0
   fi
 
-  setup_test_namespace "${ns}"
-  # Closed window creates per-pod PDB with maxUnavailable: 0
-  render_workload_class "s3-wc" "${ns}" "Saturday" "00:00" "01:00" | kubectl apply -f - >/dev/null
-  render_workload_deployment "s3-app" "${ns}" "s3-wc" | kubectl apply -f - >/dev/null
-
-  kubectl -n "${ns}" rollout status deployment/s3-app --timeout="${TIMEOUT}s" >/dev/null
-  local pod_name
-  pod_name="$(kubectl -n "${ns}" get pod -l app=s3-app -o jsonpath='{.items[0].metadata.name}')"
-
-  # Wait for WorkloadClass controller to create per-pod PDB
-  if wait_until "per-pod PDB to exist" kubectl -n "${ns}" get pdb "workload-${pod_name}"; then
-    local max_unavail
-    max_unavail="$(kubectl -n "${ns}" get pdb "workload-${pod_name}" -o jsonpath='{.spec.maxUnavailable}')"
-    log "  ok: Per-pod PDB workload-${pod_name} established with maxUnavailable=${max_unavail}"
-  else
-    skip "Scenario 3: Per-pod PDB creation timed out"
-  fi
+  skip_or_fail_dependency "Scenario 3" "dry-run eviction requires WorkloadClass per-pod PDB controller leasing (#42)"
 }
 
 # Scenario 4: Window closes mid-checkpoint
@@ -506,10 +520,7 @@ s3_dry_run_blocked_by_per_pod_pdb() {
 s4_window_closes_mid_checkpoint() {
   local ns="wc-e2e-s4"
   log "== Scenario 4: Window closes mid-checkpoint (lease lets final eviction finish)"
-  if [[ "${SKIP_UNSUPPORTED}" == "true" ]]; then
-    skip "Scenario 4: Validated via envtest TestLeasedPDBWindowBoundary"
-    return 0
-  fi
+  skip_or_fail_dependency "Scenario 4" "window boundary lease persistence during checkpoint requires in-flight lease controller (#292)"
 }
 
 # Scenario 5: Spoofed pod-migration.gke.io/fenced: "true" outside window
@@ -522,27 +533,7 @@ s5_spoofed_fenced_outside_window() {
     return 0
   fi
 
-  setup_test_namespace "${ns}"
-  render_workload_class "s5-wc" "${ns}" "Saturday" "00:00" "01:00" | kubectl apply -f - >/dev/null
-  render_workload_deployment "s5-app" "${ns}" "s5-wc" | kubectl apply -f - >/dev/null
-
-  kubectl -n "${ns}" rollout status deployment/s5-app --timeout="${TIMEOUT}s" >/dev/null
-  local pod_name
-  pod_name="$(kubectl -n "${ns}" get pod -l app=s5-app -o jsonpath='{.items[0].metadata.name}')"
-
-  # Attempt spoofing fence label directly
-  kubectl -n "${ns}" label pod "${pod_name}" "pod-migration.gke.io/fenced=true" --overwrite >/dev/null 2>&1 || true
-
-  # Attempt eviction outside window
-  local evict_res
-  evict_res="$(kubectl create --raw "/api/v1/namespaces/${ns}/pods/${pod_name}/eviction" \
-    -f - <<<"{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":{\"name\":\"${pod_name}\",\"namespace\":\"${ns}\"}}" 2>&1 || true)"
-
-  if [[ "${evict_res}" =~ 403|Forbidden ]]; then
-    log "  ok: Spoofed eviction denied by disruption webhook: ${evict_res}"
-  else
-    skip "Scenario 5: Eviction response: ${evict_res}"
-  fi
+  skip_or_fail_dependency "Scenario 5" "spoofed fenced rejection requires WorkloadClass disruption webhook and #292 lease validation"
 }
 
 # Scenario 6: Checkpoint timeout
@@ -550,7 +541,7 @@ s5_spoofed_fenced_outside_window() {
 s6_checkpoint_timeout() {
   local ns="wc-e2e-s6"
   log "== Scenario 6: Checkpoint timeout aborts cleanly (no frozen pods)"
-  log "  ok: Verified via controller/internal/controller/podmigrationjob_controller_test.go"
+  skip_or_fail_dependency "Scenario 6" "in-cluster checkpoint timeout cancellation requires timeout fault injector; unit-tested in controller/internal/controller/podmigrationjob_controller_test.go"
 }
 
 # Scenario 7: Allowed caller outside the window
@@ -563,24 +554,7 @@ s7_allowed_caller_outside_window() {
     return 0
   fi
 
-  setup_test_namespace "${ns}"
-  local sa="test-autoscaler-sa"
-  kubectl -n "${ns}" create serviceaccount "${sa}" >/dev/null 2>&1 || true
-
-  render_workload_class "s7-wc" "${ns}" "Saturday" "00:00" "01:00" "${sa}" | kubectl apply -f - >/dev/null
-  render_workload_deployment "s7-app" "${ns}" "s7-wc" | kubectl apply -f - >/dev/null
-
-  kubectl -n "${ns}" rollout status deployment/s7-app --timeout="${TIMEOUT}s" >/dev/null
-  local pod_name
-  pod_name="$(kubectl -n "${ns}" get pod -l app=s7-app -o jsonpath='{.items[0].metadata.name}')"
-
-  log "Attempting eviction as allowed subject system:serviceaccount:${ns}:${sa}..."
-  local evict_res
-  evict_res="$(kubectl create --raw "/api/v1/namespaces/${ns}/pods/${pod_name}/eviction" \
-    --as="system:serviceaccount:${ns}:${sa}" \
-    -f - <<<"{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":{\"name\":\"${pod_name}\",\"namespace\":\"${ns}\"}}" 2>&1 || true)"
-
-  log "  ok: Allowed caller lease interaction evaluated: ${evict_res}"
+  skip_or_fail_dependency "Scenario 7" "allowed caller outside window requires RBAC bindings for impersonated SA and active per-pod lease controller (#292)"
 }
 
 # Scenario 8: Spot VM reclaim (~30s notice)
@@ -588,7 +562,7 @@ s7_allowed_caller_outside_window() {
 s8_spot_preemption_reclaim() {
   local ns="wc-e2e-s8"
   log "== Scenario 8: Spot VM reclaim bypasses WorkloadClass and PDBs (#305)"
-  log "  ok: Controller deletes source pod directly at end of preemption checkpoint (#305 verified)"
+  skip_or_fail_dependency "Scenario 8" "Spot VM reclaim preemption bypass requires node preemption injection harness (#305)"
 }
 
 # Scenario 9: Incompatible node shape or restore error
@@ -596,7 +570,7 @@ s8_spot_preemption_reclaim() {
 s9_incompatible_node_shape() {
   local ns="wc-e2e-s9"
   log "== Scenario 9: Incompatible node shape or restore error (#294)"
-  log "  ok: Placement incompatibility signals (engine=<e> requirements=<r>) verified via #294 / PR #299"
+  skip_or_fail_dependency "Scenario 9" "incompatible node shape cold-start fallback requires heterogeneous node topology (#294)"
 }
 
 # Scenario 10: Opt-out or missing storage
@@ -604,20 +578,7 @@ s9_incompatible_node_shape() {
 s10_opt_out_missing_storage() {
   local ns="wc-e2e-s10"
   log "== Scenario 10: Opt-out or missing storage skips migration and cold-restarts"
-  setup_test_namespace "${ns}"
-  # Delete PodMigration storage object in this namespace
-  kubectl -n "${ns}" delete podmigration default --ignore-not-found >/dev/null
-
-  render_workload_deployment "s10-app" "${ns}" "unmanaged" "false" | kubectl apply -f - >/dev/null
-  kubectl -n "${ns}" rollout status deployment/s10-app --timeout="${TIMEOUT}s" >/dev/null
-  local pod_name
-  pod_name="$(kubectl -n "${ns}" get pod -l app=s10-app -o jsonpath='{.items[0].metadata.name}')"
-
-  log "Evicting non-opted-in pod ${pod_name} without storage..."
-  kubectl create --raw "/api/v1/namespaces/${ns}/pods/${pod_name}/eviction" \
-    -f - <<<"{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":{\"name\":\"${pod_name}\",\"namespace\":\"${ns}\"}}" >/dev/null 2>&1 || true
-
-  log "  ok: Non-opted-in pod cold-restarted cleanly without PMJ"
+  skip_or_fail_dependency "Scenario 10" "opt-out cold start validation requires controller deployment with strict invariant mode (#296)"
 }
 
 # Scenario 11: Webhook outage and forced deletion
@@ -625,7 +586,7 @@ s10_opt_out_missing_storage() {
 s11_webhook_outage_forced_deletion() {
   local ns="wc-e2e-s11"
   log "== Scenario 11: Webhook outage fail-open & forced deletion cleanup (#295)"
-  log "  ok: Runc creation webhook matches Ignore fail-open; forced deletion cleans stale PMJ"
+  skip_or_fail_dependency "Scenario 11" "webhook outage fail-open requires mutating webhook fault injector (#295)"
 }
 
 # Scenario 12: Pod age after a warm move
@@ -633,10 +594,7 @@ s11_webhook_outage_forced_deletion() {
 s12_pod_age_origin_start_time() {
   local ns="wc-e2e-s12"
   log "== Scenario 12: Pod age after warm move (origin-start-time, #298)"
-  if [[ "${SKIP_UNSUPPORTED}" == "true" ]]; then
-    skip "Scenario 12: Workload age preservation via origin-start-time is tracked under unmerged #298"
-    return 0
-  fi
+  skip_or_fail_dependency "Scenario 12" "pod age preservation via origin-start-time requires unmerged #298"
 }
 
 # --- 5. Main Execution Flow ---
@@ -649,8 +607,10 @@ main() {
   local current_ctx
   current_ctx="$(kubectl config current-context 2>/dev/null || true)"
   if [[ -z "${current_ctx}" ]]; then
-    warn "No active kubectl context found. Running in --self-test mode."
-    run_self_test
+    fail "No active Kubernetes cluster context found. To run offline self-test, pass --self-test."
+  fi
+  if ! kubectl cluster-info >/dev/null 2>&1; then
+    fail "Cluster context '${current_ctx}' is not reachable. To run offline self-test, pass --self-test."
   fi
 
   log "Starting Joint gke-labs/workload-class × pod-migration E2E Suite"
@@ -659,20 +619,7 @@ main() {
 
   local scenarios=()
   if ((${#SELECTED_SCENARIOS[@]} == 0)); then
-    scenarios=(
-      s1_drain_outside_window
-      s2_drain_when_window_opens
-      s3_dry_run_blocked_by_per_pod_pdb
-      s4_window_closes_mid_checkpoint
-      s5_spoofed_fenced_outside_window
-      s6_checkpoint_timeout
-      s7_allowed_caller_outside_window
-      s8_spot_preemption_reclaim
-      s9_incompatible_node_shape
-      s10_opt_out_missing_storage
-      s11_webhook_outage_forced_deletion
-      s12_pod_age_origin_start_time
-    )
+    scenarios=("${ALL_SCENARIOS[@]}")
   else
     for s in "${SELECTED_SCENARIOS[@]}"; do
       case "${s}" in
@@ -689,20 +636,7 @@ main() {
         11|s11|s11_webhook_outage_forced_deletion) scenarios+=(s11_webhook_outage_forced_deletion) ;;
         12|s12|s12_pod_age_origin_start_time) scenarios+=(s12_pod_age_origin_start_time) ;;
         all)
-          scenarios=(
-            s1_drain_outside_window
-            s2_drain_when_window_opens
-            s3_dry_run_blocked_by_per_pod_pdb
-            s4_window_closes_mid_checkpoint
-            s5_spoofed_fenced_outside_window
-            s6_checkpoint_timeout
-            s7_allowed_caller_outside_window
-            s8_spot_preemption_reclaim
-            s9_incompatible_node_shape
-            s10_opt_out_missing_storage
-            s11_webhook_outage_forced_deletion
-            s12_pod_age_origin_start_time
-          )
+          scenarios=("${ALL_SCENARIOS[@]}")
           break
           ;;
         *) fail "Unknown scenario: ${s}" ;;
@@ -715,7 +649,15 @@ main() {
     check_cluster
   done
 
-  log "PASS: Joint WorkloadClass × PodMigration E2E suite completed with 0 invariant violations."
+  if ((FAILED_COUNT > 0)); then
+    fail "FAILED: Joint WorkloadClass × PodMigration E2E suite encountered ${FAILED_COUNT} failure(s)."
+  elif ((SKIPPED_COUNT > 0)); then
+    warn "INCOMPLETE: Joint WorkloadClass × PodMigration E2E suite finished with ${SKIPPED_COUNT} scenario(s) skipped (passed: ${PASSED_COUNT}, skipped: ${SKIPPED_COUNT}, failed: ${FAILED_COUNT})."
+  elif ((PASSED_COUNT > 0)); then
+    log "PASS: Joint WorkloadClass × PodMigration E2E suite completed all scenarios with 0 invariant violations."
+  else
+    warn "NOOP: No scenarios were executed."
+  fi
 }
 
 main "$@"
