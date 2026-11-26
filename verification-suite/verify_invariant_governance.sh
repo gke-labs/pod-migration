@@ -42,6 +42,8 @@
 #   5. Never exempts detached HEAD (`HEAD` / `DETACHED_HEAD`); only direct
 #      commits on `main` skip per-PR lane diff enforcement.
 #   6. Fails closed if the git diff against a base ref cannot be resolved.
+#   7. Computes changed files without rename detection, so a file moved out of
+#      (or into) a governed path counts against both its old and new paths.
 
 set -euo pipefail
 
@@ -218,11 +220,11 @@ resolve_changed_files() {
   base="$(resolve_base_ref)" || return 1
 
   if [[ "${base}" == "HEAD^1" ]]; then
-    git -C "${REPO_ROOT}" diff --name-only HEAD^1 HEAD
+    git -C "${REPO_ROOT}" diff --no-renames --name-only HEAD^1 HEAD
     return 0
   fi
 
-  git -C "${REPO_ROOT}" diff --name-only "${base}...HEAD"
+  git -C "${REPO_ROOT}" diff --no-renames --name-only "${base}...HEAD"
 }
 
 collect_pr_commit_messages() {
@@ -433,8 +435,42 @@ EOF
     exit 1
   fi
 
+  # 11. Negative (renames): moving a governed file out of controller/internal/invariants/
+  # must still count as touching it. git's default rename detection would report
+  # only the new path, so the diff must be computed without rename detection.
+  local rn_repo="${tmp_dir}/rename-repo"
+  if ! (
+    set -e
+    git init -q -b main "${rn_repo}"
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    mkdir -p "${rn_repo}/controller/internal/invariants"
+    printf 'package invariants\n\n// rule body\nvar x = 1\n' > "${rn_repo}/controller/internal/invariants/rules.go"
+    git -C "${rn_repo}" add -A
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q -m rules
+    git -C "${rn_repo}" checkout -q -b feature/move-rule
+    mkdir -p "${rn_repo}/controller/x"
+    git -C "${rn_repo}" mv controller/internal/invariants/rules.go controller/x/rules.go
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q -m "chore: move file"
+  ) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: could not build the rename fixture repository"
+    exit 1
+  fi
+  local rn_changed
+  rn_changed="$(REPO_ROOT="${rn_repo}" BASE_REF="main" HAS_CHANGED_OVERRIDE="false" resolve_changed_files)"
+  if ! grep -qx 'controller/internal/invariants/rules.go' <<<"${rn_changed}"; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: a file renamed out of controller/internal/invariants/ did not report its old path (got: $(tr '\n' ' ' <<<"${rn_changed}"))"
+    exit 1
+  fi
+  if evaluate_governance "feature/move-rule" "${valid_co}" "${rn_changed}" "false" "chore: move file" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: Lane 1 allowed moving a file out of controller/internal/invariants/"
+    exit 1
+  fi
+
   rm -rf "${tmp_dir}"
-  log "Self-test PASSED: all 10 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, and co-change cases verified"
+  log "Self-test PASSED: all 11 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, co-change and rename cases verified"
 }
 
 main() {
