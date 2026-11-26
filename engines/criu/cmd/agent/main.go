@@ -366,9 +366,9 @@ func runNodeWorker(ctx context.Context, nd nodeWorker) {
 		log.Error(err, "CRIU bootstrap failed (continuing; node remains unready)")
 	}
 	// Publish this node's facts as restore placement labels (#257) after
-	// bootstrap, so the CRIU bundle's version is readable, and keep them
-	// current. A failed bootstrap still publishes: a version the agent
-	// can't read is published as unknown. Without this, checkpoints still
+	// bootstrap, and keep them current. A failed bootstrap still publishes;
+	// the CRIU version comes from the agent image's bundle (#109), and one
+	// the agent can't read is published as unknown. Without this, checkpoints still
 	// say placementLabels v1, and every constrained restore waits out the
 	// restore ceiling for a node with the labels.
 	go nd.RunNodeFactsLoop(ctx, node.DefaultNodeFactsInterval, node.DefaultNodeFactsRetry)

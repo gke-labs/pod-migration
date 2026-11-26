@@ -49,7 +49,7 @@ func TestInstallCRIUBundle_SkipsSubdirectories(t *testing.T) {
 	}
 
 	// installCRIUBundleDirs must skip licenses/ without erroring on copyFile.
-	ver, err := installCRIUBundleDirs(srcDir, dstDir, confDir, binDir)
+	ver, err := installCRIUBundleDirs(srcDir, dstDir, confDir, binDir, []byte("#!/bin/sh\n"))
 	if err != nil {
 		t.Fatalf("installCRIUBundleDirs failed: %v", err)
 	}

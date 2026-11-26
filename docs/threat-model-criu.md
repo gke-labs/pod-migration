@@ -29,6 +29,7 @@ The CRIU snapshot engine enables live process checkpoint and restore for `runc` 
 |   |   - Privileged host daemon: hostPID=true, hostNetwork=true                    |   |
 |   |   - Interacts with kubelet ContainerCheckpoint API and local containerd       |   |
 |   |   - Installs CRIU bundle: /var/lib/pod-migrate/criu-bundle/ & /usr/local/sbin |   |
+|   |     (COS: /home/kubernetes/bin, bound over /usr/local)                        |   |
 |   |   - Executes runc restore into replacement pod sandbox namespaces             |   |
 |   +-------------------------------------------------------------------------------+   |
 |                                           |                                           |
@@ -74,7 +75,14 @@ The agent mounts host filesystem paths to bridge Kubernetes and container runtim
 | `/var/lib/kubelet/checkpoints` | `/var/lib/kubelet/checkpoints` | `type: DirectoryOrCreate`         | Staging directory where the local kubelet writes container checkpoint tarballs.                                                                  |
 | `/var/lib/kubelet/pods`        | `/var/lib/kubelet/pods`        | `readOnly: true`                  | Reads downward-API volume projections and annotations for target pods.                                                                           |
 | `/etc/criu`                    | `/etc/criu`                    | `type: DirectoryOrCreate`         | Hosts global CRIU configuration (`runc.conf`) containing default flags (`tcp-close`, `skip-in-flight`, `file-validation buildid`, `file-locks`). |
-| `/usr/local/sbin`              | `/usr/local/sbin`              | `type: DirectoryOrCreate`         | Target directory where the agent installs the atomic `/usr/local/sbin/criu` wrapper script so containerd/runc can resolve `criu` on system PATH. |
+
+The agent mounts no directory for the `criu` wrapper: it installs the bundle
+and the wrapper through the host's root, `/proc/1/root`, which `hostPID`
+gives it, in `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin`, or on
+COS under `/home/kubernetes/bin` with a bind mount over `/usr/local` that it
+makes in the host's mount namespace (#109; `engines/criu/README.md`, Node
+images). A compromised agent could write anywhere on the host through
+`/proc/1/root`, as it already could through `nsenter -t 1`.
 
 ### Blast Radius & Mitigations
 
@@ -242,8 +250,9 @@ When `pod-migrate-agent` starts on a node, it applies the following modification
 
 | Modification            | Host Location                       | Rollback / Cleanup                                                                                                                                  |
 | ----------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **CRIU Bundle**         | `/var/lib/pod-migrate/criu-bundle/` | Directory containing self-contained `criu.bin`, bundled shared libraries, dynamic linker, and `VERSION` file. Manually removable when uninstalling. |
-| **CRIU System Wrapper** | `/usr/local/sbin/criu`              | Executable wrapper script that launches CRIU via the bundled dynamic linker. Overwritten atomically.                                                |
+| **CRIU Bundle**         | `/var/lib/pod-migrate/criu-bundle/` (COS: `/home/kubernetes/bin/pod-migrate/criu-bundle/`) | Directory containing self-contained `criu.bin`, bundled shared libraries, dynamic linker, and `VERSION` file. Manually removable when uninstalling (on COS, `umount /usr/local` first). |
+| **CRIU System Wrapper** | `/usr/local/sbin/criu` (COS: `/home/kubernetes/bin/pod-migrate/usr-local/sbin/criu`) | Executable wrapper script that launches CRIU via the bundled dynamic linker. Overwritten atomically.                                                |
+| **`/usr/local` bind mount (COS only)** | `/usr/local`         | `/home/kubernetes/bin/pod-migrate/usr-local` bound over COS's empty `/usr/local` so containerd finds `/usr/local/sbin/criu`. Lasts until reboot; `umount /usr/local` removes it. |
 | **Runc Configuration**  | `/etc/criu/runc.conf`               | CRIU global configuration specifying `tcp-close`, `skip-in-flight`, `file-validation buildid`, and `file-locks`.                                    |
 | **Node Annotations**    | Kubernetes `Node` metadata          | Stamped with `pod-migrate.io/criu-ready` (`true` or `false`) and `pod-migrate.io/criu-version`. Stale annotations cleared on demotion.              |
 | **Socket Watching**     | `/run/containerd/containerd.sock`   | Actively monitored for inode changes to detect containerd daemon restarts and re-probe readiness.                                                   |

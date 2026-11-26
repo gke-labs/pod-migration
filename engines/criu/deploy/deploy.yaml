@@ -276,6 +276,10 @@ spec:
     spec:
       serviceAccountName: pod-migrate-agent
       hostNetwork: true
+      # hostPID also gives the agent the host's root, /proc/1/root, through
+      # which it installs CRIU: under /var/lib/pod-migrate and
+      # /usr/local/sbin, or on COS, whose root is read-only, under
+      # /home/kubernetes/bin (#109; see engines/criu/README.md).
       hostPID: true
       affinity:
         nodeAffinity:
@@ -288,11 +292,6 @@ spec:
                   - key: sandbox.gke.io/runtime
                     operator: NotIn
                     values: ["gvisor"]
-                  # COS mounts /usr/local read-only until #109 moves the CRIU
-                  # install path onto /home/kubernetes/bin.
-                  - key: cloud.google.com/gke-os-distribution
-                    operator: NotIn
-                    values: ["cos"]
       tolerations:
         - operator: Exists
       containers:
@@ -337,8 +336,6 @@ spec:
               readOnly: true
             - name: etc-criu
               mountPath: /etc/criu
-            - name: host-sbin
-              mountPath: /usr/local/sbin
             # The archive signing keys (--archive-signing-keys-dir, #244).
             - name: archive-signing-keys
               mountPath: /etc/pod-migrate/archive-signing
@@ -391,10 +388,6 @@ spec:
         - name: etc-criu
           hostPath:
             path: /etc/criu
-            type: DirectoryOrCreate
-        - name: host-sbin
-          hostPath:
-            path: /usr/local/sbin
             type: DirectoryOrCreate
 ---
 apiVersion: v1

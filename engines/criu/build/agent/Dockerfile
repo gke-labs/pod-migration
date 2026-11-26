@@ -21,7 +21,10 @@
 # UDP-Lite, every dump fails; 3.16 also hits the cgroup2 cgns restore quirk.
 # Ubuntu 24.04 dropped criu and Debian trixie ships 4.1.1, so this takes Debian
 # forky's. The bundle carries the binary + all shared libs + its own ld-linux
-# so it runs on the GKE host without touching host libraries. CRIU stays an
+# so it runs on the GKE host without touching host libraries. Its criu wrapper
+# names the default install directory, /var/lib/pod-migrate/criu-bundle; the
+# agent writes its own for the node's layout (/home/kubernetes/bin on COS,
+# #109), identical to this one on other nodes. CRIU stays an
 # unmodified external executable (exec-only subprocess).
 # Forky is Debian testing, whose packages change from week to week, so the
 # stage pins its inputs: the base image by digest, and apt to the

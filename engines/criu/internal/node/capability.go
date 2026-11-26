@@ -50,24 +50,24 @@ const (
 	// bundle (built by build/agent/Dockerfile from a criu >= 4.2.1 distro).
 	imageBundleDir = "/opt/criu-bundle"
 
-	// hostPathBinDir is a host directory on containerd's/kubelet's PATH
-	// (hostPath mount). The kubelet checkpoint API fails with "criu: executable
-	// file not found in $PATH" unless the wrapper is visible there.
-	hostPathBinDir = "/usr/local/sbin"
-
 	// nodeAPITimeout bounds individual Node GET/PATCH calls so a slow API server
 	// cannot stall PSEngineCheckpoint or RunProbeLoop indefinitely.
 	nodeAPITimeout = 10 * time.Second
 )
 
-// installCRIUBundle copies the bundle from the image onto the node's writable
-// path (stock GKE ships no CRIU; COS needs a writable location) and installs
-// the wrapper on the host PATH.
-func installCRIUBundle() (version string, err error) {
-	return installCRIUBundleDirs(imageBundleDir, criuBundleDir, criuConfDir, hostPathBinDir)
+// installCRIUBundle copies the bundle from the image onto the host (stock GKE
+// ships no CRIU), in layout l, and puts the criu wrapper where containerd and
+// runc (and therefore the kubelet checkpoint API, which fails with "criu:
+// executable file not found in $PATH" otherwise) find it.
+func installCRIUBundle(ctx context.Context, l criuLayout, execHost func(context.Context, []string, string, ...string) (string, error)) (version string, err error) {
+	return installCRIUBundleLayout(ctx, imageBundleDir, hostRootDir, criuConfDir, l, execHost)
 }
 
-func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir string) (version string, err error) {
+// installCRIUBundleDirs copies the bundle's files from srcBundleDir to
+// dstBundleDir, writes runc.conf to dstConfDir, and writes wrapper as criu
+// in both dstBundleDir and dstBinDir. The directories are as the agent sees
+// them.
+func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir string, wrapper []byte) (version string, err error) {
 	entries, err := os.ReadDir(srcBundleDir)
 	if err != nil {
 		return "", fmt.Errorf("agent image carries no criu bundle: %w", err)
@@ -76,7 +76,7 @@ func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir str
 		return "", err
 	}
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || e.Name() == "criu" {
 			continue
 		}
 		src := filepath.Join(srcBundleDir, e.Name())
@@ -84,6 +84,11 @@ func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir str
 		if err := copyFile(src, dst, 0o755); err != nil {
 			return "", fmt.Errorf("install %s: %w", e.Name(), err)
 		}
+	}
+	// The wrapper names the bundle's host directory, which depends on the
+	// layout, so the agent writes its own rather than the image's.
+	if err := writeFileAtomic(filepath.Join(dstBundleDir, "criu"), wrapper, 0o755); err != nil {
+		return "", fmt.Errorf("install criu wrapper: %w", err)
 	}
 	v, err := os.ReadFile(filepath.Join(dstBundleDir, "VERSION"))
 	if err != nil {
@@ -106,10 +111,6 @@ func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir str
 	}
 	// Put the wrapper on the host PATH so containerd/runc (and therefore the
 	// kubelet checkpoint API) can exec it.
-	wrapper, err := os.ReadFile(filepath.Join(dstBundleDir, "criu"))
-	if err != nil {
-		return "", err
-	}
 	if err := writeFileAtomic(filepath.Join(dstBinDir, "criu"), wrapper, 0o755); err != nil {
 		return "", fmt.Errorf("install criu wrapper on host PATH: %w", err)
 	}
@@ -117,16 +118,16 @@ func installCRIUBundleDirs(srcBundleDir, dstBundleDir, dstConfDir, dstBinDir str
 	return strings.TrimSpace(string(v)), nil
 }
 
-// verifyCRIU runs `criu check --all` on the host (host kernel context) via
+// verifyCRIU runs bundleDir's `criu check --all` on the host (host kernel context) via
 // nsenter and returns the raw output. PODMIG_CRIU_CHECK=core relaxes the gate
 // to plain `criu check` (core C/R features only) for kernels where `--all`
 // reports optional/experimental feature warnings while core dump/restore works.
-func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, string, ...string) (string, error)) (ok bool, raw string) {
+func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, string, ...string) (string, error), bundleDir string) (ok bool, raw string) {
 	args := []string{"check", "--all"}
 	if os.Getenv("PODMIG_CRIU_CHECK") == "core" {
 		args = []string{"check"}
 	}
-	out, err := execHost(ctx, nil, criuBundleDir+"/criu", args...)
+	out, err := execHost(ctx, nil, bundleDir+"/criu", args...)
 	raw = strings.TrimSpace(out)
 	if err != nil {
 		return false, raw + " (err: " + err.Error() + ")"
