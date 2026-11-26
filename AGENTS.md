@@ -83,7 +83,7 @@ The runtime safety invariants defined in `docs/invariants.md` and implemented in
 
 ### Lane 2: Invariant Evolution PRs
 - **Branch naming:** Must match `^invariant/` (e.g., `invariant/i11-source-fenced-after-checkpoint`).
-- **Scope limitation:** Dedicated invariant PRs must touch **only** `controller/internal/invariants/**` and documentation (`docs/invariants.md`).
+- **Scope limitation:** Dedicated invariant PRs must touch **only** `controller/internal/invariants/**` and documentation (`docs/invariants.md`), and must change at least one file under `controller/internal/invariants/`.
 - **Verification requirement:** Every new or updated invariant rule must include positive tests (passing valid reconcile traces) and negative fault-injection tests (verifying detection of violating traces).
 
 ---
