@@ -104,11 +104,11 @@ func manifestObject(t *testing.T, path, kind, name string, into interface{}) {
 // before (a-stamper) and after (z-stamper) our webhooks (#303).
 //
 // Invariants verified:
-// 1. Shipped mpodgate uses reinvocationPolicy: IfNeeded with namespaceSelector on managed namespaces.
-// 2. mpodgate-runc matches all pods in managed namespaces (no matchConditions restriction) so pods
-//    whose runtimeClassName or opt-in label is added by later webhooks are reinvoked and gated.
-// 3. mpodgate is ordered BEFORE CRIU restore-inject (mutating-webhook-configuration < pod-migrate-psengine-restore-inject).
-// 4. On reinvocation, mpodgate does NOT scrub pod-migrate.io/psengine-injected on an already-gated pod.
+//  1. Shipped mpodgate uses reinvocationPolicy: IfNeeded with namespaceSelector on managed namespaces.
+//  2. mpodgate-runc matches all pods in managed namespaces (no matchConditions restriction) so pods
+//     whose runtimeClassName or opt-in label is added by later webhooks are reinvoked and gated.
+//  3. mpodgate is ordered BEFORE CRIU restore-inject (mutating-webhook-configuration < pod-migrate-psengine-restore-inject).
+//  4. On reinvocation, mpodgate does NOT scrub pod-migrate.io/psengine-injected on an already-gated pod.
 func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS not set; skipping creation reinvocation webhook envtest")
@@ -507,8 +507,8 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 
 		// Pod created without opt-in label:
 		// Round 1: mpodgate skips (no label), restore-inject skips (no gate), z-stamper stamps label.
-		// Round 2: mpodgate gates pod and assigns PMJ, restore-inject wraps holder and stamps psengine-injected.
-		// Round 3: mpodgate reinvokes but does NOT scrub psengine-injected!
+		// Round 2: mpodgate gates pod and assigns PMJ, then restore-inject wraps holder and stamps psengine-injected.
+		// (psengine-injected preservation runs on reinvocation when webhooks sort before mpodgate or on already-gated pods).
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: managedNS,

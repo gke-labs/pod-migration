@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
@@ -1185,5 +1186,152 @@ func TestReplacementWebhook_RayWorker_AmbiguousSibling_BypassedColdStart(t *test
 	}
 	if !hasBypass {
 		t.Errorf("Expected cold-start bypass (ps-name='') for ambiguous worker replacement, got patches: %+v", resp.Patches)
+	}
+}
+
+func TestPodGateInjector_AlreadyGatedReinvocationScrubbing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "replacement-pod"
+	pmjName := util.FormatPMJName(podName, "12345678")
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      pmjName,
+			UID:       types.UID("pmj-uid-1234"),
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef: corev1.LocalObjectReference{Name: podName},
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseSnapshotting,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+		WithObjects(pmj).
+		Build()
+
+	handler := &PodGateInjector{
+		Client: fakeClient,
+	}
+	_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+	// Case 1: An already-gated pod with matching assigned-pmj, carrying injected CRIU marker
+	// AND spoofed restore annotations (GKE ps-name, CRIU restore outcome/reason).
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ:         pmjName,
+				engine.CRIUInjectedAnnotation:      "true",
+				engine.CRIURestoreStatusAnnotation: "restored",
+				engine.CRIURestoreReasonAnnotation: "pre-supplied",
+				"podsnapshot.gke.io/ps-name":       "spoofed-snap",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+			Containers: []corev1.Container{
+				{
+					Name:  "app",
+					Image: "pause",
+				},
+			},
+		},
+	}
+
+	rawPod, _ := json.Marshal(pod)
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace: namespace,
+			Object:    runtime.RawExtension{Raw: rawPod},
+		},
+	}
+
+	resp := handler.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("Expected allowed, got denied: %+v", resp.Result)
+	}
+
+	// Because spoofed annotations were scrubbed, response must contain patches rather than unmutated Allowed.
+	if len(resp.Patches) == 0 {
+		t.Fatalf("Expected patches removing spoofed annotations, got empty patches")
+	}
+
+	for _, patch := range resp.Patches {
+		if patch.Path == "/metadata/annotations" {
+			if m, ok := patch.Value.(map[string]interface{}); ok {
+				if _, ok := m["podsnapshot.gke.io/ps-name"]; ok {
+					t.Errorf("podsnapshot.gke.io/ps-name survived scrubbing in patch")
+				}
+				if _, ok := m[engine.CRIURestoreStatusAnnotation]; ok {
+					t.Errorf("CRIURestoreStatusAnnotation survived scrubbing in patch")
+				}
+				if _, ok := m[engine.CRIURestoreReasonAnnotation]; ok {
+					t.Errorf("CRIURestoreReasonAnnotation survived scrubbing in patch")
+				}
+				if val, ok := m[engine.CRIUInjectedAnnotation]; !ok || val != "true" {
+					t.Errorf("CRIUInjectedAnnotation was scrubbed: got %v, want 'true'", val)
+				}
+			}
+		}
+	}
+
+	// Case 2: Clean already-gated pod with matching assigned-pmj and CRIU injected marker,
+	// with NO spoofed annotations. Must return pure Allowed (0 patches, no-op).
+	cleanPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ:    pmjName,
+				engine.CRIUInjectedAnnotation: "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "gke.io/pod-migration-gate"},
+			},
+			Containers: []corev1.Container{
+				{
+					Name:  "app",
+					Image: "pause",
+				},
+			},
+		},
+	}
+
+	rawCleanPod, _ := json.Marshal(cleanPod)
+	cleanReq := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace: namespace,
+			Object:    runtime.RawExtension{Raw: rawCleanPod},
+		},
+	}
+
+	cleanResp := handler.Handle(context.Background(), cleanReq)
+	if !cleanResp.Allowed {
+		t.Fatalf("Expected clean pod allowed, got: %+v", cleanResp.Result)
+	}
+	if len(cleanResp.Patches) != 0 {
+		t.Errorf("Expected 0 patches on clean already-gated reinvocation, got %d patches: %+v", len(cleanResp.Patches), cleanResp.Patches)
 	}
 }

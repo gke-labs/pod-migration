@@ -1206,7 +1206,12 @@ kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent
 
 Then point the PodMigration of each namespace that only CRIU serves at that
 bucket (`spec.storage.location: gs://<BUCKET_NAME>/<namespace>/snapshots`
-or another path starting with `<namespace>/`).
+or another path starting with `<namespace>/`), and ensure the workload namespace
+is labeled for migration:
+
+```bash
+kubectl label namespace <namespace> pod-migration.gke.io/managed="true"
+```
 
 When creating `PodSnapshotStorageConfig` and `PodSnapshotPolicy` resources for
 this engine, label them with `pod-migrate.io/engine: criu` so `cmd/engine`

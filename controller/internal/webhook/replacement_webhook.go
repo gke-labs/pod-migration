@@ -232,10 +232,9 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 	}
 
-	// If the pod was already gated and assigned to this PMJ in a prior round
-	// of admission mutation, reinvocation is a no-op. Crucially, do this check
-	// before scrubbing to avoid stripping engine injection markers (such as
-	// CRIU's pod-migrate.io/psengine-injected) added by subsequent webhooks (#303).
+	// Replacement pod matched an active PMJ: check whether the scheduling gate
+	// and matching PMJ assignment are already present from a prior round of
+	// admission mutation (#303).
 	hasGate := false
 	for _, gate := range pod.Spec.SchedulingGates {
 		if gate.Name == "gke.io/pod-migration-gate" {
@@ -243,30 +242,62 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 			break
 		}
 	}
-	if hasGate && pod.Annotations != nil && pod.Annotations[util.AnnotationAssignedPMJ] == assignedPMJ {
-		logger.Info("Pod already has the scheduling gate and PMJ assignment, bypassing")
-		return admission.Allowed("scheduling gate already present")
-	}
+	alreadyGatedAndAssigned := hasGate && pod.Annotations != nil && pod.Annotations[util.AnnotationAssignedPMJ] == assignedPMJ
 
-	// Replacement pod matched an active unassigned PMJ: scrub any pre-existing or
-	// spoofed restore annotations across ALL registered engines (plus engine
-	// injection/status markers) so PodGateReconciler is the sole authority to
-	// order the restore once the checkpoint is durable (#135, C10 R1).
+	// Scrub any pre-existing or spoofed restore annotations across ALL registered
+	// engines (plus engine status markers) so PodGateReconciler is the sole
+	// authority to order the restore once the checkpoint is durable (#135, C10 R1).
+	// Crucially:
+	// - restoreAnnotations, CRIURestoreStatusAnnotation, and CRIURestoreReasonAnnotation
+	//   are ALWAYS scrubbed (even on reinvocation / already-gated pods, to prevent
+	//   spoofed restore orders or statuses on CREATE requests that pre-supply
+	//   the gate and assigned-pmj).
+	// - CRIUInjectedAnnotation is scrubbed only on initial gating (!alreadyGatedAndAssigned),
+	//   so reinvocation does not strip the marker stamped by a downstream injector (#303).
+	scrubbed := false
 	if pod.Annotations != nil {
 		for _, ann := range a.restoreAnnotations() {
 			if _, ok := pod.Annotations[ann]; ok {
 				delete(pod.Annotations, ann)
+				scrubbed = true
 			}
 		}
-		if _, ok := pod.Annotations[engine.CRIUInjectedAnnotation]; ok {
-			delete(pod.Annotations, engine.CRIUInjectedAnnotation)
+		if !alreadyGatedAndAssigned {
+			if _, ok := pod.Annotations[engine.CRIUInjectedAnnotation]; ok {
+				delete(pod.Annotations, engine.CRIUInjectedAnnotation)
+				scrubbed = true
+			}
 		}
 		if _, ok := pod.Annotations[engine.CRIURestoreStatusAnnotation]; ok {
 			delete(pod.Annotations, engine.CRIURestoreStatusAnnotation)
+			scrubbed = true
 		}
 		if _, ok := pod.Annotations[engine.CRIURestoreReasonAnnotation]; ok {
 			delete(pod.Annotations, engine.CRIURestoreReasonAnnotation)
+			scrubbed = true
 		}
+	}
+
+	cleared := 0
+	if !a.PreserveReadinessDelay {
+		preserveVal, hasPreserveAnnotation := pod.Annotations[util.AnnotationPreserveReadinessDelay]
+		if preserveVal != "true" {
+			if hasPreserveAnnotation {
+				logger.Info("Ignoring preserve-readiness-delay annotation: value must be \"true\"",
+					"annotation", util.AnnotationPreserveReadinessDelay, "value", preserveVal)
+			}
+			cleared = clearReadinessInitialDelay(pod)
+			if cleared > 0 {
+				logger.Info("Cleared readinessProbe.initialDelaySeconds on restore-candidate replacement pod", "containers", cleared)
+			}
+		}
+	}
+
+	// If the pod was already gated and assigned to this PMJ, and neither scrubbing
+	// nor readiness-delay clearing required mutation, reinvocation is a clean no-op.
+	if alreadyGatedAndAssigned && !scrubbed && cleared == 0 {
+		logger.Info("Pod already has the scheduling gate and PMJ assignment, bypassing")
+		return admission.Allowed("scheduling gate already present")
 	}
 
 	if !hasGate {
@@ -280,19 +311,6 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		pod.Annotations = make(map[string]string)
 	}
 	pod.Annotations[util.AnnotationAssignedPMJ] = assignedPMJ
-
-	if !a.PreserveReadinessDelay {
-		preserveVal, hasPreserveAnnotation := pod.Annotations[util.AnnotationPreserveReadinessDelay]
-		if preserveVal != "true" {
-			if hasPreserveAnnotation {
-				logger.Info("Ignoring preserve-readiness-delay annotation: value must be \"true\"",
-					"annotation", util.AnnotationPreserveReadinessDelay, "value", preserveVal)
-			}
-			if n := clearReadinessInitialDelay(pod); n > 0 {
-				logger.Info("Cleared readinessProbe.initialDelaySeconds on restore-candidate replacement pod", "containers", n)
-			}
-		}
-	}
 
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {

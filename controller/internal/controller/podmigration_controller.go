@@ -59,8 +59,11 @@ const (
 	ReasonConflictingStorageLocation       = "ConflictingStorageLocation"
 	ReasonUnscopedStorageLocation          = "UnscopedStorageLocation"
 	ReasonInvalidStorageLocation           = "InvalidStorageLocation"
-	ReasonStorageIsolationWarning          = "StorageIsolationWarning"
-	maxDeletionDeferral                    = 10 * time.Minute
+	// ReasonBucketReservedForRootStorage: the storage location is on a bucket
+	// that --allow-bucket-root-storage-namespaces binds to another namespace.
+	ReasonBucketReservedForRootStorage = "BucketReservedForRootStorage"
+	ReasonStorageIsolationWarning      = "StorageIsolationWarning"
+	maxDeletionDeferral                = 10 * time.Minute
 
 	StorageIsolationModeEnforce = "enforce"
 	StorageIsolationModeWarn    = "warn"
@@ -130,10 +133,14 @@ type PodMigrationReconciler struct {
 	// or "enforce" (fail-closed with Ready=False).
 	StorageIsolationMode string
 
-	// AllowBucketRootStorage allows PodMigration storage locations to target the bucket
-	// root (gs://bucket or gs://bucket/) without namespace path scoping. Intended only for
-	// single-tenant clusters where the entire bucket is dedicated to one namespace.
-	AllowBucketRootStorage bool
+	// BucketRootStorage binds namespaces to the buckets whose root (gs://bucket or
+	// gs://bucket/) their PodMigrations may use as a storage location, without
+	// namespace path scoping (--allow-bucket-root-storage-namespaces). A bound bucket
+	// is reserved for its namespace: PodMigrations in every other namespace are
+	// refused any location on it (ReasonBucketReservedForRootStorage). Every other
+	// bucket keeps the gs://<bucket>/<namespace>/... requirement. The zero value
+	// binds nothing.
+	BucketRootStorage util.BucketRootBindings
 }
 
 // engines returns the registry that serves the reconciler: Engines, or the
@@ -378,8 +385,9 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// 1. Validate namespace scoping for multi-tenant isolation (#278):
 	// The controller always requires the first path segment to equal the namespace and a non-empty path,
-	// with the bucket root only allowed through an explicit operator opt-in (--allow-bucket-root-storage).
-	if err := util.ValidateStorageLocationForNamespace(config.Spec.Storage.Location, config.Namespace, r.AllowBucketRootStorage); err != nil {
+	// with the bucket root only allowed on the bucket the operator binds to the namespace
+	// (--allow-bucket-root-storage-namespaces), and a bound bucket refused to every other namespace.
+	if err := util.ValidateStorageLocationForNamespace(config.Spec.Storage.Location, config.Namespace, r.BucketRootStorage); err != nil {
 		deferCleanup := false
 		if controllerutil.ContainsFinalizer(config, StorageCleanupFinalizer) {
 			inFlight, err := r.listInFlightMigrations(ctx, config)
@@ -415,13 +423,22 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			}
 		}
 		var locationErr *engine.StorageLocationError
+		var reservedErr *util.BucketReservedError
 		reason := ReasonUnscopedStorageLocation
-		if errors.As(err, &locationErr) || strings.Contains(err.Error(), "invalid storage path") || strings.Contains(err.Error(), "invalid GCS location") {
-			reason = ReasonInvalidStorageLocation
-		}
 		msg := fmt.Sprintf("Storage location %q is not scoped to namespace %q: %v",
 			config.Spec.Storage.Location, config.Namespace, err)
-		logger.Info("Refusing un-scoped storage location",
+		switch {
+		case errors.As(err, &reservedErr):
+			reason = ReasonBucketReservedForRootStorage
+			msg = fmt.Sprintf("Storage location %q is refused: %v", config.Spec.Storage.Location, err)
+		case errors.As(err, &locationErr) || strings.Contains(err.Error(), "invalid storage path") || strings.Contains(err.Error(), "invalid GCS location"):
+			reason = ReasonInvalidStorageLocation
+		}
+		logMsg := "Refusing un-scoped storage location"
+		if reason == ReasonBucketReservedForRootStorage {
+			logMsg = "Refusing storage location on a bucket reserved for another namespace"
+		}
+		logger.Info(logMsg,
 			"name", config.Name, "namespace", config.Namespace, "location", config.Spec.Storage.Location, "reason", reason)
 		before := config.Status.DeepCopy()
 		changed := meta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
@@ -455,7 +472,7 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	if conflict := util.FindConflictingStoragePodMigration(config, allMigs.Items, r.AllowBucketRootStorage); conflict != nil {
+	if conflict := util.FindConflictingStoragePodMigration(config, allMigs.Items, r.BucketRootStorage); conflict != nil {
 		if isolationMode == StorageIsolationModeWarn {
 			logger.Info("Storage location conflict detected in warn mode; allowing reconciliation to proceed",
 				"name", config.Name, "namespace", config.Namespace, "conflictingWith", conflict.Namespace+"/"+conflict.Name)
