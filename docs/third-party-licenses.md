@@ -46,11 +46,9 @@ The project publishes four container images across its controllers and the CRIU 
   - `k8s.io/api`, `k8s.io/apimachinery`, `k8s.io/client-go`: `Apache-2.0`
   - `sigs.k8s.io/controller-runtime`: `Apache-2.0`
   - `sigs.k8s.io/yaml`: `MIT` and `BSD-3-Clause`
-  - `github.com/containerd/containerd/v2`: `Apache-2.0`
-  - `github.com/opencontainers/runtime-spec`, `github.com/opencontainers/image-spec`: `Apache-2.0`
   - `github.com/prometheus/client_golang`: `Apache-2.0`
 - **In-Image License Disclosures**:
-  - Go runtime and all compiled third-party Go module `LICENSE` / `NOTICE` files (plus `go-modules.txt`): `/THIRD_PARTY_NOTICES/`
+  - Go runtime and all compiled third-party Go module and subpackage `LICENSE` / `NOTICE` files (plus `go-modules.txt`): `/THIRD_PARTY_NOTICES/`
   - Distroless base license notices (`/usr/share/doc/*/copyright`).
 
 ### 2.3 Pod Sandbox Holder (`pod-migration-criu-holder`)
@@ -71,6 +69,13 @@ The project publishes four container images across its controllers and the CRIU 
 - **Purpose**: Privileged DaemonSet node agent driving CRIU checkpoints and OCI container restores.
 - **Runtime Components**:
   - `/agent` (compiled Go binary): `Apache-2.0`
+- **Go Direct Module Dependencies**:
+  - `github.com/containerd/containerd/v2`, `github.com/containerd/errdefs`: `Apache-2.0`
+  - `github.com/moby/sys/mountinfo`: `Apache-2.0`
+  - `github.com/opencontainers/runtime-spec`, `github.com/opencontainers/image-spec`: `Apache-2.0`
+  - `github.com/pelletier/go-toml/v2`: `MIT`
+  - `k8s.io/api`, `k8s.io/apimachinery`, `k8s.io/client-go`: `Apache-2.0`
+  - `sigs.k8s.io/yaml`: `MIT` and `BSD-3-Clause`
 - **Distribution Packages (Ubuntu 24.04 Archive)**:
   - `util-linux` (`nsenter`): `GPL-2.0-or-later`, `LGPL-2.1-or-later`, `BSD-3-Clause`, `Public Domain`
   - `ca-certificates`: `MPL-2.0`, `GPL-2.0-or-later`

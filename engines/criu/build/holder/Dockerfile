@@ -21,23 +21,25 @@ WORKDIR /src
 COPY go.mod go.sum ./
 COPY cmd/holder/ cmd/holder/
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /holder ./cmd/holder && \
-    set -eu && \
-    mkdir -p /third-party-notices/go-stdlib && \
-    : > /third-party-notices/go-modules.txt && \
-    go_lic="" && \
-    for cand in "$(go env GOROOT)/LICENSE" /usr/local/go/LICENSE /usr/share/doc/golang-go/copyright; do \
-      if [ -f "${cand}" ]; then go_lic="${cand}"; break; fi; \
-    done && \
-    if [ -z "${go_lic}" ]; then echo "ERROR: Go stdlib LICENSE not found" >&2; exit 1; fi && \
-    cp "${go_lic}" /third-party-notices/go-stdlib/LICENSE && \
-    third_party="$(CGO_ENABLED=0 GOOS=linux go list -deps -f '{{if and .Module (not .Module.Main)}}{{.Module.Path}}{{end}}' ./cmd/holder | sort -u)" && \
-    if [ -n "${third_party}" ]; then \
-      echo "ERROR: holder unexpectedly imports third-party Go modules: ${third_party}" >&2; \
-      exit 1; \
-    fi && \
-    chmod -R u+w /third-party-notices && \
-    find /third-party-notices -type d -exec chmod 0755 {} + && \
-    find /third-party-notices -type f -exec chmod 0644 {} +
+    sh -eu -c ' \
+      out="/third-party-notices"; \
+      mkdir -p "${out}/go-stdlib" || exit 1; \
+      : > "${out}/go-modules.txt" || exit 1; \
+      go_lic=""; \
+      for cand in "$(go env GOROOT)/LICENSE" /usr/local/go/LICENSE /usr/share/doc/golang-go/copyright; do \
+        if [ -f "${cand}" ]; then go_lic="${cand}"; break; fi; \
+      done; \
+      if [ -z "${go_lic}" ]; then echo "ERROR: Go stdlib LICENSE not found" >&2; exit 1; fi; \
+      cp "${go_lic}" "${out}/go-stdlib/LICENSE" || exit 1; \
+      third_party="$(CGO_ENABLED=0 GOOS=linux go list -deps -f "{{if and .Module (not .Module.Main)}}{{.Module.Path}}{{end}}" ./cmd/holder | sort -u)" || exit 1; \
+      if [ -n "${third_party}" ]; then \
+        echo "ERROR: holder unexpectedly imports third-party Go modules: ${third_party}" >&2; \
+        exit 1; \
+      fi; \
+      chmod -R u+w "${out}" || exit 1; \
+      find "${out}" -type d -exec chmod 0755 {} + || exit 1; \
+      find "${out}" -type f -exec chmod 0644 {} + || exit 1; \
+    '
 
 FROM scratch
 COPY --from=build /holder /holder

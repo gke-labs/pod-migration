@@ -160,8 +160,9 @@ test-invariant-gen: ## Run unit tests for tools/invariant-gen blind-spot detecto
 test-t5-guardrail: verify-invariant-governance test-pmprofiler test-invariant-gen ## Run T5 invariant evolution pipeline self-test.
 	../verification-suite/run_guardrail_t5_evolution.sh --self-test
 
-test-gpl-source-packager: ## Run package_gpl_sources self-test.
+test-gpl-source-packager: ## Run package_gpl_sources and Dockerfile notice self-tests.
 	../tools/release/package_gpl_sources_test.sh
+	../tools/release/dockerfile_notices_test.sh
 
 install: manifests ## Install CRDs into the K8s cluster and wait for them to be ready.
 	kubectl apply -f config/crd/bases/

@@ -89,12 +89,15 @@ cd ../..
 Verify that each image carries `/THIRD_PARTY_NOTICES/` (Go stdlib and all compiled third-party Go module notices, plus reciprocal Go source where applicable) and that the agent image carries the bundled CRIU license notices:
 
 ```bash
-# Distroless/scratch images have no shell; inspect via docker create + docker export:
+# Distroless/scratch images have no shell; docker cp fails non-zero if a file is missing:
+tmp_notices="$(mktemp -d)"
 for img in "${CONTROLLER_IMG}" "${ENGINE_IMG}" "${HOLDER_IMG}"; do
   cid="$(docker create "${img}")"
-  docker export "${cid}" | tar -t | grep -E '^THIRD_PARTY_NOTICES/(go-stdlib/LICENSE|go-modules\.txt)$'
+  docker cp "${cid}:/THIRD_PARTY_NOTICES/go-stdlib/LICENSE" "${tmp_notices}/LICENSE"
+  docker cp "${cid}:/THIRD_PARTY_NOTICES/go-modules.txt" "${tmp_notices}/go-modules.txt"
   docker rm "${cid}" >/dev/null
 done
+rm -rf "${tmp_notices}"
 
 # Agent image (Ubuntu base):
 docker run --rm --entrypoint ls "${AGENT_IMG}" -la /THIRD_PARTY_NOTICES/ /opt/criu-bundle/licenses/
