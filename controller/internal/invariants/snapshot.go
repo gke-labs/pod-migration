@@ -103,6 +103,12 @@ type SnapshotProgress struct {
 // engineName (or the default/registered engines when engineName is empty).
 // When present is true, either snapshotRef is the non-empty checkpoint
 // identifier ordered for restore or coldStartBypass is true.
+//
+// It must only read the pod (C5). Besides real pods, the invariants pass it
+// probe pods that carry a single annotation, to learn which annotation an
+// engine reads; an engine whose order is not the (trimmed) value of one pod
+// annotation therefore has orders of unknown API group, which I1 matches
+// against every group.
 type RestoreOrderFunc func(engineName string, pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool)
 
 // Violation represents a single detected violation of an invariant (I1-I9).
