@@ -25,7 +25,11 @@ The controller is implemented as a custom Operator consisting of the following c
 - **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods matched to an active `PodMigrationJob`, it injects the `gke.io/pod-migration-gate` scheduling gate (and scrubs untrusted `<group>/ps-name` restore annotations across registered engines) to hold the pod in a pending state until checkpoint readiness and volume detachment complete, preventing replica collisions; by default (`--shorten-restored-readiness-delay=true`), it also sets `readinessProbe.initialDelaySeconds` to `0` on the replacement's containers and restartable sidecar init containers unless the pod sets `pod-migration.gke.io/preserve-readiness-delay: "true"`, leaving liveness and startup probes untouched (#141). On scale-up pods, it stamps per-engine cold-start bypasses (each gVisor scale-up may evaluate the webhook up to four times across reinvocations). The webhook is split across two entries matching namespaces labeled `pod-migration.gke.io/managed: "true"` with `reinvocationPolicy: IfNeeded` (#303):
   - `mpodgate.podmigration.gke.io` (gVisor `runtimeClassName: gvisor`, `failurePolicy: Fail`): guarantees that gVisor scale-ups receive the cold-start bypass annotation (`podsnapshot.gke.io/ps-name: ""`) at creation (#151). The cost of `failurePolicy: Fail` is that during a controller outage, ALL gVisor pod creations in managed namespaces are blocked.
   - `mpodgate-runc.podmigration.gke.io` (all pods in managed namespaces, `failurePolicy: Ignore`): non-gVisor pods fail open during controller outages, meaning pods start cold without migration and cluster workloads do not wedge during an outage.
-  - **Custom gVisor runtime classes**: If your cluster runs gVisor workloads under custom runtime class names (configured via `--runtime-class-engines` or `--migratable-runtime-classes`, #83), during a controller outage those pods match only the fail-open entry and will start cold without the #151 bypass; to enforce fail-closed protection for custom gVisor classes, update `mpodgate.podmigration.gke.io`'s `matchConditions` in `controller/deploy.yaml` to include your custom runtime class names.
+  - **Custom gVisor runtime classes**: If your cluster runs gVisor workloads under custom runtime class names (configured via `--runtime-class-engines` or `--migratable-runtime-classes`, #83), during a controller outage those pods match only the fail-open entry and do not receive the #151 cold-start bypass (`podsnapshot.gke.io/ps-name: ""`). Without this bypass, a custom gVisor pod scale-up during an outage can inadvertently come back from a leftover snapshot rather than starting cold (#151). To enforce fail-closed protection for custom gVisor classes, update `mpodgate.podmigration.gke.io`'s `matchConditions` in `controller/deploy.yaml` to match your custom runtime class:
+    ```cel
+    has(object.spec.runtimeClassName) && object.spec.runtimeClassName in ['gvisor', 'my-custom-gvisor']
+    ```
+    _Note_: This customization must be re-applied on every upgrade of `controller/deploy.yaml`.
 - **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Handled by `PodStatusMutator`. Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
 - **Fence Webhook (`/mutate-v1-pod-fence`)**: Handled by `PodFenceMutator`. Intercepts status updates of Pods labeled `pod-migration.gke.io/fenced: "true"` and holds their `Ready` condition at `False` (reason `PodMigrationFenced`), so a fenced migration source stays out of its Services' endpoints (#131). The other conditions, including `ContainersReady`, keep the kubelet's view. It uses `failurePolicy: Fail`: while the webhook is down, a fenced Pod's status writes are rejected, so it stays NotReady, and it can't finish deleting either, because the kubelet writes a Pod's final status before the Pod is removed. That heals when the webhook is back. Pods without the label never reach it. See [Source fence](#3-source-fence).
 - **Restore Order Policy (`pod-migration-restore-order`)**: A `ValidatingAdmissionPolicy` in `controller/deploy.yaml`, not a webhook: the API server evaluates it itself, so it doesn't depend on the controller being up. On `CREATE` in managed namespaces, it denies any request carrying non-GKE restore annotations (`<group>/ps-name` != `podsnapshot.gke.io/ps-name`), guarding against malicious restores while runc webhook fails open, without blocking Kubeflow's pre-existing `podsnapshot.gke.io/ps-name` resume flow (#303). On `UPDATE` in managed namespaces, on any opted-in Pod or any Pod carrying a non-GKE restore order, only the controller may set, change or remove a restore order (`<group>/ps-name`, for any engine) (#233). It covers updates of the Pod and of its `status` subresource, which can change annotations too. The policy is skipped for every update that leaves the restore orders as they are, so labels (including removing `pod-migration.gke.io/enabled` to opt out), other annotations, the spec and the kubelet's status writes aren't affected. See [Changing a Restore Order by Hand](#changing-a-restore-order-by-hand).
@@ -153,7 +157,9 @@ kubectl wait --for=condition=Available --timeout=5m -n cert-manager deployment/c
 > Admission webhooks (`veviction`, `mpodgate`, `mpodgate-runc`, and CRIU `restore-inject`) and admission policies (`pod-migration-restore-order` and `pod-migrate-psengine-restore-status`) are scoped strictly to namespaces labeled `pod-migration.gke.io/managed: "true"`. The status webhook (`mpodstatus`) and fence webhook (`mpodfence`) remain cluster-scoped.
 >
 > - **What changes**: In an unlabelled namespace, `veviction` does not intercept voluntary evictions, allowing them to proceed cold without migration; `mpodgate` does not intercept pod creations, so replacement pods (including those created during voluntary eviction or spot node preemption) are never gated and start cold without live migration (and gVisor replacements do not receive the cold-start bypass annotation).
-> - **Failure policy change during outages**: While in previous releases every opted-in pod failed closed during controller outages, non-gVisor pods and custom gVisor runtime classes now fail open (`failurePolicy: Ignore`), allowing scale-ups and normal workloads to proceed cold without wedging cluster availability.
+> - **Failure policy change during outages**:
+>   - **Fail-open for runc**: Non-gVisor pods and custom gVisor runtime classes now fail open (`failurePolicy: Ignore`), allowing scale-ups and normal workloads to proceed cold without wedging cluster availability during a controller outage.
+>   - **Fail-closed for gVisor**: Conversely, under `mpodgate.podmigration.gke.io` (`failurePolicy: Fail`), _all_ gVisor pod creations in managed namespaces (even those that are _not_ opted into live migration with `pod-migration.gke.io/enabled: "true"`) now fail closed during controller outages to prevent scale-ups from inadvertently restoring from leftover snapshots (#151).
 > - **How to tell**: Check your workload namespaces with `kubectl get namespaces --show-labels` (look for `pod-migration.gke.io/managed=true`).
 > - **How to fix**: Label all workload namespaces using live migration:
 >   ```bash
@@ -184,21 +190,31 @@ Follow these ordered steps when upgrading an existing cluster:
    ```
    _Note_: Webhook configuration names (`mutating-webhook-configuration` and `validating-webhook-configuration`) are preserved in place, so nothing needs deleting and `kubectl apply` cleanly updates them without orphaned configurations. (During a rolling upgrade, an `reinvocationPolicy: IfNeeded` config can briefly reach an older controller replica before rollout completes; this is transient).
 3. **Apply Engine Manifests (CRIU)**:
-   If running the CRIU engine, apply its updated manifests:
+   If running the CRIU engine, apply its updated manifests while substituting your image registry and Workload Identity parameters (see [Deploy the CRIU Engine](engines/criu/README.md#storage-credentials)):
    ```bash
-   kubectl apply -f engines/criu/deploy/deploy.yaml
+   sed -e "s|<YOUR_CRIU_ENGINE_IMAGE>|${ENGINE_IMG}|g" \
+       -e "s|<YOUR_CRIU_AGENT_IMAGE>|${AGENT_IMG}|g" \
+       -e "s|<YOUR_CRIU_HOLDER_IMAGE>|${HOLDER_IMG}|g" \
+       -e "s|<YOUR_WORKLOAD_POOL>|${WORKLOAD_POOL}|g" \
+       -e "s|<YOUR_IDENTITY_PROVIDER>|${IDENTITY_PROVIDER}|g" \
+       engines/criu/deploy/deploy.yaml | kubectl apply -f -
    ```
-   _Important_: Without applying the CRIU manifest, `restore-inject` retains its legacy `objectSelector` and will miss replacement pods whose opt-in label is stamped by downstream webhooks.
+   _Important_: Applying raw `engines/criu/deploy/deploy.yaml` without substituting placeholders will roll running engine and agent daemonset pods back to `<YOUR_CRIU_...>` placeholder images. Without applying the CRIU manifest, `restore-inject` retains its legacy `objectSelector` and will miss replacement pods whose opt-in label is stamped by downstream webhooks.
 4. **Verify Upgrade**:
-   Verify the webhook configurations and namespace selectors:
+   Verify that the live webhook configurations require `pod-migration.gke.io/managed: "true"`:
    ```bash
-   kubectl get mutatingwebhookconfigurations mutating-webhook-configuration -o yaml | grep -A 5 namespaceSelector
-   kubectl get validatingwebhookconfigurations validating-webhook-configuration -o yaml | grep -A 5 namespaceSelector
+   kubectl get mutatingwebhookconfiguration mutating-webhook-configuration pod-migrate-psengine-restore-inject \
+     -o jsonpath='{range .items[*].webhooks[*]}{.name}{"\t"}{.namespaceSelector.matchLabels}{"\n"}{end}'
+   kubectl get validatingwebhookconfiguration validating-webhook-configuration \
+     -o jsonpath='{range .items[*].webhooks[*]}{.name}{"\t"}{.namespaceSelector.matchLabels}{"\n"}{end}'
    ```
+   The output should confirm `map[pod-migration.gke.io/managed:true]` on `veviction.podmigration.gke.io`, `mpodgate.podmigration.gke.io`, `mpodgate-runc.podmigration.gke.io`, and `restore-inject.psengine.pod-migrate.io` (while status and fence webhooks remain cluster-scoped without `matchLabels`).
+
+### Fresh Installation
 
 Follow these steps to deploy the Pod Migration Controller for a new installation once the prerequisites are met:
 
-### Step 1: One-Time Snapshot Storage & Workload Identity Configuration
+#### Step 1: One-Time Snapshot Storage & Workload Identity Configuration
 
 Run the provided setup script to automatically create the GCS bucket, configure IAM permissions for Workload Identity, and create the test Kubernetes Service Account (KSA):
 
@@ -215,7 +231,7 @@ _This script performs the following:_
 
 This bucket is for GKE Pod Snapshots. The experimental CRIU engine needs a bucket of its own, which grants object access to its two service accounts and to nobody else: an archive is a full memory dump. Set one up with `./patches/setup-criu-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]`, and point only the `PodMigration`s of namespaces that only CRIU serves at it (see "Storage credentials" in `engines/criu/README.md`).
 
-### Step 2: Install CRDs
+#### Step 2: Install CRDs
 
 Install the custom resource definitions for the pod migration controller:
 
@@ -223,7 +239,7 @@ Install the custom resource definitions for the pod migration controller:
 kubectl apply -f controller/config/crd/bases/
 ```
 
-### Step 3: Deploy the Pod Migration Controller
+#### Step 3: Deploy the Pod Migration Controller
 
 The controller manager orchestrates the migration lifecycle and hosts the admission webhooks.
 
@@ -265,7 +281,7 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
 > sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
 > ```
 
-### Step 4: Deploy Validating Policies (Optional)
+#### Step 4: Deploy Validating Policies (Optional)
 
 To reject incompatible workloads (e.g. BEAM/fsnotify) at admission time:
 

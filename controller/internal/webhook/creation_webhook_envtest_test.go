@@ -297,7 +297,7 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 	}
 
 	// 2. Shipped CRIU restore-inject webhook handler: /psengine-restore-inject
-	// Faithful copy of CRIU psengine.RestoreInjector and InjectHolder (#135):
+	// Stand-in for CRIU restore-inject webhook handler modeling psengine.RestoreInjector and InjectHolder (#135):
 	// Injects pmhold and pm-podinfo volumes, pm-holder-seed initContainer,
 	// and holder command wrap, and stamps pod-migrate.io/psengine-injected: "true"
 	// only when pod carries gke.io/pod-migration-gate and an assigned PMJ (#135).
@@ -323,7 +323,7 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 				return admission.Allowed("already injected")
 			}
 
-			// Faithful copy of CRIU psengine.InjectHolder
+			// Stand-in modeling CRIU psengine.InjectHolder to pin duplicate detection
 			pod.Spec.Volumes = append(pod.Spec.Volumes,
 				corev1.Volume{Name: "pmhold", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 				corev1.Volume{Name: "pm-podinfo", VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{
