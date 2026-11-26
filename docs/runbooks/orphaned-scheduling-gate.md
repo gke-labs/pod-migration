@@ -87,7 +87,7 @@ The `PodGateReconciler` automatically resolves orphaned gates:
    ```bash
    kubectl delete pmj <assigned-pmj> -n <namespace>
    ```
-3. Watch the pod: within seconds, the controller reads the missing PMJ from the API server, annotates the pod with the cold-start bypass annotation (`podsnapshot.gke.io/ps-name: ""` for GKE Pod Snapshots or `<criu-api-group>/ps-name: ""` for CRIU), and removes `gke.io/pod-migration-gate`.
+3. Watch the pod: within seconds, the controller reads the missing PMJ from the API server, annotates the pod with the cold-start bypass annotation (`podsnapshot.gke.io/ps-name: ""` for GKE Pod Snapshots, `<criu-api-group>/ps-name: ""` for CRIU, and both on a gVisor pod that CRIU serves), and removes `gke.io/pod-migration-gate`.
 
 ### Remediation Option 2: Delete PMJ First, Then Delete Gated Pod
 
@@ -134,7 +134,7 @@ To execute an emergency manual release:
        {\"op\": \"remove\", \"path\": \"/spec/schedulingGates/${GATE_INDEX}\"}
      ]"
      ```
-   - **For CRIU Engine (using configured `<criu-api-group>`, default `criu.podmigration.gke.io`):**
+   - **For CRIU on a non-gVisor pod (using configured `<criu-api-group>`, default `criu.podmigration.gke.io`):**
      ```bash
      CRIU_GROUP="criu.podmigration.gke.io" # replace if --criu-api-group is non-default
      CRIU_ESC=$(echo "$CRIU_GROUP" | sed 's/\//~1/g')
@@ -143,6 +143,15 @@ To execute an emergency manual release:
        {\"op\": \"remove\", \"path\": \"/spec/schedulingGates/${GATE_INDEX}\"}
      ]"
      ```
+   - **For a gVisor pod that CRIU serves:** set `CRIU_GROUP` and `CRIU_ESC` as above, then run this one patch instead (never remove the gate first and annotate later):
+     ```bash
+     kubectl patch pod <pod-name> -n <namespace> --type=json -p "[
+       {\"op\": \"add\", \"path\": \"/metadata/annotations/podsnapshot.gke.io~1ps-name\", \"value\": \"\"},
+       {\"op\": \"add\", \"path\": \"/metadata/annotations/${CRIU_ESC}~1ps-name\", \"value\": \"\"},
+       {\"op\": \"remove\", \"path\": \"/spec/schedulingGates/${GATE_INDEX}\"}
+     ]"
+     ```
+     GKE Pod Snapshots reads `podsnapshot.gke.io/ps-name` whenever it creates a gVisor sandbox, so without `""` there it can restore a leftover snapshot into the pod. `add` replaces a stale value; in a single-group install both ops write the same key, which is harmless. While the PodMigrationJob exists, I2 reports a released gVisor pod without the GKE bypass as `GVisorPodMissingGKEColdStartBypass`.
 5. Immediately restore the policy binding back to `Deny`:
    ```bash
    kubectl patch validatingadmissionpolicybinding pod-migration-restore-order --type=merge -p '{"spec":{"validationActions":["Deny"]}}'
