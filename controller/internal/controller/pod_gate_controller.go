@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -64,6 +65,15 @@ type PodGateReconciler struct {
 	Scheme          *runtime.Scheme
 	Recorder        record.EventRecorder
 	InvariantEngine *invariants.Engine
+
+	// ReadForInvariants reads, for invariant evaluation, the PodSnapshot of
+	// the job a pod is assigned to, so that I4 sees whether a Snapshotting job
+	// past its timeout is still making progress (#231). main.go sets it to the
+	// PodMigrationJob reconciler's ReadForInvariants. After that reconciler's
+	// SetupWithManager, which main.go runs first, it reads only the kinds the
+	// reconciler watches, from the informer cache. nil skips the read, and I4
+	// judges the job without its progress.
+	ReadForInvariants func(ctx context.Context, key types.NamespacedName, obj *unstructured.Unstructured) error
 
 	// Engines provides the snapshot engine whose restore orders a released
 	// pod gets: the job's engine for a restore, the pod's for a cold start.
@@ -155,13 +165,34 @@ func (r *PodGateReconciler) evaluateInvariants(ctx context.Context, pod *corev1.
 	if r.Engines != nil {
 		restoreOrders = r.Engines.InspectRestoreOrder
 	}
+
+	// A Snapshotting job past its timeout is fine while its snapshot makes
+	// progress, as the job reconciler sees it (#231). Read the job's
+	// PodSnapshot from the cache so I4 can tell, only when I4 needs it.
+	// Until the PodSnapshot informer first syncs, this read waits; the pod
+	// gate runs one reconcile at a time, and the manager's cache-sync timeout
+	// bounds the wait. Unlike the job reconciler's peer reads, NotFound and
+	// NoKindMatch don't fall back to the engine's own snapshot provider: both
+	// in-tree engines use GKEProvider, which reads this same object.
+	now := time.Now()
+	var snapshotProgress map[string]invariants.SnapshotProgress
+	if job != nil && r.ReadForInvariants != nil && snapshotProgressNeeded(job, now) {
+		snap := &unstructured.Unstructured{}
+		snap.SetGroupVersionKind(snapshot.PodSnapshotGVK(r.jobSnapshotGroup(job)))
+		if err := r.ReadForInvariants(ctx, types.NamespacedName{Namespace: job.Namespace, Name: job.Status.SnapshotRef}, snap); err == nil {
+			snapshotProgress = map[string]invariants.SnapshotProgress{
+				job.Namespace + "/" + job.Name: snapshotProgressFromStatus(snapshot.CheckPodSnapshotStatus(snap, now)),
+			}
+		}
+	}
 	_, _ = r.InvariantEngine.Evaluate(ctx, &invariants.ReconcileSnapshot{
-		Now:           time.Now(),
-		Reconciler:    "PodGateReconciler",
-		PrimaryPod:    pod,
-		PrimaryPMJ:    job,
-		TargetingPMJs: targeting,
-		RestoreOrders: restoreOrders,
+		Now:              now,
+		Reconciler:       "PodGateReconciler",
+		PrimaryPod:       pod,
+		PrimaryPMJ:       job,
+		TargetingPMJs:    targeting,
+		SnapshotProgress: snapshotProgress,
+		RestoreOrders:    restoreOrders,
 	})
 }
 
