@@ -17,7 +17,9 @@ package controller
 
 import (
 	"context"
+	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -93,6 +95,31 @@ func TestFailedPlacementKeys(t *testing.T) {
 			criuNode("no-avx2", withoutAVX2()),
 		},
 		want: allCRIU,
+	}, {
+		// A node that meets the constraints as a whole (here, of the source
+		// node's pool) was already rejected by the scheduler with them in
+		// place, perhaps for resources: it isn't a way out, so it doesn't
+		// mark any constraint as met.
+		name: "CRIU, a full source-pool node and a node with an older kernel: the kernel version",
+		pod:  criuStuckPod(),
+		nodes: []client.Object{
+			criuNode("same", criuSourceFacts),
+			criuNode("old-kernel", olderKernel()),
+		},
+		want: kernelKey,
+	}, {
+		name: "CRIU, a full source-pool node and a node without avx2: that flag",
+		pod:  criuStuckPod(),
+		nodes: []client.Object{
+			criuNode("same", criuSourceFacts),
+			criuNode("no-avx2", withoutAVX2()),
+		},
+		want: []string{criuplacement.MissingCPUFlagLabelPrefix + "avx2"},
+	}, {
+		name:  "CRIU, only a full source-pool node: all added",
+		pod:   criuStuckPod(),
+		nodes: []client.Object{criuNode("same", criuSourceFacts)},
+		want:  allCRIU,
 	}, {
 		name:  "CRIU, the only other node isn't Ready: all added",
 		pod:   criuStuckPod(),
@@ -203,9 +230,80 @@ func TestPlacementSignal(t *testing.T) {
 	if got, ok := placementSignalOf("engine=gke-pod-snapshots requirements=: text"); !ok || got != "engine=gke-pod-snapshots requirements=" {
 		t.Errorf("placementSignalOf(no keys) = %q, %t", got, ok)
 	}
-	for _, old := range []string{"", "Replacement pod p, released with the restore's node constraints", "engine=criu: text"} {
+	// A later version may add fields at the end: they're kept with the
+	// others.
+	later := "engine=criu requirements=" + criuplacement.LabelKernelVersion + " pool=pool-b nodes="
+	if got, ok := placementSignalOf(later + ": text: more"); !ok || got != later {
+		t.Errorf("placementSignalOf(a later field) = %q, %t; want %q", got, ok, later)
+	}
+	// Human text with ": " in it isn't taken for fields.
+	for message, want := range map[string]string{
+		"engine=criu requirements=: Replacement pod p: wasn't scheduled":   "engine=criu requirements=",
+		"engine=criu requirements=a,b: note=x: y":                          "engine=criu requirements=a,b",
+		"engine=criu requirements=a extra=b: Replacement pod p: note=x: y": "engine=criu requirements=a extra=b",
+	} {
+		if got, ok := placementSignalOf(message); !ok || got != want {
+			t.Errorf("placementSignalOf(%q) = %q, %t; want %q", message, got, ok, want)
+		}
+	}
+	for _, old := range []string{"", "Replacement pod p, released with the restore's node constraints", "engine=criu: text",
+		"engine=criu requirements=a Replacement pod p: text", "engine=criu requirements=a extra: text"} {
 		if got, ok := placementSignalOf(old); ok {
 			t.Errorf("placementSignalOf(%q) = %q, want none", old, got)
+		}
+	}
+}
+
+// TestDocumentedSignalPatterns checks the regular expressions that
+// README.md gives external controllers against the fields the controller
+// writes: they match them, with any field a later version adds at the end,
+// and don't reach into human text that contains ": ".
+func TestDocumentedSignalPatterns(t *testing.T) {
+	const (
+		placementPattern    = "^engine=([^ :]+) requirements=([^ :]*)(?: [^ :=]+=[^ :]*)*: "
+		incompatiblePattern = "^engine=([^ :]+) fact=([^ :]+) node=([^ :]*) sourceNode=([^ :]*)(?: [^ :=]+=[^ :]*)*: "
+	)
+	readme, err := os.ReadFile("../../../README.md")
+	if err != nil {
+		t.Fatalf("reading README.md: %v", err)
+	}
+	for _, pattern := range []string{placementPattern, incompatiblePattern} {
+		if !strings.Contains(string(readme), "`"+pattern+"`") {
+			t.Errorf("README.md doesn't document %q", pattern)
+		}
+	}
+	keys := criuplacement.LabelKernelVersion + "," + criuplacement.MissingCPUFlagLabelPrefix + "avx2"
+	for _, tc := range []struct {
+		pattern, signal string
+		want            []string
+	}{{
+		pattern: placementPattern,
+		signal:  placementSignal("criu", strings.Split(keys, ",")),
+		want:    []string{"criu", keys},
+	}, {
+		pattern: placementPattern,
+		signal:  placementSignal("gke-pod-snapshots", nil),
+		want:    []string{"gke-pod-snapshots", ""},
+	}, {
+		pattern: incompatiblePattern,
+		signal:  incompatibleNodeSignal("criu", "cpu-model", "pool-b-1", "pool-a-3"),
+		want:    []string{"criu", "cpu-model", "pool-b-1", "pool-a-3"},
+	}, {
+		pattern: incompatiblePattern,
+		signal:  incompatibleNodeSignal("criu", "cpu-model", "", ""),
+		want:    []string{"criu", "cpu-model", "", ""},
+	}} {
+		re := regexp.MustCompile(tc.pattern)
+		for _, signal := range []string{tc.signal, tc.signal + " later=x", tc.signal + " later= more=y"} {
+			message := withSignal(signal, "Replacement pod p: note=x: y")
+			m := re.FindStringSubmatch(message)
+			if m == nil {
+				t.Errorf("%q doesn't match %q", tc.pattern, message)
+				continue
+			}
+			if !reflect.DeepEqual(m[1:], tc.want) || m[0] != signal+": " {
+				t.Errorf("%q on %q = %q, want fields %q", tc.pattern, message, m, tc.want)
+			}
 		}
 	}
 }

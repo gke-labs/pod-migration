@@ -394,7 +394,7 @@ kubectl get podmigrationjob <job-name> -o jsonpath='{.status.conditions[?(@.type
 
 Controllers that place workloads, such as `gke-labs/workload-class`, don't know which snapshot engine serves a Pod, but can tell from these reasons and Warning events when a warm restore wasn't possible on the capacity the Pod got, and why (#294). They're stable: a reason isn't renamed, and the fields below keep their names and order (new fields, if any, are added at the end).
 
-Some messages start with machine-readable fields, then `: ` and the human text. Fields are `key=value`, separated by single spaces. A value never contains a space or `: `, and is empty when it isn't known. A message written by an earlier version of the controller has no fields.
+Some messages start with machine-readable fields, then `: ` and the human text. Fields are `key=value`, separated by single spaces. A value never contains a space or a colon, and is empty when it isn't known. A message written by an earlier version of the controller has no fields.
 
 | Reason | Where | When | Message |
 |---|---|---|---|
@@ -408,7 +408,7 @@ Some messages start with machine-readable fields, then `: ` and the human text. 
 The fields:
 
 - `engine`: the snapshot engine that serves the job: `gke-pod-snapshots` or `criu`.
-- `requirements`: comma-separated node label keys of the constraints that failed, in the engine's order. These are the constraints the Pod Gate Reconciler added to the replacement (recorded in its `pod-migrate.io/restore-placement-added` annotation) that no node meets among the nodes that would take the Pod without them, checked as the placement deadline checks them (Ready, not cordoned, the Pod's node selector, affinity and tolerations; not resources). When that singles out none (no such node exists, or each constraint is met by some node and only their combination isn't), it lists all the added constraints. For GKE Pod Snapshots that's `node.kubernetes.io/instance-type`. For CRIU, it can be `kubernetes.io/arch` and `criu.pod-migrate.io/*` keys (CPU vendor, model, XSAVE state, kernel, CRIU, runc and containerd versions), and `missing-cpu.criu.pod-migrate.io/<flag>` for instruction flags the node lacks; more than 8 flag keys are listed as one `missing-cpu.criu.pod-migrate.io/*` (see [engines/criu/README.md](engines/criu/README.md) for the labels).
+- `requirements`: comma-separated node label keys of the constraints that failed, in the engine's order. These are the constraints the Pod Gate Reconciler added to the replacement (recorded in its `pod-migrate.io/restore-placement-added` annotation) that no node meets among the nodes that don't meet the constraints as a whole yet would take the Pod without them, checked as the placement deadline checks them (Ready, not cordoned, the Pod's node selector, affinity and tolerations; not resources). A node that meets them all, such as a full node in the source node's pool, was already turned down by the scheduler with them in place, so it doesn't count. When that singles out none (no such node exists, or each constraint is met by some node and only their combination isn't), it lists all the added constraints. For GKE Pod Snapshots that's `node.kubernetes.io/instance-type`. For CRIU, it can be `kubernetes.io/arch` and `criu.pod-migrate.io/*` keys (CPU vendor, model, XSAVE state, kernel, CRIU, runc and containerd versions), and `missing-cpu.criu.pod-migrate.io/<flag>` for instruction flags the node lacks; more than 8 flag keys are listed as one `missing-cpu.criu.pod-migrate.io/*` (see [engines/criu/README.md](engines/criu/README.md) for the labels).
 - `fact`: the node fact that didn't match. CRIU: `cpu-model` (the `model name` in `/proc/cpuinfo`, which the node agent compares with the archive's).
 - `node`: the replacement's node. `sourceNode`: the node the checkpoint was taken on (`status.originNodeName`).
 
@@ -419,7 +419,7 @@ Warning  PlacementTimeout  engine=gke-pod-snapshots requirements=node.kubernetes
 Warning  RestoreIncompatibleNode  engine=criu fact=cpu-model node=pool-b-1 sourceNode=pool-a-3: The replacement's node isn't compatible with the checkpoint's source node (cpu-model differs), so it started cold: ...
 ```
 
-A controller can match the reason, then the fields with `^engine=(\S+) requirements=(\S*): ` or `^engine=(\S+) fact=(\S+) node=(\S*) sourceNode=(\S*): `.
+A controller can match the reason, then the fields with `^engine=([^ :]+) requirements=([^ :]*)(?: [^ :=]+=[^ :]*)*: ` or `^engine=([^ :]+) fact=([^ :]+) node=([^ :]*) sourceNode=([^ :]*)(?: [^ :=]+=[^ :]*)*: `. These also match fields that a later version adds at the end, and never reach into the human text, which can contain `: `. Equivalently, split the message at the first `: ` and read the space-separated `key=value` fields before it.
 
 ---
 

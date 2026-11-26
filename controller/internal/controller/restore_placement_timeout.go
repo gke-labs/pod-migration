@@ -229,9 +229,12 @@ func (r *PodMigrationJobReconciler) carriesRestorePlacement(ctx context.Context,
 // pod, job's replacement, from being scheduled, for the PlacementTimeout
 // messages (#294): of the constraints the pod gate added to it
 // (addedPlacementRequirements), the ones that no node meets among the nodes
-// that would take pod without them. Those nodes are found as
-// blockedByRestorePlacement finds them: withoutRequirements gives the pod as
-// its owner recreates it, and nodeFits checks each node for it. For GKE Pod
+// that don't meet the constraints as a whole yet would take pod without
+// them. Those nodes are found as blockedByRestorePlacement finds them:
+// withoutRequirements gives the pod as its owner recreates it, nodeFits
+// checks each node for it, and a node that pod's own affinity matches is
+// skipped, since the scheduler already rejected it (for example, a full
+// node of the source node's pool). For GKE Pod
 // Snapshots, that's node.kubernetes.io/instance-type; for CRIU, the
 // arch, CPU, version and missing-CPU-flag label keys that differ.
 //
@@ -264,8 +267,13 @@ func (r *PodMigrationJobReconciler) failedPlacementKeys(ctx context.Context, job
 	}
 	recreated := withoutRequirements(pod, reqs)
 	recreatedAffinity := nodeaffinity.GetRequiredNodeAffinity(recreated)
+	affinity := nodeaffinity.GetRequiredNodeAffinity(pod)
+	opts := []client.ListOption{client.UnsafeDisableDeepCopy}
+	if selector, ok := wayOutSelector(recreated, reqs); ok {
+		opts = append(opts, client.MatchingLabelsSelector{Selector: selector})
+	}
 	nodes := &corev1.NodeList{}
-	if err := r.List(ctx, nodes, client.UnsafeDisableDeepCopy); err != nil {
+	if err := r.List(ctx, nodes, opts...); err != nil {
 		log.FromContext(ctx).V(1).Info("Couldn't list nodes; naming every constraint the pod gate added", "job", job.Name, "err", err.Error())
 		return keys(added)
 	}
@@ -279,6 +287,12 @@ func (r *PodMigrationJobReconciler) failedPlacementKeys(ctx context.Context, job
 	candidates := 0
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
+		// A node that meets the constraints as a whole was rejected by the
+		// scheduler with them in place, perhaps for resources, so it isn't
+		// a way out, and it would mark every constraint as met.
+		if match, err := affinity.Match(node); err != nil || match {
+			continue
+		}
 		if !nodeFits(ctx, node, recreated, recreatedAffinity) {
 			continue
 		}

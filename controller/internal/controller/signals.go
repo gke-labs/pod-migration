@@ -29,9 +29,10 @@ import (
 //	engine=<engine> requirements=<key>[,<key>...]: <text>
 //	engine=<engine> fact=<fact> node=<node> sourceNode=<node>: <text>
 //
-// Fields are key=value, separated by single spaces, in that order. Values
-// never contain a space or ": " (engine names, label keys and node names
-// can't), and may be empty when not known. README.md, "Signals for external
+// Fields are key=value, separated by single spaces, in that order; a later
+// version may add some at the end. Values never contain a space or a colon
+// (engine names, label keys and node names can't, and validSignalValue
+// checks the engine's own), and may be empty when not known. README.md, "Signals for external
 // controllers", documents them.
 
 // maxListedCPUFlagKeys is how many of the CRIU engine's missing-CPU-flag
@@ -42,8 +43,10 @@ import (
 const maxListedCPUFlagKeys = 8
 
 // placementSignalPattern matches the fields at the start of a
-// PlacementTimeout message.
-var placementSignalPattern = regexp.MustCompile(`^(engine=[^ :]+ requirements=[^ :]*): `)
+// PlacementTimeout message, with any that a later version adds at the end.
+// No class matches a space or a colon, so a match never runs into human
+// text that contains ": ".
+var placementSignalPattern = regexp.MustCompile(`^(engine=[^ :]+ requirements=[^ :]*(?: [^ :=]+=[^ :]*)*): `)
 
 // placementSignal renders the fields of a PlacementTimeout message: the
 // engine that stated the node constraints, and the keys of the ones that
