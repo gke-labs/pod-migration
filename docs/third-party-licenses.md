@@ -31,7 +31,9 @@ The project publishes four container images across its controllers and the CRIU 
   - `github.com/evanphx/json-patch/v5`: `BSD-3-Clause`
   - `github.com/prometheus/client_golang`, `github.com/prometheus/client_model`: `Apache-2.0`
   - `gomodules.xyz/jsonpatch/v2`: `Apache-2.0`
-- **In-Image License Disclosures**: Distroless base license notices.
+- **In-Image License Disclosures**:
+  - Go runtime and all compiled third-party Go module `LICENSE` / `NOTICE` files (plus `go-modules.txt`): `/THIRD_PARTY_NOTICES/`
+  - Distroless base license notices (`/usr/share/doc/*/copyright`).
 
 ### 2.2 CRIU Engine Controller (`pod-migration-criu-engine`)
 
@@ -47,7 +49,9 @@ The project publishes four container images across its controllers and the CRIU 
   - `github.com/containerd/containerd/v2`: `Apache-2.0`
   - `github.com/opencontainers/runtime-spec`, `github.com/opencontainers/image-spec`: `Apache-2.0`
   - `github.com/prometheus/client_golang`: `Apache-2.0`
-- **In-Image License Disclosures**: Distroless base license notices.
+- **In-Image License Disclosures**:
+  - Go runtime and all compiled third-party Go module `LICENSE` / `NOTICE` files (plus `go-modules.txt`): `/THIRD_PARTY_NOTICES/`
+  - Distroless base license notices (`/usr/share/doc/*/copyright`).
 
 ### 2.3 Pod Sandbox Holder (`pod-migration-criu-holder`)
 
@@ -57,7 +61,8 @@ The project publishes four container images across its controllers and the CRIU 
 - **Runtime Components**:
   - `/holder` (compiled Go binary): `Apache-2.0`
 - **Go Direct Module Dependencies**: Go standard library only (`CGO_ENABLED=0`).
-- **In-Image License Disclosures**: Statically linked Go runtime under BSD-3-Clause.
+- **In-Image License Disclosures**:
+  - Go runtime (`BSD-3-Clause`) license text and module manifest: `/THIRD_PARTY_NOTICES/` (`go-stdlib/LICENSE`, `go-modules.txt`).
 
 ### 2.4 CRIU Node Agent (`pod-migration-criu-agent`)
 
@@ -94,6 +99,8 @@ The project publishes four container images across its controllers and the CRIU 
   - `libmnl.so.0`: `LGPL-2.1-or-later`
   - `libuuid.so.1` (util-linux): `BSD-3-Clause`
 - **In-Image License Disclosures**:
+  - Go runtime and all compiled third-party Go module `LICENSE` / `NOTICE` files (plus `go-modules.txt`): `/THIRD_PARTY_NOTICES/`
+  - Reciprocal Go dependency source (unmodified `github.com/cyphar/filepath-securejoin` `MPL-2.0` files compiled transitively via `containerd/v2`): `/THIRD_PARTY_NOTICES/reciprocal-source/`
   - Distribution packages: `/usr/share/doc/*/copyright`
   - Bundled CRIU and shared libraries: `/opt/criu-bundle/licenses/*.copyright`
   - Build-time package version manifest: `/opt/criu-bundle/licenses/package-versions.txt`
