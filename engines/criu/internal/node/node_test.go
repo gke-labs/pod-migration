@@ -539,6 +539,9 @@ func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
 				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
 					return "Looks good but some kernel features are missing\nwhich, depending on your process tree, may cause\ndump or restore failure.\n", errors.New("exit status 1")
 				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
+				}
 				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
 					if args[2] == "pagemap_scan_guard_pages" || args[2] == "timer_cr_ids" {
 						return "", errors.New("exit status 1")
@@ -606,6 +609,9 @@ func TestNode_DeterministicFailuresDoNotReprobeWithoutRestart(t *testing.T) {
 			execHostFn: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
 				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
 					return "Looks good but some kernel features are missing\nwhich, depending on your process tree, may cause\ndump or restore failure.\n", errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
 				}
 				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
 					if args[2] == "uffd" {

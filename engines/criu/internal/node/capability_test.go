@@ -132,10 +132,30 @@ dump or restore failure.
 			wantReason: "",
 		},
 		{
+			name: "fast path requires err == nil even if stdout contains Looks good",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return "Looks good.\n", errors.New("exit status 1")
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "uffd" {
+						return "", errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
+			wantOK:     false,
+			wantReason: "criu check missing required features: uffd",
+		},
+		{
 			name: "GKE 6.12 kernel: missing optional pagemap_scan_guard_pages and timer_cr_ids",
 			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
 				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
 					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
 				}
 				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
 					switch args[2] {
@@ -155,10 +175,30 @@ dump or restore failure.
 			wantReason: "missing optional CRIU features: pagemap_scan_guard_pages, timer_cr_ids",
 		},
 		{
+			name: "unlisted silent category-2 check missing in --all but required and optional features pass",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
+			wantOK:     true,
+			wantReason: "",
+		},
+		{
 			name: "single optional feature missing: timer_cr_ids",
 			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
 				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
 					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
 				}
 				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
 					if args[2] == "timer_cr_ids" {
@@ -176,6 +216,9 @@ dump or restore failure.
 			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
 				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
 					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
 				}
 				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
 					if args[2] == "pagemap_scan_guard_pages" {
@@ -196,6 +239,9 @@ dump or restore failure.
 				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
 					return raw612, errors.New("exit status 1")
 				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
+				}
 				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
 					if args[2] == "uffd" {
 						return "", errors.New("exit status 1")
@@ -208,10 +254,73 @@ dump or restore failure.
 			wantReason: "criu check missing required features: uffd",
 		},
 		{
+			name: "required feature missing: fdinfo_lock",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "fdinfo_lock" {
+						return "", errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
+			wantOK:     false,
+			wantReason: "criu check missing required features: fdinfo_lock",
+		},
+		{
+			name: "required feature missing: seccomp_suspend",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "seccomp_suspend" {
+						return "", errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
+			wantOK:     false,
+			wantReason: "criu check missing required features: seccomp_suspend",
+		},
+		{
+			name: "required feature missing: seccomp_filters",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "seccomp_filters" {
+						return "", errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
+			wantOK:     false,
+			wantReason: "criu check missing required features: seccomp_filters",
+		},
+		{
 			name: "multiple required features missing: cgroupns and uffd",
 			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
 				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
 					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
 				}
 				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
 					if args[2] == "cgroupns" || args[2] == "uffd" {
@@ -230,6 +339,9 @@ dump or restore failure.
 				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
 					return raw612, errors.New("exit status 1")
 				}
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
+				}
 				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
 					if args[2] == "uffd" || args[2] == "timer_cr_ids" {
 						return "", errors.New("exit status 1")
@@ -247,7 +359,7 @@ dump or restore failure.
 				return "Does not look good.\n", errors.New("exit status 1")
 			},
 			wantOK:     false,
-			wantReason: "criu check --all failed",
+			wantReason: "criu check failed",
 		},
 		{
 			name: "core check binary exec error",
@@ -270,10 +382,19 @@ dump or restore failure.
 			wantReason: "",
 		},
 		{
-			name:      "checkMode core fails if core check fails",
+			name:      "checkMode core fails if core check outputs Does not look good",
 			checkMode: "core",
 			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
 				return "Does not look good.\n", errors.New("exit status 1")
+			},
+			wantOK:     false,
+			wantReason: "criu check failed",
+		},
+		{
+			name:      "checkMode core fails if exit status is non-zero even with Looks good",
+			checkMode: "core",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				return "Looks good.\n", errors.New("exit status 1")
 			},
 			wantOK:     false,
 			wantReason: "criu check failed",

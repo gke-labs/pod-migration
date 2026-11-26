@@ -131,9 +131,19 @@ var knownOptionalFeatures = []string{
 // requiredFeatures lists the Category-2 CRIU kernel features that the engine
 // depends on beyond the core CRIU checks. Each feature is probed via
 // `criu check --feature <name>`.
+//
+//   - cgroupns: namespace isolation for container checkpoint/restore
+//   - fdinfo_lock: file-locks option in runc.conf
+//   - mem_dirty_track: memory dirty tracking
+//   - seccomp_filters: RuntimeDefault seccomp profile dump/restore
+//   - seccomp_suspend: RuntimeDefault seccomp profile dump/restore
+//   - uffd: userfaultfd support
 var requiredFeatures = []string{
 	"cgroupns",
+	"fdinfo_lock",
 	"mem_dirty_track",
+	"seccomp_filters",
+	"seccomp_suspend",
 	"uffd",
 }
 
@@ -141,52 +151,61 @@ var requiredFeatures = []string{
 // in the host context via nsenter.
 //
 // Gating is authoritative and exit-code based:
-// 1. Core check: `criu check` verifies Category-1 features. If this fails, the node is unready.
-//    If PODMIG_CRIU_CHECK=core is set, verification uses plain `criu check`.
-// 2. Default check: runs `criu check --all`. If clean ("Looks good." with exit 0 and no missing
-//    features warning), the node is immediately marked ready (single invocation).
-// 3. When `criu check --all` reports missing features:
-//    - Required features (cgroupns, mem_dirty_track, uffd) are probed via `criu check --feature <name>`.
-//      If any required feature is missing, the node is marked unready (criu-ready=false).
-//    - Optional features (timer_cr_ids, pagemap_scan_guard_pages) are probed via `criu check --feature <name>`.
-//      For pagemap_scan_guard_pages, it is treated as optional only when the kernel lacks MADV_GUARD_INSTALL.
-//      If the kernel has MADV_GUARD_INSTALL (6.13+) but lacks PAGE_IS_GUARD, CRIU warns that dumps will fail
-//      if processes use guard pages, in which case it is treated as required and marks the node unready.
-//    - Missing optional features are recorded in reason so they are published in pod-migrate.io/criu-reason.
+//
+//  1. Core mode: when PODMIG_CRIU_CHECK=core, gates strictly on exit 0 and "Looks good"
+//     from `criu check`.
+//  2. Default fast path: runs `criu check --all`. If clean (exit status 0, "Looks good.",
+//     and no missing features warning), the node is immediately marked ready (single invocation).
+//  3. Default fallback: when `criu check --all` reports missing features or exits non-zero:
+//     - Core check: if core kernel checks fail (output lacks "Looks good" or contains "Does not look good"),
+//     the node is unconditionally unready (criu-ready=false).
+//     - Required features: probes each engine dependency (cgroupns, fdinfo_lock, mem_dirty_track,
+//     seccomp_filters, seccomp_suspend, uffd) via `criu check --feature <name>`. If any required
+//     probe exits non-zero, the node is marked unready (criu-ready=false).
+//     - Optional features: probes known optional features (timer_cr_ids, pagemap_scan_guard_pages).
+//     For pagemap_scan_guard_pages, it is treated as optional ONLY when the kernel lacks
+//     MADV_GUARD_INSTALL. On kernels with MADV_GUARD_INSTALL (6.13+) without PAGE_IS_GUARD, CRIU
+//     warns that dumps will fail if processes use guard pages; in that case, it is treated as
+//     required and marks the node unready.
+//     - If core and all required features pass, the node is marked ready (criu-ready=true).
+//     Any missing optional features are recorded in pod-migrate.io/criu-reason.
 func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, string, ...string) (string, error), bundleDir string) (ok bool, reason string, raw string) {
 	checkMode := os.Getenv("PODMIG_CRIU_CHECK")
-	args := []string{"check", "--all"}
 	if checkMode == "core" {
-		args = []string{"check"}
-	}
-
-	out, err := execHost(ctx, nil, bundleDir+"/criu", args...)
-	raw = strings.TrimSpace(out)
-	if err != nil && raw == "" {
-		return false, "criu check failed: " + err.Error(), "(err: " + err.Error() + ")"
-	}
-
-	if checkMode == "core" {
-		if strings.Contains(raw, "Looks good") && !strings.Contains(raw, "Does not look good") {
+		out, err := execHost(ctx, nil, bundleDir+"/criu", "check")
+		raw = strings.TrimSpace(out)
+		if err != nil && raw == "" {
+			return false, "criu check failed: " + err.Error(), "(err: " + err.Error() + ")"
+		}
+		if err == nil && strings.Contains(raw, "Looks good") && !strings.Contains(raw, "Does not look good") {
 			return true, "", raw
 		}
 		return false, "criu check failed", raw
 	}
 
-	if !strings.Contains(raw, "Looks good") || strings.Contains(raw, "Does not look good") {
-		return false, "criu check --all failed", raw
+	// 1. Fast path: run `criu check --all`. On fully capable kernels (all core and category-2
+	// features supported), CRIU outputs "Looks good." with exit status 0 in a single invocation.
+	out, err := execHost(ctx, nil, bundleDir+"/criu", "check", "--all")
+	raw = strings.TrimSpace(out)
+	if err != nil && raw == "" {
+		return false, "criu check failed: " + err.Error(), "(err: " + err.Error() + ")"
 	}
-
-	if !strings.Contains(raw, "Looks good but some kernel features are missing") && err == nil {
+	if err == nil && strings.Contains(raw, "Looks good") && !strings.Contains(raw, "Looks good but some kernel features are missing") && !strings.Contains(raw, "Does not look good") {
 		return true, "", raw
 	}
 
-	// Some features are missing in category 2: probe required and optional features
-	// authoritatively via `criu check --feature <name>`.
+	// 2. Core check: verify category-1 features.
+	// If the core kernel features fail, the node is unconditionally unready.
+	if !strings.Contains(raw, "Looks good") || strings.Contains(raw, "Does not look good") {
+		return false, "criu check failed", raw
+	}
+
+	// 3. Category-2 required features: probe each feature required by the engine via
+	// `criu check --feature <name>`. Gated authoritatively by exit code.
 	var missingRequired []string
 	for _, feat := range requiredFeatures {
-		featOut, featErr := execHost(ctx, nil, bundleDir+"/criu", "check", "--feature", feat)
-		if featErr != nil || strings.Contains(featOut, "is not supported") {
+		_, featErr := execHost(ctx, nil, bundleDir+"/criu", "check", "--feature", feat)
+		if featErr != nil {
 			missingRequired = append(missingRequired, feat)
 		}
 	}
@@ -195,15 +214,15 @@ func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, st
 		return false, "criu check missing required features: " + strings.Join(missingRequired, ", "), raw
 	}
 
+	// 4. Optional features: probe known optional features via `criu check --feature <name>`.
+	// For pagemap_scan_guard_pages, it is treated as optional ONLY when the kernel lacks MADV_GUARD_INSTALL.
+	// On kernels with MADV_GUARD_INSTALL (6.13+) without PAGE_IS_GUARD, CRIU warns that dumps will fail
+	// if processes use guard pages; in that case, it is treated as required and marks the node unready.
 	var missingOptional []string
 	for _, feat := range knownOptionalFeatures {
 		featOut, featErr := execHost(ctx, nil, bundleDir+"/criu", "check", "--feature", feat)
-		if featErr != nil || strings.Contains(featOut, "is not supported") {
+		if featErr != nil {
 			if feat == "pagemap_scan_guard_pages" {
-				// Treat guard pages as optional ONLY when the kernel lacks MADV_GUARD_INSTALL.
-				// On kernels with MADV_GUARD_INSTALL (6.13+) without PAGE_IS_GUARD, CRIU prints:
-				// "ioctl(PAGEMAP_SCAN) doesn't support PAGE_IS_GUARD flag. CRIU dump will fail if dumped processes use madvise(MADV_GUARD_INSTALL)."
-				// In that case, dumps will fail if processes use guard pages, so the feature cannot be treated as optional.
 				if strings.Contains(featOut, "MADV_GUARD_INSTALL") || strings.Contains(featOut, "PAGE_IS_GUARD") {
 					return false, "criu check missing required features: pagemap_scan_guard_pages", featOut
 				}
@@ -212,12 +231,14 @@ func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, st
 		}
 	}
 
+	// All required features are satisfied. If any optional features are missing, record them
+	// in reason so they are published in pod-migrate.io/criu-reason.
 	if len(missingOptional) > 0 {
 		sort.Strings(missingOptional)
 		return true, "missing optional CRIU features: " + strings.Join(missingOptional, ", "), raw
 	}
 
-	return false, "criu check --all missing unspecified features", raw
+	return true, "", raw
 }
 
 // annotateNode publishes the node's CRIU capability verdict, version, and optional reason/remediation.
