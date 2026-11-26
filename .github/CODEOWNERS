@@ -4,3 +4,4 @@
 /controller/internal/invariants/ @yaoluo @bnaylor
 /.github/CODEOWNERS @yaoluo @bnaylor
 /verification-suite/verify_invariant_governance.sh @yaoluo @bnaylor
+/.github/workflows/ @yaoluo @bnaylor

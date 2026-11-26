@@ -237,6 +237,12 @@ func main() {
 		LeaderElection:                enableLeaderElection,
 		LeaderElectionID:              "pod-migration-controller-leader",
 		LeaderElectionReleaseOnCancel: true,
+		// The client keeps reading unstructured objects (the engines' triggers
+		// and PodSnapshots) from the API server: the engines' state machines
+		// need fresh reads, and a cached read of a kind the controller doesn't
+		// watch would start an informer that blocks until it syncs. Invariant
+		// evaluation reads the kinds the PodMigrationJob reconciler watches
+		// from this cache instead (#199).
 		Cache: cache.Options{
 			DefaultTransform: cache.TransformStripManagedFields(),
 			ByObject: map[client.Object]cache.ByObject{
