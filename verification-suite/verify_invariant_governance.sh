@@ -44,6 +44,10 @@
 #   5. Never exempts detached HEAD (`HEAD` / `DETACHED_HEAD`); only direct
 #      commits on `main` skip per-PR lane diff enforcement.
 #   6. Fails closed if the git diff against a base ref cannot be resolved.
+#   7. Computes changed files without rename detection, so a file moved out of
+#      (or into) a governed path counts against both its old and new paths, and
+#      without path quoting; a changed path with whitespace or control
+#      characters fails closed.
 
 set -euo pipefail
 
@@ -216,15 +220,32 @@ resolve_changed_files() {
     return 0
   fi
 
-  local base
+  local base range
   base="$(resolve_base_ref)" || return 1
-
+  range="${base}...HEAD"
   if [[ "${base}" == "HEAD^1" ]]; then
-    git -C "${REPO_ROOT}" diff --name-only HEAD^1 HEAD
-    return 0
+    range="HEAD^1..HEAD"
   fi
 
-  git -C "${REPO_ROOT}" diff --name-only "${base}...HEAD"
+  # --no-renames: a moved file counts against both its old and new paths.
+  # core.quotePath=false and -z: paths come back verbatim and NUL-separated,
+  # never C-quoted (a quoted path like "controller/internal/invariants/\303\251.go"
+  # would not match the governed prefixes). Paths containing whitespace or
+  # control characters fail closed, since evaluate_governance splits on spaces.
+  local raw
+  raw="$(git -C "${REPO_ROOT}" -c core.quotePath=false diff --no-renames --name-only -z "${range}" | tr '\0' '\n')" || {
+    fail "git diff ${range} failed; failing closed"
+    return 1
+  }
+  local f
+  while IFS= read -r f; do
+    [[ -z "${f}" ]] && continue
+    if [[ "${f}" =~ [[:space:]] || "${f}" =~ [[:cntrl:]] ]]; then
+      fail "Changed path contains whitespace or control characters, which governance can't evaluate safely: '${f}'; failing closed"
+      return 1
+    fi
+    printf '%s\n' "${f}"
+  done <<<"${raw}"
 }
 
 collect_pr_commit_messages() {
@@ -463,8 +484,93 @@ EOF
     fi
   done
 
+  # 14. Negative (renames): moving a governed file out of controller/internal/invariants/
+  # must still count as touching it. git's default rename detection would report
+  # only the new path, so the diff must be computed without rename detection.
+  local rn_repo="${tmp_dir}/rename-repo"
+  if ! (
+    set -e
+    git init -q -b main "${rn_repo}"
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    mkdir -p "${rn_repo}/controller/internal/invariants"
+    printf 'package invariants\n\n// rule body\nvar x = 1\n' > "${rn_repo}/controller/internal/invariants/rules.go"
+    git -C "${rn_repo}" add -A
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q -m rules
+    git -C "${rn_repo}" checkout -q -b feature/move-rule
+    mkdir -p "${rn_repo}/controller/x"
+    git -C "${rn_repo}" mv controller/internal/invariants/rules.go controller/x/rules.go
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q -m "chore: move file"
+  ) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: could not build the rename fixture repository"
+    exit 1
+  fi
+  local rn_changed
+  rn_changed="$(REPO_ROOT="${rn_repo}" BASE_REF="main" HAS_CHANGED_OVERRIDE="false" resolve_changed_files)"
+  if ! grep -qx 'controller/internal/invariants/rules.go' <<<"${rn_changed}"; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: a file renamed out of controller/internal/invariants/ did not report its old path (got: $(tr '\n' ' ' <<<"${rn_changed}"))"
+    exit 1
+  fi
+  if evaluate_governance "feature/move-rule" "${valid_co}" "${rn_changed}" "false" "chore: move file" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: Lane 1 allowed moving a file out of controller/internal/invariants/"
+    exit 1
+  fi
+
+  # 15. Negative (path quoting): a non-ASCII file name under controller/internal/invariants/
+  # must be reported verbatim (not C-quoted) so Lane 1 still sees the governed prefix.
+  # A changed path containing whitespace must fail closed.
+  local q_repo="${tmp_dir}/quote-repo"
+  if ! (
+    set -e
+    git init -q -b main "${q_repo}"
+    git -C "${q_repo}" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    git -C "${q_repo}" checkout -q -b feature/quoted
+    mkdir -p "${q_repo}/controller/internal/invariants"
+    printf 'package invariants\n' > "${q_repo}/controller/internal/invariants/r\303\251gle.go"
+    git -C "${q_repo}" add -A
+    git -C "${q_repo}" -c user.name=t -c user.email=t@t commit -q -m "chore: add"
+  ) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: could not build the quoting fixture repository"
+    exit 1
+  fi
+  local q_changed
+  q_changed="$(REPO_ROOT="${q_repo}" BASE_REF="main" HAS_CHANGED_OVERRIDE="false" resolve_changed_files)"
+  if ! grep -q '^controller/internal/invariants/' <<<"${q_changed}"; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: a non-ASCII path under controller/internal/invariants/ was not reported verbatim (got: ${q_changed})"
+    exit 1
+  fi
+  if evaluate_governance "feature/quoted" "${valid_co}" "${q_changed}" "false" "chore: add" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: Lane 1 allowed a non-ASCII file under controller/internal/invariants/"
+    exit 1
+  fi
+  local s_repo="${tmp_dir}/space-repo"
+  if ! (
+    set -e
+    git init -q -b main "${s_repo}"
+    git -C "${s_repo}" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    git -C "${s_repo}" checkout -q -b feature/space
+    mkdir -p "${s_repo}/docs/a b"
+    printf 'x\n' > "${s_repo}/docs/a b/c.md"
+    git -C "${s_repo}" add -A
+    git -C "${s_repo}" -c user.name=t -c user.email=t@t commit -q -m "chore: add"
+  ) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: could not build the whitespace fixture repository"
+    exit 1
+  fi
+  if (REPO_ROOT="${s_repo}" BASE_REF="main" HAS_CHANGED_OVERRIDE="false" resolve_changed_files) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: a changed path with whitespace did not fail closed"
+    exit 1
+  fi
+
   rm -rf "${tmp_dir}"
-  log "Self-test PASSED: all 13 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, and co-change cases verified"
+  log "Self-test PASSED: all 15 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, co-change, rename and path-quoting cases verified"
 }
 
 main() {
