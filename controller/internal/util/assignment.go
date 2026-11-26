@@ -81,8 +81,14 @@ func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod
 			rs := &appsv1.ReplicaSet{}
 			err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}, rs)
 			if err == nil {
+				if ref.UID != "" && rs.UID != "" && rs.UID != ref.UID {
+					continue
+				}
+				if ref.Controller != nil && !*ref.Controller {
+					continue
+				}
 				for _, rsRef := range rs.OwnerReferences {
-					if rsRef.Kind == "Deployment" {
+					if rsRef.Kind == "Deployment" && (rsRef.Controller == nil || *rsRef.Controller) {
 						return rsRef.Name, "Deployment", string(rsRef.UID), nil
 					}
 				}
@@ -90,7 +96,7 @@ func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod
 			} else {
 				return "", "", "", err
 			}
-		} else if ref.Kind == "Job" || ref.Kind == "StatefulSet" {
+		} else if (ref.Kind == "Job" || ref.Kind == "StatefulSet") && (ref.Controller == nil || *ref.Controller) {
 			return ref.Name, ref.Kind, string(ref.UID), nil
 		} else if ref.Controller != nil && *ref.Controller {
 			fallbackControllerOwner = ref
@@ -610,7 +616,7 @@ func FindUnassignedActivePMJ(
 
 // MatchesPMJWorkload checks whether a replacement pod belongs to the same parent workload
 // and matches the replica identity criteria recorded on the PodMigrationJob.
-func MatchesPMJWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, parentName, parentKind, parentUID string) bool {
+func MatchesPMJWorkload(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, parentName, parentKind, parentUID string) bool {
 	if pod == nil || job == nil {
 		return false
 	}
@@ -618,15 +624,6 @@ func MatchesPMJWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod, j
 	jobParentName := job.Labels[LabelParentName]
 	jobParentKind := job.Labels[LabelParentKind]
 	jobParentUID := job.Labels[LabelParentUID]
-
-	// If the job does not declare a parent workload, it matches if the pod name matches the target pod,
-	// or in uncontested/synthetic fixtures where no parent was declared.
-	if jobParentName == "" {
-		if job.Spec.PodRef.Name != "" && pod.Name == job.Spec.PodRef.Name {
-			return true
-		}
-		return parentName == ""
-	}
 
 	// For managed workloads, parent name and kind must match.
 	if parentName != jobParentName || parentKind != jobParentKind {
@@ -698,7 +695,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 
 	// If the job records a parent workload, the pod must match that workload lineage.
 	if job.Labels != nil && job.Labels[LabelParentName] != "" {
-		if !MatchesPMJWorkload(ctx, c, pod, job, parentName, parentKind, parentUID) {
+		if !MatchesPMJWorkload(pod, job, parentName, parentKind, parentUID) {
 			return "", true, nil // Ineligible contender: clear assignment for cold-start bypass
 		}
 	}
@@ -727,7 +724,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 			if err != nil && !apierrors.IsNotFound(err) {
 				return "", false, err
 			}
-			if !MatchesPMJWorkload(ctx, c, p, job, pParentName, pParentKind, pParentUID) {
+			if !MatchesPMJWorkload(p, job, pParentName, pParentKind, pParentUID) {
 				continue
 			}
 		}
@@ -750,12 +747,36 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		contenders = optedIn
 	}
 
+	findLoserResolution := func() (string, bool, error) {
+		var podTemplateHash string
+		var jobCompletionIndex string
+		var replicaKey string
+		if pod.Labels != nil {
+			podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+			jobCompletionIndex = pod.Labels[LabelJobCompletionIndex]
+		}
+		if !IsBuiltInWorkloadKind(parentKind) {
+			replicaKey, _ = ResolveOperatorReplicaKey(pod, parentKind)
+		}
+
+		altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true, replicaKey)
+		if err != nil {
+			return "", false, err
+		}
+
+		if altPMJ != "" {
+			return altPMJ, true, nil // Re-assigned to alternative PMJ
+		}
+
+		return "", true, nil // No alternative, we are a scale-up pod (clear assignment)
+	}
+
 	if len(contenders) <= 1 {
 		winner := contenders[0]
 		if winner.UID == pod.UID {
 			return assignedPMJ, false, nil // Sole eligible winner
 		}
-		return "", true, nil // Loser (un-opted-in or collided): clear assignment
+		return findLoserResolution() // Loser (un-opted-in displaced by opted-in contender)
 	}
 
 	// Sort contenders deterministically by creation timestamp, then alphabetically by name
@@ -771,26 +792,6 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		return assignedPMJ, false, nil // We are the winner, no change
 	}
 
-	var podTemplateHash string
-	var jobCompletionIndex string
-	var replicaKey string
-	if pod.Labels != nil {
-		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
-		jobCompletionIndex = pod.Labels[LabelJobCompletionIndex]
-	}
-	if !IsBuiltInWorkloadKind(parentKind) {
-		replicaKey, _ = ResolveOperatorReplicaKey(pod, parentKind)
-	}
-
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true, replicaKey)
-	if err != nil {
-		return "", false, err
-	}
-
-	if altPMJ != "" {
-		return altPMJ, true, nil // Re-assigned to alternative PMJ
-	}
-
-	return "", true, nil // No alternative, we are a scale-up pod (clear assignment)
+	return findLoserResolution()
 }

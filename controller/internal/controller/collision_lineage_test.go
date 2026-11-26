@@ -20,8 +20,9 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -199,3 +200,932 @@ func TestCollisionResolution_FiltersUnmanagedAndMismatchedPods(t *testing.T) {
 	}
 }
 
+// TestCollisionResolution_DeploymentPathAndPodTemplateHash verifies that in the Deployment path,
+// a contender with a mismatched pod-template-hash is filtered out so the genuine replacement
+// with matching hash wins, even if the mismatched contender was created earlier.
+func TestCollisionResolution_DeploymentPathAndPodTemplateHash(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	isController := true
+	rsOwner := []metav1.OwnerReference{
+		{
+			APIVersion: "apps/v1",
+			Kind:       "ReplicaSet",
+			Name:       "web-rs",
+			UID:        "rs-uid-123",
+			Controller: &isController,
+		},
+	}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Second))
+	t1 := metav1.NewTime(time.Now())
+
+	// Pod 1 created earlier at t0, but with old/mismatched pod-template-hash
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-canary",
+			Namespace:         "default",
+			UID:               "pod1-uid",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				"app":                                  "web",
+				appsv1.DefaultDeploymentUniqueLabelKey: "hash-old",
+				util.LabelPodMigrationEnabled:          "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-deploy"},
+			OwnerReferences: rsOwner,
+		},
+	}
+
+	// Pod 2 created later at t1, with matching pod-template-hash
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-target",
+			Namespace:         "default",
+			UID:               "pod2-uid",
+			CreationTimestamp: t1,
+			Labels: map[string]string{
+				"app":                                  "web",
+				appsv1.DefaultDeploymentUniqueLabelKey: "hash-target",
+				util.LabelPodMigrationEnabled:          "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-deploy"},
+			OwnerReferences: rsOwner,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-deploy",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName:      "web-deploy",
+				util.LabelParentKind:      "Deployment",
+				util.LabelParentUID:       "deploy-uid-123",
+				util.LabelPodTemplateHash: "hash-target",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+			TargetPodUID: "src-uid",
+		},
+	}
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-rs",
+			Namespace: "default",
+			UID:       "rs-uid-123",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "Deployment",
+					Name:       "web-deploy",
+					UID:        "deploy-uid-123",
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, rs, pmj).Build()
+
+	// Pod 2 (matching hash) reconciles. Pod 1 must be filtered out, so Pod 2 is the winner.
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-deploy", "web-deploy", "Deployment", "deploy-uid-123")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	if changed {
+		t.Fatalf("expected pod2 to win and remain unchanged, got changed=true, corrected=%q", corrected)
+	}
+	if corrected != "pmj-deploy" {
+		t.Fatalf("expected pod2 to keep pmj-deploy, got %q", corrected)
+	}
+
+	// Pod 1 (mismatched hash) reconciles. It must be cleared.
+	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-deploy", "web-deploy", "Deployment", "deploy-uid-123")
+	if err1 != nil {
+		t.Fatalf("ResolveCollision err=%v", err1)
+	}
+	if !changed1 || corrected1 != "" {
+		t.Fatalf("expected pod1 to be cleared (changed=true, corrected=\"\"), got changed=%v, corrected=%q", changed1, corrected1)
+	}
+}
+
+// TestCollisionResolution_StatefulSet verifies that a StatefulSet replacement pod with
+// matching pod name wins collision over an earlier pod from the same StatefulSet with a different name.
+func TestCollisionResolution_StatefulSet(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	isController := true
+	stsOwner := []metav1.OwnerReference{
+		{
+			APIVersion: "apps/v1",
+			Kind:       "StatefulSet",
+			Name:       "redis",
+			UID:        "sts-uid-123",
+			Controller: &isController,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-redis-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "redis",
+				util.LabelParentKind: "StatefulSet",
+				util.LabelParentUID:  "sts-uid-123",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "redis-0"},
+			TargetPodUID: "redis-0-src-uid",
+		},
+	}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Second))
+	t1 := metav1.NewTime(time.Now())
+
+	// Pod 1 (redis-1) created earlier at t0, but wrong pod name for this PMJ
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "redis-1",
+			Namespace:         "default",
+			UID:               "pod1-uid",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				"app":                         "redis",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-redis-0"},
+			OwnerReferences: stsOwner,
+		},
+	}
+
+	// Pod 2 (redis-0) created later at t1, matching target pod name
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "redis-0",
+			Namespace:         "default",
+			UID:               "pod2-uid",
+			CreationTimestamp: t1,
+			Labels: map[string]string{
+				"app":                         "redis",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-redis-0"},
+			OwnerReferences: stsOwner,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, pmj).Build()
+
+	// redis-0 reconciles: redis-1 is filtered out, redis-0 wins!
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-redis-0", "redis", "StatefulSet", "sts-uid-123")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	if changed || corrected != "pmj-redis-0" {
+		t.Fatalf("expected redis-0 to win without change, got changed=%v, corrected=%q", changed, corrected)
+	}
+
+	// redis-1 reconciles: name mismatch, cleared
+	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-redis-0", "redis", "StatefulSet", "sts-uid-123")
+	if err1 != nil {
+		t.Fatalf("ResolveCollision err=%v", err1)
+	}
+	if !changed1 || corrected1 != "" {
+		t.Fatalf("expected redis-1 to be cleared, got changed=%v, corrected=%q", changed1, corrected1)
+	}
+}
+
+// TestCollisionResolution_JobIndex verifies that an indexed Job replacement pod with
+// matching completion index wins collision over an earlier pod with a different index.
+func TestCollisionResolution_JobIndex(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	isController := true
+	jobOwner := []metav1.OwnerReference{
+		{
+			APIVersion: "batch/v1",
+			Kind:       "Job",
+			Name:       "batch-job",
+			UID:        "job-uid-123",
+			Controller: &isController,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-job-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName:         "batch-job",
+				util.LabelParentKind:         "Job",
+				util.LabelParentUID:          "job-uid-123",
+				util.LabelJobCompletionIndex: "0",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "batch-job-src"},
+			TargetPodUID: "src-uid",
+		},
+	}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Second))
+	t1 := metav1.NewTime(time.Now())
+
+	// Pod 1 has index 1, created earlier at t0
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "batch-job-1",
+			Namespace:         "default",
+			UID:               "pod1-uid",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				"job-name":                    "batch-job",
+				util.LabelJobCompletionIndex:  "1",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-job-0"},
+			OwnerReferences: jobOwner,
+		},
+	}
+
+	// Pod 2 has index 0, created later at t1
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "batch-job-0",
+			Namespace:         "default",
+			UID:               "pod2-uid",
+			CreationTimestamp: t1,
+			Labels: map[string]string{
+				"job-name":                    "batch-job",
+				util.LabelJobCompletionIndex:  "0",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-job-0"},
+			OwnerReferences: jobOwner,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, pmj).Build()
+
+	// Pod 2 (index 0) reconciles: pod1 filtered out, pod2 wins!
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-job-0", "batch-job", "Job", "job-uid-123")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	if changed || corrected != "pmj-job-0" {
+		t.Fatalf("expected pod2 to win, got changed=%v, corrected=%q", changed, corrected)
+	}
+
+	// Pod 1 (index 1) reconciles: index mismatch, cleared
+	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-job-0", "batch-job", "Job", "job-uid-123")
+	if err1 != nil {
+		t.Fatalf("ResolveCollision err=%v", err1)
+	}
+	if !changed1 || corrected1 != "" {
+		t.Fatalf("expected pod1 to be cleared, got changed=%v, corrected=%q", changed1, corrected1)
+	}
+}
+
+// TestCollisionResolution_OperatorReplicaKey verifies that an operator-owned replacement pod
+// with matching replica key wins collision over an earlier pod with a different replica key.
+func TestCollisionResolution_OperatorReplicaKey(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	isController := true
+	opOwner := []metav1.OwnerReference{
+		{
+			APIVersion: "ray.io/v1",
+			Kind:       "RayCluster",
+			Name:       "sample-ray",
+			UID:        "ray-uid-123",
+			Controller: &isController,
+		},
+	}
+
+	headKey := "ray.io/group=headgroup,ray.io/node-type=head"
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-ray-head",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "sample-ray",
+				util.LabelParentKind: "RayCluster",
+				util.LabelParentUID:  "ray-uid-123",
+			},
+			Annotations: map[string]string{
+				util.AnnotationReplicaIdentityKey: headKey,
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-head"},
+			TargetPodUID: "src-uid",
+		},
+	}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Second))
+	t1 := metav1.NewTime(time.Now())
+
+	// Pod 1 is a worker pod, created earlier at t0
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sample-ray-worker-1",
+			Namespace:         "default",
+			UID:               "pod1-uid",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				"ray.io/group":                "workergroup",
+				"ray.io/node-type":            "worker",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-ray-head"},
+			OwnerReferences: opOwner,
+		},
+	}
+
+	// Pod 2 is a head pod, created later at t1
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sample-ray-head-1",
+			Namespace:         "default",
+			UID:               "pod2-uid",
+			CreationTimestamp: t1,
+			Labels: map[string]string{
+				"ray.io/group":                "headgroup",
+				"ray.io/node-type":            "head",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-ray-head"},
+			OwnerReferences: opOwner,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, pmj).Build()
+
+	// Pod 2 (head pod) reconciles: worker pod1 filtered out, pod2 wins!
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-ray-head", "sample-ray", "RayCluster", "ray-uid-123")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	if changed || corrected != "pmj-ray-head" {
+		t.Fatalf("expected pod2 to win, got changed=%v, corrected=%q", changed, corrected)
+	}
+
+	// Pod 1 (worker pod) reconciles: replica key mismatch, cleared
+	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-ray-head", "sample-ray", "RayCluster", "ray-uid-123")
+	if err1 != nil {
+		t.Fatalf("ResolveCollision err=%v", err1)
+	}
+	if !changed1 || corrected1 != "" {
+		t.Fatalf("expected pod1 to be cleared, got changed=%v, corrected=%q", changed1, corrected1)
+	}
+}
+
+// TestCollisionResolution_OptInPrecedence verifies that when two pods from the same workload
+// collide on a PMJ, the opted-in pod wins over an un-opted-in pod even if the un-opted-in
+// pod was created earlier.
+func TestCollisionResolution_OptInPrecedence(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	isController := true
+	rsOwner := []metav1.OwnerReference{
+		{
+			APIVersion: "apps/v1",
+			Kind:       "ReplicaSet",
+			Name:       "web-rs",
+			UID:        "rs-uid-123",
+			Controller: &isController,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-rs",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "web-rs",
+				util.LabelParentKind: "ReplicaSet",
+				util.LabelParentUID:  "rs-uid-123",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+			TargetPodUID: "src-uid",
+		},
+	}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Second))
+	t1 := metav1.NewTime(time.Now())
+
+	// Pod 1 created at t0, not opted in
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-unopted",
+			Namespace:         "default",
+			UID:               "pod1-uid",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				"app": "web",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-rs"},
+			OwnerReferences: rsOwner,
+		},
+	}
+
+	// Pod 2 created at t1, opted in
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-opted",
+			Namespace:         "default",
+			UID:               "pod2-uid",
+			CreationTimestamp: t1,
+			Labels: map[string]string{
+				"app":                         "web",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-rs"},
+			OwnerReferences: rsOwner,
+		},
+	}
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-rs",
+			Namespace: "default",
+			UID:       "rs-uid-123",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, rs, pmj).Build()
+
+	// Pod 2 (opted-in) reconciles: pod1 un-opted-in filtered out, pod2 wins!
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-rs", "web-rs", "ReplicaSet", "rs-uid-123")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	if changed || corrected != "pmj-rs" {
+		t.Fatalf("expected pod2 to win, got changed=%v, corrected=%q", changed, corrected)
+	}
+
+	// Pod 1 (un-opted-in) reconciles: displaced by opted-in pod, cleared
+	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-rs", "web-rs", "ReplicaSet", "rs-uid-123")
+	if err1 != nil {
+		t.Fatalf("ResolveCollision err=%v", err1)
+	}
+	if !changed1 || corrected1 != "" {
+		t.Fatalf("expected pod1 to be cleared, got changed=%v, corrected=%q", changed1, corrected1)
+	}
+}
+
+// TestCollisionResolution_ParentUIDMismatch verifies that a contender whose parent UID
+// does not match the PMJ's LabelParentUID is filtered out of collision resolution.
+func TestCollisionResolution_ParentUIDMismatch(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	isController := true
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-rs",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "web-rs",
+				util.LabelParentKind: "ReplicaSet",
+				util.LabelParentUID:  "rs-uid-original",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+			TargetPodUID: "src-uid",
+		},
+	}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Second))
+	t1 := metav1.NewTime(time.Now())
+
+	// Pod 1 belongs to a different ReplicaSet with different UID, created earlier at t0
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-stale-parent",
+			Namespace:         "default",
+			UID:               "pod1-uid",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				"app":                         "web",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-rs"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "web-rs",
+					UID:        "rs-uid-stale",
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	// Pod 2 belongs to the matching ReplicaSet UID, created at t1
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-matching-parent",
+			Namespace:         "default",
+			UID:               "pod2-uid",
+			CreationTimestamp: t1,
+			Labels: map[string]string{
+				"app":                         "web",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-rs"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "web-rs",
+					UID:        "rs-uid-original",
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	rsOriginal := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-rs",
+			Namespace: "default",
+			UID:       "rs-uid-original",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, rsOriginal, pmj).Build()
+
+	// Pod 2 reconciles: pod1 filtered out by parent UID mismatch, pod2 wins!
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-rs", "web-rs", "ReplicaSet", "rs-uid-original")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	if changed || corrected != "pmj-rs" {
+		t.Fatalf("expected pod2 to win, got changed=%v, corrected=%q", changed, corrected)
+	}
+
+	// Pod 1 reconciles: UID mismatch, cleared
+	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-rs", "web-rs", "ReplicaSet", "rs-uid-stale")
+	if err1 != nil {
+		t.Fatalf("ResolveCollision err=%v", err1)
+	}
+	if !changed1 || corrected1 != "" {
+		t.Fatalf("expected pod1 to be cleared, got changed=%v, corrected=%q", changed1, corrected1)
+	}
+}
+
+// TestCollisionResolution_ParentKindAndNameMismatch verifies that a contender from a different
+// parent kind or name is filtered out of collision resolution.
+func TestCollisionResolution_ParentKindAndNameMismatch(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	isController := true
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-rs",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "web-rs",
+				util.LabelParentKind: "ReplicaSet",
+				util.LabelParentUID:  "rs-uid-123",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+			TargetPodUID: "src-uid",
+		},
+	}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Second))
+	t1 := metav1.NewTime(time.Now())
+
+	// Pod 1 belongs to a different StatefulSet parent, created earlier at t0
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "other-workload-pod",
+			Namespace:         "default",
+			UID:               "pod1-uid",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-rs"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "StatefulSet",
+					Name:       "other-sts",
+					UID:        "sts-uid-999",
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	// Pod 2 belongs to the matching ReplicaSet, created at t1
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-repl",
+			Namespace:         "default",
+			UID:               "pod2-uid",
+			CreationTimestamp: t1,
+			Labels: map[string]string{
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-rs"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "web-rs",
+					UID:        "rs-uid-123",
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-rs",
+			Namespace: "default",
+			UID:       "rs-uid-123",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, rs, pmj).Build()
+
+	// Pod 2 reconciles: pod1 filtered out by parent kind/name mismatch, pod2 wins!
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-rs", "web-rs", "ReplicaSet", "rs-uid-123")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	if changed || corrected != "pmj-rs" {
+		t.Fatalf("expected pod2 to win, got changed=%v, corrected=%q", changed, corrected)
+	}
+
+	// Pod 1 reconciles: kind/name mismatch, cleared
+	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-rs", "other-sts", "StatefulSet", "sts-uid-999")
+	if err1 != nil {
+		t.Fatalf("ResolveCollision err=%v", err1)
+	}
+	if !changed1 || corrected1 != "" {
+		t.Fatalf("expected pod1 to be cleared, got changed=%v, corrected=%q", changed1, corrected1)
+	}
+}
+
+// TestCollisionResolution_OptedInLoserReassignedToAlternativePMJ verifies that when two opted-in pods
+// collide on a PMJ, the loser is reassigned to an available alternative active PMJ rather than starting cold.
+func TestCollisionResolution_OptedInLoserReassignedToAlternativePMJ(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	isController := true
+	rsOwner := []metav1.OwnerReference{
+		{
+			APIVersion: "apps/v1",
+			Kind:       "ReplicaSet",
+			Name:       "web-rs",
+			UID:        "rs-uid-123",
+			Controller: &isController,
+		},
+	}
+
+	// Primary PMJ collided on
+	pmj1 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-rs-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "web-rs",
+				util.LabelParentKind: "ReplicaSet",
+				util.LabelParentUID:  "rs-uid-123",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-src-1"},
+			TargetPodUID: "src-uid-1",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	// Alternative active unassigned PMJ
+	pmj2 := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-rs-2",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "web-rs",
+				util.LabelParentKind: "ReplicaSet",
+				util.LabelParentUID:  "rs-uid-123",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-src-2"},
+			TargetPodUID: "src-uid-2",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Second))
+	t1 := metav1.NewTime(time.Now())
+
+	// Pod 1 created at t0, opted in, assigned pmj-rs-1 (winner)
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-repl-1",
+			Namespace:         "default",
+			UID:               "pod1-uid",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				"app":                         "web",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-rs-1"},
+			OwnerReferences: rsOwner,
+		},
+	}
+
+	// Pod 2 created at t1, opted in, also assigned pmj-rs-1 (loser of collision)
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "web-repl-2",
+			Namespace:         "default",
+			UID:               "pod2-uid",
+			CreationTimestamp: t1,
+			Labels: map[string]string{
+				"app":                         "web",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations:     map[string]string{util.AnnotationAssignedPMJ: "pmj-rs-1"},
+			OwnerReferences: rsOwner,
+		},
+	}
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-rs",
+			Namespace: "default",
+			UID:       "rs-uid-123",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, rs, pmj1, pmj2).Build()
+
+	// Pod 2 (loser of pmj-rs-1) reconciles: must be reassigned to pmj-rs-2!
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-rs-1", "web-rs", "ReplicaSet", "rs-uid-123")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	if !changed {
+		t.Fatalf("expected loser pod2 to be changed=true")
+	}
+	if corrected != "pmj-rs-2" {
+		t.Fatalf("expected loser pod2 to be reassigned to pmj-rs-2, got %q", corrected)
+	}
+}
+
+// TestCollisionResolution_ClearAndReleaseCold verifies that an ineligible contender reconciling
+// alone in PodGateReconciler has its assigned-pmj annotation removed and scheduling gate released cold.
+func TestCollisionResolution_ClearAndReleaseCold(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	gate := []corev1.PodSchedulingGate{{Name: "gke.io/pod-migration-gate"}}
+
+	// Unmanaged pod carrying assigned-pmj for a managed PMJ
+	unmanaged := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stray-pod",
+			Namespace: "default",
+			UID:       "stray-uid",
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ: "pmj-managed",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGates: gate,
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-managed",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "web-rs",
+				util.LabelParentKind: "ReplicaSet",
+				util.LabelParentUID:  "rs-uid-123",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+			TargetPodUID: "src-uid",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseRestoring,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(unmanaged, pmj).Build()
+
+	r := &PodGateReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "stray-pod"}}); err != nil {
+		t.Fatalf("Reconcile err=%v", err)
+	}
+
+	updated := &corev1.Pod{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: "stray-pod"}, updated); err != nil {
+		t.Fatalf("get pod err=%v", err)
+	}
+
+	// Must be released with cold-start bypass:
+	// 1. assigned-pmj annotation removed
+	if _, ok := updated.Annotations[util.AnnotationAssignedPMJ]; ok {
+		t.Fatalf("expected assigned-pmj annotation removed, got %v", updated.Annotations)
+	}
+	// 2. ps-name cleared
+	if updated.Annotations["podsnapshot.gke.io/ps-name"] != "" {
+		t.Fatalf("expected ps-name cleared, got %q", updated.Annotations["podsnapshot.gke.io/ps-name"])
+	}
+	// 3. Scheduling gate removed
+	if len(updated.Spec.SchedulingGates) != 0 {
+		t.Fatalf("expected scheduling gates removed, got %v", updated.Spec.SchedulingGates)
+	}
+}
