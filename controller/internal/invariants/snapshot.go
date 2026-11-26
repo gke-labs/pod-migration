@@ -95,7 +95,8 @@ type SnapshotProgress struct {
 	// or refusal (PhaseFailed / PhaseRefused).
 	Failed bool `json:"Failed,omitempty"`
 	// LastProgressTime is the most recent timestamp at which the snapshot made
-	// forward progress.
+	// forward progress. For a Ready snapshot, it is when the snapshot became
+	// Ready, or zero when the provider doesn't report that (#231).
 	LastProgressTime time.Time `json:"LastProgressTime,omitempty"`
 }
 
