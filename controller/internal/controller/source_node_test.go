@@ -73,7 +73,12 @@ func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 		podNodeName string
 		podMemory   string            // the pod's memory request, if any
 		annotations map[string]string // the job's annotations before the reconcile
-		funcs       interceptor.Funcs
+		// noTimeout: the job has no timeout annotation before the reconcile,
+		// like one created by hand or by an earlier version. Otherwise a job
+		// without annotations gets the 10m0s the controller records when it
+		// creates one (#330).
+		noTimeout bool
+		funcs     interceptor.Funcs
 		// recordedType and recordedVersion are already in the job's status
 		// before the reconcile.
 		recordedType, recordedVersion string
@@ -163,9 +168,21 @@ func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 			node:          node(n2Standard4, "v1.37.1-gke.2097000"),
 			podNodeName:   nodeName,
 			podMemory:     "100Mi", // 10m default + 100Mi / 50MiB/s = 10m2s
+			noTimeout:     true,
 			wantType:      "n2-standard-4",
 			wantVersion:   "v1.37.1-gke.2097000",
 			wantTimeout:   "10m2s",
+			wantJobWrites: 1,
+		},
+		{
+			// Also when the timeout is the default (#330).
+			name:          "a default timeout is written while pending",
+			node:          node(n2Standard4, "v1.37.1-gke.2097000"),
+			podNodeName:   nodeName,
+			noTimeout:     true,
+			wantType:      "n2-standard-4",
+			wantVersion:   "v1.37.1-gke.2097000",
+			wantTimeout:   "10m0s",
 			wantJobWrites: 1,
 		},
 	}
@@ -189,11 +206,15 @@ func TestPodMigrationJobReconciler_Pending_RecordsSourceNode(t *testing.T) {
 					},
 				}}
 			}
+			annotations := tc.annotations
+			if annotations == nil && !tc.noTimeout {
+				annotations = map[string]string{util.AnnotationMigrationTimeout: "10m0s"}
+			}
 			pmj := &pmv1alpha1.PodMigrationJob{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace:         namespace,
 					Name:              jobName,
-					Annotations:       tc.annotations,
+					Annotations:       annotations,
 					CreationTimestamp: metav1.Now(),
 				},
 				Spec: pmv1alpha1.PodMigrationJobSpec{
