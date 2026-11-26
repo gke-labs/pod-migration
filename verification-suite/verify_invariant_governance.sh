@@ -37,8 +37,10 @@
 #        - Commit trailer `Invariant-Cochange: <reason>` in any commit on the PR, or
 #        - CLI flag `--allow-cochange`.
 #   4. Lane 2 (Dedicated Invariant PRs — branch matches ^invariant/):
-#      Requires all modified files to be strictly scoped to
-#      controller/internal/invariants/** unless a co-change override is present.
+#      Requires every modified file to be under controller/internal/invariants/**
+#      or to be docs/invariants.md (the invariant specification, AGENTS.md
+#      section 4), and at least one file under controller/internal/invariants/,
+#      unless a co-change override is present.
 #   5. Never exempts detached HEAD (`HEAD` / `DETACHED_HEAD`); only direct
 #      commits on `main` skip per-PR lane diff enforcement.
 #   6. Fails closed if the git diff against a base ref cannot be resolved.
@@ -303,11 +305,16 @@ evaluate_governance() {
       return 1
     fi
     local touched_invariants=0
+    local touched_spec=""
     for f in "${files[@]}"; do
       if [[ "${f}" =~ ^controller/internal/invariants/ ]]; then
         touched_invariants=$((touched_invariants + 1))
+      elif [[ "${f}" == "docs/invariants.md" ]]; then
+        # The invariant specification changes with the rules it describes.
+        touched_spec=" and docs/invariants.md"
+        continue
       else
-        fail "Lane 2 violation: invariant branch '${branch}' modified non-invariant path '${f}'. Dedicated invariant PRs must touch ONLY controller/internal/invariants/** (or set 'Invariant-Cochange: <reason>' / label 'allow-invariant-cochange' for co-dependent changes)."
+        fail "Lane 2 violation: invariant branch '${branch}' modified non-invariant path '${f}'. Dedicated invariant PRs must touch ONLY controller/internal/invariants/** and docs/invariants.md (or set 'Invariant-Cochange: <reason>' / label 'allow-invariant-cochange' for co-dependent changes)."
         return 1
       fi
     done
@@ -315,7 +322,7 @@ evaluate_governance() {
       fail "Lane 2 violation: invariant branch '${branch}' did not modify any file under controller/internal/invariants/"
       return 1
     fi
-    log "PASS (Lane 2): invariant branch '${branch}' touches only controller/internal/invariants/** (${touched_invariants} file(s))"
+    log "PASS (Lane 2): invariant branch '${branch}' touches only controller/internal/invariants/** (${touched_invariants} file(s))${touched_spec}"
     return 0
   fi
 
@@ -433,8 +440,31 @@ EOF
     exit 1
   fi
 
+  # 11. Positive (Lane 2): invariant/* branch updating docs/invariants.md with its rule, without a trailer
+  evaluate_governance "invariant/i4-ready-bound" "${valid_co}" \
+    "controller/internal/invariants/rules.go controller/internal/invariants/i4_anchor_test.go docs/invariants.md" "false" "fix: bound I4" >/dev/null
+
+  # 12. Negative (Lane 2): invariant/* branch changing docs/invariants.md but no file under controller/internal/invariants/
+  if evaluate_governance "invariant/docs-only" "${valid_co}" \
+    "docs/invariants.md" "false" "docs: reword I4" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: Lane 2 allowed invariant/* branch that changes no file under controller/internal/invariants/"
+    exit 1
+  fi
+
+  # 13. Negative (Lane 2): invariant/* branch changing any other path, even one close to docs/invariants.md
+  local other_path
+  for other_path in README.md docs/design/engine-contract.md docs/invariants.md.bak Docs/invariants.md; do
+    if evaluate_governance "invariant/other-docs" "${valid_co}" \
+      "controller/internal/invariants/rules.go docs/invariants.md ${other_path}" "false" "fix: rule and ${other_path}" >/dev/null 2>&1; then
+      rm -rf "${tmp_dir}"
+      fail "Self-test failed: Lane 2 allowed invariant/* branch to modify ${other_path}"
+      exit 1
+    fi
+  done
+
   rm -rf "${tmp_dir}"
-  log "Self-test PASSED: all 10 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, and co-change cases verified"
+  log "Self-test PASSED: all 13 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, and co-change cases verified"
 }
 
 main() {
