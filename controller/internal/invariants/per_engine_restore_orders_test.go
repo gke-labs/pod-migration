@@ -332,6 +332,24 @@ func TestI1_SnapshotsOfDifferentAPIGroupsAreDifferent(t *testing.T) {
 				replacementPod("a", gvisorClass, "pmj-g1", false, podAnn{gkeOrderKey: "snap-1", criuOrderKey: "snap-1"}),
 				replacementPod("b", runcClass, "pmj-c1", false, podAnn{criuOrderKey: "snap-1"}),
 			}, nil},
+		// A pod whose job isn't known is read with the first order found, GKE
+		// first. When both keys hold that name, the order rests on neither key
+		// alone, so its group is unknown and it can be either group's snapshot.
+		{"unknown job, both keys hold the name: a duplicate of a GKE pod's snapshot", multiGroup,
+			[]corev1.Pod{
+				replacementPod("a", runcClass, "pmj-gone", false, podAnn{gkeOrderKey: "snap-1", criuOrderKey: "snap-1"}),
+				replacementPod("b", gvisorClass, "pmj-g1", false, podAnn{gkeOrderKey: "snap-1"}),
+			}, []string{dup}},
+		{"unknown job, both keys hold the name: a duplicate of a CRIU pod's snapshot", multiGroup,
+			[]corev1.Pod{
+				replacementPod("a", runcClass, "pmj-gone", false, podAnn{gkeOrderKey: "snap-1", criuOrderKey: "snap-1"}),
+				replacementPod("b", runcClass, "pmj-c1", false, podAnn{criuOrderKey: "snap-1"}),
+			}, []string{dup}},
+		{"unknown job: the order is matched under the annotation it came from", multiGroup,
+			[]corev1.Pod{
+				replacementPod("a", runcClass, "pmj-gone", false, podAnn{gkeOrderKey: "snap-1", criuOrderKey: "snap-2"}),
+				replacementPod("b", runcClass, "pmj-c1", false, podAnn{criuOrderKey: "snap-1"}),
+			}, nil},
 		{"single-group install: CRIU on podsnapshot.gke.io shares GKE's snapshots", registryRestoreOrders(t, engine.DefaultAPIGroup),
 			[]corev1.Pod{
 				replacementPod("a", gvisorClass, "pmj-g1", false, podAnn{gkeOrderKey: "snap-1"}),

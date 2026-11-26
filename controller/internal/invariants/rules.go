@@ -289,8 +289,11 @@ func sameSnapshot(a, b snapshotOrder) bool {
 }
 
 // orderKey returns the annotation of pod from which engineName ("" for any
-// registered engine) read its restore order snap: the first, in sorted order,
-// of the annotations that hold snap and that engineName reads, or "" if none.
+// registered engine) read its restore order snap: of the annotations that hold
+// snap, the first in sorted order whose removal changes what RestoreOrders
+// reads. It returns "" (an unknown API group) when no annotation holds snap,
+// or when the order doesn't rest on any single one of them, such as two
+// engines' annotations holding the same name on a pod whose job isn't known.
 func orderKey(s *ReconcileSnapshot, engineName string, pod *corev1.Pod, snap string) string {
 	var keys []string
 	for k, v := range pod.Annotations {
@@ -300,7 +303,21 @@ func orderKey(s *ReconcileSnapshot, engineName string, pod *corev1.Pod, snap str
 	}
 	slices.Sort(keys)
 	for _, k := range keys {
-		if readsRestoreKey(s, engineName, pod, k) {
+		without := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   pod.Namespace,
+				Name:        pod.Name,
+				UID:         pod.UID,
+				Annotations: make(map[string]string, len(pod.Annotations)),
+			},
+			Spec: corev1.PodSpec{RuntimeClassName: pod.Spec.RuntimeClassName},
+		}
+		for ak, av := range pod.Annotations {
+			if ak != k {
+				without.Annotations[ak] = av
+			}
+		}
+		if got, bypass, ok := inspectPodRestoreOrder(s, engineName, without); !ok || bypass || got != snap {
 			return k
 		}
 	}
