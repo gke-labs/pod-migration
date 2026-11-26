@@ -42,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -75,6 +76,22 @@ func init() {
 	// Register our custom resource schemas
 	utilruntime.Must(pmv1alpha1.AddToScheme(scheme))
 	_ = corev1.AddToScheme // already in clientgoscheme; explicit just for clarity
+}
+
+// newPodGateReconciler builds the pod gate. Its I4 check reads the assigned
+// job's PodSnapshot through jobs, the job reconciler: from the manager's cache,
+// and only for the kinds jobs watches (#231).
+func newPodGateReconciler(mgr ctrl.Manager, recorder record.EventRecorder, invariantEngine *invariants.Engine, engines *engine.Registry, restorePlacement bool, jobs *controller.PodMigrationJobReconciler) *controller.PodGateReconciler {
+	return &controller.PodGateReconciler{
+		Client:            mgr.GetClient(),
+		APIReader:         mgr.GetAPIReader(),
+		Scheme:            mgr.GetScheme(),
+		Recorder:          recorder,
+		InvariantEngine:   invariantEngine,
+		Engines:           engines,
+		RestorePlacement:  restorePlacement,
+		ReadForInvariants: jobs.ReadForInvariants,
+	}
 }
 
 func main() {
@@ -354,7 +371,7 @@ func main() {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")
 		os.Exit(1)
 	}
-	if err := (&controller.PodMigrationJobReconciler{
+	jobReconciler := &controller.PodMigrationJobReconciler{
 		Client:                     mgr.GetClient(),
 		APIReader:                  mgr.GetAPIReader(),
 		Scheme:                     mgr.GetScheme(),
@@ -371,22 +388,15 @@ func main() {
 		FencePreCheckpointCap: fenceCap,
 		FenceLateStopWatch:    fenceLateStopWatch,
 		SnapshotRetention:     snapshotRetention,
-	}).SetupWithManager(mgr, reconcilerOpts); err != nil {
+	}
+	if err := jobReconciler.SetupWithManager(mgr, reconcilerOpts); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationJobReconciler")
 		os.Exit(1)
 	}
 
 	// PodGateReconciler hardcodes MaxConcurrentReconciles: 1 in its own
 	// SetupWithManager — see the comment there for the serialization contract.
-	if err := (&controller.PodGateReconciler{
-		Client:           mgr.GetClient(),
-		APIReader:        mgr.GetAPIReader(),
-		Scheme:           mgr.GetScheme(),
-		Recorder:         eventRecorder,
-		InvariantEngine:  invariantEngine,
-		Engines:          engines,
-		RestorePlacement: restorePlacement,
-	}).SetupWithManager(mgr); err != nil {
+	if err := newPodGateReconciler(mgr, eventRecorder, invariantEngine, engines, restorePlacement, jobReconciler).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodGateReconciler")
 		os.Exit(1)
 	}
