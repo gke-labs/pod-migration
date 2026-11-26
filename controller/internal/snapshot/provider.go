@@ -35,6 +35,12 @@ const (
 )
 
 // Status represents the observed result of a snapshot check.
+// LastProgressTime is the time the snapshot's progress is measured from:
+// while it's in progress, its latest condition transition that isn't a
+// stall, or its creation; once it's Ready, when it became Ready (#231). It's
+// zero before there's a snapshot status to read, while the snapshot is being
+// deleted (#265), after a failure, and when a Ready snapshot's conditions
+// don't say.
 type Status struct {
 	Phase            Phase
 	SnapshotRef      string

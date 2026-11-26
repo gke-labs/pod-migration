@@ -377,6 +377,7 @@ func statusFromConditions(snapshotName string, conditions []metav1.Condition, cr
 		readyTerminalTransition time.Time
 		subconditionInProgress  bool
 		isReady                 bool
+		readySince              time.Time // earliest transition into Ready (#231)
 	)
 
 	for i := range conditions {
@@ -403,10 +404,12 @@ func statusFromConditions(snapshotName string, conditions []metav1.Condition, cr
 			}
 			if cType == "Checkpoint" && cStatus == "True" && cReason == "Succeeded" {
 				isReady = true
+				readySince = earliestTime(readySince, condTransitionTime)
 			}
 		case "Ready":
 			if cStatus == "True" {
 				isReady = true
+				readySince = earliestTime(readySince, condTransitionTime)
 			} else if cStatus == "False" && isTerminalSnapshotFailureReason(cReason) {
 				readyTerminalCond = cond
 				readyTerminalTransition = condTransitionTime
@@ -493,11 +496,18 @@ func statusFromConditions(snapshotName string, conditions []metav1.Condition, cr
 		}
 	}
 
-	// 4. Check for readiness
+	// 4. Check for readiness. A Ready snapshot's LastProgressTime is when it
+	// became Ready, and stays zero when its conditions don't say (#231). The
+	// reconciler counts any Ready snapshot as progressing and moves the job to
+	// Evicting. The time is there so that I4 can tell how long a job has stayed
+	// in Snapshotting after it. It relies on these conditions turning True with
+	// their reason, as both engines do: a reason that changed to Succeeded later
+	// would keep the earlier lastTransitionTime.
 	if isReady {
 		return &Status{
-			Phase:       PhaseReady,
-			SnapshotRef: snapshotName,
+			Phase:            PhaseReady,
+			SnapshotRef:      snapshotName,
+			LastProgressTime: readySince,
 		}
 	}
 
@@ -511,6 +521,14 @@ func statusFromConditions(snapshotName string, conditions []metav1.Condition, cr
 		Message:          fmt.Sprintf("Waiting for GKE PodSnapshot %q checkpoint to complete", snapshotName),
 		LastProgressTime: lastProgress,
 	}
+}
+
+// earliestTime returns the earlier of a and b, ignoring a zero time.
+func earliestTime(a, b time.Time) time.Time {
+	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+		return b
+	}
+	return a
 }
 
 func (p *GKEProvider) Cleanup(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) error {
