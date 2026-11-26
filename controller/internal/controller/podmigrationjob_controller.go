@@ -801,7 +801,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 	r.evaluateInvariantsWithSnapshot(ctx, job, nil, res, reconcileErr)
 }
 
-// getForInvariants reads a PodSnapshotManualTrigger or PodSnapshot (obj
+// ReadForInvariants reads a PodSnapshotManualTrigger or PodSnapshot (obj
 // carries its GVK) for invariant evaluation from the informer cache, so these
 // reads never reach the API server (#199). The only live read left is the I5
 // confirmation in confirmOrphanedTrigger.
@@ -814,7 +814,11 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 // syncs and Get blocks for as long as the reconcile runs. So for such a kind
 // it reads nothing and returns NoKindMatchError, the error a live read returns
 // when the CRD is missing.
-func (r *PodMigrationJobReconciler) getForInvariants(ctx context.Context, key types.NamespacedName, obj *unstructured.Unstructured) error {
+//
+// PodGateReconciler also calls it, for the PodSnapshot of its pod's job (I4,
+// #231). A call made before this reconciler's watches have synced, such as
+// the pod gate's right after a restart, waits for that informer to sync.
+func (r *PodMigrationJobReconciler) ReadForInvariants(ctx context.Context, key types.NamespacedName, obj *unstructured.Unstructured) error {
 	if r.invariantReader == nil {
 		return r.Get(ctx, key, obj)
 	}
@@ -843,6 +847,19 @@ func (r *PodMigrationJobReconciler) confirmOrphanedTrigger(ctx context.Context, 
 		return !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err)
 	}
 	return live.GetDeletionTimestamp() == nil
+}
+
+// snapshotProgressNeeded reports whether I4 needs job's snapshot progress at
+// now: job is Snapshotting with a snapshot, past its timeout and inside the
+// hard cap plus I4's 30-second slack. Before the timeout I4 doesn't look at
+// progress, and past the cap progress no longer counts, so a read then would
+// be wasted.
+func snapshotProgressNeeded(job *pmv1alpha1.PodMigrationJob, now time.Time) bool {
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || job.Status.SnapshotRef == "" {
+		return false
+	}
+	anchor := migrationDeadlineAnchor(job)
+	return !anchor.IsZero() && now.Sub(anchor) > invariants.EffectiveMigrationTimeout(job) && now.Sub(anchor) <= util.MaxMigrationTimeout+30*time.Second
 }
 
 func snapshotProgressFromStatus(st *snapshot.Status) invariants.SnapshotProgress {
@@ -899,7 +916,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 		triggerKey := types.NamespacedName{Namespace: job.Namespace, Name: triggerName}
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(snapshot.ManualTriggerGVK(primaryGroup))
-		if err := r.getForInvariants(ctx, triggerKey, trigger); err == nil {
+		if err := r.ReadForInvariants(ctx, triggerKey, trigger); err == nil {
 			if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
 				job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed) && trigger.GetDeletionTimestamp() == nil {
 				hasOrphanedTrigger = r.confirmOrphanedTrigger(ctx, triggerKey, trigger.GroupVersionKind())
@@ -917,7 +934,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 	if snapName != "" {
 		snapObj := &unstructured.Unstructured{}
 		snapObj.SetGroupVersionKind(snapshot.PodSnapshotGVK(primaryGroup))
-		if err := r.getForInvariants(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
+		if err := r.ReadForInvariants(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
 			primarySnapObj = snapObj
 			primarySnapshotConditions = extractUnstructuredConditions(snapObj)
 		}
@@ -947,16 +964,12 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 		if otherKey == primaryKey {
 			continue
 		}
-		if other.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || other.Status.SnapshotRef == "" {
-			continue
-		}
-		anchor := migrationDeadlineAnchor(other)
-		if anchor.IsZero() || now.Sub(anchor) <= invariants.EffectiveMigrationTimeout(other) || now.Sub(anchor) > util.MaxMigrationTimeout+30*time.Second {
+		if !snapshotProgressNeeded(other, now) {
 			continue
 		}
 		otherSnapObj := &unstructured.Unstructured{}
 		otherSnapObj.SetGroupVersionKind(snapshot.PodSnapshotGVK(r.jobAPIGroup(other)))
-		if err := r.getForInvariants(ctx, types.NamespacedName{Namespace: other.Namespace, Name: other.Status.SnapshotRef}, otherSnapObj); err == nil {
+		if err := r.ReadForInvariants(ctx, types.NamespacedName{Namespace: other.Namespace, Name: other.Status.SnapshotRef}, otherSnapObj); err == nil {
 			recordSnapshotProgress(otherKey, snapshot.CheckPodSnapshotStatus(otherSnapObj, now))
 		} else if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			var fallbackProvider snapshot.Provider

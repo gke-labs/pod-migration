@@ -7,6 +7,8 @@ Each invariant predicate inspects an in-memory `ReconcileSnapshot` built from th
 - the reconciled job's `PodSnapshotManualTrigger` and `PodSnapshot`;
 - the `PodSnapshot` of each other job in the namespace that is `Snapshotting` with a `Status.SnapshotRef`, past its timeout but still inside the 2-hour hard cap (#199).
 
+`PodGateReconciler` also reads one `PodSnapshot` from the same cache: that of the job attached to the reconciled Pod (its `pod-migration.gke.io/assigned-pmj` annotation), when that job is `Snapshotting` with a `Status.SnapshotRef`, past its timeout but still inside the 2-hour hard cap, so that `I4` sees the job's progress there too (#231).
+
 Only kinds whose CRDs existed when the controller started are watched and read. For a kind without a CRD at startup, the controller skips the read and treats the object as absent, the same result a live read of a missing CRD gives, so a cluster without, for example, the GKE Pod Snapshots CRDs runs normally. Restart the controller after installing a snapshot engine's CRDs.
 
 The exception: when the cache shows a `Succeeded` or `Failed` job's trigger as not yet deleted, the controller makes one live read before reporting `I5`. The reconcile that concluded the job may have deleted the trigger just before the evaluation, and the cache may not have seen the delete yet.
