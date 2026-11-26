@@ -22,6 +22,10 @@ eviction. It also holds the CRIU engine's E2E on kind (`kind/up.sh`,
 - `dashboard/`: Static web UI visualization showing test outcomes.
 - `run_scale_drain_gate.sh`: 100-pod concurrent drain scale regression gate
   runner under strict invariant mode (#251).
+- `run_workload_class_e2e.sh`: Joint gke-labs/workload-class × pod-migration
+  end-to-end verification suite exercising Scenarios 1–12 (disruption windows,
+  per-pod PDB leasing, Spot preemption bypass, and workload age preservation)
+  under `--invariant-mode=strict` (#296).
 - `kind/up.sh` and `run_criu_kind_e2e.sh`: the CRIU engine E2E on a local
   kind cluster that CI runs on pull requests (no GKE or cloud credentials
   needed); see
