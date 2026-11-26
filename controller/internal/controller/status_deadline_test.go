@@ -292,16 +292,16 @@ func TestStatusDeadline_Pending_BaselineAndOverrides(t *testing.T) {
 }
 
 // TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring verifies that status.deadline
-// moves on each phase transition:
-// - Snapshotting: publishes SST + MaxMigrationTimeout (2h upper bound for progressing snapshots)
-// - Evicting: moves to EvictingStartTime + timeout (capped by MaxMigrationTimeout from SST)
-// - Restoring: moves to RestoringStartTime + restoreCeiling()
+// moves on each phase transition through the real Reconcile:
+// - Pending -> Snapshotting: moves to SST + MaxMigrationTimeout (2h upper bound for progressing snapshots)
+// - Snapshotting -> Evicting: moves to EvictingStartTime + timeout (capped by MaxMigrationTimeout from SST)
+// - Evicting -> Restoring: moves to RestoringStartTime + restoreCeiling()
+// - Restoring pod gate consumption: updates to new RST + restoreCeiling() when pod gate resets RST
 func TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring(t *testing.T) {
 	ctx := context.Background()
 	scheme := deadlineTestScheme()
 
-	createdAt := metav1.NewTime(time.Now().Add(-15 * time.Minute))
-	snapStart := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	createdAt := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -321,9 +321,8 @@ func TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring(t *testing.
 			TargetPodUID: "source-uid",
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase:                 pmv1alpha1.PodMigrationJobPhaseSnapshotting,
-			SnapshottingStartTime: &snapStart,
-			SnapshotRef:           "snapshot-123",
+			Phase:    pmv1alpha1.PodMigrationJobPhasePending,
+			Deadline: &metav1.Time{Time: createdAt.Time.Add(util.DefaultMigrationTimeout)},
 		},
 	}
 
@@ -344,18 +343,38 @@ func TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring(t *testing.
 		SnapshotProvider: mockSnapProvider,
 	}
 
-	// 1. In Snapshotting: calculateDeadline returns SST + MaxMigrationTimeout (2h upper bound)
-	snapDeadline := r.calculateDeadline(pmj)
-	if snapDeadline == nil {
+	key := types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}
+
+	// 1. Reconcile Pending -> Snapshotting: verifies Reconcile writes SST + MaxMigrationTimeout (2h)
+	// and pins the deadline update at the Pending -> Snapshotting transition (:1527).
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	if err != nil {
+		t.Fatalf("Reconcile to Snapshotting: %v", err)
+	}
+	if !res.Requeue {
+		t.Errorf("expected Requeue: true on transition to Snapshotting")
+	}
+
+	got := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get PMJ after Snapshotting transition: %v", err)
+	}
+	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Fatalf("phase = %s, want %s", got.Status.Phase, pmv1alpha1.PodMigrationJobPhaseSnapshotting)
+	}
+	if got.Status.SnapshottingStartTime == nil {
+		t.Fatalf("SnapshottingStartTime is nil")
+	}
+	if got.Status.Deadline == nil {
 		t.Fatalf("Snapshotting deadline is nil")
 	}
-	wantSnapDeadline := snapStart.Time.Add(util.MaxMigrationTimeout)
-	if !snapDeadline.Time.Equal(wantSnapDeadline) {
-		t.Errorf("Snapshotting deadline = %v, want %v", snapDeadline.Time, wantSnapDeadline)
+	wantSnapDeadline := got.Status.SnapshottingStartTime.Time.Add(util.MaxMigrationTimeout)
+	if !got.Status.Deadline.Time.Equal(wantSnapDeadline) {
+		t.Errorf("Snapshotting deadline = %v, want SST + MaxMigrationTimeout %v (was pending deadline kept?)", got.Status.Deadline.Time, wantSnapDeadline)
 	}
 
 	// 2. Reconcile: Snapshotting -> Evicting (mock provider reports PhaseReady)
-	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}})
+	res, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 	if err != nil {
 		t.Fatalf("Reconcile to Evicting: %v", err)
 	}
@@ -363,8 +382,7 @@ func TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring(t *testing.
 		t.Errorf("expected Requeue: true on transition to Evicting")
 	}
 
-	got := &pmv1alpha1.PodMigrationJob{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}, got); err != nil {
+	if err := c.Get(ctx, key, got); err != nil {
 		t.Fatalf("get PMJ after Evicting transition: %v", err)
 	}
 	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
@@ -388,11 +406,11 @@ func TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring(t *testing.
 		t.Fatalf("deleting source pod: %v", err)
 	}
 	// Reconcile: source pod is gone, PVs detached -> transitions to Restoring
-	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}}); err != nil {
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
 		t.Fatalf("Reconcile to Restoring: %v", err)
 	}
 
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}, got); err != nil {
+	if err := c.Get(ctx, key, got); err != nil {
 		t.Fatalf("get PMJ after Restoring transition: %v", err)
 	}
 	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
@@ -409,6 +427,30 @@ func TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring(t *testing.
 	wantRestoreDeadline := got.Status.RestoringStartTime.Time.Add(r.restoreCeiling())
 	if !got.Status.Deadline.Time.Equal(wantRestoreDeadline) {
 		t.Errorf("status.deadline in Restoring = %v, want %v", got.Status.Deadline.Time, wantRestoreDeadline)
+	}
+
+	// 4. PodGate consumption in Restoring: pod gate consumes job 3 minutes later and resets
+	// RestoringStartTime = now. The reconciler must advance status.deadline to new RST + restoreCeiling().
+	gateRST := metav1.NewTime(got.Status.RestoringStartTime.Time.Add(3 * time.Minute))
+	got.Status.RestoringStartTime = &gateRST
+	got.Status.Consumed = true
+	got.Status.RestoredPodUID = "restored-pod-uid"
+	got.Status.RestoredPodName = "restored-pod-name"
+	if err := c.Status().Update(ctx, got); err != nil {
+		t.Fatalf("simulating pod gate consumption update: %v", err)
+	}
+
+	// Next Reconcile pass in Restoring must detect the new RST and patch status.deadline
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile after pod gate consumption: %v", err)
+	}
+
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get PMJ after pod gate consumption reconcile: %v", err)
+	}
+	wantConsumedDeadline := gateRST.Time.Add(r.restoreCeiling())
+	if got.Status.Deadline == nil || !got.Status.Deadline.Time.Equal(wantConsumedDeadline) {
+		t.Errorf("status.deadline after pod gate consumption = %v, want %v", got.Status.Deadline, wantConsumedDeadline)
 	}
 }
 
@@ -635,6 +677,14 @@ func TestStatusDeadline_ZeroExtraStatusWrites(t *testing.T) {
 	if statusWrites != 2 {
 		t.Errorf("status writes after Snapshotting transition = %d, want 2", statusWrites)
 	}
+	gotSnap := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(ctx, key, gotSnap); err != nil {
+		t.Fatalf("get PMJ after Snapshotting transition: %v", err)
+	}
+	wantSnapDeadline := gotSnap.Status.SnapshottingStartTime.Time.Add(util.MaxMigrationTimeout)
+	if gotSnap.Status.Deadline == nil || !gotSnap.Status.Deadline.Time.Equal(wantSnapDeadline) {
+		t.Errorf("status.deadline after Snapshotting transition = %v, want %v", gotSnap.Status.Deadline, wantSnapDeadline)
+	}
 
 	// Pass 3: In Snapshotting with mock provider returning Ready ->
 	// fences source (1 write) and transitions to Evicting (1 write) -> exactly 4 status writes
@@ -694,5 +744,40 @@ func TestStatusDeadline_ZeroExtraStatusWrites(t *testing.T) {
 	wantFinalDeadline := got.Status.RestoringStartTime.Time.Add(r.restoreCeiling())
 	if !got.Status.Deadline.Time.Equal(wantFinalDeadline) {
 		t.Errorf("final PMJ status.deadline = %v, want %v", got.Status.Deadline.Time, wantFinalDeadline)
+	}
+
+	// Pass 8: PodGate consumes job and resets RestoringStartTime 3 minutes later ->
+	// Reconcile updates status.deadline to new RST + restoreCeiling() with exactly 1 status write
+	gateRST := metav1.NewTime(got.Status.RestoringStartTime.Time.Add(3 * time.Minute))
+	got.Status.RestoringStartTime = &gateRST
+	got.Status.Consumed = true
+	got.Status.RestoredPodUID = "consumer-pod-uid"
+	got.Status.RestoredPodName = "consumer-pod-name"
+	if err := c.Status().Update(ctx, got); err != nil {
+		t.Fatalf("simulating pod gate consumption update: %v", err)
+	}
+	consumptionUpdateWrites := statusWrites
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile 8: %v", err)
+	}
+	if statusWrites != consumptionUpdateWrites+1 {
+		t.Errorf("status writes after pod gate consumption update = %d, want %d (exactly 1 patch)", statusWrites, consumptionUpdateWrites+1)
+	}
+
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get PMJ after consumption reconcile: %v", err)
+	}
+	wantUpdatedDeadline := gateRST.Time.Add(r.restoreCeiling())
+	if got.Status.Deadline == nil || !got.Status.Deadline.Time.Equal(wantUpdatedDeadline) {
+		t.Errorf("status.deadline after consumption update = %v, want %v", got.Status.Deadline, wantUpdatedDeadline)
+	}
+
+	// Pass 9: Subsequent reconcile in Restoring -> exactly 0 new status writes (no churn)
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile 9: %v", err)
+	}
+	if statusWrites != consumptionUpdateWrites+1 {
+		t.Errorf("status writes on subsequent reconcile = %d, want %d (zero extra writes / no churn)", statusWrites, consumptionUpdateWrites+1)
 	}
 }

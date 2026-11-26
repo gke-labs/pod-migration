@@ -338,6 +338,13 @@ func (r *PodMigrationJobReconciler) triggerUnanswered(ctx context.Context, job *
 	return true, util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
 }
 
+// isEvictionWithinBudget checks whether the origin pod eviction phase has
+// exceeded its migration budget.
+// Note: When EvictingStartTime and AnnotationEvictingSince are both missing,
+// calculateDeadline falls back to the job's CreationTimestamp as the anchor,
+// so this returns true while within budget from CreationTimestamp. On main,
+// missing both returned false; with the single caller behind the Evicting gate,
+// returning true before EvictingStartTime is initialized is safe and harmless.
 func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMigrationJob) bool {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		return false
@@ -1959,7 +1966,8 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseRestoring:
-		// 1. Ensure RestoringStartTime is initialized
+		// 1. Ensure RestoringStartTime is initialized, and keep status.deadline aligned
+		// with RestoringStartTime + restoreCeiling() when the pod gate resets RestoringStartTime on consumption.
 		if job.Status.RestoringStartTime == nil {
 			now := metav1.Now()
 			job.Status.RestoringStartTime = &now
@@ -1967,6 +1975,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if err := r.patchStatus(ctx, job, origJob); err != nil {
 				return r.handleStatusError(ctx, err, "Failed to initialize RestoringStartTime")
 			}
+			origJob = job.DeepCopy()
+		} else if expectedDeadline := r.calculateDeadline(job); expectedDeadline != nil && job.Status.Deadline != nil && !job.Status.Deadline.Equal(expectedDeadline) {
+			job.Status.Deadline = expectedDeadline
+			if err := r.patchStatus(ctx, job, origJob, client.MergeFromWithOptimisticLock{}); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to update deadline in Restoring phase")
+			}
+			origJob = job.DeepCopy()
 		}
 
 		// An earlier version of the pod gate found no node that could
