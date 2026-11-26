@@ -195,7 +195,9 @@ func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, st
 	}
 
 	// 2. Core check: verify category-1 features.
-	// If the core kernel features fail, the node is unconditionally unready.
+	// In CRIU 4.2.1 (cr-check.c), CHECK_GOOD ("Looks good.") and CHECK_MAYBE ("Looks good but some kernel features...")
+	// are only emitted after every Category-1 (core) check has passed. Thus, presence of "Looks good" in the
+	// `criu check --all` output proves core checks passed without needing a redundant second `criu check` subprocess.
 	if !strings.Contains(raw, "Looks good") || strings.Contains(raw, "Does not look good") {
 		return false, "criu check failed", raw
 	}
