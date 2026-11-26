@@ -97,6 +97,7 @@ drain_node_and_verify_single_hop() {
 
 # Cleanup old podsnapshots before starting (Rule 2)
 echo "[*] Cleaning up old podsnapshots..."
+kubectl label namespace default pod-migration.gke.io/managed="true" --overwrite >/dev/null 2>&1 || true
 # Temporarily delete VAP to allow finalizer removal
 kubectl delete validatingadmissionpolicybinding gke-pod-snapshot-vap-binding --ignore-not-found || true
 # Remove finalizers using JSON patch

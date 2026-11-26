@@ -16,10 +16,13 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -32,7 +35,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -41,98 +46,200 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
+	"github.com/gke-labs/pod-migration/controller/internal/engine"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
 )
 
-// TestWebhook_CreationReinvocation_Envtest tests that when an opt-in label
-// (pod-migration.gke.io/enabled: "true") is added by another mutating admission webhook
-// (e.g. workload-class) that runs AFTER our webhook in lexicographical order,
-// reinvocationPolicy: IfNeeded with namespaceSelector correctly reinvokes mpodgate,
-// injecting the scheduling gate and assigning the active PMJ (#303).
+func controllerManifestPath() string {
+	return filepath.Join("..", "..", "deploy.yaml")
+}
+
+func criuManifestPath() string {
+	return filepath.Join("..", "..", "..", "engines", "criu", "deploy", "deploy.yaml")
+}
+
+// manifestObjects decodes every object of a multi-document manifest.
+func manifestObjects(t *testing.T, path string) []*unstructured.Unstructured {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+	var out []*unstructured.Unstructured
+	for {
+		obj := &unstructured.Unstructured{}
+		if err := decoder.Decode(&obj.Object); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decoding %s: %v", path, err)
+		}
+		if len(obj.Object) == 0 {
+			continue
+		}
+		out = append(out, obj)
+	}
+	return out
+}
+
+// manifestObject decodes the object of the given kind and name into into.
+func manifestObject(t *testing.T, path, kind, name string, into interface{}) {
+	t.Helper()
+	for _, obj := range manifestObjects(t, path) {
+		if obj.GetKind() != kind || obj.GetName() != name {
+			continue
+		}
+		if err := apiruntime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, into); err != nil {
+			t.Fatalf("converting %s %s of %s: %v", kind, name, path, err)
+		}
+		return
+	}
+	t.Fatalf("%s has no %s named %s", path, kind, name)
+}
+
+// TestWebhook_CreationReinvocation_Envtest verifies the complete mutating webhook chain
+// loaded directly from the shipped manifests (controller/deploy.yaml and CRIU deploy.yaml),
+// exercising both lexicographical orders with third-party label-stamping webhooks sorting
+// before (a-stamper) and after (z-stamper) our webhooks (#303).
+//
+// Invariants verified:
+// 1. Shipped mpodgate uses reinvocationPolicy: IfNeeded with namespaceSelector on managed namespaces.
+// 2. mpodgate-runc matches all pods in managed namespaces (no matchConditions restriction) so pods
+//    whose runtimeClassName or opt-in label is added by later webhooks are reinvoked and gated.
+// 3. mpodgate is ordered BEFORE CRIU restore-inject (mutating-webhook-configuration < pod-migrate-psengine-restore-inject).
+// 4. On reinvocation, mpodgate does NOT scrub pod-migrate.io/psengine-injected on an already-gated pod.
 func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS not set; skipping creation reinvocation webhook envtest")
 	}
 
+	// 1. Load shipped mutating-webhook-configuration from controller/deploy.yaml.
+	shippedMpodgate := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	manifestObject(t, controllerManifestPath(), "MutatingWebhookConfiguration", "mutating-webhook-configuration", shippedMpodgate)
+
+	// Pin shipped configuration invariants
+	if shippedMpodgate.Name != "mutating-webhook-configuration" {
+		t.Fatalf("shipped mutating webhook configuration name = %q, want 'mutating-webhook-configuration'", shippedMpodgate.Name)
+	}
+	if len(shippedMpodgate.Webhooks) != 4 {
+		t.Fatalf("shipped mutating webhook configuration has %d webhooks, want 4 (mpodgate, mpodgate-runc, mpodstatus, mpodfence)", len(shippedMpodgate.Webhooks))
+	}
+	for _, wh := range shippedMpodgate.Webhooks {
+		if wh.Name == "mpodgate.podmigration.gke.io" || wh.Name == "mpodgate-runc.podmigration.gke.io" {
+			if wh.ReinvocationPolicy == nil || *wh.ReinvocationPolicy != admissionregistrationv1.IfNeededReinvocationPolicy {
+				t.Fatalf("webhook %s reinvocationPolicy = %v, want IfNeeded", wh.Name, wh.ReinvocationPolicy)
+			}
+		}
+		if wh.Name == "mpodgate-runc.podmigration.gke.io" {
+			if len(wh.MatchConditions) != 0 {
+				t.Fatalf("webhook %s has matchConditions (%+v), want none so it matches every pod in managed namespaces", wh.Name, wh.MatchConditions)
+			}
+			if wh.FailurePolicy == nil || *wh.FailurePolicy != admissionregistrationv1.Ignore {
+				t.Fatalf("webhook %s failurePolicy = %v, want Ignore", wh.Name, wh.FailurePolicy)
+			}
+		}
+		if wh.Name == "mpodgate.podmigration.gke.io" {
+			if wh.FailurePolicy == nil || *wh.FailurePolicy != admissionregistrationv1.Fail {
+				t.Fatalf("webhook %s failurePolicy = %v, want Fail", wh.Name, wh.FailurePolicy)
+			}
+		}
+	}
+
+	// 2. Load shipped pod-migrate-psengine-restore-inject from engines/criu/deploy/deploy.yaml.
+	shippedCRIU := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	manifestObject(t, criuManifestPath(), "MutatingWebhookConfiguration", "pod-migrate-psengine-restore-inject", shippedCRIU)
+	if shippedCRIU.Name != "pod-migrate-psengine-restore-inject" {
+		t.Fatalf("shipped CRIU webhook configuration name = %q, want 'pod-migrate-psengine-restore-inject'", shippedCRIU.Name)
+	}
+	if shippedMpodgate.Name >= shippedCRIU.Name {
+		t.Fatalf("ordering violation: %q must sort alphabetically before %q so mpodgate gates before restore-inject", shippedMpodgate.Name, shippedCRIU.Name)
+	}
+
+	// 3. Construct early and late label-stamping webhooks to test both ordering paths.
+	earlyStamperPath := "/mutate-stamper-early"
+	lateStamperPath := "/mutate-stamper-late"
 	failPolicy := admissionregistrationv1.Fail
 	sideEffects := admissionregistrationv1.SideEffectClassNone
-	reinvokeIfNeeded := admissionregistrationv1.IfNeededReinvocationPolicy
 	reinvokeNever := admissionregistrationv1.NeverReinvocationPolicy
 
-	mpodgatePath := "/mutate-v1-pod-scheduling-gate"
-	labelStamperPath := "/mutate-workload-class"
+	// a-stamper sorts BEFORE mutating-webhook-configuration
+	aStamper := &admissionregistrationv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "a-stamper"},
+		Webhooks: []admissionregistrationv1.MutatingWebhook{
+			{
+				Name:                    "early-stamper.test.gke.io",
+				AdmissionReviewVersions: []string{"v1"},
+				FailurePolicy:           &failPolicy,
+				SideEffects:             &sideEffects,
+				ReinvocationPolicy:      &reinvokeNever,
+				ClientConfig: admissionregistrationv1.WebhookClientConfig{
+					Service: &admissionregistrationv1.ServiceReference{
+						Path: &earlyStamperPath,
+					},
+				},
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						util.LabelNamespaceManaged: "true",
+					},
+				},
+				Rules: []admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"pods"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// z-stamper sorts AFTER pod-migrate-psengine-restore-inject
+	zStamper := &admissionregistrationv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "z-stamper"},
+		Webhooks: []admissionregistrationv1.MutatingWebhook{
+			{
+				Name:                    "late-stamper.test.gke.io",
+				AdmissionReviewVersions: []string{"v1"},
+				FailurePolicy:           &failPolicy,
+				SideEffects:             &sideEffects,
+				ReinvocationPolicy:      &reinvokeNever,
+				ClientConfig: admissionregistrationv1.WebhookClientConfig{
+					Service: &admissionregistrationv1.ServiceReference{
+						Path: &lateStamperPath,
+					},
+				},
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						util.LabelNamespaceManaged: "true",
+					},
+				},
+				Rules: []admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"pods"},
+						},
+					},
+				},
+			},
+		},
+	}
 
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 		WebhookInstallOptions: envtest.WebhookInstallOptions{
 			MutatingWebhooks: []*admissionregistrationv1.MutatingWebhookConfiguration{
-				{
-					// Named "a-mpodgate" so it is called BEFORE "b-workload-class"
-					ObjectMeta: metav1.ObjectMeta{Name: "a-mpodgate"},
-					Webhooks: []admissionregistrationv1.MutatingWebhook{
-						{
-							Name:                    "mpodgate.podmigration.gke.io",
-							AdmissionReviewVersions: []string{"v1"},
-							FailurePolicy:           &failPolicy,
-							SideEffects:             &sideEffects,
-							ReinvocationPolicy:      &reinvokeIfNeeded,
-							ClientConfig: admissionregistrationv1.WebhookClientConfig{
-								Service: &admissionregistrationv1.ServiceReference{
-									Path: &mpodgatePath,
-								},
-							},
-							NamespaceSelector: &metav1.LabelSelector{
-								MatchLabels: map[string]string{
-									util.LabelNamespaceManaged: "true",
-								},
-							},
-							Rules: []admissionregistrationv1.RuleWithOperations{
-								{
-									Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
-									Rule: admissionregistrationv1.Rule{
-										APIGroups:   []string{""},
-										APIVersions: []string{"v1"},
-										Resources:   []string{"pods"},
-									},
-								},
-							},
-						},
-					},
-				},
-				{
-					// Named "b-workload-class" so it is called AFTER "a-mpodgate"
-					ObjectMeta: metav1.ObjectMeta{Name: "b-workload-class"},
-					Webhooks: []admissionregistrationv1.MutatingWebhook{
-						{
-							Name:                    "label-stamper.workload-class.gke.io",
-							AdmissionReviewVersions: []string{"v1"},
-							FailurePolicy:           &failPolicy,
-							SideEffects:             &sideEffects,
-							ReinvocationPolicy:      &reinvokeNever,
-							ClientConfig: admissionregistrationv1.WebhookClientConfig{
-								Service: &admissionregistrationv1.ServiceReference{
-									Path: &labelStamperPath,
-								},
-							},
-							NamespaceSelector: &metav1.LabelSelector{
-								MatchLabels: map[string]string{
-									util.LabelNamespaceManaged: "true",
-								},
-							},
-							Rules: []admissionregistrationv1.RuleWithOperations{
-								{
-									Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
-									Rule: admissionregistrationv1.Rule{
-										APIGroups:   []string{""},
-										APIVersions: []string{"v1"},
-										Resources:   []string{"pods"},
-									},
-								},
-							},
-						},
-					},
-				},
+				aStamper,
+				shippedMpodgate,
+				shippedCRIU,
+				zStamper,
 			},
 		},
 	}
@@ -147,9 +254,10 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 		}
 	})
 
-	scheme := runtime.NewScheme()
+	scheme := apiruntime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = pmv1alpha1.AddToScheme(scheme)
+	_ = nodev1.AddToScheme(scheme)
 
 	whOpts := &testEnv.WebhookInstallOptions
 	webhookServer := ctrlwebhook.NewServer(ctrlwebhook.Options{
@@ -168,31 +276,104 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue); err != nil {
-		cancel()
 		t.Fatalf("indexing PMJ parent key: %v", err)
 	}
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue); err != nil {
-		cancel()
 		t.Fatalf("indexing Pod assigned PMJ: %v", err)
 	}
 
+	// 1. Shipped replacement webhook handler: /mutate-v1-pod-scheduling-gate
 	if err := SetupReplacementWebhookWithManager(mgr, mgr.GetAPIReader(), true); err != nil {
-		cancel()
 		t.Fatalf("setting up replacement webhook: %v", err)
 	}
+	if err := SetupStatusWebhookWithManager(mgr, mgr.GetAPIReader()); err != nil {
+		t.Fatalf("setting up status webhook: %v", err)
+	}
+	if err := SetupFenceWebhookWithManager(mgr); err != nil {
+		t.Fatalf("setting up fence webhook: %v", err)
+	}
 
-	// Register the simulated workload-class webhook handler that stamps
-	// pod-migration.gke.io/enabled: "true" when pod has label "workload: test"
-	mgr.GetWebhookServer().Register(labelStamperPath, &ctrlwebhook.Admission{
+	// 2. Shipped CRIU restore-inject webhook handler: /psengine-restore-inject
+	// Simulates RestoreInjector: injects holder wrap and stamps pod-migrate.io/psengine-injected
+	// only when pod carries gke.io/pod-migration-gate and an assigned PMJ (#135).
+	mgr.GetWebhookServer().Register("/psengine-restore-inject", &ctrlwebhook.Admission{
 		Handler: admission.HandlerFunc(func(ctx context.Context, req admission.Request) admission.Response {
 			pod := &corev1.Pod{}
 			if err := json.Unmarshal(req.Object.Raw, pod); err != nil {
 				return admission.Errored(http.StatusBadRequest, err)
 			}
-			if pod.Labels != nil && pod.Labels["workload"] == "test" {
+			hasGate := false
+			for _, g := range pod.Spec.SchedulingGates {
+				if g.Name == "gke.io/pod-migration-gate" {
+					hasGate = true
+					break
+				}
+			}
+			assignedPMJ := pod.Annotations[util.AnnotationAssignedPMJ]
+			if !hasGate || assignedPMJ == "" {
+				return admission.Allowed("not a gated migration replacement pod")
+			}
+			if pod.Annotations[engine.CRIUInjectedAnnotation] == "true" {
+				return admission.Allowed("already injected")
+			}
+			if pod.Annotations == nil {
+				pod.Annotations = make(map[string]string)
+			}
+			pod.Annotations[engine.CRIUInjectedAnnotation] = "true"
+			if len(pod.Spec.Containers) == 1 {
+				pod.Spec.Containers[0].Command = append([]string{"/pmhold/holder", "wrap", "--"}, pod.Spec.Containers[0].Command...)
+			}
+			marshaled, err := json.Marshal(pod)
+			if err != nil {
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			return admission.PatchResponseFromRaw(req.Object.Raw, marshaled)
+		}),
+	})
+
+	// 3. Early stamper (a-stamper): stamps enabled: "true" when workload == "test-early"
+	mgr.GetWebhookServer().Register(earlyStamperPath, &ctrlwebhook.Admission{
+		Handler: admission.HandlerFunc(func(ctx context.Context, req admission.Request) admission.Response {
+			pod := &corev1.Pod{}
+			if err := json.Unmarshal(req.Object.Raw, pod); err != nil {
+				return admission.Errored(http.StatusBadRequest, err)
+			}
+			if pod.Labels != nil && pod.Labels["workload"] == "test-early" {
 				pod.Labels["pod-migration.gke.io/enabled"] = "true"
+			}
+			marshaled, err := json.Marshal(pod)
+			if err != nil {
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			return admission.PatchResponseFromRaw(req.Object.Raw, marshaled)
+		}),
+	})
+
+	// 4. Late stamper (z-stamper): stamps enabled: "true" when workload == "test-late",
+	// or stamps gvisor + enabled: "true" when workload == "test-set-runtime-and-label",
+	// or touches annotation when workload == "trigger-reinvocation".
+	mgr.GetWebhookServer().Register(lateStamperPath, &ctrlwebhook.Admission{
+		Handler: admission.HandlerFunc(func(ctx context.Context, req admission.Request) admission.Response {
+			pod := &corev1.Pod{}
+			if err := json.Unmarshal(req.Object.Raw, pod); err != nil {
+				return admission.Errored(http.StatusBadRequest, err)
+			}
+			if pod.Labels != nil && pod.Labels["workload"] == "test-late" {
+				pod.Labels["pod-migration.gke.io/enabled"] = "true"
+			}
+			if pod.Labels != nil && pod.Labels["workload"] == "test-set-runtime-and-label" {
+				gvisor := "gvisor"
+				pod.Spec.RuntimeClassName = &gvisor
+				pod.Labels["pod-migration.gke.io/enabled"] = "true"
+			}
+			if pod.Labels != nil && pod.Labels["workload"] == "trigger-reinvocation" {
+				if pod.Annotations == nil {
+					pod.Annotations = make(map[string]string)
+				}
+				pod.Annotations["stamper-touched"] = "true"
 			}
 			marshaled, err := json.Marshal(pod)
 			if err != nil {
@@ -238,7 +419,16 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 		t.Fatalf("creating admin client: %v", err)
 	}
 
-	// 1. Managed namespace: has pod-migration.gke.io/managed: "true"
+	// Register RuntimeClass for gvisor and runc so API server accepts pods with runtimeClassName: gvisor
+	for _, rc := range []string{"runc", "gvisor"} {
+		if err := admin.Create(ctx, &nodev1.RuntimeClass{
+			ObjectMeta: metav1.ObjectMeta{Name: rc},
+			Handler:    rc,
+		}); err != nil {
+			t.Fatalf("creating runtimeClass %s: %v", rc, err)
+		}
+	}
+
 	managedNS := "managed-ns"
 	if err := admin.Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -251,7 +441,6 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 		t.Fatalf("creating managed namespace: %v", err)
 	}
 
-	// 2. Unmanaged namespace: lacks pod-migration.gke.io/managed: "true"
 	unmanagedNS := "unmanaged-ns"
 	if err := admin.Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -283,19 +472,103 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 		return pmj
 	}
 
-	t.Run("replacement pod opted in by second webhook is gated via reinvocation", func(t *testing.T) {
-		pmj := createPMJ(managedNS, "work-pod-reinvoke")
+	t.Run("replacement pod opted in by later webhook (z-stamper) gets gated and CRIU holder injected", func(t *testing.T) {
+		pmj := createPMJ(managedNS, "work-pod-late")
 
-		// Pod is created WITHOUT pod-migration.gke.io/enabled: "true", but WITH workload: test.
-		// a-mpodgate runs first -> skips gate.
-		// b-workload-class runs second -> adds pod-migration.gke.io/enabled: "true".
-		// Reinvocation triggers a-mpodgate again -> injects gate and assigns PMJ!
+		// Pod created without opt-in label:
+		// Round 1: mpodgate skips (no label), restore-inject skips (no gate), z-stamper stamps label.
+		// Round 2: mpodgate gates pod and assigns PMJ, restore-inject wraps holder and stamps psengine-injected.
+		// Round 3: mpodgate reinvokes but does NOT scrub psengine-injected!
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: managedNS,
-				Name:      "work-pod-reinvoke",
+				Name:      "work-pod-late",
 				Labels: map[string]string{
-					"workload": "test",
+					"workload": "test-late",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "app", Image: "registry.k8s.io/pause:3.10", Command: []string{"/app"}},
+				},
+			},
+		}
+		if err := admin.Create(ctx, pod); err != nil {
+			t.Fatalf("creating pod: %v", err)
+		}
+
+		if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
+			t.Errorf("pod-migration.gke.io/enabled = %q, want 'true'", pod.Labels["pod-migration.gke.io/enabled"])
+		}
+		if len(pod.Spec.SchedulingGates) != 1 || pod.Spec.SchedulingGates[0].Name != "gke.io/pod-migration-gate" {
+			t.Errorf("schedulingGates = %+v, want [gke.io/pod-migration-gate]", pod.Spec.SchedulingGates)
+		}
+		if pod.Annotations[util.AnnotationAssignedPMJ] != pmj.Name {
+			t.Errorf("assigned-pmj = %q, want %q", pod.Annotations[util.AnnotationAssignedPMJ], pmj.Name)
+		}
+		if pod.Annotations[engine.CRIUInjectedAnnotation] != "true" {
+			t.Errorf("psengine-injected = %q, want 'true'", pod.Annotations[engine.CRIUInjectedAnnotation])
+		}
+		if len(pod.Spec.Containers[0].Command) < 3 || pod.Spec.Containers[0].Command[0] != "/pmhold/holder" {
+			t.Errorf("command = %v, want wrapped with /pmhold/holder wrap --", pod.Spec.Containers[0].Command)
+		}
+	})
+
+	t.Run("replacement pod opted in by earlier webhook (a-stamper) gets gated and CRIU holder injected", func(t *testing.T) {
+		pmj := createPMJ(managedNS, "work-pod-early")
+
+		// Pod created without opt-in label:
+		// Round 1: a-stamper stamps label, mpodgate gates pod and assigns PMJ, restore-inject wraps holder and stamps psengine-injected.
+		// Round 2: mpodgate reinvokes and does NOT scrub psengine-injected!
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: managedNS,
+				Name:      "work-pod-early",
+				Labels: map[string]string{
+					"workload": "test-early",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "app", Image: "registry.k8s.io/pause:3.10", Command: []string{"/app"}},
+				},
+			},
+		}
+		if err := admin.Create(ctx, pod); err != nil {
+			t.Fatalf("creating pod: %v", err)
+		}
+
+		if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
+			t.Errorf("pod-migration.gke.io/enabled = %q, want 'true'", pod.Labels["pod-migration.gke.io/enabled"])
+		}
+		if len(pod.Spec.SchedulingGates) != 1 || pod.Spec.SchedulingGates[0].Name != "gke.io/pod-migration-gate" {
+			t.Errorf("schedulingGates = %+v, want [gke.io/pod-migration-gate]", pod.Spec.SchedulingGates)
+		}
+		if pod.Annotations[util.AnnotationAssignedPMJ] != pmj.Name {
+			t.Errorf("assigned-pmj = %q, want %q", pod.Annotations[util.AnnotationAssignedPMJ], pmj.Name)
+		}
+		if pod.Annotations[engine.CRIUInjectedAnnotation] != "true" {
+			t.Errorf("psengine-injected = %q, want 'true'", pod.Annotations[engine.CRIUInjectedAnnotation])
+		}
+		if len(pod.Spec.Containers[0].Command) < 3 || pod.Spec.Containers[0].Command[0] != "/pmhold/holder" {
+			t.Errorf("command = %v, want wrapped with /pmhold/holder wrap --", pod.Spec.Containers[0].Command)
+		}
+	})
+
+	t.Run("runtimeClassName set to gvisor by later webhook is gated via runc entry reinvocation", func(t *testing.T) {
+		pmj := createPMJ(managedNS, "work-pod-runtime-later")
+
+		// Pod created without runtimeClassName and without opt-in label.
+		// Round 1: mpodgate (gVisor) matchConditions is false.
+		//          mpodgate-runc matches every pod in managed namespaces! But opt-in label is missing.
+		//          z-stamper sets runtimeClassName: gvisor AND pod-migration.gke.io/enabled: "true".
+		// Round 2: mpodgate-runc is reinvoked, sees opt-in label, matches PMJ, and injects scheduling gate!
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: managedNS,
+				Name:      "work-pod-runtime-later",
+				Labels: map[string]string{
+					"workload": "test-set-runtime-and-label",
 				},
 			},
 			Spec: corev1.PodSpec{
@@ -308,35 +581,31 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 			t.Fatalf("creating pod: %v", err)
 		}
 
-		// Verify label was stamped
-		if pod.Labels["pod-migration.gke.io/enabled"] != "true" {
-			t.Errorf("pod-migration.gke.io/enabled = %q, want 'true'", pod.Labels["pod-migration.gke.io/enabled"])
+		if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
+			t.Errorf("runtimeClassName = %v, want 'gvisor'", pod.Spec.RuntimeClassName)
 		}
-
-		// Verify scheduling gate was injected on reinvocation
 		if len(pod.Spec.SchedulingGates) != 1 || pod.Spec.SchedulingGates[0].Name != "gke.io/pod-migration-gate" {
 			t.Errorf("schedulingGates = %+v, want [gke.io/pod-migration-gate]", pod.Spec.SchedulingGates)
 		}
-
-		// Verify assigned PMJ was stamped
 		if pod.Annotations[util.AnnotationAssignedPMJ] != pmj.Name {
 			t.Errorf("assigned-pmj = %q, want %q", pod.Annotations[util.AnnotationAssignedPMJ], pmj.Name)
 		}
 	})
 
-	t.Run("reinvocation on already-gated pod is a no-op", func(t *testing.T) {
-		pmj := createPMJ(managedNS, "already-gated")
+	t.Run("already-gated pod with CRIU injected marker preserves marker on reinvocation", func(t *testing.T) {
+		pmj := createPMJ(managedNS, "already-gated-reinvoke")
 
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: managedNS,
-				Name:      "already-gated",
+				Name:      "already-gated-reinvoke",
 				Labels: map[string]string{
-					"workload":                     "test",
+					"workload":                     "trigger-reinvocation",
 					"pod-migration.gke.io/enabled": "true",
 				},
 				Annotations: map[string]string{
-					util.AnnotationAssignedPMJ: pmj.Name,
+					util.AnnotationAssignedPMJ:    pmj.Name,
+					engine.CRIUInjectedAnnotation: "true",
 				},
 			},
 			Spec: corev1.PodSpec{
@@ -344,7 +613,7 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 					{Name: "gke.io/pod-migration-gate"},
 				},
 				Containers: []corev1.Container{
-					{Name: "app", Image: "registry.k8s.io/pause:3.10"},
+					{Name: "app", Image: "registry.k8s.io/pause:3.10", Command: []string{"/pmhold/holder", "wrap", "--", "/app"}},
 				},
 			},
 		}
@@ -352,6 +621,13 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 			t.Fatalf("creating already-gated pod: %v", err)
 		}
 
+		// Verify reinvocation did not strip the CRIU injected marker
+		if pod.Annotations[engine.CRIUInjectedAnnotation] != "true" {
+			t.Errorf("psengine-injected was stripped on reinvocation: got %q, want 'true'", pod.Annotations[engine.CRIUInjectedAnnotation])
+		}
+		if pod.Annotations["stamper-touched"] != "true" {
+			t.Errorf("stamper-touched = %q, want 'true' (confirming z-stamper reinvocation occurred)", pod.Annotations["stamper-touched"])
+		}
 		if len(pod.Spec.SchedulingGates) != 1 {
 			t.Errorf("schedulingGates count = %d, want 1", len(pod.Spec.SchedulingGates))
 		}
@@ -392,7 +668,7 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 				Namespace: unmanagedNS,
 				Name:      "unmanaged-work-pod",
 				Labels: map[string]string{
-					"workload": "test",
+					"workload": "test-late",
 				},
 			},
 			Spec: corev1.PodSpec{
@@ -416,103 +692,35 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 }
 
 // TestWebhook_OutageFailOpenFailClosed_Envtest verifies that when the webhook endpoint
-// is unreachable (controller outage), creating a runc pod succeeds (fails open with Ignore)
-// while creating a gVisor pod fails closed (FailurePolicy: Fail) (#303).
+// is unreachable (controller outage), the shipped MutatingWebhookConfiguration from
+// controller/deploy.yaml ensures:
+// 1. runc pod without runtimeClassName succeeds (fails open with Ignore)
+// 2. runc pod with explicit runtimeClassName != 'gvisor' succeeds (fails open with Ignore)
+// 3. gVisor pod with runtimeClassName == 'gvisor' fails closed (FailurePolicy: Fail)
+// 4. Custom gVisor runtime class (e.g. 'gvisor-custom') fails open with Ignore (#303, #83).
 func TestWebhook_OutageFailOpenFailClosed_Envtest(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("KUBEBUILDER_ASSETS not set; skipping outage fail-open/fail-closed envtest")
 	}
 
-	failPolicy := admissionregistrationv1.Fail
-	ignorePolicy := admissionregistrationv1.Ignore
-	sideEffects := admissionregistrationv1.SideEffectClassNone
-	unreachablePath := "/mutate-v1-pod-scheduling-gate"
+	shippedMpodgate := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	manifestObject(t, controllerManifestPath(), "MutatingWebhookConfiguration", "mutating-webhook-configuration", shippedMpodgate)
 
 	// Dummy port where nothing is listening to simulate unreachable webhook endpoint.
 	unreachablePort := int32(59999)
+	for i := range shippedMpodgate.Webhooks {
+		shippedMpodgate.Webhooks[i].TimeoutSeconds = ptr(int32(1))
+		if shippedMpodgate.Webhooks[i].ClientConfig.Service != nil {
+			shippedMpodgate.Webhooks[i].ClientConfig.Service.Port = &unreachablePort
+		}
+	}
 
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 		WebhookInstallOptions: envtest.WebhookInstallOptions{
 			MutatingWebhooks: []*admissionregistrationv1.MutatingWebhookConfiguration{
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "pod-migration-mutating-webhook-configuration"},
-					Webhooks: []admissionregistrationv1.MutatingWebhook{
-						{
-							Name:                    "mpodgate.podmigration.gke.io",
-							AdmissionReviewVersions: []string{"v1"},
-							FailurePolicy:           &failPolicy,
-							SideEffects:             &sideEffects,
-							TimeoutSeconds:          ptr(int32(1)),
-							ClientConfig: admissionregistrationv1.WebhookClientConfig{
-								Service: &admissionregistrationv1.ServiceReference{
-									Namespace: "pod-migration-system",
-									Name:      "webhook-service",
-									Path:      &unreachablePath,
-									Port:      &unreachablePort,
-								},
-							},
-							NamespaceSelector: &metav1.LabelSelector{
-								MatchLabels: map[string]string{
-									util.LabelNamespaceManaged: "true",
-								},
-							},
-							MatchConditions: []admissionregistrationv1.MatchCondition{
-								{
-									Name:       "gvisor-runtime-class",
-									Expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'",
-								},
-							},
-							Rules: []admissionregistrationv1.RuleWithOperations{
-								{
-									Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
-									Rule: admissionregistrationv1.Rule{
-										APIGroups:   []string{""},
-										APIVersions: []string{"v1"},
-										Resources:   []string{"pods"},
-									},
-								},
-							},
-						},
-						{
-							Name:                    "mpodgate-runc.podmigration.gke.io",
-							AdmissionReviewVersions: []string{"v1"},
-							FailurePolicy:           &ignorePolicy,
-							SideEffects:             &sideEffects,
-							TimeoutSeconds:          ptr(int32(1)),
-							ClientConfig: admissionregistrationv1.WebhookClientConfig{
-								Service: &admissionregistrationv1.ServiceReference{
-									Namespace: "pod-migration-system",
-									Name:      "webhook-service",
-									Path:      &unreachablePath,
-									Port:      &unreachablePort,
-								},
-							},
-							NamespaceSelector: &metav1.LabelSelector{
-								MatchLabels: map[string]string{
-									util.LabelNamespaceManaged: "true",
-								},
-							},
-							MatchConditions: []admissionregistrationv1.MatchCondition{
-								{
-									Name:       "non-gvisor-runtime-class",
-									Expression: "!has(object.spec.runtimeClassName) || object.spec.runtimeClassName != 'gvisor'",
-								},
-							},
-							Rules: []admissionregistrationv1.RuleWithOperations{
-								{
-									Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
-									Rule: admissionregistrationv1.Rule{
-										APIGroups:   []string{""},
-										APIVersions: []string{"v1"},
-										Resources:   []string{"pods"},
-									},
-								},
-							},
-						},
-					},
-				},
+				shippedMpodgate,
 			},
 		},
 	}
@@ -527,7 +735,7 @@ func TestWebhook_OutageFailOpenFailClosed_Envtest(t *testing.T) {
 		}
 	})
 
-	scheme := runtime.NewScheme()
+	scheme := apiruntime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = nodev1.AddToScheme(scheme)
 
@@ -537,7 +745,7 @@ func TestWebhook_OutageFailOpenFailClosed_Envtest(t *testing.T) {
 	}
 
 	// Create RuntimeClass objects so the API server does not reject pods with "RuntimeClass not found"
-	for _, rc := range []string{"runc", "gvisor"} {
+	for _, rc := range []string{"runc", "gvisor", "gvisor-custom"} {
 		if err := admin.Create(context.Background(), &nodev1.RuntimeClass{
 			ObjectMeta: metav1.ObjectMeta{Name: rc},
 			Handler:    rc,
@@ -620,6 +828,27 @@ func TestWebhook_OutageFailOpenFailClosed_Envtest(t *testing.T) {
 		t.Errorf("creating gvisor pod during outage succeeded, want error (fail-closed)")
 	} else if !strings.Contains(err.Error(), "mpodgate.podmigration.gke.io") {
 		t.Errorf("creating gvisor pod error = %v, want denial mentioning mpodgate.podmigration.gke.io", err)
+	}
+
+	// 4. Custom gVisor class name (e.g. 'gvisor-custom'): falls through to mpodgate-runc (Ignore) -> succeeds
+	gvisorCustomClass := "gvisor-custom"
+	customPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: managedNS,
+			Name:      "gvisor-custom-pod",
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorCustomClass,
+			Containers: []corev1.Container{
+				{Name: "app", Image: "registry.k8s.io/pause:3.10"},
+			},
+		},
+	}
+	if err := admin.Create(context.Background(), customPod); err != nil {
+		t.Errorf("creating gvisor-custom pod during outage failed: %v, want success (fail-open)", err)
 	}
 }
 

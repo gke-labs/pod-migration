@@ -180,7 +180,7 @@ func TestRestoreOrderPolicy_MatchesTheControllerManifest(t *testing.T) {
 
 	// Same pods and namespaces as mpodgate.
 	webhooks := &admissionregistrationv1.MutatingWebhookConfiguration{}
-	manifestObject(t, path, "MutatingWebhookConfiguration", "pod-migration-mutating-webhook-configuration", webhooks)
+	manifestObject(t, path, "MutatingWebhookConfiguration", "mutating-webhook-configuration", webhooks)
 	var gate *admissionregistrationv1.MutatingWebhook
 	for i := range webhooks.Webhooks {
 		if webhooks.Webhooks[i].Name == "mpodgate.podmigration.gke.io" {

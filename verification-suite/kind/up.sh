@@ -222,11 +222,13 @@ main() {
   # The gate webhook fails closed and the restore webhook fails open (a
   # replacement it misses starts cold), so neither may be missing its CA.
   local wh
-  for wh in mutatingwebhookconfiguration/pod-migration-mutating-webhook-configuration \
-    validatingwebhookconfiguration/pod-migration-validating-webhook-configuration \
+  for wh in mutatingwebhookconfiguration/mutating-webhook-configuration \
+    validatingwebhookconfiguration/validating-webhook-configuration \
     mutatingwebhookconfiguration/pod-migrate-psengine-restore-inject; do
     wait_until 120 "the CA bundle of ${wh}" has_ca_bundle "${wh}"
   done
+
+  kubectl label namespace default pod-migration.gke.io/managed="true" --overwrite >/dev/null 2>&1 || true
 
   local node
   for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name); do

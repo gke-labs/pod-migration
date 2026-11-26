@@ -14,147 +14,147 @@ kind: ClusterRole
 metadata:
   name: pod-migration-controller-role
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - nodes
-  - persistentvolumeclaims
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - nodes/status
-  verbs:
-  - get
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  verbs:
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - pods/eviction
-  verbs:
-  - create
-- apiGroups:
-  - ""
-  resources:
-  - pods/status
-  verbs:
-  - get
-  - patch
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  - statefulsets
-  verbs:
-  - get
-- apiGroups:
-  - apps
-  resources:
-  - replicasets
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - criu.podmigration.gke.io
-  - podsnapshot.gke.io
-  resources:
-  - podsnapshotmanualtriggers
-  - podsnapshotpolicies
-  - podsnapshotstorageconfigs
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - criu.podmigration.gke.io
-  - podsnapshot.gke.io
-  resources:
-  - podsnapshots
-  verbs:
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
-  - criu.podmigration.gke.io
-  - podsnapshot.gke.io
-  resources:
-  - podsnapshots/status
-  verbs:
-  - get
-- apiGroups:
-  - podmigration.gke.io
-  resources:
-  - podmigrationjobs
-  - podmigrations
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - podmigration.gke.io
-  resources:
-  - podmigrationjobs/finalizers
-  - podmigrations/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - podmigration.gke.io
-  resources:
-  - podmigrationjobs/status
-  - podmigrations/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - policy
-  resources:
-  - poddisruptionbudgets
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - storage.k8s.io
-  resources:
-  - volumeattachments
-  verbs:
-  - get
-  - list
-  - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - get
+      - list
+      - patch
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/status
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods/eviction
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - pods/status
+    verbs:
+      - get
+      - patch
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+      - statefulsets
+    verbs:
+      - get
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - criu.podmigration.gke.io
+      - podsnapshot.gke.io
+    resources:
+      - podsnapshotmanualtriggers
+      - podsnapshotpolicies
+      - podsnapshotstorageconfigs
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - criu.podmigration.gke.io
+      - podsnapshot.gke.io
+    resources:
+      - podsnapshots
+    verbs:
+      - delete
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - criu.podmigration.gke.io
+      - podsnapshot.gke.io
+    resources:
+      - podsnapshots/status
+    verbs:
+      - get
+  - apiGroups:
+      - podmigration.gke.io
+    resources:
+      - podmigrationjobs
+      - podmigrations
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - podmigration.gke.io
+    resources:
+      - podmigrationjobs/finalizers
+      - podmigrations/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - podmigration.gke.io
+    resources:
+      - podmigrationjobs/status
+      - podmigrations/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - storage.k8s.io
+    resources:
+      - volumeattachments
+    verbs:
+      - get
+      - list
+      - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -165,9 +165,9 @@ roleRef:
   kind: ClusterRole
   name: pod-migration-controller-role
 subjects:
-- kind: ServiceAccount
-  name: pod-migration-controller
-  namespace: pod-migration-system
+  - kind: ServiceAccount
+    name: pod-migration-controller
+    namespace: pod-migration-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -175,21 +175,21 @@ metadata:
   name: pod-migration-leader-election-role
   namespace: pod-migration-system
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - create
-  - get
-  - update
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - get
+      - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -201,9 +201,9 @@ roleRef:
   kind: Role
   name: pod-migration-leader-election-role
 subjects:
-- kind: ServiceAccount
-  name: pod-migration-controller
-  namespace: pod-migration-system
+  - kind: ServiceAccount
+    name: pod-migration-controller
+    namespace: pod-migration-system
 ---
 apiVersion: cert-manager.io/v1
 kind: Issuer
@@ -220,8 +220,8 @@ metadata:
   namespace: pod-migration-system
 spec:
   dnsNames:
-  - webhook-service.pod-migration-system.svc
-  - webhook-service.pod-migration-system.svc.cluster.local
+    - webhook-service.pod-migration-system.svc
+    - webhook-service.pod-migration-system.svc.cluster.local
   issuerRef:
     kind: Issuer
     name: selfsigned-issuer
@@ -248,60 +248,60 @@ spec:
         app: pod-migration-controller
     spec:
       topologySpreadConstraints:
-      # Use ScheduleAnyway to allow both replicas to schedule on small or single-node development
-      # clusters while still spreading across distinct nodes whenever multi-node topology is available.
-      - maxSkew: 1
-        topologyKey: kubernetes.io/hostname
-        whenUnsatisfiable: ScheduleAnyway
-        labelSelector:
-          matchLabels:
-            app: pod-migration-controller
+        # Use ScheduleAnyway to allow both replicas to schedule on small or single-node development
+        # clusters while still spreading across distinct nodes whenever multi-node topology is available.
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: pod-migration-controller
       serviceAccountName: pod-migration-controller
       containers:
-      - name: manager
-        image: <YOUR_CONTROLLER_IMAGE>
-        imagePullPolicy: Always
-        command:
-        - /manager
-        args:
-        - --metrics-bind-address=:8080
-        - --health-probe-bind-address=:8081
-        - --leader-elect=true
-        - --client-go-qps=500
-        - --client-go-burst=1000
-        - --max-concurrent-reconciles=50
-        ports:
-        - containerPort: 9443
-          name: webhook-server
-          protocol: TCP
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8081
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8081
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        volumeMounts:
-        - mountPath: /tmp/k8s-webhook-server/serving-certs
-          name: cert
-          readOnly: true
-        resources:
-          requests:
-            cpu: 200m
-            memory: 1Gi
-          limits:
-            cpu: 1000m
-            memory: 2Gi
+        - name: manager
+          image: <YOUR_CONTROLLER_IMAGE>
+          imagePullPolicy: Always
+          command:
+            - /manager
+          args:
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --leader-elect=true
+            - --client-go-qps=500
+            - --client-go-burst=1000
+            - --max-concurrent-reconciles=50
+          ports:
+            - containerPort: 9443
+              name: webhook-server
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - mountPath: /tmp/k8s-webhook-server/serving-certs
+              name: cert
+              readOnly: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 1Gi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
       volumes:
-      - name: cert
-        secret:
-          defaultMode: 420
-          secretName: webhook-server-cert
+        - name: cert
+          secret:
+            defaultMode: 420
+            secretName: webhook-server-cert
 ---
 apiVersion: v1
 kind: Service
@@ -310,16 +310,16 @@ metadata:
   namespace: pod-migration-system
 spec:
   ports:
-  - port: 443
-    protocol: TCP
-    targetPort: 9443
+    - port: 443
+      protocol: TCP
+      targetPort: 9443
   selector:
     app: pod-migration-controller
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
-  name: pod-migration-validating-webhook-configuration
+  name: validating-webhook-configuration
   annotations:
     cert-manager.io/inject-ca-from: pod-migration-system/webhook-cert
 webhooks:
@@ -335,6 +335,8 @@ webhooks:
         path: /validate-v1-pod-eviction
         port: 443
     namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
@@ -351,7 +353,7 @@ webhooks:
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  name: pod-migration-mutating-webhook-configuration
+  name: mutating-webhook-configuration
   annotations:
     cert-manager.io/inject-ca-from: pod-migration-system/webhook-cert
 webhooks:
@@ -407,9 +409,6 @@ webhooks:
           values:
             - pod-migration-system
             - kube-system
-    matchConditions:
-      - name: non-gvisor-runtime-class
-        expression: "!has(object.spec.runtimeClassName) || object.spec.runtimeClassName != 'gvisor'"
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
@@ -494,9 +493,12 @@ webhooks:
 # pod-migration.gke.io/enabled to opt out), other annotations, the spec and
 # the kubelet's status writes go through as before.
 #
-# Scope: pods that have the opt-in label before or after the update, like
-# mpodgate. A pod without it isn't migrated, and a restore order on it is a
-# restore outside a migration, which the engine authorizes (C10 R1, #55).
+# Scope: on CREATE in managed namespaces, any pod carrying a non-empty non-GKE
+# restore order annotation (<group>/ps-name != podsnapshot.gke.io/ps-name) is
+# denied to prevent spoofing during fail-open webhook outages, while Kubeflow
+# resume flow is preserved. On UPDATE, pods that have the opt-in label before
+# or after the update: only the controller's service account may set, change
+# or remove a restore order.
 #
 # The validation below names the controller's service account, namespace
 # included. An install that renames the namespace or the service account must
@@ -631,4 +633,3 @@ spec:
       nonResourceRules:
         - verbs: ["*"]
           nonResourceURLs: ["*"]
-

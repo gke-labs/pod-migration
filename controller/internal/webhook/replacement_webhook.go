@@ -232,33 +232,10 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 	}
 
-	// Replacement pod matched an active unassigned PMJ: scrub any pre-existing or
-	// spoofed restore annotations across ALL registered engines (plus engine
-	// injection/status markers) so PodGateReconciler is the sole authority to
-	// order the restore once the checkpoint is durable (#135, C10 R1).
-	scrubbed := false
-	if pod.Annotations != nil {
-		for _, ann := range a.restoreAnnotations() {
-			if _, ok := pod.Annotations[ann]; ok {
-				delete(pod.Annotations, ann)
-				scrubbed = true
-			}
-		}
-		if _, ok := pod.Annotations[engine.CRIUInjectedAnnotation]; ok {
-			delete(pod.Annotations, engine.CRIUInjectedAnnotation)
-			scrubbed = true
-		}
-		if _, ok := pod.Annotations[engine.CRIURestoreStatusAnnotation]; ok {
-			delete(pod.Annotations, engine.CRIURestoreStatusAnnotation)
-			scrubbed = true
-		}
-		if _, ok := pod.Annotations[engine.CRIURestoreReasonAnnotation]; ok {
-			delete(pod.Annotations, engine.CRIURestoreReasonAnnotation)
-			scrubbed = true
-		}
-	}
-
-	// Check if the gate is already present
+	// If the pod was already gated and assigned to this PMJ in a prior round
+	// of admission mutation, reinvocation is a no-op. Crucially, do this check
+	// before scrubbing to avoid stripping engine injection markers (such as
+	// CRIU's pod-migrate.io/psengine-injected) added by subsequent webhooks (#303).
 	hasGate := false
 	for _, gate := range pod.Spec.SchedulingGates {
 		if gate.Name == "gke.io/pod-migration-gate" {
@@ -266,10 +243,30 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 			break
 		}
 	}
-
-	if hasGate && pod.Annotations[util.AnnotationAssignedPMJ] == assignedPMJ && !scrubbed {
+	if hasGate && pod.Annotations != nil && pod.Annotations[util.AnnotationAssignedPMJ] == assignedPMJ {
 		logger.Info("Pod already has the scheduling gate and PMJ assignment, bypassing")
 		return admission.Allowed("scheduling gate already present")
+	}
+
+	// Replacement pod matched an active unassigned PMJ: scrub any pre-existing or
+	// spoofed restore annotations across ALL registered engines (plus engine
+	// injection/status markers) so PodGateReconciler is the sole authority to
+	// order the restore once the checkpoint is durable (#135, C10 R1).
+	if pod.Annotations != nil {
+		for _, ann := range a.restoreAnnotations() {
+			if _, ok := pod.Annotations[ann]; ok {
+				delete(pod.Annotations, ann)
+			}
+		}
+		if _, ok := pod.Annotations[engine.CRIUInjectedAnnotation]; ok {
+			delete(pod.Annotations, engine.CRIUInjectedAnnotation)
+		}
+		if _, ok := pod.Annotations[engine.CRIURestoreStatusAnnotation]; ok {
+			delete(pod.Annotations, engine.CRIURestoreStatusAnnotation)
+		}
+		if _, ok := pod.Annotations[engine.CRIURestoreReasonAnnotation]; ok {
+			delete(pod.Annotations, engine.CRIURestoreReasonAnnotation)
+		}
 	}
 
 	if !hasGate {
