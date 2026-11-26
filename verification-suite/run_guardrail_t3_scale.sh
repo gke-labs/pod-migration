@@ -574,7 +574,7 @@ clean_stale_migration_resources() {
 
 clean_t3_workloads() {
   backup_preexisting_podmigrations
-  kubectl label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite >/dev/null 2>&1 || true
+  kubectl label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite
   kubectl delete deployment/t3-s1-counter deployment/t3-counter deployment/t3-redis \
     deployment/t3-postgres deployment/t3-memcached deployment/t3-nginx \
     deployment/t3-s3-hetero deployment/t3-s4-soak \

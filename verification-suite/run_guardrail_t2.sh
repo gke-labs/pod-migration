@@ -764,7 +764,7 @@ preflight_snapshot_policy() {
 ensure_podmigration_policy() {
   local name="${1:-diskless-migration}"
   local force_create="${2:-false}"
-  "${KUBECTL_CMD}" label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite >/dev/null 2>&1 || true
+  "${KUBECTL_CMD}" label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite
   resolve_gcs_bucket
   if [[ "${SKIP_PODMIGRATION_CREATE}" == "true" && "${force_create}" != "true" ]]; then
     log "Skipping PodMigration CR creation (--skip-podmigration-create; using pre-created policy with GCS_BUCKET=${GCS_BUCKET})"
@@ -781,7 +781,7 @@ spec:
   storage:
     location: ${GCS_BUCKET}
 EOF
-  "${KUBECTL_CMD}" label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite >/dev/null 2>&1 || true
+  "${KUBECTL_CMD}" label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite
   "${KUBECTL_CMD}" wait --for=condition=Ready "podmigration/${name}" -n "${NAMESPACE}" --timeout=60s >/dev/null
   preflight_snapshot_policy
 }

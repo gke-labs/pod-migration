@@ -228,7 +228,7 @@ main() {
     wait_until 120 "the CA bundle of ${wh}" has_ca_bundle "${wh}"
   done
 
-  kubectl label namespace default pod-migration.gke.io/managed="true" --overwrite >/dev/null 2>&1 || true
+  kubectl label namespace default pod-migration.gke.io/managed="true" --overwrite
 
   local node
   for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name); do

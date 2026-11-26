@@ -166,7 +166,12 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			continue
 		}
 
-		// Check opt-in label
+		// Check opt-in label.
+		// Note: the preemption controller triggers on opted-in pods regardless of
+		// namespace labels (the controller's ClusterRole does not read namespaces).
+		// In an unmanaged namespace (lacking pod-migration.gke.io/managed: "true"),
+		// the replacement pod will not be intercepted by the mpodgate webhook and will
+		// start cold (#303).
 		if !util.IsPodMigrationEnabled(pod) {
 			continue
 		}

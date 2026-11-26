@@ -297,8 +297,11 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 	}
 
 	// 2. Shipped CRIU restore-inject webhook handler: /psengine-restore-inject
-	// Simulates RestoreInjector: injects holder wrap and stamps pod-migrate.io/psengine-injected
+	// Faithful copy of CRIU psengine.RestoreInjector and InjectHolder (#135):
+	// Injects pmhold and pm-podinfo volumes, pm-holder-seed initContainer,
+	// and holder command wrap, and stamps pod-migrate.io/psengine-injected: "true"
 	// only when pod carries gke.io/pod-migration-gate and an assigned PMJ (#135).
+	// If already injected (pod-migrate.io/psengine-injected == "true"), returns Allowed without mutating.
 	mgr.GetWebhookServer().Register("/psengine-restore-inject", &ctrlwebhook.Admission{
 		Handler: admission.HandlerFunc(func(ctx context.Context, req admission.Request) admission.Response {
 			pod := &corev1.Pod{}
@@ -319,13 +322,40 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 			if pod.Annotations[engine.CRIUInjectedAnnotation] == "true" {
 				return admission.Allowed("already injected")
 			}
+
+			// Faithful copy of CRIU psengine.InjectHolder
+			pod.Spec.Volumes = append(pod.Spec.Volumes,
+				corev1.Volume{Name: "pmhold", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+				corev1.Volume{Name: "pm-podinfo", VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{
+					Items: []corev1.DownwardAPIVolumeFile{{
+						Path:     "annotations",
+						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations"},
+					}},
+				}}},
+			)
+			pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
+				Name:    "pm-holder-seed",
+				Image:   "gcr.io/gke-labs/holder:v1",
+				Command: []string{"/holder", "seed", "/pmhold/holder"},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "pmhold", MountPath: "/pmhold"},
+				},
+			})
+			if len(pod.Spec.Containers) == 1 {
+				app := &pod.Spec.Containers[0]
+				orig := append(append([]string{}, app.Command...), app.Args...)
+				app.VolumeMounts = append(app.VolumeMounts,
+					corev1.VolumeMount{Name: "pmhold", MountPath: "/pmhold", ReadOnly: true},
+					corev1.VolumeMount{Name: "pm-podinfo", MountPath: "/etc/pod-migrate", ReadOnly: true},
+				)
+				app.Command = append([]string{"/pmhold/holder", "wrap", "--"}, orig...)
+				app.Args = nil
+			}
 			if pod.Annotations == nil {
 				pod.Annotations = make(map[string]string)
 			}
 			pod.Annotations[engine.CRIUInjectedAnnotation] = "true"
-			if len(pod.Spec.Containers) == 1 {
-				pod.Spec.Containers[0].Command = append([]string{"/pmhold/holder", "wrap", "--"}, pod.Spec.Containers[0].Command...)
-			}
+
 			marshaled, err := json.Marshal(pod)
 			if err != nil {
 				return admission.Errored(http.StatusInternalServerError, err)
@@ -509,8 +539,23 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 		if pod.Annotations[engine.CRIUInjectedAnnotation] != "true" {
 			t.Errorf("psengine-injected = %q, want 'true'", pod.Annotations[engine.CRIUInjectedAnnotation])
 		}
-		if len(pod.Spec.Containers[0].Command) < 3 || pod.Spec.Containers[0].Command[0] != "/pmhold/holder" {
-			t.Errorf("command = %v, want wrapped with /pmhold/holder wrap --", pod.Spec.Containers[0].Command)
+		if len(pod.Spec.InitContainers) != 1 || pod.Spec.InitContainers[0].Name != "pm-holder-seed" {
+			t.Errorf("initContainers = %+v, want exactly 1 [pm-holder-seed]", pod.Spec.InitContainers)
+		}
+		holderVolumes := 0
+		for _, v := range pod.Spec.Volumes {
+			if v.Name == "pmhold" {
+				holderVolumes++
+			}
+		}
+		if holderVolumes != 1 {
+			t.Errorf("pmhold volumes = %d, want exactly 1", holderVolumes)
+		}
+		cmd := pod.Spec.Containers[0].Command
+		if len(cmd) < 3 || cmd[0] != "/pmhold/holder" || cmd[1] != "wrap" || cmd[2] != "--" {
+			t.Errorf("command = %v, want wrapped with /pmhold/holder wrap --", cmd)
+		} else if len(cmd) >= 6 && cmd[3] == "/pmhold/holder" && cmd[4] == "wrap" {
+			t.Errorf("command double-wrapped: %v", cmd)
 		}
 	})
 
@@ -550,8 +595,23 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 		if pod.Annotations[engine.CRIUInjectedAnnotation] != "true" {
 			t.Errorf("psengine-injected = %q, want 'true'", pod.Annotations[engine.CRIUInjectedAnnotation])
 		}
-		if len(pod.Spec.Containers[0].Command) < 3 || pod.Spec.Containers[0].Command[0] != "/pmhold/holder" {
-			t.Errorf("command = %v, want wrapped with /pmhold/holder wrap --", pod.Spec.Containers[0].Command)
+		if len(pod.Spec.InitContainers) != 1 || pod.Spec.InitContainers[0].Name != "pm-holder-seed" {
+			t.Errorf("initContainers = %+v, want exactly 1 [pm-holder-seed]", pod.Spec.InitContainers)
+		}
+		holderEarlyVolumes := 0
+		for _, v := range pod.Spec.Volumes {
+			if v.Name == "pmhold" {
+				holderEarlyVolumes++
+			}
+		}
+		if holderEarlyVolumes != 1 {
+			t.Errorf("pmhold volumes = %d, want exactly 1", holderEarlyVolumes)
+		}
+		cmdEarly := pod.Spec.Containers[0].Command
+		if len(cmdEarly) < 3 || cmdEarly[0] != "/pmhold/holder" || cmdEarly[1] != "wrap" || cmdEarly[2] != "--" {
+			t.Errorf("command = %v, want wrapped with /pmhold/holder wrap --", cmdEarly)
+		} else if len(cmdEarly) >= 6 && cmdEarly[3] == "/pmhold/holder" && cmdEarly[4] == "wrap" {
+			t.Errorf("command double-wrapped: %v", cmdEarly)
 		}
 	})
 
@@ -612,8 +672,32 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 				SchedulingGates: []corev1.PodSchedulingGate{
 					{Name: "gke.io/pod-migration-gate"},
 				},
+				Volumes: []corev1.Volume{
+					{Name: "pmhold", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+					{Name: "pm-podinfo", VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{
+						Items: []corev1.DownwardAPIVolumeFile{{Path: "annotations", FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations"}}},
+					}}},
+				},
+				InitContainers: []corev1.Container{
+					{
+						Name:    "pm-holder-seed",
+						Image:   "gcr.io/gke-labs/holder:v1",
+						Command: []string{"/holder", "seed", "/pmhold/holder"},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "pmhold", MountPath: "/pmhold"},
+						},
+					},
+				},
 				Containers: []corev1.Container{
-					{Name: "app", Image: "registry.k8s.io/pause:3.10", Command: []string{"/pmhold/holder", "wrap", "--", "/app"}},
+					{
+						Name:    "app",
+						Image:   "registry.k8s.io/pause:3.10",
+						Command: []string{"/pmhold/holder", "wrap", "--", "/app"},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "pmhold", MountPath: "/pmhold", ReadOnly: true},
+							{Name: "pm-podinfo", MountPath: "/etc/pod-migrate", ReadOnly: true},
+						},
+					},
 				},
 			},
 		}
@@ -630,6 +714,24 @@ func TestWebhook_CreationReinvocation_Envtest(t *testing.T) {
 		}
 		if len(pod.Spec.SchedulingGates) != 1 {
 			t.Errorf("schedulingGates count = %d, want 1", len(pod.Spec.SchedulingGates))
+		}
+		if len(pod.Spec.InitContainers) != 1 || pod.Spec.InitContainers[0].Name != "pm-holder-seed" {
+			t.Errorf("initContainers = %+v, want exactly 1 [pm-holder-seed]", pod.Spec.InitContainers)
+		}
+		holderReinvokeVolumes := 0
+		for _, v := range pod.Spec.Volumes {
+			if v.Name == "pmhold" {
+				holderReinvokeVolumes++
+			}
+		}
+		if holderReinvokeVolumes != 1 {
+			t.Errorf("pmhold volumes = %d, want exactly 1", holderReinvokeVolumes)
+		}
+		cmdReinvoke := pod.Spec.Containers[0].Command
+		if len(cmdReinvoke) < 3 || cmdReinvoke[0] != "/pmhold/holder" || cmdReinvoke[1] != "wrap" || cmdReinvoke[2] != "--" {
+			t.Errorf("command = %v, want wrapped with /pmhold/holder wrap --", cmdReinvoke)
+		} else if len(cmdReinvoke) >= 6 && cmdReinvoke[3] == "/pmhold/holder" && cmdReinvoke[4] == "wrap" {
+			t.Errorf("command double-wrapped: %v", cmdReinvoke)
 		}
 	})
 

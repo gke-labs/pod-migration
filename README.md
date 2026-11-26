@@ -22,10 +22,13 @@ The controller is implemented as a custom Operator consisting of the following c
 ### 1. Webhooks
 
 - **Eviction Interception Webhook (`/validate-v1-pod-eviction`)**: Handled by `EvictionGate`. Intercepts Pod eviction API calls in namespaces labeled `pod-migration.gke.io/managed: "true"`. If the Pod is opted-in (`pod-migration.gke.io/enabled: "true"`), it denies the eviction request with `429 (Too Many Requests)` to block immediate destruction, and spawns a `PodMigrationJob` (PMJ) CR to orchestrate the migration flow. A replacement Pod that its own migration is still restoring isn't migrated again until that migration concludes: if its new node is also being drained (or for a non-drain eviction), the webhook answers `429` so the evictor retries once restore concludes (#162); if it is a same-name replacement (`StatefulSet`) already off the cordoned origin node and onto an uncordoned node, the webhook answers `404 (Not Found)` so `kubectl drain` on the origin node sees the original Pod is gone and exits cleanly without re-migrating the replacement.
-- **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods matched to an active `PodMigrationJob`, it injects the `gke.io/pod-migration-gate` scheduling gate (and scrubs untrusted `<group>/ps-name` restore annotations across registered engines) to hold the pod in a pending state until checkpoint readiness and volume detachment complete, preventing replica collisions; by default (`--shorten-restored-readiness-delay=true`), it also sets `readinessProbe.initialDelaySeconds` to `0` on the replacement's containers and restartable sidecar init containers unless the pod sets `pod-migration.gke.io/preserve-readiness-delay: "true"`, leaving liveness and startup probes untouched (#141). On scale-up pods, it stamps per-engine cold-start bypasses. The webhook is split across two entries matching namespaces labeled `pod-migration.gke.io/managed: "true"` with `reinvocationPolicy: IfNeeded` (#303): `mpodgate.podmigration.gke.io` (gVisor `runtimeClassName: gvisor`, `failurePolicy: Fail`) to guarantee the cold-start bypass is stamped (#151) and fails closed during controller outages for all gVisor pods in managed namespaces (even non-opted-in); and `mpodgate-runc.podmigration.gke.io` (all pods in managed namespaces, `failurePolicy: Ignore`) so runc and custom runtime classes fail open during controller outages.
+- **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods matched to an active `PodMigrationJob`, it injects the `gke.io/pod-migration-gate` scheduling gate (and scrubs untrusted `<group>/ps-name` restore annotations across registered engines) to hold the pod in a pending state until checkpoint readiness and volume detachment complete, preventing replica collisions; by default (`--shorten-restored-readiness-delay=true`), it also sets `readinessProbe.initialDelaySeconds` to `0` on the replacement's containers and restartable sidecar init containers unless the pod sets `pod-migration.gke.io/preserve-readiness-delay: "true"`, leaving liveness and startup probes untouched (#141). On scale-up pods, it stamps per-engine cold-start bypasses (each gVisor scale-up may evaluate the webhook up to four times across reinvocations). The webhook is split across two entries matching namespaces labeled `pod-migration.gke.io/managed: "true"` with `reinvocationPolicy: IfNeeded` (#303):
+  - `mpodgate.podmigration.gke.io` (gVisor `runtimeClassName: gvisor`, `failurePolicy: Fail`): guarantees that gVisor scale-ups receive the cold-start bypass annotation (`podsnapshot.gke.io/ps-name: ""`) at creation (#151). The cost of `failurePolicy: Fail` is that during a controller outage, ALL gVisor pod creations in managed namespaces are blocked.
+  - `mpodgate-runc.podmigration.gke.io` (all pods in managed namespaces, `failurePolicy: Ignore`): non-gVisor pods fail open during controller outages, meaning pods start cold without migration and cluster workloads do not wedge during an outage.
+  - **Custom gVisor runtime classes**: If your cluster runs gVisor workloads under custom runtime class names (configured via `--runtime-class-engines` or `--migratable-runtime-classes`, #83), during a controller outage those pods match only the fail-open entry and will start cold without the #151 bypass; to enforce fail-closed protection for custom gVisor classes, update `mpodgate.podmigration.gke.io`'s `matchConditions` in `controller/deploy.yaml` to include your custom runtime class names.
 - **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Handled by `PodStatusMutator`. Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
 - **Fence Webhook (`/mutate-v1-pod-fence`)**: Handled by `PodFenceMutator`. Intercepts status updates of Pods labeled `pod-migration.gke.io/fenced: "true"` and holds their `Ready` condition at `False` (reason `PodMigrationFenced`), so a fenced migration source stays out of its Services' endpoints (#131). The other conditions, including `ContainersReady`, keep the kubelet's view. It uses `failurePolicy: Fail`: while the webhook is down, a fenced Pod's status writes are rejected, so it stays NotReady, and it can't finish deleting either, because the kubelet writes a Pod's final status before the Pod is removed. That heals when the webhook is back. Pods without the label never reach it. See [Source fence](#3-source-fence).
-- **Restore Order Policy (`pod-migration-restore-order`)**: A `ValidatingAdmissionPolicy` in `controller/deploy.yaml`, not a webhook: the API server evaluates it itself, so it doesn't depend on the controller being up. On `CREATE` in managed namespaces, it denies any request carrying non-GKE restore annotations (`<group>/ps-name` != `podsnapshot.gke.io/ps-name`), guarding against malicious restores while runc webhook fails open, without blocking Kubeflow's pre-existing `podsnapshot.gke.io/ps-name` resume flow (#303). On `UPDATE` on an opted-in Pod, only the controller may set, change or remove a restore order (`<group>/ps-name`, for any engine) (#233). It covers updates of the Pod and of its `status` subresource, which can change annotations too. The policy is skipped for every update that leaves the restore orders as they are, so labels (including removing `pod-migration.gke.io/enabled` to opt out), other annotations, the spec and the kubelet's status writes aren't affected. See [Changing a Restore Order by Hand](#changing-a-restore-order-by-hand).
+- **Restore Order Policy (`pod-migration-restore-order`)**: A `ValidatingAdmissionPolicy` in `controller/deploy.yaml`, not a webhook: the API server evaluates it itself, so it doesn't depend on the controller being up. On `CREATE` in managed namespaces, it denies any request carrying non-GKE restore annotations (`<group>/ps-name` != `podsnapshot.gke.io/ps-name`), guarding against malicious restores while runc webhook fails open, without blocking Kubeflow's pre-existing `podsnapshot.gke.io/ps-name` resume flow (#303). On `UPDATE` in managed namespaces, on any opted-in Pod or any Pod carrying a non-GKE restore order, only the controller may set, change or remove a restore order (`<group>/ps-name`, for any engine) (#233). It covers updates of the Pod and of its `status` subresource, which can change annotations too. The policy is skipped for every update that leaves the restore orders as they are, so labels (including removing `pod-migration.gke.io/enabled` to opt out), other annotations, the spec and the kubelet's status writes aren't affected. See [Changing a Restore Order by Hand](#changing-a-restore-order-by-hand).
 
 ### 2. Reconcilers
 
@@ -143,9 +146,57 @@ kubectl wait --for=condition=Available --timeout=5m -n cert-manager deployment/c
 
 ---
 
-## Installation Guide
+## Installation & Upgrade Guide
 
-Follow these steps to deploy the Pod Migration Controller once the prerequisites are met:
+> [!WARNING]
+> **Upgrade Action Required: Mandatory Namespace Labeling (`pod-migration.gke.io/managed="true"`)**:
+> Admission webhooks (`veviction`, `mpodgate`, `mpodgate-runc`, and CRIU `restore-inject`) and admission policies (`pod-migration-restore-order` and `pod-migrate-psengine-restore-status`) are scoped strictly to namespaces labeled `pod-migration.gke.io/managed: "true"`. The status webhook (`mpodstatus`) and fence webhook (`mpodfence`) remain cluster-scoped.
+>
+> - **What changes**: In an unlabelled namespace, `veviction` does not intercept voluntary evictions, allowing them to proceed cold without migration; `mpodgate` does not intercept pod creations, so replacement pods (including those created during voluntary eviction or spot node preemption) are never gated and start cold without live migration (and gVisor replacements do not receive the cold-start bypass annotation).
+> - **Failure policy change during outages**: While in previous releases every opted-in pod failed closed during controller outages, non-gVisor pods and custom gVisor runtime classes now fail open (`failurePolicy: Ignore`), allowing scale-ups and normal workloads to proceed cold without wedging cluster availability.
+> - **How to tell**: Check your workload namespaces with `kubectl get namespaces --show-labels` (look for `pod-migration.gke.io/managed=true`).
+> - **How to fix**: Label all workload namespaces using live migration:
+>   ```bash
+>   kubectl label namespace <target-namespace> pod-migration.gke.io/managed="true"
+>   ```
+
+> [!WARNING]
+> **Upgrade Action Required: Mandatory Storage Namespace Scoping**:
+> The controller strictly enforces cross-namespace storage isolation in all modes. Storage locations (`spec.storage.location`) must be scoped to the namespace (`gs://<bucket>/<namespace>/...`).
+>
+> - **What breaks**: Existing single-namespace clusters configured with legacy un-scoped paths like `gs://<bucket>/snapshots` (or an empty root path `gs://<bucket>`) fail scoping validation on upgrade. The `PodMigration` transitions to `Ready=False` with reason `UnscopedStorageLocation`. In-flight migrations drain, after which the controller deletes the managed `PodSnapshotStorageConfig` (PSSC) and `PodSnapshotPolicy` (PSP). The eviction webhook then finds no `Ready` policy and allows cold evictions (`eviction_webhook.go:380`), causing live migration to quietly stop.
+> - **How to tell**: Run `kubectl get podmigrations -A` (look for `READY: False`, reason `UnscopedStorageLocation`) or inspect events with `kubectl get events -A --field-selector reason=UnscopedStorageLocation`.
+> - **How to fix**: Update `spec.storage.location` in each `PodMigration` to begin with its namespace: e.g. `gs://<bucket>/default/snapshots`. The controller immediately reconciles, recreates storage objects, and restores `Ready=True`. (Alternatively, `--allow-bucket-root-storage=true` can be passed to the controller for single-tenant clusters dedicated to a single namespace).
+
+### Upgrading an Existing Installation (from v0.1.0 or earlier)
+
+Follow these ordered steps when upgrading an existing cluster:
+
+1. **Label Workload Namespaces**:
+   Label every namespace hosting workloads that use live migration:
+   ```bash
+   kubectl label namespace <target-namespace> pod-migration.gke.io/managed="true"
+   ```
+2. **Apply Controller Manifests**:
+   Apply the updated controller deployment and webhook manifests:
+   ```bash
+   sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
+   ```
+   _Note_: Webhook configuration names (`mutating-webhook-configuration` and `validating-webhook-configuration`) are preserved in place, so nothing needs deleting and `kubectl apply` cleanly updates them without orphaned configurations. (During a rolling upgrade, an `reinvocationPolicy: IfNeeded` config can briefly reach an older controller replica before rollout completes; this is transient).
+3. **Apply Engine Manifests (CRIU)**:
+   If running the CRIU engine, apply its updated manifests:
+   ```bash
+   kubectl apply -f engines/criu/deploy/deploy.yaml
+   ```
+   _Important_: Without applying the CRIU manifest, `restore-inject` retains its legacy `objectSelector` and will miss replacement pods whose opt-in label is stamped by downstream webhooks.
+4. **Verify Upgrade**:
+   Verify the webhook configurations and namespace selectors:
+   ```bash
+   kubectl get mutatingwebhookconfigurations mutating-webhook-configuration -o yaml | grep -A 5 namespaceSelector
+   kubectl get validatingwebhookconfigurations validating-webhook-configuration -o yaml | grep -A 5 namespaceSelector
+   ```
+
+Follow these steps to deploy the Pod Migration Controller for a new installation once the prerequisites are met:
 
 ### Step 1: One-Time Snapshot Storage & Workload Identity Configuration
 
@@ -184,32 +235,13 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
     ```
 
 2.  **Configure the GCS Bucket:**
-    Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots:
+    Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots (remembering that storage locations must begin with the namespace, e.g. `gs://<bucket>/default/snapshots`):
 
     ```yaml
     spec:
       storage:
         location: gs://<YOUR_BUCKET_NAME>/default/snapshots
     ```
-
-    > [!WARNING]
-    > **Upgrade Action Required: Mandatory Storage Namespace Scoping**:
-    > The controller strictly enforces cross-namespace storage isolation in all modes. Storage locations (`spec.storage.location`) must be scoped to the namespace (`gs://<bucket>/<namespace>/...`).
-    >
-    > - **What breaks**: Existing single-namespace clusters configured with legacy un-scoped paths like `gs://<bucket>/snapshots` (or an empty root path `gs://<bucket>`) fail scoping validation on upgrade. The `PodMigration` transitions to `Ready=False` with reason `UnscopedStorageLocation`. In-flight migrations drain, after which the controller deletes the managed `PodSnapshotStorageConfig` (PSSC) and `PodSnapshotPolicy` (PSP). The eviction webhook then finds no `Ready` policy and allows cold evictions (`eviction_webhook.go:380`), causing live migration to quietly stop.
-    > - **How to tell**: Run `kubectl get podmigrations -A` (look for `READY: False`, reason `UnscopedStorageLocation`) or inspect events with `kubectl get events -A --field-selector reason=UnscopedStorageLocation`.
-    > - **How to fix**: Update `spec.storage.location` in each `PodMigration` to begin with its namespace: e.g. `gs://<bucket>/default/snapshots`. The controller immediately reconciles, recreates storage objects, and restores `Ready=True`. (Alternatively, `--allow-bucket-root-storage=true` can be passed to the controller for single-tenant clusters dedicated to a single namespace).
-
-    > [!WARNING]
-    > **Upgrade Action Required: Mandatory Namespace Labeling for Admission Webhooks (`pod-migration.gke.io/managed="true"`)**:
-    > All admission webhooks (`veviction`, `mpodgate`, and CRIU `restore-inject`) and admission policies (`pod-migration-restore-order` and `pod-migrate-psengine-restore-status`) are scoped to namespaces carrying `pod-migration.gke.io/managed: "true"` (#303).
-    >
-    > - **What breaks**: When upgrading an existing installation (including v0.1.0), unlabelled workload namespaces will not be intercepted by `veviction` or `mpodgate`. If an unlabelled namespace runs workloads with `pod-migration.gke.io/enabled: "true"`, evictions are allowed cold without migrating (or if evicted, replacement pods are never gated, starting cold and losing gVisor scale-up bypasses and VAP protection).
-    > - **How to tell**: Inspect workload namespaces with `kubectl get namespaces --show-labels` (look for `pod-migration.gke.io/managed=true`).
-    > - **How to fix**: Label all workload namespaces with:
-    >   ```bash
-    >   kubectl label namespace <target-namespace> pod-migration.gke.io/managed="true"
-    >   ```
 
 3.  **Deploy the Controller:**
     Apply the manifests by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:

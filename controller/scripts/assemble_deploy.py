@@ -9,6 +9,17 @@ EXCLUDED_NAMESPACES = [
     "kube-system",
 ]
 
+MANAGED_WEBHOOK_NAMES = {
+    "veviction.podmigration.gke.io",
+    "mpodgate.podmigration.gke.io",
+    "mpodgate-runc.podmigration.gke.io",
+}
+
+UNMANAGED_WEBHOOK_NAMES = {
+    "mpodstatus.podmigration.gke.io",
+    "mpodfence.podmigration.gke.io",
+}
+
 def format_namespace_selector(indent=4, match_labels=None):
     pad = " " * indent
     lines = [
@@ -57,12 +68,18 @@ def main():
             documents[i] = role_content + '\n'
             clusterrole_sub_count += 1
         elif 'kind: ValidatingWebhookConfiguration' in doc or 'kind: MutatingWebhookConfiguration' in doc:
-            pattern = r'(    namespaceSelector:\n(?:      matchLabels:\n(?:        [^\n]+\n)+)?      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
+            pattern = r'(  - name: ([a-z0-9.-]+)\n(?:(?!  - name:).)*?)(    namespaceSelector:\n(?:      matchLabels:\n(?:        [^\n]+\n)+)?      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
             def replace_sel(match):
-                if 'pod-migration.gke.io/managed' in match.group(0):
-                    return format_namespace_selector(indent=4, match_labels={"pod-migration.gke.io/managed": "true"}) + '\n'
-                return format_namespace_selector(indent=4) + '\n'
-            new_doc, count = re.subn(pattern, replace_sel, doc)
+                wh_prefix = match.group(1)
+                wh_name = match.group(2)
+                if wh_name in MANAGED_WEBHOOK_NAMES:
+                    return wh_prefix + format_namespace_selector(indent=4, match_labels={"pod-migration.gke.io/managed": "true"}) + '\n'
+                elif wh_name in UNMANAGED_WEBHOOK_NAMES:
+                    return wh_prefix + format_namespace_selector(indent=4) + '\n'
+                else:
+                    print(f"Error: Unknown webhook name '{wh_name}' in namespaceSelector replacement", file=sys.stderr)
+                    sys.exit(1)
+            new_doc, count = re.subn(pattern, replace_sel, doc, flags=re.DOTALL)
             if count == 0:
                 print(f"Error: namespaceSelector replacement failed in document {i}", file=sys.stderr)
                 sys.exit(1)

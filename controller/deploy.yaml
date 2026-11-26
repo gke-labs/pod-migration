@@ -357,6 +357,15 @@ metadata:
   annotations:
     cert-manager.io/inject-ca-from: pod-migration-system/webhook-cert
 webhooks:
+  # The replacement mutating webhook is split into two entries matching
+  # namespaces labeled pod-migration.gke.io/managed: "true" with reinvocationPolicy: IfNeeded (#303):
+  #
+  # 1. mpodgate.podmigration.gke.io (failurePolicy: Fail):
+  #    Matches pods with object.spec.runtimeClassName == 'gvisor'. For gVisor pods,
+  #    the cold-start bypass annotation (podsnapshot.gke.io/ps-name: "") must be guaranteed
+  #    at creation (#151); without it, GKE Pod Snapshots fails to restore on normal scale-ups.
+  #    The cost of failurePolicy: Fail is that during a controller outage, ALL gVisor pod
+  #    creations in managed namespaces are blocked.
   - name: mpodgate.podmigration.gke.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
@@ -388,6 +397,11 @@ webhooks:
         resources: ["pods"]
         scope: Namespaced
 
+  # 2. mpodgate-runc.podmigration.gke.io (failurePolicy: Ignore):
+  #    Matches all pods in managed namespaces. Non-gVisor pods (and custom gVisor runtime
+  #    classes) fail open during a controller outage, meaning new pods start cold and
+  #    cluster workloads do not wedge during outages. The handler is idempotent and returns
+  #    Allowed immediately on reinvocation if already gated and assigned.
   - name: mpodgate-runc.podmigration.gke.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
@@ -496,9 +510,10 @@ webhooks:
 # Scope: on CREATE in managed namespaces, any pod carrying a non-empty non-GKE
 # restore order annotation (<group>/ps-name != podsnapshot.gke.io/ps-name) is
 # denied to prevent spoofing during fail-open webhook outages, while Kubeflow
-# resume flow is preserved. On UPDATE, pods that have the opt-in label before
-# or after the update: only the controller's service account may set, change
-# or remove a restore order.
+# resume flow is preserved. On UPDATE in managed namespaces, on pods that have the
+# opt-in label before or after the update, or any pod carrying a non-GKE restore
+# order before or after the update: only the controller's service account may set,
+# change or remove a restore order.
 #
 # The validation below names the controller's service account, namespace
 # included. An install that renames the namespace or the service account must
