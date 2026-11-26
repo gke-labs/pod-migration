@@ -66,6 +66,44 @@ func TestMainExitsNonZeroOnInvalidCRIUAPIGroupFlag(t *testing.T) {
 	}
 }
 
+func TestMainExitsNonZeroOnBucketRootStorageWithoutNamespaces(t *testing.T) {
+	if os.Getenv("TEST_SUBPROCESS_MAIN") == "1" {
+		os.Args = []string{"manager", "--allow-bucket-root-storage=true"}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainExitsNonZeroOnBucketRootStorageWithoutNamespaces$")
+	cmd.Env = append(os.Environ(), "TEST_SUBPROCESS_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1 on --allow-bucket-root-storage=true without a namespace list, got err=%v output=%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "--allow-bucket-root-storage-namespaces") {
+		t.Errorf("expected startup error naming --allow-bucket-root-storage-namespaces, got: %s", string(out))
+	}
+}
+
+func TestMainExitsNonZeroOnBucketBoundToTwoNamespaces(t *testing.T) {
+	if os.Getenv("TEST_SUBPROCESS_MAIN") == "1" {
+		os.Args = []string{"manager", "--allow-bucket-root-storage-namespaces=team-a=shared-bucket,team-b=shared-bucket"}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainExitsNonZeroOnBucketBoundToTwoNamespaces$")
+	cmd.Env = append(os.Environ(), "TEST_SUBPROCESS_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1 when one bucket is bound to two namespaces, got err=%v output=%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "bound to two namespaces") {
+		t.Errorf("expected startup error naming the doubly bound bucket, got: %s", string(out))
+	}
+}
+
 func TestShouldRegisterCRIU(t *testing.T) {
 	gvisorOnly, err := engine.ParseRoutes("gvisor=gke-pod-snapshots")
 	if err != nil {

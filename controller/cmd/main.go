@@ -103,6 +103,7 @@ func main() {
 		coverageRefreshInterval time.Duration
 		storageIsolationMode    string
 		allowBucketRootStorage  bool
+		bucketRootBindingsRaw   string
 		showVersion             bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "")
@@ -127,8 +128,9 @@ func main() {
 	flag.DurationVar(&orphanSweepInterval, "orphan-snapshot-sweep-interval", controller.DefaultOrphanSnapshotSweepInterval, "How often the leader deletes orphaned PodSnapshots: ones our triggers created (gke-pod-snapshot-triggered-by is psmt-<pod>-<uid>) whose PodMigrationJob is gone, and that no pod, trigger or job references (#107). Deleting a PodSnapshot tells its snapshot engine to delete the checkpoint archive. 0 turns the sweep off; otherwise at least 1m.")
 	flag.DurationVar(&orphanMinAge, "orphan-snapshot-min-age", controller.DefaultOrphanSnapshotMinAge, fmt.Sprintf("How old an orphaned PodSnapshot must be, from its creation, before the sweep deletes it. When the sweep is on, at least --snapshot-retention plus %s.", controller.OrphanSnapshotMinAgeMargin))
 	flag.DurationVar(&coverageRefreshInterval, "coverage-refresh-interval", controller.DefaultCoverageRefreshInterval, "How often active PodMigration coverage metrics are refreshed without re-syncing managed resources. 0 turns periodic refresh off; otherwise at least 5s.")
-	flag.StringVar(&storageIsolationMode, "storage-isolation-mode", controller.DefaultStorageIsolationMode, "Multi-tenant storage isolation mode for cross-namespace conflicts when --allow-bucket-root-storage is enabled: warn (default, log and emit Warning events while permitting upgrade migration) or enforce (fail-closed on cross-namespace collision).")
-	flag.BoolVar(&allowBucketRootStorage, "allow-bucket-root-storage", false, "Allow PodMigration storage locations to target the bucket root (gs://bucket or gs://bucket/) without namespace path scoping. Intended only for single-tenant clusters where the entire bucket is dedicated to one namespace.")
+	flag.StringVar(&storageIsolationMode, "storage-isolation-mode", controller.DefaultStorageIsolationMode, "Multi-tenant storage isolation mode for cross-namespace storage location conflicts: warn (default, log and emit Warning events while permitting upgrade migration) or enforce (fail-closed on cross-namespace collision). PodMigrations that pass namespace scoping and the --allow-bucket-root-storage-namespaces bucket reservation can't produce such a conflict, so this is a safeguard; it doesn't affect UnscopedStorageLocation or BucketReservedForRootStorage refusals.")
+	flag.StringVar(&bucketRootBindingsRaw, "allow-bucket-root-storage-namespaces", "", "Comma-separated <namespace>=<bucket> entries, e.g. team-a=team-a-snapshots. Each entry lets that namespace's PodMigrations use the root of that bucket (gs://bucket or gs://bucket/) as their storage location, without namespace path scoping, and reserves the bucket for the namespace: PodMigrations in every other namespace are refused any location on it (BucketReservedForRootStorage). Only appropriate when exactly one namespace can create PodMigrations on that bucket; a bucket bound to two namespaces is refused at startup. Every other bucket keeps the gs://<bucket>/<namespace>/... requirement. The pod-migration-storage-location admission policy rejects the bucket root regardless. Empty (the default) binds nothing.")
+	flag.BoolVar(&allowBucketRootStorage, "allow-bucket-root-storage", false, "Deprecated: use --allow-bucket-root-storage-namespaces. No longer allows any namespace by itself; when true, --allow-bucket-root-storage-namespaces must bind at least one namespace to its bucket or the controller refuses to start. Only appropriate when exactly one namespace can create PodMigrations on that bucket.")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -171,6 +173,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	bucketRootBindings, err := util.ParseBucketRootBindings(allowBucketRootStorage, bucketRootBindingsRaw)
+	if err != nil {
+		setupLog.Error(err, "invalid --allow-bucket-root-storage-namespaces flag")
+		os.Exit(1)
+	}
+	if allowBucketRootStorage {
+		setupLog.Info("--allow-bucket-root-storage is deprecated and has no effect beyond requiring --allow-bucket-root-storage-namespaces; remove it")
+	}
+
 	ver := version.Get()
 	setupLog.Info("Starting pod-migration-controller",
 		"version", ver.GitVersion,
@@ -187,7 +198,8 @@ func main() {
 		"shortenRestoredReadinessDelay", shortenReadinessDelay,
 		"snapshotRetention", snapshotRetention,
 		"orphanSnapshotSweepInterval", orphanSweepInterval,
-		"orphanSnapshotMinAge", orphanMinAge)
+		"orphanSnapshotMinAge", orphanMinAge,
+		"bucketRootStorage", bucketRootBindings.List())
 
 	// Reject values client-go would silently reinterpret (QPS==0 falls back to
 	// the 5-QPS default; negative disables rate limiting).
@@ -322,14 +334,14 @@ func main() {
 	logEngineRoutes(engines, runtimeClassPolicy, len(runtimeClassRoutes) == 0)
 
 	if err := (&controller.PodMigrationReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		Recorder:               eventRecorder,
-		InvariantEngine:        invariantEngine,
-		Engines:                engines,
-		RuntimeClassPolicy:     runtimeClassPolicy,
-		StorageIsolationMode:   storageIsolationMode,
-		AllowBucketRootStorage: allowBucketRootStorage,
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Recorder:             eventRecorder,
+		InvariantEngine:      invariantEngine,
+		Engines:              engines,
+		RuntimeClassPolicy:   runtimeClassPolicy,
+		StorageIsolationMode: storageIsolationMode,
+		BucketRootStorage:    bucketRootBindings,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create PodMigrationReconciler")
 		os.Exit(1)
