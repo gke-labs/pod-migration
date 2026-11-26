@@ -236,31 +236,33 @@ func migrationDeadlineAnchor(job *pmv1alpha1.PodMigrationJob) time.Time {
 }
 
 // calculateDeadline computes the timestamp at which the reconciler will time out
-// the job's current phase: the value it already enforces, including the Evicting
-// extension and the MaxMigrationTimeout hard cap.
-// In Pending: CreationTimestamp + timeout.
-// In Snapshotting: SnapshottingStartTime + timeout (capped by MaxMigrationTimeout from anchor).
-// In Evicting: EvictingStartTime + timeout, strictly capped by MaxMigrationTimeout from anchor.
+// the job's current phase:
+// - Pending: CreationTimestamp + effective timeout (capped by MaxMigrationTimeout)
+// - Snapshotting: SnapshottingStartTime + MaxMigrationTimeout (the upper bound while progressing)
+// - Evicting: EvictingStartTime + effective timeout (capped by MaxMigrationTimeout from SnapshottingStartTime)
+// - Restoring: RestoringStartTime + restoreCeiling()
+// - Terminal (Succeeded/Failed): preserves the historical deadline, or nil if none was recorded
 func (r *PodMigrationJobReconciler) calculateDeadline(job *pmv1alpha1.PodMigrationJob) *metav1.Time {
 	if job == nil {
 		return nil
 	}
-	if job.Status.Deadline != nil && !job.Status.Deadline.IsZero() {
-		if invariants.IsTerminalPhase(job.Status.Phase) || job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseRestoring {
-			return job.Status.Deadline
-		}
+	if invariants.IsTerminalPhase(job.Status.Phase) {
+		return job.Status.Deadline
 	}
 	timeout := r.getMigrationTimeout(job)
 	anchor := migrationDeadlineAnchor(job)
-	if anchor.IsZero() {
-		anchor = time.Now()
-	}
 	hardCap := anchor.Add(util.MaxMigrationTimeout)
 
 	var phaseDeadline time.Time
 	switch job.Status.Phase {
+	case pmv1alpha1.PodMigrationJobPhaseRestoring:
+		rst := anchor
+		if job.Status.RestoringStartTime != nil && !job.Status.RestoringStartTime.IsZero() {
+			rst = job.Status.RestoringStartTime.Time
+		}
+		phaseDeadline = rst.Add(r.restoreCeiling())
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
-		evictingStart := time.Now()
+		evictingStart := anchor
 		if job.Status.EvictingStartTime != nil && !job.Status.EvictingStartTime.IsZero() {
 			evictingStart = job.Status.EvictingStartTime.Time
 		} else if job.Annotations != nil {
@@ -277,14 +279,11 @@ func (r *PodMigrationJobReconciler) calculateDeadline(job *pmv1alpha1.PodMigrati
 			phaseDeadline = hardCap
 		}
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
-		snapStart := anchor
-		if job.Status.SnapshottingStartTime != nil && !job.Status.SnapshottingStartTime.IsZero() {
-			snapStart = job.Status.SnapshottingStartTime.Time
-		}
-		phaseDeadline = snapStart.Add(timeout)
-		if phaseDeadline.After(hardCap) {
-			phaseDeadline = hardCap
-		}
+		// While Snapshotting, a progressing snapshot is allowed to run up to the
+		// MaxMigrationTimeout hard cap from SnapshottingStartTime (I4 tolerance).
+		// Publishing SST + MaxMigrationTimeout gives external coordinators the true
+		// upper bound so leases are not prematurely revoked.
+		phaseDeadline = hardCap
 	default: // Pending or uninitialized
 		phaseDeadline = anchor.Add(timeout)
 		if phaseDeadline.After(hardCap) {
@@ -343,26 +342,11 @@ func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMi
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		return false
 	}
-	if time.Since(migrationDeadlineAnchor(job)) > util.MaxMigrationTimeout {
+	deadline := r.calculateDeadline(job)
+	if deadline == nil {
 		return false
 	}
-	evictionBudget := r.getMigrationTimeout(job)
-	if job.Status.EvictingStartTime != nil {
-		return time.Since(job.Status.EvictingStartTime.Time) < evictionBudget
-	}
-	// Fallback to evicting-since annotation for in-flight jobs during upgrade
-	if job.Annotations != nil {
-		if evictingSinceStr := job.Annotations[util.AnnotationEvictingSince]; evictingSinceStr != "" {
-			evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
-			if err != nil {
-				evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)
-			}
-			if err == nil {
-				return time.Since(evictingSince) < evictionBudget
-			}
-		}
-	}
-	return false
+	return time.Now().Before(deadline.Time)
 }
 
 // isOriginPodTerminatedDueToNodeShutdown checks whether the origin pod was terminated due to node shutdown.
@@ -1364,9 +1348,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	switch job.Status.Phase {
 	case pmv1alpha1.PodMigrationJobPhasePending:
 		var annotationUpdated bool
-		if job.Status.Deadline == nil {
-			job.Status.Deadline = r.calculateDeadline(job)
-		}
 		// Capture PV Names, origin node name (and its machine type and version), and migration timeout before starting checkpoint (pod is guaranteed to exist).
 		// A job waiting for the disruption budget checks the source again on every pass,
 		// since the source can be deleted, replaced, or finish during the wait (#42).
@@ -1561,9 +1542,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
-		if job.Status.Deadline == nil {
-			job.Status.Deadline = r.calculateDeadline(job)
-		}
 		// Fence the source before its checkpoint is triggered (#131).
 		if err := r.fenceSource(ctx, job, origJob); err != nil {
 			if reason, message, failed := r.fenceFailure(job, err); failed {
@@ -1735,9 +1713,6 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 	case pmv1alpha1.PodMigrationJobPhaseEvicting:
-		if job.Status.Deadline == nil {
-			job.Status.Deadline = r.calculateDeadline(job)
-		}
 		// Ensure EvictingStartTime is initialized
 		if job.Status.EvictingStartTime == nil {
 			startTime := metav1.Now()
@@ -1960,6 +1935,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
 		restoringNow := metav1.Now()
 		job.Status.RestoringStartTime = &restoringNow
+		job.Status.Deadline = r.calculateDeadline(job)
 		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -1987,6 +1963,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if job.Status.RestoringStartTime == nil {
 			now := metav1.Now()
 			job.Status.RestoringStartTime = &now
+			job.Status.Deadline = r.calculateDeadline(job)
 			if err := r.patchStatus(ctx, job, origJob); err != nil {
 				return r.handleStatusError(ctx, err, "Failed to initialize RestoringStartTime")
 			}

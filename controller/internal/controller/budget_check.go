@@ -190,9 +190,6 @@ func (r *PodMigrationJobReconciler) checkDisruptionBudget(ctx context.Context, j
 			"Migration is waiting for other migrations under the PodDisruptionBudget to finish (%v); nothing has been checkpointed", checkErr)
 	}
 	deadline := migrationDeadlineAnchor(job).Add(r.getMigrationTimeout(job))
-	if job.Status.Deadline != nil && !job.Status.Deadline.IsZero() {
-		deadline = job.Status.Deadline.Time
-	}
 	after := budgetRecheckAfter(meta.FindStatusCondition(job.Status.Conditions, ConditionDisruptionBudgetChecked),
 		deadline, time.Now())
 	log.FromContext(ctx).Info("Disruption budget doesn't allow the source's eviction yet; waiting in Pending", "reason", reason, "recheckAfter", after)

@@ -17,6 +17,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -41,6 +42,15 @@ func deadlineTestScheme() *runtime.Scheme {
 	_ = corev1.AddToScheme(s)
 	_ = pmv1alpha1.AddToScheme(s)
 	return s
+}
+
+type stubDeadlineBudgetChecker struct {
+	reason string
+	err    error
+}
+
+func (s *stubDeadlineBudgetChecker) Check(context.Context, *pmv1alpha1.PodMigrationJob, string) (string, error) {
+	return s.reason, s.err
 }
 
 // TestStatusDeadline_Pending_BaselineAndOverrides verifies that in Pending phase,
@@ -149,7 +159,7 @@ func TestStatusDeadline_Pending_BaselineAndOverrides(t *testing.T) {
 		}
 	})
 
-	t.Run("per-pod override annotation (25m)", func(t *testing.T) {
+	t.Run("per-pod override annotation (25m) pinned in budget-blocked pending", func(t *testing.T) {
 		createdAt := metav1.NewTime(time.Now().Add(-5 * time.Second))
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -178,13 +188,17 @@ func TestStatusDeadline_Pending_BaselineAndOverrides(t *testing.T) {
 			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).Build()
 		r := &PodMigrationJobReconciler{
 			Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10),
+			BudgetChecker: &stubDeadlineBudgetChecker{
+				reason: reasonBudgetExhausted,
+				err:    errors.New("budget exhausted"),
+			},
 		}
 
-		// Reconcile 1: sets Phase=Pending
+		// Reconcile 1: sets Phase=Pending (with default 10m baseline deadline)
 		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-custom"}}); err != nil {
 			t.Fatalf("Reconcile 1: %v", err)
 		}
-		// Reconcile 2: inspects pod, propagates 25m timeout, transitions to Snapshotting
+		// Reconcile 2: inspects pod, discovers 25m override, recomputes deadline, budget check blocks and keeps job in Pending
 		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-custom"}}); err != nil {
 			t.Fatalf("Reconcile 2: %v", err)
 		}
@@ -193,22 +207,22 @@ func TestStatusDeadline_Pending_BaselineAndOverrides(t *testing.T) {
 		if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pmj-custom"}, got); err != nil {
 			t.Fatalf("get PMJ: %v", err)
 		}
-		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
-			t.Fatalf("phase = %s, want %s", got.Status.Phase, pmv1alpha1.PodMigrationJobPhaseSnapshotting)
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
+			t.Fatalf("phase = %s, want %s (job should remain in Pending while budget-blocked)", got.Status.Phase, pmv1alpha1.PodMigrationJobPhasePending)
 		}
 		if got.Status.Deadline == nil {
 			t.Fatalf("status.deadline is nil, want non-nil")
 		}
-		wantDeadline := got.Status.SnapshottingStartTime.Time.Add(25 * time.Minute)
+		wantDeadline := got.CreationTimestamp.Time.Add(25 * time.Minute)
 		if !got.Status.Deadline.Time.Equal(wantDeadline) {
-			t.Errorf("status.deadline = %v, want %v", got.Status.Deadline.Time, wantDeadline)
+			t.Errorf("status.deadline = %v, want %v (difference: %v)", got.Status.Deadline.Time, wantDeadline, got.Status.Deadline.Time.Sub(got.CreationTimestamp.Time))
 		}
 	})
 
-	t.Run("size-scaled memory requests", func(t *testing.T) {
+	t.Run("size-scaled memory requests pinned in budget-blocked pending (5000Mi -> 11m40s)", func(t *testing.T) {
 		createdAt := metav1.NewTime(time.Now().Add(-5 * time.Second))
-		// 500 MiB memory request adds 10s (500MiB / 50MiB/s = 10s)
-		memQty := resource.MustParse("500Mi")
+		// 5000 MiB memory request adds 100s = 1m40s (5000MiB / 50MiB/s = 100s), giving 11m40s total
+		memQty := resource.MustParse("5000Mi")
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: "default",
@@ -243,11 +257,17 @@ func TestStatusDeadline_Pending_BaselineAndOverrides(t *testing.T) {
 			WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).Build()
 		r := &PodMigrationJobReconciler{
 			Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10),
+			BudgetChecker: &stubDeadlineBudgetChecker{
+				reason: reasonBudgetExhausted,
+				err:    errors.New("budget exhausted"),
+			},
 		}
 
+		// Reconcile 1: sets Phase=Pending (with default 10m baseline deadline)
 		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-mem"}}); err != nil {
 			t.Fatalf("Reconcile 1: %v", err)
 		}
+		// Reconcile 2: inspects pod, discovers 5000Mi memory, scales timeout to 11m40s, recomputes deadline, budget check blocks and keeps job in Pending
 		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-mem"}}); err != nil {
 			t.Fatalf("Reconcile 2: %v", err)
 		}
@@ -256,20 +276,27 @@ func TestStatusDeadline_Pending_BaselineAndOverrides(t *testing.T) {
 		if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pmj-mem"}, got); err != nil {
 			t.Fatalf("get PMJ: %v", err)
 		}
-		wantTimeout := util.DefaultMigrationTimeout + 10*time.Second
-		wantDeadline := got.Status.SnapshottingStartTime.Time.Add(wantTimeout)
+		if got.Status.Phase != pmv1alpha1.PodMigrationJobPhasePending {
+			t.Fatalf("phase = %s, want %s (job should remain in Pending while budget-blocked)", got.Status.Phase, pmv1alpha1.PodMigrationJobPhasePending)
+		}
+		if got.Status.Deadline == nil {
+			t.Fatalf("status.deadline is nil, want non-nil")
+		}
+		wantTimeout := util.DefaultMigrationTimeout + 100*time.Second // 11m40s
+		wantDeadline := got.CreationTimestamp.Time.Add(wantTimeout)
 		if !got.Status.Deadline.Time.Equal(wantDeadline) {
-			t.Errorf("status.deadline = %v, want %v", got.Status.Deadline.Time, wantDeadline)
+			t.Errorf("status.deadline = %v, want %v (deadline - created = %v, want 11m40s)",
+				got.Status.Deadline.Time, wantDeadline, got.Status.Deadline.Time.Sub(got.CreationTimestamp.Time))
 		}
 	})
 }
 
-// TestStatusDeadline_Transitions_SnapshottingAndEvicting verifies that status.deadline
+// TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring verifies that status.deadline
 // moves on each phase transition:
-// - runs from creation in Pending
-// - moves to SnapshottingStartTime in Snapshotting
-// - moves to EvictingStartTime in Evicting
-func TestStatusDeadline_Transitions_SnapshottingAndEvicting(t *testing.T) {
+// - Snapshotting: publishes SST + MaxMigrationTimeout (2h upper bound for progressing snapshots)
+// - Evicting: moves to EvictingStartTime + timeout (capped by MaxMigrationTimeout from SST)
+// - Restoring: moves to RestoringStartTime + restoreCeiling()
+func TestStatusDeadline_Transitions_SnapshottingEvictingAndRestoring(t *testing.T) {
 	ctx := context.Background()
 	scheme := deadlineTestScheme()
 
@@ -317,10 +344,20 @@ func TestStatusDeadline_Transitions_SnapshottingAndEvicting(t *testing.T) {
 		SnapshotProvider: mockSnapProvider,
 	}
 
-	// Reconcile: Snapshotting -> Evicting (mock provider reports PhaseReady)
+	// 1. In Snapshotting: calculateDeadline returns SST + MaxMigrationTimeout (2h upper bound)
+	snapDeadline := r.calculateDeadline(pmj)
+	if snapDeadline == nil {
+		t.Fatalf("Snapshotting deadline is nil")
+	}
+	wantSnapDeadline := snapStart.Time.Add(util.MaxMigrationTimeout)
+	if !snapDeadline.Time.Equal(wantSnapDeadline) {
+		t.Errorf("Snapshotting deadline = %v, want %v", snapDeadline.Time, wantSnapDeadline)
+	}
+
+	// 2. Reconcile: Snapshotting -> Evicting (mock provider reports PhaseReady)
 	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}})
 	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
+		t.Fatalf("Reconcile to Evicting: %v", err)
 	}
 	if !res.Requeue {
 		t.Errorf("expected Requeue: true on transition to Evicting")
@@ -328,7 +365,7 @@ func TestStatusDeadline_Transitions_SnapshottingAndEvicting(t *testing.T) {
 
 	got := &pmv1alpha1.PodMigrationJob{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}, got); err != nil {
-		t.Fatalf("get PMJ: %v", err)
+		t.Fatalf("get PMJ after Evicting transition: %v", err)
 	}
 	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		t.Fatalf("phase = %s, want %s", got.Status.Phase, pmv1alpha1.PodMigrationJobPhaseEvicting)
@@ -340,25 +377,60 @@ func TestStatusDeadline_Transitions_SnapshottingAndEvicting(t *testing.T) {
 		t.Fatalf("status.deadline is nil, want non-nil")
 	}
 
-	// In Evicting, deadline must run from EvictingStartTime
-	wantDeadline := got.Status.EvictingStartTime.Time.Add(util.DefaultMigrationTimeout)
-	if !got.Status.Deadline.Time.Equal(wantDeadline) {
-		t.Errorf("status.deadline = %v, want %v", got.Status.Deadline.Time, wantDeadline)
+	// In Evicting, deadline runs from EvictingStartTime + timeout
+	wantEvictDeadline := got.Status.EvictingStartTime.Time.Add(util.DefaultMigrationTimeout)
+	if !got.Status.Deadline.Time.Equal(wantEvictDeadline) {
+		t.Errorf("status.deadline in Evicting = %v, want %v", got.Status.Deadline.Time, wantEvictDeadline)
+	}
+
+	// 3. Delete origin pod and reconcile to transition Evicting -> Restoring
+	if err := c.Delete(ctx, pod); err != nil {
+		t.Fatalf("deleting source pod: %v", err)
+	}
+	// Reconcile: source pod is gone, PVs detached -> transitions to Restoring
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}}); err != nil {
+		t.Fatalf("Reconcile to Restoring: %v", err)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pmj-multi-phase"}, got); err != nil {
+		t.Fatalf("get PMJ after Restoring transition: %v", err)
+	}
+	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseRestoring {
+		t.Fatalf("phase = %s, want %s", got.Status.Phase, pmv1alpha1.PodMigrationJobPhaseRestoring)
+	}
+	if got.Status.RestoringStartTime == nil {
+		t.Fatalf("RestoringStartTime is nil")
+	}
+	if got.Status.Deadline == nil {
+		t.Fatalf("status.deadline in Restoring is nil, want non-nil")
+	}
+
+	// In Restoring, deadline must be stamped with RestoringStartTime + restoreCeiling()
+	wantRestoreDeadline := got.Status.RestoringStartTime.Time.Add(r.restoreCeiling())
+	if !got.Status.Deadline.Time.Equal(wantRestoreDeadline) {
+		t.Errorf("status.deadline in Restoring = %v, want %v", got.Status.Deadline.Time, wantRestoreDeadline)
 	}
 }
 
-// TestStatusDeadline_Evicting_MaxMigrationTimeoutHardCap verifies that in Evicting phase,
-// the deadline is strictly capped by MaxMigrationTimeout (2h) from SnapshottingStartTime,
-// matching the reconciler's hard cap enforcement.
-func TestStatusDeadline_Evicting_MaxMigrationTimeoutHardCap(t *testing.T) {
+// TestStatusDeadline_Evicting_MaxMigrationTimeoutHardCap_ThroughReconcile verifies that
+// during transition to Evicting phase driven by Reconcile, the deadline is strictly capped
+// by MaxMigrationTimeout (2h) from SnapshottingStartTime, matching enforcement.
+func TestStatusDeadline_Evicting_MaxMigrationTimeoutHardCap_ThroughReconcile(t *testing.T) {
+	ctx := context.Background()
 	scheme := deadlineTestScheme()
 
-	// Snapshotting started 1h50m ago (extended via active progress).
-	// Now entering Evicting with a 20m timeout.
-	// 1h50m + 20m = 2h10m, which exceeds the 2h MaxMigrationTimeout hard cap!
-	snapStart := metav1.NewTime(time.Now().Add(-110 * time.Minute))
-	evictStart := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+	// Snapshotting started 110m ago.
+	// Entering Evicting with a 20m timeout.
+	// 110m + 20m = 130m > 120m (2h MaxMigrationTimeout hard cap).
+	snapStart := metav1.NewTime(time.Now().Add(-110 * time.Minute).Truncate(time.Second))
 
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "cap-pod",
+			UID:       "cap-uid",
+		},
+	}
 	pmj := &pmv1alpha1.PodMigrationJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         "default",
@@ -369,40 +441,53 @@ func TestStatusDeadline_Evicting_MaxMigrationTimeoutHardCap(t *testing.T) {
 			},
 		},
 		Spec: pmv1alpha1.PodMigrationJobSpec{
-			PodRef:       corev1.LocalObjectReference{Name: "app-pod"},
-			TargetPodUID: "app-uid",
+			PodRef:       corev1.LocalObjectReference{Name: "cap-pod"},
+			TargetPodUID: "cap-uid",
 		},
 		Status: pmv1alpha1.PodMigrationJobStatus{
-			Phase:                 pmv1alpha1.PodMigrationJobPhaseEvicting,
+			Phase:                 pmv1alpha1.PodMigrationJobPhaseSnapshotting,
 			SnapshottingStartTime: &snapStart,
-			EvictingStartTime:     &evictStart,
 			SnapshotRef:           "snapshot-cap-test",
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(pmj).
-		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).Build()
-	r := &PodMigrationJobReconciler{
-		Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10),
+	mockSnapProvider := &fakeSnapshotProvider{
+		checkStatusResult: &snapshot.Status{
+			Phase:       snapshot.PhaseReady,
+			SnapshotRef: "snapshot-cap-test",
+		},
 	}
 
-	// Calculate deadline
-	deadline := r.calculateDeadline(pmj)
-	if deadline == nil {
-		t.Fatalf("calculateDeadline returned nil")
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(pod, pmj).
+		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).Build()
+	r := &PodMigrationJobReconciler{
+		Client:           c,
+		Scheme:           scheme,
+		Recorder:         record.NewFakeRecorder(10),
+		SnapshotProvider: mockSnapProvider,
+	}
+
+	// Reconcile: drives transition from Snapshotting to Evicting
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "pmj-hard-cap"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := &pmv1alpha1.PodMigrationJob{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pmj-hard-cap"}, got); err != nil {
+		t.Fatalf("get PMJ: %v", err)
+	}
+	if got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
+		t.Fatalf("phase = %s, want %s", got.Status.Phase, pmv1alpha1.PodMigrationJobPhaseEvicting)
+	}
+	if got.Status.Deadline == nil {
+		t.Fatalf("status.deadline is nil, want non-nil")
 	}
 
 	// Hard cap: snapStart + 2h
 	wantHardCap := snapStart.Time.Add(util.MaxMigrationTimeout)
-	uncappedDeadline := evictStart.Time.Add(20 * time.Minute)
-
-	if !uncappedDeadline.After(wantHardCap) {
-		t.Fatalf("test setup sanity error: uncappedDeadline %v should be after hardCap %v", uncappedDeadline, wantHardCap)
-	}
-
-	if !deadline.Time.Equal(wantHardCap) {
-		t.Errorf("deadline = %v, want hard cap %v (uncapped would be %v)", deadline.Time, wantHardCap, uncappedDeadline)
+	if !got.Status.Deadline.Time.Equal(wantHardCap) {
+		t.Errorf("deadline = %v, want hard cap %v", got.Status.Deadline.Time, wantHardCap)
 	}
 }
 
@@ -465,17 +550,17 @@ func TestStatusDeadline_TerminalPhase_Retained(t *testing.T) {
 		t.Errorf("status.deadline = %v, want %v", got.Status.Deadline.Time, wantDeadline)
 	}
 
-	// Also verify calculateDeadline preserves existing deadline on Restoring and Succeeded
-	got.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
-	restoringDeadline := r.calculateDeadline(got)
-	if restoringDeadline == nil || !restoringDeadline.Time.Equal(wantDeadline) {
-		t.Errorf("calculateDeadline in Restoring = %v, want %v", restoringDeadline, wantDeadline)
-	}
-
+	// Also verify calculateDeadline preserves existing deadline on terminal phases
 	got.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceeded
 	succeededDeadline := r.calculateDeadline(got)
 	if succeededDeadline == nil || !succeededDeadline.Time.Equal(wantDeadline) {
 		t.Errorf("calculateDeadline in Succeeded = %v, want %v", succeededDeadline, wantDeadline)
+	}
+
+	got.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore
+	swrDeadline := r.calculateDeadline(got)
+	if swrDeadline == nil || !swrDeadline.Time.Equal(wantDeadline) {
+		t.Errorf("calculateDeadline in SucceededWithoutRestore = %v, want %v", swrDeadline, wantDeadline)
 	}
 }
 
@@ -605,5 +690,9 @@ func TestStatusDeadline_ZeroExtraStatusWrites(t *testing.T) {
 	}
 	if got.Status.Deadline == nil {
 		t.Fatalf("final PMJ status.deadline is nil, want non-nil")
+	}
+	wantFinalDeadline := got.Status.RestoringStartTime.Time.Add(r.restoreCeiling())
+	if !got.Status.Deadline.Time.Equal(wantFinalDeadline) {
+		t.Errorf("final PMJ status.deadline = %v, want %v", got.Status.Deadline.Time, wantFinalDeadline)
 	}
 }

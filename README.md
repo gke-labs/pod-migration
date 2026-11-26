@@ -9,6 +9,7 @@ This controller implements Pod Migration by intercepting eviction requests (e.g.
 - **Other causes:** Responds to manual evictions and third-party controllers triggering Pod evictions.
 
 While this controller mitigates the effects of eviction, the migration is not completely transparent and the application will experience:
+
 - A change in Pod identity (different Pod name suffix and IP address).
 - Closed network connections that must be re-established by client-side retry logic.
 
@@ -19,6 +20,7 @@ While this controller mitigates the effects of eviction, the migration is not co
 The controller is implemented as a custom Operator consisting of the following core components:
 
 ### 1. Webhooks
+
 - **Eviction Interception Webhook (`/validate-v1-pod-eviction`)**: Handled by `EvictionGate`. Intercepts Pod eviction API calls. If the Pod is opted-in (`pod-migration.gke.io/enabled: "true"`), it denies the eviction request with `429 (Too Many Requests)` to block immediate destruction, and spawns a `PodMigrationJob` (PMJ) CR to orchestrate the migration flow. A replacement Pod that its own migration is still restoring isn't migrated again until that migration concludes: if its new node is also being drained (or for a non-drain eviction), the webhook answers `429` so the evictor retries once restore concludes (#162); if it is a same-name replacement (`StatefulSet`) already off the cordoned origin node and onto an uncordoned node, the webhook answers `404 (Not Found)` so `kubectl drain` on the origin node sees the original Pod is gone and exits cleanly without re-migrating the replacement.
 - **Replacement Webhook (`/mutate-v1-pod-scheduling-gate`)**: Handled by `PodGateInjector`. Intercepts Pod creation requests. For replacement pods matched to an active `PodMigrationJob`, it injects the `gke.io/pod-migration-gate` scheduling gate (and scrubs untrusted `<group>/ps-name` restore annotations across registered engines) to hold the pod in a pending state until checkpoint readiness and volume detachment complete, preventing replica collisions; by default (`--shorten-restored-readiness-delay=true`), it also sets `readinessProbe.initialDelaySeconds` to `0` on the replacement's containers and restartable sidecar init containers unless the pod sets `pod-migration.gke.io/preserve-readiness-delay: "true"`, leaving liveness and startup probes untouched (#141). On scale-up pods, it stamps per-engine cold-start bypasses.
 - **Status Mutating Webhook (`/mutate-v1-pod-status`)**: Handled by `PodStatusMutator`. Intercepts Pod status updates. For migrating Job-owned Pods, it overrides the final exit code to `137` and status to `Failed`. This allows the Kubernetes Job controller to reschedule the Pod without depleting its `backoffLimit` retry budget (see Job Rescheduling section).
@@ -26,6 +28,7 @@ The controller is implemented as a custom Operator consisting of the following c
 - **Restore Order Policy (`pod-migration-restore-order`)**: A `ValidatingAdmissionPolicy` in `controller/deploy.yaml`, not a webhook: the API server evaluates it itself, so it doesn't depend on the controller being up. The replacement webhook handles restore orders only when a Pod is created. Afterwards, on a Pod that is opted in, only the controller may set, change or remove a restore order (`<group>/ps-name`, for any engine) (#233). It covers updates of the Pod and of its `status` subresource, which can change annotations too. The policy is skipped for every update that leaves the restore orders as they are, so labels (including removing `pod-migration.gke.io/enabled` to opt out), other annotations, the spec and the kubelet's status writes aren't affected. See [Changing a Restore Order by Hand](#changing-a-restore-order-by-hand).
 
 ### 2. Reconcilers
+
 - **`PodMigration` (Config) Reconciler**: Watches `PodMigration` resources. It automatically provisions the required GKE `PodSnapshotStorageConfig` (PSSC) and manual `PodSnapshotPolicy` (PSP) resources with `postCheckpoint: stop` in the target namespace. It also watches those two objects. If someone edits their spec, it changes it back right away. If someone deletes one, it recreates it right away. If one is stuck being deleted, for example because another component's finalizer holds it, the controller doesn't touch it and sets the PodMigration's `Ready` condition to `False` with reason `ManagedObjectTerminating`. Once the object is gone, the controller recreates it (#144).
   - **Storage Isolation & Scoping**: Automatically enforces cross-namespace storage location isolation. The controller always requires storage paths to be scoped to the namespace (`gs://<bucket>/<namespace>/...`); un-scoped locations or bucket root paths are refused (`Ready=False`, `UnscopedStorageLocation`), unless the bucket root is explicitly enabled via `--allow-bucket-root-storage` (off by default). When cross-namespace conflicts occur under `--allow-bucket-root-storage`, `--storage-isolation-mode` controls handling (`warn` logs and emits `StorageIsolationWarning` events, while `enforce` fails closed with `Ready=False`, `ConflictingStorageLocation`).
 - **`PodMigrationJob` (Execution) Reconciler**: Coordinates the active migration loop:
@@ -37,6 +40,14 @@ The controller is implemented as a custom Operator consisting of the following c
   6. Transitions the job to `Restoring`, signaling the Pod Gate Reconciler that it is safe to release the replacement Pod.
   7. Watches the restore and concludes the job: `Succeeded` once the restore is verified or inferred; `SucceededWithoutRestore` if the replacement runs without its restored state, if the restore isn't confirmed in time (for example after a cold start or the restore timeout), or if no node takes the restore (`PlacementTimeout`, with `--restore-placement`, or `NoCompatibleNode` for a replacement that an earlier version held), or if its `PodSnapshot` is being deleted or is gone before the replacement is released (`SnapshotDeleting`, #265, or `SnapshotGone`, #269); or `Failed` (for example after a restore crash).
   8. Deletes the job's `PodSnapshot` once the job is `Succeeded` or `Failed` and nothing can still restore from it (#107). See [Checkpoint garbage collection](#checkpoint-garbage-collection).
+  - **Migration Deadlines & Disruption Leases (`status.deadline`, #304)**: External controllers that coordinate with live migration (such as disruption-policy coordinators like [gke-labs/workload-class](https://github.com/gke-labs/workload-class)) need to know how long a `PodMigrationJob` may legitimately run to cap disruption leases accurately without cutting off valid migrations or leaving workloads unprotected if a migration wedges. `status.deadline` (`metav1.Time`) publishes the timestamp at which the reconciler will time out the job's current phase:
+    - `Pending`: Job creation timestamp plus the effective migration timeout (`--migration-timeout`, Spot 2m override, or pod override plus memory scaling), clamped to the 2-hour hard cap (`MaxMigrationTimeout`).
+    - `Snapshotting`: Start of snapshotting (`status.snapshottingStartTime`) plus the 2-hour hard cap (`MaxMigrationTimeout`). This reflects the maximum time an actively progressing snapshot is allowed to run without premature disruption lease cancellation. (If snapshot progress stalls, the reconciler times out sooner, failing the job).
+    - `Evicting`: Start of origin pod eviction (`status.evictingStartTime`) plus the effective migration timeout, strictly capped by `MaxMigrationTimeout` measured from `status.snapshottingStartTime`.
+    - `Restoring`: Start of replacement pod restore (`status.restoringStartTime`) plus the restore safety ceiling (`restoreTimeout` of 5 minutes plus any configured `--restore-stabilization-window`).
+    - Terminal phases (`Succeeded`, `SucceededWithoutRestore`, `Failed`): The field is retained as a historical record. External consumers observing a terminal phase should release any held leases or locks immediately.
+    - Missing field (older controllers): External consumers should fall back to their own local ceiling (such as `MaxMigrationTimeout` plus a margin).
+      Consumers should cap their leases or waiting timeouts at `status.deadline` plus a small margin and re-read `status.deadline` on subsequent job status transitions.
 - **Pod Gate Reconciler**: Monitors replacement Pods injected with the `gke.io/pod-migration-gate` scheduling gate. It holds them in a pending state and releases the gate once the matched `PodMigrationJob` reaches `Restoring` (confirming snapshot readiness and volume detachment), then injects the GKE snapshot name annotation to force restore, and removes the scheduling gate to allow startup. It doesn't release a replacement for a restore while the job's `PodSnapshot` is being deleted, or once it's gone. It holds the replacement until the job concludes `SucceededWithoutRestore` (reason `SnapshotDeleting` or `SnapshotGone`), then releases it cold (#265, #269). It bypasses gate injection for normal scale-up pods.
   - **Placement (controller flag `--restore-placement`, on by default, #14; `--restore-placement=false` turns it off):** in the update that removes the gate, it also adds the snapshot engine's node constraints to the Pod's required node affinity, if a ReplicaSet or StatefulSet would recreate the Pod (see below). Kubernetes accepts that change only while the Pod is gated, so the constraints can't be dropped after the release.
     - For GKE Pod Snapshots the constraint is the source node's machine type, `node.kubernetes.io/instance-type In [<type>]`, because a snapshot restored on another machine type can fail and crash-loop. The machine type is the one the job recorded in `status.originNodeInstanceType` while it was `Pending` (step 1 above). If that's empty, because the source node couldn't be read then, had no such label, or the job was past `Pending` when the controller was upgraded, the machine type is unknown, and the replacement gets no constraint and no check, as with the flag off. So does a replacement whose own node selector, or every term of its own required node affinity, already requires the constraint: a Pod recreated in its place would have it too. Its `MigrationRestoreReleased` event then ends with "without adding node constraints". The node's GKE version must match too, but no node label carries it, so it isn't a constraint: a replacement on a node of another GKE version, for example during a node pool upgrade, can still start cold. Nodes of one machine type can also run on different CPU platforms, for example E2 on Intel or AMD hosts, or N1 on several Intel generations, so a restore on a node of the right type can still fail.
@@ -56,19 +67,20 @@ After GKE Pod Snapshots checkpoints the source Pod, it stops it, and the kubelet
 
 A successful migration deletes the source, and the label goes with it. When a migration fails, the controller decides what happens to the fenced source:
 
-| Situation | What the controller does |
-|---|---|
-| The budget check refused the disruption | Nothing: the source was never fenced. |
-| The source was deleted or replaced during the migration (reason `PodNotFound`, #295) | Nothing to settle: the label went with the Pod, and the job drops its `pod-migration.gke.io/source-fence` finalizer. |
-| The trigger was rejected (forbidden, invalid, denied by admission) | The job fails with reason `TriggerCreateFailed`. Nothing was checkpointed, so the source is unfenced (next row). |
-| Creating the trigger fails with retryable errors | Retried for up to `--fence-pre-checkpoint-cap` (default 30 s); then the job fails with reason `FenceCapExceeded`, and the next row applies. |
-| The job's `PodSnapshot` is being deleted after its checkpoint completed (reason `SnapshotDeleting`, #265) | The source stays fenced (next row but one), recorded in the same status write that fails the job, so the record outlives the snapshot. A snapshot being deleted whose checkpoint hasn't completed is handled as any other failure (next row). |
-| The job's `PodSnapshot`, seen before, is gone (reason `SnapshotGone`, #269) | A fenced source stays fenced (next row but one), recorded in the same status write that fails the job. Whether the checkpoint completed can't be read any more, so the fence is kept either way. |
-| Any other failure (snapshot failure, timeout, strict-mode invariant failure) | The trigger is deleted, and the controller waits up to 30 s for the snapshot to finish or go away. If the snapshot never completed its checkpoint, and the source still runs the containers it was fenced with, the source can't have stopped: the controller sets `SourceFenced=False` (reason `Unfenced`), removes the label, and emits `SourceUnfenced`. The kubelet's next status write, within about 10 s, sets `Ready` again. |
-| Otherwise (the checkpoint completed, a container changed or restarted, or the snapshot didn't finish in time) | The source stays fenced (`SourceFenced=True`, reason `FenceKept`, Warning event `SourceKeptFenced`), and the controller evicts it, honouring its PodDisruptionBudgets and its grace period, so that its workload controller replaces it. A Pod without a controller isn't evicted, because nothing would replace it: delete it to release it. |
-| A source returned to service stops anyway | For `--fence-late-stop-watch` (default 5 min) after an unfence, the controller checks the source's containers. If they change, it fences the source again (Warning event `SourceRefencedLateStop`) and evicts it. |
+| Situation                                                                                                     | What the controller does                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The budget check refused the disruption                                                                       | Nothing: the source was never fenced.                                                                                                                                                                                                                                                                                                                                                                                               |
+| The source was deleted or replaced during the migration (reason `PodNotFound`, #295)                          | Nothing to settle: the label went with the Pod, and the job drops its `pod-migration.gke.io/source-fence` finalizer.                                                                                                                                                                                                                                                                                                                |
+| The trigger was rejected (forbidden, invalid, denied by admission)                                            | The job fails with reason `TriggerCreateFailed`. Nothing was checkpointed, so the source is unfenced (next row).                                                                                                                                                                                                                                                                                                                    |
+| Creating the trigger fails with retryable errors                                                              | Retried for up to `--fence-pre-checkpoint-cap` (default 30 s); then the job fails with reason `FenceCapExceeded`, and the next row applies.                                                                                                                                                                                                                                                                                         |
+| The job's `PodSnapshot` is being deleted after its checkpoint completed (reason `SnapshotDeleting`, #265)     | The source stays fenced (next row but one), recorded in the same status write that fails the job, so the record outlives the snapshot. A snapshot being deleted whose checkpoint hasn't completed is handled as any other failure (next row).                                                                                                                                                                                       |
+| The job's `PodSnapshot`, seen before, is gone (reason `SnapshotGone`, #269)                                   | A fenced source stays fenced (next row but one), recorded in the same status write that fails the job. Whether the checkpoint completed can't be read any more, so the fence is kept either way.                                                                                                                                                                                                                                    |
+| Any other failure (snapshot failure, timeout, strict-mode invariant failure)                                  | The trigger is deleted, and the controller waits up to 30 s for the snapshot to finish or go away. If the snapshot never completed its checkpoint, and the source still runs the containers it was fenced with, the source can't have stopped: the controller sets `SourceFenced=False` (reason `Unfenced`), removes the label, and emits `SourceUnfenced`. The kubelet's next status write, within about 10 s, sets `Ready` again. |
+| Otherwise (the checkpoint completed, a container changed or restarted, or the snapshot didn't finish in time) | The source stays fenced (`SourceFenced=True`, reason `FenceKept`, Warning event `SourceKeptFenced`), and the controller evicts it, honouring its PodDisruptionBudgets and its grace period, so that its workload controller replaces it. A Pod without a controller isn't evicted, because nothing would replace it: delete it to release it.                                                                                       |
+| A source returned to service stops anyway                                                                     | For `--fence-late-stop-watch` (default 5 min) after an unfence, the controller checks the source's containers. If they change, it fences the source again (Warning event `SourceRefencedLateStop`) and evicts it.                                                                                                                                                                                                                   |
 
 Notes:
+
 - The webhook must be installed: the controller only sets `Ready` to `False` once, and without the webhook the kubelet's next status write sets it back.
 - A fenced source counts as unhealthy for its PodDisruptionBudgets, so the budget checks of its siblings see the smaller budget.
 - The fence covers Service endpoints only. Services with `publishNotReadyAddresses: true`, clients that connect to the Pod IP directly, and the restarted instance's own outbound work and volume writes aren't fenced.
@@ -76,6 +88,7 @@ Notes:
 - The fence needs RBAC on `pods/status` (`get`, `patch`), which `deploy.yaml` grants.
 
 ### 4. Design Docs & Security
+
 - [Snapshot engine contract](docs/design/engine-contract.md): what the controller requires from a snapshot engine (GKE Pod Snapshots today; CRIU and upstream pod checkpoint/restore next).
 - [Safety invariants](docs/invariants.md): the invariants the controller can check after each reconcile (off by default; see `--invariant-mode`).
 - [Threat model & security guidance (CRIU engine)](docs/threat-model-criu.md): threat model, node agent privileges, restore path authorization, containerd posture, and GCS storage guidance.
@@ -88,11 +101,14 @@ Notes:
 Before deploying the Pod Migration Controller, ensure your cluster meets the following requirements:
 
 ### 1. GKE Standard Cluster with Pod Snapshots Enabled
+
 A GKE Standard cluster with the GKE Pod Snapshots addon enabled.
+
 - **Minimum GKE Version**: `1.36.0-gke.2253000` or later (required to support GKE Pod Snapshots with VPA and manual triggers).
 - **Release Channel**: Depending on availability in your region, you may need to use the `Rapid` release channel to obtain a compatible version.
 
 Example cluster creation command (using Rapid channel):
+
 ```bash
 gcloud container clusters create pod-migration-cluster \
   --release-channel=rapid \
@@ -103,7 +119,9 @@ gcloud container clusters create pod-migration-cluster \
 ```
 
 ### 2. gVisor Node Pool
+
 At least one node pool must have gVisor sandboxing enabled (`--sandbox=type=gvisor`) to run the sandboxed workloads:
+
 ```bash
 gcloud container node-pools create gvisor-pool \
   --cluster=pod-migration-cluster \
@@ -115,7 +133,9 @@ gcloud container node-pools create gvisor-pool \
 ```
 
 ### 3. cert-manager
+
 `cert-manager` must be installed to manage TLS certificates for the admission webhooks:
+
 ```bash
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.0/cert-manager.yaml
 kubectl wait --for=condition=Available --timeout=5m -n cert-manager deployment/cert-manager-webhook
@@ -128,6 +148,7 @@ kubectl wait --for=condition=Available --timeout=5m -n cert-manager deployment/c
 Follow these steps to deploy the Pod Migration Controller once the prerequisites are met:
 
 ### Step 1: One-Time Snapshot Storage & Workload Identity Configuration
+
 Run the provided setup script to automatically create the GCS bucket, configure IAM permissions for Workload Identity, and create the test Kubernetes Service Account (KSA):
 
 ```bash
@@ -135,7 +156,8 @@ chmod +x patches/setup-storage.sh
 ./patches/setup-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION] [MODE] [TENANT_NAMESPACES]
 ```
 
-*This script performs the following:*
+_This script performs the following:_
+
 - Creates a GCS bucket `gs://<BUCKET_NAME>` with uniform bucket-level access, hierarchical namespaces enabled, and soft-delete disabled.
 - **Single-Tenant Mode (`MODE=single-tenant`, default)**: Configures dedicated bucket storage (`tokenSource: podKSA`). Binds `roles/storage.objectUser` and `roles/storage.bucketViewer` to all KSAs in the `default` namespace and to the GKE container engine robot service account. Creates KSA `pm-test-ksa` in the `default` namespace.
 - **Multi-Tenant Mode (`MODE=multi-tenant`)**: Configures shared-bucket storage with path-restricted tokens (`tokenSource: federatedP4SA`). Binds `roles/storage.admin` to the GKE node service account (`service-${PROJECT_NUMBER}@gcp-sa-gkenode.iam.gserviceaccount.com`), creates per-namespace managed folders, and grants workload KSAs zero bucket-wide permissions. Pass a comma-separated list of namespaces as the 5th argument (e.g. `"tenant-a,tenant-b"`). See [Multi-Tenant Snapshot Storage Architecture & Guidance](docs/storage-multitenancy.md).
@@ -143,15 +165,19 @@ chmod +x patches/setup-storage.sh
 This bucket is for GKE Pod Snapshots. The experimental CRIU engine needs a bucket of its own, which grants object access to its two service accounts and to nobody else: an archive is a full memory dump. Set one up with `./patches/setup-criu-storage.sh [PROJECT_ID] [BUCKET_NAME] [REGION]`, and point only the `PodMigration`s of namespaces that only CRIU serves at it (see "Storage credentials" in `engines/criu/README.md`).
 
 ### Step 2: Install CRDs
+
 Install the custom resource definitions for the pod migration controller:
+
 ```bash
 kubectl apply -f controller/config/crd/bases/
 ```
 
 ### Step 3: Deploy the Pod Migration Controller
+
 The controller manager orchestrates the migration lifecycle and hosts the admission webhooks.
 
 1.  **Build and push the controller image:**
+
     ```bash
     make -C controller docker-build IMG=<YOUR_REGISTRY>/pod-migration-controller:latest
     docker push <YOUR_REGISTRY>/pod-migration-controller:latest
@@ -159,6 +185,7 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
 
 2.  **Configure the GCS Bucket:**
     Edit `controller/podmigration-config.yaml` to configure your target GCS bucket for snapshots:
+
     ```yaml
     spec:
       storage:
@@ -168,6 +195,7 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
     > [!WARNING]
     > **Upgrade Action Required: Mandatory Storage Namespace Scoping**:
     > The controller strictly enforces cross-namespace storage isolation in all modes. Storage locations (`spec.storage.location`) must be scoped to the namespace (`gs://<bucket>/<namespace>/...`).
+    >
     > - **What breaks**: Existing single-namespace clusters configured with legacy un-scoped paths like `gs://<bucket>/snapshots` (or an empty root path `gs://<bucket>`) fail scoping validation on upgrade. The `PodMigration` transitions to `Ready=False` with reason `UnscopedStorageLocation`. In-flight migrations drain, after which the controller deletes the managed `PodSnapshotStorageConfig` (PSSC) and `PodSnapshotPolicy` (PSP). The eviction webhook then finds no `Ready` policy and allows cold evictions (`eviction_webhook.go:380`), causing live migration to quietly stop.
     > - **How to tell**: Run `kubectl get podmigrations -A` (look for `READY: False`, reason `UnscopedStorageLocation`) or inspect events with `kubectl get events -A --field-selector reason=UnscopedStorageLocation`.
     > - **How to fix**: Update `spec.storage.location` in each `PodMigration` to begin with its namespace: e.g. `gs://<bucket>/default/snapshots`. The controller immediately reconciles, recreates storage objects, and restores `Ready=True`. (Alternatively, `--allow-bucket-root-storage=true` can be passed to the controller for single-tenant clusters dedicated to a single namespace).
@@ -176,10 +204,10 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
     Apply the manifests by replacing the `<YOUR_CONTROLLER_IMAGE>` placeholder:
     ```bash
     sed 's|<YOUR_CONTROLLER_IMAGE>|<YOUR_REGISTRY>/pod-migration-controller:latest|' controller/deploy.yaml | kubectl apply -f -
-    
+
     # Apply the storage config
     kubectl apply -f controller/podmigration-config.yaml
-    
+
     # Verify deployment status
     kubectl rollout status deployment/pod-migration-controller -n pod-migration-system
     ```
@@ -187,6 +215,7 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
 > [!IMPORTANT]
 > **Upgrading from Single-Replica to Multi-Replica HA**:
 > The controller runs in High Availability (2 replicas) with active/standby Leader Election enabled by default. When upgrading an existing cluster from the legacy un-elected single-replica deployment, scale down and wait for the old pod to fully terminate before applying the HA manifests:
+>
 > ```bash
 > kubectl scale deployment/pod-migration-controller -n pod-migration-system --replicas=0
 > kubectl wait --for=delete pod -l app=pod-migration-controller -n pod-migration-system --timeout=60s
@@ -194,7 +223,9 @@ The controller manager orchestrates the migration lifecycle and hosts the admiss
 > ```
 
 ### Step 4: Deploy Validating Policies (Optional)
+
 To reject incompatible workloads (e.g. BEAM/fsnotify) at admission time:
+
 ```bash
 kubectl apply -f patches/gke-pod-snapshot-admission-webhook.yaml
 ```
@@ -206,39 +237,40 @@ kubectl apply -f patches/gke-pod-snapshot-admission-webhook.yaml
 Every workload in this matrix has been verified through real E2E eviction migrations on a GKE Standard node pool.
 
 > [!NOTE]
+>
 > - **Job Rescheduling**: Workloads of type `Job` (e.g., `go`, `node`) are supported for resilient rescheduling using the Status Mutating Webhook.
 > - **NATS Caveat**: `nats` is marked as flaky due to a transient runtime-level deadlock during checkpointing; see troubleshooting notes below.
 
-| Application | Category | Verdict | Required Workarounds & Bypass Configurations |
-| :--- | :--- | :--- | :--- |
-| **node** | app / Job | ✅ **SURVIVED** | Verified both as StatefulSet and Job (rescheduled via webhook). Out-of-the-box support. |
-| **go** | app / Job | ✅ **SURVIVED** | Verified both as StatefulSet and Job (rescheduled via webhook). Out-of-the-box support. |
-| **redis** | datastore | ✅ **SURVIVED** | Pure in-memory key-value store. Very fast migration. |
-| **valkey** | datastore | ✅ **SURVIVED** | Pure in-memory key-value store. Very fast migration. |
-| **mysql** | datastore | ✅ **SURVIVED** | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`. |
-| **mariadb** | datastore | ✅ **SURVIVED** | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`. |
-| **memcached** | datastore | ✅ **SURVIVED** | Pure in-memory cache blocks restored. |
-| **dragonfly** | datastore | ✅ **SURVIVED** | **epoll Bypass**: Requires epoll forcing flag (`--force_epoll`). Verified with redis-client. |
-| **vault** | secrets | ✅ **SURVIVED** | Dev-mode secrets state restored. |
-| **consul** | coordination | ✅ **SURVIVED** | Dev-mode memory key-value databases survive. |
-| **etcd** | coordination | ✅ **SURVIVED** | BoltDB storage writes successfully restored. |
-| **nats** | streaming | ⚠️ **SURVIVED (FLAKY)** | **Deadlock Flake / Retry Caveat**: Memory jetstream offsets restored. Encountered runtime-level deadlock on 1st run. Succeeded on retry. |
-| **zookeeper** | coordination | ✅ **SURVIVED** | **emptyDir Path Redirect**: Redirect `ZOO_DATA_DIR` away from Kubelet `emptyDir` mounts (e.g. to `/tmp/zookeeper`) to prevent walk errors. |
-| **kafka** (KRaft) | streaming | ✅ **SURVIVED** | **JVM Metrics Bypass**: Inject environment variable `KAFKA_OPTS="-XX:-UseContainerSupport"` to avoid cgroups mismatch crashes on target nodes. |
-| **postgres** | datastore | ✅ **SURVIVED** | Works out-of-the-box (uses guest POSIX shared memory). Requires setting `PGDATA` to container local directories. |
-| **minio** | datastore | ✅ **SURVIVED** | Redirect storage paths to container writable layers to avoid emptyDir mount walk failures. |
-| **nginx** | proxy | ✅ **SERVED** | Stateless proxies restore and handle reconnected traffic. |
-| **haproxy** | proxy | ✅ **SERVED** | Stateless proxies restore and handle reconnected traffic. |
-| **traefik** | proxy | ✅ **SERVED** | Stateless routers restore and handle reconnected traffic. |
-| **caddy** | proxy | ✅ **SERVED** | Stateless routers restore and handle reconnected traffic. |
-| **python** (HTTP) | app | ✅ **SERVED** | Stateless python workers survive. |
-| **mongodb** | datastore | ❌ **FAILED** | WiredTiger storage engine locks and blocks on sandboxed `io_uring` seccomp. |
-| **cassandra** | datastore | ❌ **FAILED** | Large JVM heaps mismatch host cgroups descriptors post-restore. |
-| **cockroachdb** | datastore | ❌ **FAILED** | Raft synchronization timeouts and socket reset crashes post-restore. |
-| **clickhouse** | datastore | ❌ **FAILED** | Columnar block datastore sync locks and file descriptor leaks. |
-| **rabbitmq / couchdb** | streaming | ❌ **FAILED** | Erlang BEAM runtime epoll and green thread scheduler structures cannot be serialized. |
-| **prometheus** | monitoring | ❌ **REFUSED** | Active WAL memory mappings exceed serialization limits under both runtimes. |
-| **elasticsearch** | search | ❌ **REFUSED** | Heavy `fsnotify` directory watches cannot be serialized. |
+| Application            | Category     | Verdict                 | Required Workarounds & Bypass Configurations                                                                                                   |
+| :--------------------- | :----------- | :---------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
+| **node**               | app / Job    | ✅ **SURVIVED**         | Verified both as StatefulSet and Job (rescheduled via webhook). Out-of-the-box support.                                                        |
+| **go**                 | app / Job    | ✅ **SURVIVED**         | Verified both as StatefulSet and Job (rescheduled via webhook). Out-of-the-box support.                                                        |
+| **redis**              | datastore    | ✅ **SURVIVED**         | Pure in-memory key-value store. Very fast migration.                                                                                           |
+| **valkey**             | datastore    | ✅ **SURVIVED**         | Pure in-memory key-value store. Very fast migration.                                                                                           |
+| **mysql**              | datastore    | ✅ **SURVIVED**         | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`.                    |
+| **mariadb**            | datastore    | ✅ **SURVIVED**         | **InnoDB AIO Bypass**: Disable native async I/O (`--innodb_use_native_aio=OFF`) to avoid seccomp blocks on host `io_uring`.                    |
+| **memcached**          | datastore    | ✅ **SURVIVED**         | Pure in-memory cache blocks restored.                                                                                                          |
+| **dragonfly**          | datastore    | ✅ **SURVIVED**         | **epoll Bypass**: Requires epoll forcing flag (`--force_epoll`). Verified with redis-client.                                                   |
+| **vault**              | secrets      | ✅ **SURVIVED**         | Dev-mode secrets state restored.                                                                                                               |
+| **consul**             | coordination | ✅ **SURVIVED**         | Dev-mode memory key-value databases survive.                                                                                                   |
+| **etcd**               | coordination | ✅ **SURVIVED**         | BoltDB storage writes successfully restored.                                                                                                   |
+| **nats**               | streaming    | ⚠️ **SURVIVED (FLAKY)** | **Deadlock Flake / Retry Caveat**: Memory jetstream offsets restored. Encountered runtime-level deadlock on 1st run. Succeeded on retry.       |
+| **zookeeper**          | coordination | ✅ **SURVIVED**         | **emptyDir Path Redirect**: Redirect `ZOO_DATA_DIR` away from Kubelet `emptyDir` mounts (e.g. to `/tmp/zookeeper`) to prevent walk errors.     |
+| **kafka** (KRaft)      | streaming    | ✅ **SURVIVED**         | **JVM Metrics Bypass**: Inject environment variable `KAFKA_OPTS="-XX:-UseContainerSupport"` to avoid cgroups mismatch crashes on target nodes. |
+| **postgres**           | datastore    | ✅ **SURVIVED**         | Works out-of-the-box (uses guest POSIX shared memory). Requires setting `PGDATA` to container local directories.                               |
+| **minio**              | datastore    | ✅ **SURVIVED**         | Redirect storage paths to container writable layers to avoid emptyDir mount walk failures.                                                     |
+| **nginx**              | proxy        | ✅ **SERVED**           | Stateless proxies restore and handle reconnected traffic.                                                                                      |
+| **haproxy**            | proxy        | ✅ **SERVED**           | Stateless proxies restore and handle reconnected traffic.                                                                                      |
+| **traefik**            | proxy        | ✅ **SERVED**           | Stateless routers restore and handle reconnected traffic.                                                                                      |
+| **caddy**              | proxy        | ✅ **SERVED**           | Stateless routers restore and handle reconnected traffic.                                                                                      |
+| **python** (HTTP)      | app          | ✅ **SERVED**           | Stateless python workers survive.                                                                                                              |
+| **mongodb**            | datastore    | ❌ **FAILED**           | WiredTiger storage engine locks and blocks on sandboxed `io_uring` seccomp.                                                                    |
+| **cassandra**          | datastore    | ❌ **FAILED**           | Large JVM heaps mismatch host cgroups descriptors post-restore.                                                                                |
+| **cockroachdb**        | datastore    | ❌ **FAILED**           | Raft synchronization timeouts and socket reset crashes post-restore.                                                                           |
+| **clickhouse**         | datastore    | ❌ **FAILED**           | Columnar block datastore sync locks and file descriptor leaks.                                                                                 |
+| **rabbitmq / couchdb** | streaming    | ❌ **FAILED**           | Erlang BEAM runtime epoll and green thread scheduler structures cannot be serialized.                                                          |
+| **prometheus**         | monitoring   | ❌ **REFUSED**          | Active WAL memory mappings exceed serialization limits under both runtimes.                                                                    |
+| **elasticsearch**      | search       | ❌ **REFUSED**          | Heavy `fsnotify` directory watches cannot be serialized.                                                                                       |
 
 ---
 
@@ -276,7 +308,9 @@ Routing the fallback through the Eviction API to obtain the condition would make
 </details>
 
 ### Job Configuration Example:
+
 To enable this, your Job manifest must:
+
 1. Enable migration via labels.
 2. Configure `podFailurePolicy` to `Ignore` exit codes `137` (migration eviction) and `128` (restore-crash fallback).
 
@@ -314,6 +348,7 @@ spec:
 To migrate your workload using this controller:
 
 ### Step 1: Opt-in your Workload
+
 Add the label `pod-migration.gke.io/enabled: "true"` to your workload Pod template and ensure the Pod uses the `gvisor` runtime.
 
 The eviction webhook only migrates Pods whose runtime class is listed in the controller flag `--migratable-runtime-classes` (default `gvisor`; the token `@default` matches Pods that set no `runtimeClassName`). Only list a class that your installed snapshot engine supports: GKE Pod Snapshots supports `gvisor`.
@@ -323,6 +358,7 @@ A snapshot engine serves each migratable runtime class. By default, the controll
 An engine that does not fence the source Pod after checkpointing (`FencingNone` or unset) leaves the source running alongside the replacement until evicted. To migrate a Pod using an unfenced engine, the Pod must explicitly opt in with the annotation `pod-migration.gke.io/allow-unfenced: "true"`. Without this annotation, the eviction webhook and preemption controller refuse live migration, record a `Warning MigrationSkippedUnfencedEngine` event on the Pod, and fall back to cold eviction.
 
 Example (Deployment):
+
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -355,6 +391,7 @@ Because Pod probe specs are immutable after creation, any gated Pod that starts 
 - **Manifest recommendation:** Where you control the Pod manifest, prefer a short-period `startupProbe` with `readinessProbe.initialDelaySeconds: 0` instead of a long `initialDelaySeconds`, which speeds up both warm restores and cold starts without waiting on a long `periodSeconds` interval.
 
 ### Step 2: Trigger Migration via Eviction
+
 The controller automatically intercepts standard Kubernetes evictions and orchestrates the stateful migration. You can trigger this manually (e.g. for testing node upgrades) by draining the node the Pod is running on:
 
 1. **Find the node the Pod is running on:**
@@ -371,23 +408,24 @@ The controller automatically intercepts standard Kubernetes evictions and orches
    ```
 
 ### Step 3: Check the Restore Verdict
+
 The `PodMigrationJob`'s `Restored` condition records how the replacement Pod came up, and its message names the snapshot engine and the evidence:
 
 ```bash
 kubectl get podmigrationjob <job-name> -o jsonpath='{.status.conditions[?(@.type=="Restored")]}'
 ```
 
-| Phase | `Restored` reason | Meaning |
-|---|---|---|
-| `Succeeded` | `RestoreVerified` | The snapshot engine confirmed the restore with positive evidence. |
-| `Succeeded` | `RestoreInferred` | The engine has no positive restore signal and saw no sign of a failed restore, and the replacement stayed Ready without a container restart for the stabilization window (controller flag `--restore-stabilization-window`, default `30s`). GKE Pod Snapshots reports this verdict. |
-| `SucceededWithoutRestore` | `RestoreLost` | A container of the replacement restarted before the verdict, so it runs without its restored state. A `RestoreLost` Warning event is recorded on the job and on the Pod. |
-| `SucceededWithoutRestore` | `FallbackToColdStart`, `RestoreFailed` | The engine reported a cold start, or a failed restore. |
-| `SucceededWithoutRestore` | `RestoreTimeout` | No verdict within 5 minutes plus the stabilization window. With `--restore-placement`, a replacement released with the node constraints that isn't scheduled yet can still be deleted afterwards, once the scheduler reports that no node can take it, for its ReplicaSet or StatefulSet to recreate. Then `PlacementTimeout` Warning events are recorded on the job and the Pod, and the job keeps this reason. |
-| `SucceededWithoutRestore` | `NoCompatibleNode` | Only for a job that an earlier version of the controller held, with `--restore-placement`, because no node met the snapshot engine's node constraints when its replacement was due for release: the replacement started cold, without them. A `NoCompatibleNode` Warning event is recorded on the job. |
-| `SucceededWithoutRestore` | `PlacementTimeout` | With `--restore-placement`, the replacement released with the snapshot engine's node constraints wasn't scheduled within `--restore-placement-deadline` while a node without them could take it, or by the restore timeout, so it's deleted for its owner to recreate, and the new Pod starts cold. A `PlacementTimeout` Warning event is recorded on the job and on the Pod. If the scheduler placed or nominated the Pod just before the delete, the Pod is kept (and may still restore), and another `PlacementTimeout` Warning event on the job says so. |
-| `SucceededWithoutRestore` | `SnapshotDeleting` | The job was `Restoring`, and its replacement wasn't released yet, when its `PodSnapshot` was found being deleted, so nothing can restore from it (#265). The Pod Gate Reconciler holds the replacement rather than order a restore from that snapshot, and records `SnapshotRestorable=False` (reason `SnapshotDeleting`) on the job. The job then concludes, and the gate releases the replacement cold. A `SnapshotDeleting` Warning event is recorded on the job. |
-| `SucceededWithoutRestore` | `SnapshotGone` | As `SnapshotDeleting`, for a `PodSnapshot` that was already gone (#269). A `Restoring` job got there on a `Ready` snapshot, so one the API server doesn't have is gone. The hold is recorded as `SnapshotRestorable=False` with reason `SnapshotGone`, and a `SnapshotGone` Warning event is recorded on the job. |
+| Phase                     | `Restored` reason                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Succeeded`               | `RestoreVerified`                      | The snapshot engine confirmed the restore with positive evidence.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `Succeeded`               | `RestoreInferred`                      | The engine has no positive restore signal and saw no sign of a failed restore, and the replacement stayed Ready without a container restart for the stabilization window (controller flag `--restore-stabilization-window`, default `30s`). GKE Pod Snapshots reports this verdict.                                                                                                                                                                                                                                                                          |
+| `SucceededWithoutRestore` | `RestoreLost`                          | A container of the replacement restarted before the verdict, so it runs without its restored state. A `RestoreLost` Warning event is recorded on the job and on the Pod.                                                                                                                                                                                                                                                                                                                                                                                     |
+| `SucceededWithoutRestore` | `FallbackToColdStart`, `RestoreFailed` | The engine reported a cold start, or a failed restore.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `SucceededWithoutRestore` | `RestoreTimeout`                       | No verdict within 5 minutes plus the stabilization window. With `--restore-placement`, a replacement released with the node constraints that isn't scheduled yet can still be deleted afterwards, once the scheduler reports that no node can take it, for its ReplicaSet or StatefulSet to recreate. Then `PlacementTimeout` Warning events are recorded on the job and the Pod, and the job keeps this reason.                                                                                                                                             |
+| `SucceededWithoutRestore` | `NoCompatibleNode`                     | Only for a job that an earlier version of the controller held, with `--restore-placement`, because no node met the snapshot engine's node constraints when its replacement was due for release: the replacement started cold, without them. A `NoCompatibleNode` Warning event is recorded on the job.                                                                                                                                                                                                                                                       |
+| `SucceededWithoutRestore` | `PlacementTimeout`                     | With `--restore-placement`, the replacement released with the snapshot engine's node constraints wasn't scheduled within `--restore-placement-deadline` while a node without them could take it, or by the restore timeout, so it's deleted for its owner to recreate, and the new Pod starts cold. A `PlacementTimeout` Warning event is recorded on the job and on the Pod. If the scheduler placed or nominated the Pod just before the delete, the Pod is kept (and may still restore), and another `PlacementTimeout` Warning event on the job says so. |
+| `SucceededWithoutRestore` | `SnapshotDeleting`                     | The job was `Restoring`, and its replacement wasn't released yet, when its `PodSnapshot` was found being deleted, so nothing can restore from it (#265). The Pod Gate Reconciler holds the replacement rather than order a restore from that snapshot, and records `SnapshotRestorable=False` (reason `SnapshotDeleting`) on the job. The job then concludes, and the gate releases the replacement cold. A `SnapshotDeleting` Warning event is recorded on the job.                                                                                         |
+| `SucceededWithoutRestore` | `SnapshotGone`                         | As `SnapshotDeleting`, for a `PodSnapshot` that was already gone (#269). A `Restoring` job got there on a `Ready` snapshot, so one the API server doesn't have is gone. The hold is recorded as `SnapshotRestorable=False` with reason `SnapshotGone`, and a `SnapshotGone` Warning event is recorded on the job.                                                                                                                                                                                                                                            |
 
 ---
 
@@ -396,7 +434,9 @@ kubectl get podmigrationjob <job-name> -o jsonpath='{.status.conditions[?(@.type
 This repository contains production-ready YAML templates for trying out pod migration on your workloads under the `verification-suite/manifests/` directory.
 
 ### Running E2E Verification
+
 You can run automated E2E pod migration verification for any of the 21 pre-configured applications using the driver script `verification-suite/run_app_validation.sh`:
+
 ```bash
 # Run validation on Valkey
 ./verification-suite/run_app_validation.sh valkey
@@ -414,7 +454,9 @@ The CRIU engine has its own E2E on kind, which needs no GKE cluster or cloud cre
 ### Expected Log Output from `run_app_validation.sh`
 
 #### Valkey Verification
+
 When running `./verification-suite/run_app_validation.sh valkey`, you should expect logs similar to:
+
 ```
 [*] Deploying Valkey StatefulSet...
 statefulset.apps/pm-valkey created
@@ -447,12 +489,14 @@ pod/pm-valkey-0 condition met
 `PodMigration` resources use the `podmigration.gke.io/storage-cleanup` finalizer to ensure that cluster-scoped `PodSnapshotStorageConfig` (PSSC) and namespaced `PodSnapshotPolicy` (PSP) resources are cleanly deleted when a `PodMigration` CR is deleted. The finalizer also verifies whether any active migrations (`PodMigrationJob` resources in non-terminal phases) are running in the namespace, postponing deletion until in-flight jobs reach a terminal state (`Succeeded`, `SucceededWithoutRestore`, or `Failed`).
 
 When undeploying the controller, `PodMigration` custom resources must be deleted while the controller is still running so it can process the finalizer:
+
 ```bash
 # make undeploy handles this automatically by deleting PodMigration CRs first:
 make -C controller undeploy
 ```
 
 If the controller is deleted before the custom resources, `PodMigration` objects will wedge in `Terminating` and block CRD deletion. Similarly, if the controller is downgraded or rolled back to a pre-#35 image that does not support the finalizer, any `PodMigration` deleted during that time will wedge in `Terminating`. To manually unwedge:
+
 ```bash
 kubectl patch podmigration <name> -n <namespace> --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]'
 ```
@@ -462,6 +506,7 @@ kubectl patch podmigration <name> -n <namespace> --type=json -p='[{"op": "remove
 GKE enforces a ValidatingAdmissionPolicy (`gke-pod-snapshot-validating-admission-policy`) that prevents manual edits to `podsnapshots.podsnapshot.gke.io` by anyone other than the GKE snapshot controller and agent. This blocks users from manually removing finalizers from stuck `podsnapshots.podsnapshot.gke.io` (e.g. when GCS upload fails or during test resets).
 
 To override this check and perform cleanup (qualifying the `podsnapshot.gke.io` group explicitly so dual-engine clusters do not hit `podsnapshots.criu.podmigration.gke.io`):
+
 1. **Disable the validation actions temporarily by patching the binding to "Audit" instead of "Deny":**
    ```bash
    kubectl patch validatingadmissionpolicybinding gke-pod-snapshot-vap-binding \
@@ -570,27 +615,28 @@ The CRIU engine protects its restore outcome (`pod-migrate.io/psengine-restore`,
 
 The controller registers Prometheus metrics on the standard controller-runtime metrics endpoint (`:8080/metrics` by default):
 
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `pod_migration_active` | Gauge | None | Number of currently active pod migrations in flight. |
-| `pod_migration_outcomes_total` | Counter | `outcome` (`succeeded`, `failed`, `timeout`, `budget_timeout`, `fallback`, `succeeded_without_restore`, `engine_not_registered`, `restore_lost`, `deleted`) | Total completed migrations by outcome. `timeout` counts jobs that timed out, for example with reason `RestoreTimeout`. `NoCompatibleNode` and `PlacementTimeout` count as `succeeded_without_restore`: they're about placement, not a restore that ran out of time. |
-| `pod_migration_restore_verdicts_total` | Counter | `engine`, `verdict` (`confirmed`, `inferred`, `cold_start`, `failed`, `lost`, `timeout`, `no_compatible_node`, `placement_timeout`, `snapshot_deleting`, `snapshot_gone`) | Restore verdicts on replacement Pods, so a restore the engine confirmed can be told apart from one it inferred. |
-| `pod_migration_phase_duration_seconds` | Histogram | `phase` (`pending`, `snapshotting`, `evicting`, `restoring`) | Latency distribution of individual migration phases. |
-| `pod_migration_restore_crash_fallback_total` | Counter | None | Total cold-start fallbacks triggered by matched gVisor/OCI restore crashes. |
-| `pod_migration_restore_crash_unmatched_total` | Counter | None | Total unrecognised StartError restore-pod crashes with no known signature. |
-| `pod_migration_source_fence_total` | Counter | `action` (`fenced`, `unfenced`, `kept`, `refenced`) | Fence actions on migration sources (see [Source fence](#3-source-fence)). |
-| `pod_migration_spot_preemption_triggered_total` | Counter | None | Migrations started for Pods on a node that's being preempted. |
-| `pod_migration_spot_preemption_skipped_total` | Counter | `reason` (`ineligible`, `unfenced_engine`, `no_policy`, `unknown_memory`, `no_replica_key`, `ambiguous_replica_key`, `budget_exceeded`) | Pods on a node that's being preempted that were skipped for one of these reasons. Each skip also records a Warning event on the Pod, for example `MigrationSkippedIneligible` when the snapshot engine can't migrate the Pod. |
-| `pod_migration_source_fenced_seconds` | Histogram | `outcome` (`migrated`, `unfenced`) | Time a source spent fenced: until the migration moved on to restoring, or until a failed migration returned it to service. |
-| `pod_migration_application_downtime_seconds` | Histogram | `engine`, `outcome` (`RestoreVerified`, `RestoreInferred`, `ColdStart`) | Application pause duration (traffic stopped on source until replacement became Ready) in seconds (1s resolution, from whole-second RFC3339 timestamps), measuring actual service downtime. `ColdStart` samples are recorded once the replacement pod becomes `Ready` (which can be after job conclusion); cold replacements are observed for up to 5 minutes after job conclusion (checked when the controller reconciles), after which backfill is skipped. |
-| `pod_migration_skipped_total` | Counter | `reason`, `engine` | Total number of migration trigger evaluations that skipped live migration (by decision), labeled by canonical reason (`not_opted_in`, `unsupported_runtime`, `multi_container`, `host_network`, `node_not_ready`, `no_ready_policy`, `unfenced_engine`, `readiness_gates_unsatisfied`, `pdb_timed_out`, `no_replica_key`, `ambiguous_replica_key`, `budget_exceeded`, `unknown_memory`, `already_restored`, `missing_command`, `ineligible`) and engine. Counts evaluations per trigger event (decisions): repeated drain attempts retried every 5s on a PDB block or spot preemptions are counted on each decision, and non-opted-in pods evicted in user namespaces count under `not_opted_in`. Terminal jobs and unreadable pods fail open or cold-evict without moving this counter. |
-| `pod_migration_covered_running_pods` | Gauge | `namespace` | Number of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime. |
-| `pod_migration_total_running_pods` | Gauge | `namespace` | Total number of running pods in a migratable namespace. |
-| `pod_migration_coverage_ratio` | Gauge | `namespace` | Share of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime (0.0 to 1.0). Evaluated periodically (default 30s, flag `--coverage-refresh-interval`; 0 turns refresh off, otherwise at least 5s); "covered" checks workload opt-in, running status, supported runtime class, engine eligibility, and fencing allowance (readiness gates and replica-key ambiguity are evaluated at trigger time). |
+| Metric                                          | Type      | Labels                                                                                                                                                                    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pod_migration_active`                          | Gauge     | None                                                                                                                                                                      | Number of currently active pod migrations in flight.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `pod_migration_outcomes_total`                  | Counter   | `outcome` (`succeeded`, `failed`, `timeout`, `budget_timeout`, `fallback`, `succeeded_without_restore`, `engine_not_registered`, `restore_lost`, `deleted`)               | Total completed migrations by outcome. `timeout` counts jobs that timed out, for example with reason `RestoreTimeout`. `NoCompatibleNode` and `PlacementTimeout` count as `succeeded_without_restore`: they're about placement, not a restore that ran out of time.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `pod_migration_restore_verdicts_total`          | Counter   | `engine`, `verdict` (`confirmed`, `inferred`, `cold_start`, `failed`, `lost`, `timeout`, `no_compatible_node`, `placement_timeout`, `snapshot_deleting`, `snapshot_gone`) | Restore verdicts on replacement Pods, so a restore the engine confirmed can be told apart from one it inferred.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `pod_migration_phase_duration_seconds`          | Histogram | `phase` (`pending`, `snapshotting`, `evicting`, `restoring`)                                                                                                              | Latency distribution of individual migration phases.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `pod_migration_restore_crash_fallback_total`    | Counter   | None                                                                                                                                                                      | Total cold-start fallbacks triggered by matched gVisor/OCI restore crashes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `pod_migration_restore_crash_unmatched_total`   | Counter   | None                                                                                                                                                                      | Total unrecognised StartError restore-pod crashes with no known signature.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `pod_migration_source_fence_total`              | Counter   | `action` (`fenced`, `unfenced`, `kept`, `refenced`)                                                                                                                       | Fence actions on migration sources (see [Source fence](#3-source-fence)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `pod_migration_spot_preemption_triggered_total` | Counter   | None                                                                                                                                                                      | Migrations started for Pods on a node that's being preempted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `pod_migration_spot_preemption_skipped_total`   | Counter   | `reason` (`ineligible`, `unfenced_engine`, `no_policy`, `unknown_memory`, `no_replica_key`, `ambiguous_replica_key`, `budget_exceeded`)                                   | Pods on a node that's being preempted that were skipped for one of these reasons. Each skip also records a Warning event on the Pod, for example `MigrationSkippedIneligible` when the snapshot engine can't migrate the Pod.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `pod_migration_source_fenced_seconds`           | Histogram | `outcome` (`migrated`, `unfenced`)                                                                                                                                        | Time a source spent fenced: until the migration moved on to restoring, or until a failed migration returned it to service.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `pod_migration_application_downtime_seconds`    | Histogram | `engine`, `outcome` (`RestoreVerified`, `RestoreInferred`, `ColdStart`)                                                                                                   | Application pause duration (traffic stopped on source until replacement became Ready) in seconds (1s resolution, from whole-second RFC3339 timestamps), measuring actual service downtime. `ColdStart` samples are recorded once the replacement pod becomes `Ready` (which can be after job conclusion); cold replacements are observed for up to 5 minutes after job conclusion (checked when the controller reconciles), after which backfill is skipped.                                                                                                                                                                                                                                                                                                                             |
+| `pod_migration_skipped_total`                   | Counter   | `reason`, `engine`                                                                                                                                                        | Total number of migration trigger evaluations that skipped live migration (by decision), labeled by canonical reason (`not_opted_in`, `unsupported_runtime`, `multi_container`, `host_network`, `node_not_ready`, `no_ready_policy`, `unfenced_engine`, `readiness_gates_unsatisfied`, `pdb_timed_out`, `no_replica_key`, `ambiguous_replica_key`, `budget_exceeded`, `unknown_memory`, `already_restored`, `missing_command`, `ineligible`) and engine. Counts evaluations per trigger event (decisions): repeated drain attempts retried every 5s on a PDB block or spot preemptions are counted on each decision, and non-opted-in pods evicted in user namespaces count under `not_opted_in`. Terminal jobs and unreadable pods fail open or cold-evict without moving this counter. |
+| `pod_migration_covered_running_pods`            | Gauge     | `namespace`                                                                                                                                                               | Number of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `pod_migration_total_running_pods`              | Gauge     | `namespace`                                                                                                                                                               | Total number of running pods in a migratable namespace.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `pod_migration_coverage_ratio`                  | Gauge     | `namespace`                                                                                                                                                               | Share of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime (0.0 to 1.0). Evaluated periodically (default 30s, flag `--coverage-refresh-interval`; 0 turns refresh off, otherwise at least 5s); "covered" checks workload opt-in, running status, supported runtime class, engine eligibility, and fencing allowance (readiness gates and replica-key ambiguity are evaluated at trigger time).                                                                                                                                                                                                                                                                                                                                             |
 
 ### High Availability (HA) Scraping Considerations
 
 When running in multi-replica HA mode with leader election enabled:
+
 - The `/metrics` endpoint is served by all controller replicas.
 - Only the **leader replica** reconciles migrations and updates `pod_migration_active` in memory; standby replicas serve `pod_migration_active == 0`.
 - Coverage gauges (`pod_migration_covered_running_pods`, `pod_migration_total_running_pods`, and `pod_migration_coverage_ratio`) are evaluated by a leader-elected runner and only exist on the leader replica; alert and query on `max by (namespace) (pod_migration_coverage_ratio)`.
@@ -607,5 +653,3 @@ Reference Prometheus alerting rules are packaged in [`monitoring/prometheus-rule
 
 - **Release Process**: Step-by-step instructions for building, validating, and publishing official releases are documented in [docs/release-process.md](docs/release-process.md).
 - **Third-Party Licenses & GPL Source Availability**: The complete software inventory of published container images, license disclosures, and instructions for obtaining matching GPL/LGPL source code are documented in [docs/third-party-licenses.md](docs/third-party-licenses.md).
-
-
