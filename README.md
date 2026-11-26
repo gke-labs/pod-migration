@@ -190,7 +190,7 @@ Follow these ordered steps when upgrading an existing cluster:
    ```
    _Note_: Webhook configuration names (`mutating-webhook-configuration` and `validating-webhook-configuration`) are preserved in place, so nothing needs deleting and `kubectl apply` cleanly updates them without orphaned configurations. (During a rolling upgrade, an `reinvocationPolicy: IfNeeded` config can briefly reach an older controller replica before rollout completes; this is transient).
 3. **Apply Engine Manifests (CRIU)**:
-   If running the CRIU engine, apply its updated manifests while substituting your image registry and Workload Identity parameters (see [Deploy the CRIU Engine](engines/criu/README.md#storage-credentials)). `ENGINE_IMG`, `AGENT_IMG`, and `HOLDER_IMG` can be set to the images already running (e.g. read from the existing Deployment `pod-migrate-psengine-criu` and DaemonSet `pod-migrate-agent` in `pod-migration-criu-system`):
+   If running the CRIU engine, apply its updated manifests while substituting your image registry and Workload Identity parameters (see [Deploy the CRIU Engine](engines/criu/README.md#storage-credentials)). `ENGINE_IMG`, `AGENT_IMG`, and `HOLDER_IMG` can be set to the images already running (e.g. read from the existing Deployment `pod-migrate-psengine` and DaemonSet `pod-migrate-agent` in `pod-migration-criu-system`):
    ```bash
    sed -e "s|<YOUR_CRIU_ENGINE_IMAGE>|${ENGINE_IMG}|g" \
        -e "s|<YOUR_CRIU_AGENT_IMAGE>|${AGENT_IMG}|g" \

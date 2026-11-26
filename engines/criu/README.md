@@ -414,6 +414,7 @@ they start cold instead of being restored; also delete the
   when optional kernel features are missing (e.g. `missing optional CRIU features: pagemap_scan_guard_pages, timer_cr_ids`).
   When querying specifically for unready nodes, check `pod-migrate.io/criu-ready: "false"` rather than
   relying solely on the presence of the reason annotation.
+
 - **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
   `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
   bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable
