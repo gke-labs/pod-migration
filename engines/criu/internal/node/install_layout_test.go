@@ -288,7 +288,7 @@ func TestVerifyCRIU_RunsLayoutBundle(t *testing.T) {
 		ran = name
 		return "Looks good.", nil
 	}
-	if ok, _ := verifyCRIU(context.Background(), execHost, cosLayout.bundleDir); !ok {
+	if ok, _, _ := verifyCRIU(context.Background(), execHost, cosLayout.bundleDir); !ok {
 		t.Fatal("verifyCRIU = false")
 	}
 	if ran != "/home/kubernetes/bin/pod-migrate/criu-bundle/criu" {

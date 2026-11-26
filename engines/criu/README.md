@@ -124,15 +124,21 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      Debian forky pinned to a snapshot.debian.org timestamp)
      into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`
      (on COS, under `/home/kubernetes/bin`; see [Node images](#node-images)),
-     writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
-     `nsenter`, verifies containerd readiness (inspecting containerd's process
+     writes `/etc/criu/runc.conf`, runs `criu check --all` in the host namespaces via
+     `nsenter` (controlled by `PODMIG_CRIU_CHECK`, default: `all`), verifies containerd readiness (inspecting containerd's process
      PATH or shim PATH and ensuring `enable_criu != false` in containerd configuration
      before declaring the node ready), and stamps `pod-migrate.io/criu-ready` and
      `pod-migrate.io/criu-version` on the `Node`.
+     The node reaches `pod-migrate.io/criu-ready: true` if core checkpoint/restore features
+     pass and all required feature probes pass (`cgroupns`, `fdinfo_lock`, `mem_dirty_track`,
+     `seccomp_filters`, `seccomp_suspend`, and `uffd`). Missing optional features (such as
+     `timer_cr_ids` or `pagemap_scan_guard_pages` on Linux 6.12) are recorded in
+     `pod-migrate.io/criu-reason`. Setting `PODMIG_CRIU_CHECK=core` relaxes the kernel check
+     to plain `criu check` (core C/R features only).
      If containerd cannot resolve CRIU on its PATH/shim PATH, or CRIU is disabled
      by configuration, or containerd cached a failed CRIU lookup, or the CRIU
      containerd resolves is older than 4.2.1 (the bundle's minimum: older CRIU
-     fails dumps on Linux >= 6.16), the agent marks
+     fails dumps on Linux >= 6.16), or a required kernel feature is missing, the agent marks
      the node `pod-migrate.io/criu-ready: false` with reason and remediation
      annotations (`pod-migrate.io/criu-reason` and `pod-migrate.io/criu-remediation`).
      This prevents orchestrators from dispatching checkpoints to nodes where containerd
@@ -402,6 +408,11 @@ they start cold instead of being restored; also delete the
   first (put `/usr/local/sbin` earlier on containerd's `PATH`, or on the shim
   `PATH` if one is set) or remove the node's own CRIU, then restart
   containerd. The agent notices the restart and checks the node again.
+
+  Note: `pod-migrate.io/criu-reason` can also appear on ready nodes (`pod-migrate.io/criu-ready: true`)
+  when optional kernel features are missing (e.g. `missing optional CRIU features: pagemap_scan_guard_pages, timer_cr_ids`).
+  When querying specifically for unready nodes, check `pod-migrate.io/criu-ready: "false"` rather than
+  relying solely on the presence of the reason annotation.
 - **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
   `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
   bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable

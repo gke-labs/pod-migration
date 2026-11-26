@@ -66,6 +66,7 @@ type Node struct {
 	demoteInode        uint64
 	pendingDemote      bool
 	pendingVerdict     *nodeVerdict
+	readyReason        string
 	unreadyReason      string
 	unreadyRemediation string
 	transientReadiness bool
@@ -283,6 +284,7 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 	}
 	if v.ready {
 		n.poisonedInode = 0
+		n.readyReason = v.reason
 		n.unreadyReason = ""
 		n.unreadyRemediation = ""
 	} else {
@@ -351,18 +353,22 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno, startDemoteSeq u
 	if execFn == nil {
 		return fmt.Errorf("host command runner is not configured")
 	}
-	ok, raw := verifyCRIU(ctx, execFn, layout.bundleDir)
+	ok, criuReason, raw := verifyCRIU(ctx, execFn, layout.bundleDir)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	log.Info("criu capability", "version", version, "checkAll", ok, "raw", truncate(raw, 200))
+	log.Info("criu capability", "version", version, "checkAll", ok, "reason", criuReason, "raw", truncate(raw, 200))
 
 	var reason, remediation string
 	var transientErr error
 	if !ok {
-		reason = "criu check --all failed"
+		reason = criuReason
+		if reason == "" {
+			reason = "criu check --all failed"
+		}
 		remediation = "check host kernel support for CRIU"
 	} else {
+		reason = criuReason
 		// Kernel check passed; verify containerd readiness so an unready containerd
 		// is never sent a checkpoint that would poison its lookup cache (#130).
 		insp := n.Inspector
@@ -598,6 +604,10 @@ func (n *Node) retryContainerdReadiness(ctx context.Context, ino uint64) (bool, 
 	if !cOk {
 		reason = cReason
 		remediation = cRemediation
+	} else {
+		n.mu.Lock()
+		reason = n.readyReason
+		n.mu.Unlock()
 	}
 
 	if err := n.publish(ctx, nodeVerdict{
