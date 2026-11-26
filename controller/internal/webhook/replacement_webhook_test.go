@@ -1273,23 +1273,18 @@ func TestPodGateInjector_AlreadyGatedReinvocationScrubbing(t *testing.T) {
 		t.Fatalf("Expected patches removing spoofed annotations, got empty patches")
 	}
 
-	for _, patch := range resp.Patches {
-		if patch.Path == "/metadata/annotations" {
-			if m, ok := patch.Value.(map[string]interface{}); ok {
-				if _, ok := m["podsnapshot.gke.io/ps-name"]; ok {
-					t.Errorf("podsnapshot.gke.io/ps-name survived scrubbing in patch")
-				}
-				if _, ok := m[engine.CRIURestoreStatusAnnotation]; ok {
-					t.Errorf("CRIURestoreStatusAnnotation survived scrubbing in patch")
-				}
-				if _, ok := m[engine.CRIURestoreReasonAnnotation]; ok {
-					t.Errorf("CRIURestoreReasonAnnotation survived scrubbing in patch")
-				}
-				if val, ok := m[engine.CRIUInjectedAnnotation]; !ok || val != "true" {
-					t.Errorf("CRIUInjectedAnnotation was scrubbed: got %v, want 'true'", val)
-				}
-			}
-		}
+	patchedPod := applyReadinessAdmissionPatches(t, rawPod, resp)
+	if _, ok := patchedPod.Annotations["podsnapshot.gke.io/ps-name"]; ok {
+		t.Errorf("podsnapshot.gke.io/ps-name survived scrubbing on reinvocation")
+	}
+	if _, ok := patchedPod.Annotations[engine.CRIURestoreStatusAnnotation]; ok {
+		t.Errorf("%s survived scrubbing on reinvocation", engine.CRIURestoreStatusAnnotation)
+	}
+	if _, ok := patchedPod.Annotations[engine.CRIURestoreReasonAnnotation]; ok {
+		t.Errorf("%s survived scrubbing on reinvocation", engine.CRIURestoreReasonAnnotation)
+	}
+	if val, ok := patchedPod.Annotations[engine.CRIUInjectedAnnotation]; !ok || val != "true" {
+		t.Errorf("%s was scrubbed: got %v, want 'true'", engine.CRIUInjectedAnnotation, val)
 	}
 
 	// Case 2: Clean already-gated pod with matching assigned-pmj and CRIU injected marker,

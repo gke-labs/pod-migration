@@ -400,8 +400,9 @@ webhooks:
   # 2. mpodgate-runc.podmigration.gke.io (failurePolicy: Ignore):
   #    Matches all pods in managed namespaces. Non-gVisor pods (and custom gVisor runtime
   #    classes) fail open during a controller outage, meaning new pods start cold and
-  #    cluster workloads do not wedge during outages. The handler is idempotent and returns
-  #    Allowed immediately on reinvocation if already gated and assigned.
+  #    cluster workloads do not wedge during outages. The handler is idempotent on reinvocation:
+  #    it scrubs restore annotations, clears readiness delay, and preserves CRIU injector markers
+  #    without duplicating scheduling gates.
   - name: mpodgate-runc.podmigration.gke.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
