@@ -2,6 +2,7 @@ package invariants
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -192,10 +193,17 @@ func effectiveJobEngineName(job *pmv1alpha1.PodMigrationJob) string {
 	return DefaultEngineName
 }
 
-func inspectPodRestoreOrder(s *ReconcileSnapshot, engineName string, pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool) {
-	if s != nil && s.RestoreOrders != nil {
-		return s.RestoreOrders(engineName, pod)
-	}
+// isGVisorPod reports whether pod runs in a gVisor sandbox. The GKE Pod
+// Snapshots runtime reads podsnapshot.gke.io/ps-name when it creates the
+// sandbox of such a pod, whatever engine serves the pod's job (#151).
+func isGVisorPod(pod *corev1.Pod) bool {
+	return pod != nil && pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName == restore.GVisorRuntimeClass
+}
+
+// gkeRestoreOrder reads the GKE Pod Snapshots restore order on pod
+// (podsnapshot.gke.io/ps-name): a snapshot name, or the cold-start bypass when
+// the value is empty.
+func gkeRestoreOrder(pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool) {
 	if pod == nil || pod.Annotations == nil {
 		return "", false, false
 	}
@@ -208,6 +216,149 @@ func inspectPodRestoreOrder(s *ReconcileSnapshot, engineName string, pod *corev1
 		return "", true, true
 	}
 	return trimmed, false, true
+}
+
+// inspectPodRestoreOrder reads the restore order of engineName on pod ("" for
+// the first order of any registered engine) through s.RestoreOrders, or the
+// GKE Pod Snapshots order when the snapshot has no RestoreOrders.
+func inspectPodRestoreOrder(s *ReconcileSnapshot, engineName string, pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool) {
+	if s != nil && s.RestoreOrders != nil {
+		return s.RestoreOrders(engineName, pod)
+	}
+	return gkeRestoreOrder(pod)
+}
+
+// assignedJobEngine returns the engine of the job that pod is attached to (its
+// assigned-pmj annotation), named as effectiveJobEngineName names it, and
+// whether that job is in jobByKey. Without a job in the snapshot, it returns
+// "" and false, and callers accept the restore order of any registered engine.
+func assignedJobEngine(jobByKey map[string]pmv1alpha1.PodMigrationJob, pod *corev1.Pod) (string, bool) {
+	if pod == nil || pod.Annotations == nil {
+		return "", false
+	}
+	assigned := pod.Annotations[AnnotationAssignedPMJ]
+	if assigned == "" {
+		return "", false
+	}
+	job, ok := jobByKey[pod.Namespace+"/"+assigned]
+	if !ok {
+		return "", false
+	}
+	return effectiveJobEngineName(&job), true
+}
+
+// restoreKeyProbe is a snapshot name that no engine orders. readsRestoreKey
+// sets it under one annotation key to learn whether an engine reads that key.
+const restoreKeyProbe = "pod-migration-invariants-restore-key-probe"
+
+// readsRestoreKey reports whether engineName ("" for any registered engine)
+// reads its restore order from the annotation key. It asks RestoreOrders about
+// a probe pod that carries only key, set to restoreKeyProbe, and otherwise has
+// pod's namespace, name, UID and runtime class. RestoreOrders only reads the
+// pod (C5), so the engine reads the probe back exactly when key is its restore
+// key. Without RestoreOrders, every engine reads podsnapshot.gke.io/ps-name.
+func readsRestoreKey(s *ReconcileSnapshot, engineName string, pod *corev1.Pod, key string) bool {
+	if pod == nil {
+		pod = &corev1.Pod{}
+	}
+	probe := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   pod.Namespace,
+			Name:        pod.Name,
+			UID:         pod.UID,
+			Annotations: map[string]string{key: restoreKeyProbe},
+		},
+		Spec: corev1.PodSpec{RuntimeClassName: pod.Spec.RuntimeClassName},
+	}
+	snap, bypass, present := inspectPodRestoreOrder(s, engineName, probe)
+	return present && !bypass && snap == restoreKeyProbe
+}
+
+// snapshotOrder is an order on a pod to restore the snapshot snap. key is the
+// pod annotation that holds the order (<group>/ps-name), so it names the
+// snapshot's API group; "" means the group is unknown.
+type snapshotOrder struct {
+	key  string
+	snap string
+}
+
+// sameSnapshot reports whether the orders a and b can name the same snapshot:
+// the same name under the same key, or under a key that is unknown.
+func sameSnapshot(a, b snapshotOrder) bool {
+	return a.snap == b.snap && (a.key == b.key || a.key == "" || b.key == "")
+}
+
+// orderKey returns the annotation of pod from which engineName ("" for any
+// registered engine) read its restore order snap: of the annotations that hold
+// snap, the first in sorted order whose removal changes what RestoreOrders
+// reads. It returns "" (an unknown API group) when no annotation holds snap,
+// or when the order doesn't rest on any single one of them, such as two
+// engines' annotations holding the same name on a pod whose job isn't known.
+func orderKey(s *ReconcileSnapshot, engineName string, pod *corev1.Pod, snap string) string {
+	var keys []string
+	for k, v := range pod.Annotations {
+		if strings.TrimSpace(v) == snap {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		without := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   pod.Namespace,
+				Name:        pod.Name,
+				UID:         pod.UID,
+				Annotations: make(map[string]string, len(pod.Annotations)),
+			},
+			Spec: corev1.PodSpec{RuntimeClassName: pod.Spec.RuntimeClassName},
+		}
+		for ak, av := range pod.Annotations {
+			if ak != k {
+				without.Annotations[ak] = av
+			}
+		}
+		if got, bypass, ok := inspectPodRestoreOrder(s, engineName, without); !ok || bypass || got != snap {
+			return k
+		}
+	}
+	return ""
+}
+
+// restoredSnapshots returns the snapshots that pod is ordered to restore: the
+// restore order of engineName ("" for any registered engine) and, on a gVisor
+// pod, the GKE Pod Snapshots order, which the GKE runtime acts on whatever
+// engine serves the pod's job (#151). A cold-start bypass restores nothing.
+func restoredSnapshots(s *ReconcileSnapshot, engineName string, pod *corev1.Pod) []snapshotOrder {
+	var orders []snapshotOrder
+	if snap, bypass, ok := inspectPodRestoreOrder(s, engineName, pod); ok && !bypass && snap != "" {
+		orders = append(orders, snapshotOrder{key: orderKey(s, engineName, pod, snap), snap: snap})
+	}
+	if isGVisorPod(pod) {
+		if snap, bypass, ok := gkeRestoreOrder(pod); ok && !bypass && snap != "" {
+			if o := (snapshotOrder{key: AnnotationPSName, snap: snap}); !slices.Contains(orders, o) {
+				orders = append(orders, o)
+			}
+		}
+	}
+	return orders
+}
+
+// restoresJobSnapshot reports whether pod is ordered to restore snapshotRef, a
+// snapshot of a job that engineName serves. When pod's job is known, orders are
+// the ones restoredSnapshots counts for pod, and one of them must name
+// snapshotRef under a key that engineName reads (or under an unknown key).
+// Otherwise pod's order for engineName must name snapshotRef.
+func restoresJobSnapshot(s *ReconcileSnapshot, engineName, snapshotRef string, pod *corev1.Pod, jobKnown bool, orders []snapshotOrder) bool {
+	if !jobKnown {
+		snap, bypass, ok := inspectPodRestoreOrder(s, engineName, pod)
+		return ok && !bypass && snap == snapshotRef
+	}
+	for _, o := range orders {
+		if o.snap == snapshotRef && (o.key == "" || readsRestoreKey(s, engineName, pod, o.key)) {
+			return true
+		}
+	}
+	return false
 }
 
 // migratedAgain reports whether targeting, the jobs that target one pod, holds a
@@ -238,6 +389,17 @@ func restoreVerified(job *pmv1alpha1.PodMigrationJob) bool {
 // A PodSnapshot may be bound to and consumed by at most one replacement Pod UID
 // across the cluster's lifetime, and a consumed PMJ with GateReleased=true must
 // never be re-bound to a different replacement Pod UID.
+//
+// To find duplicates, a pod's restore order is read for the engine of its job
+// (GKE Pod Snapshots for a job that names no engine), never another engine's,
+// and as the first order of any registered engine when its job isn't in the
+// snapshot. A gVisor pod also restores its podsnapshot.gke.io/ps-name order,
+// whatever its job's engine. A snapshot belongs to the API group of the
+// annotation that orders it (<group>/ps-name): the same name under two groups'
+// keys is two snapshots, while engines that share a group share its snapshots.
+// The rebind check counts the same orders for a pod whose job is known, under a
+// key the consumed job's engine reads, and otherwise the pod's order for the
+// consumed job's engine.
 func EvaluateI1(s *ReconcileSnapshot) []Violation {
 	var violations []Violation
 	jobs := allPMJs(s)
@@ -248,50 +410,52 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 		jobByKey[j.Namespace+"/"+j.Name] = j
 	}
 
-	snapshotConsumers := make(map[string]string) // snapshotRef -> podUID (or pod key)
-	for _, pod := range pods {
-		engName := ""
-		if pod.Annotations != nil {
-			if assigned := pod.Annotations[AnnotationAssignedPMJ]; assigned != "" {
-				if assignedJob, ok := jobByKey[pod.Namespace+"/"+assigned]; ok {
-					engName = jobEngineAnnotation(&assignedJob)
-				}
-			}
-		}
-		snap, bypass, ok := inspectPodRestoreOrder(s, engName, &pod)
-		if (!ok || bypass || snap == "") && engName != "" {
-			snap, bypass, ok = inspectPodRestoreOrder(s, "", &pod)
-		}
-		if !ok || bypass || snap == "" {
-			continue
-		}
+	// consumers maps a snapshot name to the orders to restore it seen so far,
+	// with the pod (UID, or namespace/name without one) that carries each.
+	type consumer struct {
+		order snapshotOrder
+		podID string
+	}
+	consumers := make(map[string][]consumer)
+	// podOrders[i] holds the orders counted for pods[i], and jobKnown[i] whether
+	// its job is in the snapshot; the rebind check below reads them again.
+	podOrders := make([][]snapshotOrder, len(pods))
+	jobKnown := make([]bool, len(pods))
+	for i := range pods {
+		pod := &pods[i]
+		engName, known := assignedJobEngine(jobByKey, pod)
+		podOrders[i], jobKnown[i] = restoredSnapshots(s, engName, pod), known
 		podID := string(pod.UID)
 		if podID == "" {
 			podID = pod.Namespace + "/" + pod.Name
 		}
-		if prevPodID, exists := snapshotConsumers[snap]; exists && prevPodID != podID {
-			violations = append(violations, Violation{
-				InvariantID:   "I1",
-				InvariantName: "AtMostOnceRestore",
-				Reason:        "DuplicateSnapshotConsumption",
-				Message:       fmt.Sprintf("snapshot %q is simultaneously bound to multiple replacement pods (%s and %s)", snap, prevPodID, podID),
-				Namespace:     pod.Namespace,
-				PodName:       pod.Name,
-			})
-		} else {
-			snapshotConsumers[snap] = podID
+		for _, order := range podOrders[i] {
+			for _, prev := range consumers[order.snap] {
+				if prev.podID != podID && sameSnapshot(prev.order, order) {
+					violations = append(violations, Violation{
+						InvariantID:   "I1",
+						InvariantName: "AtMostOnceRestore",
+						Reason:        "DuplicateSnapshotConsumption",
+						Message:       fmt.Sprintf("snapshot %q is simultaneously bound to multiple replacement pods (%s and %s)", order.snap, prev.podID, podID),
+						Namespace:     pod.Namespace,
+						PodName:       pod.Name,
+					})
+					break
+				}
+			}
+			consumers[order.snap] = append(consumers[order.snap], consumer{order: order, podID: podID})
 		}
 	}
 
 	for _, job := range jobs {
 		if job.Status.Consumed && job.Status.GateReleased && job.Status.SnapshotRef != "" {
-			engName := jobEngineAnnotation(&job)
-			for _, pod := range pods {
-				snap, bypass, ok := inspectPodRestoreOrder(s, engName, &pod)
-				if ok && !bypass && snap == job.Status.SnapshotRef &&
-					job.Status.RestoredPodUID != "" &&
+			engName := effectiveJobEngineName(&job)
+			for i := range pods {
+				pod := &pods[i]
+				if job.Status.RestoredPodUID != "" &&
 					string(pod.UID) != "" &&
-					string(pod.UID) != job.Status.RestoredPodUID {
+					string(pod.UID) != job.Status.RestoredPodUID &&
+					restoresJobSnapshot(s, engName, job.Status.SnapshotRef, pod, jobKnown[i], podOrders[i]) {
 					// The rebound pod is the one about to restore the consumed
 					// snapshot, so report against the job it is attached to when
 					// it has one; strict mode fails only the job a violation names (#198).
@@ -320,6 +484,7 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 // A PMJ may transition to Succeeded (warm restore) iff Status.SnapshotRef is non-empty,
 // Status.RestoredPodName is recorded, and (when the replacement Pod is present in the
 // snapshot) the replacement Pod carries the matching restore order for the job's engine
+// (GKE Pod Snapshots for a job that names no engine; another engine's order doesn't count)
 // and did not bypass restore via a cold-start bypass order. The replacement check matches
 // by RestoredPodUID when recorded, skipping pods replaced under the same name. The cold-start
 // bypass is accepted when another PMJ set the bypass on the pod (stamping its name in
@@ -330,6 +495,10 @@ func EvaluateI1(s *ReconcileSnapshot) []Violation {
 // or RestoreInferred) AND the replacement carries `pod-migration.gke.io/restore-completed`
 // matching Status.SnapshotRef: the controller sets both after the verified restore, so that later
 // restarts of the replacement don't restore the migration snapshot again (#152).
+// A released gVisor replacement whose job's engine orders restores under a key other than
+// podsnapshot.gke.io/ps-name must also carry the GKE Pod Snapshots cold-start bypass
+// (podsnapshot.gke.io/ps-name: ""): the GKE runtime reads that key when it creates the
+// sandbox of every gVisor pod, and can restore a leftover snapshot without it (#151).
 func EvaluateI2(s *ReconcileSnapshot) []Violation {
 	var violations []Violation
 	jobs := allPMJs(s)
@@ -378,7 +547,8 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 				if job.Status.RestoredPodUID != "" && pod.UID != "" && string(pod.UID) != job.Status.RestoredPodUID {
 					continue
 				}
-				snapAnn, coldStartBypass, present := inspectPodRestoreOrder(s, jobEngineAnnotation(&job), &pod)
+				engName := effectiveJobEngineName(&job)
+				snapAnn, coldStartBypass, present := inspectPodRestoreOrder(s, engName, &pod)
 				restoreCompleted := pod.Annotations[AnnotationRestoreCompleted]
 				if coldStartBypass && restoreVerified(&job) && restoreCompleted != "" && restoreCompleted == job.Status.SnapshotRef {
 					continue
@@ -395,8 +565,8 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 						InvariantID:   "I2",
 						InvariantName: "NoSilentColdStart",
 						Reason:        "SucceededPodMissingRestoreAnnotation",
-						Message: fmt.Sprintf("PMJ %s/%s is Succeeded expecting snapshot %q on replacement pod %s, but pod has %s=%q (coldStartBypass=%t)",
-							job.Namespace, job.Name, job.Status.SnapshotRef, pod.Name, AnnotationPSName, snapAnn, coldStartBypass),
+						Message: fmt.Sprintf("PMJ %s/%s is Succeeded expecting snapshot %q on replacement pod %s, but the pod's restore order for engine %q is %q (present=%t, coldStartBypass=%t)",
+							job.Namespace, job.Name, job.Status.SnapshotRef, pod.Name, engName, snapAnn, present, coldStartBypass),
 						Namespace: job.Namespace,
 						PMJName:   job.Name,
 						PodName:   pod.Name,
@@ -407,7 +577,8 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 	}
 
 	// Also verify that any replacement pod still carrying assigned-pmj whose gate was removed
-	// has either a non-empty snapshot name or the explicit cold-start bypass order.
+	// has either a non-empty snapshot name or the explicit cold-start bypass order of its
+	// job's engine (of any registered engine when the job isn't in the snapshot).
 	for _, pod := range pods {
 		if pod.DeletionTimestamp != nil || podHasGate(&pod) || pod.Annotations == nil {
 			continue
@@ -416,25 +587,38 @@ func EvaluateI2(s *ReconcileSnapshot) []Violation {
 		if assigned == "" {
 			continue
 		}
-		engName := ""
-		if assignedJob, ok := jobByKey[pod.Namespace+"/"+assigned]; ok {
-			engName = jobEngineAnnotation(&assignedJob)
-		}
-		_, _, hasPSKey := inspectPodRestoreOrder(s, engName, &pod)
-		if !hasPSKey && engName != "" {
-			_, _, hasPSKey = inspectPodRestoreOrder(s, "", &pod)
-		}
-		if !hasPSKey {
+		engName, jobKnown := assignedJobEngine(jobByKey, &pod)
+		if _, _, hasOrder := inspectPodRestoreOrder(s, engName, &pod); !hasOrder {
+			wantOrder := "any registered engine"
+			if jobKnown {
+				wantOrder = fmt.Sprintf("engine %q", engName)
+			}
 			violations = append(violations, Violation{
 				InvariantID:   "I2",
 				InvariantName: "NoSilentColdStart",
 				Reason:        "GateReleasedWithoutSnapshotOrColdStartBypass",
-				Message: fmt.Sprintf("pod %s/%s had scheduling gate %q removed while assigned to PMJ %s without %s set to a snapshot name or explicit empty-string bypass",
-					pod.Namespace, pod.Name, MigrationGateName, assigned, AnnotationPSName),
+				Message: fmt.Sprintf("pod %s/%s had scheduling gate %q removed while assigned to PMJ %s without a restore order of %s (a snapshot name or the explicit empty-string cold-start bypass)",
+					pod.Namespace, pod.Name, MigrationGateName, assigned, wantOrder),
 				Namespace: pod.Namespace,
 				PMJName:   assigned,
 				PodName:   pod.Name,
 			})
+		}
+		// Without its job in the snapshot, the pod's engine is unknown, so
+		// only a pod whose job's engine is known is checked here.
+		if jobKnown && isGVisorPod(&pod) && !readsRestoreKey(s, engName, &pod, AnnotationPSName) {
+			if gkeSnap, gkeBypass, gkePresent := gkeRestoreOrder(&pod); !gkePresent || !gkeBypass {
+				violations = append(violations, Violation{
+					InvariantID:   "I2",
+					InvariantName: "NoSilentColdStart",
+					Reason:        "GVisorPodMissingGKEColdStartBypass",
+					Message: fmt.Sprintf("gVisor pod %s/%s had scheduling gate %q removed while assigned to PMJ %s, whose engine %q orders restores under a key other than %s, without the GKE Pod Snapshots cold-start bypass %s: \"\" (present=%t, snapshot=%q), so GKE Pod Snapshots can restore a leftover snapshot into its sandbox",
+						pod.Namespace, pod.Name, MigrationGateName, assigned, engName, AnnotationPSName, AnnotationPSName, gkePresent, gkeSnap),
+					Namespace: pod.Namespace,
+					PMJName:   assigned,
+					PodName:   pod.Name,
+				})
+			}
 		}
 	}
 	return violations
