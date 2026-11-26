@@ -144,8 +144,8 @@ type PodMigrationJobReconciler struct {
 	Recorder record.EventRecorder
 
 	// InvariantEngine evaluates stateless correctness invariants (I1-I12) at the
-	// end of each reconcile step with zero extra API calls. Optional: nil skips
-	// evaluation.
+	// end of each reconcile step from the informer cache (see invariantReader).
+	// Optional: nil skips evaluation.
 	InvariantEngine *invariants.Engine
 
 	// RestoreEngines classifies restore failures.  Optional: nil selects the
@@ -209,6 +209,16 @@ type PodMigrationJobReconciler struct {
 	// (namespace/name -> time.Time).  In-memory only; a restart just means
 	// one extra probe per in-flight migration.
 	fallbackEventChecks sync.Map
+
+	// invariantReader serves the PodSnapshotManualTrigger and PodSnapshot
+	// reads of invariant evaluation from the informer cache (#199), for the
+	// kinds in invariantCachedGVKs. SetupWithManager sets both: the manager's
+	// cache, and the kinds it watches, whose informers are already running.
+	// The manager's client reads unstructured objects from the API server, so
+	// without this every evaluation would make live reads. nil (unit tests
+	// that build the reconciler directly) reads through Client.
+	invariantReader     client.Reader
+	invariantCachedGVKs map[schema.GroupVersionKind]bool
 }
 
 func (r *PodMigrationJobReconciler) getMigrationTimeout(job *pmv1alpha1.PodMigrationJob) time.Duration {
@@ -791,6 +801,50 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 	r.evaluateInvariantsWithSnapshot(ctx, job, nil, res, reconcileErr)
 }
 
+// getForInvariants reads a PodSnapshotManualTrigger or PodSnapshot (obj
+// carries its GVK) for invariant evaluation from the informer cache, so these
+// reads never reach the API server (#199). The only live read left is the I5
+// confirmation in confirmOrphanedTrigger.
+//
+// It reads only kinds that SetupWithManager watches, whose informers are
+// running and synced. A kind it doesn't watch had no CRD at startup. A cache
+// read of that kind would start a new informer in the middle of a reconcile,
+// and if the controller can't list and watch it (for example a custom
+// --criu-api-group that the shipped RBAC doesn't cover), that informer never
+// syncs and Get blocks for as long as the reconcile runs. So for such a kind
+// it reads nothing and returns NoKindMatchError, the error a live read returns
+// when the CRD is missing.
+func (r *PodMigrationJobReconciler) getForInvariants(ctx context.Context, key types.NamespacedName, obj *unstructured.Unstructured) error {
+	if r.invariantReader == nil {
+		return r.Get(ctx, key, obj)
+	}
+	gvk := obj.GroupVersionKind()
+	if !r.invariantCachedGVKs[gvk] {
+		return &meta.NoKindMatchError{GroupKind: gvk.GroupKind(), SearchedVersions: []string{gvk.Version}}
+	}
+	return r.invariantReader.Get(ctx, key, obj)
+}
+
+// confirmOrphanedTrigger reports whether a concluded job's trigger, which
+// the cache still shows undeleted, really is (I5). The paths that fail a job
+// delete its trigger in the same reconcile, just before this evaluation, so
+// the cache may not have seen the delete yet. One live read tells a leaked
+// trigger from a stale cache entry. It runs only when the cache shows a
+// concluded job with an undeleted trigger. If the live read fails for another
+// reason, the cache's answer stands.
+func (r *PodMigrationJobReconciler) confirmOrphanedTrigger(ctx context.Context, key types.NamespacedName, gvk schema.GroupVersionKind) bool {
+	if r.invariantReader == nil {
+		// The trigger was just read through Client, without a cache.
+		return true
+	}
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(gvk)
+	if err := r.liveReader().Get(ctx, key, live); err != nil {
+		return !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err)
+	}
+	return live.GetDeletionTimestamp() == nil
+}
+
 func snapshotProgressFromStatus(st *snapshot.Status) invariants.SnapshotProgress {
 	return invariants.SnapshotProgress{
 		Ready:            st.Phase == snapshot.PhaseReady,
@@ -842,12 +896,13 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 	snapName := job.Status.SnapshotRef
 	if job.Spec.PodRef.Name != "" {
 		triggerName := util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
+		triggerKey := types.NamespacedName{Namespace: job.Namespace, Name: triggerName}
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(snapshot.ManualTriggerGVK(primaryGroup))
-		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger); err == nil {
+		if err := r.getForInvariants(ctx, triggerKey, trigger); err == nil {
 			if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
 				job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed) && trigger.GetDeletionTimestamp() == nil {
-				hasOrphanedTrigger = true
+				hasOrphanedTrigger = r.confirmOrphanedTrigger(ctx, triggerKey, trigger.GroupVersionKind())
 			}
 			if snapName == "" {
 				if createdName, found, _ := unstructured.NestedString(trigger.Object, "status", "snapshotCreated", "name"); found {
@@ -862,7 +917,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 	if snapName != "" {
 		snapObj := &unstructured.Unstructured{}
 		snapObj.SetGroupVersionKind(snapshot.PodSnapshotGVK(primaryGroup))
-		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
+		if err := r.getForInvariants(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
 			primarySnapObj = snapObj
 			primarySnapshotConditions = extractUnstructuredConditions(snapObj)
 		}
@@ -901,7 +956,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 		}
 		otherSnapObj := &unstructured.Unstructured{}
 		otherSnapObj.SetGroupVersionKind(snapshot.PodSnapshotGVK(r.jobAPIGroup(other)))
-		if err := r.Get(ctx, types.NamespacedName{Namespace: other.Namespace, Name: other.Status.SnapshotRef}, otherSnapObj); err == nil {
+		if err := r.getForInvariants(ctx, types.NamespacedName{Namespace: other.Namespace, Name: other.Status.SnapshotRef}, otherSnapObj); err == nil {
 			recordSnapshotProgress(otherKey, snapshot.CheckPodSnapshotStatus(otherSnapObj, now))
 		} else if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			var fallbackProvider snapshot.Provider
@@ -2793,6 +2848,11 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 
 	restMapper := mgr.GetRESTMapper()
 
+	// Invariant evaluation reads triggers and PodSnapshots of the kinds
+	// watched below from the manager's cache (#199).
+	r.invariantReader = mgr.GetCache()
+	r.invariantCachedGVKs = map[schema.GroupVersionKind]bool{}
+
 	for _, group := range r.apiGroups() {
 		psmtGVK := snapshot.ManualTriggerGVK(group)
 		watchPSMT, err := shouldWatchCRD(restMapper, psmtGVK)
@@ -2805,6 +2865,7 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 			psmt := &unstructured.Unstructured{}
 			psmt.SetGroupVersionKind(psmtGVK)
 			bldr = bldr.Watches(psmt, handler.EnqueueRequestForOwner(mgr.GetScheme(), restMapper, &pmv1alpha1.PodMigrationJob{}))
+			r.invariantCachedGVKs[psmtGVK] = true
 		}
 
 		snapGVK := snapshot.PodSnapshotGVK(group)
@@ -2818,6 +2879,7 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 			snap := &unstructured.Unstructured{}
 			snap.SetGroupVersionKind(snapGVK)
 			bldr = bldr.Watches(snap, handler.EnqueueRequestsFromMapFunc(r.mapSnapshotToPMJ))
+			r.invariantCachedGVKs[snapGVK] = true
 		}
 	}
 
