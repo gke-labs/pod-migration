@@ -702,17 +702,13 @@ func EvaluateI3(s *ReconcileSnapshot) []Violation {
 
 // EffectiveMigrationTimeout reads the effective migration deadline stamped on the PMJ's
 // `pod-migration.gke.io/timeout` annotation (which PR #57 stamps at creation / Pending),
-// capped at util.MaxMigrationTimeout (2h) to match the reconciler, and falling back to
+// clamped to [util.MinMigrationTimeout, util.MaxMigrationTimeout] (1m to 2h) with
+// util.ParseClampedTimeout, as the reconciler reads it (#330), and falling back to
 // MaxMigrationDuration (10m) when unset or invalid.
 func EffectiveMigrationTimeout(job *pmv1alpha1.PodMigrationJob) time.Duration {
 	if job != nil && job.Annotations != nil {
-		if raw := job.Annotations[AnnotationMigrationTimeout]; raw != "" {
-			if d, err := time.ParseDuration(raw); err == nil && d > 0 {
-				if d > util.MaxMigrationTimeout {
-					return util.MaxMigrationTimeout
-				}
-				return d
-			}
+		if d, ok := util.ParseClampedTimeout(job.Annotations[AnnotationMigrationTimeout]); ok {
+			return d
 		}
 	}
 	return MaxMigrationDuration
@@ -745,7 +741,8 @@ func snapshotProgressForJob(s *ReconcileSnapshot, job *pmv1alpha1.PodMigrationJo
 
 // EvaluateI4 enforces I4 (Terminal Progress):
 // Active PMJs in Pending/Snapshotting/Evicting must not exceed their effective migration
-// timeout (`pod-migration.gke.io/timeout` annotation on the PMJ, or 10m default)
+// timeout (`pod-migration.gke.io/timeout` annotation on the PMJ, clamped to 1m-2h as
+// the reconciler reads it, or 10m default)
 // without transitioning to a terminal phase, and a deleting PodMigration CR with
 // StorageCleanupFinalizer must not remain un-finalized past MaxMigrationDuration (10m).
 // The PMJ deadline runs from creation while Pending and from Status.SnapshottingStartTime after.
