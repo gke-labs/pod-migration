@@ -110,6 +110,27 @@ func newPostCheckpointEviction(pod *corev1.Pod) *policyv1.Eviction {
 	}
 }
 
+// removeCheckpointedSource asks the API server to remove the checkpointed
+// origin pod with postCheckpointEvictionGracePeriodSeconds. A Spot
+// preemption job deletes it directly (#305): preemption is an involuntary
+// disruption, as for the skipped budget check in Pending, and an admission
+// webhook or policy on pods/eviction, such as a disruption window, would deny
+// the eviction even after node shutdown terminated the pod, leaving the job to
+// wait out its short deadline and cold-start. The UID precondition keeps the
+// delete from removing a pod that reused the name since pod was read, such as
+// a StatefulSet replacement; the API server answers that with a Conflict.
+// Every other job uses the eviction subresource, which honors budgets and
+// admission on evictions.
+func (r *PodMigrationJobReconciler) removeCheckpointedSource(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) error {
+	if isSpotPreemptionJob(job) {
+		uid := pod.UID
+		return r.Delete(ctx, pod,
+			client.GracePeriodSeconds(postCheckpointEvictionGracePeriodSeconds),
+			client.Preconditions{UID: &uid})
+	}
+	return r.SubResource("eviction").Create(ctx, pod, newPostCheckpointEviction(pod))
+}
+
 // PodMigrationJobReconciler reconciles a PodMigrationJob object.
 type PodMigrationJobReconciler struct {
 	client.Client
@@ -1480,6 +1501,13 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 			return r.handleStatusError(ctx, err, "Failed to fence the source before its checkpoint")
 		}
+		// A source deleted outright, for example force-deleted by a drain
+		// past its timeout, or replaced under its name, has nothing left to
+		// checkpoint (#295). Fail now, as for a source that finished, rather
+		// than wait out the migration timeout with the replacement gated.
+		if res, failed, err := r.failIfSourceGoneMidCheckpoint(ctx, req, job, origJob); failed || err != nil {
+			return res, err
+		}
 		// Note: a same-IP engine (such as CRIU) must wait for EndpointSlice
 		// serving: false before checkpointing (#146 C4), so in-flight traffic drains.
 		res, err := r.getSnapshotProvider(job).EnsureTrigger(ctx, job, podName)
@@ -1684,13 +1712,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if pod.DeletionTimestamp != nil {
 				// An external evictor (kubectl drain, node upgrade) may have won the race to evict the
 				// checkpointed pod with the pod's full grace period. Shorten it through the eviction
-				// subresource: the API server skips PDB checks for terminating pods, and a delete can
-				// only shorten, never extend, a pending grace period. Best effort: on failure the pod
-				// still terminates on its original grace period.
+				// subresource (a Spot preemption job: a direct delete, #305): the API server skips PDB
+				// checks for terminating pods, and a delete can only shorten, never extend, a pending
+				// grace period. Best effort: on failure the pod still terminates on its original grace
+				// period.
 				if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds > postCheckpointEvictionGracePeriodSeconds {
 					logger.Info("Shortening termination grace period of checkpointed origin pod", "pod", podName,
 						"fromSeconds", *pod.DeletionGracePeriodSeconds, "toSeconds", postCheckpointEvictionGracePeriodSeconds)
-					if err := r.SubResource("eviction").Create(ctx, pod, newPostCheckpointEviction(pod)); err != nil && !apierrors.IsNotFound(err) {
+					if err := r.removeCheckpointedSource(ctx, job, pod); err != nil && !apierrors.IsNotFound(err) {
 						logger.Error(err, "Failed to shorten origin pod termination grace period", "pod", podName)
 					}
 				}
@@ -1723,9 +1752,25 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{Requeue: true}, nil
 			}
 
+			// A Spot preemption job deletes the source directly (#305), so
+			// neither a budget nor an admission policy on evictions can hold
+			// it. A Conflict is the UID precondition failing: the name now
+			// belongs to another pod, so the source is gone, and the next
+			// pass sees the new UID and moves on.
+			if isSpotPreemptionJob(job) {
+				logger.Info("Deleting checkpointed origin pod of a Spot preemption job", "pod", podName,
+					"gracePeriodSeconds", postCheckpointEvictionGracePeriodSeconds)
+				err = r.removeCheckpointedSource(ctx, job, pod)
+				if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+					logger.Error(err, "Failed to delete origin pod of a Spot preemption job")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+
 			logger.Info("Requesting PDB-safe origin pod eviction", "pod", podName,
 				"gracePeriodSeconds", postCheckpointEvictionGracePeriodSeconds)
-			err = r.SubResource("eviction").Create(ctx, pod, newPostCheckpointEviction(pod))
+			err = r.removeCheckpointedSource(ctx, job, pod)
 			switch {
 			case err == nil || apierrors.IsNotFound(err):
 				logger.Info("Successfully initiated PDB-safe pod eviction", "pod", podName)

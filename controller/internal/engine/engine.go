@@ -136,9 +136,19 @@ type Engine interface {
 }
 
 // Verdict is an eligibility decision. Reason explains a refusal.
+// Code optionally carries a canonical skip reason (e.g. multi_container, host_network, node_not_ready).
 type Verdict struct {
 	OK     bool
+	Code   string
 	Reason string
+}
+
+// ClassifyEligibilityVerdict returns the canonical skip reason for an eligibility refusal.
+func ClassifyEligibilityVerdict(v Verdict) string {
+	if v.Code != "" {
+		return v.Code
+	}
+	return "ineligible"
 }
 
 // PolicyRef names the policy object that serves a pod.

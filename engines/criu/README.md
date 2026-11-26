@@ -119,7 +119,8 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      `pod-migration.gke.io/engine: criu` so other engines' pods are never touched).
 2. **`cmd/agent` (privileged node DaemonSet):**
    - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 4.2.1
-     bundle (older CRIU fails dumps on Linux >= 6.16)
+     bundle (older CRIU fails dumps on Linux >= 6.16; the image builds it from
+     Debian forky pinned to a snapshot.debian.org timestamp)
      into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
      writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
      `nsenter`, verifies containerd readiness (inspecting containerd's process
@@ -127,11 +128,14 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      before declaring the node ready), and stamps `pod-migrate.io/criu-ready` and
      `pod-migrate.io/criu-version` on the `Node`.
      If containerd cannot resolve CRIU on its PATH/shim PATH, or CRIU is disabled
-     by configuration, or containerd cached a failed CRIU lookup, the agent marks
+     by configuration, or containerd cached a failed CRIU lookup, or the CRIU
+     containerd resolves is older than 4.2.1 (the bundle's minimum: older CRIU
+     fails dumps on Linux >= 6.16), the agent marks
      the node `pod-migrate.io/criu-ready: false` with reason and remediation
      annotations (`pod-migrate.io/criu-reason` and `pod-migrate.io/criu-remediation`).
      This prevents orchestrators from dispatching checkpoints to nodes where containerd
-     would poison its CRIU lookup cache (#130).
+     would poison its CRIU lookup cache (#130), or dump with a CRIU too old for
+     the kernel.
      Containerd inspection reads containerd's primary configuration file (from
      `--config` / `-c` or default `/etc/containerd/config.toml`) and does not follow
      multi-file `imports` / `conf.d` drop-ins.
@@ -366,6 +370,34 @@ they start cold instead of being restored; also delete the
   in that order. A node whose `runc` is elsewhere is still marked CRIU-ready,
   but its restores fail and the replacements start cold. Nodes need no CRIU of
   their own: the agent installs its bundled CRIU.
+- **CRIU on containerd's path:** if a node has its own CRIU and containerd
+  finds it before the agent's `/usr/local/sbin/criu` (earlier on containerd's
+  `PATH`, or on the shim `PATH` when one is set), it must be 4.2.1 or newer.
+  Otherwise the agent marks the node `pod-migrate.io/criu-ready: false`, and
+  its `pod-migrate.io/criu-reason` ends in "older than minimum supported
+  version 4.2.1".
+
+  **Upgrading.** An agent from before this requirement accepted any CRIU from
+  3.16 on. After the upgrade, a node where containerd finds its own CRIU 3.16
+  to 4.2.0 first turns `criu-ready: false`, with a `criu-reason` like this:
+
+  ```text
+  criu version 4.1.1 on containerd PATH is older than minimum supported version 4.2.1
+  ```
+
+  The controller then stops migrating that node's pods with CRIU, so a drain
+  evicts them cold; checkpoints already running and restores aren't affected.
+  To list such nodes:
+
+  ```bash
+  kubectl get nodes -o custom-columns='NODE:.metadata.name,REASON:.metadata.annotations.pod-migrate\.io/criu-reason' \
+    | grep 'older than minimum supported version 4.2.1'
+  ```
+
+  To fix a node, make containerd find the agent's `/usr/local/sbin/criu`
+  first (put `/usr/local/sbin` earlier on containerd's `PATH`, or on the shim
+  `PATH` if one is set) or remove the node's own CRIU, then restart
+  containerd. The agent notices the restart and checks the node again.
 - **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
   `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
   bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable
@@ -498,7 +530,8 @@ for last the one through which project Editors may change the bucket's IAM
 policy), checks that the bucket grants nobody else, and warns about what the
 bucket's own policy can't keep out (below). Run it as a project Owner or
 Storage Admin. Then point the PodMigration of each namespace that only CRIU
-serves at the bucket (`spec.storage.location: gs://<BUCKET_NAME>/<PATH>`).
+serves at the bucket (`spec.storage.location: gs://<BUCKET_NAME>/<namespace>/snapshots`
+or another path starting with `<namespace>/`, as required by the controller's multi-tenant scoping guardrails).
 
 A namespace that both engines serve (its runtime classes routed partly to
 `gke-pod-snapshots` and partly to `criu`) has one storage location for both
@@ -1059,21 +1092,38 @@ docker build -f build/holder/Dockerfile -t <YOUR_CRIU_HOLDER_IMAGE> .
 
 ### End-to-end test on kind
 
-CI runs real migrations on a local kind cluster for pull requests and pushes
-to `main` that touch `engines/criu/`, `controller/`, `verification-suite/` or
-`.github/workflows/` (`.github/workflows/criu-e2e.yaml`,
-[#230](https://github.com/gke-labs/pod-migration/issues/230)). The kind
+CI runs real migrations on a local kind cluster
+(`.github/workflows/criu-e2e.yaml`,
+[#230](https://github.com/gke-labs/pod-migration/issues/230)). The job runs for
+every pull request to `main`, so that it can be a required check, but it brings
+up the cluster only when the pull request touches `engines/criu/`,
+`controller/`, `verification-suite/` or `.github/workflows/`; otherwise it
+passes within seconds. Pushes to `main` that touch those paths run it too, and
+so does a manual run. The kind
 workers run real containerd, runc and CRIU, and `fake-gcs-server` stands in
 for the bucket. Two stateful pods, each in its own namespace, are drained to
 the other worker: the first must be restored warm; the second holds a file on
 an emptyDir, which doesn't move, so its restore must fail and its replacement
 must start cold and serve.
 
+A failed run isn't retried. Whether to rerun it is a maintainer's decision:
+the job checks correctness, and a pass on a second try can hide a real race.
+A failed run uploads the `criu-kind-e2e-logs` artifact (node journals, every
+pod's log, the migration objects and events) and keeps it for 7 days.
+
 To run it locally you need an x86-64 Linux host whose kernel passes
 `criu check`, with Docker, kind v0.33.0 (the version CI pins), kubectl, make,
-jq and openssl. `up.sh` first deletes any kind cluster named `pm-e2e`, and
+curl, jq and openssl. `up.sh` first deletes any kind cluster named `pm-e2e`, and
 creates the archive signing key Secret with a random key before it applies
-the engine's manifest (see [Archive signing](#archive-signing)).
+the engine's manifest (see [Archive signing](#archive-signing)). It pins the
+kind node image, `fake-gcs-server`, the counter's busybox image and
+cert-manager's manifest by digest or checksum (see the top of `up.sh` to change
+one). It doesn't pin cert-manager's own images, which that manifest names by
+tag, or most of what goes into the four images it builds (base images by tag,
+packages from live archives), and CI runs on GitHub's `ubuntu-24.04` runner
+image, kernel included, so a run can also fail on a tree that didn't change.
+`run_criu_kind_e2e.sh` reads `BUCKET`, `CLUSTER` and `WORKLOAD_IMAGE` too:
+export them for both scripts.
 
 ```bash
 verification-suite/kind/up.sh
@@ -1119,7 +1169,8 @@ kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent
 ```
 
 Then point the PodMigration of each namespace that only CRIU serves at that
-bucket (`spec.storage.location: gs://<BUCKET_NAME>/<PATH>`).
+bucket (`spec.storage.location: gs://<BUCKET_NAME>/<namespace>/snapshots`
+or another path starting with `<namespace>/`).
 
 When creating `PodSnapshotStorageConfig` and `PodSnapshotPolicy` resources for
 this engine, label them with `pod-migrate.io/engine: criu` so `cmd/engine`

@@ -482,9 +482,10 @@ var wantPolicy = map[string]interface{}{
 
 func TestGKEPodSnapshots_NamespaceResources(t *testing.T) {
 	tests := []struct {
-		name     string
-		location string
-		wantGCS  map[string]interface{}
+		name        string
+		location    string
+		tokenSource string
+		wantGCS     map[string]interface{}
 	}{
 		{name: "bucket and path", location: "gs://my-test-bucket/snapshots/path",
 			wantGCS: map[string]interface{}{"bucket": "my-test-bucket", "path": "snapshots/path"}},
@@ -492,10 +493,16 @@ func TestGKEPodSnapshots_NamespaceResources(t *testing.T) {
 			wantGCS: map[string]interface{}{"bucket": "my-test-bucket"}},
 		{name: "bucket with a trailing slash", location: "gs://my-test-bucket/",
 			wantGCS: map[string]interface{}{"bucket": "my-test-bucket"}},
+		{name: "federatedP4SA multi-tenancy tokenSource", location: "gs://my-test-bucket/tenant-a", tokenSource: "federatedP4SA",
+			wantGCS: map[string]interface{}{"bucket": "my-test-bucket", "path": "tenant-a", "tokenSource": "federatedP4SA"}},
+		{name: "podKSA explicit tokenSource", location: "gs://my-test-bucket/tenant-b", tokenSource: "podKSA",
+			wantGCS: map[string]interface{}{"bucket": "my-test-bucket", "path": "tenant-b", "tokenSource": "podKSA"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := NewGKEPodSnapshots(nil, nil).NamespaceResources(testPodMigration(tt.location))
+			pm := testPodMigration(tt.location)
+			pm.Spec.Storage.TokenSource = tt.tokenSource
+			got, err := NewGKEPodSnapshots(nil, nil).NamespaceResources(pm)
 			if err != nil {
 				t.Fatalf("NamespaceResources: %v", err)
 			}
@@ -509,6 +516,19 @@ func TestGKEPodSnapshots_NamespaceResources(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestGKEPodSnapshots_NamespaceResourcesRejectsInvalidTokenSource(t *testing.T) {
+	pm := testPodMigration("gs://my-test-bucket/snapshots")
+	pm.Spec.Storage.TokenSource = "invalid-token-source"
+	got, err := NewGKEPodSnapshots(nil, nil).NamespaceResources(pm)
+	var locationErr *StorageLocationError
+	if !errors.As(err, &locationErr) {
+		t.Fatalf("NamespaceResources with invalid tokenSource error = %v, want *StorageLocationError", err)
+	}
+	if got != nil {
+		t.Errorf("NamespaceResources returned objects %v with error", got)
 	}
 }
 

@@ -155,6 +155,38 @@ var (
 		Buckets: prometheus.ExponentialBuckets(1, 2, 12),
 	}, []string{"outcome"})
 
+	// SkippedMigrationsTotal counts migration trigger evaluations that skipped
+	// live migration by canonical reason and engine (by decision).
+	// Reasons: not_opted_in | unsupported_runtime | multi_container | host_network |
+	// node_not_ready | no_ready_policy | unfenced_engine | readiness_gates_unsatisfied |
+	// pdb_timed_out | no_replica_key | ambiguous_replica_key | already_restored |
+	// missing_command | unknown_memory | budget_exceeded | ineligible
+	// Engines: gke-pod-snapshots | criu | none
+	SkippedMigrationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pod_migration_skipped_total",
+		Help: "Total number of migration trigger evaluations that skipped live migration (by decision), labeled by canonical reason and engine.",
+	}, []string{"reason", "engine"})
+
+	// MigratableCoveredRunningPods tracks the number of running pods in a migratable
+	// namespace covered by a Ready migration policy and eligible runtime.
+	MigratableCoveredRunningPods = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pod_migration_covered_running_pods",
+		Help: "Number of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime.",
+	}, []string{"namespace"})
+
+	// MigratableTotalRunningPods tracks the total number of running pods in a migratable namespace.
+	MigratableTotalRunningPods = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pod_migration_total_running_pods",
+		Help: "Total number of running pods in a migratable namespace.",
+	}, []string{"namespace"})
+
+	// MigratableCoverageRatio tracks the fraction (0.0 to 1.0) of running pods in a
+	// migratable namespace covered by a Ready migration policy and eligible runtime.
+	MigratableCoverageRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pod_migration_coverage_ratio",
+		Help: "Share of running pods in a migratable namespace covered by a Ready migration policy and eligible runtime (0.0 to 1.0).",
+	}, []string{"namespace"})
+
 	// ApplicationDowntimeSeconds tracks the observed application downtime (pause duration)
 	// from source pod traffic stop to replacement pod Ready, by engine and outcome.
 	// Outcomes: RestoreVerified | RestoreInferred | ColdStart
@@ -166,6 +198,9 @@ var (
 
 	activeJobsMu sync.Mutex
 	activeJobs   = make(map[string]struct{})
+
+	coverageNamespacesMu sync.Mutex
+	coverageNamespaces   = make(map[string]struct{})
 )
 
 func init() {
@@ -183,8 +218,65 @@ func init() {
 		SourceFenceTotal,
 		SourceFencedSeconds,
 		RestoreVerdictsTotal,
+		SkippedMigrationsTotal,
+		MigratableCoveredRunningPods,
+		MigratableTotalRunningPods,
+		MigratableCoverageRatio,
 		ApplicationDowntimeSeconds,
 	)
+}
+
+// RecordMigrationSkipped increments the counter for skipped pod live migrations.
+func RecordMigrationSkipped(reason, engine string) {
+	if engine == "" {
+		engine = "none"
+	}
+	if reason != "" {
+		SkippedMigrationsTotal.WithLabelValues(reason, engine).Inc()
+	}
+}
+
+// RecordNamespaceCoverage sets the gauge metrics for running pod coverage in a migratable namespace.
+func RecordNamespaceCoverage(namespace string, covered, total int) {
+	if namespace == "" {
+		return
+	}
+	coverageNamespacesMu.Lock()
+	coverageNamespaces[namespace] = struct{}{}
+	coverageNamespacesMu.Unlock()
+
+	MigratableCoveredRunningPods.WithLabelValues(namespace).Set(float64(covered))
+	MigratableTotalRunningPods.WithLabelValues(namespace).Set(float64(total))
+	ratio := 0.0
+	if total > 0 {
+		ratio = float64(covered) / float64(total)
+	}
+	MigratableCoverageRatio.WithLabelValues(namespace).Set(ratio)
+}
+
+// ClearNamespaceCoverage removes the gauge metrics for a namespace that is no longer migratable.
+func ClearNamespaceCoverage(namespace string) {
+	if namespace == "" {
+		return
+	}
+	coverageNamespacesMu.Lock()
+	delete(coverageNamespaces, namespace)
+	coverageNamespacesMu.Unlock()
+
+	MigratableCoveredRunningPods.DeleteLabelValues(namespace)
+	MigratableTotalRunningPods.DeleteLabelValues(namespace)
+	MigratableCoverageRatio.DeleteLabelValues(namespace)
+}
+
+// CoverageNamespaces returns a slice of all namespaces currently carrying coverage metrics.
+func CoverageNamespaces() []string {
+	coverageNamespacesMu.Lock()
+	defer coverageNamespacesMu.Unlock()
+	res := make([]string, 0, len(coverageNamespaces))
+	for ns := range coverageNamespaces {
+		res = append(res, ns)
+	}
+	return res
 }
 
 // RecordApplicationDowntime records the observed application downtime in seconds
@@ -322,4 +414,16 @@ func ResetActiveJobsForTest() {
 	defer activeJobsMu.Unlock()
 	activeJobs = make(map[string]struct{})
 	ActiveMigrations.Set(0)
+}
+
+// ResetCoverageForTest resets coverage and skipped metrics for unit tests.
+func ResetCoverageForTest() {
+	coverageNamespacesMu.Lock()
+	coverageNamespaces = make(map[string]struct{})
+	coverageNamespacesMu.Unlock()
+
+	MigratableCoveredRunningPods.Reset()
+	MigratableTotalRunningPods.Reset()
+	MigratableCoverageRatio.Reset()
+	SkippedMigrationsTotal.Reset()
 }

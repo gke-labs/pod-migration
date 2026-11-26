@@ -242,11 +242,21 @@ func findLatestReadyManualStopPSP(
 		return nil, fmt.Errorf("failed to list PSPs in group %s: %w", group, err)
 	}
 
+	return MatchLatestReadyManualStopPSP(pspList.Items, podLabels, requiredPolicyLabels, excludedEngine), nil
+}
+
+// MatchLatestReadyManualStopPSP matches the newest Ready manual+stop PSP from an in-memory slice of policies.
+func MatchLatestReadyManualStopPSP(
+	items []unstructured.Unstructured,
+	podLabels map[string]string,
+	requiredPolicyLabels map[string]string,
+	excludedEngine string,
+) *unstructured.Unstructured {
 	var matchingPSPs []*unstructured.Unstructured
 	podLabelSet := labels.Set(podLabels)
 
-	for i := range pspList.Items {
-		psp := &pspList.Items[i]
+	for i := range items {
+		psp := &items[i]
 
 		if excludedEngine != "" && psp.GetLabels()[LabelSnapshotEngine] == excludedEngine {
 			continue
@@ -317,7 +327,7 @@ func findLatestReadyManualStopPSP(
 	}
 
 	if len(matchingPSPs) == 0 {
-		return nil, nil // No matching ready policy found
+		return nil
 	}
 
 	// Sort by latest updated time (descending)
@@ -330,10 +340,10 @@ func findLatestReadyManualStopPSP(
 	// 4. Validate latest policy for "stop" behavior
 	postCheckpoint, found, err := unstructured.NestedString(latestPSP.Object, "spec", "triggerConfig", "postCheckpoint")
 	if err == nil && found && postCheckpoint == "stop" {
-		return latestPSP, nil
+		return latestPSP
 	}
 
-	return nil, nil // Return nil if the latest policy is not a "stop" policy
+	return nil
 }
 
 // LatestUpdate extracts the most recent "Update" timestamp from managed fields of unstructured object.

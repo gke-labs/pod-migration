@@ -62,6 +62,7 @@ type fenceTestProvider struct {
 	cleanupCalls int
 	state        snapshot.CheckpointState
 	stateErr     error
+	status       *snapshot.Status // CheckStatus's answer; nil: in progress
 }
 
 func (p *fenceTestProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (ctrl.Result, error) {
@@ -76,6 +77,10 @@ func (p *fenceTestProvider) EnsureTrigger(ctx context.Context, job *pmv1alpha1.P
 }
 
 func (p *fenceTestProvider) CheckStatus(ctx context.Context, job *pmv1alpha1.PodMigrationJob, podName string) (*snapshot.Status, error) {
+	if p.status != nil {
+		st := *p.status
+		return &st, nil
+	}
 	return &snapshot.Status{Phase: snapshot.PhaseInProgress, Reason: "Snapshotting", Message: "checkpointing"}, nil
 }
 
@@ -401,34 +406,110 @@ func TestFenceSource_NoTriggerUntilTheFenceIsInPlace(t *testing.T) {
 }
 
 // TestFenceSource_NothingToFence: a source that's gone, replaced, or finished
-// isn't fenced, and the trigger step runs as before.
+// isn't fenced. A finished one goes on to the trigger step as before; a gone
+// or replaced one fails the job with PodNotFound, and no trigger is created
+// for a pod that isn't there (#295).
 func TestFenceSource_NothingToFence(t *testing.T) {
 	replaced := fenceTestSource(fenceTestCID, 0)
 	replaced.UID = "successor-uid"
 	finished := fenceTestSource(fenceTestCID, 0)
 	finished.Status.Phase = corev1.PodSucceeded
-	for name, objs := range map[string][]client.Object{
-		"gone":     nil,
-		"replaced": {replaced},
-		"finished": {finished},
+	for name, tc := range map[string]struct {
+		objs        []client.Object
+		wantEnsure  int
+		wantFailure string
+	}{
+		"gone":     {nil, 0, "PodNotFound"},
+		"replaced": {[]client.Object{replaced}, 0, "PodNotFound"},
+		"finished": {[]client.Object{finished}, 1, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
-			f := newFenceFixture(t, interceptor.Funcs{}, append(objs, fenceTestSnapshottingJob())...)
+			f := newFenceFixture(t, interceptor.Funcs{}, append(tc.objs, fenceTestSnapshottingJob())...)
 			if _, err := f.reconcile(t); err != nil {
 				t.Fatalf("Reconcile: %v", err)
 			}
-			if f.provider.ensureCalls != 1 {
-				t.Errorf("EnsureTrigger calls = %d, want 1", f.provider.ensureCalls)
+			if f.provider.ensureCalls != tc.wantEnsure {
+				t.Errorf("EnsureTrigger calls = %d, want %d", f.provider.ensureCalls, tc.wantEnsure)
 			}
 			for _, w := range f.writes.list() {
 				if strings.HasPrefix(w, "pod ") {
 					t.Errorf("wrote %q to a pod that isn't the source", w)
 				}
 			}
-			if meta.FindStatusCondition(f.job(t).Status.Conditions, ConditionSourceFenced) != nil {
+			job := f.job(t)
+			if meta.FindStatusCondition(job.Status.Conditions, ConditionSourceFenced) != nil {
 				t.Error("SourceFenced recorded without a source to fence")
 			}
+			if tc.wantFailure != "" {
+				ready := meta.FindStatusCondition(job.Status.Conditions, "Ready")
+				if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseFailed || ready == nil || ready.Reason != tc.wantFailure {
+					t.Errorf("phase=%s Ready=%+v, want Failed/%s", job.Status.Phase, ready, tc.wantFailure)
+				}
+				if f.provider.cleanupCalls == 0 {
+					t.Error("the trigger wasn't cleaned up when the source was gone")
+				}
+			}
 		})
+	}
+}
+
+// TestSourceGone_SnapshotOutcomeDecides: once the source is gone, only a
+// checkpoint that hasn't completed fails the job with PodNotFound (#295). A
+// completed one that's still uploading is waited for, a durable snapshot
+// still goes on to Evicting, which restores it, and a failed one keeps its
+// own reason.
+func TestSourceGone_SnapshotOutcomeDecides(t *testing.T) {
+	inProgress := snapshot.Status{Phase: snapshot.PhaseInProgress, Reason: "Snapshotting", SnapshotRef: "snap-1"}
+	for name, tc := range map[string]struct {
+		status     snapshot.Status
+		state      snapshot.CheckpointState
+		wantPhase  pmv1alpha1.PodMigrationJobPhase
+		wantReason string
+	}{
+		"in progress":          {inProgress, snapshot.CheckpointState{}, pmv1alpha1.PodMigrationJobPhaseFailed, "PodNotFound"},
+		"completed, uploading": {inProgress, snapshot.CheckpointState{Completed: true}, pmv1alpha1.PodMigrationJobPhaseSnapshotting, "Snapshotting"},
+		"ready":                {snapshot.Status{Phase: snapshot.PhaseReady, SnapshotRef: "snap-1"}, snapshot.CheckpointState{Completed: true, Settled: true}, pmv1alpha1.PodMigrationJobPhaseEvicting, "Evicting"},
+		"deleting":             {snapshot.Status{Phase: snapshot.PhaseInProgress, Reason: snapshot.ReasonSnapshotDeleting, SnapshotRef: "snap-1"}, snapshot.CheckpointState{}, pmv1alpha1.PodMigrationJobPhaseSnapshotting, ""},
+		"failed":               {snapshot.Status{Phase: snapshot.PhaseFailed, Reason: "SnapshotFailed", Message: "dump failed"}, snapshot.CheckpointState{}, pmv1alpha1.PodMigrationJobPhaseFailed, "SnapshotFailed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSnapshottingJob())
+			st := tc.status
+			f.provider.status = &st
+			f.provider.state = tc.state
+			if _, err := f.reconcile(t); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			job := f.job(t)
+			ready := meta.FindStatusCondition(job.Status.Conditions, "Ready")
+			if tc.wantReason == "" {
+				// Left to the usual handling, which confirms a deleting
+				// snapshot live; the fake has none, so the job waits.
+				if job.Status.Phase != tc.wantPhase || (ready != nil && ready.Reason == "PodNotFound") {
+					t.Fatalf("phase=%s Ready=%+v, want %s and not PodNotFound", job.Status.Phase, ready, tc.wantPhase)
+				}
+				return
+			}
+			if job.Status.Phase != tc.wantPhase || ready == nil || ready.Reason != tc.wantReason {
+				t.Fatalf("phase=%s Ready=%+v, want %s/%s", job.Status.Phase, ready, tc.wantPhase, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestSourceGone_CacheMissConfirmedLive: a source the cache doesn't have yet,
+// but the API server does, isn't taken for gone (#295).
+func TestSourceGone_CacheMissConfirmedLive(t *testing.T) {
+	f := newFenceFixture(t, interceptor.Funcs{}, fenceTestSnapshottingJob())
+	f.r.APIReader = fake.NewClientBuilder().WithScheme(fenceTestScheme()).
+		WithObjects(fenceTestSource(fenceTestCID, 0)).Build()
+	job := f.job(t)
+	_, failed, err := f.r.failIfSourceGoneMidCheckpoint(context.Background(), ctrl.Request{}, job, job.DeepCopy())
+	if err != nil || failed {
+		t.Fatalf("failed=%t err=%v, want the live source to keep the job going", failed, err)
+	}
+	if got := f.job(t); got.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting {
+		t.Fatalf("phase=%s, want Snapshotting", got.Status.Phase)
 	}
 }
 
