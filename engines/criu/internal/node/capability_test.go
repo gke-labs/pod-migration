@@ -52,7 +52,7 @@ func TestInstallCRIUBundle_SkipsSubdirectories(t *testing.T) {
 	}
 
 	// installCRIUBundleDirs must skip licenses/ without erroring on copyFile.
-	ver, err := installCRIUBundleDirs(srcDir, dstDir, confDir, binDir)
+	ver, err := installCRIUBundleDirs(srcDir, dstDir, confDir, binDir, []byte("#!/bin/sh\n"))
 	if err != nil {
 		t.Fatalf("installCRIUBundleDirs failed: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestVerifyCRIU_ExecAndModes(t *testing.T) {
 			return "Looks good.\n", nil
 		}
 
-		ok, reason, raw := verifyCRIU(ctx, execHost)
+		ok, reason, raw := verifyCRIU(ctx, execHost, criuBundleDir)
 		if !ok || reason != "" || !strings.Contains(raw, "Looks good") {
 			t.Fatalf("unexpected verifyCRIU result: ok=%v reason=%q raw=%q", ok, reason, raw)
 		}
@@ -280,7 +280,7 @@ func TestVerifyCRIU_ExecAndModes(t *testing.T) {
 			return "Looks good.\n", nil
 		}
 
-		ok, reason, _ := verifyCRIU(ctx, execHost)
+		ok, reason, _ := verifyCRIU(ctx, execHost, criuBundleDir)
 		if !ok || reason != "" {
 			t.Fatalf("unexpected verifyCRIU result: ok=%v reason=%q", ok, reason)
 		}
@@ -295,7 +295,7 @@ func TestVerifyCRIU_ExecAndModes(t *testing.T) {
 			return "", errors.New("binary not executable")
 		}
 
-		ok, reason, _ := verifyCRIU(ctx, execHost)
+		ok, reason, _ := verifyCRIU(ctx, execHost, criuBundleDir)
 		if ok {
 			t.Fatal("expected ok=false on exec error")
 		}

@@ -7,8 +7,8 @@
 > `criu.podmigration.gke.io` CRD group so it can coexist alongside the managed
 > GKE Pod Snapshots addon (`podsnapshot.gke.io`) in test clusters, and its
 > DaemonSet targets Linux nodes (`kubernetes.io/os=linux`) while excluding
-> `gVisor` sandbox nodes (`sandbox.gke.io/runtime=gvisor`) and read-only COS
-> nodes (`cloud.google.com/gke-os-distribution=cos`, pending [#109](https://github.com/gke-labs/pod-migration/issues/109)).
+> `gVisor` sandbox nodes (`sandbox.gke.io/runtime=gvisor`). It runs on both
+> Ubuntu and COS node images (see [Node images](#node-images)).
 > Never apply `deploy/crds.yaml` or `deploy/deploy.yaml` to a production
 > cluster.
 >
@@ -62,9 +62,10 @@
 >     fallback before the annotation projects into `/pminfo/annotations`.
 >   - `internal/psengine/restore_node.go`: `fetch()` enforces a 4 MiB download cap on
 >     metadata (`manifest.json`, `spec.json`) and an 8 GiB cap on `checkpoint.tar`.
->   - `internal/node/capability.go`: `Bootstrap` installs `/usr/local/sbin/criu`
->     and `/etc/criu/runc.conf` on the host node; removing the DaemonSet does
->     not automatically uninstall those host files.
+>   - `internal/node/node.go`: `Bootstrap` installs `/usr/local/sbin/criu`
+>     (on COS, a bind mount over `/usr/local`) and `/etc/criu/runc.conf` on the
+>     host node; removing the DaemonSet does not automatically uninstall those
+>     host files or remove that bind mount.
 
 `engines/criu` is a standalone snapshot engine for the `gke-labs/pod-migration`
 controller that implements the snapshot engine CustomResource contract
@@ -121,7 +122,8 @@ The CRIU snapshot engine consists of three binaries built from this Go module
    - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 4.2.1
      bundle (older CRIU fails dumps on Linux >= 6.16; the image builds it from
      Debian forky pinned to a snapshot.debian.org timestamp)
-     into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
+     into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`
+     (on COS, under `/home/kubernetes/bin`; see [Node images](#node-images)),
      writes `/etc/criu/runc.conf`, runs `criu check --all` in the host namespaces via
      `nsenter` (controlled by `PODMIG_CRIU_CHECK`, default: `all`), verifies containerd readiness (inspecting containerd's process
      PATH or shim PATH and ensuring `enable_criu != false` in containerd configuration
@@ -287,7 +289,7 @@ that group while keeping `gVisor` workloads on `podsnapshot.gke.io`.
 pod shape) in memory before performing a single `get` on the assigned
 `PodMigrationJob` to confirm `pod-migration.gke.io/engine: criu`, and
 `deploy/deploy.yaml` restricts `pod-migrate-agent` to Linux nodes while
-excluding `gVisor` sandbox nodes and read-only COS nodes (pending [#109](https://github.com/gke-labs/pod-migration/issues/109)).
+excluding `gVisor` sandbox nodes.
 
 #### Upgrading an existing CRIU install from `podsnapshot.gke.io`
 
@@ -368,6 +370,8 @@ they start cold instead of being restored; also delete the
   node agent and the engine controller use the bucket as their own
   Kubernetes service accounts, never as the nodes' VM service account (see
   [Storage credentials](#storage-credentials)).
+- **Node images:** see [Node images](#node-images): Ubuntu and COS
+  (`COS_CONTAINERD`) are supported.
 - **Linux kernel & runtime:** Nodes running `containerd` 2.x + `runc` with
   kubelet `ContainerCheckpoint` enabled and a kernel passing `criu check`.
 - **runc location:** the agent runs the node's own `runc` for restores, looked
@@ -433,18 +437,59 @@ they start cold instead of being restored; also delete the
     and the preemption controller record a Warning `MigrationSkippedIneligible`
     event on such a pod, with the engine's reason (#275).
 
+## Node images
+
+The agent runs on GKE's Ubuntu (`UBUNTU_CONTAINERD`) and Container-Optimized
+OS (`COS_CONTAINERD`) node images, and on kind. It installs CRIU through the
+host's root, `/proc/1/root` (its DaemonSet has `hostPID`), and picks where
+from the host's `/etc/os-release` when it starts:
+
+- **Ubuntu, kind, any other node:** the bundle in
+  `/var/lib/pod-migrate/criu-bundle`, the `criu` wrapper in `/usr/local/sbin`.
+- **COS (`ID=cos`):** COS mounts its root (`/usr`, `/opt`) read-only and
+  `/var` and `/home` `noexec`, and containerd's `PATH` there is
+  `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` (the shims
+  put `/opt/containerd/bin` first), so no directory on it is writable, and
+  `/home/kubernetes/bin`, the one writable host path that allows exec, isn't
+  on it. containerd 2.x has no option to point runc at another `criu`. So the
+  agent installs the bundle in `/home/kubernetes/bin/pod-migrate/criu-bundle`,
+  writes the wrapper to `/home/kubernetes/bin/pod-migrate/usr-local/sbin`, and
+  bind-mounts `/home/kubernetes/bin/pod-migrate/usr-local` over `/usr/local`,
+  which COS ships empty. containerd then finds `/usr/local/sbin/criu`, as on
+  Ubuntu.
+
+On COS:
+
+- If the host's `/usr/local` isn't empty and isn't the agent's bind already,
+  the agent doesn't cover it: the node is marked
+  `pod-migrate.io/criu-ready: false` with a `criu-reason` that starts with
+  `criu bundle install failed: host /usr/local isn't empty`. Empty it (or
+  unmount what covers it), then restart that node's `pod-migrate-agent` pod.
+- The bind mount lasts until the node reboots, and the agent makes it again
+  when it starts. Removing the agent leaves it in place; `umount /usr/local`
+  on the node removes it.
+- `/etc/criu`, on COS's writable `/etc` overlay, is lost at reboot too, and
+  rewritten by the agent at startup.
+
+**Upgrading.** Earlier `deploy/deploy.yaml` kept the agent off COS nodes.
+After you apply this one, the agent also starts on every COS node, makes the
+bind mount there, and marks the node `criu-ready` once it passes its checks:
+drains of eligible pods on those nodes then migrate with CRIU instead of
+evicting cold.
+
 ## What Installing the Engine Changes on a Node
 
 When `pod-migrate-agent` starts on a node, it applies the following modifications:
 
-| Modification             | Host Location                       | Description                                                                                                                                                                                                                                                                                                    |
-| ------------------------ | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **CRIU Bundle**          | `/var/lib/pod-migrate/criu-bundle/` | Directory containing self-contained `criu.bin`, bundled shared libraries, dynamic linker, and `VERSION` file.                                                                                                                                                                                                  |
-| **CRIU System Wrapper**  | `/usr/local/sbin/criu`              | Executable wrapper script that launches CRIU via the bundled dynamic linker.                                                                                                                                                                                                                                   |
-| **Runc Configuration**   | `/etc/criu/runc.conf`               | CRIU global configuration specifying `tcp-close`, `skip-in-flight`, `file-validation buildid`, and `file-locks`.                                                                                                                                                                                               |
-| **Node Annotations**     | Kubernetes `Node` metadata          | Annotated with `pod-migrate.io/criu-ready` (`true` or `false`) and `pod-migrate.io/criu-version`. Stale reason/remediation annotations are cleared on promotion, except when known optional kernel features are missing on an otherwise ready node, where `pod-migrate.io/criu-reason` records what's missing. |
-| **Node Placement Facts** | Kubernetes `Node` metadata          | Labelled with `criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` placement labels, and annotated with `pod-migrate.io/criu-node-facts` and `pod-migrate.io/criu-node-cpu-features` (see [Restore placement](#restore-placement)).                                                                 |
-| **Socket Watching**      | `/run/containerd/containerd.sock`   | Monitored for inode changes to detect containerd daemon restarts and re-probe readiness.                                                                                                                                                                                                                       |
+| Modification                           | Host Location                                                                              | Description                                                                                                                                                                                                                                                                                                    |
+| -------------------------------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **CRIU Bundle**                        | `/var/lib/pod-migrate/criu-bundle/` (COS: `/home/kubernetes/bin/pod-migrate/criu-bundle/`) | Directory containing self-contained `criu.bin`, bundled shared libraries, dynamic linker, and `VERSION` file.                                                                                                                                                                                                  |
+| **CRIU System Wrapper**                | `/usr/local/sbin/criu`                                                                     | Executable wrapper script that launches CRIU via the bundled dynamic linker. On COS it is `/home/kubernetes/bin/pod-migrate/usr-local/sbin/criu`, seen at `/usr/local/sbin/criu` through the bind mount below.                                                                                                 |
+| **`/usr/local` bind mount (COS only)** | `/usr/local`                                                                               | `/home/kubernetes/bin/pod-migrate/usr-local` bind-mounted over COS's empty, read-only `/usr/local`, until the node reboots (see [Node images](#node-images)).                                                                                                                                                  |
+| **Runc Configuration**                 | `/etc/criu/runc.conf`                                                                      | CRIU global configuration specifying `tcp-close`, `skip-in-flight`, `file-validation buildid`, and `file-locks`.                                                                                                                                                                                               |
+| **Node Annotations**                   | Kubernetes `Node` metadata                                                                 | Annotated with `pod-migrate.io/criu-ready` (`true` or `false`) and `pod-migrate.io/criu-version`. Stale reason/remediation annotations are cleared on promotion, except when known optional kernel features are missing on an otherwise ready node, where `pod-migrate.io/criu-reason` records what's missing. |
+| **Node Placement Facts**               | Kubernetes `Node` metadata                                                                 | Labelled with `criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` placement labels, and annotated with `pod-migrate.io/criu-node-facts` and `pod-migrate.io/criu-node-cpu-features` (see [Restore placement](#restore-placement)).                                                                 |
+| **Socket Watching**                    | `/run/containerd/containerd.sock`                                                          | Monitored for inode changes to detect containerd daemon restarts and re-probe readiness.                                                                                                                                                                                                                       |
 
 Uninstalling the engine doesn't remove the `Node` labels and annotations: they
 stay on each `Node` until you remove them, for example with

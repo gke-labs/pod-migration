@@ -72,6 +72,9 @@ type Node struct {
 	transientIno       uint64
 	transientDemoteSeq uint64
 
+	// layout is where this node's CRIU is installed (#109); the zero value
+	// means defaultLayout.
+	layout          criuLayout
 	statSocketFn    func(string) (uint64, error)
 	installBundleFn func() (string, error)
 	execHostFn      func(context.Context, []string, string, ...string) (string, error)
@@ -86,17 +89,40 @@ func NewNode(c client.Client, nodeName string) (*Node, error) {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
 	r := newRestorer(cc)
-	return &Node{
-		Client:          c,
-		NodeName:        nodeName,
-		Kubelet:         newKubeletCheckpoint(),
-		Restorer:        r,
-		SocketPath:      "/run/containerd/containerd.sock",
-		statSocketFn:    getSocketInode,
-		installBundleFn: installCRIUBundle,
-		execHostFn:      r.execHost,
-		Inspector:       NewDefaultContainerdInspector(r.execHost),
-	}, nil
+	n := &Node{
+		Client:       c,
+		NodeName:     nodeName,
+		Kubelet:      newKubeletCheckpoint(),
+		Restorer:     r,
+		SocketPath:   "/run/containerd/containerd.sock",
+		statSocketFn: getSocketInode,
+		execHostFn:   r.execHost,
+		Inspector:    NewDefaultContainerdInspector(r.execHost),
+	}
+	n.useLayout(detectCRIULayout(hostRootDir))
+	return n, nil
+}
+
+// useLayout installs CRIU in layout l and has the kernel check and the
+// restores run that install's bundle (#109).
+func (n *Node) useLayout(l criuLayout) {
+	n.layout = l
+	exec := n.execHostFn
+	if n.Restorer != nil {
+		n.Restorer.bundleDir = l.bundleDir
+		if exec == nil {
+			exec = n.Restorer.execHost
+		}
+	}
+	n.installBundleFn = func() (string, error) { return installCRIUBundle(context.Background(), l, exec) }
+}
+
+// criuLayout is where this node's CRIU is installed.
+func (n *Node) criuLayout() criuLayout {
+	if n.layout.bundleDir == "" {
+		return defaultLayout
+	}
+	return n.layout
 }
 
 func getSocketInode(path string) (uint64, error) {
@@ -290,9 +316,11 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno, startDemoteSeq u
 		})
 		return errors.Join(err, pubErr)
 	}
+	layout := n.criuLayout()
+	log.Info("criu install layout", "layout", layout.name, "bundleDir", layout.bundleDir)
 	installFn := n.installBundleFn
 	if installFn == nil {
-		installFn = installCRIUBundle
+		installFn = func() (string, error) { return installCRIUBundle(ctx, layout, n.execHostFn) }
 	}
 	version, err := installFn()
 	if err != nil {
@@ -323,7 +351,7 @@ func (n *Node) bootstrapInternal(ctx context.Context, startIno, startDemoteSeq u
 	if execFn == nil {
 		return fmt.Errorf("host command runner is not configured")
 	}
-	ok, criuReason, raw := verifyCRIU(ctx, execFn)
+	ok, criuReason, raw := verifyCRIU(ctx, execFn, layout.bundleDir)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
