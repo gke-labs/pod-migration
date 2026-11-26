@@ -66,6 +66,7 @@ type Node struct {
 	demoteInode        uint64
 	pendingDemote      bool
 	pendingVerdict     *nodeVerdict
+	readyReason        string
 	unreadyReason      string
 	unreadyRemediation string
 	transientReadiness bool
@@ -283,6 +284,7 @@ func (n *Node) publish(ctx context.Context, v nodeVerdict) error {
 	}
 	if v.ready {
 		n.poisonedInode = 0
+		n.readyReason = v.reason
 		n.unreadyReason = ""
 		n.unreadyRemediation = ""
 	} else {
@@ -602,6 +604,10 @@ func (n *Node) retryContainerdReadiness(ctx context.Context, ino uint64) (bool, 
 	if !cOk {
 		reason = cReason
 		remediation = cRemediation
+	} else {
+		n.mu.Lock()
+		reason = n.readyReason
+		n.mu.Unlock()
 	}
 
 	if err := n.publish(ctx, nodeVerdict{

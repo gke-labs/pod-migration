@@ -20,7 +20,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -103,137 +102,179 @@ func TestCheckContainerdVersion(t *testing.T) {
 	}
 }
 
-func TestParseCRIUCheckOutput(t *testing.T) {
+func TestVerifyCRIU(t *testing.T) {
+	ctx := context.Background()
+
+	raw612 := `Looks good but some kernel features are missing
+which, depending on your process tree, may cause
+dump or restore failure.
+`
+
 	tests := []struct {
 		name       string
-		raw        string
 		checkMode  string
+		execHost   func(context.Context, []string, string, ...string) (string, error)
 		wantOK     bool
 		wantReason string
 	}{
 		{
-			name: "clean pass with Looks good",
-			raw: `Version: 4.2.1
-Running on Linux 6.6.0
-File /run/criu.kdat does not exist
-Looks good.
-`,
-			checkMode:  "all",
+			name: "clean pass with core and all features supported",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) >= 1 && args[0] == "check" && (len(args) == 1 || args[1] == "--all") {
+					return "Looks good.\n", nil
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
 			wantOK:     true,
 			wantReason: "",
 		},
 		{
-			name: "GKE 6.12 kernel: missing pagemap_scan_guard_pages and timer_cr_ids (only optional features)",
-			raw: `(00.000042) Version: 4.2.1
-(00.000055) Running on Linux 6.12.113+
-Warn  (criu/kerndat.c:1904): ioctl(PAGEMAP_SCAN) doesn't support PAGE_IS_GUARD flag. CRIU dump will fail if dumped processes use madvise(MADV_GUARD_INSTALL). Please, consider updating your kernel.
-Warn  (criu/cr-check.c:1740): timer_cr_ids feature is not supported
-Looks good but some kernel features are missing
-which, depending on your process tree, may cause
-dump or restore failure.
-`,
-			checkMode:  "all",
+			name: "GKE 6.12 kernel: missing optional pagemap_scan_guard_pages and timer_cr_ids",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					switch args[2] {
+					case "timer_cr_ids":
+						// On Linux 6.12, check_timer_cr_ids returns -1 silently (pr_debug only)
+						return "", errors.New("exit status 1")
+					case "pagemap_scan_guard_pages":
+						// On Linux 6.12 lacking MADV_GUARD_INSTALL, returns -1 silently without warning
+						return "", errors.New("exit status 1")
+					default:
+						return args[2] + " is supported\n", nil
+					}
+				}
+				return "", errors.New("unexpected args")
+			},
 			wantOK:     true,
 			wantReason: "missing optional CRIU features: pagemap_scan_guard_pages, timer_cr_ids",
 		},
 		{
-			name: "single optional feature missing: pagemap_scan_guard_pages",
-			raw: `Warn  (criu/kerndat.c:1904): ioctl(PAGEMAP_SCAN) doesn't support PAGE_IS_GUARD flag. CRIU dump will fail if dumped processes use madvise(MADV_GUARD_INSTALL). Please, consider updating your kernel.
-Looks good but some kernel features are missing
-which, depending on your process tree, may cause
-dump or restore failure.
-`,
-			checkMode:  "all",
-			wantOK:     true,
-			wantReason: "missing optional CRIU features: pagemap_scan_guard_pages",
-		},
-		{
 			name: "single optional feature missing: timer_cr_ids",
-			raw: `Warn: feature timer_cr_ids is not supported
-Looks good but some kernel features are missing
-which, depending on your process tree, may cause
-dump or restore failure.
-`,
-			checkMode:  "all",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "timer_cr_ids" {
+						return "", errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
 			wantOK:     true,
 			wantReason: "missing optional CRIU features: timer_cr_ids",
 		},
 		{
+			name: "guard pages on 6.13+ kernel with MADV_GUARD_INSTALL but lacking PAGE_IS_GUARD fails closed",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "pagemap_scan_guard_pages" {
+						// 6.13+ warning: madvise(MADV_GUARD_INSTALL) exists, so dump will fail!
+						warn := "Warn (criu/kerndat.c:1851): ioctl(PAGEMAP_SCAN) doesn't support PAGE_IS_GUARD flag. CRIU dump will fail if dumped processes use madvise(MADV_GUARD_INSTALL).\n"
+						return warn, errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
+			wantOK:     false,
+			wantReason: "criu check missing required features: pagemap_scan_guard_pages",
+		},
+		{
 			name: "required feature missing: uffd",
-			raw: `Warn  (criu/cr-check.c:1232): UFFD is not supported
-Looks good but some kernel features are missing
-which, depending on your process tree, may cause
-dump or restore failure.
-`,
-			checkMode:  "all",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "uffd" {
+						return "", errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
 			wantOK:     false,
-			wantReason: "criu check --all missing required features: uffd",
+			wantReason: "criu check missing required features: uffd",
 		},
 		{
-			name: "required feature missing: cgroupns",
-			raw: `Warn  (criu/cr-check.c:1040): cgroupns not supported. This is not fatal.
-Looks good but some kernel features are missing
-which, depending on your process tree, may cause
-dump or restore failure.
-`,
-			checkMode:  "all",
+			name: "multiple required features missing: cgroupns and uffd",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "cgroupns" || args[2] == "uffd" {
+						return "", errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
 			wantOK:     false,
-			wantReason: "criu check --all missing required features: cgroupns",
+			wantReason: "criu check missing required features: cgroupns, uffd",
 		},
 		{
-			name: "mixed optional and required features missing: rejects readiness and names required",
-			raw: `Warn  (criu/kerndat.c:1904): ioctl(PAGEMAP_SCAN) doesn't support PAGE_IS_GUARD flag. CRIU dump will fail if dumped processes use madvise(MADV_GUARD_INSTALL). Please, consider updating your kernel.
-Warn: timer_cr_ids feature is not supported
-Warn  (criu/cr-check.c:1232): UFFD is not supported
-Looks good but some kernel features are missing
-which, depending on your process tree, may cause
-dump or restore failure.
-`,
-			checkMode:  "all",
+			name: "mixed missing required and optional features: fails closed and names required",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 2 && args[0] == "check" && args[1] == "--all" {
+					return raw612, errors.New("exit status 1")
+				}
+				if len(args) == 3 && args[0] == "check" && args[1] == "--feature" {
+					if args[2] == "uffd" || args[2] == "timer_cr_ids" {
+						return "", errors.New("exit status 1")
+					}
+					return args[2] + " is supported\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
 			wantOK:     false,
-			wantReason: "criu check --all missing required features: uffd",
-		},
-		{
-			name: "unrecognized warning when some features missing: fails closed",
-			raw: `Warn: unknown_kernel_capability_xyz failed
-Looks good but some kernel features are missing
-which, depending on your process tree, may cause
-dump or restore failure.
-`,
-			checkMode:  "all",
-			wantOK:     false,
-			wantReason: "criu check --all missing required features: unknown_kernel_capability_xyz failed",
+			wantReason: "criu check missing required features: uffd",
 		},
 		{
 			name: "core check failure: does not look good",
-			raw: `Error (criu/crtools.c:260): Could not initialize kernel features detection.
-Does not look good.
-`,
-			checkMode:  "all",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				return "Does not look good.\n", errors.New("exit status 1")
+			},
 			wantOK:     false,
 			wantReason: "criu check --all failed",
 		},
 		{
-			name: "core check failure: lacks CONFIG_CHECKPOINT_RESTORE",
-			raw: `Error: kernel lacks CONFIG_CHECKPOINT_RESTORE
-`,
-			checkMode:  "all",
+			name: "core check binary exec error",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				return "", errors.New("binary not found")
+			},
 			wantOK:     false,
-			wantReason: "criu check --all failed",
+			wantReason: "criu check failed: binary not found",
 		},
 		{
-			name: "checkMode core with Looks good passes cleanly",
-			raw: `Looks good.
-`,
-			checkMode:  "core",
+			name:      "checkMode core passes with core check even if features missing",
+			checkMode: "core",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				if len(args) == 1 && args[0] == "check" {
+					return "Looks good.\n", nil
+				}
+				return "", errors.New("unexpected args")
+			},
 			wantOK:     true,
 			wantReason: "",
 		},
 		{
-			name: "checkMode core with failure fails",
-			raw: `Does not look good.
-`,
-			checkMode:  "core",
+			name:      "checkMode core fails if core check fails",
+			checkMode: "core",
+			execHost: func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+				return "Does not look good.\n", errors.New("exit status 1")
+			},
 			wantOK:     false,
 			wantReason: "criu check failed",
 		},
@@ -241,66 +282,14 @@ Does not look good.
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotOK, gotReason := parseCRIUCheckOutput(tc.raw, tc.checkMode)
+			t.Setenv("PODMIG_CRIU_CHECK", tc.checkMode)
+			gotOK, gotReason, _ := verifyCRIU(ctx, tc.execHost, criuBundleDir)
 			if gotOK != tc.wantOK {
-				t.Errorf("parseCRIUCheckOutput() ok = %v, want %v", gotOK, tc.wantOK)
+				t.Errorf("verifyCRIU() ok = %v, want %v", gotOK, tc.wantOK)
 			}
 			if gotReason != tc.wantReason {
-				t.Errorf("parseCRIUCheckOutput() reason = %q, want %q", gotReason, tc.wantReason)
+				t.Errorf("verifyCRIU() reason = %q, want %q", gotReason, tc.wantReason)
 			}
 		})
 	}
-}
-
-func TestVerifyCRIU_ExecAndModes(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("default check mode invokes check --all", func(t *testing.T) {
-		t.Setenv("PODMIG_CRIU_CHECK", "")
-		var capturedArgs []string
-		execHost := func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
-			capturedArgs = args
-			return "Looks good.\n", nil
-		}
-
-		ok, reason, raw := verifyCRIU(ctx, execHost, criuBundleDir)
-		if !ok || reason != "" || !strings.Contains(raw, "Looks good") {
-			t.Fatalf("unexpected verifyCRIU result: ok=%v reason=%q raw=%q", ok, reason, raw)
-		}
-		if want := []string{"check", "--all"}; !reflect.DeepEqual(capturedArgs, want) {
-			t.Fatalf("expected args %v, got %v", want, capturedArgs)
-		}
-	})
-
-	t.Run("PODMIG_CRIU_CHECK=core invokes check without --all", func(t *testing.T) {
-		t.Setenv("PODMIG_CRIU_CHECK", "core")
-		var capturedArgs []string
-		execHost := func(_ context.Context, _ []string, _ string, args ...string) (string, error) {
-			capturedArgs = args
-			return "Looks good.\n", nil
-		}
-
-		ok, reason, _ := verifyCRIU(ctx, execHost, criuBundleDir)
-		if !ok || reason != "" {
-			t.Fatalf("unexpected verifyCRIU result: ok=%v reason=%q", ok, reason)
-		}
-		if want := []string{"check"}; !reflect.DeepEqual(capturedArgs, want) {
-			t.Fatalf("expected args %v, got %v", want, capturedArgs)
-		}
-	})
-
-	t.Run("execHost error with empty raw returns error failure", func(t *testing.T) {
-		t.Setenv("PODMIG_CRIU_CHECK", "")
-		execHost := func(_ context.Context, _ []string, _ string, _ ...string) (string, error) {
-			return "", errors.New("binary not executable")
-		}
-
-		ok, reason, _ := verifyCRIU(ctx, execHost, criuBundleDir)
-		if ok {
-			t.Fatal("expected ok=false on exec error")
-		}
-		if !strings.Contains(reason, "binary not executable") {
-			t.Fatalf("expected error reason, got %q", reason)
-		}
-	})
 }
