@@ -9,15 +9,21 @@ EXCLUDED_NAMESPACES = [
     "kube-system",
 ]
 
-def format_namespace_selector(indent=4):
+def format_namespace_selector(indent=4, match_labels=None):
     pad = " " * indent
     lines = [
         f"{pad}namespaceSelector:",
+    ]
+    if match_labels:
+        lines.append(f"{pad}  matchLabels:")
+        for k, v in match_labels.items():
+            lines.append(f"{pad}    {k}: \"{v}\"")
+    lines.extend([
         f"{pad}  matchExpressions:",
         f"{pad}    - key: kubernetes.io/metadata.name",
         f"{pad}      operator: NotIn",
         f"{pad}      values:",
-    ]
+    ])
     for ns in EXCLUDED_NAMESPACES:
         lines.append(f"{pad}        - {ns}")
     return "\n".join(lines)
@@ -51,9 +57,12 @@ def main():
             documents[i] = role_content + '\n'
             clusterrole_sub_count += 1
         elif 'kind: ValidatingWebhookConfiguration' in doc or 'kind: MutatingWebhookConfiguration' in doc:
-            pattern = r'(    namespaceSelector:\n      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
-            formatted = format_namespace_selector(indent=4) + '\n'
-            new_doc, count = re.subn(pattern, formatted, doc)
+            pattern = r'(    namespaceSelector:\n(?:      matchLabels:\n(?:        [^\n]+\n)+)?      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
+            def replace_sel(match):
+                if 'pod-migration.gke.io/managed' in match.group(0):
+                    return format_namespace_selector(indent=4, match_labels={"pod-migration.gke.io/managed": "true"}) + '\n'
+                return format_namespace_selector(indent=4) + '\n'
+            new_doc, count = re.subn(pattern, replace_sel, doc)
             if count == 0:
                 print(f"Error: namespaceSelector replacement failed in document {i}", file=sys.stderr)
                 sys.exit(1)
@@ -62,9 +71,12 @@ def main():
         elif re.search(r'^kind: ValidatingAdmissionPolicy\s*$', doc, re.MULTILINE):
             # An admission policy's spec.matchConstraints.namespaceSelector is
             # at the same depth as a webhook's, so the same pattern applies.
-            pattern = r'(    namespaceSelector:\n      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
-            formatted = format_namespace_selector(indent=4) + '\n'
-            new_doc, count = re.subn(pattern, formatted, doc)
+            pattern = r'(    namespaceSelector:\n(?:      matchLabels:\n(?:        [^\n]+\n)+)?      matchExpressions:\n        - key: kubernetes\.io/metadata\.name\n          operator: NotIn\n          values:\n(?:            - [^\n]+\n)+)'
+            def replace_policy_sel(match):
+                if 'pod-migration.gke.io/managed' in match.group(0):
+                    return format_namespace_selector(indent=4, match_labels={"pod-migration.gke.io/managed": "true"}) + '\n'
+                return format_namespace_selector(indent=4) + '\n'
+            new_doc, count = re.subn(pattern, replace_policy_sel, doc)
             if count == 0:
                 print(f"Error: namespaceSelector replacement failed in admission policy document {i}", file=sys.stderr)
                 sys.exit(1)
@@ -75,9 +87,9 @@ def main():
         print(f"Error: Expected exactly 1 ClusterRole (name: pod-migration-controller-role) replacement, got {clusterrole_sub_count}", file=sys.stderr)
         sys.exit(1)
 
-    # One per webhook entry: veviction, mpodgate, mpodstatus and mpodfence.
-    if webhook_sub_count != 4:
-        print(f"Error: Expected 4 webhook namespaceSelector replacements, got {webhook_sub_count}", file=sys.stderr)
+    # One per webhook entry: veviction, mpodgate (gVisor), mpodgate-runc, mpodstatus and mpodfence.
+    if webhook_sub_count != 5:
+        print(f"Error: Expected 5 webhook namespaceSelector replacements, got {webhook_sub_count}", file=sys.stderr)
         sys.exit(1)
 
     # The restore order policy (pod-migration-restore-order).

@@ -1024,7 +1024,7 @@ Rolling node-pool upgrades in GKE cordon and drain nodes one by one, triggering 
 ### Prerequisites for Clean Upgrades
 
 1. **Homogeneous Node Pools:** Node pools participating in rolling upgrades should share CPU model and instruction sets, and upgrade forward only. Otherwise placement finds no compatible node and the replacement starts cold ([Restore placement](#restore-placement)).
-2. **Workload Opt-In & CRIU Routing:** Workloads must carry `pod-migration.gke.io/enabled: "true"` and the namespace must configure a `PodMigration` routing workloads to CRIU (e.g. `pod-migration.gke.io/runtime-class-engines: "@default=criu"`).
+2. **Workload Opt-In & CRIU Routing:** Workloads must carry `pod-migration.gke.io/enabled: "true"`, the namespace must carry `pod-migration.gke.io/managed: "true"` (#303), and the namespace must configure a `PodMigration` routing workloads to CRIU (e.g. `pod-migration.gke.io/runtime-class-engines: "@default=criu"`).
 
 ### Running the Live Upgrade Verification Suite
 

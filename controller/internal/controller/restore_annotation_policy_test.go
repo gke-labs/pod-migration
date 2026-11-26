@@ -108,7 +108,7 @@ func admissionPolicy(t *testing.T, path, name string) (*admissionregistrationv1.
 // they see only updates of pods and of pods/status (a status write can change
 // annotations too), fail closed, are skipped unless a protected annotation
 // changes, and their binding denies.
-func assertPodUpdatePolicy(t *testing.T, policy *admissionregistrationv1.ValidatingAdmissionPolicy, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding) {
+func assertPodPolicy(t *testing.T, policy *admissionregistrationv1.ValidatingAdmissionPolicy, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding, wantOps ...admissionregistrationv1.OperationType) {
 	t.Helper()
 	if policy.Spec.FailurePolicy == nil || *policy.Spec.FailurePolicy != admissionregistrationv1.Fail {
 		t.Errorf("failurePolicy = %v, want Fail", policy.Spec.FailurePolicy)
@@ -120,8 +120,11 @@ func assertPodUpdatePolicy(t *testing.T, policy *admissionregistrationv1.Validat
 		t.Fatalf("matchConstraints = %+v, want exactly one resource rule", policy.Spec.MatchConstraints)
 	}
 	rule := policy.Spec.MatchConstraints.ResourceRules[0]
-	if !reflect.DeepEqual(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}) {
-		t.Errorf("operations = %v, want only UPDATE: creation is the webhooks' job", rule.Operations)
+	if len(wantOps) == 0 {
+		wantOps = []admissionregistrationv1.OperationType{admissionregistrationv1.Update}
+	}
+	if !reflect.DeepEqual(rule.Operations, wantOps) {
+		t.Errorf("operations = %v, want %v", rule.Operations, wantOps)
 	}
 	if !reflect.DeepEqual(rule.APIGroups, []string{""}) || !reflect.DeepEqual(rule.Resources, []string{"pods", "pods/status"}) {
 		t.Errorf("rule matches groups %v resources %v, want pods and pods/status of the core group", rule.APIGroups, rule.Resources)
@@ -157,12 +160,12 @@ func validationExpressions(policy *admissionregistrationv1.ValidatingAdmissionPo
 
 // The restore order policy in controller/deploy.yaml names the controller's
 // service account, and has the scope of mpodgate, the webhook that handles
-// restore orders when a pod is created (#233). The manifest has no templating,
+// restore orders when a pod is created (#233, #303). The manifest has no templating,
 // so nothing else keeps these in step.
 func TestRestoreOrderPolicy_MatchesTheControllerManifest(t *testing.T) {
 	path := controllerManifestPath()
 	policy, binding := admissionPolicy(t, path, restoreOrderPolicyName)
-	assertPodUpdatePolicy(t, policy, binding)
+	assertPodPolicy(t, policy, binding, admissionregistrationv1.Create, admissionregistrationv1.Update)
 
 	// The identity the policy allows is the one the controller runs as.
 	deployment := &appsv1.Deployment{}
@@ -177,7 +180,7 @@ func TestRestoreOrderPolicy_MatchesTheControllerManifest(t *testing.T) {
 
 	// Same pods and namespaces as mpodgate.
 	webhooks := &admissionregistrationv1.MutatingWebhookConfiguration{}
-	manifestObject(t, path, "MutatingWebhookConfiguration", "mutating-webhook-configuration", webhooks)
+	manifestObject(t, path, "MutatingWebhookConfiguration", "pod-migration-mutating-webhook-configuration", webhooks)
 	var gate *admissionregistrationv1.MutatingWebhook
 	for i := range webhooks.Webhooks {
 		if webhooks.Webhooks[i].Name == "mpodgate.podmigration.gke.io" {
@@ -215,7 +218,7 @@ func TestRestoreOrderPolicy_MatchesTheControllerManifest(t *testing.T) {
 func TestRestoreStatusPolicy_MatchesTheCRIUManifest(t *testing.T) {
 	path := criuManifestPath()
 	policy, binding := admissionPolicy(t, path, restoreStatusPolicyName)
-	assertPodUpdatePolicy(t, policy, binding)
+	assertPodPolicy(t, policy, binding)
 
 	agent := &appsv1.DaemonSet{}
 	manifestObject(t, path, "DaemonSet", "pod-migrate-agent", agent)

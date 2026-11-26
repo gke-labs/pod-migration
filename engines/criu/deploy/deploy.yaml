@@ -454,10 +454,9 @@ webhooks:
     failurePolicy: Ignore
     timeoutSeconds: 5
     reinvocationPolicy: IfNeeded
-    objectSelector:
-      matchLabels:
-        pod-migration.gke.io/enabled: "true"
     namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
@@ -516,6 +515,8 @@ spec:
         resources: ["pods", "pods/status"]
         scope: Namespaced
     namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
