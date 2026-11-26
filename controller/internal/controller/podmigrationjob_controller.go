@@ -1540,12 +1540,12 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 				memBytes := util.CalculatePodMemoryRequest(originPod)
 				calculated := util.CalculateMigrationTimeout(rawTimeout, memBytes, r.DefaultMigrationTimeout)
-				base := r.DefaultMigrationTimeout
-				if base <= 0 {
-					base = util.DefaultMigrationTimeout
-				}
-				if calculated != base {
-					job.Annotations[util.AnnotationMigrationTimeout] = calculated.String()
+				// Record the timeout even when it is --migration-timeout, so
+				// the job says what deadline it's held to (#330). Jobs the
+				// controller creates carry it already; this covers a job
+				// created by hand or by an earlier version.
+				if v, ok := util.TimeoutAnnotationValue(calculated); ok {
+					job.Annotations[util.AnnotationMigrationTimeout] = v
 					annotationUpdated = true
 					job.Status.Deadline = r.calculateDeadline(job)
 				}
