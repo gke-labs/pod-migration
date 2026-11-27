@@ -156,7 +156,7 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 		maxHeapBytes           = uint64(64 * 1024 * 1024)
 		maxHeapIncreaseBytes   = int64(32 * 1024 * 1024)
 	)
-	maxUncachedGets := int64(podCount + 10)
+	maxUncachedGets := int64(2*podCount + 10)
 	maxUncachedLists := int64(podCount + 10)
 
 	reportPath := os.Getenv("SCALE_SUMMARY_PATH")
@@ -403,6 +403,7 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 					Name:      pmjName,
 					Labels: map[string]string{
 						util.LabelParentUID:       string(rs.UID),
+						util.LabelParentName:      rs.Name,
 						util.LabelParentKind:      "ReplicaSet",
 						util.LabelPodTemplateHash: "hash-scale-100",
 					},

@@ -24,6 +24,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -109,6 +111,9 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("Parent ReplicaSet not found (likely deleted), treating as bare pod")
+		} else if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+			logger.Info("Pod owner cannot be read, bypassing scheduling gate injection")
+			return admission.Allowed("pod owner cannot be read")
 		} else {
 			logger.Error(err, "Failed to resolve parent workload")
 			return admission.Errored(http.StatusInternalServerError, err)
@@ -138,18 +143,27 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 	// A false miss here would irreversibly stamp ps-name: "" and skip the scheduling gate,
 	// permanently forcing a cold start and stranding the PMJ.
 	if assignedPMJ == "" && a.APIReader != nil {
-		liveParentName, liveParentKind, liveParentUID, err := util.ResolveParentWorkload(ctx, a.APIReader, pod)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				logger.Info("Parent ReplicaSet not found via live APIReader, treating as bare pod")
-			} else {
-				logger.Error(err, "Failed to resolve parent workload via live APIReader")
-				return admission.Errored(http.StatusInternalServerError, err)
-			}
-		}
+		liveParentName := parentName
+		liveParentKind := parentKind
+		liveParentUID := parentUID
 		liveReplicaKey := replicaKey
-		if !util.IsBuiltInWorkloadKind(liveParentKind) {
-			liveReplicaKey, _ = util.ResolveOperatorReplicaKey(pod, liveParentKind)
+		// Only resolve parent via live APIReader if not already resolved by Client
+		if liveParentName == "" {
+			liveParentName, liveParentKind, liveParentUID, err = util.ResolveParentWorkload(ctx, a.APIReader, pod)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					logger.Info("Parent ReplicaSet not found via live APIReader, treating as bare pod")
+				} else if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+					logger.Info("Pod owner cannot be read via live APIReader, bypassing scheduling gate injection")
+					return admission.Allowed("pod owner cannot be read")
+				} else {
+					logger.Error(err, "Failed to resolve parent workload via live APIReader")
+					return admission.Errored(http.StatusInternalServerError, err)
+				}
+			}
+			if !util.IsBuiltInWorkloadKind(liveParentKind) {
+				liveReplicaKey, _ = util.ResolveOperatorReplicaKey(pod, liveParentKind)
+			}
 		}
 		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex, false, liveReplicaKey)
 		if err != nil {

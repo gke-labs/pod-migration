@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -289,6 +290,23 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		// Resolve parent workload details
 		parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.apiReader(), pod)
 		if err != nil && !apierrors.IsNotFound(err) {
+			if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+				ctrlRef := metav1.GetControllerOf(pod)
+				ownerKind, ownerName := "unknown", "unknown"
+				if ctrlRef != nil {
+					ownerKind, ownerName = ctrlRef.Kind, ctrlRef.Name
+				}
+				logger.Info("Skipping preemption migration: pod owner cannot be read due to RBAC or missing CRD",
+					"pod", pod.Name, "ownerKind", ownerKind, "ownerName", ownerName)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedOwnerUnreadable",
+						"Pod is owned by %s/%s but owner cannot be read (%v); skipping spot preemption migration", ownerKind, ownerName, err)
+				}
+				metrics.RecordSpotPreemptionSkipped("owner_unreadable")
+				metrics.RecordMigrationSkipped("owner_unreadable", eng.Name())
+				r.processedPods.Store(pod.UID, time.Now())
+				continue
+			}
 			logger.Error(err, "Failed to resolve parent workload for pod", "pod", pod.Name)
 			continue
 		}

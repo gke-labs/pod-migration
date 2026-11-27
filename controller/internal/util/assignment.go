@@ -79,22 +79,6 @@ const (
 	PMJParentKeyIndexKey = "pmj.podmigration.gke.io/parent-key"
 )
 
-func isIgnorableSchemeError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if apierrors.IsForbidden(err) {
-		return true
-	}
-	if runtime.IsNotRegisteredError(err) || meta.IsNoMatchError(err) {
-		return true
-	}
-	if strings.Contains(err.Error(), "no kind is registered for the type") {
-		return true
-	}
-	return false
-}
-
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, StatefulSet,
 // or any custom operator controller=true owner) via live API lookup with UID and selector validation.
 func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod) (string, string, string, error) {
@@ -117,9 +101,6 @@ func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod
 	case "ReplicaSet":
 		rs := &appsv1.ReplicaSet{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, rs); err != nil {
-			if isIgnorableSchemeError(err) {
-				return "", "", "", nil
-			}
 			return "", "", "", err
 		}
 		if rs.UID != ctrlRef.UID {
@@ -141,9 +122,6 @@ func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod
 	case "StatefulSet":
 		sts := &appsv1.StatefulSet{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, sts); err != nil {
-			if isIgnorableSchemeError(err) {
-				return "", "", "", nil
-			}
 			return "", "", "", err
 		}
 		if sts.UID != ctrlRef.UID {
@@ -160,9 +138,6 @@ func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod
 	case "Job":
 		job := &batchv1.Job{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, job); err != nil {
-			if isIgnorableSchemeError(err) {
-				return "", "", "", nil
-			}
 			return "", "", "", err
 		}
 		if job.UID != ctrlRef.UID {
@@ -182,24 +157,27 @@ func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod
 		u.SetAPIVersion(ctrlRef.APIVersion)
 		u.SetKind(ctrlRef.Kind)
 		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, u); err != nil {
-			if isIgnorableSchemeError(err) {
-				return "", "", "", nil
-			}
 			return "", "", "", err
 		}
 		if u.GetUID() != ctrlRef.UID {
 			return "", "", "", nil
 		}
-		if selectorMap, found, _ := unstructured.NestedMap(u.Object, "spec", "selector"); found {
+		if selField, found, _ := unstructured.NestedFieldNoCopy(u.Object, "spec", "selector"); found && selField != nil {
+			selectorMap, isMap := selField.(map[string]interface{})
+			if !isMap {
+				return "", "", "", nil
+			}
 			selJSON, jsonErr := json.Marshal(selectorMap)
-			if jsonErr == nil {
-				var ls metav1.LabelSelector
-				if unmarshalErr := json.Unmarshal(selJSON, &ls); unmarshalErr == nil {
-					selector, selErr := metav1.LabelSelectorAsSelector(&ls)
-					if selErr != nil || !selector.Matches(labels.Set(pod.Labels)) {
-						return "", "", "", nil
-					}
-				}
+			if jsonErr != nil {
+				return "", "", "", nil
+			}
+			var ls metav1.LabelSelector
+			if unmarshalErr := json.Unmarshal(selJSON, &ls); unmarshalErr != nil {
+				return "", "", "", nil
+			}
+			selector, selErr := metav1.LabelSelectorAsSelector(&ls)
+			if selErr != nil || !selector.Matches(labels.Set(pod.Labels)) {
+				return "", "", "", nil
 			}
 		}
 		return u.GetName(), u.GetKind(), string(u.GetUID()), nil
@@ -800,6 +778,9 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 	if job.Labels != nil && job.Labels[LabelParentName] != "" {
 		podParentName, podParentKind, podParentUID, err := ResolveParentWorkload(ctx, reader, pod)
 		if err != nil && !apierrors.IsNotFound(err) {
+			if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+				return "", true, nil // Ineligible contender: cannot verify lineage, clear assignment
+			}
 			return "", false, err
 		}
 		if !MatchesPMJWorkload(pod, job, podParentName, podParentKind, podParentUID) {
@@ -828,8 +809,16 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		}
 		// Contenders must match workload lineage if the job specifies a parent workload
 		if job.Labels != nil && job.Labels[LabelParentName] != "" {
+			if p.UID == pod.UID {
+				// Reconciling pod was already verified at line :785. Skip re-resolution.
+				contenders = append(contenders, p)
+				continue
+			}
 			pParentName, pParentKind, pParentUID, err := ResolveParentWorkload(ctx, reader, p)
 			if err != nil && !apierrors.IsNotFound(err) {
+				if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+					continue
+				}
 				return "", false, err
 			}
 			if !MatchesPMJWorkload(p, job, pParentName, pParentKind, pParentUID) {

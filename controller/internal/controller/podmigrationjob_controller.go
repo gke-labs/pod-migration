@@ -773,6 +773,8 @@ func (r *PodMigrationJobReconciler) getSnapshotProvider(job *pmv1alpha1.PodMigra
 
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get
+// +kubebuilder:rbac:groups=ray.io,resources=rayclusters,verbs=get
+// +kubebuilder:rbac:groups=kubeflow.org,resources=pytorchjobs;notebooks,verbs=get
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podmigration.gke.io,resources=podmigrationjobs/finalizers,verbs=update
