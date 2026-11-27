@@ -24,6 +24,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -974,6 +975,7 @@ func TestResolveParentWorkload_StandaloneReplicaSet(t *testing.T) {
 	namespace := "default"
 	rsUID := "rs-uid-999"
 	rsName := "standalone-rs"
+	isController := true
 
 	rs := &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -994,6 +996,7 @@ func TestResolveParentWorkload_StandaloneReplicaSet(t *testing.T) {
 					Kind:       "ReplicaSet",
 					Name:       rsName,
 					UID:        types.UID(rsUID),
+					Controller: &isController,
 				},
 			},
 		},
@@ -1483,7 +1486,22 @@ func TestResolveParentWorkload_OperatorOwnedPod(t *testing.T) {
 					OwnerReferences: tc.ownerReferences,
 				},
 			}
-			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+			objs := []client.Object{pod}
+			if tc.expectedParent != "" {
+				rayCluster := &unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "ray.io/v1",
+						"kind":       tc.expectedKind,
+						"metadata": map[string]interface{}{
+							"name":      tc.expectedParent,
+							"namespace": namespace,
+							"uid":       tc.expectedUID,
+						},
+					},
+				}
+				objs = append(objs, rayCluster)
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 			parentName, parentKind, parentUID, err := ResolveParentWorkload(context.Background(), cl, pod)
 			if err != nil {
 				t.Fatalf("ResolveParentWorkload failed: %v", err)
@@ -2166,11 +2184,23 @@ func TestResolveCollision_OperatorOwned_LoserIdentified(t *testing.T) {
 		},
 	}
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndexKey, PMJParentKeyIndexValue).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndexKey, PodAssignedPMJIndexValue).
-		WithObjects(pmj, pod1, pod2).
+		WithObjects(pmj, pod1, pod2, rayCluster).
 		Build()
 
 	ctx := context.Background()

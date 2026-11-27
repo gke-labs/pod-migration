@@ -79,6 +79,12 @@ rules:
   - list
   - watch
 - apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - get
+- apiGroups:
   - criu.podmigration.gke.io
   - podsnapshot.gke.io
   resources:
@@ -108,6 +114,13 @@ rules:
   - podsnapshot.gke.io
   resources:
   - podsnapshots/status
+  verbs:
+  - get
+- apiGroups:
+  - kubeflow.org
+  resources:
+  - notebooks
+  - pytorchjobs
   verbs:
   - get
 - apiGroups:
@@ -147,6 +160,12 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - ray.io
+  resources:
+  - rayclusters
+  verbs:
+  - get
 - apiGroups:
   - storage.k8s.io
   resources:

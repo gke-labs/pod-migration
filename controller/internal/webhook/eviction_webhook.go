@@ -24,7 +24,9 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -311,8 +313,23 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	}
 
 	// Resolve parent owner details
-	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)
+	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.apiReader(), pod)
 	if err != nil && !apierrors.IsNotFound(err) {
+		if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+			ctrlRef := metav1.GetControllerOf(pod)
+			ownerKind, ownerName := "unknown", "unknown"
+			if ctrlRef != nil {
+				ownerKind, ownerName = ctrlRef.Kind, ctrlRef.Name
+			}
+			logger.Info("Pod owner cannot be read due to RBAC or missing CRD, skipping migration and allowing eviction",
+				"pod", pod.Name, "ownerKind", ownerKind, "ownerName", ownerName, "error", err)
+			if a.Recorder != nil {
+				a.Recorder.Eventf(pod, corev1.EventTypeWarning, "MigrationSkippedOwnerUnreadable",
+					"Pod is owned by %s/%s but owner cannot be read (%v); allowing cold eviction", ownerKind, ownerName, err)
+			}
+			metrics.RecordMigrationSkipped("owner_unreadable", eng.Name())
+			return admission.Allowed(fmt.Sprintf("skipping migration: pod owner %s/%s cannot be read", ownerKind, ownerName))
+		}
 		logger.Error(err, "Failed to resolve parent workload")
 		return denied429("transient error resolving parent workload, retrying")
 	}
@@ -532,6 +549,13 @@ func denied429(msg string) admission.Response {
 			},
 		},
 	}
+}
+
+func (a *EvictionGate) apiReader() client.Reader {
+	if a.APIReader != nil {
+		return a.APIReader
+	}
+	return a.Client
 }
 
 // InjectDecoder injects the decoder.

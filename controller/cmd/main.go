@@ -38,6 +38,8 @@ import (
 	"time"
 
 	// Import every API group whose types we need to read/write/serialize.
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -274,6 +276,16 @@ func main() {
 		LeaderElection:                enableLeaderElection,
 		LeaderElectionID:              "pod-migration-controller-leader",
 		LeaderElectionReleaseOnCancel: true,
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{
+					&appsv1.StatefulSet{},
+					&appsv1.ReplicaSet{},
+					&batchv1.Job{},
+				},
+				Unstructured: false,
+			},
+		},
 		// The client keeps reading unstructured objects (the engines' triggers
 		// and PodSnapshots) from the API server: the engines' state machines
 		// need fresh reads, and a cached read of a kind the controller doesn't

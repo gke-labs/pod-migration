@@ -18,12 +18,15 @@ package webhook
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,7 +42,9 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
+	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestEvictionGate(t *testing.T) {
@@ -161,6 +166,7 @@ func TestEvictionGate(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "deploy-rs-v1",
 							UID:        "rs-uid-111",
+							Controller: ptr(true),
 						},
 					},
 					UID: "deploy-pod-uid-999",
@@ -182,6 +188,7 @@ func TestEvictionGate(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "my-deployment",
 								UID:        "deploy-uid-111",
+								Controller: ptr(true),
 							},
 						},
 					},
@@ -215,6 +222,7 @@ func TestEvictionGate(t *testing.T) {
 							Kind:       "Job",
 							Name:       "my-indexed-job",
 							UID:        "job-uid-999",
+							Controller: ptr(true),
 						},
 					},
 				},
@@ -224,6 +232,13 @@ func TestEvictionGate(t *testing.T) {
 			},
 			initObjects: []client.Object{
 				createPSP("psp-test-manual", "manual", "stop"),
+				&batchv1.Job{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "my-indexed-job",
+						UID:       "job-uid-999",
+					},
+				},
 			},
 			subResource:        "eviction",
 			expectedAllowed:    false,
@@ -596,6 +611,7 @@ func TestEvictionGate(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = corev1.AddToScheme(scheme)
 			_ = appsv1.AddToScheme(scheme)
+			_ = batchv1.AddToScheme(scheme)
 			_ = pmv1alpha1.AddToScheme(scheme)
 
 			initObjs := append(tt.initObjects, tt.pod)
@@ -1086,7 +1102,18 @@ func TestEvictionGate_OperatorOwned_RayHead_CreatesPMJ(t *testing.T) {
 	}
 
 	psp := createPSP("sample-ray-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp, rayCluster).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,
@@ -1124,6 +1151,198 @@ func TestEvictionGate_OperatorOwned_RayHead_CreatesPMJ(t *testing.T) {
 	if job.Annotations[util.AnnotationReplicaIdentityKey] != expectedReplicaKey {
 		t.Errorf("PMJ replica identity annotation mismatch: got %q, want %q",
 			job.Annotations[util.AnnotationReplicaIdentityKey], expectedReplicaKey)
+	}
+}
+
+func TestEvictionGate_OperatorOwned_OwnerForbidden_AllowsColdEvictionWithoutDegradingToBare(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	gvisorRuntime := "gvisor"
+	namespace := "default"
+	podName := "sample-ray-head-001"
+	podUID := "uid-ray-head-001"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "headgroup",
+				"ray.io/node-type":             "head",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+	// Interceptor returns 403 Forbidden on the operator CRD lookup
+	fakeClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == clusterName {
+				return apierrors.NewForbidden(schema.GroupResource{Group: "ray.io", Resource: "rayclusters"}, key.Name, nil)
+			}
+			return client.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	recorder := record.NewFakeRecorder(10)
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		Recorder:  recorder,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	beforeMetric := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("owner_unreadable", "gke-pod-snapshots"))
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+
+	if !resp.Allowed {
+		t.Fatalf("Expected cold eviction to be allowed when operator owner is 403 Forbidden, got denied: %v", resp.Result)
+	}
+
+	// Verify MigrationSkippedOwnerUnreadable warning event was recorded
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, "MigrationSkippedOwnerUnreadable") {
+			t.Errorf("Expected MigrationSkippedOwnerUnreadable event, got %q", event)
+		}
+	default:
+		t.Fatalf("Expected warning event to be emitted on 403 owner read, got none")
+	}
+
+	// Verify eviction owner_unreadable metric was incremented
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("owner_unreadable", "gke-pod-snapshots")); got != beforeMetric+1 {
+		t.Errorf("Expected SkippedMigrationsTotal[owner_unreadable, gke-pod-snapshots] to increment by 1, got %v (before=%v)", got, beforeMetric)
+	}
+
+	// Verify no PMJ was created (must NOT degrade to bare pod PMJ!)
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := baseClient.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("Failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 0 {
+		t.Fatalf("Expected 0 PMJs created (must not degrade to bare pod!), got %d: %+v", len(pmjList.Items), pmjList.Items)
+	}
+}
+
+func TestEvictionGate_OperatorOwned_OwnerNoMatch_AllowsColdEvictionWithoutDegradingToBare(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	gvisorRuntime := "gvisor"
+	namespace := "default"
+	podName := "sample-ray-head-001"
+	podUID := "uid-ray-head-001"
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID(podUID),
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"ray.io/group":                 "headgroup",
+				"ray.io/node-type":             "head",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       clusterKind,
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorRuntime,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+	fakeClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == clusterName {
+				return &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "ray.io", Kind: "RayCluster"}}
+			}
+			return client.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	recorder := record.NewFakeRecorder(10)
+	handler := &EvictionGate{
+		Client:    fakeClient,
+		APIReader: fakeClient,
+		Recorder:  recorder,
+		decoder:   admission.NewDecoder(scheme),
+	}
+
+	resp := handler.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace:   namespace,
+			Name:        podName,
+			SubResource: "eviction",
+		},
+	})
+
+	if !resp.Allowed {
+		t.Fatalf("Expected cold eviction to be allowed when operator CRD is not matched, got denied: %v", resp.Result)
+	}
+
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, "MigrationSkippedOwnerUnreadable") {
+			t.Errorf("Expected MigrationSkippedOwnerUnreadable event, got %q", event)
+		}
+	default:
+		t.Fatalf("Expected warning event to be emitted on NoMatch owner read, got none")
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := baseClient.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("Failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 0 {
+		t.Fatalf("Expected 0 PMJs created (must not degrade to bare pod!), got %d: %+v", len(pmjList.Items), pmjList.Items)
 	}
 }
 
@@ -1236,7 +1455,18 @@ func TestEvictionGate_OperatorOwned_AmbiguousSiblingWorker_AllowsColdEviction(t 
 	}
 
 	psp := createPSP("sample-ray-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, sibling, psp).Build()
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, sibling, psp, rayCluster).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,
@@ -1351,7 +1581,18 @@ func TestEvictionGate_OperatorOwned_NoReplicaKey_AllowsColdEviction(t *testing.T
 	}
 
 	psp := createPSP("custom-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	customCR := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "custom.io/v1",
+			"kind":       "CustomOperator",
+			"metadata": map[string]interface{}{
+				"name":      "custom-cr",
+				"namespace": namespace,
+				"uid":       "custom-uid-111",
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp, customCR).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,
@@ -1468,7 +1709,18 @@ func TestEvictionGate_OperatorOwned_StableName_CreatesPMJ(t *testing.T) {
 	}
 
 	psp := createPSP("pytorch-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	pytorchJob := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "kubeflow.org/v1",
+			"kind":       parentKind,
+			"metadata": map[string]interface{}{
+				"name":      parentName,
+				"namespace": namespace,
+				"uid":       parentUID,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp, pytorchJob).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,
@@ -1607,7 +1859,18 @@ func TestEvictionGate_OperatorOwned_InFlightReplicaKey_Refused(t *testing.T) {
 	}
 
 	psp := createPSP("sample-ray-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, existingPMJ, psp).Build()
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, existingPMJ, psp, rayCluster).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,

@@ -24,9 +24,13 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -158,6 +162,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs",
 							UID:        "rs-uid",
+							Controller: ptr(true),
 						},
 					},
 				},
@@ -174,6 +179,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr(true),
 							},
 						},
 					},
@@ -198,6 +204,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs",
 							UID:        "rs-uid",
+							Controller: ptr(true),
 						},
 					},
 				},
@@ -214,6 +221,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr(true),
 							},
 						},
 					},
@@ -252,6 +260,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs-v2",
 							UID:        "rs-v2-uid",
+							Controller: ptr(true),
 						},
 					},
 				},
@@ -268,6 +277,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr(true),
 							},
 						},
 					},
@@ -307,6 +317,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs-v1",
 							UID:        "rs-v1-uid",
+							Controller: ptr(true),
 						},
 					},
 				},
@@ -323,6 +334,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr(true),
 							},
 						},
 					},
@@ -362,6 +374,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs-v2",
 							UID:        "rs-v2-uid",
+							Controller: ptr(true),
 						},
 					},
 				},
@@ -378,6 +391,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr(true),
 							},
 						},
 					},
@@ -431,11 +445,19 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "Job",
 							Name:       "test-indexed-job",
 							UID:        "job-uid-1",
+							Controller: ptr(true),
 						},
 					},
 				},
 			},
 			initObjs: []runtime.Object{
+				&batchv1.Job{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-indexed-job",
+						UID:       "job-uid-1",
+					},
+				},
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
@@ -471,11 +493,19 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "Job",
 							Name:       "test-indexed-job",
 							UID:        "job-uid-1",
+							Controller: ptr(true),
 						},
 					},
 				},
 			},
 			initObjs: []runtime.Object{
+				&batchv1.Job{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-indexed-job",
+						UID:       "job-uid-1",
+					},
+				},
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
@@ -502,6 +532,7 @@ func TestPodGateInjector(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = corev1.AddToScheme(scheme)
 			_ = appsv1.AddToScheme(scheme)
+			_ = batchv1.AddToScheme(scheme)
 			_ = pmv1alpha1.AddToScheme(scheme)
 			dec := admission.NewDecoder(scheme)
 
@@ -749,6 +780,7 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 						Kind:       "Deployment",
 						Name:       "test-deploy",
 						UID:        "deploy-uid",
+						Controller: ptr(true),
 					},
 				},
 			},
@@ -768,6 +800,7 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 						Kind:       "ReplicaSet",
 						Name:       "test-deploy-rs-v1",
 						UID:        "rs-v1-uid",
+						Controller: ptr(true),
 					},
 				},
 			},
@@ -860,6 +893,7 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 						Kind:       "ReplicaSet",
 						Name:       "test-deploy-rs-v1",
 						UID:        "rs-v1-uid",
+						Controller: ptr(true),
 					},
 				},
 			},
@@ -1012,11 +1046,23 @@ func TestReplacementWebhook_RayHead_GatedAndAssigned(t *testing.T) {
 		},
 	}
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
 		WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
-		WithObjects(pmj).
+		WithObjects(pmj, rayCluster).
 		Build()
 
 	handler := &PodGateInjector{
@@ -1328,5 +1374,240 @@ func TestPodGateInjector_AlreadyGatedReinvocationScrubbing(t *testing.T) {
 	}
 	if len(cleanResp.Patches) != 0 {
 		t.Errorf("Expected 0 patches on clean already-gated reinvocation, got %d patches: %+v", len(cleanResp.Patches), cleanResp.Patches)
+	}
+}
+
+func TestPodGateInjector_OperatorOwned_OwnerForbiddenOrNoMatch_ScrubsAndBypassesColdStart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "custom-op-pod"
+	gvisorClass := "gvisor"
+	isController := true
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+			},
+			Annotations: map[string]string{
+				util.AnnotationAssignedPMJ:    "stale-pmj",
+				engine.CRIUInjectedAnnotation: "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "custom.io/v1",
+					Kind:       "CustomCR",
+					Name:       "sample-custom",
+					UID:        "custom-uid-123",
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &gvisorClass,
+		},
+	}
+
+	rawPod, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatalf("Failed to marshal pod: %v", err)
+	}
+
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Name:      podName,
+			Namespace: namespace,
+			Object: runtime.RawExtension{
+				Raw: rawPod,
+			},
+		},
+	}
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+	cl := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == "sample-custom" {
+				return apierrors.NewForbidden(schema.GroupResource{Group: "custom.io", Resource: "customcrs"}, key.Name, nil)
+			}
+			return client.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	handler := &PodGateInjector{
+		Client:    cl,
+		APIReader: cl,
+	}
+	_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+	resp := handler.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("Expected allowed, got denied: %v", resp.Result)
+	}
+
+	// Gate must NOT be added
+	for _, patch := range resp.Patches {
+		if patch.Path == "/spec/schedulingGates" || patch.Path == "/spec/schedulingGates/-" {
+			t.Fatalf("Expected NO scheduling gate injected for unreadable owner, but got patch: %+v", patch)
+		}
+	}
+
+	// Must have patches scrubbing stale annotations and stamping ps-name: ""
+	if len(resp.Patches) == 0 {
+		t.Fatalf("Expected patches scrubbing stale annotations and stamping cold start bypass, got 0 patches")
+	}
+
+	hasColdStartBypass := false
+	scrubbedAssignedPMJ := false
+	for _, patch := range resp.Patches {
+		if patch.Path == "/metadata/annotations" {
+			if valMap, ok := patch.Value.(map[string]interface{}); ok {
+				if val, exists := valMap["podsnapshot.gke.io/ps-name"]; exists && val == "" {
+					hasColdStartBypass = true
+				}
+				if _, exists := valMap[util.AnnotationAssignedPMJ]; !exists {
+					scrubbedAssignedPMJ = true
+				}
+			}
+		} else if patch.Path == "/metadata/annotations/podsnapshot.gke.io~1ps-name" && patch.Value == "" {
+			hasColdStartBypass = true
+		} else if patch.Operation == "remove" && patch.Path == "/metadata/annotations/pod-migration.gke.io~1assigned-pmj" {
+			scrubbedAssignedPMJ = true
+		}
+	}
+
+	if !hasColdStartBypass {
+		t.Errorf("Expected cold start bypass annotation podsnapshot.gke.io/ps-name: \"\" in patches, got %+v", resp.Patches)
+	}
+	if !scrubbedAssignedPMJ {
+		t.Errorf("Expected assigned-pmj annotation to be scrubbed, got patches: %+v", resp.Patches)
+	}
+}
+
+func TestPodGateInjector_APIReaderFallback_ReusesClientParentResolution(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-rs-pod"
+	isController := true
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "web-rs",
+			UID:       "rs-uid-123",
+			Labels: map[string]string{
+				"app": "web",
+			},
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			Labels: map[string]string{
+				"pod-migration.gke.io/enabled": "true",
+				"app":                          "web",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "web-rs",
+					UID:        "rs-uid-123",
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      "pmj-web-rs",
+			Labels: map[string]string{
+				util.LabelParentName: "web-rs",
+				util.LabelParentKind: "ReplicaSet",
+				util.LabelParentUID:  "rs-uid-123",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "old-pod"},
+			TargetPodUID: "uid-old",
+		},
+		Status: pmv1alpha1.PodMigrationJobStatus{
+			Phase: pmv1alpha1.PodMigrationJobPhaseEvicting,
+		},
+	}
+
+	rawPod, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatalf("Failed to marshal pod: %v", err)
+	}
+
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Name:      podName,
+			Namespace: namespace,
+			Object: runtime.RawExtension{
+				Raw: rawPod,
+			},
+		},
+	}
+
+	// Client has the ReplicaSet, but NO PMJ (simulating informer cache lag for the PMJ)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+		WithObjects(rs).
+		Build()
+
+	// APIReader has both the ReplicaSet and the PMJ
+	baseAPIReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
+		WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
+		WithObjects(rs, pmj).
+		Build()
+
+	var apiReaderRSGetCount int
+	trackedAPIReader := interceptor.NewClient(baseAPIReader, interceptor.Funcs{
+		Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == "web-rs" {
+				apiReaderRSGetCount++
+			}
+			return client.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	handler := &PodGateInjector{
+		Client:    fakeClient,
+		APIReader: trackedAPIReader,
+	}
+	_ = handler.InjectDecoder(admission.NewDecoder(scheme))
+
+	resp := handler.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("Expected allowed, got %v", resp.Result)
+	}
+
+	// Because Client already resolved the parent ReplicaSet, APIReader fallback MUST NOT re-fetch web-rs!
+	if apiReaderRSGetCount != 0 {
+		t.Fatalf("Expected 0 ReplicaSet GET calls via APIReader (parent workload must be reused from Client resolution), got %d", apiReaderRSGetCount)
 	}
 }

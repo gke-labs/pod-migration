@@ -17,6 +17,7 @@ package util
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,7 +26,11 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,6 +45,7 @@ const (
 	LabelControllerRevisionHash      = appsv1.ControllerRevisionHashLabelKey
 	LabelJobCompletionIndex          = batchv1.JobCompletionIndexAnnotation
 	LabelOriginPodName               = "pod-migration.gke.io/origin-pod-name"
+	LabelPodMigrationEnabled         = "pod-migration.gke.io/enabled"
 	AnnotationAssignedPMJ            = "pod-migration.gke.io/assigned-pmj"
 	AnnotationColdStartBypassJob     = "pod-migration.gke.io/cold-start-bypass-job"
 	AnnotationRestoreCompleted       = "pod-migration.gke.io/restore-completed"
@@ -74,34 +80,108 @@ const (
 )
 
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, StatefulSet,
-// or any custom operator controller=true owner).
+// or any custom operator controller=true owner) via live API lookup with UID and selector validation.
 func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod) (string, string, string, error) {
-	var fallbackControllerOwner *metav1.OwnerReference
-	for i := range pod.OwnerReferences {
-		ref := &pod.OwnerReferences[i]
-		if ref.Kind == "ReplicaSet" {
-			rs := &appsv1.ReplicaSet{}
-			err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}, rs)
-			if err == nil {
-				for _, rsRef := range rs.OwnerReferences {
-					if rsRef.Kind == "Deployment" {
-						return rsRef.Name, "Deployment", string(rsRef.UID), nil
-					}
-				}
-				return rs.Name, "ReplicaSet", string(rs.UID), nil
-			} else {
-				return "", "", "", err
-			}
-		} else if ref.Kind == "Job" || ref.Kind == "StatefulSet" {
-			return ref.Name, ref.Kind, string(ref.UID), nil
-		} else if ref.Controller != nil && *ref.Controller {
-			fallbackControllerOwner = ref
+	if pod == nil {
+		return "", "", "", nil
+	}
+
+	ctrlRef := metav1.GetControllerOf(pod)
+	if ctrlRef == nil {
+		return "", "", "", nil
+	}
+
+	// Deployments manage ReplicaSets and never own Pods directly.
+	// Reject direct Deployment controller references.
+	if ctrlRef.Kind == "Deployment" {
+		return "", "", "", nil
+	}
+
+	switch ctrlRef.Kind {
+	case "ReplicaSet":
+		rs := &appsv1.ReplicaSet{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, rs); err != nil {
+			return "", "", "", err
 		}
+		if rs.UID != ctrlRef.UID {
+			return "", "", "", nil
+		}
+		if rs.Spec.Selector != nil {
+			selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
+			if err != nil || !selector.Matches(labels.Set(pod.Labels)) {
+				return "", "", "", nil
+			}
+		}
+
+		rsCtrl := metav1.GetControllerOf(rs)
+		if rsCtrl != nil && rsCtrl.Kind == "Deployment" {
+			return rsCtrl.Name, "Deployment", string(rsCtrl.UID), nil
+		}
+		return rs.Name, "ReplicaSet", string(rs.UID), nil
+
+	case "StatefulSet":
+		sts := &appsv1.StatefulSet{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, sts); err != nil {
+			return "", "", "", err
+		}
+		if sts.UID != ctrlRef.UID {
+			return "", "", "", nil
+		}
+		if sts.Spec.Selector != nil {
+			selector, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
+			if err != nil || !selector.Matches(labels.Set(pod.Labels)) {
+				return "", "", "", nil
+			}
+		}
+		return sts.Name, "StatefulSet", string(sts.UID), nil
+
+	case "Job":
+		job := &batchv1.Job{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, job); err != nil {
+			return "", "", "", err
+		}
+		if job.UID != ctrlRef.UID {
+			return "", "", "", nil
+		}
+		if job.Spec.Selector != nil {
+			selector, err := metav1.LabelSelectorAsSelector(job.Spec.Selector)
+			if err != nil || !selector.Matches(labels.Set(pod.Labels)) {
+				return "", "", "", nil
+			}
+		}
+		return job.Name, "Job", string(job.UID), nil
+
+	default:
+		// Custom operator kinds: fetch via unstructured live Get
+		u := &unstructured.Unstructured{}
+		u.SetAPIVersion(ctrlRef.APIVersion)
+		u.SetKind(ctrlRef.Kind)
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, u); err != nil {
+			return "", "", "", err
+		}
+		if u.GetUID() != ctrlRef.UID {
+			return "", "", "", nil
+		}
+		if selField, found, _ := unstructured.NestedFieldNoCopy(u.Object, "spec", "selector"); found && selField != nil {
+			selectorMap, isMap := selField.(map[string]interface{})
+			if !isMap {
+				return "", "", "", nil
+			}
+			selJSON, jsonErr := json.Marshal(selectorMap)
+			if jsonErr != nil {
+				return "", "", "", nil
+			}
+			var ls metav1.LabelSelector
+			if unmarshalErr := json.Unmarshal(selJSON, &ls); unmarshalErr != nil {
+				return "", "", "", nil
+			}
+			selector, selErr := metav1.LabelSelectorAsSelector(&ls)
+			if selErr != nil || !selector.Matches(labels.Set(pod.Labels)) {
+				return "", "", "", nil
+			}
+		}
+		return u.GetName(), u.GetKind(), string(u.GetUID()), nil
 	}
-	if fallbackControllerOwner != nil {
-		return fallbackControllerOwner.Name, fallbackControllerOwner.Kind, string(fallbackControllerOwner.UID), nil
-	}
-	return "", "", "", nil
 }
 
 // IsBuiltInWorkloadKind reports whether kind is one of the built-in Kubernetes workload kinds
@@ -610,9 +690,76 @@ func FindUnassignedActivePMJ(
 	return "", nil
 }
 
+// MatchesPMJWorkload checks whether a replacement pod belongs to the same parent workload
+// and matches the replica identity criteria recorded on the PodMigrationJob.
+func MatchesPMJWorkload(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, parentName, parentKind, parentUID string) bool {
+	if pod == nil || job == nil {
+		return false
+	}
+
+	jobParentName := job.Labels[LabelParentName]
+	jobParentKind := job.Labels[LabelParentKind]
+	jobParentUID := job.Labels[LabelParentUID]
+
+	// For managed workloads, parent name and kind must match.
+	if parentName != jobParentName || parentKind != jobParentKind {
+		return false
+	}
+
+	// If parent UID is recorded on the job, it must match.
+	if jobParentUID != "" && parentUID != "" && parentUID != jobParentUID {
+		return false
+	}
+
+	// Deployment: pod-template-hash must match.
+	if jobParentKind == "Deployment" {
+		podTemplateHash := ""
+		if pod.Labels != nil {
+			podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+		}
+		if jobTemplateHash := job.Labels[LabelPodTemplateHash]; jobTemplateHash != "" && podTemplateHash != jobTemplateHash {
+			return false
+		}
+	}
+
+	// Job: completion index must match when present.
+	if jobParentKind == "Job" {
+		jobCompletionIndex := ""
+		if pod.Labels != nil {
+			jobCompletionIndex = pod.Labels[LabelJobCompletionIndex]
+		}
+		if jobCompIdx := job.Labels[LabelJobCompletionIndex]; jobCompIdx != "" && jobCompletionIndex != jobCompIdx {
+			return false
+		}
+	}
+
+	// StatefulSet: pod name must match.
+	if jobParentKind == "StatefulSet" {
+		if pod.Name != job.Spec.PodRef.Name {
+			return false
+		}
+	}
+
+	// Custom operator: replica key must match.
+	if !IsBuiltInWorkloadKind(jobParentKind) {
+		replicaKey, _ := ResolveOperatorReplicaKey(pod, jobParentKind)
+		jobKey := JobReplicaIdentityKey(job)
+		if replicaKey != "" && jobKey != "" && replicaKey != jobKey {
+			return false
+		}
+	}
+
+	return true
+}
+
 // ResolveCollision deterministically resolves PMJ assignment races.
 // Returns: (correctedPMJ, changed, error)
-func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, assignedPMJ, parentName, parentKind, parentUID string) (string, bool, error) {
+func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, assignedPMJ, parentName, parentKind, parentUID string, apiReader ...client.Reader) (string, bool, error) {
+	reader := client.Reader(c)
+	if len(apiReader) > 0 && apiReader[0] != nil {
+		reader = apiReader[0]
+	}
+
 	// Fetch the assigned PMJ to check targetPodUID
 	job := &pmv1alpha1.PodMigrationJob{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assignedPMJ}, job); err != nil {
@@ -625,6 +772,21 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 			return assignedPMJ, false, nil
 		}
 		return "", false, err
+	}
+
+	// If the job records a parent workload, the pod must match that workload lineage.
+	if job.Labels != nil && job.Labels[LabelParentName] != "" {
+		podParentName, podParentKind, podParentUID, err := ResolveParentWorkload(ctx, reader, pod)
+		if err != nil && !apierrors.IsNotFound(err) {
+			if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+				return "", true, nil // Ineligible contender: cannot verify lineage, clear assignment
+			}
+			return "", false, err
+		}
+		if !MatchesPMJWorkload(pod, job, podParentName, podParentKind, podParentUID) {
+			return "", true, nil // Ineligible contender: clear assignment for cold-start bypass
+		}
+		parentName, parentKind, parentUID = podParentName, podParentKind, podParentUID
 	}
 
 	// Contenders are exactly the pods indexed under this PMJ name; a
@@ -645,11 +807,73 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		if string(p.UID) == job.Spec.TargetPodUID {
 			continue
 		}
+		// Contenders must match workload lineage if the job specifies a parent workload
+		if job.Labels != nil && job.Labels[LabelParentName] != "" {
+			if p.UID == pod.UID {
+				// Reconciling pod was already verified at line :785. Skip re-resolution.
+				contenders = append(contenders, p)
+				continue
+			}
+			pParentName, pParentKind, pParentUID, err := ResolveParentWorkload(ctx, reader, p)
+			if err != nil && !apierrors.IsNotFound(err) {
+				if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+					continue
+				}
+				return "", false, err
+			}
+			if !MatchesPMJWorkload(p, job, pParentName, pParentKind, pParentUID) {
+				continue
+			}
+		}
 		contenders = append(contenders, p)
 	}
 
 	if len(contenders) <= 1 {
 		return assignedPMJ, false, nil // No collision
+	}
+
+	// If any contender is opted in (pod-migration.gke.io/enabled: "true"),
+	// un-opted-in pods cannot compete in the collision.
+	var optedIn []*corev1.Pod
+	for _, p := range contenders {
+		if p.Labels != nil && p.Labels[LabelPodMigrationEnabled] == "true" {
+			optedIn = append(optedIn, p)
+		}
+	}
+	if len(optedIn) > 0 {
+		contenders = optedIn
+	}
+
+	findLoserResolution := func() (string, bool, error) {
+		var podTemplateHash string
+		var jobCompletionIndex string
+		var replicaKey string
+		if pod.Labels != nil {
+			podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+			jobCompletionIndex = pod.Labels[LabelJobCompletionIndex]
+		}
+		if !IsBuiltInWorkloadKind(parentKind) {
+			replicaKey, _ = ResolveOperatorReplicaKey(pod, parentKind)
+		}
+
+		altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true, replicaKey)
+		if err != nil {
+			return "", false, err
+		}
+
+		if altPMJ != "" {
+			return altPMJ, true, nil // Re-assigned to alternative PMJ
+		}
+
+		return "", true, nil // No alternative, we are a scale-up pod (clear assignment)
+	}
+
+	if len(contenders) <= 1 {
+		winner := contenders[0]
+		if winner.UID == pod.UID {
+			return assignedPMJ, false, nil // Sole eligible winner
+		}
+		return findLoserResolution() // Loser (un-opted-in displaced by opted-in contender)
 	}
 
 	// Sort contenders deterministically by creation timestamp, then alphabetically by name
@@ -665,26 +889,6 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		return assignedPMJ, false, nil // We are the winner, no change
 	}
 
-	var podTemplateHash string
-	var jobCompletionIndex string
-	var replicaKey string
-	if pod.Labels != nil {
-		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
-		jobCompletionIndex = pod.Labels[LabelJobCompletionIndex]
-	}
-	if !IsBuiltInWorkloadKind(parentKind) {
-		replicaKey, _ = ResolveOperatorReplicaKey(pod, parentKind)
-	}
-
 	// We are the loser! Try to find an alternative active PMJ
-	altPMJ, err := FindUnassignedActivePMJ(ctx, c, pod.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true, replicaKey)
-	if err != nil {
-		return "", false, err
-	}
-
-	if altPMJ != "" {
-		return altPMJ, true, nil // Re-assigned to alternative PMJ
-	}
-
-	return "", true, nil // No alternative, we are a scale-up pod (clear assignment)
+	return findLoserResolution()
 }

@@ -18,10 +18,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -30,7 +32,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -802,10 +806,34 @@ func TestNodePreemptionReconciler_OperatorOwned_RayHeadAndAmbiguousWorker(t *tes
 
 	psp := createTestPSP("psp-default", "default")
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": "default",
+				"uid":       clusterUID,
+			},
+		},
+	}
+
+	customCR := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "custom.io/v1",
+			"kind":       "CustomCR",
+			"metadata": map[string]interface{}{
+				"name":      "custom-name",
+				"namespace": "default",
+				"uid":       "custom-uid",
+			},
+		},
+	}
+
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
-		WithObjects(node, headPod, worker1, worker2, unknownOpPod, psp).
+		WithObjects(node, headPod, worker1, worker2, unknownOpPod, psp, rayCluster, customCR).
 		Build()
 
 	r := &NodePreemptionReconciler{
@@ -893,10 +921,22 @@ func TestNodePreemptionReconciler_OperatorOwned_InFlightPMJ_Refused(t *testing.T
 	psp := createTestPSP("psp-default", "default")
 	recorder := record.NewFakeRecorder(20)
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": "default",
+				"uid":       clusterUID,
+			},
+		},
+	}
+
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
-		WithObjects(node, headPod, existingPMJ, psp).
+		WithObjects(node, headPod, existingPMJ, psp, rayCluster).
 		Build()
 
 	r := &NodePreemptionReconciler{
@@ -981,5 +1021,98 @@ func TestNodePreemptionReconciler_IneligibleVerdictMetrics(t *testing.T) {
 	if testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("ineligible", "ineligible-engine")) < 1 {
 		t.Errorf("expected SkippedMigrationsTotal[ineligible, ineligible-engine] >= 1, got %v",
 			testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("ineligible", "ineligible-engine")))
+	}
+}
+
+func TestNodePreemptionReconciler_OperatorOwned_OwnerForbidden_Skipped(t *testing.T) {
+	metrics.ResetCoverageForTest()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	nodeName := "spot-node-forbidden"
+	node := createTestNode(nodeName, true, "taint-gke")
+
+	clusterName := "sample-ray"
+	clusterKind := "RayCluster"
+	clusterUID := "ray-uid-111"
+	isController := true
+
+	headPod := createTestPod("ray-head", "default", nodeName, "2Gi", "uid-ray-head")
+	headPod.Labels["ray.io/group"] = "headgroup"
+	headPod.Labels["ray.io/node-type"] = "head"
+	headPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: "ray.io/v1",
+			Kind:       clusterKind,
+			Name:       clusterName,
+			UID:        types.UID(clusterUID),
+			Controller: &isController,
+		},
+	}
+
+	psp := createTestPSP("psp-default", "default")
+
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
+		WithObjects(node, headPod, psp).
+		Build()
+
+	cl := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == clusterName {
+				return apierrors.NewForbidden(schema.GroupResource{Group: "ray.io", Resource: "rayclusters"}, key.Name, nil)
+			}
+			return client.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	recorder := record.NewFakeRecorder(20)
+	r := &NodePreemptionReconciler{
+		Client:                  cl,
+		APIReader:               cl,
+		Scheme:                  scheme,
+		Recorder:                recorder,
+		DefaultMigrationTimeout: 10 * time.Minute,
+	}
+
+	beforeSpotMetric := testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("owner_unreadable"))
+	beforeMigMetric := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("owner_unreadable", "gke-pod-snapshots"))
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: nodeName},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	pmjList := &pmv1alpha1.PodMigrationJobList{}
+	if err := baseClient.List(context.Background(), pmjList); err != nil {
+		t.Fatalf("failed to list PMJs: %v", err)
+	}
+	if len(pmjList.Items) != 0 {
+		t.Fatalf("expected 0 PMJs created when owner Get is Forbidden, got %d", len(pmjList.Items))
+	}
+
+	// Verify MigrationSkippedOwnerUnreadable event was emitted
+	foundEvent := false
+	for len(recorder.Events) > 0 {
+		e := <-recorder.Events
+		if strings.Contains(e, "MigrationSkippedOwnerUnreadable") {
+			foundEvent = true
+			break
+		}
+	}
+	if !foundEvent {
+		t.Fatalf("expected MigrationSkippedOwnerUnreadable warning event to be emitted on 403 owner read")
+	}
+
+	// Verify metrics
+	if got := testutil.ToFloat64(metrics.SpotPreemptionSkippedTotal.WithLabelValues("owner_unreadable")); got != beforeSpotMetric+1 {
+		t.Errorf("expected spot_preemption_skipped_total{reason=\"owner_unreadable\"} to increment by 1, got %v (before=%v)", got, beforeSpotMetric)
+	}
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("owner_unreadable", "gke-pod-snapshots")); got != beforeMigMetric+1 {
+		t.Errorf("expected pod_migration_skipped_total{reason=\"owner_unreadable\", engine=\"gke-pod-snapshots\"} to increment by 1, got %v (before=%v)", got, beforeMigMetric)
 	}
 }
