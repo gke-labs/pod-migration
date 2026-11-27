@@ -22,6 +22,7 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -31,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -161,6 +163,7 @@ func TestEvictionGate(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "deploy-rs-v1",
 							UID:        "rs-uid-111",
+							Controller: ptr.To(true),
 						},
 					},
 					UID: "deploy-pod-uid-999",
@@ -182,6 +185,7 @@ func TestEvictionGate(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "my-deployment",
 								UID:        "deploy-uid-111",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -215,6 +219,7 @@ func TestEvictionGate(t *testing.T) {
 							Kind:       "Job",
 							Name:       "my-indexed-job",
 							UID:        "job-uid-999",
+							Controller: ptr.To(true),
 						},
 					},
 				},
@@ -224,6 +229,13 @@ func TestEvictionGate(t *testing.T) {
 			},
 			initObjects: []client.Object{
 				createPSP("psp-test-manual", "manual", "stop"),
+				&batchv1.Job{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "my-indexed-job",
+						UID:       "job-uid-999",
+					},
+				},
 			},
 			subResource:        "eviction",
 			expectedAllowed:    false,
@@ -596,6 +608,7 @@ func TestEvictionGate(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = corev1.AddToScheme(scheme)
 			_ = appsv1.AddToScheme(scheme)
+			_ = batchv1.AddToScheme(scheme)
 			_ = pmv1alpha1.AddToScheme(scheme)
 
 			initObjs := append(tt.initObjects, tt.pod)
@@ -1086,7 +1099,18 @@ func TestEvictionGate_OperatorOwned_RayHead_CreatesPMJ(t *testing.T) {
 	}
 
 	psp := createPSP("sample-ray-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp, rayCluster).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,
@@ -1236,7 +1260,18 @@ func TestEvictionGate_OperatorOwned_AmbiguousSiblingWorker_AllowsColdEviction(t 
 	}
 
 	psp := createPSP("sample-ray-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, sibling, psp).Build()
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, sibling, psp, rayCluster).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,
@@ -1351,7 +1386,18 @@ func TestEvictionGate_OperatorOwned_NoReplicaKey_AllowsColdEviction(t *testing.T
 	}
 
 	psp := createPSP("custom-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	customCR := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "custom.io/v1",
+			"kind":       "CustomOperator",
+			"metadata": map[string]interface{}{
+				"name":      "custom-cr",
+				"namespace": namespace,
+				"uid":       "custom-uid-111",
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp, customCR).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,
@@ -1468,7 +1514,18 @@ func TestEvictionGate_OperatorOwned_StableName_CreatesPMJ(t *testing.T) {
 	}
 
 	psp := createPSP("pytorch-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp).Build()
+	pytorchJob := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "kubeflow.org/v1",
+			"kind":       parentKind,
+			"metadata": map[string]interface{}{
+				"name":      parentName,
+				"namespace": namespace,
+				"uid":       parentUID,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, psp, pytorchJob).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,
@@ -1607,7 +1664,18 @@ func TestEvictionGate_OperatorOwned_InFlightReplicaKey_Refused(t *testing.T) {
 	}
 
 	psp := createPSP("sample-ray-psp", "manual", "stop")
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, existingPMJ, psp).Build()
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, existingPMJ, psp, rayCluster).Build()
 	recorder := record.NewFakeRecorder(10)
 	handler := &EvictionGate{
 		Client:    fakeClient,

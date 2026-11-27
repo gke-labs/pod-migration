@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -870,6 +871,7 @@ func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t 
 	namespace := "default"
 	pmjName := "pmj-deploy-1"
 	altPmjName := "pmj-deploy-2"
+	isController := true
 
 	rs := &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -882,6 +884,7 @@ func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t 
 					Kind:       "Deployment",
 					Name:       "test-deployment",
 					UID:        "deploy-uid",
+					Controller: &isController,
 				},
 			},
 		},
@@ -906,6 +909,7 @@ func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t 
 					Kind:       "ReplicaSet",
 					Name:       "test-rs",
 					UID:        "rs-uid",
+					Controller: &isController,
 				},
 			},
 		},
@@ -935,6 +939,7 @@ func TestPodGateReconciler_Reconcile_Collision_Deployment_AlternativePMJFound(t 
 					Kind:       "ReplicaSet",
 					Name:       "test-rs",
 					UID:        "rs-uid",
+					Controller: &isController,
 				},
 			},
 		},
@@ -2576,12 +2581,24 @@ func TestPodGateReconciler_OperatorOwned_RayHead_UnGatedAndRestored(t *testing.T
 		},
 	}
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
 		WithStatusSubresource(&pmv1alpha1.PodMigrationJob{}).
-		WithObjects(withReadySnapshots([]client.Object{gatedPod, pmj})...).
+		WithObjects(withReadySnapshots([]client.Object{gatedPod, pmj, rayCluster})...).
 		Build()
 
 	r := &PodGateReconciler{

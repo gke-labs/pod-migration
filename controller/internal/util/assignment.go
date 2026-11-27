@@ -17,6 +17,7 @@ package util
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,7 +26,11 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -71,41 +76,128 @@ const (
 	PMJParentKeyIndexKey = "pmj.podmigration.gke.io/parent-key"
 )
 
+func isIgnorableSchemeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if runtime.IsNotRegisteredError(err) || meta.IsNoMatchError(err) {
+		return true
+	}
+	if strings.Contains(err.Error(), "no kind is registered for the type") {
+		return true
+	}
+	return false
+}
+
 // ResolveParentWorkload finds the parent owner details (ReplicaSet -> Deployment, Job, StatefulSet,
-// or any custom operator controller=true owner).
+// or any custom operator controller=true owner) via live API lookup with UID and selector validation.
 func ResolveParentWorkload(ctx context.Context, c client.Reader, pod *corev1.Pod) (string, string, string, error) {
-	var fallbackControllerOwner *metav1.OwnerReference
-	for i := range pod.OwnerReferences {
-		ref := &pod.OwnerReferences[i]
-		if ref.Kind == "ReplicaSet" {
-			rs := &appsv1.ReplicaSet{}
-			err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}, rs)
-			if err == nil {
-				if ref.UID != "" && rs.UID != "" && rs.UID != ref.UID {
-					continue
-				}
-				if ref.Controller != nil && !*ref.Controller {
-					continue
-				}
-				for _, rsRef := range rs.OwnerReferences {
-					if rsRef.Kind == "Deployment" && (rsRef.Controller == nil || *rsRef.Controller) {
-						return rsRef.Name, "Deployment", string(rsRef.UID), nil
+	if pod == nil {
+		return "", "", "", nil
+	}
+
+	ctrlRef := metav1.GetControllerOf(pod)
+	if ctrlRef == nil {
+		return "", "", "", nil
+	}
+
+	// Deployments manage ReplicaSets and never own Pods directly.
+	// Reject direct Deployment controller references.
+	if ctrlRef.Kind == "Deployment" {
+		return "", "", "", nil
+	}
+
+	switch ctrlRef.Kind {
+	case "ReplicaSet":
+		rs := &appsv1.ReplicaSet{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, rs); err != nil {
+			if isIgnorableSchemeError(err) {
+				return "", "", "", nil
+			}
+			return "", "", "", err
+		}
+		if rs.UID != ctrlRef.UID {
+			return "", "", "", nil
+		}
+		if rs.Spec.Selector != nil {
+			selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
+			if err != nil || !selector.Matches(labels.Set(pod.Labels)) {
+				return "", "", "", nil
+			}
+		}
+
+		rsCtrl := metav1.GetControllerOf(rs)
+		if rsCtrl != nil && rsCtrl.Kind == "Deployment" {
+			return rsCtrl.Name, "Deployment", string(rsCtrl.UID), nil
+		}
+		return rs.Name, "ReplicaSet", string(rs.UID), nil
+
+	case "StatefulSet":
+		sts := &appsv1.StatefulSet{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, sts); err != nil {
+			if isIgnorableSchemeError(err) {
+				return "", "", "", nil
+			}
+			return "", "", "", err
+		}
+		if sts.UID != ctrlRef.UID {
+			return "", "", "", nil
+		}
+		if sts.Spec.Selector != nil {
+			selector, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
+			if err != nil || !selector.Matches(labels.Set(pod.Labels)) {
+				return "", "", "", nil
+			}
+		}
+		return sts.Name, "StatefulSet", string(sts.UID), nil
+
+	case "Job":
+		job := &batchv1.Job{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, job); err != nil {
+			if isIgnorableSchemeError(err) {
+				return "", "", "", nil
+			}
+			return "", "", "", err
+		}
+		if job.UID != ctrlRef.UID {
+			return "", "", "", nil
+		}
+		if job.Spec.Selector != nil {
+			selector, err := metav1.LabelSelectorAsSelector(job.Spec.Selector)
+			if err != nil || !selector.Matches(labels.Set(pod.Labels)) {
+				return "", "", "", nil
+			}
+		}
+		return job.Name, "Job", string(job.UID), nil
+
+	default:
+		// Custom operator kinds: fetch via unstructured live Get
+		u := &unstructured.Unstructured{}
+		u.SetAPIVersion(ctrlRef.APIVersion)
+		u.SetKind(ctrlRef.Kind)
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ctrlRef.Name}, u); err != nil {
+			if isIgnorableSchemeError(err) {
+				return "", "", "", nil
+			}
+			return "", "", "", err
+		}
+		if u.GetUID() != ctrlRef.UID {
+			return "", "", "", nil
+		}
+		if selectorMap, found, _ := unstructured.NestedMap(u.Object, "spec", "selector"); found {
+			selJSON, jsonErr := json.Marshal(selectorMap)
+			if jsonErr == nil {
+				var ls metav1.LabelSelector
+				if unmarshalErr := json.Unmarshal(selJSON, &ls); unmarshalErr == nil {
+					selector, selErr := metav1.LabelSelectorAsSelector(&ls)
+					if selErr != nil || !selector.Matches(labels.Set(pod.Labels)) {
+						return "", "", "", nil
 					}
 				}
-				return rs.Name, "ReplicaSet", string(rs.UID), nil
-			} else {
-				return "", "", "", err
 			}
-		} else if (ref.Kind == "Job" || ref.Kind == "StatefulSet") && (ref.Controller == nil || *ref.Controller) {
-			return ref.Name, ref.Kind, string(ref.UID), nil
-		} else if ref.Controller != nil && *ref.Controller {
-			fallbackControllerOwner = ref
 		}
+		return u.GetName(), u.GetKind(), string(u.GetUID()), nil
 	}
-	if fallbackControllerOwner != nil {
-		return fallbackControllerOwner.Name, fallbackControllerOwner.Kind, string(fallbackControllerOwner.UID), nil
-	}
-	return "", "", "", nil
 }
 
 // IsBuiltInWorkloadKind reports whether kind is one of the built-in Kubernetes workload kinds
@@ -695,9 +787,14 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 
 	// If the job records a parent workload, the pod must match that workload lineage.
 	if job.Labels != nil && job.Labels[LabelParentName] != "" {
-		if !MatchesPMJWorkload(pod, job, parentName, parentKind, parentUID) {
+		podParentName, podParentKind, podParentUID, err := ResolveParentWorkload(ctx, c, pod)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return "", false, err
+		}
+		if !MatchesPMJWorkload(pod, job, podParentName, podParentKind, podParentUID) {
 			return "", true, nil // Ineligible contender: clear assignment for cold-start bypass
 		}
+		parentName, parentKind, parentUID = podParentName, podParentKind, podParentUID
 	}
 
 	// Contenders are exactly the pods indexed under this PMJ name; a

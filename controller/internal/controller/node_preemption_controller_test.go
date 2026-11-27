@@ -802,10 +802,34 @@ func TestNodePreemptionReconciler_OperatorOwned_RayHeadAndAmbiguousWorker(t *tes
 
 	psp := createTestPSP("psp-default", "default")
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": "default",
+				"uid":       clusterUID,
+			},
+		},
+	}
+
+	customCR := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "custom.io/v1",
+			"kind":       "CustomCR",
+			"metadata": map[string]interface{}{
+				"name":      "custom-name",
+				"namespace": "default",
+				"uid":       "custom-uid",
+			},
+		},
+	}
+
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
-		WithObjects(node, headPod, worker1, worker2, unknownOpPod, psp).
+		WithObjects(node, headPod, worker1, worker2, unknownOpPod, psp, rayCluster, customCR).
 		Build()
 
 	r := &NodePreemptionReconciler{
@@ -893,10 +917,22 @@ func TestNodePreemptionReconciler_OperatorOwned_InFlightPMJ_Refused(t *testing.T
 	psp := createTestPSP("psp-default", "default")
 	recorder := record.NewFakeRecorder(20)
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": "default",
+				"uid":       clusterUID,
+			},
+		},
+	}
+
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodNodeNameIndex, PodNodeNameIndexValue).
-		WithObjects(node, headPod, existingPMJ, psp).
+		WithObjects(node, headPod, existingPMJ, psp, rayCluster).
 		Build()
 
 	r := &NodePreemptionReconciler{

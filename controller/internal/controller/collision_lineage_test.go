@@ -24,8 +24,10 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -73,7 +75,7 @@ func TestCollisionResolution_FiltersUnmanagedAndMismatchedPods(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{
 			SchedulingGates:  gate,
-			RuntimeClassName: stringPtr("gvisor"),
+			RuntimeClassName: ptr.To("gvisor"),
 			Containers:       []corev1.Container{{Name: "a", Image: "batch-worker"}},
 		},
 	}
@@ -95,7 +97,7 @@ func TestCollisionResolution_FiltersUnmanagedAndMismatchedPods(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{
 			SchedulingGates:  gate,
-			RuntimeClassName: stringPtr("gvisor"),
+			RuntimeClassName: ptr.To("gvisor"),
 			Containers:       []corev1.Container{{Name: "a", Image: "app"}},
 		},
 	}
@@ -390,10 +392,23 @@ func TestCollisionResolution_StatefulSet(t *testing.T) {
 		},
 	}
 
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "redis",
+			Namespace: "default",
+			UID:       "sts-uid-123",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "redis"},
+			},
+		},
+	}
+
 	cl := fake.NewClientBuilder().WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
-		WithObjects(pod1, pod2, pmj).Build()
+		WithObjects(pod1, pod2, sts, pmj).Build()
 
 	// redis-0 reconciles: redis-1 is filtered out, redis-0 wins!
 	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-redis-0", "redis", "StatefulSet", "sts-uid-123")
@@ -488,10 +503,23 @@ func TestCollisionResolution_JobIndex(t *testing.T) {
 		},
 	}
 
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "batch-job",
+			Namespace: "default",
+			UID:       "job-uid-123",
+		},
+		Spec: batchv1.JobSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"job-name": "batch-job"},
+			},
+		},
+	}
+
 	cl := fake.NewClientBuilder().WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
-		WithObjects(pod1, pod2, pmj).Build()
+		WithObjects(pod1, pod2, job, pmj).Build()
 
 	// Pod 2 (index 0) reconciles: pod1 filtered out, pod2 wins!
 	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-job-0", "batch-job", "Job", "job-uid-123")
@@ -588,10 +616,22 @@ func TestCollisionResolution_OperatorReplicaKey(t *testing.T) {
 		},
 	}
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       "RayCluster",
+			"metadata": map[string]interface{}{
+				"name":      "sample-ray",
+				"namespace": "default",
+				"uid":       "ray-uid-123",
+			},
+		},
+	}
+
 	cl := fake.NewClientBuilder().WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
-		WithObjects(pod1, pod2, pmj).Build()
+		WithObjects(pod1, pod2, rayCluster, pmj).Build()
 
 	// Pod 2 (head pod) reconciles: worker pod1 filtered out, pod2 wins!
 	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-ray-head", "sample-ray", "RayCluster", "ray-uid-123")
@@ -871,7 +911,7 @@ func TestCollisionResolution_ParentKindAndNameMismatch(t *testing.T) {
 					APIVersion: "apps/v1",
 					Kind:       "StatefulSet",
 					Name:       "other-sts",
-					UID:        "sts-uid-999",
+					UID:        "rs-uid-123",
 					Controller: &isController,
 				},
 			},
@@ -909,10 +949,18 @@ func TestCollisionResolution_ParentKindAndNameMismatch(t *testing.T) {
 		},
 	}
 
+	otherSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "other-sts",
+			Namespace: "default",
+			UID:       "rs-uid-123",
+		},
+	}
+
 	cl := fake.NewClientBuilder().WithScheme(scheme).
 		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
-		WithObjects(pod1, pod2, rs, pmj).Build()
+		WithObjects(pod1, pod2, rs, otherSts, pmj).Build()
 
 	// Pod 2 reconciles: pod1 filtered out by parent kind/name mismatch, pod2 wins!
 	corrected, changed, err := util.ResolveCollision(ctx, cl, pod2, "pmj-rs", "web-rs", "ReplicaSet", "rs-uid-123")
@@ -923,8 +971,8 @@ func TestCollisionResolution_ParentKindAndNameMismatch(t *testing.T) {
 		t.Fatalf("expected pod2 to win, got changed=%v, corrected=%q", changed, corrected)
 	}
 
-	// Pod 1 reconciles: kind/name mismatch, cleared
-	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-rs", "other-sts", "StatefulSet", "sts-uid-999")
+	// Pod 1 reconciles: kind/name mismatch, cleared (even with matching parent UID)
+	corrected1, changed1, err1 := util.ResolveCollision(ctx, cl, pod1, "pmj-rs", "other-sts", "StatefulSet", "rs-uid-123")
 	if err1 != nil {
 		t.Fatalf("ResolveCollision err=%v", err1)
 	}
@@ -1128,4 +1176,409 @@ func TestCollisionResolution_ClearAndReleaseCold(t *testing.T) {
 	if len(updated.Spec.SchedulingGates) != 0 {
 		t.Fatalf("expected scheduling gates removed, got %v", updated.Spec.SchedulingGates)
 	}
+}
+
+// TestCollisionResolution_NonControllerRefsAndDirectDeploymentRejected verifies that
+// owner references with controller: false, direct Deployment controller references,
+// or owner selector mismatches fail ResolveParentWorkload and are cleared as ineligible contenders.
+func TestCollisionResolution_NonControllerRefsAndDirectDeploymentRejected(t *testing.T) {
+	ctx := context.TODO()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	t.Run("ReplicaSet owner ref with controller: false is rejected", func(t *testing.T) {
+		notController := false
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web-pod",
+				Namespace: "default",
+				UID:       "pod-uid",
+				Labels: map[string]string{
+					"app":                         "web",
+					util.LabelPodMigrationEnabled: "true",
+				},
+				Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-deploy"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "ReplicaSet",
+						Name:       "web-rs",
+						UID:        "rs-uid",
+						Controller: &notController,
+					},
+				},
+			},
+		}
+		isCtrl := true
+		rs := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web-rs",
+				Namespace: "default",
+				UID:       "rs-uid",
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       "web-deploy",
+						UID:        "deploy-uid",
+						Controller: &isCtrl,
+					},
+				},
+			},
+			Spec: appsv1.ReplicaSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			},
+		}
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pmj-deploy",
+				Namespace: "default",
+				Labels: map[string]string{
+					util.LabelParentName: "web-deploy",
+					util.LabelParentKind: "Deployment",
+					util.LabelParentUID:  "deploy-uid",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+				TargetPodUID: "src-uid",
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+			WithObjects(pod, rs, pmj).Build()
+
+		corrected, changed, err := util.ResolveCollision(ctx, cl, pod, "pmj-deploy", "web-deploy", "Deployment", "deploy-uid")
+		if err != nil {
+			t.Fatalf("ResolveCollision err=%v", err)
+		}
+		if !changed || corrected != "" {
+			t.Fatalf("expected pod with controller: false to be cleared, got changed=%v, corrected=%q", changed, corrected)
+		}
+	})
+
+	t.Run("ReplicaSet Deployment ref with controller: false is rejected", func(t *testing.T) {
+		isCtrl := true
+		notCtrl := false
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web-pod",
+				Namespace: "default",
+				UID:       "pod-uid",
+				Labels: map[string]string{
+					"app":                         "web",
+					util.LabelPodMigrationEnabled: "true",
+				},
+				Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-deploy"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "ReplicaSet",
+						Name:       "web-rs",
+						UID:        "rs-uid",
+						Controller: &isCtrl,
+					},
+				},
+			},
+		}
+		rs := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web-rs",
+				Namespace: "default",
+				UID:       "rs-uid",
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       "web-deploy",
+						UID:        "deploy-uid",
+						Controller: &notCtrl,
+					},
+				},
+			},
+			Spec: appsv1.ReplicaSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			},
+		}
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pmj-deploy",
+				Namespace: "default",
+				Labels: map[string]string{
+					util.LabelParentName: "web-deploy",
+					util.LabelParentKind: "Deployment",
+					util.LabelParentUID:  "deploy-uid",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+				TargetPodUID: "src-uid",
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+			WithObjects(pod, rs, pmj).Build()
+
+		corrected, changed, err := util.ResolveCollision(ctx, cl, pod, "pmj-deploy", "web-deploy", "Deployment", "deploy-uid")
+		if err != nil {
+			t.Fatalf("ResolveCollision err=%v", err)
+		}
+		if !changed || corrected != "" {
+			t.Fatalf("expected RS with controller: false Deployment owner to be rejected, got changed=%v, corrected=%q", changed, corrected)
+		}
+	})
+
+	t.Run("StatefulSet ref with controller: false is rejected", func(t *testing.T) {
+		notCtrl := false
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "redis-0",
+				Namespace: "default",
+				UID:       "pod-uid",
+				Labels: map[string]string{
+					"app":                         "redis",
+					util.LabelPodMigrationEnabled: "true",
+				},
+				Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-sts"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "StatefulSet",
+						Name:       "redis",
+						UID:        "sts-uid",
+						Controller: &notCtrl,
+					},
+				},
+			},
+		}
+		sts := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "redis",
+				Namespace: "default",
+				UID:       "sts-uid",
+			},
+			Spec: appsv1.StatefulSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "redis"}},
+			},
+		}
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pmj-sts",
+				Namespace: "default",
+				Labels: map[string]string{
+					util.LabelParentName: "redis",
+					util.LabelParentKind: "StatefulSet",
+					util.LabelParentUID:  "sts-uid",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "redis-0"},
+				TargetPodUID: "src-uid",
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+			WithObjects(pod, sts, pmj).Build()
+
+		corrected, changed, err := util.ResolveCollision(ctx, cl, pod, "pmj-sts", "redis", "StatefulSet", "sts-uid")
+		if err != nil {
+			t.Fatalf("ResolveCollision err=%v", err)
+		}
+		if !changed || corrected != "" {
+			t.Fatalf("expected StatefulSet with controller: false to be rejected, got changed=%v, corrected=%q", changed, corrected)
+		}
+	})
+
+	t.Run("Job ref with controller: false is rejected", func(t *testing.T) {
+		notCtrl := false
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "batch-job-0",
+				Namespace: "default",
+				UID:       "pod-uid",
+				Labels: map[string]string{
+					"job-name":                                 "batch-job",
+					"batch.kubernetes.io/job-completion-index": "0",
+					util.LabelPodMigrationEnabled:              "true",
+				},
+				Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-job"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "batch/v1",
+						Kind:       "Job",
+						Name:       "batch-job",
+						UID:        "job-uid",
+						Controller: &notCtrl,
+					},
+				},
+			},
+		}
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "batch-job",
+				Namespace: "default",
+				UID:       "job-uid",
+			},
+			Spec: batchv1.JobSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"job-name": "batch-job"}},
+			},
+		}
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pmj-job",
+				Namespace: "default",
+				Labels: map[string]string{
+					util.LabelParentName:                      "batch-job",
+					util.LabelParentKind:                      "Job",
+					util.LabelParentUID:                       "job-uid",
+					"batch.kubernetes.io/job-completion-index": "0",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "batch-job-0"},
+				TargetPodUID: "src-uid",
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+			WithObjects(pod, job, pmj).Build()
+
+		corrected, changed, err := util.ResolveCollision(ctx, cl, pod, "pmj-job", "batch-job", "Job", "job-uid")
+		if err != nil {
+			t.Fatalf("ResolveCollision err=%v", err)
+		}
+		if !changed || corrected != "" {
+			t.Fatalf("expected Job with controller: false to be rejected, got changed=%v, corrected=%q", changed, corrected)
+		}
+	})
+
+	t.Run("Direct Deployment controller ref on pod is rejected", func(t *testing.T) {
+		isCtrl := true
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "fake-deploy-pod",
+				Namespace: "default",
+				UID:       "pod-uid",
+				Labels: map[string]string{
+					"app":                         "web",
+					util.LabelPodMigrationEnabled: "true",
+				},
+				Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-deploy"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       "web-deploy",
+						UID:        "deploy-uid",
+						Controller: &isCtrl,
+					},
+				},
+			},
+		}
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pmj-deploy",
+				Namespace: "default",
+				Labels: map[string]string{
+					util.LabelParentName: "web-deploy",
+					util.LabelParentKind: "Deployment",
+					util.LabelParentUID:  "deploy-uid",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+				TargetPodUID: "src-uid",
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+			WithObjects(pod, pmj).Build()
+
+		corrected, changed, err := util.ResolveCollision(ctx, cl, pod, "pmj-deploy", "web-deploy", "Deployment", "deploy-uid")
+		if err != nil {
+			t.Fatalf("ResolveCollision err=%v", err)
+		}
+		if !changed || corrected != "" {
+			t.Fatalf("expected direct Deployment controller ref to be rejected, got changed=%v, corrected=%q", changed, corrected)
+		}
+	})
+
+	t.Run("Owner selector mismatch is rejected", func(t *testing.T) {
+		isCtrl := true
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web-pod",
+				Namespace: "default",
+				UID:       "pod-uid",
+				Labels: map[string]string{
+					"app":                         "wrong-app",
+					util.LabelPodMigrationEnabled: "true",
+				},
+				Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-deploy"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "ReplicaSet",
+						Name:       "web-rs",
+						UID:        "rs-uid",
+						Controller: &isCtrl,
+					},
+				},
+			},
+		}
+		rs := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web-rs",
+				Namespace: "default",
+				UID:       "rs-uid",
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       "web-deploy",
+						UID:        "deploy-uid",
+						Controller: &isCtrl,
+					},
+				},
+			},
+			Spec: appsv1.ReplicaSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			},
+		}
+		pmj := &pmv1alpha1.PodMigrationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pmj-deploy",
+				Namespace: "default",
+				Labels: map[string]string{
+					util.LabelParentName: "web-deploy",
+					util.LabelParentKind: "Deployment",
+					util.LabelParentUID:  "deploy-uid",
+				},
+			},
+			Spec: pmv1alpha1.PodMigrationJobSpec{
+				PodRef:       corev1.LocalObjectReference{Name: "web-src"},
+				TargetPodUID: "src-uid",
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+			WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+			WithObjects(pod, rs, pmj).Build()
+
+		corrected, changed, err := util.ResolveCollision(ctx, cl, pod, "pmj-deploy", "web-deploy", "Deployment", "deploy-uid")
+		if err != nil {
+			t.Fatalf("ResolveCollision err=%v", err)
+		}
+		if !changed || corrected != "" {
+			t.Fatalf("expected selector mismatch to be rejected, got changed=%v, corrected=%q", changed, corrected)
+		}
+	})
 }

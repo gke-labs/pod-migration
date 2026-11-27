@@ -24,6 +24,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -542,9 +543,21 @@ func TestEvictionGate_SkippedMigrationMetrics_OperatorReplicaKeysAndEngineResolu
 		},
 	}
 
+	customParent := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "custom.io/v1",
+			"kind":       "CustomOperator",
+			"metadata": map[string]interface{}{
+				"name":      "custom-parent",
+				"namespace": "default",
+				"uid":       "parent-uid-123",
+			},
+		},
+	}
+
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(pm, podNoKey, podAmbiguous1, podAmbiguous2, podPDB, podGate, podPMJInFlight, pmjExisting).
+		WithObjects(pm, podNoKey, podAmbiguous1, podAmbiguous2, podPDB, podGate, podPMJInFlight, pmjExisting, customParent).
 		WithStatusSubresource(pm).
 		Build()
 

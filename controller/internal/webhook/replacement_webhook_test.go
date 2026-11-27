@@ -24,10 +24,13 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -157,6 +160,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs",
 							UID:        "rs-uid",
+							Controller: ptr.To(true),
 						},
 					},
 				},
@@ -173,6 +177,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -197,6 +202,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs",
 							UID:        "rs-uid",
+							Controller: ptr.To(true),
 						},
 					},
 				},
@@ -213,6 +219,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -251,6 +258,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs-v2",
 							UID:        "rs-v2-uid",
+							Controller: ptr.To(true),
 						},
 					},
 				},
@@ -267,6 +275,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -306,6 +315,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs-v1",
 							UID:        "rs-v1-uid",
+							Controller: ptr.To(true),
 						},
 					},
 				},
@@ -322,6 +332,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -361,6 +372,7 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "test-rs-v2",
 							UID:        "rs-v2-uid",
+							Controller: ptr.To(true),
 						},
 					},
 				},
@@ -377,6 +389,7 @@ func TestPodGateInjector(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "test-deployment",
 								UID:        "deploy-uid",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -430,11 +443,19 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "Job",
 							Name:       "test-indexed-job",
 							UID:        "job-uid-1",
+							Controller: ptr.To(true),
 						},
 					},
 				},
 			},
 			initObjs: []runtime.Object{
+				&batchv1.Job{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-indexed-job",
+						UID:       "job-uid-1",
+					},
+				},
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
@@ -470,11 +491,19 @@ func TestPodGateInjector(t *testing.T) {
 							Kind:       "Job",
 							Name:       "test-indexed-job",
 							UID:        "job-uid-1",
+							Controller: ptr.To(true),
 						},
 					},
 				},
 			},
 			initObjs: []runtime.Object{
+				&batchv1.Job{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+						Name:      "test-indexed-job",
+						UID:       "job-uid-1",
+					},
+				},
 				&pmv1alpha1.PodMigrationJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
@@ -501,6 +530,7 @@ func TestPodGateInjector(t *testing.T) {
 			scheme := runtime.NewScheme()
 			_ = corev1.AddToScheme(scheme)
 			_ = appsv1.AddToScheme(scheme)
+			_ = batchv1.AddToScheme(scheme)
 			_ = pmv1alpha1.AddToScheme(scheme)
 			dec := admission.NewDecoder(scheme)
 
@@ -748,6 +778,7 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 						Kind:       "Deployment",
 						Name:       "test-deploy",
 						UID:        "deploy-uid",
+						Controller: ptr.To(true),
 					},
 				},
 			},
@@ -767,6 +798,7 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 						Kind:       "ReplicaSet",
 						Name:       "test-deploy-rs-v1",
 						UID:        "rs-v1-uid",
+						Controller: ptr.To(true),
 					},
 				},
 			},
@@ -859,6 +891,7 @@ func TestPodGateInjector_APIReaderFallback(t *testing.T) {
 						Kind:       "ReplicaSet",
 						Name:       "test-deploy-rs-v1",
 						UID:        "rs-v1-uid",
+						Controller: ptr.To(true),
 					},
 				},
 			},
@@ -1011,11 +1044,23 @@ func TestReplacementWebhook_RayHead_GatedAndAssigned(t *testing.T) {
 		},
 	}
 
+	rayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       clusterKind,
+			"metadata": map[string]interface{}{
+				"name":      clusterName,
+				"namespace": namespace,
+				"uid":       clusterUID,
+			},
+		},
+	}
+
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithIndex(&pmv1alpha1.PodMigrationJob{}, util.PMJParentKeyIndexKey, util.PMJParentKeyIndexValue).
 		WithIndex(&corev1.Pod{}, util.PodAssignedPMJIndexKey, util.PodAssignedPMJIndexValue).
-		WithObjects(pmj).
+		WithObjects(pmj, rayCluster).
 		Build()
 
 	handler := &PodGateInjector{
