@@ -67,7 +67,13 @@ metadata:
     pod-migrate.io/component: psengine
 rules:
   - apiGroups: ["criu.podmigration.gke.io"]
-    resources: ["podsnapshotstorageconfigs", "podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
+    resources:
+      [
+        "podsnapshotstorageconfigs",
+        "podsnapshotpolicies",
+        "podsnapshotmanualtriggers",
+        "podsnapshots",
+      ]
     verbs: ["get", "list", "watch", "create"]
   # The archive finalizer: added at create, removed once the archive is
   # deleted from the bucket (#107). Delete: a work order an earlier trigger
@@ -77,7 +83,12 @@ rules:
     resources: ["podsnapshots"]
     verbs: ["update", "patch", "delete"]
   - apiGroups: ["criu.podmigration.gke.io"]
-    resources: ["podsnapshotpolicies/status", "podsnapshotmanualtriggers/status", "podsnapshots/status"]
+    resources:
+      [
+        "podsnapshotpolicies/status",
+        "podsnapshotmanualtriggers/status",
+        "podsnapshots/status",
+      ]
     verbs: ["get", "update", "patch"]
   # list: before deleting a work order an earlier trigger left, the engine
   # checks live that no job still names it (#262).
@@ -447,10 +458,9 @@ webhooks:
     failurePolicy: Ignore
     timeoutSeconds: 5
     reinvocationPolicy: IfNeeded
-    objectSelector:
-      matchLabels:
-        pod-migration.gke.io/enabled: "true"
     namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
@@ -509,6 +519,8 @@ spec:
         resources: ["pods", "pods/status"]
         scope: Namespaced
     namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn

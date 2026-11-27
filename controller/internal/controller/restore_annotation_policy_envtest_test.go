@@ -85,7 +85,7 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 		Rules: []rbacv1.PolicyRule{{
 			APIGroups: []string{""},
 			Resources: []string{"pods"},
-			Verbs:     []string{"get", "list", "update", "patch"},
+			Verbs:     []string{"get", "list", "create", "update", "patch"},
 		}},
 	}
 	// A status writer may write pods/status, like a kubelet or a controller
@@ -131,7 +131,14 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 		}
 	}
 
-	if err := admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+	if err := admin.Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns,
+			Labels: map[string]string{
+				util.LabelNamespaceManaged: "true",
+			},
+		},
+	}); err != nil {
 		t.Fatalf("creating namespace: %v", err)
 	}
 	optedIn := map[string]string{optInLabel: "true"}
@@ -141,19 +148,6 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 	// The reason of a failed restore (#244), guarded by the same policy.
 	const reason = engine.CRIURestoreReasonAnnotation
 
-	newPod := func(t *testing.T, namespace, name string, labels, annotations map[string]string) *corev1.Pod {
-		t.Helper()
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: labels, Annotations: annotations},
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: "app", Image: "registry.example.com/app:1", Command: []string{"/app"}}},
-			},
-		}
-		if err := admin.Create(ctx, pod); err != nil {
-			t.Fatalf("creating pod %s/%s: %v", namespace, name, err)
-		}
-		return pod
-	}
 	// patch reads the pod as it is now, and sends mutate's change as c.
 	patch := func(t *testing.T, c client.Client, pod *corev1.Pod, mutate func(*corev1.Pod)) error {
 		t.Helper()
@@ -164,6 +158,44 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 		base := current.DeepCopy()
 		mutate(current)
 		return c.Patch(ctx, current, client.MergeFrom(base))
+	}
+
+	newPod := func(t *testing.T, namespace, name string, labels, annotations map[string]string) *corev1.Pod {
+		t.Helper()
+		initialAnnotations := make(map[string]string)
+		var restoreOrders map[string]string
+		for k, v := range annotations {
+			if strings.HasSuffix(k, "/ps-name") && k != gkeOrder && v != "" {
+				if restoreOrders == nil {
+					restoreOrders = make(map[string]string)
+				}
+				restoreOrders[k] = v
+			} else {
+				initialAnnotations[k] = v
+			}
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: labels, Annotations: initialAnnotations},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "registry.example.com/app:1", Command: []string{"/app"}}},
+			},
+		}
+		if err := admin.Create(ctx, pod); err != nil {
+			t.Fatalf("creating pod %s/%s: %v", namespace, name, err)
+		}
+		if len(restoreOrders) > 0 {
+			if err := patch(t, controller, pod, func(p *corev1.Pod) {
+				if p.Annotations == nil {
+					p.Annotations = make(map[string]string)
+				}
+				for k, v := range restoreOrders {
+					p.Annotations[k] = v
+				}
+			}); err != nil {
+				t.Fatalf("setting restore order on pod %s/%s: %v", namespace, name, err)
+			}
+		}
+		return pod
 	}
 	// update is patch with a full update, which is how the node agent writes.
 	update := func(t *testing.T, c client.Client, pod *corev1.Pod, mutate func(*corev1.Pod)) error {
@@ -414,6 +446,69 @@ func TestRestoreAnnotationPolicies_Envtest(t *testing.T) {
 			// An excluded namespace, like the webhooks'.
 			system := newPod(t, "kube-system", "order-system", optedIn, nil)
 			wantAllowed(t, patch(t, tenant, system, set(gkeOrder, "snap-a")), "a restore order in kube-system")
+		})
+
+		t.Run("non-GKE restore annotations on CREATE are denied while GKE restore annotations are allowed", func(t *testing.T) {
+			// Tenant attempting to create a pod carrying a spoofed CRIU restore order (#303).
+			criuPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   ns,
+					Name:        "order-create-criu",
+					Labels:      optedIn,
+					Annotations: map[string]string{criuOrder: "snap-spoofed"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "app", Image: "registry.example.com/app:1", Command: []string{"/app"}}},
+				},
+			}
+			wantDenied(t, tenant.Create(ctx, criuPod), restoreOrderPolicyName, "tenant creating pod with non-GKE restore order")
+
+			// Custom engine restore order is also denied on CREATE.
+			customKey := "snapshots.example.com/ps-name"
+			customPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   ns,
+					Name:        "order-create-custom",
+					Labels:      optedIn,
+					Annotations: map[string]string{customKey: "snap-custom"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "app", Image: "registry.example.com/app:1", Command: []string{"/app"}}},
+				},
+			}
+			wantDenied(t, admin.Create(ctx, customPod), restoreOrderPolicyName, "admin creating pod with custom engine restore order")
+
+			// GKE restore annotation on CREATE (Kubeflow resume flow) is allowed.
+			gkePod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   ns,
+					Name:        "order-create-gke-resume",
+					Labels:      optedIn,
+					Annotations: map[string]string{gkeOrder: "kubeflow-checkpoint-1"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "app", Image: "registry.example.com/app:1", Command: []string{"/app"}}},
+				},
+			}
+			wantAllowed(t, tenant.Create(ctx, gkePod), "tenant creating pod with GKE restore order (Kubeflow flow)")
+
+			// In an unmanaged namespace (without pod-migration.gke.io/managed: "true"), non-GKE restore order is allowed.
+			unmanagedNS := "unmanaged-tenant-ns"
+			if err := admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: unmanagedNS}}); err != nil {
+				t.Fatalf("creating unmanaged namespace: %v", err)
+			}
+			unmanagedPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   unmanagedNS,
+					Name:        "order-create-unmanaged",
+					Labels:      optedIn,
+					Annotations: map[string]string{criuOrder: "snap-unmanaged"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "app", Image: "registry.example.com/app:1", Command: []string{"/app"}}},
+				},
+			}
+			wantAllowed(t, admin.Create(ctx, unmanagedPod), "creating pod with CRIU restore order in an unmanaged namespace")
 		})
 	})
 

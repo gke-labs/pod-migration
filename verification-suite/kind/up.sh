@@ -228,6 +228,8 @@ main() {
     wait_until 120 "the CA bundle of ${wh}" has_ca_bundle "${wh}"
   done
 
+  kubectl label namespace default pod-migration.gke.io/managed="true" --overwrite
+
   local node
   for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name); do
     if ! wait_until 180 "${node} to be CRIU-ready" criu_ready "${node}"; then
