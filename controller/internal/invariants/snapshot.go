@@ -95,7 +95,8 @@ type SnapshotProgress struct {
 	// or refusal (PhaseFailed / PhaseRefused).
 	Failed bool `json:"Failed,omitempty"`
 	// LastProgressTime is the most recent timestamp at which the snapshot made
-	// forward progress.
+	// forward progress. For a Ready snapshot, it is when the snapshot became
+	// Ready, or zero when the provider doesn't report that (#231).
 	LastProgressTime time.Time `json:"LastProgressTime,omitempty"`
 }
 
@@ -103,6 +104,12 @@ type SnapshotProgress struct {
 // engineName (or the default/registered engines when engineName is empty).
 // When present is true, either snapshotRef is the non-empty checkpoint
 // identifier ordered for restore or coldStartBypass is true.
+//
+// It must only read the pod (C5). Besides real pods, the invariants pass it
+// probe pods, copies of a pod that carry a single annotation or lack one, to
+// learn which annotation an engine reads; an engine whose order is not the
+// (trimmed) value of one pod annotation therefore has orders of unknown API
+// group, which I1 matches against every group.
 type RestoreOrderFunc func(engineName string, pod *corev1.Pod) (snapshotRef string, coldStartBypass bool, present bool)
 
 // Violation represents a single detected violation of an invariant (I1-I9).

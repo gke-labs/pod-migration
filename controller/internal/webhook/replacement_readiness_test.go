@@ -440,7 +440,7 @@ func TestPodGateInjector_ShortensReadinessInitialDelay(t *testing.T) {
 			wantStartupDelays:   []int32{-1},
 		},
 		{
-			name: "pod already carrying migration scheduling gate and PMJ assignment is untouched",
+			name: "pod already carrying migration scheduling gate and PMJ assignment clears newly added readiness initialDelaySeconds",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace:   "default",
@@ -460,7 +460,32 @@ func TestPodGateInjector_ShortensReadinessInitialDelay(t *testing.T) {
 			},
 			cacheObjs:           []runtime.Object{activeBarePMJ("already-gated-pod", pmv1alpha1.PodMigrationJobPhaseRestoring)},
 			wantGate:            true,
-			wantReadinessDelays: []int32{50},
+			wantReadinessDelays: []int32{0},
+			wantLivenessDelays:  []int32{-1},
+			wantStartupDelays:   []int32{-1},
+		},
+		{
+			name: "pod already carrying migration scheduling gate, PMJ assignment, and zero readiness delay is untouched",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   "default",
+					Name:        "already-gated-zero-delay-pod",
+					Labels:      map[string]string{"pod-migration.gke.io/enabled": "true"},
+					Annotations: map[string]string{util.AnnotationAssignedPMJ: util.FormatPMJName("already-gated-zero-delay-pod", "12345678")},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGates: []corev1.PodSchedulingGate{{Name: "gke.io/pod-migration-gate"}},
+					Containers: []corev1.Container{
+						{
+							Name:           "app",
+							ReadinessProbe: httpGetProbe("/readyz", 0, 20),
+						},
+					},
+				},
+			},
+			cacheObjs:           []runtime.Object{activeBarePMJ("already-gated-zero-delay-pod", pmv1alpha1.PodMigrationJobPhaseRestoring)},
+			wantGate:            true,
+			wantReadinessDelays: []int32{0},
 			wantLivenessDelays:  []int32{-1},
 			wantStartupDelays:   []int32{-1},
 		},

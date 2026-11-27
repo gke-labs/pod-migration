@@ -7,8 +7,8 @@
 > `criu.podmigration.gke.io` CRD group so it can coexist alongside the managed
 > GKE Pod Snapshots addon (`podsnapshot.gke.io`) in test clusters, and its
 > DaemonSet targets Linux nodes (`kubernetes.io/os=linux`) while excluding
-> `gVisor` sandbox nodes (`sandbox.gke.io/runtime=gvisor`) and read-only COS
-> nodes (`cloud.google.com/gke-os-distribution=cos`, pending [#109](https://github.com/gke-labs/pod-migration/issues/109)).
+> `gVisor` sandbox nodes (`sandbox.gke.io/runtime=gvisor`). It runs on both
+> Ubuntu and COS node images (see [Node images](#node-images)).
 > Never apply `deploy/crds.yaml` or `deploy/deploy.yaml` to a production
 > cluster.
 >
@@ -62,9 +62,10 @@
 >     fallback before the annotation projects into `/pminfo/annotations`.
 >   - `internal/psengine/restore_node.go`: `fetch()` enforces a 4 MiB download cap on
 >     metadata (`manifest.json`, `spec.json`) and an 8 GiB cap on `checkpoint.tar`.
->   - `internal/node/capability.go`: `Bootstrap` installs `/usr/local/sbin/criu`
->     and `/etc/criu/runc.conf` on the host node; removing the DaemonSet does
->     not automatically uninstall those host files.
+>   - `internal/node/node.go`: `Bootstrap` installs `/usr/local/sbin/criu`
+>     (on COS, a bind mount over `/usr/local`) and `/etc/criu/runc.conf` on the
+>     host node; removing the DaemonSet does not automatically uninstall those
+>     host files or remove that bind mount.
 
 `engines/criu` is a standalone snapshot engine for the `gke-labs/pod-migration`
 controller that implements the snapshot engine CustomResource contract
@@ -121,16 +122,23 @@ The CRIU snapshot engine consists of three binaries built from this Go module
    - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 4.2.1
      bundle (older CRIU fails dumps on Linux >= 6.16; the image builds it from
      Debian forky pinned to a snapshot.debian.org timestamp)
-     into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
-     writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
-     `nsenter`, verifies containerd readiness (inspecting containerd's process
+     into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`
+     (on COS, under `/home/kubernetes/bin`; see [Node images](#node-images)),
+     writes `/etc/criu/runc.conf`, runs `criu check --all` in the host namespaces via
+     `nsenter` (controlled by `PODMIG_CRIU_CHECK`, default: `all`), verifies containerd readiness (inspecting containerd's process
      PATH or shim PATH and ensuring `enable_criu != false` in containerd configuration
      before declaring the node ready), and stamps `pod-migrate.io/criu-ready` and
      `pod-migrate.io/criu-version` on the `Node`.
+     The node reaches `pod-migrate.io/criu-ready: true` if core checkpoint/restore features
+     pass and all required feature probes pass (`cgroupns`, `fdinfo_lock`, `mem_dirty_track`,
+     `seccomp_filters`, `seccomp_suspend`, and `uffd`). Missing optional features (such as
+     `timer_cr_ids` or `pagemap_scan_guard_pages` on Linux 6.12) are recorded in
+     `pod-migrate.io/criu-reason`. Setting `PODMIG_CRIU_CHECK=core` relaxes the kernel check
+     to plain `criu check` (core C/R features only).
      If containerd cannot resolve CRIU on its PATH/shim PATH, or CRIU is disabled
      by configuration, or containerd cached a failed CRIU lookup, or the CRIU
      containerd resolves is older than 4.2.1 (the bundle's minimum: older CRIU
-     fails dumps on Linux >= 6.16), the agent marks
+     fails dumps on Linux >= 6.16), or a required kernel feature is missing, the agent marks
      the node `pod-migrate.io/criu-ready: false` with reason and remediation
      annotations (`pod-migrate.io/criu-reason` and `pod-migrate.io/criu-remediation`).
      This prevents orchestrators from dispatching checkpoints to nodes where containerd
@@ -232,7 +240,8 @@ The CRIU snapshot engine consists of three binaries built from this Go module
      joining the holder's network/IPC/UTS namespaces, and stamps
      `pod-migrate.io/psengine-restore: restored` (or `failed`, with why in
      `pod-migrate.io/psengine-restore-reason`, in the same update).
-     On an existing pod, only the agent may write these annotations, and only
+     On an existing pod in a managed namespace (`pod-migration.gke.io/managed: "true"`),
+     only the agent may write these annotations, and only
      once: the `pod-migrate-psengine-restore-status`
      `ValidatingAdmissionPolicy` in `deploy/deploy.yaml` denies every other
      write, change or removal (#233), and a reason next to anything but
@@ -282,7 +291,7 @@ that group while keeping `gVisor` workloads on `podsnapshot.gke.io`.
 pod shape) in memory before performing a single `get` on the assigned
 `PodMigrationJob` to confirm `pod-migration.gke.io/engine: criu`, and
 `deploy/deploy.yaml` restricts `pod-migrate-agent` to Linux nodes while
-excluding `gVisor` sandbox nodes and read-only COS nodes (pending [#109](https://github.com/gke-labs/pod-migration/issues/109)).
+excluding `gVisor` sandbox nodes.
 
 #### Upgrading an existing CRIU install from `podsnapshot.gke.io`
 
@@ -363,6 +372,8 @@ they start cold instead of being restored; also delete the
   node agent and the engine controller use the bucket as their own
   Kubernetes service accounts, never as the nodes' VM service account (see
   [Storage credentials](#storage-credentials)).
+- **Node images:** see [Node images](#node-images): Ubuntu and COS
+  (`COS_CONTAINERD`) are supported.
 - **Linux kernel & runtime:** Nodes running `containerd` 2.x + `runc` with
   kubelet `ContainerCheckpoint` enabled and a kernel passing `criu check`.
 - **runc location:** the agent runs the node's own `runc` for restores, looked
@@ -398,6 +409,12 @@ they start cold instead of being restored; also delete the
   first (put `/usr/local/sbin` earlier on containerd's `PATH`, or on the shim
   `PATH` if one is set) or remove the node's own CRIU, then restart
   containerd. The agent notices the restart and checks the node again.
+
+  Note: `pod-migrate.io/criu-reason` can also appear on ready nodes (`pod-migrate.io/criu-ready: true`)
+  when optional kernel features are missing (e.g. `missing optional CRIU features: pagemap_scan_guard_pages, timer_cr_ids`).
+  When querying specifically for unready nodes, check `pod-migrate.io/criu-ready: "false"` rather than
+  relying solely on the presence of the reason annotation.
+
 - **Minimum containerd version (Security Requirement):** containerd `>= 2.2.7`,
   `>= 2.3.4`, or `2.0.x` is strictly required. The agent verifies this at
   bootstrap via `CheckContainerdVersion`. Nodes with containerd in the vulnerable
@@ -427,18 +444,59 @@ they start cold instead of being restored; also delete the
     and the preemption controller record a Warning `MigrationSkippedIneligible`
     event on such a pod, with the engine's reason (#275).
 
+## Node images
+
+The agent runs on GKE's Ubuntu (`UBUNTU_CONTAINERD`) and Container-Optimized
+OS (`COS_CONTAINERD`) node images, and on kind. It installs CRIU through the
+host's root, `/proc/1/root` (its DaemonSet has `hostPID`), and picks where
+from the host's `/etc/os-release` when it starts:
+
+- **Ubuntu, kind, any other node:** the bundle in
+  `/var/lib/pod-migrate/criu-bundle`, the `criu` wrapper in `/usr/local/sbin`.
+- **COS (`ID=cos`):** COS mounts its root (`/usr`, `/opt`) read-only and
+  `/var` and `/home` `noexec`, and containerd's `PATH` there is
+  `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` (the shims
+  put `/opt/containerd/bin` first), so no directory on it is writable, and
+  `/home/kubernetes/bin`, the one writable host path that allows exec, isn't
+  on it. containerd 2.x has no option to point runc at another `criu`. So the
+  agent installs the bundle in `/home/kubernetes/bin/pod-migrate/criu-bundle`,
+  writes the wrapper to `/home/kubernetes/bin/pod-migrate/usr-local/sbin`, and
+  bind-mounts `/home/kubernetes/bin/pod-migrate/usr-local` over `/usr/local`,
+  which COS ships empty. containerd then finds `/usr/local/sbin/criu`, as on
+  Ubuntu.
+
+On COS:
+
+- If the host's `/usr/local` isn't empty and isn't the agent's bind already,
+  the agent doesn't cover it: the node is marked
+  `pod-migrate.io/criu-ready: false` with a `criu-reason` that starts with
+  `criu bundle install failed: host /usr/local isn't empty`. Empty it (or
+  unmount what covers it), then restart that node's `pod-migrate-agent` pod.
+- The bind mount lasts until the node reboots, and the agent makes it again
+  when it starts. Removing the agent leaves it in place; `umount /usr/local`
+  on the node removes it.
+- `/etc/criu`, on COS's writable `/etc` overlay, is lost at reboot too, and
+  rewritten by the agent at startup.
+
+**Upgrading.** Earlier `deploy/deploy.yaml` kept the agent off COS nodes.
+After you apply this one, the agent also starts on every COS node, makes the
+bind mount there, and marks the node `criu-ready` once it passes its checks:
+drains of eligible pods on those nodes then migrate with CRIU instead of
+evicting cold.
+
 ## What Installing the Engine Changes on a Node
 
 When `pod-migrate-agent` starts on a node, it applies the following modifications:
 
-| Modification            | Host Location                       | Description                                                                                                                                                      |
-| ----------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **CRIU Bundle**         | `/var/lib/pod-migrate/criu-bundle/` | Directory containing self-contained `criu.bin`, bundled shared libraries, dynamic linker, and `VERSION` file.                                                    |
-| **CRIU System Wrapper** | `/usr/local/sbin/criu`              | Executable wrapper script that launches CRIU via the bundled dynamic linker.                                                                                     |
-| **Runc Configuration**  | `/etc/criu/runc.conf`               | CRIU global configuration specifying `tcp-close`, `skip-in-flight`, `file-validation buildid`, and `file-locks`.                                                 |
-| **Node Annotations**    | Kubernetes `Node` metadata          | Annotated with `pod-migrate.io/criu-ready` (`true` or `false`) and `pod-migrate.io/criu-version`. Stale reason/remediation annotations are cleared on promotion. |
-| **Node Placement Facts** | Kubernetes `Node` metadata         | Labelled with `criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` placement labels, and annotated with `pod-migrate.io/criu-node-facts` and `pod-migrate.io/criu-node-cpu-features` (see [Restore placement](#restore-placement)). |
-| **Socket Watching**     | `/run/containerd/containerd.sock`   | Monitored for inode changes to detect containerd daemon restarts and re-probe readiness.                                                                         |
+| Modification                           | Host Location                                                                              | Description                                                                                                                                                                                                                                    |
+| -------------------------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **CRIU Bundle**                        | `/var/lib/pod-migrate/criu-bundle/` (COS: `/home/kubernetes/bin/pod-migrate/criu-bundle/`) | Directory containing self-contained `criu.bin`, bundled shared libraries, dynamic linker, and `VERSION` file.                                                                                                                                  |
+| **CRIU System Wrapper**                | `/usr/local/sbin/criu`                                                                     | Executable wrapper script that launches CRIU via the bundled dynamic linker. On COS it is `/home/kubernetes/bin/pod-migrate/usr-local/sbin/criu`, seen at `/usr/local/sbin/criu` through the bind mount below.                                 |
+| **`/usr/local` bind mount (COS only)** | `/usr/local`                                                                               | `/home/kubernetes/bin/pod-migrate/usr-local` bind-mounted over COS's empty, read-only `/usr/local`, until the node reboots (see [Node images](#node-images)).                                                                                  |
+| **Runc Configuration**                 | `/etc/criu/runc.conf`                                                                      | CRIU global configuration specifying `tcp-close`, `skip-in-flight`, `file-validation buildid`, and `file-locks`.                                                                                                                               |
+| **Node Annotations**                   | Kubernetes `Node` metadata                                                                 | Annotated with `pod-migrate.io/criu-ready` (`true` or `false`) and `pod-migrate.io/criu-version`. Stale reason/remediation annotations are cleared on promotion.                                                                               |
+| **Node Placement Facts**               | Kubernetes `Node` metadata                                                                 | Labelled with `criu.pod-migrate.io/*` and `missing-cpu.criu.pod-migrate.io/*` placement labels, and annotated with `pod-migrate.io/criu-node-facts` and `pod-migrate.io/criu-node-cpu-features` (see [Restore placement](#restore-placement)). |
+| **Socket Watching**                    | `/run/containerd/containerd.sock`                                                          | Monitored for inode changes to detect containerd daemon restarts and re-probe readiness.                                                                                                                                                       |
 
 Uninstalling the engine doesn't remove the `Node` labels and annotations: they
 stay on each `Node` until you remove them, for example with
@@ -493,9 +551,9 @@ credentials instead, which the bucket shouldn't grant.
 **Install substitutions.** Replace these in `deploy/deploy.yaml`, along with
 the images (see [Installing on a Test Cluster](#installing-on-a-test-cluster)):
 
-| Placeholder | Value |
-| ----------- | ----- |
-| `<YOUR_WORKLOAD_POOL>` | The cluster's Workload Identity pool: `<PROJECT_ID>.svc.id.goog` |
+| Placeholder                | Value                                                                                                                                |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `<YOUR_WORKLOAD_POOL>`     | The cluster's Workload Identity pool: `<PROJECT_ID>.svc.id.goog`                                                                     |
 | `<YOUR_IDENTITY_PROVIDER>` | The cluster's identity provider: `https://container.googleapis.com/v1/projects/<PROJECT_ID>/locations/<LOCATION>/clusters/<CLUSTER>` |
 
 `<YOUR_WORKLOAD_POOL>` appears twice, as the agent's `WORKLOAD_POOL` and as
@@ -669,7 +727,7 @@ the archive to the restore it belongs to (contract clause C10 R2, #244):
   `Checkpoint=False`, reason `Failed`, with a message that says why
   (`archive signing key not configured on the node agent`, or that the agent
   doesn't know the cluster UID) and ends `the source container was not
-  touched`. The migration then falls back as for any failed checkpoint.
+touched`. The migration then falls back as for any failed checkpoint.
 - The agent never commits an archive that no restore would accept. Right
   before it signs the manifest, it reads the work order and its trigger past
   the cache, and takes the job from the trigger's controller reference. A
@@ -775,14 +833,14 @@ the PodMigrationJob concludes `SucceededWithoutRestore` with the reason
 Neither the event nor the annotation names key IDs or cluster UIDs; the
 agent's log does. The reasons:
 
-| Reason | Meaning |
-| ------ | ------- |
-| `ArchiveSigningKeyUnavailable` | The restoring agent has no archive signing keys (see its log). |
-| `ArchiveSignatureInvalid` | `manifest.json` is malformed, unsigned (for example written by an agent from before archive signing), signed with a key the agent doesn't hold, or its signature doesn't match. |
-| `ArchiveBindingMismatch` | A genuine archive, bound to another snapshot, pod, location, job or cluster. |
-| `ArchiveDigestMismatch` | `spec.json` or `checkpoint.tar` doesn't match the digests in the signed manifest. |
+| Reason                         | Meaning                                                                                                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ArchiveSigningKeyUnavailable` | The restoring agent has no archive signing keys (see its log).                                                                                                                  |
+| `ArchiveSignatureInvalid`      | `manifest.json` is malformed, unsigned (for example written by an agent from before archive signing), signed with a key the agent doesn't hold, or its signature doesn't match. |
+| `ArchiveBindingMismatch`       | A genuine archive, bound to another snapshot, pod, location, job or cluster.                                                                                                    |
+| `ArchiveDigestMismatch`        | `spec.json` or `checkpoint.tar` doesn't match the digests in the signed manifest.                                                                                               |
 | `RestoreIncompatibleNode` | A genuine archive, refused because this node's CPU model (`model name` in `/proc/cpuinfo`) isn't the one recorded in its manifest (#294). The PodMigrationJob concludes with this reason instead of `FallbackToColdStart`; see below. |
-| `RestoreFailed` | Any other failure. |
+| `RestoreFailed`                | Any other failure.                                                                                                                                                              |
 
 For `RestoreIncompatibleNode` only, the PodMigrationJob's `Restored`
 condition takes the reason too, and the controller records
@@ -966,13 +1024,13 @@ passed. For
 its own node, `cpuFeatures` is the intersection across processors. Labels
 (all are always present, except the missing-flag ones):
 
-| Label | Value |
-| ----- | ----- |
-| `criu.pod-migrate.io/cpu-vendor` | `vendor_id`, or `unknown` |
-| `criu.pod-migrate.io/cpu-model` | the first 16 hex digits of the SHA-256 of the model name, or `unknown` |
-| `criu.pod-migrate.io/xstate` | the XSAVE state flags the node has, dot-separated (`avx.avx512f.ospke`), `none`, or `unknown` (features unknown, or not x86) |
-| `criu.pod-migrate.io/kernel-version-code`, `criu-version-code`, `runc-version-code`, `containerd-version-code` | `major*1000000 + minor*1000 + patch`, or `1000000000` if unknown |
-| `missing-cpu.criu.pod-migrate.io/<flag>` | `true`, for each compared x86 instruction flag the node lacks; none when its features are unknown |
+| Label                                                                                                          | Value                                                                                                                        |
+| -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `criu.pod-migrate.io/cpu-vendor`                                                                               | `vendor_id`, or `unknown`                                                                                                    |
+| `criu.pod-migrate.io/cpu-model`                                                                                | the first 16 hex digits of the SHA-256 of the model name, or `unknown`                                                       |
+| `criu.pod-migrate.io/xstate`                                                                                   | the XSAVE state flags the node has, dot-separated (`avx.avx512f.ospke`), `none`, or `unknown` (features unknown, or not x86) |
+| `criu.pod-migrate.io/kernel-version-code`, `criu-version-code`, `runc-version-code`, `containerd-version-code` | `major*1000000 + minor*1000 + patch`, or `1000000000` if unknown                                                             |
+| `missing-cpu.criu.pod-migrate.io/<flag>`                                                                       | `true`, for each compared x86 instruction flag the node lacks; none when its features are unknown                            |
 
 The controller requires `kubernetes.io/arch In [<source arch>]`,
 `In [<source value>, unknown]` on the vendor, model
@@ -1036,17 +1094,17 @@ Rolling node-pool upgrades in GKE cordon and drain nodes one by one, triggering 
 
 ### Version Compatibility Matrix & Guidelines
 
-| Upgrade Type                   | Example Jump                               | Compatibility Status   | Operational Guidance & Behavior                                                                                                                                                                                                 |
-| ------------------------------ | ------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **GKE Patch Upgrade**          | `1.34.1-gke.1000` &rarr; `1.34.2-gke.1100` | **Expected (untested)** | Identical kernel major.minor, identical glibc/ABI. In-memory state and socket structures expected to restore with zero degradation.                                                                                               |
-| **GKE Minor Upgrade**          | `1.34.x` &rarr; `1.35.x`                   | **Expected (untested)** | Newer kernel on destination node. Linux user-space ABI stability ensures task memory, threads, and file descriptors restore cleanly provided CPU features match.                                                                |
-| **Minor Downgrade / Rollback** | `1.35.x` &rarr; `1.34.x`                   | **Placed away (untested live)** | With `--restore-placement` (on by default), a node with an older kernel, CRIU, runc or containerd than the source doesn't meet the restore's constraints ([Restore placement](#restore-placement)), so a ReplicaSet or StatefulSet replacement isn't restored there. With placement off, or for a replacement that placement doesn't constrain (a Job's or a bare pod), a failed restore falls back to a cold start with `RestoreCrashFallback`. |
-| **CPU Architecture Mismatch**  | Intel &rarr; AMD / mixed microarch         | **Placed (untested live)** | Heterogeneous CPU instruction sets (e.g. missing AVX/AVX-512 flags) cause SIGILL on restore. With `--restore-placement` (on by default), the replacement only goes to a node with the same vendor and model and the source's instruction set ([Restore placement](#restore-placement), [#257](https://github.com/gke-labs/pod-migration/issues/257)); this applies to ReplicaSet and StatefulSet replacements only. If no node meets it, the replacement is recreated to start cold after `--restore-placement-deadline` when another node could take it, or at the restore timeout otherwise. |
+| Upgrade Type                   | Example Jump                               | Compatibility Status            | Operational Guidance & Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------ | ------------------------------------------ | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **GKE Patch Upgrade**          | `1.34.1-gke.1000` &rarr; `1.34.2-gke.1100` | **Expected (untested)**         | Identical kernel major.minor, identical glibc/ABI. In-memory state and socket structures expected to restore with zero degradation.                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **GKE Minor Upgrade**          | `1.34.x` &rarr; `1.35.x`                   | **Expected (untested)**         | Newer kernel on destination node. Linux user-space ABI stability ensures task memory, threads, and file descriptors restore cleanly provided CPU features match.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| **Minor Downgrade / Rollback** | `1.35.x` &rarr; `1.34.x`                   | **Placed away (untested live)** | With `--restore-placement` (on by default), a node with an older kernel, CRIU, runc or containerd than the source doesn't meet the restore's constraints ([Restore placement](#restore-placement)), so a ReplicaSet or StatefulSet replacement isn't restored there. With placement off, or for a replacement that placement doesn't constrain (a Job's or a bare pod), a failed restore falls back to a cold start with `RestoreCrashFallback`.                                                                                                                                               |
+| **CPU Architecture Mismatch**  | Intel &rarr; AMD / mixed microarch         | **Placed (untested live)**      | Heterogeneous CPU instruction sets (e.g. missing AVX/AVX-512 flags) cause SIGILL on restore. With `--restore-placement` (on by default), the replacement only goes to a node with the same vendor and model and the source's instruction set ([Restore placement](#restore-placement), [#257](https://github.com/gke-labs/pod-migration/issues/257)); this applies to ReplicaSet and StatefulSet replacements only. If no node meets it, the replacement is recreated to start cold after `--restore-placement-deadline` when another node could take it, or at the restore timeout otherwise. |
 
 ### Prerequisites for Clean Upgrades
 
 1. **Homogeneous Node Pools:** Node pools participating in rolling upgrades should share CPU model and instruction sets, and upgrade forward only. Otherwise placement finds no compatible node and the replacement starts cold ([Restore placement](#restore-placement)).
-2. **Workload Opt-In & CRIU Routing:** Workloads must carry `pod-migration.gke.io/enabled: "true"` and the namespace must configure a `PodMigration` routing workloads to CRIU (e.g. `pod-migration.gke.io/runtime-class-engines: "@default=criu"`).
+2. **Workload Opt-In & CRIU Routing:** Workloads must carry `pod-migration.gke.io/enabled: "true"`, the namespace must carry `pod-migration.gke.io/managed: "true"` (#303), and the namespace must configure a `PodMigration` routing workloads to CRIU (e.g. `pod-migration.gke.io/runtime-class-engines: "@default=criu"`).
 
 ### Running the Live Upgrade Verification Suite
 
@@ -1170,7 +1228,12 @@ kubectl -n pod-migration-criu-system rollout status ds/pod-migrate-agent
 
 Then point the PodMigration of each namespace that only CRIU serves at that
 bucket (`spec.storage.location: gs://<BUCKET_NAME>/<namespace>/snapshots`
-or another path starting with `<namespace>/`).
+or another path starting with `<namespace>/`), and ensure the workload namespace
+is labeled for migration:
+
+```bash
+kubectl label namespace <namespace> pod-migration.gke.io/managed="true"
+```
 
 When creating `PodSnapshotStorageConfig` and `PodSnapshotPolicy` resources for
 this engine, label them with `pod-migrate.io/engine: criu` so `cmd/engine`

@@ -84,6 +84,21 @@ func ParseClampedTimeout(raw string) (time.Duration, bool) {
 	return d, true
 }
 
+// TimeoutAnnotationValue returns the value to record in a job's
+// AnnotationMigrationTimeout for its effective timeout d, which
+// ParseClampedTimeout reads back as d (#330). It reports false for a d outside
+// [MinMigrationTimeout, MaxMigrationTimeout], which would read back clamped to
+// another value. The controller refuses a --migration-timeout outside that
+// range, so a timeout it computes is always inside it; only a reconciler that a
+// test builds with a shorter default gets false, and its jobs keep no
+// annotation and follow that default, as before.
+func TimeoutAnnotationValue(d time.Duration) (string, bool) {
+	if d < MinMigrationTimeout || d > MaxMigrationTimeout {
+		return "", false
+	}
+	return d.String(), true
+}
+
 // CalculateMigrationTimeout computes the effective migration timeout based on explicit annotation,
 // pod memory request scaling, and controller baseline timeout.
 func CalculateMigrationTimeout(annotatedTimeout string, memBytes int64, baseTimeout time.Duration) time.Duration {

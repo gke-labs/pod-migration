@@ -544,9 +544,11 @@ run_live() {
     if [[ -n "${existing_pm}" ]]; then
       die "Namespace '${NAMESPACE}' already contains a PodMigration (${existing_pm}). PodMigrations are singletons per namespace (#98); run in a dedicated namespace or let the script create a fresh one."
     fi
+    ${KUBECTL_CMD} label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite
   else
     log "Creating dedicated test namespace ${NAMESPACE}..."
     ${KUBECTL_CMD} create namespace "${NAMESPACE}"
+    ${KUBECTL_CMD} label namespace "${NAMESPACE}" pod-migration.gke.io/managed="true" --overwrite
     OWNED_NAMESPACE="true"
   fi
 

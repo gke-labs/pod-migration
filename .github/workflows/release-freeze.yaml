@@ -1,0 +1,55 @@
+name: Release freeze
+
+# Until v0.1.0-alpha is tagged (#110), Q1 work waits. This check fails a pull
+# request whose description references an issue in the Q1 2027 milestone
+# (Closes #N, Fixes #N, Part of #N, ...). Once the tag is cut, set the
+# repository variable ALPHA_FREEZE to "off" (or drop the required check) and
+# re-run this check on the held pull requests.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  release-freeze:
+    name: release-freeze
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hold Q1 work until v0.1.0-alpha is tagged
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ALPHA_FREEZE: ${{ vars.ALPHA_FREEZE }}
+          FROZEN_MILESTONE: "Q1 2027: All Pod Migration Code Complete"
+        run: |
+          set -euo pipefail
+          if [ "${ALPHA_FREEZE:-on}" = "off" ]; then
+            echo "The release freeze is off."
+            exit 0
+          fi
+
+          # Issues the description links with a closing keyword or "Part of".
+          body="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq '.body // ""')"
+          refs="$(printf '%s\n' "$body" \
+            | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?|part of|addresses) +#[0-9]+' \
+            | grep -oE '[0-9]+' | sort -un || true)"
+
+          held=0
+          for n in $refs; do
+            ms="$(gh api "repos/$REPO/issues/$n" --jq '.milestone.title // ""' 2>/dev/null)" || ms=""
+            if [ "$ms" = "$FROZEN_MILESTONE" ]; then
+              echo "::error title=Release freeze::#$n is Q1 work, so this pull request waits for the v0.1.0-alpha tag (#110)."
+              held=1
+            fi
+          done
+          if [ "$held" -eq 1 ]; then
+            exit 1
+          fi
+          echo "No Q1 issue linked, so the release freeze doesn't apply."

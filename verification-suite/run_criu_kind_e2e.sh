@@ -169,6 +169,7 @@ migrate() {
   log "== $1: deploying the counter in namespace ${NS}"
   kubectl delete namespace "${NS}" --ignore-not-found --wait --timeout="${TIMEOUT}s" >/dev/null
   kubectl create namespace "${NS}" >/dev/null
+  kubectl label namespace "${NS}" pod-migration.gke.io/managed="true" >/dev/null
   render "${NS}" "$1" "$2" | kubectl apply -f - >/dev/null
   kubectl -n "${NS}" wait podmigration/default --for=condition=Ready --timeout="${TIMEOUT}s" >/dev/null
   kubectl -n "${NS}" rollout status statefulset/counter --timeout="${TIMEOUT}s" >/dev/null

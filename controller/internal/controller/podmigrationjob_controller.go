@@ -144,8 +144,8 @@ type PodMigrationJobReconciler struct {
 	Recorder record.EventRecorder
 
 	// InvariantEngine evaluates stateless correctness invariants (I1-I12) at the
-	// end of each reconcile step with zero extra API calls. Optional: nil skips
-	// evaluation.
+	// end of each reconcile step from the informer cache (see invariantReader).
+	// Optional: nil skips evaluation.
 	InvariantEngine *invariants.Engine
 
 	// RestoreEngines classifies restore failures.  Optional: nil selects the
@@ -209,6 +209,16 @@ type PodMigrationJobReconciler struct {
 	// (namespace/name -> time.Time).  In-memory only; a restart just means
 	// one extra probe per in-flight migration.
 	fallbackEventChecks sync.Map
+
+	// invariantReader serves the PodSnapshotManualTrigger and PodSnapshot
+	// reads of invariant evaluation from the informer cache (#199), for the
+	// kinds in invariantCachedGVKs. SetupWithManager sets both: the manager's
+	// cache, and the kinds it watches, whose informers are already running.
+	// The manager's client reads unstructured objects from the API server, so
+	// without this every evaluation would make live reads. nil (unit tests
+	// that build the reconciler directly) reads through Client.
+	invariantReader     client.Reader
+	invariantCachedGVKs map[schema.GroupVersionKind]bool
 }
 
 func (r *PodMigrationJobReconciler) getMigrationTimeout(job *pmv1alpha1.PodMigrationJob) time.Duration {
@@ -233,6 +243,66 @@ func migrationDeadlineAnchor(job *pmv1alpha1.PodMigrationJob) time.Time {
 		return job.Status.SnapshottingStartTime.Time
 	}
 	return job.CreationTimestamp.Time
+}
+
+// calculateDeadline computes the timestamp at which the reconciler will time out
+// the job's current phase:
+// - Pending: CreationTimestamp + effective timeout (capped by MaxMigrationTimeout)
+// - Snapshotting: SnapshottingStartTime + MaxMigrationTimeout (the upper bound while progressing)
+// - Evicting: EvictingStartTime + effective timeout (capped by MaxMigrationTimeout from SnapshottingStartTime)
+// - Restoring: RestoringStartTime + restoreCeiling()
+// - Terminal (Succeeded/Failed): preserves the historical deadline, or nil if none was recorded
+func (r *PodMigrationJobReconciler) calculateDeadline(job *pmv1alpha1.PodMigrationJob) *metav1.Time {
+	if job == nil {
+		return nil
+	}
+	if invariants.IsTerminalPhase(job.Status.Phase) {
+		return job.Status.Deadline
+	}
+	timeout := r.getMigrationTimeout(job)
+	anchor := migrationDeadlineAnchor(job)
+	hardCap := anchor.Add(util.MaxMigrationTimeout)
+
+	var phaseDeadline time.Time
+	switch job.Status.Phase {
+	case pmv1alpha1.PodMigrationJobPhaseRestoring:
+		rst := anchor
+		if job.Status.RestoringStartTime != nil && !job.Status.RestoringStartTime.IsZero() {
+			rst = job.Status.RestoringStartTime.Time
+		}
+		phaseDeadline = rst.Add(r.restoreCeiling())
+	case pmv1alpha1.PodMigrationJobPhaseEvicting:
+		evictingStart := anchor
+		if job.Status.EvictingStartTime != nil && !job.Status.EvictingStartTime.IsZero() {
+			evictingStart = job.Status.EvictingStartTime.Time
+		} else if job.Annotations != nil {
+			if s := job.Annotations[util.AnnotationEvictingSince]; s != "" {
+				if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+					evictingStart = t
+				} else if t, err := time.Parse(time.RFC3339, s); err == nil {
+					evictingStart = t
+				}
+			}
+		}
+		phaseDeadline = evictingStart.Add(timeout)
+		if phaseDeadline.After(hardCap) {
+			phaseDeadline = hardCap
+		}
+	case pmv1alpha1.PodMigrationJobPhaseSnapshotting:
+		// While Snapshotting, a progressing snapshot is allowed to run up to the
+		// MaxMigrationTimeout hard cap from SnapshottingStartTime (I4 tolerance).
+		// Publishing SST + MaxMigrationTimeout gives external coordinators the true
+		// upper bound so leases are not prematurely revoked.
+		phaseDeadline = hardCap
+	default: // Pending or uninitialized
+		phaseDeadline = anchor.Add(timeout)
+		if phaseDeadline.After(hardCap) {
+			phaseDeadline = hardCap
+		}
+	}
+
+	t := metav1.NewTime(phaseDeadline)
+	return &t
 }
 
 func (r *PodMigrationJobReconciler) isSnapshotProgressing(ctx context.Context, job *pmv1alpha1.PodMigrationJob, timeout time.Duration) bool {
@@ -278,30 +348,22 @@ func (r *PodMigrationJobReconciler) triggerUnanswered(ctx context.Context, job *
 	return true, util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
 }
 
+// isEvictionWithinBudget checks whether the origin pod eviction phase has
+// exceeded its migration budget.
+// Note: When EvictingStartTime and AnnotationEvictingSince are both missing,
+// calculateDeadline falls back to the job's CreationTimestamp as the anchor,
+// so this returns true while within budget from CreationTimestamp. On main,
+// missing both returned false; with the single caller behind the Evicting gate,
+// returning true before EvictingStartTime is initialized is safe and harmless.
 func (r *PodMigrationJobReconciler) isEvictionWithinBudget(job *pmv1alpha1.PodMigrationJob) bool {
 	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseEvicting {
 		return false
 	}
-	if time.Since(migrationDeadlineAnchor(job)) > util.MaxMigrationTimeout {
+	deadline := r.calculateDeadline(job)
+	if deadline == nil {
 		return false
 	}
-	evictionBudget := r.getMigrationTimeout(job)
-	if job.Status.EvictingStartTime != nil {
-		return time.Since(job.Status.EvictingStartTime.Time) < evictionBudget
-	}
-	// Fallback to evicting-since annotation for in-flight jobs during upgrade
-	if job.Annotations != nil {
-		if evictingSinceStr := job.Annotations[util.AnnotationEvictingSince]; evictingSinceStr != "" {
-			evictingSince, err := time.Parse(time.RFC3339Nano, evictingSinceStr)
-			if err != nil {
-				evictingSince, err = time.Parse(time.RFC3339, evictingSinceStr)
-			}
-			if err == nil {
-				return time.Since(evictingSince) < evictionBudget
-			}
-		}
-	}
-	return false
+	return time.Now().Before(deadline.Time)
 }
 
 // isOriginPodTerminatedDueToNodeShutdown checks whether the origin pod was terminated due to node shutdown.
@@ -739,6 +801,67 @@ func (r *PodMigrationJobReconciler) evaluateInvariants(ctx context.Context, job 
 	r.evaluateInvariantsWithSnapshot(ctx, job, nil, res, reconcileErr)
 }
 
+// ReadForInvariants reads a PodSnapshotManualTrigger or PodSnapshot (obj
+// carries its GVK) for invariant evaluation from the informer cache, so these
+// reads never reach the API server (#199). The only live read left is the I5
+// confirmation in confirmOrphanedTrigger.
+//
+// It reads only kinds that SetupWithManager watches, whose informers are
+// running and synced. A kind it doesn't watch had no CRD at startup. A cache
+// read of that kind would start a new informer in the middle of a reconcile,
+// and if the controller can't list and watch it (for example a custom
+// --criu-api-group that the shipped RBAC doesn't cover), that informer never
+// syncs and Get blocks for as long as the reconcile runs. So for such a kind
+// it reads nothing and returns NoKindMatchError, the error a live read returns
+// when the CRD is missing.
+//
+// PodGateReconciler also calls it, for the PodSnapshot of its pod's job (I4,
+// #231). A call made before this reconciler's watches have synced, such as
+// the pod gate's right after a restart, waits for that informer to sync.
+func (r *PodMigrationJobReconciler) ReadForInvariants(ctx context.Context, key types.NamespacedName, obj *unstructured.Unstructured) error {
+	if r.invariantReader == nil {
+		return r.Get(ctx, key, obj)
+	}
+	gvk := obj.GroupVersionKind()
+	if !r.invariantCachedGVKs[gvk] {
+		return &meta.NoKindMatchError{GroupKind: gvk.GroupKind(), SearchedVersions: []string{gvk.Version}}
+	}
+	return r.invariantReader.Get(ctx, key, obj)
+}
+
+// confirmOrphanedTrigger reports whether a concluded job's trigger, which
+// the cache still shows undeleted, really is (I5). The paths that fail a job
+// delete its trigger in the same reconcile, just before this evaluation, so
+// the cache may not have seen the delete yet. One live read tells a leaked
+// trigger from a stale cache entry. It runs only when the cache shows a
+// concluded job with an undeleted trigger. If the live read fails for another
+// reason, the cache's answer stands.
+func (r *PodMigrationJobReconciler) confirmOrphanedTrigger(ctx context.Context, key types.NamespacedName, gvk schema.GroupVersionKind) bool {
+	if r.invariantReader == nil {
+		// The trigger was just read through Client, without a cache.
+		return true
+	}
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(gvk)
+	if err := r.liveReader().Get(ctx, key, live); err != nil {
+		return !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err)
+	}
+	return live.GetDeletionTimestamp() == nil
+}
+
+// snapshotProgressNeeded reports whether I4 needs job's snapshot progress at
+// now: job is Snapshotting with a snapshot, past its timeout and inside the
+// hard cap plus I4's 30-second slack. Before the timeout I4 doesn't look at
+// progress, and past the cap progress no longer counts, so a read then would
+// be wasted.
+func snapshotProgressNeeded(job *pmv1alpha1.PodMigrationJob, now time.Time) bool {
+	if job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || job.Status.SnapshotRef == "" {
+		return false
+	}
+	anchor := migrationDeadlineAnchor(job)
+	return !anchor.IsZero() && now.Sub(anchor) > invariants.EffectiveMigrationTimeout(job) && now.Sub(anchor) <= util.MaxMigrationTimeout+30*time.Second
+}
+
 func snapshotProgressFromStatus(st *snapshot.Status) invariants.SnapshotProgress {
 	return invariants.SnapshotProgress{
 		Ready:            st.Phase == snapshot.PhaseReady,
@@ -790,12 +913,13 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 	snapName := job.Status.SnapshotRef
 	if job.Spec.PodRef.Name != "" {
 		triggerName := util.FormatPSMTName(job.Spec.PodRef.Name, job.Spec.TargetPodUID)
+		triggerKey := types.NamespacedName{Namespace: job.Namespace, Name: triggerName}
 		trigger := &unstructured.Unstructured{}
 		trigger.SetGroupVersionKind(snapshot.ManualTriggerGVK(primaryGroup))
-		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: triggerName}, trigger); err == nil {
+		if err := r.ReadForInvariants(ctx, triggerKey, trigger); err == nil {
 			if (job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseSucceeded ||
 				job.Status.Phase == pmv1alpha1.PodMigrationJobPhaseFailed) && trigger.GetDeletionTimestamp() == nil {
-				hasOrphanedTrigger = true
+				hasOrphanedTrigger = r.confirmOrphanedTrigger(ctx, triggerKey, trigger.GroupVersionKind())
 			}
 			if snapName == "" {
 				if createdName, found, _ := unstructured.NestedString(trigger.Object, "status", "snapshotCreated", "name"); found {
@@ -810,7 +934,7 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 	if snapName != "" {
 		snapObj := &unstructured.Unstructured{}
 		snapObj.SetGroupVersionKind(snapshot.PodSnapshotGVK(primaryGroup))
-		if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
+		if err := r.ReadForInvariants(ctx, types.NamespacedName{Namespace: job.Namespace, Name: snapName}, snapObj); err == nil {
 			primarySnapObj = snapObj
 			primarySnapshotConditions = extractUnstructuredConditions(snapObj)
 		}
@@ -840,16 +964,12 @@ func (r *PodMigrationJobReconciler) evaluateInvariantsWithSnapshot(ctx context.C
 		if otherKey == primaryKey {
 			continue
 		}
-		if other.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSnapshotting || other.Status.SnapshotRef == "" {
-			continue
-		}
-		anchor := migrationDeadlineAnchor(other)
-		if anchor.IsZero() || now.Sub(anchor) <= invariants.EffectiveMigrationTimeout(other) || now.Sub(anchor) > util.MaxMigrationTimeout+30*time.Second {
+		if !snapshotProgressNeeded(other, now) {
 			continue
 		}
 		otherSnapObj := &unstructured.Unstructured{}
 		otherSnapObj.SetGroupVersionKind(snapshot.PodSnapshotGVK(r.jobAPIGroup(other)))
-		if err := r.Get(ctx, types.NamespacedName{Namespace: other.Namespace, Name: other.Status.SnapshotRef}, otherSnapObj); err == nil {
+		if err := r.ReadForInvariants(ctx, types.NamespacedName{Namespace: other.Namespace, Name: other.Status.SnapshotRef}, otherSnapObj); err == nil {
 			recordSnapshotProgress(otherKey, snapshot.CheckPodSnapshotStatus(otherSnapObj, now))
 		} else if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			var fallbackProvider snapshot.Provider
@@ -1009,6 +1129,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Set initial phase if empty
 	if job.Status.Phase == "" {
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhasePending
+		job.Status.Deadline = r.calculateDeadline(job)
 		err = r.patchStatus(ctx, job, origJob)
 		if err != nil {
 			return r.handleStatusError(ctx, err, "Failed to initialize job phase")
@@ -1419,13 +1540,14 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 				memBytes := util.CalculatePodMemoryRequest(originPod)
 				calculated := util.CalculateMigrationTimeout(rawTimeout, memBytes, r.DefaultMigrationTimeout)
-				base := r.DefaultMigrationTimeout
-				if base <= 0 {
-					base = util.DefaultMigrationTimeout
-				}
-				if calculated != base {
-					job.Annotations[util.AnnotationMigrationTimeout] = calculated.String()
+				// Record the timeout even when it is --migration-timeout, so
+				// the job says what deadline it's held to (#330). Jobs the
+				// controller creates carry it already; this covers a job
+				// created by hand or by an earlier version.
+				if v, ok := util.TimeoutAnnotationValue(calculated); ok {
+					job.Annotations[util.AnnotationMigrationTimeout] = v
 					annotationUpdated = true
+					job.Status.Deadline = r.calculateDeadline(job)
 				}
 			}
 
@@ -1477,6 +1599,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseSnapshotting
 		now := metav1.Now()
 		job.Status.SnapshottingStartTime = &now
+		job.Status.Deadline = r.calculateDeadline(job)
 		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -1570,6 +1693,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseEvicting
 			job.Status.EvictingStartTime = &now
 			job.Status.SnapshotRef = snapStatus.SnapshotRef
+			job.Status.Deadline = r.calculateDeadline(job)
 			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 				Type:               "Ready",
 				Status:             metav1.ConditionFalse,
@@ -1677,6 +1801,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				}
 			}
 			job.Status.EvictingStartTime = &startTime
+			job.Status.Deadline = r.calculateDeadline(job)
 			if err := r.patchStatus(ctx, job, origJob); err != nil {
 				return r.handleStatusError(ctx, err, "Failed to initialize EvictingStartTime")
 			}
@@ -1885,6 +2010,7 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		job.Status.Phase = pmv1alpha1.PodMigrationJobPhaseRestoring
 		restoringNow := metav1.Now()
 		job.Status.RestoringStartTime = &restoringNow
+		job.Status.Deadline = r.calculateDeadline(job)
 		meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -1908,13 +2034,22 @@ func (r *PodMigrationJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 
 	case pmv1alpha1.PodMigrationJobPhaseRestoring:
-		// 1. Ensure RestoringStartTime is initialized
+		// 1. Ensure RestoringStartTime is initialized, and keep status.deadline aligned
+		// with RestoringStartTime + restoreCeiling() when the pod gate resets RestoringStartTime on consumption.
 		if job.Status.RestoringStartTime == nil {
 			now := metav1.Now()
 			job.Status.RestoringStartTime = &now
+			job.Status.Deadline = r.calculateDeadline(job)
 			if err := r.patchStatus(ctx, job, origJob); err != nil {
 				return r.handleStatusError(ctx, err, "Failed to initialize RestoringStartTime")
 			}
+			origJob = job.DeepCopy()
+		} else if expectedDeadline := r.calculateDeadline(job); expectedDeadline != nil && job.Status.Deadline != nil && !job.Status.Deadline.Equal(expectedDeadline) {
+			job.Status.Deadline = expectedDeadline
+			if err := r.patchStatus(ctx, job, origJob, client.MergeFromWithOptimisticLock{}); err != nil {
+				return r.handleStatusError(ctx, err, "Failed to update deadline in Restoring phase")
+			}
+			origJob = job.DeepCopy()
 		}
 
 		// An earlier version of the pod gate found no node that could
@@ -2727,6 +2862,11 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 
 	restMapper := mgr.GetRESTMapper()
 
+	// Invariant evaluation reads triggers and PodSnapshots of the kinds
+	// watched below from the manager's cache (#199).
+	r.invariantReader = mgr.GetCache()
+	r.invariantCachedGVKs = map[schema.GroupVersionKind]bool{}
+
 	for _, group := range r.apiGroups() {
 		psmtGVK := snapshot.ManualTriggerGVK(group)
 		watchPSMT, err := shouldWatchCRD(restMapper, psmtGVK)
@@ -2739,6 +2879,7 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 			psmt := &unstructured.Unstructured{}
 			psmt.SetGroupVersionKind(psmtGVK)
 			bldr = bldr.Watches(psmt, handler.EnqueueRequestForOwner(mgr.GetScheme(), restMapper, &pmv1alpha1.PodMigrationJob{}))
+			r.invariantCachedGVKs[psmtGVK] = true
 		}
 
 		snapGVK := snapshot.PodSnapshotGVK(group)
@@ -2752,6 +2893,7 @@ func (r *PodMigrationJobReconciler) SetupWithManager(mgr ctrl.Manager, options c
 			snap := &unstructured.Unstructured{}
 			snap.SetGroupVersionKind(snapGVK)
 			bldr = bldr.Watches(snap, handler.EnqueueRequestsFromMapFunc(r.mapSnapshotToPMJ))
+			r.invariantCachedGVKs[snapGVK] = true
 		}
 	}
 

@@ -122,7 +122,7 @@ Non-goals:
 
 ### C5. Restore order and exactly-once restore
 
-- The controller issues one restore order per replacement, through the engine: `ps-name` today, `spec.restoreFrom` for KEP-5823. The engine also defines the explicit cold-start bypass, `ps-name: ""` today. The controller sets it on a replacement it releases without a restore, on the source right before the trigger (#156), and on every pod created without an active migration (#158): GKE Pod Snapshots restores a pod that has no `ps-name` from a matching snapshot when its sandbox is created.
+- The controller issues one restore order per replacement, through the engine: `ps-name` today, `spec.restoreFrom` for KEP-5823. The engine also defines the explicit cold-start bypass, `ps-name: ""` today. The controller sets it on a replacement it releases without a restore, on the source right before the trigger (#156), and on every pod created without an active migration (#158): GKE Pod Snapshots restores a pod that has no `ps-name` from a matching snapshot when its sandbox is created. On a gVisor pod whose engine orders restores under another annotation, GKE Pod Snapshots still reads `podsnapshot.gke.io/ps-name` when it creates the sandbox, so the controller sets it to `""` when such a pod is created without an active migration and adds it, if missing, when it releases a replacement; I2 checks released replacements (#234).
 - **Rule.** A replacement is restored from a checkpoint at most once, and its outcome is recorded once. A retried reconcile, a conflict on the outcome write, a container restart or an engine restart must never re-apply the checkpoint to a pod that has already run restored code. A second restore rolls the application back after it has already served clients.
 - **The controller's half exists.** Invariant I1 (`AtMostOnceRestore`) and the single-use gate stop a second pod from consuming the same checkpoint.
 - **The engine owns the other half.** Neither of those can see a second restore inside the same pod. The engine guards the restore with a durable marker, written before restoring under optimistic concurrency, not with in-memory state.
@@ -326,7 +326,7 @@ Three new checks follow the style of the existing invariants ([invariants.md](..
 - `--invariant-mode` defaults to `disabled`, so production behavior doesn't change.
 - T1 runs in strict mode, so each new rule must stay silent on today's scenarios. I11 is: no job records `SourceFenced=True` until the fence lands.
 - I11 reads only what `ReconcileSnapshot` already carries, the namespace's jobs and pods. `RestoreOutcomeConfirmed` needs the engine's identity and the recorded evidence, and the snapshot is built outside `invariants/**`, so it needs a plumbing PR on a normal branch first (or the `allow-invariant-cochange` label), then its `invariant/` PR.
-- The existing I1 (`AtMostOnceRestore`) and I2 (`NoSilentColdStart`) read the `podsnapshot.gke.io/ps-name` annotation. For an engine with another API group or `spec.restoreFrom` they would miss restores or report false violations, so they read the job's engine's restore order once engines resolve per pod (step 3).
+- I1 (`AtMostOnceRestore`) and I2 (`NoSilentColdStart`) read each pod's restore order for its job's engine, plus `podsnapshot.gke.io/ps-name` on a gVisor pod, and I2 requires the GKE cold-start bypass on a gVisor pod whose engine orders restores under another annotation (#234). An engine that orders restores through `spec.restoreFrom` rather than an annotation has orders whose API group I1 can't tell, so I1 matches them against every group.
 - The engine conformance suite (#108) runs every clause for each engine, including the negative security tests from #129.
 
 ## Who owns what
@@ -385,7 +385,7 @@ Three new checks follow the style of the existing invariants ([invariants.md](..
 | 9    | Placement constraints                                                                                                                                                                                                                                             | #14        |
 | 10   | Security requirements; the conformance suite                                                                                                                                                                                                                      | #129, #108 |
 
-`SourceFencedAfterCheckpoint` comes ahead of the fence as I11 (#159), silent until the fence records `SourceFenced=True`. `RestoreOutcomeConfirmed` lands as an `invariant/` PR after its plumbing PR and step 5. The I1/I2 change follows step 3.
+`SourceFencedAfterCheckpoint` comes ahead of the fence as I11 (#159), silent until the fence records `SourceFenced=True`. `RestoreOutcomeConfirmed` lands as an `invariant/` PR after its plumbing PR and step 5.
 
 Step 6 keeps a `Stopped` engine's source fenced after a failure unless the checkpoint never completed and the containers match the baseline (C4). For other engines, putting a source back waits for confirmed cancellation (step 8).
 

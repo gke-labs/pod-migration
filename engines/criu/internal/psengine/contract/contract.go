@@ -64,6 +64,8 @@ const (
 	AnnotationOrchestratorEngine = "pod-migration.gke.io/engine"
 	// LabelEnabled is the workload opt-in (replacement_webhook.go:65).
 	LabelEnabled = "pod-migration.gke.io/enabled"
+	// LabelNamespaceManaged is the namespace opt-in label for admission webhooks (#303).
+	LabelNamespaceManaged = "pod-migration.gke.io/managed"
 	// SchedulingGate holds replacement pods (replacement_webhook.go:171).
 	SchedulingGate = "gke.io/pod-migration-gate"
 

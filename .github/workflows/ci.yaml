@@ -60,6 +60,9 @@ jobs:
       - name: Run 100-Pod Scale Regression Gate
         run: make -C controller test-scale-drain
 
+      - name: Run WorkloadClass Joint E2E Self-Test
+        run: make -C controller test-workload-class-e2e
+
       - name: Upload Scale Gate Summary Artifact
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

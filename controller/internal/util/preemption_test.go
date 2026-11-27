@@ -660,8 +660,8 @@ func TestBuildPMJLabelsAndAnnotations(t *testing.T) {
 	if annotations[AnnotationPodSnapshotPolicy] != "psp-test-policy" {
 		t.Errorf("Expected PSP annotation psp-test-policy, got %s", annotations[AnnotationPodSnapshotPolicy])
 	}
-	if annotations[AnnotationMigrationTimeout] != "20m" {
-		t.Errorf("Expected migration timeout 20m, got %s", annotations[AnnotationMigrationTimeout])
+	if annotations[AnnotationMigrationTimeout] != "20m0s" {
+		t.Errorf("Expected migration timeout 20m0s, got %s", annotations[AnnotationMigrationTimeout])
 	}
 }
 

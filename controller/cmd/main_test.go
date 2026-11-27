@@ -16,13 +16,23 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/gke-labs/pod-migration/controller/internal/controller"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
+	"github.com/gke-labs/pod-migration/controller/internal/snapshot"
 )
 
 func TestValidateCRIUAPIGroup(t *testing.T) {
@@ -66,6 +76,44 @@ func TestMainExitsNonZeroOnInvalidCRIUAPIGroupFlag(t *testing.T) {
 	}
 }
 
+func TestMainExitsNonZeroOnBucketRootStorageWithoutNamespaces(t *testing.T) {
+	if os.Getenv("TEST_SUBPROCESS_MAIN") == "1" {
+		os.Args = []string{"manager", "--allow-bucket-root-storage=true"}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainExitsNonZeroOnBucketRootStorageWithoutNamespaces$")
+	cmd.Env = append(os.Environ(), "TEST_SUBPROCESS_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1 on --allow-bucket-root-storage=true without a namespace list, got err=%v output=%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "--allow-bucket-root-storage-namespaces") {
+		t.Errorf("expected startup error naming --allow-bucket-root-storage-namespaces, got: %s", string(out))
+	}
+}
+
+func TestMainExitsNonZeroOnBucketBoundToTwoNamespaces(t *testing.T) {
+	if os.Getenv("TEST_SUBPROCESS_MAIN") == "1" {
+		os.Args = []string{"manager", "--allow-bucket-root-storage-namespaces=team-a=shared-bucket,team-b=shared-bucket"}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainExitsNonZeroOnBucketBoundToTwoNamespaces$")
+	cmd.Env = append(os.Environ(), "TEST_SUBPROCESS_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1 when one bucket is bound to two namespaces, got err=%v output=%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "bound to two namespaces") {
+		t.Errorf("expected startup error naming the doubly bound bucket, got: %s", string(out))
+	}
+}
+
 func TestShouldRegisterCRIU(t *testing.T) {
 	gvisorOnly, err := engine.ParseRoutes("gvisor=gke-pod-snapshots")
 	if err != nil {
@@ -86,5 +134,79 @@ func TestShouldRegisterCRIU(t *testing.T) {
 	}
 	if !shouldRegisterCRIU(false, withCRIU) {
 		t.Error("shouldRegisterCRIU(false, withCRIU) = false, want true when --runtime-class-engines names criu")
+	}
+}
+
+func TestMainLogsDeprecationOnStorageIsolationMode(t *testing.T) {
+	if os.Getenv("TEST_SUBPROCESS_MAIN") == "1" {
+		os.Args = []string{"manager", "--storage-isolation-mode=enforce", "--criu-api-group=invalid_no_dot"}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainLogsDeprecationOnStorageIsolationMode$")
+	cmd.Env = append(os.Environ(), "TEST_SUBPROCESS_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got err=%v output=%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "--storage-isolation-mode is deprecated") {
+		t.Errorf("expected output to contain '--storage-isolation-mode is deprecated', got: %s", string(out))
+	}
+}
+
+func TestMainDoesNotLogDeprecationWhenStorageIsolationModeUnset(t *testing.T) {
+	if os.Getenv("TEST_SUBPROCESS_MAIN") == "1" {
+		os.Args = []string{"manager", "--criu-api-group=invalid_no_dot"}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainDoesNotLogDeprecationWhenStorageIsolationModeUnset$")
+	cmd.Env = append(os.Environ(), "TEST_SUBPROCESS_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got err=%v output=%s", err, string(out))
+	}
+	if strings.Contains(string(out), "--storage-isolation-mode is deprecated") {
+		t.Errorf("expected output NOT to contain '--storage-isolation-mode is deprecated', got: %s", string(out))
+	}
+}
+
+// podGateTestManager serves only what newPodGateReconciler uses.
+type podGateTestManager struct {
+	ctrl.Manager
+	client client.Client
+	scheme *runtime.Scheme
+}
+
+func (m podGateTestManager) GetClient() client.Client    { return m.client }
+func (m podGateTestManager) GetAPIReader() client.Reader { return m.client }
+func (m podGateTestManager) GetScheme() *runtime.Scheme  { return m.scheme }
+
+// TestNewPodGateReconcilerReadsThroughTheJobReconciler (#231): the pod gate's
+// I4 check reads the assigned job's PodSnapshot through the job reconciler,
+// which serves the kinds it watches from the cache. Without that wiring the
+// pod gate flags jobs whose snapshot is still making progress.
+func TestNewPodGateReconcilerReadsThroughTheJobReconciler(t *testing.T) {
+	scheme := runtime.NewScheme()
+	gvk := snapshot.PodSnapshotGVK(snapshot.DefaultAPIGroup)
+	snap := &unstructured.Unstructured{}
+	snap.SetGroupVersionKind(gvk)
+	snap.SetNamespace("default")
+	snap.SetName("snap-b")
+	jobs := &controller.PodMigrationJobReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(snap).Build()}
+	mgr := podGateTestManager{client: fake.NewClientBuilder().WithScheme(scheme).Build(), scheme: scheme}
+
+	gate := newPodGateReconciler(mgr, nil, nil, nil, false, jobs)
+	if gate.ReadForInvariants == nil {
+		t.Fatal("the pod gate has no ReadForInvariants, so I4 judges Snapshotting jobs without their progress")
+	}
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(gvk)
+	if err := gate.ReadForInvariants(context.Background(), types.NamespacedName{Namespace: "default", Name: "snap-b"}, got); err != nil {
+		t.Fatalf("ReadForInvariants: %v; want the job reconciler's read (only its client has the snapshot)", err)
 	}
 }

@@ -428,16 +428,15 @@ func BuildPMJLabelsAndAnnotationsForPolicy(
 		rawTimeout = pod.Annotations[AnnotationMigrationTimeout]
 	}
 	memBytes := CalculatePodMemoryRequest(pod)
+	// The job always records the timeout it's held to, clamped as the
+	// reconciler reads it, also when that is the controller's default, so
+	// that anything reading the job (I4) needn't know the default (#330).
 	effectiveTimeout := CalculateMigrationTimeout(rawTimeout, memBytes, baseTimeout)
-	if effectiveTimeout != baseTimeout || rawTimeout != "" {
+	if v, ok := TimeoutAnnotationValue(effectiveTimeout); ok {
 		if jobAnnotations == nil {
 			jobAnnotations = make(map[string]string)
 		}
-		if _, ok := ParseClampedTimeout(rawTimeout); ok {
-			jobAnnotations[AnnotationMigrationTimeout] = rawTimeout
-		} else if effectiveTimeout != baseTimeout {
-			jobAnnotations[AnnotationMigrationTimeout] = effectiveTimeout.String()
-		}
+		jobAnnotations[AnnotationMigrationTimeout] = v
 	}
 
 	if policyName != "" {

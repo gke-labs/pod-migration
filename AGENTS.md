@@ -83,7 +83,7 @@ The runtime safety invariants defined in `docs/invariants.md` and implemented in
 
 ### Lane 2: Invariant Evolution PRs
 - **Branch naming:** Must match `^invariant/` (e.g., `invariant/i11-source-fenced-after-checkpoint`).
-- **Scope limitation:** Dedicated invariant PRs must touch **only** `controller/internal/invariants/**` and documentation (`docs/invariants.md`).
+- **Scope limitation:** Dedicated invariant PRs must touch **only** `controller/internal/invariants/**` and documentation (`docs/invariants.md`), and must change at least one file under `controller/internal/invariants/`.
 - **Verification requirement:** Every new or updated invariant rule must include positive tests (passing valid reconcile traces) and negative fault-injection tests (verifying detection of violating traces).
 
 ---
@@ -124,7 +124,7 @@ All PRs require review from automated/peer agents and maintainers (`CODEOWNERS`)
 ### AI Agent Attribution
 When opening or updating an AI-assisted Pull Request, include the `## Self-Review` section and an AI attribution footer in the PR description:
 ```text
-Generated with the help of Jetski (Gemini).
+Generated with the help of Gemini.
 ```
 or
 ```text
@@ -135,7 +135,7 @@ Generated with the help of Claude Code.
 
 ## 6. Open-Source Hygiene & Operational Safety
 
-- **Public Repository:** `gke-labs/pod-migration` is an open-source project licensed under Apache-2.0. Never commit internal corporate URLs, internal issue links, corporate usernames, or internal cluster/project identifiers. Always use public placeholders like `<YOUR_PROJECT_ID>` or `<YOUR_CONTROLLER_IMAGE>`.
+- **Public Repository:** `gke-labs/pod-migration` is an open-source project licensed under Apache-2.0. Never commit internal corporate URLs, internal issue links, corporate usernames, internal tool names, or internal cluster/project identifiers. This applies to commit messages and to PR titles, descriptions, and comments too. Always use public placeholders like `<YOUR_PROJECT_ID>` or `<YOUR_CONTROLLER_IMAGE>`.
 - **Node Cordon Hygiene:** When testing migrations against live clusters, never leave worker nodes cordoned (`SchedulingDisabled`). Always run `kubectl uncordon <node>` once migration completes.
 - **Snapshot Metadata Cleanup:** Before running fresh E2E or verification workloads, clear stale snapshot descriptors in the specific test namespace:
   ```bash

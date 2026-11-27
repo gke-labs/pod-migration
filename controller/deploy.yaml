@@ -165,9 +165,9 @@ roleRef:
   kind: ClusterRole
   name: pod-migration-controller-role
 subjects:
-- kind: ServiceAccount
-  name: pod-migration-controller
-  namespace: pod-migration-system
+  - kind: ServiceAccount
+    name: pod-migration-controller
+    namespace: pod-migration-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -175,21 +175,21 @@ metadata:
   name: pod-migration-leader-election-role
   namespace: pod-migration-system
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - create
-  - get
-  - update
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - get
+      - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -201,9 +201,9 @@ roleRef:
   kind: Role
   name: pod-migration-leader-election-role
 subjects:
-- kind: ServiceAccount
-  name: pod-migration-controller
-  namespace: pod-migration-system
+  - kind: ServiceAccount
+    name: pod-migration-controller
+    namespace: pod-migration-system
 ---
 apiVersion: cert-manager.io/v1
 kind: Issuer
@@ -220,8 +220,8 @@ metadata:
   namespace: pod-migration-system
 spec:
   dnsNames:
-  - webhook-service.pod-migration-system.svc
-  - webhook-service.pod-migration-system.svc.cluster.local
+    - webhook-service.pod-migration-system.svc
+    - webhook-service.pod-migration-system.svc.cluster.local
   issuerRef:
     kind: Issuer
     name: selfsigned-issuer
@@ -248,60 +248,60 @@ spec:
         app: pod-migration-controller
     spec:
       topologySpreadConstraints:
-      # Use ScheduleAnyway to allow both replicas to schedule on small or single-node development
-      # clusters while still spreading across distinct nodes whenever multi-node topology is available.
-      - maxSkew: 1
-        topologyKey: kubernetes.io/hostname
-        whenUnsatisfiable: ScheduleAnyway
-        labelSelector:
-          matchLabels:
-            app: pod-migration-controller
+        # Use ScheduleAnyway to allow both replicas to schedule on small or single-node development
+        # clusters while still spreading across distinct nodes whenever multi-node topology is available.
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: pod-migration-controller
       serviceAccountName: pod-migration-controller
       containers:
-      - name: manager
-        image: <YOUR_CONTROLLER_IMAGE>
-        imagePullPolicy: Always
-        command:
-        - /manager
-        args:
-        - --metrics-bind-address=:8080
-        - --health-probe-bind-address=:8081
-        - --leader-elect=true
-        - --client-go-qps=500
-        - --client-go-burst=1000
-        - --max-concurrent-reconciles=50
-        ports:
-        - containerPort: 9443
-          name: webhook-server
-          protocol: TCP
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8081
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8081
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        volumeMounts:
-        - mountPath: /tmp/k8s-webhook-server/serving-certs
-          name: cert
-          readOnly: true
-        resources:
-          requests:
-            cpu: 200m
-            memory: 1Gi
-          limits:
-            cpu: 1000m
-            memory: 2Gi
+        - name: manager
+          image: <YOUR_CONTROLLER_IMAGE>
+          imagePullPolicy: Always
+          command:
+            - /manager
+          args:
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --leader-elect=true
+            - --client-go-qps=500
+            - --client-go-burst=1000
+            - --max-concurrent-reconciles=50
+          ports:
+            - containerPort: 9443
+              name: webhook-server
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - mountPath: /tmp/k8s-webhook-server/serving-certs
+              name: cert
+              readOnly: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 1Gi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
       volumes:
-      - name: cert
-        secret:
-          defaultMode: 420
-          secretName: webhook-server-cert
+        - name: cert
+          secret:
+            defaultMode: 420
+            secretName: webhook-server-cert
 ---
 apiVersion: v1
 kind: Service
@@ -310,9 +310,9 @@ metadata:
   namespace: pod-migration-system
 spec:
   ports:
-  - port: 443
-    protocol: TCP
-    targetPort: 9443
+    - port: 443
+      protocol: TCP
+      targetPort: 9443
   selector:
     app: pod-migration-controller
 ---
@@ -335,6 +335,8 @@ webhooks:
         path: /validate-v1-pod-eviction
         port: 443
     namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
@@ -355,10 +357,20 @@ metadata:
   annotations:
     cert-manager.io/inject-ca-from: pod-migration-system/webhook-cert
 webhooks:
+  # The replacement mutating webhook is split into two entries matching
+  # namespaces labeled pod-migration.gke.io/managed: "true" with reinvocationPolicy: IfNeeded (#303):
+  #
+  # 1. mpodgate.podmigration.gke.io (failurePolicy: Fail):
+  #    Matches pods with object.spec.runtimeClassName == 'gvisor'. For gVisor pods,
+  #    the cold-start bypass annotation (podsnapshot.gke.io/ps-name: "") must be guaranteed
+  #    at creation (#151); without it, GKE Pod Snapshots fails to restore on normal scale-ups.
+  #    The cost of failurePolicy: Fail is that during a controller outage, ALL gVisor pod
+  #    creations in managed namespaces are blocked.
   - name: mpodgate.podmigration.gke.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
     failurePolicy: Fail
+    reinvocationPolicy: IfNeeded
     timeoutSeconds: 5
     clientConfig:
       service:
@@ -366,10 +378,46 @@ webhooks:
         name: webhook-service
         path: /mutate-v1-pod-scheduling-gate
         port: 443
-    objectSelector:
-      matchLabels:
-        pod-migration.gke.io/enabled: "true"
     namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - pod-migration-system
+            - kube-system
+    matchConditions:
+      - name: gvisor-runtime-class
+        expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'"
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
+
+  # 2. mpodgate-runc.podmigration.gke.io (failurePolicy: Ignore):
+  #    Matches all pods in managed namespaces. Non-gVisor pods (and custom gVisor runtime
+  #    classes) fail open during a controller outage, meaning new pods start cold and
+  #    cluster workloads do not wedge during outages. The handler is idempotent on reinvocation:
+  #    it scrubs restore annotations, clears readiness delay, and preserves CRIU injector markers
+  #    without duplicating scheduling gates.
+  - name: mpodgate-runc.podmigration.gke.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        namespace: pod-migration-system
+        name: webhook-service
+        path: /mutate-v1-pod-scheduling-gate
+        port: 443
+    namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
@@ -460,9 +508,13 @@ webhooks:
 # pod-migration.gke.io/enabled to opt out), other annotations, the spec and
 # the kubelet's status writes go through as before.
 #
-# Scope: pods that have the opt-in label before or after the update, like
-# mpodgate. A pod without it isn't migrated, and a restore order on it is a
-# restore outside a migration, which the engine authorizes (C10 R1, #55).
+# Scope: on CREATE in managed namespaces, any pod carrying a non-empty non-GKE
+# restore order annotation (<group>/ps-name != podsnapshot.gke.io/ps-name) is
+# denied to prevent spoofing during fail-open webhook outages, while Kubeflow
+# resume flow is preserved. On UPDATE in managed namespaces, on pods that have the
+# opt-in label before or after the update, or any pod carrying a non-GKE restore
+# order before or after the update: only the controller's service account may set,
+# change or remove a restore order.
 #
 # The validation below names the controller's service account, namespace
 # included. An install that renames the namespace or the service account must
@@ -481,14 +533,13 @@ spec:
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
-        operations: ["UPDATE"]
+        operations: ["CREATE", "UPDATE"]
         # A write to pods/status can change annotations too.
         resources: ["pods", "pods/status"]
         scope: Namespaced
-    objectSelector:
-      matchLabels:
-        pod-migration.gke.io/enabled: "true"
     namespaceSelector:
+      matchLabels:
+        pod-migration.gke.io/managed: "true"
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
@@ -496,26 +547,39 @@ spec:
             - pod-migration-system
             - kube-system
   matchConditions:
-    # True when a <group>/ps-name annotation is added, changed or removed.
+    # True on CREATE if non-controller request carries non-GKE restore annotation (<group>/ps-name != podsnapshot.gke.io/ps-name),
+    # or on UPDATE when a <group>/ps-name annotation is added, changed or removed on a pod opted into migration.
     - name: restore-order-changed
       expression: >-
-        (has(object.metadata.annotations) && object.metadata.annotations.exists(k,
+        (request.operation == 'CREATE' &&
+        has(object.metadata.annotations) &&
+        object.metadata.annotations.exists(k, k.endsWith('/ps-name') && k != 'podsnapshot.gke.io/ps-name' && object.metadata.annotations[k] != ''))
+        ||
+        (request.operation == 'UPDATE' &&
+        ((has(object.metadata.annotations) && object.metadata.annotations.exists(k,
         k.endsWith('/ps-name') && (!has(oldObject.metadata.annotations) ||
         !(k in oldObject.metadata.annotations) ||
         oldObject.metadata.annotations[k] != object.metadata.annotations[k])))
         ||
         (has(oldObject.metadata.annotations) && oldObject.metadata.annotations.exists(k,
         k.endsWith('/ps-name') && (!has(object.metadata.annotations) ||
-        !(k in object.metadata.annotations))))
+        !(k in object.metadata.annotations)))))
+        &&
+        ((has(object.metadata.labels) && 'pod-migration.gke.io/enabled' in object.metadata.labels && object.metadata.labels['pod-migration.gke.io/enabled'] == 'true') ||
+        (has(oldObject.metadata.labels) && 'pod-migration.gke.io/enabled' in oldObject.metadata.labels && oldObject.metadata.labels['pod-migration.gke.io/enabled'] == 'true') ||
+        (has(object.metadata.annotations) && object.metadata.annotations.exists(k, k.endsWith('/ps-name') && k != 'podsnapshot.gke.io/ps-name')) ||
+        (has(oldObject.metadata.annotations) && oldObject.metadata.annotations.exists(k, k.endsWith('/ps-name') && k != 'podsnapshot.gke.io/ps-name'))))
   validations:
     # The controller's service account: the namespace and name of the
     # ServiceAccount in this file.
     - expression: >-
+        request.operation == 'UPDATE' &&
         request.userInfo.username ==
         'system:serviceaccount:pod-migration-system:pod-migration-controller'
       message: >-
         only the Pod Migration controller may set, change or remove a restore
-        order (<group>/ps-name) on an existing pod that is opted into migration
+        order (<group>/ps-name) on an existing pod that is opted into migration,
+        and non-GKE restore annotations may not be set on pod creation
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -585,4 +649,3 @@ spec:
       nonResourceRules:
         - verbs: ["*"]
           nonResourceURLs: ["*"]
-

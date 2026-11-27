@@ -62,6 +62,7 @@ type restorer struct {
 	// Swappable in tests.
 	execHost          func(ctx context.Context, env []string, name string, args ...string) (string, error)
 	nsenterBin        string
+	bundleDir         string // host dir of the installed CRIU bundle; "" = criuBundleDir (#109)
 	openPodNetnsFn    func(holderPid int) (*os.File, error)
 	execNetnsFn       func(ctx context.Context, netns *os.File, name string, args ...string) (string, error)
 	execRestoreFn     func(ctx context.Context, env []string, logPath string, name string, args ...string) (string, error)
@@ -222,6 +223,14 @@ func (r *restorer) execRestore(ctx context.Context, env []string, logPath string
 		return string(b), fmt.Errorf("timed out after 120s: %w", cctx.Err())
 	}
 	return string(b), runErr
+}
+
+// criuBundle is the host directory of the installed CRIU bundle.
+func (r *restorer) criuBundle() string {
+	if r != nil && r.bundleDir != "" {
+		return r.bundleDir
+	}
+	return criuBundleDir
 }
 
 func (r *restorer) rootDir() string {
@@ -772,7 +781,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 	}
 	out.FileValidationUsed = true
 
-	if v, err := r.execHost(ctx, nil, criuBundleDir+"/criu", "--version"); err == nil {
+	if v, err := r.execHost(ctx, nil, r.criuBundle()+"/criu", "--version"); err == nil {
 		out.CriuVersion = strings.TrimSpace(strings.TrimPrefix(strings.Split(v, "\n")[0], "Version: "))
 	}
 
@@ -781,7 +790,7 @@ func (r *restorer) restore(ctx context.Context, in restoreInputs) (*restoreOutco
 		imagePath = in.CheckpointDir
 	}
 	pidFile := filepath.Join(bundleDir, "pid")
-	env := []string{"PATH=" + criuBundleDir + ":" + hostRuncPATH}
+	env := []string{"PATH=" + r.criuBundle() + ":" + hostRuncPATH}
 	baseArgs := []string{
 		"--root", runcStateRoot, "restore",
 		"--bundle", bundleDir,

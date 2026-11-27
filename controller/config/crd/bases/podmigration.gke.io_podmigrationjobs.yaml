@@ -152,6 +152,26 @@ spec:
                   a subsequent replacement pod may recover and re-adopt this PMJ. Once GateReleased is true, subsequent
                   pods will ignore this PMJ, preventing cross-generational stale state resurrection.
                 type: boolean
+              deadline:
+                description: |-
+                  Deadline is the timestamp at which the reconciler will time out the job's
+                  current phase:
+                  - Pending: CreationTimestamp + effective timeout (clamped to MaxMigrationTimeout).
+                  - Snapshotting: SnapshottingStartTime + MaxMigrationTimeout (upper bound for progressing snapshots).
+                  - Evicting: EvictingStartTime + effective timeout (capped by MaxMigrationTimeout from SnapshottingStartTime).
+                  - Restoring: RestoringStartTime + restoreCeiling (5m + optional stabilization window).
+                    When the replacement pod claims the job at the scheduling gate, RestoringStartTime
+                    resets to that consumption time and deadline advances to match the fresh restore ceiling.
+                    Before consumption, a job past the ceiling whose claimant is still gated stays
+                    Restoring with no limit (WaitingOnGateRelease).
+                  In terminal phases (Succeeded, SucceededWithoutRestore, Failed), the value is historical
+                  and consumers should release right away.
+                  External consumers coordinating with live migration should cap their wait at
+                  status.deadline plus a small margin and re-read it when the job changes. A
+                  missing field (from an older controller) should be treated with a local
+                  fallback, such as MaxMigrationTimeout plus a margin.
+                format: date-time
+                type: string
               evictingStartTime:
                 description: EvictingStartTime is the timestamp when this job transitioned
                   to the Evicting phase.

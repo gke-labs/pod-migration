@@ -37,11 +37,17 @@
 #        - Commit trailer `Invariant-Cochange: <reason>` in any commit on the PR, or
 #        - CLI flag `--allow-cochange`.
 #   4. Lane 2 (Dedicated Invariant PRs — branch matches ^invariant/):
-#      Requires all modified files to be strictly scoped to
-#      controller/internal/invariants/** unless a co-change override is present.
+#      Requires every modified file to be under controller/internal/invariants/**
+#      or to be docs/invariants.md (the invariant specification, AGENTS.md
+#      section 4), and at least one file under controller/internal/invariants/,
+#      unless a co-change override is present.
 #   5. Never exempts detached HEAD (`HEAD` / `DETACHED_HEAD`); only direct
 #      commits on `main` skip per-PR lane diff enforcement.
 #   6. Fails closed if the git diff against a base ref cannot be resolved.
+#   7. Computes changed files without rename detection, so a file moved out of
+#      (or into) a governed path counts against both its old and new paths, and
+#      without path quoting; a changed path with whitespace or control
+#      characters fails closed.
 
 set -euo pipefail
 
@@ -214,15 +220,32 @@ resolve_changed_files() {
     return 0
   fi
 
-  local base
+  local base range
   base="$(resolve_base_ref)" || return 1
-
+  range="${base}...HEAD"
   if [[ "${base}" == "HEAD^1" ]]; then
-    git -C "${REPO_ROOT}" diff --name-only HEAD^1 HEAD
-    return 0
+    range="HEAD^1..HEAD"
   fi
 
-  git -C "${REPO_ROOT}" diff --name-only "${base}...HEAD"
+  # --no-renames: a moved file counts against both its old and new paths.
+  # core.quotePath=false and -z: paths come back verbatim and NUL-separated,
+  # never C-quoted (a quoted path like "controller/internal/invariants/\303\251.go"
+  # would not match the governed prefixes). Paths containing whitespace or
+  # control characters fail closed, since evaluate_governance splits on spaces.
+  local raw
+  raw="$(git -C "${REPO_ROOT}" -c core.quotePath=false diff --no-renames --name-only -z "${range}" | tr '\0' '\n')" || {
+    fail "git diff ${range} failed; failing closed"
+    return 1
+  }
+  local f
+  while IFS= read -r f; do
+    [[ -z "${f}" ]] && continue
+    if [[ "${f}" =~ [[:space:]] || "${f}" =~ [[:cntrl:]] ]]; then
+      fail "Changed path contains whitespace or control characters, which governance can't evaluate safely: '${f}'; failing closed"
+      return 1
+    fi
+    printf '%s\n' "${f}"
+  done <<<"${raw}"
 }
 
 collect_pr_commit_messages() {
@@ -303,11 +326,16 @@ evaluate_governance() {
       return 1
     fi
     local touched_invariants=0
+    local touched_spec=""
     for f in "${files[@]}"; do
       if [[ "${f}" =~ ^controller/internal/invariants/ ]]; then
         touched_invariants=$((touched_invariants + 1))
+      elif [[ "${f}" == "docs/invariants.md" ]]; then
+        # The invariant specification changes with the rules it describes.
+        touched_spec=" and docs/invariants.md"
+        continue
       else
-        fail "Lane 2 violation: invariant branch '${branch}' modified non-invariant path '${f}'. Dedicated invariant PRs must touch ONLY controller/internal/invariants/** (or set 'Invariant-Cochange: <reason>' / label 'allow-invariant-cochange' for co-dependent changes)."
+        fail "Lane 2 violation: invariant branch '${branch}' modified non-invariant path '${f}'. Dedicated invariant PRs must touch ONLY controller/internal/invariants/** and docs/invariants.md (or set 'Invariant-Cochange: <reason>' / label 'allow-invariant-cochange' for co-dependent changes)."
         return 1
       fi
     done
@@ -315,7 +343,7 @@ evaluate_governance() {
       fail "Lane 2 violation: invariant branch '${branch}' did not modify any file under controller/internal/invariants/"
       return 1
     fi
-    log "PASS (Lane 2): invariant branch '${branch}' touches only controller/internal/invariants/** (${touched_invariants} file(s))"
+    log "PASS (Lane 2): invariant branch '${branch}' touches only controller/internal/invariants/** (${touched_invariants} file(s))${touched_spec}"
     return 0
   fi
 
@@ -433,8 +461,116 @@ EOF
     exit 1
   fi
 
+  # 11. Positive (Lane 2): invariant/* branch updating docs/invariants.md with its rule, without a trailer
+  evaluate_governance "invariant/i4-ready-bound" "${valid_co}" \
+    "controller/internal/invariants/rules.go controller/internal/invariants/i4_anchor_test.go docs/invariants.md" "false" "fix: bound I4" >/dev/null
+
+  # 12. Negative (Lane 2): invariant/* branch changing docs/invariants.md but no file under controller/internal/invariants/
+  if evaluate_governance "invariant/docs-only" "${valid_co}" \
+    "docs/invariants.md" "false" "docs: reword I4" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: Lane 2 allowed invariant/* branch that changes no file under controller/internal/invariants/"
+    exit 1
+  fi
+
+  # 13. Negative (Lane 2): invariant/* branch changing any other path, even one close to docs/invariants.md
+  local other_path
+  for other_path in README.md docs/design/engine-contract.md docs/invariants.md.bak Docs/invariants.md; do
+    if evaluate_governance "invariant/other-docs" "${valid_co}" \
+      "controller/internal/invariants/rules.go docs/invariants.md ${other_path}" "false" "fix: rule and ${other_path}" >/dev/null 2>&1; then
+      rm -rf "${tmp_dir}"
+      fail "Self-test failed: Lane 2 allowed invariant/* branch to modify ${other_path}"
+      exit 1
+    fi
+  done
+
+  # 14. Negative (renames): moving a governed file out of controller/internal/invariants/
+  # must still count as touching it. git's default rename detection would report
+  # only the new path, so the diff must be computed without rename detection.
+  local rn_repo="${tmp_dir}/rename-repo"
+  if ! (
+    set -e
+    git init -q -b main "${rn_repo}"
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    mkdir -p "${rn_repo}/controller/internal/invariants"
+    printf 'package invariants\n\n// rule body\nvar x = 1\n' > "${rn_repo}/controller/internal/invariants/rules.go"
+    git -C "${rn_repo}" add -A
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q -m rules
+    git -C "${rn_repo}" checkout -q -b feature/move-rule
+    mkdir -p "${rn_repo}/controller/x"
+    git -C "${rn_repo}" mv controller/internal/invariants/rules.go controller/x/rules.go
+    git -C "${rn_repo}" -c user.name=t -c user.email=t@t commit -q -m "chore: move file"
+  ) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: could not build the rename fixture repository"
+    exit 1
+  fi
+  local rn_changed
+  rn_changed="$(REPO_ROOT="${rn_repo}" BASE_REF="main" HAS_CHANGED_OVERRIDE="false" resolve_changed_files)"
+  if ! grep -qx 'controller/internal/invariants/rules.go' <<<"${rn_changed}"; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: a file renamed out of controller/internal/invariants/ did not report its old path (got: $(tr '\n' ' ' <<<"${rn_changed}"))"
+    exit 1
+  fi
+  if evaluate_governance "feature/move-rule" "${valid_co}" "${rn_changed}" "false" "chore: move file" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: Lane 1 allowed moving a file out of controller/internal/invariants/"
+    exit 1
+  fi
+
+  # 15. Negative (path quoting): a non-ASCII file name under controller/internal/invariants/
+  # must be reported verbatim (not C-quoted) so Lane 1 still sees the governed prefix.
+  # A changed path containing whitespace must fail closed.
+  local q_repo="${tmp_dir}/quote-repo"
+  if ! (
+    set -e
+    git init -q -b main "${q_repo}"
+    git -C "${q_repo}" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    git -C "${q_repo}" checkout -q -b feature/quoted
+    mkdir -p "${q_repo}/controller/internal/invariants"
+    printf 'package invariants\n' > "${q_repo}/controller/internal/invariants/r\303\251gle.go"
+    git -C "${q_repo}" add -A
+    git -C "${q_repo}" -c user.name=t -c user.email=t@t commit -q -m "chore: add"
+  ) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: could not build the quoting fixture repository"
+    exit 1
+  fi
+  local q_changed
+  q_changed="$(REPO_ROOT="${q_repo}" BASE_REF="main" HAS_CHANGED_OVERRIDE="false" resolve_changed_files)"
+  if ! grep -q '^controller/internal/invariants/' <<<"${q_changed}"; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: a non-ASCII path under controller/internal/invariants/ was not reported verbatim (got: ${q_changed})"
+    exit 1
+  fi
+  if evaluate_governance "feature/quoted" "${valid_co}" "${q_changed}" "false" "chore: add" >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: Lane 1 allowed a non-ASCII file under controller/internal/invariants/"
+    exit 1
+  fi
+  local s_repo="${tmp_dir}/space-repo"
+  if ! (
+    set -e
+    git init -q -b main "${s_repo}"
+    git -C "${s_repo}" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    git -C "${s_repo}" checkout -q -b feature/space
+    mkdir -p "${s_repo}/docs/a b"
+    printf 'x\n' > "${s_repo}/docs/a b/c.md"
+    git -C "${s_repo}" add -A
+    git -C "${s_repo}" -c user.name=t -c user.email=t@t commit -q -m "chore: add"
+  ) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: could not build the whitespace fixture repository"
+    exit 1
+  fi
+  if (REPO_ROOT="${s_repo}" BASE_REF="main" HAS_CHANGED_OVERRIDE="false" resolve_changed_files) >/dev/null 2>&1; then
+    rm -rf "${tmp_dir}"
+    fail "Self-test failed: a changed path with whitespace did not fail closed"
+    exit 1
+  fi
+
   rm -rf "${tmp_dir}"
-  log "Self-test PASSED: all 10 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, and co-change cases verified"
+  log "Self-test PASSED: all 15 Lane 1, Lane 2, governance-file, detached-HEAD, fail-closed, co-change, rename and path-quoting cases verified"
 }
 
 main() {

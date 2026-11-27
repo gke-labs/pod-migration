@@ -11,7 +11,7 @@
 The twelve safety invariants (`I1`–`I12`) guard against data corruption, split-brain state, silent cold starts, and control plane deadlocks:
 
 - **`I1` (At-Most-Once Restore):** Potential split-brain! Two active pods may be running concurrently with the same snapshot memory state.
-- **`I2` (No Silent Cold-Start):** False success reporting; a migration reported as succeeded actually started cold without state.
+- **`I2` (No Silent Cold-Start):** False success reporting; a migration reported as succeeded actually started cold without state. It also fires when a released replacement lacks its engine's restore order or cold-start bypass, and when a released gVisor replacement whose engine doesn't read `podsnapshot.gke.io/ps-name` lacks `podsnapshot.gke.io/ps-name: ""` (`GVisorPodMissingGKEColdStartBypass`).
 - **`I3` (Gate Liveness):** Replacement pod stranded with scheduling gate after migration finished.
 - **`I4` (Terminal Progress):** Active migration stuck beyond maximum timeout ceiling.
 - **`I5` (Zero Resource Leak):** Stale `PodSnapshotManualTrigger` triggers leaking in etcd.
@@ -88,7 +88,7 @@ kubectl get events -n <namespace> --field-selector reason=InvariantViolation -o 
      ```bash
      kubectl get pods -n <namespace> -o jsonpath='{range .items[*]}{.metadata.name}{"\tGKE: "}{.metadata.annotations.podsnapshot\.gke\.io/ps-name}{"\tCRIU: "}{.metadata.annotations.criu\.podmigration\.gke\.io/ps-name}{"\n"}{end}' | grep -E "GKE: [^[:space:]]+|CRIU: [^[:space:]]+"
      ```
-   - If two running pods share the same snapshot name, determine which is the authorized replacement.
+   - If two running pods carry the same snapshot name under the same annotation (the same API group), determine which is the authorized replacement. The same name under the GKE and CRIU annotations names two different snapshots.
    - **DO NOT use `--grace-period=0 --force`!** Force-deleting removes the API object immediately while the container process may still be running on the node; for a StatefulSet, the workload controller would immediately recreate the same-name pod, exacerbating the split-brain.
    - Perform a standard graceful deletion:
      ```bash

@@ -83,11 +83,11 @@ func (n *Node) PSEngineSourceNodeFacts(ctx context.Context) contract.SourceNodeF
 }
 
 // newFactsProbe returns the probe for this node, on the host's procfs, the
-// installed CRIU bundle, and the agent's host runner and containerd client.
+// CRIU bundle in the agent's image (which every layout installs, #109), and the agent's host runner and containerd client.
 func (n *Node) newFactsProbe() factsProbe {
 	p := factsProbe{
 		procRoot:        "/proc",
-		criuVersionFile: filepath.Join(criuBundleDir, "VERSION"),
+		criuVersionFile: filepath.Join(imageBundleDir, "VERSION"),
 		execHost:        n.execHostFn,
 	}
 	if n.Restorer != nil {
