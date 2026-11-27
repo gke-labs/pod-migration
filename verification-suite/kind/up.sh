@@ -84,6 +84,18 @@ build_image() {
     cat "${LOG_DIR}/build-${name}.log" >&2
     return 1
   }
+  local cid tmp_check
+  tmp_check="$(mktemp -d "${LOG_DIR}/notices-${name}.XXXXXX")"
+  cid="$(docker create "pm-e2e/${name}:e2e")"
+  if ! docker cp "${cid}:/THIRD_PARTY_NOTICES/go-stdlib/LICENSE" "${tmp_check}/LICENSE" \
+    || ! docker cp "${cid}:/THIRD_PARTY_NOTICES/go-modules.txt" "${tmp_check}/go-modules.txt"; then
+    docker rm "${cid}" >/dev/null 2>&1 || true
+    rm -rf "${tmp_check}"
+    echo "pm-e2e/${name}:e2e is missing /THIRD_PARTY_NOTICES files" >&2
+    return 1
+  fi
+  docker rm "${cid}" >/dev/null
+  rm -rf "${tmp_check}"
 }
 
 # cert-manager's webhook can refuse Issuers and Certificates for a little
