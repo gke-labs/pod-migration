@@ -287,7 +287,7 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 
 		// Resolve parent workload details
-		parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.Client, pod)
+		parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.apiReader(), pod)
 		if err != nil && !apierrors.IsNotFound(err) {
 			logger.Error(err, "Failed to resolve parent workload for pod", "pod", pod.Name)
 			continue
@@ -469,7 +469,14 @@ func (r *NodePreemptionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager, filtering node events
+func (r *NodePreemptionReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// SetupWithManager sets up the controller with the Manager.
 // to only reconcile when preemption or shutdown signals are active.
 func (r *NodePreemptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).

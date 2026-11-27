@@ -311,7 +311,7 @@ func (a *EvictionGate) Handle(ctx context.Context, req admission.Request) admiss
 	}
 
 	// Resolve parent owner details
-	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)
+	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.apiReader(), pod)
 	if err != nil && !apierrors.IsNotFound(err) {
 		logger.Error(err, "Failed to resolve parent workload")
 		return denied429("transient error resolving parent workload, retrying")
@@ -532,6 +532,13 @@ func denied429(msg string) admission.Response {
 			},
 		},
 	}
+}
+
+func (a *EvictionGate) apiReader() client.Reader {
+	if a.APIReader != nil {
+		return a.APIReader
+	}
+	return a.Client
 }
 
 // InjectDecoder injects the decoder.

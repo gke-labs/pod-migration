@@ -254,7 +254,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	}
 
 	// Resolve parent details to look up alternative PMJs in case of collision
-	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.Client, pod)
+	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, r.apiReader(), pod)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("Parent ReplicaSet not found (likely deleted), treating as bare pod")
@@ -265,7 +265,7 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	}
 
 	// Resolve any webhook assignment races
-	correctedPMJ, changed, err := util.ResolveCollision(ctx, r.Client, pod, assignedPMJ, parentName, parentKind, parentUID)
+	correctedPMJ, changed, err := util.ResolveCollision(ctx, r.Client, pod, assignedPMJ, parentName, parentKind, parentUID, r.apiReader())
 	if err != nil {
 		return ctrl.Result{}, err
 	}

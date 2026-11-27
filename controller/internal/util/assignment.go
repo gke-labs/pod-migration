@@ -83,6 +83,9 @@ func isIgnorableSchemeError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if apierrors.IsForbidden(err) {
+		return true
+	}
 	if runtime.IsNotRegisteredError(err) || meta.IsNoMatchError(err) {
 		return true
 	}
@@ -773,7 +776,12 @@ func MatchesPMJWorkload(pod *corev1.Pod, job *pmv1alpha1.PodMigrationJob, parent
 
 // ResolveCollision deterministically resolves PMJ assignment races.
 // Returns: (correctedPMJ, changed, error)
-func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, assignedPMJ, parentName, parentKind, parentUID string) (string, bool, error) {
+func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, assignedPMJ, parentName, parentKind, parentUID string, apiReader ...client.Reader) (string, bool, error) {
+	reader := client.Reader(c)
+	if len(apiReader) > 0 && apiReader[0] != nil {
+		reader = apiReader[0]
+	}
+
 	// Fetch the assigned PMJ to check targetPodUID
 	job := &pmv1alpha1.PodMigrationJob{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: assignedPMJ}, job); err != nil {
@@ -790,7 +798,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 
 	// If the job records a parent workload, the pod must match that workload lineage.
 	if job.Labels != nil && job.Labels[LabelParentName] != "" {
-		podParentName, podParentKind, podParentUID, err := ResolveParentWorkload(ctx, c, pod)
+		podParentName, podParentKind, podParentUID, err := ResolveParentWorkload(ctx, reader, pod)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return "", false, err
 		}
@@ -820,7 +828,7 @@ func ResolveCollision(ctx context.Context, c client.Client, pod *corev1.Pod, ass
 		}
 		// Contenders must match workload lineage if the job specifies a parent workload
 		if job.Labels != nil && job.Labels[LabelParentName] != "" {
-			pParentName, pParentKind, pParentUID, err := ResolveParentWorkload(ctx, c, p)
+			pParentName, pParentKind, pParentUID, err := ResolveParentWorkload(ctx, reader, p)
 			if err != nil && !apierrors.IsNotFound(err) {
 				return "", false, err
 			}
