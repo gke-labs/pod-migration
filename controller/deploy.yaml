@@ -14,166 +14,166 @@ kind: ClusterRole
 metadata:
   name: pod-migration-controller-role
 rules:
-  - apiGroups:
-      - ""
-    resources:
-      - events
-    verbs:
-      - create
-      - get
-      - list
-      - patch
-      - watch
-  - apiGroups:
-      - ""
-    resources:
-      - nodes
-      - persistentvolumeclaims
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - ""
-    resources:
-      - nodes/status
-    verbs:
-      - get
-  - apiGroups:
-      - ""
-    resources:
-      - pods
-    verbs:
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - ""
-    resources:
-      - pods/eviction
-    verbs:
-      - create
-  - apiGroups:
-      - ""
-    resources:
-      - pods/status
-    verbs:
-      - get
-      - patch
-  - apiGroups:
-      - apps
-    resources:
-      - deployments
-      - statefulsets
-    verbs:
-      - get
-  - apiGroups:
-      - apps
-    resources:
-      - replicasets
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - batch
-    resources:
-      - jobs
-    verbs:
-      - get
-  - apiGroups:
-      - criu.podmigration.gke.io
-      - podsnapshot.gke.io
-    resources:
-      - podsnapshotmanualtriggers
-      - podsnapshotpolicies
-      - podsnapshotstorageconfigs
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - criu.podmigration.gke.io
-      - podsnapshot.gke.io
-    resources:
-      - podsnapshots
-    verbs:
-      - delete
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - criu.podmigration.gke.io
-      - podsnapshot.gke.io
-    resources:
-      - podsnapshots/status
-    verbs:
-      - get
-  - apiGroups:
-      - kubeflow.org
-    resources:
-      - notebooks
-      - pytorchjobs
-    verbs:
-      - get
-  - apiGroups:
-      - podmigration.gke.io
-    resources:
-      - podmigrationjobs
-      - podmigrations
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
-      - podmigration.gke.io
-    resources:
-      - podmigrationjobs/finalizers
-      - podmigrations/finalizers
-    verbs:
-      - update
-  - apiGroups:
-      - podmigration.gke.io
-    resources:
-      - podmigrationjobs/status
-      - podmigrations/status
-    verbs:
-      - get
-      - patch
-      - update
-  - apiGroups:
-      - policy
-    resources:
-      - poddisruptionbudgets
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - ray.io
-    resources:
-      - rayclusters
-    verbs:
-      - get
-  - apiGroups:
-      - storage.k8s.io
-    resources:
-      - volumeattachments
-    verbs:
-      - get
-      - list
-      - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - persistentvolumeclaims
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes/status
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/eviction
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - pods/status
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  verbs:
+  - get
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - get
+- apiGroups:
+  - criu.podmigration.gke.io
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshotmanualtriggers
+  - podsnapshotpolicies
+  - podsnapshotstorageconfigs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - criu.podmigration.gke.io
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshots
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - criu.podmigration.gke.io
+  - podsnapshot.gke.io
+  resources:
+  - podsnapshots/status
+  verbs:
+  - get
+- apiGroups:
+  - kubeflow.org
+  resources:
+  - notebooks
+  - pytorchjobs
+  verbs:
+  - get
+- apiGroups:
+  - podmigration.gke.io
+  resources:
+  - podmigrationjobs
+  - podmigrations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - podmigration.gke.io
+  resources:
+  - podmigrationjobs/finalizers
+  - podmigrations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - podmigration.gke.io
+  resources:
+  - podmigrationjobs/status
+  - podmigrations/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ray.io
+  resources:
+  - rayclusters
+  verbs:
+  - get
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - volumeattachments
+  verbs:
+  - get
+  - list
+  - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
