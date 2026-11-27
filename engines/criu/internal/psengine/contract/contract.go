@@ -151,6 +151,13 @@ const (
 	// RestoreReasonDigestMismatch: spec.json or checkpoint.tar doesn't match
 	// the digests in the signed manifest.
 	RestoreReasonDigestMismatch = "ArchiveDigestMismatch"
+	// RestoreReasonIncompatibleNode: the archive verified, but the restoring
+	// node's CPU model differs from the one it was checkpointed on, so the
+	// agent refused it before runc (#294). The orchestrator concludes the
+	// PodMigrationJob with the condition reason of the same name. The
+	// admission policy on the reason annotation doesn't list values, so a
+	// new code needs no policy change.
+	RestoreReasonIncompatibleNode = "RestoreIncompatibleNode"
 	// RestoreReasonFailed: any other failure.
 	RestoreReasonFailed = "RestoreFailed"
 

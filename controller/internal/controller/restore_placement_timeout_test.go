@@ -18,6 +18,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -228,6 +229,33 @@ func writeBeforeJobStatusPatch(t *testing.T, change func(*pmv1alpha1.PodMigratio
 	}}
 }
 
+// gkePlacementSignal is the start of a PlacementTimeout message for a GKE
+// Pod Snapshots replacement that a node of another machine type could take
+// (#294).
+const gkePlacementSignal = "engine=gke-pod-snapshots requirements=node.kubernetes.io/instance-type: "
+
+// signalled checks that the job's Restored and Ready conditions and the
+// PlacementTimeout Warning events, on the job and on the pod, start with
+// signal (#294), and that they still carry the human text.
+func signalled(t *testing.T, run timeoutRun, signal string) {
+	t.Helper()
+	for _, condType := range []string{"Restored", "Ready"} {
+		if cond := meta.FindStatusCondition(run.job.Status.Conditions, condType); cond == nil || !strings.HasPrefix(cond.Message, signal) ||
+			!strings.Contains(cond.Message, "released with the restore's node constraints") {
+			t.Errorf("%s condition = %+v, want its message to start with %q", condType, cond, signal)
+		}
+	}
+	n := 0
+	for _, e := range run.events {
+		if strings.HasPrefix(e, "Warning "+ReasonPlacementTimeout+" "+signal) {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("events = %q, want 2 %s Warnings (job and pod) starting with %q", run.events, ReasonPlacementTimeout, signal)
+	}
+}
+
 func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 	past := DefaultRestorePlacementDeadline + 30*time.Second
 
@@ -269,6 +297,7 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 		outcomes := outcomeCount("succeeded_without_restore")
 		run := reconcileTimeout(t, releasedJob(past), stuckPod(), timeoutSetup{})
 		concluded(t, run)
+		signalled(t, run, gkePlacementSignal)
 		if got := verdictCount(engine.GKEPodSnapshotsName, "placement_timeout") - verdicts; got != 1 {
 			t.Errorf("placement_timeout verdicts recorded = %v, want 1", got)
 		}
@@ -340,6 +369,9 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 		if !hasEventWith(run.events, "before the restore ceiling") {
 			t.Errorf("events = %q, want them to say the pod wasn't scheduled before the restore ceiling", run.events)
 		}
+		// No node would take the pod without the constraint either, so the
+		// message names the one constraint that the pod gate added.
+		signalled(t, run, gkePlacementSignal)
 	})
 
 	t.Run("between 5m and the restore ceiling with the stabilization window: not past it yet", func(t *testing.T) {
@@ -560,7 +592,7 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 		if run.job.Status.Phase != pmv1alpha1.PodMigrationJobPhaseSucceededWithoutRestore {
 			t.Errorf("phase = %s, want SucceededWithoutRestore", run.job.Status.Phase)
 		}
-		if !hasEventWith(run.events, "Warning", ReasonPlacementTimeout, "scheduled to node n2-a after all") {
+		if !hasEventWith(run.events, "Warning "+ReasonPlacementTimeout+" "+gkePlacementSignal+"Replacement pod replacement was scheduled to node n2-a after all") {
 			t.Errorf("events = %q, want a Warning that the pod was scheduled after all and kept", run.events)
 		}
 	})
@@ -629,7 +661,7 @@ func TestPodMigrationJobReconciler_PlacementTimeout(t *testing.T) {
 		if run.result.RequeueAfter != placementRecheckInterval {
 			t.Errorf("result = %+v, want a requeue after %s", run.result, placementRecheckInterval)
 		}
-		if !hasEventWith(run.events, "Warning", ReasonPlacementTimeout, "nominated to node n2-a") {
+		if !hasEventWith(run.events, "Warning "+ReasonPlacementTimeout+" "+gkePlacementSignal+"Replacement pod replacement was nominated to node n2-a") {
 			t.Errorf("events = %q, want a Warning that the nominated pod is kept for now", run.events)
 		}
 	})
@@ -866,6 +898,17 @@ func TestPodMigrationJobReconciler_RestoreTimeoutRecheck(t *testing.T) {
 		}
 		if !hasEventWith(run.events, "Warning", ReasonPlacementTimeout, "after the job concluded RestoreTimeout") {
 			t.Errorf("events = %q, want a %s Warning", run.events, ReasonPlacementTimeout)
+		}
+		// The events name the engine and the constraint (#294), on the job
+		// and on the pod.
+		n := 0
+		for _, e := range run.events {
+			if strings.HasPrefix(e, "Warning "+ReasonPlacementTimeout+" "+gkePlacementSignal) {
+				n++
+			}
+		}
+		if n != 2 {
+			t.Errorf("events = %q, want 2 starting with %q", run.events, gkePlacementSignal)
 		}
 	})
 

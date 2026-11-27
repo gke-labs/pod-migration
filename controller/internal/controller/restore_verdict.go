@@ -51,6 +51,13 @@ const (
 	// ReasonFallbackToColdStart: the engine reported that the replacement
 	// started cold.
 	ReasonFallbackToColdStart = "FallbackToColdStart"
+	// ReasonRestoreIncompatibleNode: the engine reported that the
+	// replacement started cold because its node isn't compatible with the
+	// checkpoint's source node (RestoreVerdict.IncompatibleFact), for CRIU a
+	// different CPU model (#294). Otherwise it's a FallbackToColdStart: the
+	// replacement keeps running cold. Warning events with this reason, on
+	// the job and on the pod, name the engine, the fact and both nodes.
+	ReasonRestoreIncompatibleNode = "RestoreIncompatibleNode"
 )
 
 const (
@@ -284,6 +291,20 @@ func (r *PodMigrationJobReconciler) concludeWithoutRestore(
 	if verdict.Evidence != "" {
 		message += " (" + verdict.Evidence + ")"
 	}
+	// A cold start on a node that isn't compatible with the checkpoint's
+	// source node gets its own reason, and its message the fields that name
+	// the engine, the fact that didn't match and both nodes (#294). It's
+	// still a cold start for the metrics and the downtime.
+	incompatible := verdict.Outcome == engine.ColdStart && validSignalValue(verdict.IncompatibleFact)
+	if incompatible {
+		reason = ReasonRestoreIncompatibleNode
+		node := ""
+		if pod != nil {
+			node = pod.Spec.NodeName
+		}
+		message = withSignal(incompatibleNodeSignal(engineName, verdict.IncompatibleFact, node, job.Status.OriginNodeName),
+			fmt.Sprintf("The replacement's node isn't compatible with the checkpoint's source node (%s differs), so it started cold: %s", verdict.IncompatibleFact, message))
+	}
 	log.FromContext(ctx).Info("Replacement pod wasn't restored", "pod", pod.Name, "engine", engineName, "reason", reason, "message", message)
 	if outcome != "" && pod != nil {
 		r.recordDowntimeStatus(job, pod)
@@ -295,6 +316,12 @@ func (r *PodMigrationJobReconciler) concludeWithoutRestore(
 		metrics.RecordApplicationDowntime(engineName, outcome, job.Status.ApplicationPauseDuration.Duration.Seconds())
 	}
 	metrics.RecordRestoreVerdict(engineName, label)
+	if incompatible {
+		r.eventf(job, corev1.EventTypeWarning, ReasonRestoreIncompatibleNode, "%s", message)
+		if pod != nil {
+			r.eventf(pod, corev1.EventTypeWarning, ReasonRestoreIncompatibleNode, "%s", message)
+		}
+	}
 	return nil
 }
 

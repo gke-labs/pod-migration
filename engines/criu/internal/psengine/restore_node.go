@@ -407,7 +407,7 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 	// CPU-family guard: refuse a cross-family restore before touching runc
 	// (the holder then cold-starts — state lost, app correct).
 	if mf.CPUFamily != "" && r.CPUFamily != "" && mf.CPUFamily != r.CPUFamily {
-		return fmt.Errorf("cpu family mismatch: archive from %q, this node is %q — refusing cross-family restore", mf.CPUFamily, r.CPUFamily)
+		return fmt.Errorf("%w: cpu family mismatch: archive from %q, this node is %q; refusing cross-family restore", errIncompatibleNode, mf.CPUFamily, r.CPUFamily)
 	}
 
 	specJSON, err := r.fetch(ctx, spec.Bucket, path.Join(prefix, "spec.json"), filepath.Join(dir, "spec.json"), mf.SpecSHA256, 0, maxMetadataBytes)
@@ -440,6 +440,9 @@ func (r *NodeRestoreReconciler) restore(ctx context.Context, pod *corev1.Pod, ps
 var (
 	errArchiveBindingMismatch = errors.New("archive is bound to another restore")
 	errArchiveDigestMismatch  = errors.New("archive doesn't match its signed manifest")
+	// errIncompatibleNode: this node's CPU model isn't the one the archive
+	// was checkpointed on (#294).
+	errIncompatibleNode = errors.New("node is incompatible with the checkpoint")
 )
 
 // checkBindings compares what a verified manifest binds its archive to with
@@ -488,6 +491,8 @@ func restoreFailureReason(err error) string {
 		return contract.RestoreReasonBindingMismatch
 	case errors.Is(err, errArchiveDigestMismatch):
 		return contract.RestoreReasonDigestMismatch
+	case errors.Is(err, errIncompatibleNode):
+		return contract.RestoreReasonIncompatibleNode
 	default:
 		return contract.RestoreReasonFailed
 	}

@@ -530,6 +530,51 @@ func TestCRIU_VerifyRestoreRecordsTheFailureReason(t *testing.T) {
 	}
 }
 
+// A CRIU restore that the node agent refused because the node's CPU model
+// isn't the source's is a cold start that names the mismatched fact (#294),
+// so that the job concludes RestoreIncompatibleNode. Any other reason names
+// none.
+func TestCRIU_VerifyRestoreNamesAnIncompatibleNode(t *testing.T) {
+	e, err := NewCRIU(nil, nil, CRIUAPIGroup)
+	if err != nil {
+		t.Fatalf("NewCRIU: %v", err)
+	}
+	verdict := func(t *testing.T, status, reason string) RestoreVerdict {
+		t.Helper()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			CRIUInjectedAnnotation:      "true",
+			CRIURestoreStatusAnnotation: status,
+			CRIURestoreReasonAnnotation: reason,
+		}}, Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+		v, err := e.VerifyRestore(context.Background(), nil, pod)
+		if err != nil {
+			t.Fatalf("VerifyRestore: %v", err)
+		}
+		return v
+	}
+
+	got := verdict(t, CRIURestoreStatusFailed, CRIURestoreReasonIncompatibleNode)
+	if got.Outcome != ColdStart || got.Confirmed || got.IncompatibleFact != CRIUIncompatibleFactCPUModel {
+		t.Fatalf("VerifyRestore(failed, %s) = %+v, want a ColdStart naming fact %s", CRIURestoreReasonIncompatibleNode, got, CRIUIncompatibleFactCPUModel)
+	}
+	if !strings.Contains(got.Evidence, "reason "+CRIURestoreReasonIncompatibleNode) {
+		t.Errorf("evidence = %q, want the agent's reason", got.Evidence)
+	}
+	if got := verdict(t, CRIURestoreStatusFailed, "  "+CRIURestoreReasonIncompatibleNode+" "); got.IncompatibleFact != CRIUIncompatibleFactCPUModel {
+		t.Errorf("a padded reason: IncompatibleFact = %q, want %s", got.IncompatibleFact, CRIUIncompatibleFactCPUModel)
+	}
+	for _, reason := range []string{"", "RestoreFailed", "ArchiveSignatureInvalid", "ArchiveDigestMismatch"} {
+		if got := verdict(t, CRIURestoreStatusFailed, reason); got.Outcome != ColdStart || got.IncompatibleFact != "" {
+			t.Errorf("VerifyRestore(failed, %q) = %+v, want a ColdStart naming no fact", reason, got)
+		}
+	}
+	// The policy lets a reason go only with failed; next to restored it
+	// says nothing.
+	if got := verdict(t, CRIURestoreStatusRestored, CRIURestoreReasonIncompatibleNode); got.Outcome != Restored || got.IncompatibleFact != "" {
+		t.Errorf("VerifyRestore(restored, %s) = %+v, want Restored naming no fact", CRIURestoreReasonIncompatibleNode, got)
+	}
+}
+
 func TestRegistry_SideBySideGroupsAndRestoreAnnotations(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(testScheme()).Build()
 

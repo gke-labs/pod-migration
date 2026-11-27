@@ -194,8 +194,8 @@ func (r *PodMigrationJobReconciler) recreateUnplacedAfterRestoreTimeout(ctx cont
 		}
 		return placementRecheckInterval, fmt.Errorf("failed to delete replacement pod %s: %w", pod.Name, err)
 	}
-	message := fmt.Sprintf("Replacement pod %s, released with the restore's node constraints, still wasn't scheduled after the job concluded %s, so it's deleted for its owner to recreate, and the new pod starts cold",
-		pod.Name, reasonRestoreTimeout)
+	message := r.placementTimeoutMessage(ctx, job, pod, fmt.Sprintf("Replacement pod %s, released with the restore's node constraints, still wasn't scheduled after the job concluded %s, so it's deleted for its owner to recreate, and the new pod starts cold",
+		pod.Name, reasonRestoreTimeout))
 	log.FromContext(ctx).Info("Replacement released with the restore's node constraints is unschedulable after the restore timeout; deleting it",
 		"job", job.Name, "pod", pod.Name)
 	r.eventf(job, corev1.EventTypeWarning, ReasonPlacementTimeout, "%s", message)
@@ -223,6 +223,154 @@ func (r *PodMigrationJobReconciler) carriesRestorePlacement(ctx context.Context,
 		}
 	}
 	return true, nil
+}
+
+// failedPlacementKeys returns the keys of the node constraints that kept
+// pod, job's replacement, from being scheduled, for the PlacementTimeout
+// messages (#294): of the constraints the pod gate added to it
+// (addedPlacementRequirements), the ones that no node meets among the nodes
+// that don't meet the constraints as a whole yet would take pod without
+// them. Those nodes are found as blockedByRestorePlacement finds them:
+// withoutRequirements gives the pod as its owner recreates it, nodeFits
+// checks each node for it, and a node that pod's own affinity matches is
+// skipped, since the scheduler already rejected it (for example, a full
+// node of the source node's pool). For GKE Pod
+// Snapshots, that's node.kubernetes.io/instance-type; for CRIU, the
+// arch, CPU, version and missing-CPU-flag label keys that differ.
+//
+// When that singles out none, it returns the keys of all the added
+// constraints: when no node would take the pod without them, when each one
+// is met by some such node and only their combination isn't, or when the
+// nodes can't be listed. So does a pod whose engine states no constraints
+// any more, without looking at nodes. The keys are in the engine's order,
+// compacted by compactRequirementKeys. This only shapes a message, so it
+// never fails.
+func (r *PodMigrationJobReconciler) failedPlacementKeys(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod) []string {
+	var reqs []corev1.NodeSelectorRequirement
+	if advisor, ok := r.jobEngine(job).(engine.PlacementAdvisor); ok {
+		var err error
+		if reqs, err = advisor.Placement(ctx, job); err != nil {
+			log.FromContext(ctx).V(1).Info("Couldn't read the restore's node constraints; naming the ones the pod records", "job", job.Name, "err", err.Error())
+			reqs = nil
+		}
+	}
+	added := addedPlacementRequirements(pod, reqs)
+	keys := func(reqs []corev1.NodeSelectorRequirement) []string {
+		out := make([]string, 0, len(reqs))
+		for _, req := range reqs {
+			out = append(out, req.Key)
+		}
+		return compactRequirementKeys(out)
+	}
+	if len(reqs) == 0 || len(added) == 0 {
+		return keys(added)
+	}
+	recreated := withoutRequirements(pod, reqs)
+	recreatedAffinity := nodeaffinity.GetRequiredNodeAffinity(recreated)
+	affinity := nodeaffinity.GetRequiredNodeAffinity(pod)
+	opts := []client.ListOption{client.UnsafeDisableDeepCopy}
+	if selector, ok := wayOutSelector(recreated, reqs); ok {
+		opts = append(opts, client.MatchingLabelsSelector{Selector: selector})
+	}
+	nodes := &corev1.NodeList{}
+	if err := r.List(ctx, nodes, opts...); err != nil {
+		log.FromContext(ctx).V(1).Info("Couldn't list nodes; naming every constraint the pod gate added", "job", job.Name, "err", err.Error())
+		return keys(added)
+	}
+	selectors := make([]labels.Selector, len(added))
+	for j, req := range added {
+		if selector, ok := labelSelectorFor([]corev1.NodeSelectorRequirement{req}); ok {
+			selectors[j] = selector
+		}
+	}
+	met := make([]bool, len(added))
+	candidates := 0
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		// A node that meets the constraints as a whole was rejected by the
+		// scheduler with them in place, perhaps for resources, so it isn't
+		// a way out, and it would mark every constraint as met.
+		if match, err := affinity.Match(node); err != nil || match {
+			continue
+		}
+		if !nodeFits(ctx, node, recreated, recreatedAffinity) {
+			continue
+		}
+		candidates++
+		for j, selector := range selectors {
+			if selector != nil && selector.Matches(labels.Set(node.Labels)) {
+				met[j] = true
+			}
+		}
+	}
+	var failed []corev1.NodeSelectorRequirement
+	for j, req := range added {
+		if !met[j] {
+			failed = append(failed, req)
+		}
+	}
+	if candidates == 0 || len(failed) == 0 {
+		return keys(added)
+	}
+	return keys(failed)
+}
+
+// addedPlacementRequirements returns the node selector requirements that the
+// pod gate appended to pod's required node affinity, as pod records them
+// (RestorePlacementAddedAnnotation), each once, in term order. With reqs,
+// the engine's constraints, the record must agree with them (as for
+// withoutRequirements); without the record, they're reqs. Without reqs, the
+// record is taken as it is: the engine may state none any more, for
+// example when the CRIU snapshot is gone.
+func addedPlacementRequirements(pod *corev1.Pod, reqs []corev1.NodeSelectorRequirement) []corev1.NodeSelectorRequirement {
+	var terms []corev1.NodeSelectorTerm
+	if a := pod.Spec.Affinity; a != nil && a.NodeAffinity != nil && a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		terms = a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	}
+	var counts []int
+	if len(reqs) > 0 {
+		added, ok := addedRequirements(pod, terms, reqs)
+		if !ok {
+			return reqs
+		}
+		counts = added
+	} else {
+		added, ok := recordedAddedCounts(pod, terms)
+		if !ok {
+			return nil
+		}
+		counts = added
+	}
+	var out []corev1.NodeSelectorRequirement
+	for i, n := range counts {
+		exprs := terms[i].MatchExpressions
+		for _, expr := range exprs[len(exprs)-n:] {
+			if !hasNodeSelectorRequirement(out, expr) {
+				out = append(out, expr)
+			}
+		}
+	}
+	return out
+}
+
+// placementTimeoutMessage returns text, a PlacementTimeout message about
+// pod, job's replacement, with the fields that name the engine and the
+// constraints that failed (#294).
+func (r *PodMigrationJobReconciler) placementTimeoutMessage(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod, text string) string {
+	return withSignal(placementSignal(r.jobEngine(job).Name(), r.failedPlacementKeys(ctx, job, pod)), text)
+}
+
+// keptPodPlacementSignal returns the fields for a PlacementTimeout event
+// about a replacement that job, concluded PlacementTimeout, kept after all:
+// the ones its conclusion recorded, or, for a conclusion by an earlier
+// version, the engine's name and no keys.
+func (r *PodMigrationJobReconciler) keptPodPlacementSignal(job *pmv1alpha1.PodMigrationJob) string {
+	if cond := meta.FindStatusCondition(job.Status.Conditions, "Restored"); cond != nil {
+		if signal, ok := placementSignalOf(cond.Message); ok {
+			return signal
+		}
+	}
+	return placementSignal(r.jobEngine(job).Name(), nil)
 }
 
 // unschedulable reports whether the scheduler tried pod and found no node
@@ -412,8 +560,8 @@ func wayOutSelector(pod *corev1.Pod, reqs []corev1.NodeSelectorRequirement) (lab
 // and the completion path in Reconcile deletes the pod.
 func (r *PodMigrationJobReconciler) concludePlacementTimeout(ctx context.Context, job *pmv1alpha1.PodMigrationJob, pod *corev1.Pod, why string) (ctrl.Result, bool, error) {
 	logger := log.FromContext(ctx)
-	message := fmt.Sprintf("Replacement pod %s, released with the restore's node constraints, %s, so it's deleted for its owner to recreate, and the new pod starts cold",
-		pod.Name, why)
+	message := r.placementTimeoutMessage(ctx, job, pod, fmt.Sprintf("Replacement pod %s, released with the restore's node constraints, %s, so it's deleted for its owner to recreate, and the new pod starts cold",
+		pod.Name, why))
 	logger.Info("Replacement is still unscheduled past the placement deadline; concluding without a restore and deleting it",
 		"job", job.Name, "pod", pod.Name, "why", why)
 	orig := job.DeepCopy()
@@ -495,13 +643,13 @@ func (r *PodMigrationJobReconciler) ensurePlacementTimedOutPodDeleted(ctx contex
 			switch {
 			case current.Spec.NodeName != "":
 				r.eventf(job, corev1.EventTypeWarning, ReasonPlacementTimeout,
-					"Replacement pod %s was scheduled to node %s after all, so it's kept, and it may still restore the checkpoint, although the job concluded without a restore",
-					pod.Name, current.Spec.NodeName)
+					"%s: Replacement pod %s was scheduled to node %s after all, so it's kept, and it may still restore the checkpoint, although the job concluded without a restore",
+					r.keptPodPlacementSignal(job), pod.Name, current.Spec.NodeName)
 				return 0, nil
 			case current.Status.NominatedNodeName != "":
 				r.eventf(job, corev1.EventTypeWarning, ReasonPlacementTimeout,
-					"Replacement pod %s was nominated to node %s, so it's kept while the scheduler makes room there. It's deleted if it becomes unschedulable again; if it's scheduled, it may still restore the checkpoint, although the job concluded without a restore",
-					pod.Name, current.Status.NominatedNodeName)
+					"%s: Replacement pod %s was nominated to node %s, so it's kept while the scheduler makes room there. It's deleted if it becomes unschedulable again; if it's scheduled, it may still restore the checkpoint, although the job concluded without a restore",
+					r.keptPodPlacementSignal(job), pod.Name, current.Status.NominatedNodeName)
 			}
 		}
 		// It changed since the read: look again on a fresh read.

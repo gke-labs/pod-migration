@@ -394,7 +394,9 @@ func OutcomeFor(phase pmv1alpha1.PodMigrationJobPhase, reason string) string {
 		if strings.Contains(strings.ToLower(reason), "timeout") {
 			return "timeout"
 		}
-		if reason == "FallbackToColdStart" || strings.Contains(strings.ToLower(reason), "fallback") {
+		// RestoreIncompatibleNode is a cold start too (#294): the engine
+		// refused the restore on an incompatible node.
+		if reason == "FallbackToColdStart" || reason == "RestoreIncompatibleNode" || strings.Contains(strings.ToLower(reason), "fallback") {
 			return "fallback"
 		}
 		return "succeeded_without_restore"
