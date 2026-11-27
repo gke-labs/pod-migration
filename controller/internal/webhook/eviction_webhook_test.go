@@ -42,7 +42,9 @@ import (
 	pmv1alpha1 "github.com/gke-labs/pod-migration/controller/api/v1alpha1"
 	"github.com/gke-labs/pod-migration/controller/internal/eligibility"
 	"github.com/gke-labs/pod-migration/controller/internal/engine"
+	"github.com/gke-labs/pod-migration/controller/internal/metrics"
 	"github.com/gke-labs/pod-migration/controller/internal/util"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestEvictionGate(t *testing.T) {
@@ -1214,6 +1216,8 @@ func TestEvictionGate_OperatorOwned_OwnerForbidden_AllowsColdEvictionWithoutDegr
 		decoder:   admission.NewDecoder(scheme),
 	}
 
+	beforeMetric := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("owner_unreadable", "gke-pod-snapshots"))
+
 	resp := handler.Handle(context.Background(), admission.Request{
 		AdmissionRequest: admissionv1.AdmissionRequest{
 			Namespace:   namespace,
@@ -1234,6 +1238,11 @@ func TestEvictionGate_OperatorOwned_OwnerForbidden_AllowsColdEvictionWithoutDegr
 		}
 	default:
 		t.Fatalf("Expected warning event to be emitted on 403 owner read, got none")
+	}
+
+	// Verify eviction owner_unreadable metric was incremented
+	if got := testutil.ToFloat64(metrics.SkippedMigrationsTotal.WithLabelValues("owner_unreadable", "gke-pod-snapshots")); got != beforeMetric+1 {
+		t.Errorf("Expected SkippedMigrationsTotal[owner_unreadable, gke-pod-snapshots] to increment by 1, got %v (before=%v)", got, beforeMetric)
 	}
 
 	// Verify no PMJ was created (must NOT degrade to bare pod PMJ!)

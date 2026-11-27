@@ -2287,3 +2287,119 @@ func TestCollisionResolution_OptedInDisplacementLoserReassigned(t *testing.T) {
 		t.Fatalf("expected displaced loser pod1 to be reassigned to pmj-rs-2, got %q", corrected)
 	}
 }
+
+func TestCollisionResolution_ContenderLoop_SecondaryContenderForbiddenSkipped(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = pmv1alpha1.AddToScheme(scheme)
+
+	ctx := context.Background()
+	isCtrl := true
+
+	// pod1: valid reconciling pod
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sample-ray-head-001",
+			Namespace: "default",
+			UID:       "pod1-uid",
+			Labels: map[string]string{
+				"app":                         "ray",
+				"ray.io/group":                "headgroup",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-ray"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       "RayCluster",
+					Name:       "sample-ray",
+					UID:        "ray-uid-123",
+					Controller: &isCtrl,
+				},
+			},
+		},
+	}
+
+	// pod2: competing contender assigned to same PMJ, but its owner Get returns 403 Forbidden
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sample-ray-worker-002",
+			Namespace: "default",
+			UID:       "pod2-uid",
+			Labels: map[string]string{
+				"app":                         "ray",
+				"ray.io/group":                "workergroup",
+				util.LabelPodMigrationEnabled: "true",
+			},
+			Annotations: map[string]string{util.AnnotationAssignedPMJ: "pmj-ray"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "ray.io/v1",
+					Kind:       "RayCluster",
+					Name:       "forbidden-ray",
+					UID:        "ray-uid-456",
+					Controller: &isCtrl,
+				},
+			},
+		},
+	}
+
+	pmj := &pmv1alpha1.PodMigrationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pmj-ray",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.LabelParentName: "sample-ray",
+				util.LabelParentKind: "RayCluster",
+				util.LabelParentUID:  "ray-uid-123",
+			},
+		},
+		Spec: pmv1alpha1.PodMigrationJobSpec{
+			PodRef:       corev1.LocalObjectReference{Name: "sample-ray-head-src"},
+			TargetPodUID: "src-uid",
+		},
+	}
+
+	validRayCluster := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "ray.io/v1",
+			"kind":       "RayCluster",
+			"metadata": map[string]interface{}{
+				"name":      "sample-ray",
+				"namespace": "default",
+				"uid":       "ray-uid-123",
+			},
+			"spec": map[string]interface{}{
+				"selector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{
+						"app": "ray",
+					},
+				},
+			},
+		},
+	}
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Pod{}, PodAssignedPMJIndex, PodAssignedPMJIndexValue).
+		WithIndex(&pmv1alpha1.PodMigrationJob{}, PMJParentKeyIndex, PMJParentKeyIndexValue).
+		WithObjects(pod1, pod2, pmj, validRayCluster).Build()
+
+	cl := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == "forbidden-ray" {
+				return apierrors.NewForbidden(schema.GroupResource{Group: "ray.io", Resource: "rayclusters"}, key.Name, nil)
+			}
+			return client.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	corrected, changed, err := util.ResolveCollision(ctx, cl, pod1, "pmj-ray", "sample-ray", "RayCluster", "ray-uid-123")
+	if err != nil {
+		t.Fatalf("ResolveCollision err=%v", err)
+	}
+	// pod2's 403 Forbidden owner must be skipped in contender loop, leaving only pod1 as valid contender -> no collision!
+	if changed || corrected != "pmj-ray" {
+		t.Fatalf("expected pod2 with Forbidden owner to be skipped in contender loop, leaving pod1 without collision, got changed=%v, corrected=%q", changed, corrected)
+	}
+}

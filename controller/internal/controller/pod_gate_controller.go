@@ -253,7 +253,14 @@ func (r *PodGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		return ctrl.Result{}, r.Update(ctx, pod)
 	}
 
-	// Resolve any webhook assignment races
+	// Resolve any webhook assignment races.
+	//
+	// Note on uncached API cost: ResolveCollision invokes ResolveParentWorkload which
+	// performs a live (uncached) GET of the parent controller (e.g. ReplicaSet, StatefulSet,
+	// Job) via APIReader to avoid informer cache lag and ensure authoritative lineage verification.
+	// In the common case, gated replacement pods reconcile once on admission and once on release.
+	// However, if a pod is requeued (e.g. waiting for snapshot durability during snapshotting phase),
+	// this live GET runs on each reconcile until Restoring/release.
 	correctedPMJ, changed, err := util.ResolveCollision(ctx, r.Client, pod, assignedPMJ, "", "", "", r.apiReader())
 	if err != nil {
 		return ctrl.Result{}, err

@@ -33,6 +33,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -51,13 +52,31 @@ import (
 // trackedScaleAPIReader intercepts and counts direct apiserver calls to ensure
 // no per-reconcile uncached API storms (APF regression guard).
 type trackedScaleAPIReader struct {
-	reader    client.Reader
-	getCount  atomic.Int64
-	listCount atomic.Int64
+	reader              client.Reader
+	getCount            atomic.Int64
+	listCount           atomic.Int64
+	rsGetCount          atomic.Int64
+	podSnapshotGetCount atomic.Int64
 }
 
 func (t *trackedScaleAPIReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	t.getCount.Add(1)
+	switch o := obj.(type) {
+	case *appsv1.ReplicaSet:
+		t.rsGetCount.Add(1)
+	case *unstructured.Unstructured:
+		if o.GetKind() == "ReplicaSet" {
+			t.rsGetCount.Add(1)
+		} else if o.GetKind() == "PodSnapshot" {
+			t.podSnapshotGetCount.Add(1)
+		}
+	default:
+		if obj.GetObjectKind().GroupVersionKind().Kind == "ReplicaSet" {
+			t.rsGetCount.Add(1)
+		} else if obj.GetObjectKind().GroupVersionKind().Kind == "PodSnapshot" {
+			t.podSnapshotGetCount.Add(1)
+		}
+	}
 	return t.reader.Get(ctx, key, obj, opts...)
 }
 
@@ -156,6 +175,16 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 		maxHeapBytes           = uint64(64 * 1024 * 1024)
 		maxHeapIncreaseBytes   = int64(32 * 1024 * 1024)
 	)
+	// Uncached API Reader ceilings:
+	// In this 100-pod concurrent drain fixture, exactly 200 uncached GETs are executed:
+	// 1. 100 PodSnapshot GETs from PodMigrationJobReconciler verifying durable snapshot
+	//    readiness directly via APIReader before entering Restoring phase.
+	// 2. 100 ReplicaSet GETs from PodGateReconciler invoking ResolveCollision -> ResolveParentWorkload
+	//    to verify workload lineage directly via APIReader for each gated replacement pod.
+	// We budget ReplicaSet and PodSnapshot GETs separately at podCount + 10 so neither
+	// lineage nor snapshot verification costs can silently grow.
+	maxRSGets := int64(podCount + 10)
+	maxSnapshotGets := int64(podCount + 10)
 	maxUncachedGets := int64(2*podCount + 10)
 	maxUncachedLists := int64(podCount + 10)
 
@@ -633,6 +662,14 @@ func TestScale100PodConcurrentDrain(t *testing.T) {
 	}
 
 	// SLO 8: Zero uncached API storms (APIReader Get/List bounds)
+	actualRSGets := trackedReader.rsGetCount.Load()
+	actualSnapshotGets := trackedReader.podSnapshotGetCount.Load()
+	if actualRSGets > maxRSGets {
+		t.Fatalf("SLO Breach: uncached ReplicaSet API get calls %d exceeded ceiling %d", actualRSGets, maxRSGets)
+	}
+	if actualSnapshotGets > maxSnapshotGets {
+		t.Fatalf("SLO Breach: uncached PodSnapshot API get calls %d exceeded ceiling %d", actualSnapshotGets, maxSnapshotGets)
+	}
 	if actualGets > maxUncachedGets {
 		t.Fatalf("SLO Breach: uncached API get calls %d exceeded ceiling %d", actualGets, maxUncachedGets)
 	}

@@ -106,72 +106,79 @@ func (a *PodGateInjector) Handle(ctx context.Context, req admission.Request) adm
 		return admission.Allowed("pod not opted in")
 	}
 
+	var assignedPMJ string
+	ownerUnreadable := false
+
 	// Resolve parent owner details
 	parentName, parentKind, parentUID, err := util.ResolveParentWorkload(ctx, a.Client, pod)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("Parent ReplicaSet not found (likely deleted), treating as bare pod")
 		} else if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
-			logger.Info("Pod owner cannot be read, bypassing scheduling gate injection")
-			return admission.Allowed("pod owner cannot be read")
+			logger.Info("Pod owner cannot be read, treating as no PMJ and falling through to cold-start scrub")
+			ownerUnreadable = true
 		} else {
 			logger.Error(err, "Failed to resolve parent workload")
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
 	}
 
-	var podTemplateHash string
-	var jobCompletionIndex string
-	var replicaKey string
-	if pod.Labels != nil {
-		podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
-		jobCompletionIndex = pod.Labels[util.LabelJobCompletionIndex]
-	}
-	if !util.IsBuiltInWorkloadKind(parentKind) {
-		replicaKey, _ = util.ResolveOperatorReplicaKey(pod, parentKind)
-	}
-
-	// Find active unassigned PMJ
-	assignedPMJ, err := util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true, replicaKey)
-	if err != nil {
-		logger.Error(err, "Failed to check unassigned active PMJs")
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-
-	// Fallback to APIReader on cache miss to protect against cross-replica informer lag:
-	// If a peer replica just created a PMJ, it may not yet have synced to our local informer cache.
-	// A false miss here would irreversibly stamp ps-name: "" and skip the scheduling gate,
-	// permanently forcing a cold start and stranding the PMJ.
-	if assignedPMJ == "" && a.APIReader != nil {
-		liveParentName := parentName
-		liveParentKind := parentKind
-		liveParentUID := parentUID
-		liveReplicaKey := replicaKey
-		// Only resolve parent via live APIReader if not already resolved by Client
-		if liveParentName == "" {
-			liveParentName, liveParentKind, liveParentUID, err = util.ResolveParentWorkload(ctx, a.APIReader, pod)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					logger.Info("Parent ReplicaSet not found via live APIReader, treating as bare pod")
-				} else if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
-					logger.Info("Pod owner cannot be read via live APIReader, bypassing scheduling gate injection")
-					return admission.Allowed("pod owner cannot be read")
-				} else {
-					logger.Error(err, "Failed to resolve parent workload via live APIReader")
-					return admission.Errored(http.StatusInternalServerError, err)
-				}
-			}
-			if !util.IsBuiltInWorkloadKind(liveParentKind) {
-				liveReplicaKey, _ = util.ResolveOperatorReplicaKey(pod, liveParentKind)
-			}
+	if !ownerUnreadable {
+		var podTemplateHash string
+		var jobCompletionIndex string
+		var replicaKey string
+		if pod.Labels != nil {
+			podTemplateHash = pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+			jobCompletionIndex = pod.Labels[util.LabelJobCompletionIndex]
 		}
-		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex, false, liveReplicaKey)
+		if !util.IsBuiltInWorkloadKind(parentKind) {
+			replicaKey, _ = util.ResolveOperatorReplicaKey(pod, parentKind)
+		}
+
+		// Find active unassigned PMJ
+		assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.Client, req.Namespace, pod.Name, parentName, parentKind, parentUID, podTemplateHash, jobCompletionIndex, true, replicaKey)
 		if err != nil {
-			logger.Error(err, "Failed to check unassigned active PMJs via APIReader fallback")
+			logger.Error(err, "Failed to check unassigned active PMJs")
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
-		if assignedPMJ != "" {
-			logger.Info("Found unassigned active PMJ via live APIReader fallback", "pmj", assignedPMJ)
+
+		// Fallback to APIReader on cache miss to protect against cross-replica informer lag:
+		// If a peer replica just created a PMJ, it may not yet have synced to our local informer cache.
+		// A false miss here would irreversibly stamp ps-name: "" and skip the scheduling gate,
+		// permanently forcing a cold start and stranding the PMJ.
+		if assignedPMJ == "" && a.APIReader != nil {
+			liveParentName := parentName
+			liveParentKind := parentKind
+			liveParentUID := parentUID
+			liveReplicaKey := replicaKey
+			// Only resolve parent via live APIReader if not already resolved by Client
+			if liveParentName == "" {
+				liveParentName, liveParentKind, liveParentUID, err = util.ResolveParentWorkload(ctx, a.APIReader, pod)
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						logger.Info("Parent ReplicaSet not found via live APIReader, treating as bare pod")
+					} else if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+						logger.Info("Pod owner cannot be read via live APIReader, treating as no PMJ and falling through to cold-start scrub")
+						ownerUnreadable = true
+					} else {
+						logger.Error(err, "Failed to resolve parent workload via live APIReader")
+						return admission.Errored(http.StatusInternalServerError, err)
+					}
+				}
+				if !util.IsBuiltInWorkloadKind(liveParentKind) {
+					liveReplicaKey, _ = util.ResolveOperatorReplicaKey(pod, liveParentKind)
+				}
+			}
+			if !ownerUnreadable {
+				assignedPMJ, err = util.FindUnassignedActivePMJ(ctx, a.APIReader, pod.Namespace, pod.Name, liveParentName, liveParentKind, liveParentUID, podTemplateHash, jobCompletionIndex, false, liveReplicaKey)
+				if err != nil {
+					logger.Error(err, "Failed to check unassigned active PMJs via APIReader fallback")
+					return admission.Errored(http.StatusInternalServerError, err)
+				}
+				if assignedPMJ != "" {
+					logger.Info("Found unassigned active PMJ via live APIReader fallback", "pmj", assignedPMJ)
+				}
+			}
 		}
 	}
 
