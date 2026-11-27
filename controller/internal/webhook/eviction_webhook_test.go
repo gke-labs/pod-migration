@@ -32,7 +32,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -163,7 +162,7 @@ func TestEvictionGate(t *testing.T) {
 							Kind:       "ReplicaSet",
 							Name:       "deploy-rs-v1",
 							UID:        "rs-uid-111",
-							Controller: ptr.To(true),
+							Controller: ptr(true),
 						},
 					},
 					UID: "deploy-pod-uid-999",
@@ -185,7 +184,7 @@ func TestEvictionGate(t *testing.T) {
 								Kind:       "Deployment",
 								Name:       "my-deployment",
 								UID:        "deploy-uid-111",
-								Controller: ptr.To(true),
+								Controller: ptr(true),
 							},
 						},
 					},
@@ -219,7 +218,7 @@ func TestEvictionGate(t *testing.T) {
 							Kind:       "Job",
 							Name:       "my-indexed-job",
 							UID:        "job-uid-999",
-							Controller: ptr.To(true),
+							Controller: ptr(true),
 						},
 					},
 				},
