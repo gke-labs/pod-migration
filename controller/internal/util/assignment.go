@@ -55,6 +55,9 @@ const (
 	AnnotationPreserveReadinessDelay = "pod-migration.gke.io/preserve-readiness-delay"
 	AnnotationReplicaIdentityKey     = "pod-migration.gke.io/replica-identity"
 	LabelReplicaKey                  = "pod-migration.gke.io/replica-key"
+	// LabelNamespaceManaged is the opt-in namespace label required for
+	// Pod Migration mutating admission webhooks to match pods at CREATE (#303).
+	LabelNamespaceManaged = "pod-migration.gke.io/managed"
 
 	// PodAssignedPMJIndexKey is the cache index mapping pods to the PMJ named
 	// in their assigned-pmj annotation.  Registered at manager startup via

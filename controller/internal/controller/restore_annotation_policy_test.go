@@ -45,6 +45,9 @@ const (
 
 	// optInLabel opts a pod into migration.
 	optInLabel = "pod-migration.gke.io/enabled"
+
+	// managedNamespaceLabel scopes admission webhooks to managed namespaces (#303).
+	managedNamespaceLabel = "pod-migration.gke.io/managed"
 )
 
 func controllerManifestPath() string {
@@ -108,7 +111,7 @@ func admissionPolicy(t *testing.T, path, name string) (*admissionregistrationv1.
 // they see only updates of pods and of pods/status (a status write can change
 // annotations too), fail closed, are skipped unless a protected annotation
 // changes, and their binding denies.
-func assertPodUpdatePolicy(t *testing.T, policy *admissionregistrationv1.ValidatingAdmissionPolicy, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding) {
+func assertPodPolicy(t *testing.T, policy *admissionregistrationv1.ValidatingAdmissionPolicy, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding, wantOps ...admissionregistrationv1.OperationType) {
 	t.Helper()
 	if policy.Spec.FailurePolicy == nil || *policy.Spec.FailurePolicy != admissionregistrationv1.Fail {
 		t.Errorf("failurePolicy = %v, want Fail", policy.Spec.FailurePolicy)
@@ -120,8 +123,11 @@ func assertPodUpdatePolicy(t *testing.T, policy *admissionregistrationv1.Validat
 		t.Fatalf("matchConstraints = %+v, want exactly one resource rule", policy.Spec.MatchConstraints)
 	}
 	rule := policy.Spec.MatchConstraints.ResourceRules[0]
-	if !reflect.DeepEqual(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Update}) {
-		t.Errorf("operations = %v, want only UPDATE: creation is the webhooks' job", rule.Operations)
+	if len(wantOps) == 0 {
+		wantOps = []admissionregistrationv1.OperationType{admissionregistrationv1.Update}
+	}
+	if !reflect.DeepEqual(rule.Operations, wantOps) {
+		t.Errorf("operations = %v, want %v", rule.Operations, wantOps)
 	}
 	if !reflect.DeepEqual(rule.APIGroups, []string{""}) || !reflect.DeepEqual(rule.Resources, []string{"pods", "pods/status"}) {
 		t.Errorf("rule matches groups %v resources %v, want pods and pods/status of the core group", rule.APIGroups, rule.Resources)
@@ -157,12 +163,12 @@ func validationExpressions(policy *admissionregistrationv1.ValidatingAdmissionPo
 
 // The restore order policy in controller/deploy.yaml names the controller's
 // service account, and has the scope of mpodgate, the webhook that handles
-// restore orders when a pod is created (#233). The manifest has no templating,
+// restore orders when a pod is created (#233, #303). The manifest has no templating,
 // so nothing else keeps these in step.
 func TestRestoreOrderPolicy_MatchesTheControllerManifest(t *testing.T) {
 	path := controllerManifestPath()
 	policy, binding := admissionPolicy(t, path, restoreOrderPolicyName)
-	assertPodUpdatePolicy(t, policy, binding)
+	assertPodPolicy(t, policy, binding, admissionregistrationv1.Create, admissionregistrationv1.Update)
 
 	// The identity the policy allows is the one the controller runs as.
 	deployment := &appsv1.Deployment{}
@@ -215,7 +221,7 @@ func TestRestoreOrderPolicy_MatchesTheControllerManifest(t *testing.T) {
 func TestRestoreStatusPolicy_MatchesTheCRIUManifest(t *testing.T) {
 	path := criuManifestPath()
 	policy, binding := admissionPolicy(t, path, restoreStatusPolicyName)
-	assertPodUpdatePolicy(t, policy, binding)
+	assertPodPolicy(t, policy, binding)
 
 	agent := &appsv1.DaemonSet{}
 	manifestObject(t, path, "DaemonSet", "pod-migrate-agent", agent)
@@ -260,5 +266,84 @@ func TestRestoreStatusPolicy_MatchesTheCRIUManifest(t *testing.T) {
 	if !reflect.DeepEqual(policy.Spec.MatchConstraints.NamespaceSelector, webhooks.Webhooks[0].NamespaceSelector) {
 		t.Errorf("namespaceSelector = %v, want the restore webhook's %v",
 			policy.Spec.MatchConstraints.NamespaceSelector, webhooks.Webhooks[0].NamespaceSelector)
+	}
+}
+
+// TestDeployManifest_WebhookManagedNamespaceSelectors asserts that admission
+// webhooks across controller/deploy.yaml and CRIU deploy.yaml are correctly
+// scoped with pod-migration.gke.io/managed: "true" (#303):
+// - veviction, mpodgate, and mpodgate-runc MUST target managed namespaces
+// - mpodstatus and mpodfence MUST NOT have matchLabels (they monitor all namespaces)
+// - CRIU restore-inject MUST target managed namespaces
+func TestDeployManifest_WebhookManagedNamespaceSelectors(t *testing.T) {
+	ctrlPath := controllerManifestPath()
+
+	vwebhooks := &admissionregistrationv1.ValidatingWebhookConfiguration{}
+	manifestObject(t, ctrlPath, "ValidatingWebhookConfiguration", "validating-webhook-configuration", vwebhooks)
+	foundVeviction := false
+	for _, wh := range vwebhooks.Webhooks {
+		if wh.Name == "veviction.podmigration.gke.io" {
+			foundVeviction = true
+			if wh.NamespaceSelector == nil || wh.NamespaceSelector.MatchLabels == nil ||
+				wh.NamespaceSelector.MatchLabels[managedNamespaceLabel] != "true" {
+				t.Errorf("veviction namespaceSelector missing matchLabels %s: 'true', got: %+v",
+					managedNamespaceLabel, wh.NamespaceSelector)
+			}
+		}
+	}
+	if !foundVeviction {
+		t.Fatal("veviction.podmigration.gke.io not found in validating-webhook-configuration")
+	}
+
+	mwebhooks := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	manifestObject(t, ctrlPath, "MutatingWebhookConfiguration", "mutating-webhook-configuration", mwebhooks)
+	scopedMutators := map[string]bool{
+		"mpodgate.podmigration.gke.io":      false,
+		"mpodgate-runc.podmigration.gke.io": false,
+	}
+	unscopedMutators := map[string]bool{
+		"mpodstatus.podmigration.gke.io": false,
+		"mpodfence.podmigration.gke.io":  false,
+	}
+	for _, wh := range mwebhooks.Webhooks {
+		if _, ok := scopedMutators[wh.Name]; ok {
+			scopedMutators[wh.Name] = true
+			if wh.NamespaceSelector == nil || wh.NamespaceSelector.MatchLabels == nil ||
+				wh.NamespaceSelector.MatchLabels[managedNamespaceLabel] != "true" {
+				t.Errorf("%s namespaceSelector missing matchLabels %s: 'true', got: %+v",
+					wh.Name, managedNamespaceLabel, wh.NamespaceSelector)
+			}
+		}
+		if _, ok := unscopedMutators[wh.Name]; ok {
+			unscopedMutators[wh.Name] = true
+			if wh.NamespaceSelector != nil && wh.NamespaceSelector.MatchLabels != nil &&
+				wh.NamespaceSelector.MatchLabels[managedNamespaceLabel] != "" {
+				t.Errorf("%s should not have managed matchLabels, got: %+v",
+					wh.Name, wh.NamespaceSelector)
+			}
+		}
+	}
+	for name, found := range scopedMutators {
+		if !found {
+			t.Errorf("mutator %s not found in mutating-webhook-configuration", name)
+		}
+	}
+	for name, found := range unscopedMutators {
+		if !found {
+			t.Errorf("mutator %s not found in mutating-webhook-configuration", name)
+		}
+	}
+
+	// Check CRIU deploy.yaml
+	criuPath := criuManifestPath()
+	criuMutators := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	manifestObject(t, criuPath, "MutatingWebhookConfiguration", "pod-migrate-psengine-restore-inject", criuMutators)
+	if len(criuMutators.Webhooks) != 1 {
+		t.Fatalf("CRIU restore-inject webhooks count = %d, want 1", len(criuMutators.Webhooks))
+	}
+	if criuMutators.Webhooks[0].NamespaceSelector == nil || criuMutators.Webhooks[0].NamespaceSelector.MatchLabels == nil ||
+		criuMutators.Webhooks[0].NamespaceSelector.MatchLabels[managedNamespaceLabel] != "true" {
+		t.Errorf("CRIU restore-inject missing matchLabels %s: 'true', got: %+v",
+			managedNamespaceLabel, criuMutators.Webhooks[0].NamespaceSelector)
 	}
 }

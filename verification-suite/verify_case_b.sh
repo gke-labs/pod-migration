@@ -12,6 +12,7 @@ fi
 POD_NAME="pm-redis-0"
 
 echo "[*] Cleaning up potential residue..."
+kubectl label namespace default pod-migration.gke.io/managed="true" --overwrite
 kubectl delete statefulset/pm-redis service/pm-redis-service --ignore-not-found || true
 kubectl delete podsnapshots --all || true
 
