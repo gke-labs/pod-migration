@@ -41,7 +41,14 @@ import (
 // deletes the pod. Its owner recreates it, and the new pod starts cold. No
 // invariant may fire on the way.
 func TestRestorePlacement_CRIUPlacementTimeoutFlow(t *testing.T) {
-	f := newPlacementFlowFor(t, ownedPlacementPod(), placementJob(), criuNode("old-kernel", olderKernel()))
+	// The eviction webhook records the serving engine on every job it
+	// creates; the invariants read restore orders per that engine (#234).
+	criuJob := placementJob()
+	if criuJob.Annotations == nil {
+		criuJob.Annotations = map[string]string{}
+	}
+	criuJob.Annotations[engine.AnnotationEngine] = engine.CRIUName
+	f := newPlacementFlowFor(t, ownedPlacementPod(), criuJob, criuNode("old-kernel", olderKernel()))
 	reg := criuPlacementRegistry(t, sourceNodeOf(criuSourceFacts))
 	f.gate.Engines, f.jobs.Engines = reg, reg
 	ctx := context.Background()
