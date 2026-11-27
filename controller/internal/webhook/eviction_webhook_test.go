@@ -521,7 +521,7 @@ func TestEvictionGate(t *testing.T) {
 			expectedMessage:    "migration job spawned",
 			verifyPMJCreated:   true,
 			expectedAnnotations: map[string]string{
-				util.AnnotationMigrationTimeout: "25m",
+				util.AnnotationMigrationTimeout: "25m0s",
 			},
 		},
 		{
